@@ -1,0 +1,367 @@
+// geom_bench.hml — instrumented / ablatable copy of wobbleweed src/geom.hml,
+// plus the optimization prototypes (bucketed depth sort, flat f64 vertex
+// buffers). Kept byte-for-byte faithful to the shipping code path where it
+// isn't deliberately varied, so deltas are attributable.
+
+import { draw_tris } from "../../../wobbleweed/src/sdl.hml";
+
+let VSTRIDE = 20;   // bytes per SDL_Vertex: pos(f32x2) color(u8x4) uv(f32x2)
+
+// ---------------------------------------------------------------- baseline --
+
+export fn put_vert(buf: ptr, vi: i32, v) {
+    let o = vi * VSTRIDE;
+    ptr_write_f32(ptr_offset(buf, o, 1), v.x);
+    ptr_write_f32(ptr_offset(buf, o + 4, 1), v.y);
+    ptr_write_u8(ptr_offset(buf, o + 8, 1), v.r & 255);
+    ptr_write_u8(ptr_offset(buf, o + 9, 1), v.g & 255);
+    ptr_write_u8(ptr_offset(buf, o + 10, 1), v.b & 255);
+    ptr_write_u8(ptr_offset(buf, o + 11, 1), 255);
+    ptr_write_f32(ptr_offset(buf, o + 12, 1), v.u);
+    ptr_write_f32(ptr_offset(buf, o + 16, 1), v.v);
+}
+
+export fn batch_new(max_tris: i32) {
+    return { tris: [], buf: alloc(max_tris * 3 * VSTRIDE), cap: max_tris };
+}
+
+export fn batch_reset(b) { b.tris = []; }
+
+export fn batch_tri(b, tex, a, bb, c) {
+    let depth = (a.z + bb.z + c.z) / 3.0;
+    b.tris.push({ tex: tex, depth: depth, a: a, b: bb, c: c });
+}
+
+// The shipping sort: array.sort() with a comparison closure. In the COMPILED
+// runtime this is hml_array_sort -> quicksort with a LAST-ELEMENT PIVOT and one
+// dynamic closure call per comparison.
+export fn sort_closure(tris) {
+    tris.sort(fn(p, q) {
+        if (p.depth > q.depth) { return 0 - 1; }
+        if (p.depth < q.depth) { return 1; }
+        return 0;
+    });
+}
+
+// ------------------------------------------------- bucketed O(n) depth sort --
+//
+// Depth here is ndc z in [-1, 1] for anything between the near and far plane
+// (the sky quad parks at 2.0). Quantize to NB buckets, counting-sort. Painter's
+// order = farthest first = LARGEST z first, so bucket NB-1 is emitted first.
+//
+// Precision: with NB = 2048 over the [-1, 2] range the depth quantum is
+// ~0.0015 ndc units. ndc z is heavily nonlinear (most of it is spent near the
+// camera), so this is finer than the PS1's actual 12-bit ordering table.
+
+let NB = 4096;
+// NB is the ordering-table size; see PERF.md for the precision analysis.
+
+export fn bucket_new() {
+    // counts[] + a flat output array reused every frame
+    let counts = [];
+    for (let i = 0; i <= NB; i++) { counts.push(0); }
+    return { counts: counts, out: [] };
+}
+
+// lo/hi bracket the depth key. For the shipping recommendation the key is
+// view-space depth (linear metres), lo=0, hi=draw distance.
+export fn sort_bucket(bs, tris, DZ0: f64, DZ1: f64) {
+    let counts = bs.counts;
+    let n = tris.length;
+    let scale = NB / (DZ1 - DZ0);
+    // clear
+    for (let i = 0; i <= NB; i++) { counts[i] = 0; }
+    // histogram. NB: do NOT cache the bucket index back onto the triangle
+    // object — adding a field to an existing object is a hash-table grow +
+    // rebuild in the Hemlock runtime, which costs far more than recomputing
+    // the index in the scatter pass. (Measured: caching it made the whole sort
+    // ~2x slower than recomputing.)
+    for (let i = 0; i < n; i++) {
+        let k = i32((tris[i].depth - DZ0) * scale);
+        if (k < 0) { k = 0; } if (k >= NB) { k = NB - 1; }
+        counts[k] = counts[k] + 1;
+    }
+    // prefix sums, DESCENDING bucket order (farthest first)
+    let acc = 0;
+    for (let i = NB - 1; i >= 0; i--) {
+        let c = counts[i];
+        counts[i] = acc;
+        acc = acc + c;
+    }
+    // scatter
+    let out = bs.out;
+    if (out.length != n) {
+        out = [];
+        for (let i = 0; i < n; i++) { out.push(null); }
+        bs.out = out;
+    }
+    for (let i = 0; i < n; i++) {
+        let t = tris[i];
+        let k = i32((t.depth - DZ0) * scale);
+        if (k < 0) { k = 0; } if (k >= NB) { k = NB - 1; }
+        out[counts[k]] = t;
+        counts[k] = counts[k] + 1;
+    }
+    return out;
+}
+
+// ------------------------------------------------- flat f64 vertex pipeline --
+//
+// Instead of an array of {tex, depth, a:{...}, b:{...}, c:{...}} objects (which
+// costs 4 heap objects + refcount traffic per triangle), triangles live in a
+// flat f64 buffer, 8 lanes per vertex x 3 vertices = 24 f64 = 192 bytes/tri:
+//   [x y z u v r g b] * 3
+// Depth and texture id live in parallel flat buffers.
+
+let FSTRIDE = 24;        // f64 per triangle
+let F8 = 8;              // bytes per f64
+
+export fn flat_new(max_tris: i32) {
+    return { v: alloc(max_tris * FSTRIDE * F8),      // vertex lanes
+             d: alloc(max_tris * F8),                // per-tri depth
+             t: alloc(max_tris * 8),                 // per-tri texture ptr
+             idx: alloc(max_tris * 4),               // sort permutation (i32)
+             cnt: 0,
+             cap: max_tris,
+             buf: alloc(max_tris * 3 * VSTRIDE) };   // SDL_Vertex staging
+}
+
+export fn flat_reset(f) { f.cnt = 0; }
+
+// Push a triangle from three geom-vertex objects (used when the front half of
+// the pipeline still produces objects).
+export fn flat_push_obj(f, tex, a, b, c) {
+    let i = f.cnt;
+    let o = i * FSTRIDE * F8;
+    let v = f.v;
+    ptr_write_f64(ptr_offset(v, o, 1), a.x);
+    ptr_write_f64(ptr_offset(v, o + 8, 1), a.y);
+    ptr_write_f64(ptr_offset(v, o + 16, 1), a.z);
+    ptr_write_f64(ptr_offset(v, o + 24, 1), a.u);
+    ptr_write_f64(ptr_offset(v, o + 32, 1), a.v);
+    ptr_write_f64(ptr_offset(v, o + 40, 1), a.r);
+    ptr_write_f64(ptr_offset(v, o + 48, 1), a.g);
+    ptr_write_f64(ptr_offset(v, o + 56, 1), a.b);
+    ptr_write_f64(ptr_offset(v, o + 64, 1), b.x);
+    ptr_write_f64(ptr_offset(v, o + 72, 1), b.y);
+    ptr_write_f64(ptr_offset(v, o + 80, 1), b.z);
+    ptr_write_f64(ptr_offset(v, o + 88, 1), b.u);
+    ptr_write_f64(ptr_offset(v, o + 96, 1), b.v);
+    ptr_write_f64(ptr_offset(v, o + 104, 1), b.r);
+    ptr_write_f64(ptr_offset(v, o + 112, 1), b.g);
+    ptr_write_f64(ptr_offset(v, o + 120, 1), b.b);
+    ptr_write_f64(ptr_offset(v, o + 128, 1), c.x);
+    ptr_write_f64(ptr_offset(v, o + 136, 1), c.y);
+    ptr_write_f64(ptr_offset(v, o + 144, 1), c.z);
+    ptr_write_f64(ptr_offset(v, o + 152, 1), c.u);
+    ptr_write_f64(ptr_offset(v, o + 160, 1), c.v);
+    ptr_write_f64(ptr_offset(v, o + 168, 1), c.r);
+    ptr_write_f64(ptr_offset(v, o + 176, 1), c.g);
+    ptr_write_f64(ptr_offset(v, o + 184, 1), c.b);
+    ptr_write_f64(ptr_offset(f.d, i * 8, 1), (a.z + b.z + c.z) / 3.0);
+    ptr_write_ptr(ptr_offset(f.t, i * 8, 1), tex);
+    f.cnt = i + 1;
+}
+
+// Push a triangle straight from scalars — no vertex objects ever exist.
+export fn flat_push_raw(f, tex,
+                        ax: f64, ay: f64, az: f64, au: f64, av: f64, ar: f64, ag: f64, ab: f64,
+                        bx: f64, by: f64, bz: f64, bu: f64, bv: f64, br: f64, bg: f64, bb: f64,
+                        cx: f64, cy: f64, cz: f64, cu: f64, cv: f64, cr: f64, cg: f64, cb: f64) {
+    let i = f.cnt;
+    let o = i * FSTRIDE * F8;
+    let v = f.v;
+    ptr_write_f64(ptr_offset(v, o, 1), ax);
+    ptr_write_f64(ptr_offset(v, o + 8, 1), ay);
+    ptr_write_f64(ptr_offset(v, o + 16, 1), az);
+    ptr_write_f64(ptr_offset(v, o + 24, 1), au);
+    ptr_write_f64(ptr_offset(v, o + 32, 1), av);
+    ptr_write_f64(ptr_offset(v, o + 40, 1), ar);
+    ptr_write_f64(ptr_offset(v, o + 48, 1), ag);
+    ptr_write_f64(ptr_offset(v, o + 56, 1), ab);
+    ptr_write_f64(ptr_offset(v, o + 64, 1), bx);
+    ptr_write_f64(ptr_offset(v, o + 72, 1), by);
+    ptr_write_f64(ptr_offset(v, o + 80, 1), bz);
+    ptr_write_f64(ptr_offset(v, o + 88, 1), bu);
+    ptr_write_f64(ptr_offset(v, o + 96, 1), bv);
+    ptr_write_f64(ptr_offset(v, o + 104, 1), br);
+    ptr_write_f64(ptr_offset(v, o + 112, 1), bg);
+    ptr_write_f64(ptr_offset(v, o + 120, 1), bb);
+    ptr_write_f64(ptr_offset(v, o + 128, 1), cx);
+    ptr_write_f64(ptr_offset(v, o + 136, 1), cy);
+    ptr_write_f64(ptr_offset(v, o + 144, 1), cz);
+    ptr_write_f64(ptr_offset(v, o + 152, 1), cu);
+    ptr_write_f64(ptr_offset(v, o + 160, 1), cv);
+    ptr_write_f64(ptr_offset(v, o + 168, 1), cr);
+    ptr_write_f64(ptr_offset(v, o + 176, 1), cg);
+    ptr_write_f64(ptr_offset(v, o + 184, 1), cb);
+    ptr_write_f64(ptr_offset(f.d, i * 8, 1), (az + bz + cz) / 3.0);
+    ptr_write_ptr(ptr_offset(f.t, i * 8, 1), tex);
+    f.cnt = i + 1;
+}
+
+// Counting sort over the flat depth buffer -> permutation of triangle indices
+// in f.idx. No objects touched, no closure calls.
+export fn flat_sort(f, counts, DZ0: f64, DZ1: f64) {
+    let n = f.cnt;
+    let scale = NB / (DZ1 - DZ0);
+    let d = f.d;
+    for (let i = 0; i <= NB; i++) { counts[i] = 0; }
+    for (let i = 0; i < n; i++) {
+        let k = i32((ptr_deref_f64(ptr_offset(d, i * 8, 1)) - DZ0) * scale);
+        if (k < 0) { k = 0; } if (k >= NB) { k = NB - 1; }
+        counts[k] = counts[k] + 1;
+    }
+    let acc = 0;
+    for (let i = NB - 1; i >= 0; i--) {
+        let c = counts[i];
+        counts[i] = acc;
+        acc = acc + c;
+    }
+    let idx = f.idx;
+    for (let i = 0; i < n; i++) {
+        let k = i32((ptr_deref_f64(ptr_offset(d, i * 8, 1)) - DZ0) * scale);
+        if (k < 0) { k = 0; } if (k >= NB) { k = NB - 1; }
+        ptr_write_i32(ptr_offset(idx, counts[k] * 4, 1), i);
+        counts[k] = counts[k] + 1;
+    }
+}
+
+// ------------------------------------------- SDL-native flat pipeline -------
+//
+// The remaining cost in the flat path is the f64 -> SDL_Vertex repack at flush
+// (24 ptr_deref_f64 + 8 ptr_write per triangle). Avoid it entirely: write
+// SDL_Vertex bytes *at push time* (the values are already in registers), keep
+// depth/texture in parallel arrays, and let flush be one 60-byte memcpy per
+// triangle in sorted order.
+//
+// SDL_Vertex is 20 bytes: pos(f32 x, f32 y) color(u8 r,g,b,a) uv(f32 u, f32 v).
+// A triangle is therefore exactly 60 contiguous bytes.
+
+let TSTRIDE = 60;
+
+export fn sdlv_new(max_tris: i32) {
+    return { v: alloc(max_tris * TSTRIDE),      // per-triangle SDL_Vertex[3]
+             out: alloc(max_tris * TSTRIDE),    // sorted draw buffer
+             d: alloc(max_tris * 8),
+             t: alloc(max_tris * 8),
+             idx: alloc(max_tris * 4),
+             cnt: 0, cap: max_tris };
+}
+
+export fn sdlv_reset(f) { f.cnt = 0; }
+
+fn sdlv_put(v: ptr, o: i32, x: f64, y: f64, u: f64, vv: f64, r: i32, g: i32, b: i32) {
+    ptr_write_f32(ptr_offset(v, o, 1), x);
+    ptr_write_f32(ptr_offset(v, o + 4, 1), y);
+    ptr_write_u8(ptr_offset(v, o + 8, 1), r & 255);
+    ptr_write_u8(ptr_offset(v, o + 9, 1), g & 255);
+    ptr_write_u8(ptr_offset(v, o + 10, 1), b & 255);
+    ptr_write_u8(ptr_offset(v, o + 11, 1), 255);
+    ptr_write_f32(ptr_offset(v, o + 12, 1), u);
+    ptr_write_f32(ptr_offset(v, o + 16, 1), vv);
+}
+
+export fn sdlv_push_raw(f, tex, depth: f64,
+                        ax: f64, ay: f64, au: f64, av: f64, ar: i32, ag: i32, ab: i32,
+                        bx: f64, by: f64, bu: f64, bv: f64, br: i32, bg: i32, bb: i32,
+                        cx: f64, cy: f64, cu: f64, cv: f64, cr: i32, cg: i32, cb: i32) {
+    let i = f.cnt;
+    let o = i * TSTRIDE;
+    let v = f.v;
+    sdlv_put(v, o, ax, ay, au, av, ar, ag, ab);
+    sdlv_put(v, o + 20, bx, by, bu, bv, br, bg, bb);
+    sdlv_put(v, o + 40, cx, cy, cu, cv, cr, cg, cb);
+    ptr_write_f64(ptr_offset(f.d, i * 8, 1), depth);
+    ptr_write_ptr(ptr_offset(f.t, i * 8, 1), tex);
+    f.cnt = i + 1;
+}
+
+export fn sdlv_sort(f, counts, DZ0: f64, DZ1: f64) {
+    let n = f.cnt;
+    let scale = NB / (DZ1 - DZ0);
+    let d = f.d;
+    for (let i = 0; i <= NB; i++) { counts[i] = 0; }
+    for (let i = 0; i < n; i++) {
+        let k = i32((ptr_deref_f64(ptr_offset(d, i * 8, 1)) - DZ0) * scale);
+        if (k < 0) { k = 0; } if (k >= NB) { k = NB - 1; }
+        counts[k] = counts[k] + 1;
+    }
+    let acc = 0;
+    for (let i = NB - 1; i >= 0; i--) {
+        let c = counts[i];
+        counts[i] = acc;
+        acc = acc + c;
+    }
+    let idx = f.idx;
+    for (let i = 0; i < n; i++) {
+        let k = i32((ptr_deref_f64(ptr_offset(d, i * 8, 1)) - DZ0) * scale);
+        if (k < 0) { k = 0; } if (k >= NB) { k = NB - 1; }
+        ptr_write_i32(ptr_offset(idx, counts[k] * 4, 1), i);
+        counts[k] = counts[k] + 1;
+    }
+}
+
+// Gather sorted triangles with a 60-byte memcpy each, one draw call per
+// same-texture run.
+export fn sdlv_flush(w, f, do_draw: bool) {
+    let n = f.cnt;
+    let idx = f.idx; let v = f.v; let out = f.out; let td = f.t;
+    let calls = 0;
+    let i = 0;
+    while (i < n) {
+        let t0 = ptr_deref_i32(ptr_offset(idx, i * 4, 1));
+        let tex = ptr_deref_ptr(ptr_offset(td, t0 * 8, 1));
+        let vi = 0;
+        let j = i;
+        while (j < n) {
+            let ti = ptr_deref_i32(ptr_offset(idx, j * 4, 1));
+            if (ptr_deref_ptr(ptr_offset(td, ti * 8, 1)) != tex) { break; }
+            memcpy(ptr_offset(out, vi * TSTRIDE, 1), ptr_offset(v, ti * TSTRIDE, 1), TSTRIDE);
+            vi = vi + 1;
+            j = j + 1;
+        }
+        if (do_draw) { draw_tris(w, tex, out, vi * 3); }
+        calls = calls + 1;
+        i = j;
+    }
+    return calls;
+}
+
+// Pack sorted flat triangles into SDL_Vertex staging, batching same-texture
+// runs, and issue the draw calls. Returns the number of draw calls made.
+export fn flat_flush(w, f, do_draw: bool) {
+    let n = f.cnt;
+    let idx = f.idx; let v = f.v; let buf = f.buf; let td = f.t;
+    let calls = 0;
+    let i = 0;
+    while (i < n) {
+        let t0 = ptr_deref_i32(ptr_offset(idx, i * 4, 1));
+        let tex = ptr_deref_ptr(ptr_offset(td, t0 * 8, 1));
+        let vi = 0;
+        let j = i;
+        while (j < n) {
+            let ti = ptr_deref_i32(ptr_offset(idx, j * 4, 1));
+            if (ptr_deref_ptr(ptr_offset(td, ti * 8, 1)) != tex) { break; }
+            let o = ti * FSTRIDE * F8;
+            for (let k = 0; k < 3; k++) {
+                let vo = o + k * 64;
+                let bo = vi * VSTRIDE;
+                ptr_write_f32(ptr_offset(buf, bo, 1), ptr_deref_f64(ptr_offset(v, vo, 1)));
+                ptr_write_f32(ptr_offset(buf, bo + 4, 1), ptr_deref_f64(ptr_offset(v, vo + 8, 1)));
+                ptr_write_u8(ptr_offset(buf, bo + 8, 1), i32(ptr_deref_f64(ptr_offset(v, vo + 40, 1))) & 255);
+                ptr_write_u8(ptr_offset(buf, bo + 9, 1), i32(ptr_deref_f64(ptr_offset(v, vo + 48, 1))) & 255);
+                ptr_write_u8(ptr_offset(buf, bo + 10, 1), i32(ptr_deref_f64(ptr_offset(v, vo + 56, 1))) & 255);
+                ptr_write_u8(ptr_offset(buf, bo + 11, 1), 255);
+                ptr_write_f32(ptr_offset(buf, bo + 12, 1), ptr_deref_f64(ptr_offset(v, vo + 24, 1)));
+                ptr_write_f32(ptr_offset(buf, bo + 16, 1), ptr_deref_f64(ptr_offset(v, vo + 32, 1)));
+                vi = vi + 1;
+            }
+            j = j + 1;
+        }
+        if (do_draw) { draw_tris(w, tex, buf, vi); }
+        calls = calls + 1;
+        i = j;
+    }
+    return calls;
+}

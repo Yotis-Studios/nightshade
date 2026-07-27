@@ -1,0 +1,165 @@
+// probe.hml — verify the risky SDL2 FFI features an FPS needs, empirically.
+// No SDL2 headers on this box, so every constant below is asserted by RESULT,
+// not by trusting a header.
+import "libSDL2-2.0.so.0";
+
+extern fn SDL_Init(flags: u32): i32;
+extern fn SDL_InitSubSystem(flags: u32): i32;
+extern fn SDL_CreateWindow(title: string, x: i32, y: i32, w: i32, h: i32, flags: u32): ptr;
+extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;
+extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr;
+extern fn SDL_SetRenderTarget(ren: ptr, tex: ptr): i32;
+extern fn SDL_SetTextureBlendMode(tex: ptr, mode: i32): i32;
+extern fn SDL_SetTextureAlphaMod(tex: ptr, a: u8): i32;
+extern fn SDL_SetTextureColorMod(tex: ptr, r: u8, g: u8, b: u8): i32;
+extern fn SDL_SetRenderDrawBlendMode(ren: ptr, mode: i32): i32;
+extern fn SDL_SetRenderDrawColor(ren: ptr, r: i32, g: i32, b: i32, a: i32): i32;
+extern fn SDL_RenderClear(ren: ptr): i32;
+extern fn SDL_RenderFillRect(ren: ptr, rect: ptr): i32;
+extern fn SDL_RenderReadPixels(ren: ptr, rect: ptr, fmt: u32, px: ptr, pitch: i32): i32;
+extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
+extern fn SDL_RenderCopyEx(ren: ptr, tex: ptr, src: ptr, dst: ptr, angle: f64, center: ptr, flip: i32): i32;
+extern fn SDL_SetRelativeMouseMode(enabled: i32): i32;
+extern fn SDL_GetRelativeMouseMode(): i32;
+extern fn SDL_GetRelativeMouseState(x: ptr, y: ptr): u32;
+extern fn SDL_GetMouseState(x: ptr, y: ptr): u32;
+extern fn SDL_ShowCursor(toggle: i32): i32;
+extern fn SDL_OpenAudioDevice(dev: ptr, iscapture: i32, desired: ptr, obtained: ptr, allowed: i32): u32;
+extern fn SDL_QueueAudio(dev: u32, data: ptr, len: u32): i32;
+extern fn SDL_GetQueuedAudioSize(dev: u32): u32;
+extern fn SDL_PauseAudioDevice(dev: u32, pause: i32): void;
+extern fn SDL_CloseAudioDevice(dev: u32): void;
+extern fn SDL_GetPerformanceCounter(): u64;
+extern fn SDL_GetPerformanceFrequency(): u64;
+extern fn SDL_GetError(): string;
+extern fn SDL_GetCurrentVideoDriver(): string;
+extern fn SDL_GetRevision(): string;
+extern fn SDL_Quit(): void;
+
+let SDL_INIT_VIDEO = 32;
+let SDL_INIT_AUDIO = 16;
+let WPOS = 805240832;
+let SDL_PIXELFORMAT_RGB24 = 386930691;
+let SDL_PIXELFORMAT_ARGB8888 = 372645892;   // 0x16362004
+let SDL_TEXTUREACCESS_TARGET = 2;
+let SDL_BLENDMODE_BLEND = 1;
+let SDL_BLENDMODE_ADD = 2;
+let AUDIO_S16LSB = 32784;                    // 0x8010
+
+fn ok(name: string, cond: bool, detail: string) {
+    if (cond) { print(`  PASS  ${name}  ${detail}`); }
+    else { print(`  FAIL  ${name}  ${detail}  sdlerr='${SDL_GetError()}'`); }
+}
+
+fn main() {
+    print(`SDL revision: ${SDL_GetRevision()}`);
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { print(`init failed ${SDL_GetError()}`); return; }
+    print(`video driver: ${SDL_GetCurrentVideoDriver()}`);
+
+    let win = SDL_CreateWindow("probe", WPOS, WPOS, 320, 240, 4);
+    if (win == null) { print(`no window: ${SDL_GetError()}`); return; }
+    let ren = SDL_CreateRenderer(win, -1, 0);
+    if (ren == null) { print(`no renderer: ${SDL_GetError()}`); return; }
+
+    // --- 1. high-resolution timer (delta-time loop) ---
+    let f = SDL_GetPerformanceFrequency();
+    let c0 = SDL_GetPerformanceCounter();
+    ok("perf-counter", f > 0 && c0 > 0, `freq=${f}`);
+
+    // --- 2. relative mouse mode (mouse look) ---
+    let rm = SDL_SetRelativeMouseMode(1);
+    let rmOn = SDL_GetRelativeMouseMode();
+    ok("relative-mouse-mode", rm == 0 && rmOn == 1, `set=${rm} get=${rmOn}`);
+    let mx = alloc(4); let my = alloc(4);
+    let btn = SDL_GetRelativeMouseState(mx, my);
+    ok("relative-mouse-state", true, `dx=${ptr_deref_i32(mx)} dy=${ptr_deref_i32(my)} buttons=0x${btn}`);
+    let btn2 = SDL_GetMouseState(mx, my);
+    ok("mouse-buttons-bitmask", true, `mask=${btn2} (bit0=L bit2=R)`);
+    SDL_SetRelativeMouseMode(0);
+    ok("hide-cursor", SDL_ShowCursor(0) >= 0, "SDL_ShowCursor(0)");
+
+    // --- 3. render target (HUD compositing / post-fx / screen shake) ---
+    let rt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, 320, 240);
+    ok("create-render-target", rt != null, "ARGB8888 TARGET 320x240");
+    if (rt != null) {
+        let sr = SDL_SetRenderTarget(ren, rt);
+        SDL_SetRenderDrawColor(ren, 255, 0, 0, 255);
+        SDL_RenderClear(ren);
+        // read back from the TARGET to prove we really drew into it
+        let px = buffer(320 * 240 * 3);
+        let rp = SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, buffer_ptr(px), 320 * 3);
+        let r0 = px[0]; let g0 = px[1]; let b0 = px[2];
+        ok("render-to-target", sr == 0 && rp == 0 && r0 == 255 && g0 == 0 && b0 == 0,
+           `setTarget=${sr} readPixels=${rp} px0=(${r0},${g0},${b0})`);
+        SDL_SetRenderTarget(ren, null);
+        ok("restore-backbuffer", true, "SetRenderTarget(null)");
+
+        // --- 4. alpha blending + color mod (damage vignette, muzzle flash, fog) ---
+        let bm = SDL_SetTextureBlendMode(rt, SDL_BLENDMODE_BLEND);
+        let am = SDL_SetTextureAlphaMod(rt, 128);
+        let cm = SDL_SetTextureColorMod(rt, 255, 128, 64);
+        ok("texture-blend+alpha+colormod", bm == 0 && am == 0 && cm == 0,
+           `blend=${bm} alpha=${am} colormod=${cm}`);
+
+        // composite the half-alpha red target over a blue backbuffer -> expect purple-ish
+        SDL_SetRenderDrawColor(ren, 0, 0, 255, 255);
+        SDL_RenderClear(ren);
+        SDL_RenderCopy(ren, rt, null, null);
+        let px2 = buffer(320 * 240 * 3);
+        SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, buffer_ptr(px2), 320 * 3);
+        ok("alpha-composite", px2[0] > 100 && px2[2] > 100,
+           `blended px=(${px2[0]},${px2[1]},${px2[2]}) expect red+blue mix`);
+
+        // --- 5. RenderCopyEx: rotation (sprites, weapon sway, screen roll) ---
+        let ce = SDL_RenderCopyEx(ren, rt, null, null, 15.0, null, 0);
+        ok("render-copy-ex-rotate", ce == 0, `angle=15deg ret=${ce}`);
+    }
+
+    // --- 6. draw-blend-mode + FillRect (HUD bars, crosshair, vignette) ---
+    let dbm = SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    let rect = alloc(16);
+    ptr_write_i32(rect, 10); ptr_write_i32(ptr_offset(rect, 4, 1), 20);
+    ptr_write_i32(ptr_offset(rect, 8, 1), 50); ptr_write_i32(ptr_offset(rect, 12, 1), 8);
+    SDL_SetRenderDrawColor(ren, 0, 255, 0, 160);
+    let fr = SDL_RenderFillRect(ren, rect);
+    ok("fillrect+drawblend", dbm == 0 && fr == 0, `SDL_Rect{10,20,50,8} blend=${dbm} fill=${fr}`);
+
+    // --- 7. audio via SDL_QueueAudio (NO C callback needed) ---
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        ok("audio-init", false, "InitSubSystem(AUDIO)");
+    } else {
+        // SDL_AudioSpec: freq i32@0, format u16@4, channels u8@6, silence u8@7,
+        // samples u16@8, padding u16@10, size u32@12, callback ptr@16, userdata ptr@24
+        let want = alloc(64); memset(want, 0, 64);
+        let have = alloc(64); memset(have, 0, 64);
+        ptr_write_i32(want, 22050);                              // freq (PS1-ish rate)
+        ptr_write_u16(ptr_offset(want, 4, 1), AUDIO_S16LSB);     // format
+        ptr_write_u8(ptr_offset(want, 6, 1), 1);                 // channels = mono
+        ptr_write_u16(ptr_offset(want, 8, 1), 512);              // samples
+        ptr_write_ptr(ptr_offset(want, 16, 1), null);            // callback = NULL -> queue mode
+        let dev = SDL_OpenAudioDevice(null, 0, want, have, 0);
+        ok("open-audio-device", dev != 0,
+           `dev=${dev} got freq=${ptr_deref_i32(have)} fmt=${ptr_deref_u16(ptr_offset(have,4,1))} ch=${ptr_deref_u8(ptr_offset(have,6,1))}`);
+        if (dev != 0) {
+            // queue 0.1s of a square wave — proves the queue path accepts our bytes
+            let n = 2205;
+            let buf = buffer(n * 2);
+            for (let i = 0; i < n; i++) {
+                let v = ((i / 25) % 2) == 0 ? 6000 : (0 - 6000);
+                let o = i * 2;
+                buf[o] = v & 255; buf[o + 1] = (v >> 8) & 255;
+            }
+            let q = SDL_QueueAudio(dev, buffer_ptr(buf), n * 2);
+            let qs = SDL_GetQueuedAudioSize(dev);
+            SDL_PauseAudioDevice(dev, 0);
+            ok("queue-audio", q == 0 && qs > 0, `QueueAudio=${q} queued=${qs} bytes`);
+            SDL_CloseAudioDevice(dev);
+        }
+    }
+
+    let c1 = SDL_GetPerformanceCounter();
+    print(`probe took ${(c1 - c0) * 1000.0 / f} ms`);
+    SDL_Quit();
+    print("probe complete");
+}
+main();

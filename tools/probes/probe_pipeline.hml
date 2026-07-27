@@ -1,0 +1,170 @@
+// probe_pipeline.hml — the actual Nightshade frame pipeline, end to end.
+//
+//   1. render 3D geometry (SDL_RenderGeometry) INTO a low-res TARGET texture
+//      (the 320x180 "PS1 internal resolution" buffer)
+//   2. switch back to the backbuffer
+//   3. SDL_RenderCopyEx the target upscaled with a screen-shake offset (nearest)
+//   4. composite an additive full-screen flash (muzzle flash / damage vignette)
+//   5. composite a HUD element with alpha
+//
+// This is the combination that matters: geometry + render target + blend modes
+// together. Each piece passing in isolation does not prove the composition works.
+//
+// Run: SDL_VIDEODRIVER=dummy hemlock tools/probes/probe_pipeline.hml
+
+import "libSDL2-2.0.so.0";
+
+extern fn SDL_Init(flags: u32): i32;
+extern fn SDL_Quit(): void;
+extern fn SDL_GetError(): string;
+extern fn SDL_CreateWindow(title: string, x: i32, y: i32, w: i32, h: i32, flags: u32): ptr;
+extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;
+extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr;
+extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32;
+extern fn SDL_SetRenderTarget(ren: ptr, tex: ptr): i32;
+extern fn SDL_SetRenderDrawColor(ren: ptr, r: i32, g: i32, b: i32, a: i32): i32;
+extern fn SDL_SetRenderDrawBlendMode(ren: ptr, mode: i32): i32;
+extern fn SDL_SetTextureBlendMode(tex: ptr, mode: i32): i32;
+extern fn SDL_SetTextureAlphaMod(tex: ptr, a: i32): i32;
+extern fn SDL_SetTextureScaleMode(tex: ptr, mode: i32): i32;
+extern fn SDL_RenderClear(ren: ptr): i32;
+extern fn SDL_RenderGeometry(ren: ptr, tex: ptr, verts: ptr, nv: i32, idx: ptr, ni: i32): i32;
+extern fn SDL_RenderCopyEx(ren: ptr, tex: ptr, src: ptr, dst: ptr, angle: f64, center: ptr, flip: i32): i32;
+extern fn SDL_RenderFillRect(ren: ptr, rect: ptr): i32;
+extern fn SDL_RenderReadPixels(ren: ptr, rect: ptr, fmt: u32, px: ptr, pitch: i32): i32;
+extern fn SDL_DestroyTexture(tex: ptr): void;
+extern fn SDL_DestroyRenderer(ren: ptr): void;
+extern fn SDL_DestroyWindow(win: ptr): void;
+
+let SDL_INIT_VIDEO = 32;
+let SDL_WINDOW_HIDDEN = 8;
+let SDL_WINDOWPOS_CENTERED = 805240832;
+let SDL_PIXELFORMAT_RGB24 = 386930691;
+let SDL_PIXELFORMAT_RGBA32 = 376840196;
+let SDL_TEXTUREACCESS_TARGET = 2;
+let SDL_BLENDMODE_NONE = 0;
+let SDL_BLENDMODE_BLEND = 1;
+let SDL_BLENDMODE_ADD = 2;
+let SDL_FLIP_NONE = 0;
+let SDL_ScaleModeNearest = 0;
+
+let WIN_W = 640;
+let WIN_H = 360;
+let INT_W = 320;   // PS1 internal resolution
+let INT_H = 180;
+
+let pass_count = 0;
+let fail_count = 0;
+fn check(name: string, ok: bool, detail: string) {
+    if (ok) { pass_count = pass_count + 1; print(`  PASS  ${name}  ${detail}`); }
+    else    { fail_count = fail_count + 1; print(`  FAIL  ${name}  ${detail}`); }
+}
+
+fn mkrect(x: i32, y: i32, w: i32, h: i32): ptr {
+    let r = alloc(16);
+    ptr_write_i32(r, x); ptr_write_i32(ptr_offset(r,1,4), y);
+    ptr_write_i32(ptr_offset(r,2,4), w); ptr_write_i32(ptr_offset(r,3,4), h);
+    return r;
+}
+
+// SDL_Vertex is 20 bytes: position(FPoint f32,f32)@0, color(SDL_Color u8x4)@8,
+// tex_coord(FPoint f32,f32)@12.
+fn put_vertex(base: ptr, i: i32, x: f64, y: f64, r: i32, g: i32, b: i32, a: i32) {
+    let v = ptr_offset(base, i * 20, 1);
+    ptr_write_f32(v, x);
+    ptr_write_f32(ptr_offset(v, 4, 1), y);
+    ptr_write_u8(ptr_offset(v, 8, 1), r);
+    ptr_write_u8(ptr_offset(v, 9, 1), g);
+    ptr_write_u8(ptr_offset(v, 10, 1), b);
+    ptr_write_u8(ptr_offset(v, 11, 1), a);
+    ptr_write_f32(ptr_offset(v, 12, 1), 0.0);
+    ptr_write_f32(ptr_offset(v, 16, 1), 0.0);
+}
+
+fn px(buf: ptr, w: i32, x: i32, y: i32, c: i32): i32 {
+    return ptr_deref_u8(ptr_offset(buf, (y * w + x) * 3 + c, 1));
+}
+
+fn main() {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { print(`SDL_Init: ${SDL_GetError()}`); return; }
+    let win = SDL_CreateWindow("pipeline", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               WIN_W, WIN_H, SDL_WINDOW_HIDDEN);
+    let ren = SDL_CreateRenderer(win, -1, 0);
+    if (ren == null) { print(`CreateRenderer: ${SDL_GetError()}`); return; }
+
+    // ---- the low-res scene buffer ----
+    let scene = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, INT_W, INT_H);
+    check("create 320x180 TARGET (internal res buffer)", scene != null, `ptr=${scene != null}`);
+    if (scene == null) { return; }
+
+    // ================= STEP 1: geometry into the render target ===============
+    SDL_SetRenderTarget(ren, scene);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 20, 20, 40, 255);      // dark sky
+    SDL_RenderClear(ren);
+
+    // one big untextured triangle, solid green, covering the lower-left area
+    let verts = alloc(3 * 20);
+    put_vertex(verts, 0,  10.0, 170.0, 0, 220, 0, 255);
+    put_vertex(verts, 1, 160.0,  20.0, 0, 220, 0, 255);
+    put_vertex(verts, 2, 310.0, 170.0, 0, 220, 0, 255);
+    let g = SDL_RenderGeometry(ren, null, verts, 3, null, 0);
+
+    let sbuf = alloc(INT_W * INT_H * 3);
+    SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, sbuf, INT_W * 3);
+    let center_g = px(sbuf, INT_W, 160, 120, 1);
+    let corner_b = px(sbuf, INT_W, 5, 5, 2);
+    check("SDL_RenderGeometry INTO a render target",
+          g == 0 && center_g > 200 && corner_b == 40,
+          `rc=${g} tri_center_green=${center_g}(want ~220) sky_corner_blue=${corner_b}(want 40)`);
+
+    // ================= STEP 2+3: upscale to the backbuffer with SHAKE ========
+    SDL_SetRenderTarget(ren, null);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    SDL_SetTextureScaleMode(scene, SDL_ScaleModeNearest);
+    SDL_SetTextureBlendMode(scene, SDL_BLENDMODE_NONE);
+    let shake_x = 8;
+    let shake_y = -6;
+    let up = SDL_RenderCopyEx(ren, scene, null,
+                              mkrect(shake_x, shake_y, WIN_W, WIN_H), 0.0, null, SDL_FLIP_NONE);
+    let fbuf = alloc(WIN_W * WIN_H * 3);
+    SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, fbuf, WIN_W * 3);
+    // the shake offset must leave black along the left edge (x < 8)
+    let left_edge = px(fbuf, WIN_W, 2, 180, 1);
+    let shifted   = px(fbuf, WIN_W, 320, 240, 1);
+    check("upscale target to window with screen-shake offset (RenderCopyEx)",
+          up == 0 && left_edge == 0 && shifted > 200,
+          `rc=${up} left_gap_green=${left_edge}(want 0) body_green=${shifted}(want ~220)`);
+
+    // ================= STEP 4: additive full-screen flash ====================
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_ADD);
+    SDL_SetRenderDrawColor(ren, 60, 30, 0, 255);       // warm muzzle flash
+    SDL_RenderFillRect(ren, mkrect(0, 0, WIN_W, WIN_H));
+    SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, fbuf, WIN_W * 3);
+    let flash_r = px(fbuf, WIN_W, 320, 240, 0);
+    let flash_g = px(fbuf, WIN_W, 320, 240, 1);
+    check("additive muzzle-flash over the composited frame",
+          flash_r == 60 && flash_g == 250,
+          `r=${flash_r}(want 60) g=${flash_g}(want 220+30=250)`);
+
+    // ================= STEP 5: alpha HUD element =============================
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 128);         // half-opaque HUD bar
+    SDL_RenderFillRect(ren, mkrect(0, 330, WIN_W, 30));
+    SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, fbuf, WIN_W * 3);
+    let hud_before = px(fbuf, WIN_W, 320, 300, 1);
+    let hud_in     = px(fbuf, WIN_W, 320, 340, 1);
+    check("alpha-blended HUD bar over the frame",
+          hud_in < hud_before && hud_in > 0,
+          `above_bar_green=${hud_before} inside_bar_green=${hud_in} (want roughly half)`);
+
+    print(`\nPIPELINE PROBE: ${pass_count} passed, ${fail_count} failed`);
+    SDL_DestroyTexture(scene);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+}
+
+main();

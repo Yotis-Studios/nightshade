@@ -1,0 +1,231 @@
+// probe_audio.hml — proves the callback-free audio path works through Hemlock FFI.
+//
+// The architecture under test (the one recommended for Nightshade):
+//
+//   SDL_OpenAudioDevice(desired.callback = NULL)   -> queue mode, no FFI callback
+//   per frame:  zero a mix buffer
+//               SDL_MixAudioFormat() every active voice into it
+//               SDL_QueueAudio() the mixed buffer once
+//
+// This needs ZERO libffi closures on the audio thread (SDL's audio thread would
+// otherwise re-enter the Hemlock runtime from a non-Hemlock thread), and needs
+// no SDL2_mixer (which is NOT installed on this machine).
+//
+// Also exercises the asset path: SDL_RWFromFile -> SDL_LoadWAV_RW ->
+// SDL_BuildAudioCVT/SDL_ConvertAudio (resample a 22050 Hz mono WAV to the
+// device's 44100 Hz stereo format).
+//
+// Run:  SDL_AUDIODRIVER=dummy hemlock tools/probes/probe_audio.hml <path/to.wav>
+
+import "libSDL2-2.0.so.0";
+
+extern fn SDL_Init(flags: u32): i32;
+extern fn SDL_Quit(): void;
+extern fn SDL_GetError(): string;
+extern fn SDL_Delay(ms: u32): void;
+
+extern fn SDL_OpenAudioDevice(device: ptr, iscapture: i32, desired: ptr,
+                              obtained: ptr, allowed_changes: i32): u32;
+extern fn SDL_CloseAudioDevice(dev: u32): void;
+extern fn SDL_PauseAudioDevice(dev: u32, pause_on: i32): void;
+extern fn SDL_QueueAudio(dev: u32, data: ptr, len: u32): i32;
+extern fn SDL_GetQueuedAudioSize(dev: u32): u32;
+extern fn SDL_ClearQueuedAudio(dev: u32): void;
+extern fn SDL_MixAudioFormat(dst: ptr, src: ptr, format: u16, len: u32, volume: i32): void;
+extern fn SDL_GetCurrentAudioDriver(): string;
+extern fn SDL_GetNumAudioDevices(iscapture: i32): i32;
+
+extern fn SDL_RWFromFile(file: string, mode: string): ptr;
+extern fn SDL_LoadWAV_RW(src: ptr, freesrc: i32, spec: ptr, buf: ptr, len: ptr): ptr;
+extern fn SDL_FreeWAV(audio_buf: ptr): void;
+extern fn SDL_BuildAudioCVT(cvt: ptr, src_format: u16, src_channels: u8, src_rate: i32,
+                            dst_format: u16, dst_channels: u8, dst_rate: i32): i32;
+extern fn SDL_ConvertAudio(cvt: ptr): i32;
+
+extern fn SDL_GetPerformanceCounter(): u64;
+extern fn SDL_GetPerformanceFrequency(): u64;
+
+let SDL_INIT_AUDIO = 16;
+let AUDIO_S16SYS = 32784;      // 0x8010, signed 16-bit little-endian on x86
+let SDL_MIX_MAXVOLUME = 128;
+let SDL_AUDIO_ALLOW_ANY_CHANGE = 15;
+
+// SDL_AudioSpec is 32 bytes:
+//  0 freq:i32  4 format:u16  6 channels:u8  7 silence:u8
+//  8 samples:u16 10 padding:u16 12 size:u32 16 callback:ptr 24 userdata:ptr
+let SPEC_SIZE = 32;
+// SDL_AudioCVT is 128 bytes:
+//  0 needed:i32 4 src_format:u16 6 dst_format:u16 8 rate_incr:f64
+//  16 buf:ptr 24 len:i32 28 len_cvt:i32 32 len_mult:i32 36 len_ratio:f64 ...
+let CVT_SIZE = 128;
+
+let pass_count = 0;
+let fail_count = 0;
+fn check(name: string, ok: bool, detail: string) {
+    if (ok) { pass_count = pass_count + 1; print(`  PASS  ${name}  ${detail}`); }
+    else    { fail_count = fail_count + 1; print(`  FAIL  ${name}  ${detail}`); }
+}
+
+fn spec_new(freq: i32, fmt: i32, channels: i32, samples: i32): ptr {
+    let s = alloc(SPEC_SIZE);
+    let i = 0;
+    while (i < SPEC_SIZE) { ptr_write_u8(ptr_offset(s, i, 1), 0); i = i + 1; }
+    ptr_write_i32(s, freq);
+    ptr_write_u16(ptr_offset(s, 4, 1), fmt);
+    ptr_write_u8(ptr_offset(s, 6, 1), channels);
+    ptr_write_u16(ptr_offset(s, 8, 1), samples);
+    ptr_write_ptr(ptr_offset(s, 16, 1), null);   // callback = NULL => QUEUE MODE
+    ptr_write_ptr(ptr_offset(s, 24, 1), null);
+    return s;
+}
+fn spec_freq(s: ptr): i32     { return ptr_deref_i32(s); }
+fn spec_format(s: ptr): i32   { return ptr_deref_u16(ptr_offset(s, 4, 1)); }
+fn spec_channels(s: ptr): i32 { return ptr_deref_u8(ptr_offset(s, 6, 1)); }
+fn spec_samples(s: ptr): i32  { return ptr_deref_u16(ptr_offset(s, 8, 1)); }
+fn spec_size(s: ptr): i32     { return ptr_deref_u32(ptr_offset(s, 12, 1)); }
+
+fn zero(p: ptr, n: i32) {
+    let i = 0;
+    while (i < n) { ptr_write_u8(ptr_offset(p, i, 1), 0); i = i + 1; }
+}
+
+fn main() {
+    if (SDL_Init(SDL_INIT_AUDIO) != 0) {
+        print(`  FAIL  SDL_Init(AUDIO): ${SDL_GetError()}`);
+        return;
+    }
+    print(`  audio driver = ${SDL_GetCurrentAudioDriver()}  output_devices=${SDL_GetNumAudioDevices(0)}`);
+
+    // ---------------- TEST 1: open a queue-mode device (callback = NULL) -------
+    let desired = spec_new(44100, AUDIO_S16SYS, 2, 1024);
+    let obtained = alloc(SPEC_SIZE);
+    zero(obtained, SPEC_SIZE);
+    // device=NULL -> default device. Declared as `ptr` so we can pass null.
+    let dev = SDL_OpenAudioDevice(null, 0, desired, obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+    check("SDL_OpenAudioDevice(callback=NULL) [queue mode]", dev != 0,
+          `dev=${dev} err='${SDL_GetError()}'`);
+    if (dev == 0) { SDL_Quit(); return; }
+    print(`  obtained: freq=${spec_freq(obtained)} format=0x${spec_format(obtained)} ` +
+          `channels=${spec_channels(obtained)} samples=${spec_samples(obtained)} bufsize=${spec_size(obtained)}`);
+
+    let dev_freq = spec_freq(obtained);
+    let dev_fmt = spec_format(obtained);
+    let dev_ch = spec_channels(obtained);
+
+    // ---------------- TEST 2: SDL_QueueAudio actually accepts data ------------
+    // 0.2 s of silence (we are not going to blast the speakers during a probe).
+    let nbytes = (dev_freq * dev_ch * 2) / 5;
+    let sil = alloc(nbytes);
+    zero(sil, nbytes);
+    let q = SDL_QueueAudio(dev, sil, nbytes);
+    let sz1 = SDL_GetQueuedAudioSize(dev);
+    check("SDL_QueueAudio", q == 0 && sz1 >= nbytes, `rc=${q} queued=${sz1} of ${nbytes}`);
+
+    // ---------------- TEST 3: the device actually DRAINS the queue ------------
+    SDL_PauseAudioDevice(dev, 0);          // 0 = unpause = start playing
+    SDL_Delay(120);
+    let sz2 = SDL_GetQueuedAudioSize(dev);
+    check("device drains queue (playback is live)", sz2 < sz1,
+          `before=${sz1} after_120ms=${sz2} (drained ${sz1 - sz2} bytes)`);
+
+    // ---------------- TEST 4: SDL_ClearQueuedAudio ----------------------------
+    SDL_ClearQueuedAudio(dev);
+    let sz3 = SDL_GetQueuedAudioSize(dev);
+    check("SDL_ClearQueuedAudio", sz3 == 0, `queued=${sz3}`);
+
+    // ---------------- TEST 5: SDL_MixAudioFormat (the software mixer) ---------
+    // Two "voices" of constant S16 samples mixed into one buffer at half volume.
+    // Verifies u16 (SDL_AudioFormat) marshals correctly AND that mixing is real.
+    let n = 64;
+    let mixbuf = alloc(n * 2);
+    zero(mixbuf, n * 2);
+    let voice = alloc(n * 2);
+    let i = 0;
+    while (i < n) { ptr_write_i16(ptr_offset(voice, i * 2, 1), 1000); i = i + 1; }
+    SDL_MixAudioFormat(mixbuf, voice, dev_fmt, n * 2, SDL_MIX_MAXVOLUME);
+    let after_one = ptr_deref_i16(mixbuf);
+    SDL_MixAudioFormat(mixbuf, voice, dev_fmt, n * 2, SDL_MIX_MAXVOLUME / 2);
+    let after_two = ptr_deref_i16(mixbuf);
+    check("SDL_MixAudioFormat (u16 format arg marshals; mixing is additive)",
+          after_one == 1000 && after_two > 1000,
+          `one_voice=${after_one} (want 1000)  +half_volume_voice=${after_two} (want ~1500)`);
+
+    // ---------------- TEST 6: SDL_RWFromFile + SDL_LoadWAV_RW -----------------
+    let wav_path = "";
+    let argv = args;
+    if (argv.length > 1) { wav_path = argv[1]; }
+    if (wav_path == "") {
+        print("  SKIP  LoadWAV (no wav path argument given)");
+    } else {
+        let wspec = alloc(SPEC_SIZE);
+        zero(wspec, SPEC_SIZE);
+        let pbuf = alloc(8);      // Uint8** out
+        let plen = alloc(4);      // Uint32*  out
+        ptr_write_ptr(pbuf, null);
+        ptr_write_u32(plen, 0);
+        let rw = SDL_RWFromFile(wav_path, "rb");
+        check("SDL_RWFromFile", rw != null, `rw=${rw != null} path=${wav_path}`);
+        let res = SDL_LoadWAV_RW(rw, 1, wspec, pbuf, plen);
+        let wav_buf = ptr_deref_ptr(pbuf);
+        let wav_len = ptr_deref_u32(plen);
+        check("SDL_LoadWAV_RW", res != null && wav_buf != null && wav_len > 0,
+              `spec_ret=${res != null} len=${wav_len} freq=${spec_freq(wspec)} ` +
+              `fmt=0x${spec_format(wspec)} ch=${spec_channels(wspec)}`);
+
+        // ------------ TEST 7: SDL_BuildAudioCVT + SDL_ConvertAudio ------------
+        // Convert the WAV (22050 Hz mono) to the device format (44100 Hz stereo).
+        if (wav_buf != null && wav_len > 0) {
+            let cvt = alloc(CVT_SIZE);
+            zero(cvt, CVT_SIZE);
+            let b = SDL_BuildAudioCVT(cvt, spec_format(wspec), spec_channels(wspec), spec_freq(wspec),
+                                      dev_fmt, dev_ch, dev_freq);
+            let needed = ptr_deref_i32(cvt);
+            let len_mult = ptr_deref_i32(ptr_offset(cvt, 32, 1));
+            check("SDL_BuildAudioCVT", b >= 0, `rc=${b} needed=${needed} len_mult=${len_mult}`);
+
+            if (b == 1) {
+                // cvt.buf must hold len * len_mult bytes; cvt.len = input length.
+                let cap = wav_len * len_mult;
+                let cbuf = alloc(cap);
+                // copy the source in
+                let k = 0;
+                while (k < wav_len) {
+                    ptr_write_u8(ptr_offset(cbuf, k, 1), ptr_deref_u8(ptr_offset(wav_buf, k, 1)));
+                    k = k + 1;
+                }
+                ptr_write_ptr(ptr_offset(cvt, 16, 1), cbuf);       // cvt.buf
+                ptr_write_i32(ptr_offset(cvt, 24, 1), wav_len);    // cvt.len
+                let cr = SDL_ConvertAudio(cvt);
+                let len_cvt = ptr_deref_i32(ptr_offset(cvt, 28, 1));
+                // 22050 mono -> 44100 stereo == 4x the bytes
+                check("SDL_ConvertAudio (resample WAV to device format)",
+                      cr == 0 && len_cvt > wav_len,
+                      `rc=${cr} in=${wav_len} out=${len_cvt} (expect ~${wav_len * 4})`);
+
+                // ---------- TEST 8: queue the real converted sound ------------
+                let qr = SDL_QueueAudio(dev, cbuf, len_cvt);
+                check("QueueAudio(converted WAV)", qr == 0, `rc=${qr} bytes=${len_cvt}`);
+                SDL_ClearQueuedAudio(dev);
+                free(cbuf);
+            }
+            free(cvt);
+        }
+        if (wav_buf != null) { SDL_FreeWAV(wav_buf); }
+    }
+
+    // ---------------- TEST 9: perf counter timing -----------------------------
+    let f = SDL_GetPerformanceFrequency();
+    let t0 = SDL_GetPerformanceCounter();
+    SDL_Delay(50);
+    let t1 = SDL_GetPerformanceCounter();
+    let ms = ((t1 - t0) * 1000) / f;
+    check("SDL_GetPerformanceCounter/Frequency (u64)", f > 0 && ms >= 45 && ms <= 90,
+          `freq=${f} measured_delay=${ms}ms (asked 50)`);
+
+    print(`\nAUDIO PROBE: ${pass_count} passed, ${fail_count} failed`);
+    SDL_PauseAudioDevice(dev, 1);
+    SDL_CloseAudioDevice(dev);
+    SDL_Quit();
+}
+
+main();

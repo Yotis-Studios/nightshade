@@ -1,0 +1,320 @@
+// probe_render.hml — verifies, NUMERICALLY, that the risky SDL2 render features
+// work through Hemlock FFI: render targets, blend modes, alpha/color mod,
+// SDL_RenderCopyEx (rotation + flip), rect fills, and RGBA32 byte order.
+//
+// Every test renders, then reads pixels back with SDL_RenderReadPixels and
+// asserts on the actual bytes. No "it didn't crash" tests.
+//
+// Run:  SDL_VIDEODRIVER=dummy hemlock tools/probes/probe_render.hml
+//       hemlockc -o /tmp/probe_render tools/probes/probe_render.hml && SDL_VIDEODRIVER=dummy /tmp/probe_render
+
+import "libSDL2-2.0.so.0";
+
+extern fn SDL_Init(flags: u32): i32;
+extern fn SDL_Quit(): void;
+extern fn SDL_GetError(): string;
+extern fn SDL_CreateWindow(title: string, x: i32, y: i32, w: i32, h: i32, flags: u32): ptr;
+extern fn SDL_CreateRenderer(win: ptr, index: i32, flags: u32): ptr;
+extern fn SDL_GetRendererInfo(ren: ptr, info: ptr): i32;
+extern fn SDL_CreateTexture(ren: ptr, format: u32, access: i32, w: i32, h: i32): ptr;
+extern fn SDL_UpdateTexture(tex: ptr, rect: ptr, pixels: ptr, pitch: i32): i32;
+extern fn SDL_SetRenderDrawColor(ren: ptr, r: i32, g: i32, b: i32, a: i32): i32;
+extern fn SDL_RenderClear(ren: ptr): i32;
+extern fn SDL_RenderCopy(ren: ptr, tex: ptr, src: ptr, dst: ptr): i32;
+extern fn SDL_RenderCopyEx(ren: ptr, tex: ptr, src: ptr, dst: ptr,
+                           angle: f64, center: ptr, flip: i32): i32;
+extern fn SDL_RenderFillRect(ren: ptr, rect: ptr): i32;
+extern fn SDL_RenderDrawRect(ren: ptr, rect: ptr): i32;
+extern fn SDL_RenderReadPixels(ren: ptr, rect: ptr, fmt: u32, px: ptr, pitch: i32): i32;
+extern fn SDL_SetRenderTarget(ren: ptr, tex: ptr): i32;
+extern fn SDL_GetRenderTarget(ren: ptr): ptr;
+extern fn SDL_SetTextureBlendMode(tex: ptr, mode: i32): i32;
+extern fn SDL_SetRenderDrawBlendMode(ren: ptr, mode: i32): i32;
+extern fn SDL_SetTextureAlphaMod(tex: ptr, alpha: i32): i32;
+extern fn SDL_SetTextureColorMod(tex: ptr, r: i32, g: i32, b: i32): i32;
+extern fn SDL_SetTextureScaleMode(tex: ptr, mode: i32): i32;
+extern fn SDL_DestroyTexture(tex: ptr): void;
+extern fn SDL_DestroyRenderer(ren: ptr): void;
+extern fn SDL_DestroyWindow(win: ptr): void;
+
+let SDL_INIT_VIDEO = 32;
+let SDL_WINDOW_HIDDEN = 8;
+let SDL_WINDOWPOS_CENTERED = 805240832;
+let SDL_PIXELFORMAT_RGB24 = 386930691;
+let SDL_PIXELFORMAT_RGBA32 = 376840196;    // == ABGR8888 on little-endian
+let SDL_PIXELFORMAT_ARGB8888 = 372645892;
+let SDL_TEXTUREACCESS_STATIC = 0;
+let SDL_TEXTUREACCESS_TARGET = 2;
+let SDL_BLENDMODE_NONE = 0;
+let SDL_BLENDMODE_BLEND = 1;
+let SDL_BLENDMODE_ADD = 2;
+let SDL_BLENDMODE_MOD = 4;
+let SDL_FLIP_NONE = 0;
+let SDL_FLIP_HORIZONTAL = 1;
+let SDL_FLIP_VERTICAL = 2;
+let SDL_ScaleModeNearest = 0;
+
+let W = 128;
+let H = 128;
+
+let pass_count = 0;
+let fail_count = 0;
+
+fn check(name: string, ok: bool, detail: string) {
+    if (ok) {
+        pass_count = pass_count + 1;
+        print(`  PASS  ${name}  ${detail}`);
+    } else {
+        fail_count = fail_count + 1;
+        print(`  FAIL  ${name}  ${detail}`);
+    }
+}
+
+// Allocate an SDL_Rect {i32 x,y,w,h} = 16 bytes.
+fn mkrect(x: i32, y: i32, w: i32, h: i32): ptr {
+    let r = alloc(16);
+    ptr_write_i32(r, x);
+    ptr_write_i32(ptr_offset(r, 1, 4), y);
+    ptr_write_i32(ptr_offset(r, 2, 4), w);
+    ptr_write_i32(ptr_offset(r, 3, 4), h);
+    return r;
+}
+
+// Read the whole target into an RGB24 buffer and return the raw ptr.
+fn readback(ren: ptr, buf: ptr) {
+    let rc = SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, buf, W * 3);
+    if (rc != 0) { print(`  (readback failed: ${SDL_GetError()})`); }
+}
+
+fn px(buf: ptr, x: i32, y: i32, c: i32): i32 {
+    return ptr_deref_u8(ptr_offset(buf, (y * W + x) * 3 + c, 1));
+}
+
+fn near(a: i32, b: i32, tol: i32): bool {
+    let d = a - b;
+    if (d < 0) { d = 0 - d; }
+    return d <= tol;
+}
+
+fn main() {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        print(`SDL_Init failed: ${SDL_GetError()}`);
+        return;
+    }
+    let win = SDL_CreateWindow("probe", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               W, H, SDL_WINDOW_HIDDEN);
+    if (win == null) { print(`CreateWindow failed: ${SDL_GetError()}`); return; }
+
+    // flags=0: let SDL pick (software under dummy, accelerated on a real display).
+    let ren = SDL_CreateRenderer(win, -1, 0);
+    if (ren == null) { print(`CreateRenderer failed: ${SDL_GetError()}`); return; }
+
+    // --- renderer info: name + flags + does it advertise TARGETTEXTURE? ---
+    let info = alloc(88);
+    if (SDL_GetRendererInfo(ren, info) == 0) {
+        let namep = ptr_deref_ptr(info);
+        let flags = ptr_deref_u32(ptr_offset(info, 8, 1));
+        let maxw = ptr_deref_i32(ptr_offset(info, 80, 1));
+        let nfmt = ptr_deref_u32(ptr_offset(info, 12, 1));
+        print(`  renderer flags=${flags} (bit3=TARGETTEXTURE) num_formats=${nfmt} max_tex_w=${maxw}`);
+    }
+
+    let buf = alloc(W * H * 3);
+
+    // ================= TEST 1: SDL_RenderFillRect + draw color =================
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    SDL_SetRenderDrawColor(ren, 10, 200, 30, 255);
+    let r1 = mkrect(10, 10, 20, 20);
+    let rc = SDL_RenderFillRect(ren, r1);
+    readback(ren, buf);
+    check("RenderFillRect", rc == 0 && px(buf,15,15,0)==10 && px(buf,15,15,1)==200 && px(buf,15,15,2)==30,
+          `rc=${rc} inside=(${px(buf,15,15,0)},${px(buf,15,15,1)},${px(buf,15,15,2)}) outside=(${px(buf,50,50,0)},${px(buf,50,50,1)},${px(buf,50,50,2)})`);
+
+    // ================= TEST 2: SDL_RenderDrawRect (outline) =================
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    SDL_SetRenderDrawColor(ren, 255, 255, 255, 255);
+    let rc2 = SDL_RenderDrawRect(ren, mkrect(40, 40, 20, 20));
+    readback(ren, buf);
+    // border pixel at (40,40) white, interior (50,50) black
+    check("RenderDrawRect outline", rc2 == 0 && px(buf,40,40,0)==255 && px(buf,50,50,0)==0,
+          `rc=${rc2} border=${px(buf,40,40,0)} interior=${px(buf,50,50,0)}`);
+
+    // ================= TEST 3: SDL_BLENDMODE_BLEND on draw color =================
+    // black background + red at alpha 128 => ~128 red
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    let bm = SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 255, 0, 0, 128);
+    SDL_RenderFillRect(ren, mkrect(0, 0, W, H));
+    readback(ren, buf);
+    let got = px(buf, 64, 64, 0);
+    check("SetRenderDrawBlendMode(BLEND)", bm == 0 && near(got, 128, 3),
+          `rc=${bm} expected r~128 got r=${got} g=${px(buf,64,64,1)}`);
+
+    // ================= TEST 4: SDL_BLENDMODE_ADD =================
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 40, 40, 40, 255);
+    SDL_RenderClear(ren);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_ADD);
+    SDL_SetRenderDrawColor(ren, 60, 0, 0, 255);
+    SDL_RenderFillRect(ren, mkrect(0, 0, W, H));
+    readback(ren, buf);
+    check("SetRenderDrawBlendMode(ADD)", near(px(buf,64,64,0), 100, 3),
+          `expected r~100 got r=${px(buf,64,64,0)} g=${px(buf,64,64,1)}`);
+
+    // ================= TEST 5: RGBA32 byte order via UpdateTexture =================
+    // Write bytes R=255,G=128,B=0,A=255. If RGBA32 is truly byte-order RGBA on
+    // little-endian, the rendered pixel is orange (255,128,0).
+    let t1 = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, 1, 1);
+    let onepx = alloc(4);
+    ptr_write_u8(onepx, 255);
+    ptr_write_u8(ptr_offset(onepx, 1, 1), 128);
+    ptr_write_u8(ptr_offset(onepx, 2, 1), 0);
+    ptr_write_u8(ptr_offset(onepx, 3, 1), 255);
+    let urc = SDL_UpdateTexture(t1, null, onepx, 4);
+    SDL_SetTextureBlendMode(t1, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    SDL_RenderCopy(ren, t1, null, mkrect(0, 0, 32, 32));
+    readback(ren, buf);
+    check("PIXELFORMAT_RGBA32 byte order = R,G,B,A",
+          t1 != null && urc == 0 && px(buf,5,5,0)==255 && near(px(buf,5,5,1),128,2) && px(buf,5,5,2)==0,
+          `tex=${t1 != null} rc=${urc} got=(${px(buf,5,5,0)},${px(buf,5,5,1)},${px(buf,5,5,2)}) want (255,128,0)`);
+
+    // ================= TEST 6: SDL_SetTextureAlphaMod =================
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    let am = SDL_SetTextureAlphaMod(t1, 128);
+    let tb = SDL_SetTextureBlendMode(t1, SDL_BLENDMODE_BLEND);
+    SDL_RenderCopy(ren, t1, null, mkrect(0, 0, 32, 32));
+    readback(ren, buf);
+    // 255 * (128/255) over black => ~128 ; green 128 * 0.5 => ~64
+    check("SetTextureAlphaMod + BLEND", am == 0 && tb == 0 && near(px(buf,5,5,0), 128, 4),
+          `rc=${am}/${tb} got=(${px(buf,5,5,0)},${px(buf,5,5,1)},${px(buf,5,5,2)}) want ~(128,64,0)`);
+
+    // ================= TEST 7: SDL_SetTextureColorMod =================
+    SDL_SetTextureAlphaMod(t1, 255);
+    SDL_SetTextureBlendMode(t1, SDL_BLENDMODE_NONE);
+    let cm = SDL_SetTextureColorMod(t1, 0, 255, 255);   // kill red channel
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+    SDL_RenderClear(ren);
+    SDL_RenderCopy(ren, t1, null, mkrect(0, 0, 32, 32));
+    readback(ren, buf);
+    check("SetTextureColorMod", cm == 0 && px(buf,5,5,0)==0 && near(px(buf,5,5,1),128,2),
+          `rc=${cm} got=(${px(buf,5,5,0)},${px(buf,5,5,1)},${px(buf,5,5,2)}) want (0,128,0)`);
+    SDL_SetTextureColorMod(t1, 255, 255, 255);
+
+    // ================= TEST 8: RENDER TARGET =================
+    let rt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, 64, 64);
+    if (rt == null) {
+        check("CreateTexture(TARGET)", false, `NULL: ${SDL_GetError()}`);
+    } else {
+        check("CreateTexture(TARGET)", true, "non-null");
+        let sr = SDL_SetRenderTarget(ren, rt);
+        // paint the target: all green, blue square in the corner
+        SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+        SDL_SetRenderDrawColor(ren, 0, 255, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_SetRenderDrawColor(ren, 0, 0, 255, 255);
+        SDL_RenderFillRect(ren, mkrect(0, 0, 16, 16));
+
+        // read back FROM the target (ReadPixels reads the current target)
+        let tbuf = alloc(64 * 64 * 3);
+        SDL_RenderReadPixels(ren, null, SDL_PIXELFORMAT_RGB24, tbuf, 64 * 3);
+        let tg = ptr_deref_u8(ptr_offset(tbuf, (40 * 64 + 40) * 3 + 1, 1));
+        let tb2 = ptr_deref_u8(ptr_offset(tbuf, (5 * 64 + 5) * 3 + 2, 1));
+        check("SetRenderTarget + draw into it", sr == 0 && tg == 255 && tb2 == 255,
+              `rc=${sr} green_at(40,40)=${tg} blue_at(5,5)=${tb2}`);
+
+        // back to the backbuffer, composite the target onto it
+        let sr2 = SDL_SetRenderTarget(ren, null);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_SetTextureBlendMode(rt, SDL_BLENDMODE_NONE);
+        SDL_SetTextureScaleMode(rt, SDL_ScaleModeNearest);
+        SDL_RenderCopy(ren, rt, null, mkrect(0, 0, 64, 64));
+        readback(ren, buf);
+        check("SetRenderTarget(null) + RenderCopy(target)",
+              sr2 == 0 && px(buf,40,40,1)==255 && px(buf,5,5,2)==255,
+              `rc=${sr2} green_at(40,40)=${px(buf,40,40,1)} blue_at(5,5)=${px(buf,5,5,2)}`);
+
+        // target texture with alpha mod = the screen-flash / post-fx overlay path
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_SetTextureBlendMode(rt, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureAlphaMod(rt, 64);
+        SDL_RenderCopy(ren, rt, null, mkrect(0, 0, 64, 64));
+        readback(ren, buf);
+        check("target texture + AlphaMod (overlay path)", near(px(buf,40,40,1), 64, 6),
+              `green expected ~64 got ${px(buf,40,40,1)}`);
+        SDL_SetTextureAlphaMod(rt, 255);
+        SDL_SetTextureBlendMode(rt, SDL_BLENDMODE_NONE);
+
+        // ============ TEST 9: SDL_RenderCopyEx flip ============
+        // 2x1 texture: left=red, right=blue. Flipped horizontally the left half
+        // of the destination must come out blue.
+        let t2 = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, 2, 1);
+        let two = alloc(8);
+        ptr_write_u8(two, 255); ptr_write_u8(ptr_offset(two,1,1), 0);
+        ptr_write_u8(ptr_offset(two,2,1), 0); ptr_write_u8(ptr_offset(two,3,1), 255);
+        ptr_write_u8(ptr_offset(two,4,1), 0); ptr_write_u8(ptr_offset(two,5,1), 0);
+        ptr_write_u8(ptr_offset(two,6,1), 255); ptr_write_u8(ptr_offset(two,7,1), 255);
+        SDL_UpdateTexture(t2, null, two, 8);
+        SDL_SetTextureScaleMode(t2, SDL_ScaleModeNearest);
+        SDL_SetTextureBlendMode(t2, SDL_BLENDMODE_NONE);
+
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        let f0 = SDL_RenderCopyEx(ren, t2, null, mkrect(0, 0, 64, 32), 0.0, null, SDL_FLIP_NONE);
+        readback(ren, buf);
+        let unflipped_left_r = px(buf, 10, 10, 0);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        let f1 = SDL_RenderCopyEx(ren, t2, null, mkrect(0, 0, 64, 32), 0.0, null, SDL_FLIP_HORIZONTAL);
+        readback(ren, buf);
+        let flipped_left_b = px(buf, 10, 10, 2);
+        check("RenderCopyEx FLIP_HORIZONTAL",
+              f0 == 0 && f1 == 0 && unflipped_left_r == 255 && flipped_left_b == 255,
+              `rc=${f0}/${f1} unflipped_left_red=${unflipped_left_r} flipped_left_blue=${flipped_left_b}`);
+
+        // ============ TEST 10: SDL_RenderCopyEx rotation (f64 angle) ============
+        // Rotate the 2x1 (left red / right blue) by 90 degrees about the dest
+        // center: red should end up on TOP, blue on the BOTTOM.
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        let f2 = SDL_RenderCopyEx(ren, t2, null, mkrect(32, 32, 64, 64), 90.0, null, SDL_FLIP_NONE);
+        readback(ren, buf);
+        // dest center is (64,64); after +90deg (clockwise in SDL) left->top
+        let top_r = px(buf, 64, 45, 0);
+        let bot_b = px(buf, 64, 82, 2);
+        check("RenderCopyEx rotation (f64 angle marshals)",
+              f2 == 0 && (top_r == 255 || bot_b == 255),
+              `rc=${f2} top=(${px(buf,64,45,0)},${px(buf,64,45,1)},${px(buf,64,45,2)}) bottom=(${px(buf,64,82,0)},${px(buf,64,82,1)},${px(buf,64,82,2)})`);
+
+        // ============ TEST 11: rotation about an explicit center (SDL_Point) ====
+        let ctr = alloc(8);
+        ptr_write_i32(ctr, 0);
+        ptr_write_i32(ptr_offset(ctr, 1, 4), 0);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        let f3 = SDL_RenderCopyEx(ren, t2, null, mkrect(32, 32, 32, 32), 45.0, ctr, SDL_FLIP_NONE);
+        check("RenderCopyEx with explicit center SDL_Point", f3 == 0, `rc=${f3}`);
+
+        SDL_DestroyTexture(t2);
+        SDL_DestroyTexture(rt);
+    }
+
+    print(`\nRENDER PROBE: ${pass_count} passed, ${fail_count} failed`);
+
+    SDL_DestroyTexture(t1);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+}
+
+main();

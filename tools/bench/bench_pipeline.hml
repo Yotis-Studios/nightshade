@@ -1,0 +1,499 @@
+// bench_pipeline.hml — the Nightshade render-budget benchmark.
+//
+// Drives a synthetic but pipeline-faithful scene through wobbleweed's GPU path
+// (src/vec.hml, src/clip.hml, src/sdl.hml + tools/bench/geom_bench.hml) and
+// reports triangles/second, with every stage individually ablatable.
+//
+// Everything is configured by environment variables so the sweep can be driven
+// from a shell script:
+//
+//   BENCH_STAGE     0..8  cumulative pipeline prefix (see STAGES below)
+//   BENCH_GX/GY           quad-grid tessellation (tris = 2*GX*GY*LAYERS)
+//   BENCH_LAYERS          screen-covering layers (overdraw factor)
+//   BENCH_W/BENCH_H       internal render resolution
+//   BENCH_SCALE           window scale factor
+//   BENCH_FRAMES          frames to time (after warmup)
+//   BENCH_SORT      closure|bucket|none
+//   BENCH_PATH      obj|flat|flatraw
+//   BENCH_TEX             number of distinct textures (== draw calls after sort
+//                         only if interleaving is avoided; see BENCH_TEXMODE)
+//   BENCH_TEXMODE   run|interleave   how textures are assigned to triangles
+//   BENCH_PRESENT   1|0   include SDL_RenderPresent
+//   BENCH_LABEL           free-form tag echoed in the result line
+//
+// Output: one machine-readable line
+//   RESULT <label> stage=<n> tris=<n> ... ms_per_frame=<f> fps=<f> tris_per_sec=<f>
+
+import { floor } from "@stdlib/math";
+import { getenv } from "@stdlib/env";
+import { v3, v_norm, v_dot, mat_apply, mat_mul, mat_perspective, mat_look_at } from "../../../wobbleweed/src/vec.hml";
+import { clip_tri_near, clip_tri_rect } from "../../../wobbleweed/src/clip.hml";
+import { tex_grass, tex_checker } from "../../../wobbleweed/src/texture.hml";
+import { window_open, upload_texture, clear, present_geom, poll, ticks,
+         window_close, read_pixels } from "../../../wobbleweed/src/sdl.hml";
+import { batch_new, batch_reset, batch_tri, put_vert, sort_closure,
+         bucket_new, sort_bucket,
+         flat_new, flat_reset, flat_push_obj, flat_push_raw, flat_sort,
+         flat_flush, sdlv_new, sdlv_reset, sdlv_push_raw, sdlv_sort,
+         sdlv_flush } from "./geom_bench.hml";
+import { draw_tris } from "../../../wobbleweed/src/sdl.hml";
+
+// ------------------------------------------------------------------ config --
+
+fn envi(name: string, dflt: i32): i32 {
+    let s = getenv(name);
+    if (s == null) { return dflt; }
+    return i32(s);
+}
+fn envs(name: string, dflt: string): string {
+    let s = getenv(name);
+    if (s == null) { return dflt; }
+    return s;
+}
+
+let STAGE   = envi("BENCH_STAGE", 8);
+let GX      = envi("BENCH_GX", 40);
+let GY      = envi("BENCH_GY", 25);
+let LAYERS  = envi("BENCH_LAYERS", 1);
+let W       = envi("BENCH_W", 320);
+let H       = envi("BENCH_H", 240);
+let SCALE   = envi("BENCH_SCALE", 1);
+let FRAMES  = envi("BENCH_FRAMES", 120);
+let WARMUP  = envi("BENCH_WARMUP", 20);
+let SORT    = envs("BENCH_SORT", "closure");
+let PATH    = envs("BENCH_PATH", "obj");
+let NTEX    = envi("BENCH_TEX", 1);
+let TEXMODE = envs("BENCH_TEXMODE", "run");
+let PRESENT = envi("BENCH_PRESENT", 1);
+let LABEL   = envs("BENCH_LABEL", "bench");
+// Depth distribution of the scene's painter keys:
+//   flat   all triangles coplanar -> ALL SORT KEYS EQUAL
+//   ramp   depth increases monotonically with emission order (a ground plane,
+//          or a chunk list walked front-to-back) -> keys arrive PRE-SORTED
+//   random depth scrambled -> quicksort's happy case
+let DEPTH   = envs("BENCH_DEPTH", "random");
+let SPREAD  = envi("BENCH_SPREAD", 20);     // world-unit depth range of the scene
+// Painter sort key: ndc (what wobbleweed ships) or view (linear view depth)
+let DEPTHKEY = envs("BENCH_DEPTHKEY", "ndc");
+let VERIFY  = envi("BENCH_VERIFY", 0);
+
+let NTRIS = 2 * GX * GY * LAYERS;
+
+// ------------------------------------------------------------- world build --
+//
+// A stack of screen-filling quad grids at increasing depth. At the fixed camera
+// below, layer 0 exactly fills the viewport, so total rasterized fill is
+// LAYERS screenfuls regardless of tessellation. That decouples per-triangle
+// CPU cost (GX*GY) from per-pixel GPU cost (LAYERS).
+
+let SUN = v_norm(v3(0.4, 1.0, 0.55));
+let AMBIENT = 0.45;
+fn face_light(n): f64 {
+    let d = v_dot(n, SUN);
+    if (d < 0.0) { d = 0.0; }
+    return AMBIENT + (1.0 - AMBIENT) * d;
+}
+
+let FOVY = 1.15;
+let TANH = 0.6461;                 // tan(FOVY/2)
+
+// A mesh triangle: three world positions, three UVs, a light and a texture slot.
+fn mtri(pa, pb, pc, ua: f64, va: f64, ub: f64, vb: f64, uc: f64, vc: f64, l: f64, ti: i32) {
+    return { pa: pa, pb: pb, pc: pc,
+             ua: ua, va: va, ub: ub, vb: vb, uc: uc, vc: vc, l: l, ti: ti };
+}
+
+// Deterministic 0..1 scramble.
+fn hash01(n: i32): f64 {
+    let m: i64 = 4294967295;
+    let x: i64 = (i64(n) * 2654435761) & m;
+    x = ((x ^ (x >> 13)) * 1274126177) & m;
+    x = x ^ (x >> 16);
+    return (x & 65535) / 65536.0;
+}
+
+fn build_mesh() {
+    let mesh = [];
+    let light = face_light(v3(0.0, 0.35, 1.0));
+    let ti = 0;
+    let per_run = NTRIS / NTEX;   // (unused in depth-keyed mode)
+    if (per_run < 1) { per_run = 1; }
+    let ntri = 0;
+    let nquads = GX * GY * LAYERS;
+    let qi = 0;
+    for (let L = 0; L < LAYERS; L++) {
+        for (let i = 0; i < GX; i++) {
+            for (let j = 0; j < GY; j++) {
+                // Per-quad depth. x/y are scaled by |z| so every quad lands on
+                // exactly the same screen tile regardless of its depth: total
+                // rasterized fill is independent of the depth distribution.
+                let frac = 0.0;
+                if (DEPTH == "ramp") { frac = qi / nquads; }
+                else if (DEPTH == "random") { frac = hash01(qi); }
+                qi = qi + 1;
+                let z = 0.0 - (3.0 + L * 0.7 + frac * SPREAD);
+                let hh = (0.0 - z) * TANH;
+                let hw = hh * (W / H);
+                let x0 = 0.0 - hw + (2.0 * hw) * i / GX;
+                let x1 = 0.0 - hw + (2.0 * hw) * (i + 1) / GX;
+                let y0 = 0.0 - hh + (2.0 * hh) * j / GY;
+                let y1 = 0.0 - hh + (2.0 * hh) * (j + 1) / GY;
+                let u0 = i / GX; let u1 = (i + 1) / GX;
+                let v0 = j / GY; let v1 = (j + 1) / GY;
+                let a = v3(x0, y0, z); let b = v3(x1, y0, z);
+                let c = v3(x1, y1, z); let d = v3(x0, y1, z);
+                // Texture assignment. The painter sort reorders by depth, so to
+                // get exactly NTEX draw calls the texture must be a function of
+                // DEPTH, not of emission order — that is what a real engine
+                // achieves by keying material batches to depth-sorted chunks.
+                // "interleave" deliberately breaks that to price the worst case.
+                if (TEXMODE == "run") {
+                    ti = i32(frac * NTEX);
+                    if (ti >= NTEX) { ti = NTEX - 1; }
+                    if (ti < 0) { ti = 0; }
+                } else {
+                    ti = ntri % NTEX;
+                }
+                mesh.push(mtri(a, b, c, u0, v0, u1, v0, u1, v1, light, ti));
+                ntri = ntri + 1;
+                if (TEXMODE != "run") { ti = ntri % NTEX; }
+                mesh.push(mtri(a, c, d, u0, v0, u1, v1, u0, v1, light, ti));
+                ntri = ntri + 1;
+            }
+        }
+    }
+    return mesh;
+}
+
+// ----------------------------------------------------------- pipeline bits --
+// Verbatim from wobbleweed/src/scene_gpu.hml.
+
+fn cv(mvp, p, u: f64, v: f64, l: f64) {
+    let c = mat_apply(mvp, p);
+    return { x: c.x, y: c.y, z: c.z, w: c.w, u: u, v: v, l: l };
+}
+
+// The `z` a geom vertex carries is used for exactly one thing: the painter
+// sort key (SDL_Vertex is 2D, so it never reaches the rasterizer). ndc mode is
+// what wobbleweed ships; view mode puts linear view-space depth there instead —
+// same ordering, vastly better numeric spread (see PERF.md).
+let USE_VIEW_DEPTH = (DEPTHKEY == "view");
+
+fn to_screen(v, Wf: f64, Hf: f64) {
+    let inv = 1.0 / v.w;
+    let c = i32(v.l * 255.0);
+    if (c > 255) { c = 255; } if (c < 0) { c = 0; }
+    let dz = v.z * inv;
+    if (USE_VIEW_DEPTH) { dz = v.w; }
+    return { x: floor((v.x * inv * 0.5 + 0.5) * Wf + 0.5),
+             y: floor((1.0 - (v.y * inv * 0.5 + 0.5)) * Hf + 0.5),
+             z: dz, u: v.u, v: v.v, r: c, g: c, b: c };
+}
+
+// Depth-key bracket for the bucketed sort. In ndc mode the useful keys are
+// crammed into a sliver just below 1.0 (ndc z = 1.001 - 0.2001/d for
+// near=0.1/far=200), which is exactly the precision problem view mode fixes.
+let DLO = 0.0 - 1.0;
+let DHI = 2.0;
+if (USE_VIEW_DEPTH) { DLO = 0.0; DHI = 128.0; }
+
+// Live-value sink so -O3 cannot delete an ablated prefix.
+let acc = 0.0;
+
+// Sort-correctness check: painter order = farthest first. With the ndc key
+// "farthest" is the LARGEST value; with the view-depth key it is also the
+// largest (view depth is distance from the eye). So the sorted array must be
+// non-increasing in `depth` either way. Counts inversions instead of asserting
+// so quantisation error in the bucketed sort is measurable rather than fatal.
+// An inversion inside one bucket quantum is harmless (that is exactly what a
+// PS1 ordering table does), so the number that matters is the WORST depth
+// violation, in key units — metres when the key is view depth.
+let verify_bad = 0;
+let verify_n = 0;
+let verify_max = 0.0;
+fn verify_order(tris) {
+    let n = tris.length;
+    for (let i = 1; i < n; i++) {
+        let d = tris[i].depth - tris[i - 1].depth;
+        if (d > 0.0) {
+            verify_bad = verify_bad + 1;
+            if (d > verify_max) { verify_max = d; }
+        }
+        verify_n = verify_n + 1;
+    }
+}
+
+// -------------------------------------------------------------- the render --
+
+fn render_obj(win, b, bs, mesh, mvp, texs, Wf: f64, Hf: f64) {
+    let m = 2.0 * Wf;
+    for (t in mesh) {
+        if (STAGE == 0) { acc = acc + t.pa.x; continue; }
+        let va = cv(mvp, t.pa, t.ua, t.va, t.l);
+        let vb = cv(mvp, t.pb, t.ub, t.vb, t.l);
+        let vc = cv(mvp, t.pc, t.uc, t.vc, t.l);
+        if (STAGE == 1) { acc = acc + va.x + vb.y + vc.z; continue; }
+        let ts = clip_tri_near(va, vb, vc);
+        if (STAGE == 2) { acc = acc + ts.length; continue; }
+        for (tt in ts) {
+            let p0 = to_screen(tt[0], Wf, Hf);
+            let p1 = to_screen(tt[1], Wf, Hf);
+            let p2 = to_screen(tt[2], Wf, Hf);
+            if (STAGE == 3) { acc = acc + p0.x + p1.y + p2.z; continue; }
+            let st = clip_tri_rect(p0, p1, p2, 0.0 - m, 0.0 - m, Wf + m, Hf + m);
+            if (STAGE == 4) { acc = acc + st.length; continue; }
+            for (s in st) { batch_tri(b, texs[t.ti], s[0], s[1], s[2]); }
+        }
+    }
+    if (STAGE <= 5) {
+        if (STAGE == 5) { acc = acc + b.tris.length; }
+        batch_reset(b);
+        return 0;
+    }
+
+    let tris = b.tris;
+    if (SORT == "closure") { sort_closure(tris); }
+    else if (SORT == "bucket") { tris = sort_bucket(bs, tris, DLO, DHI); }
+    if (VERIFY == 1) { verify_order(tris); }
+    if (STAGE == 6) { acc = acc + tris[0].depth; batch_reset(b); return 0; }
+
+    // put_vert + (stage 8) draw
+    let buf = b.buf;
+    let n = tris.length;
+    let calls = 0;
+    let i = 0;
+    while (i < n) {
+        let tex = tris[i].tex;
+        let vi = 0;
+        let j = i;
+        while (j < n && tris[j].tex == tex) {
+            let tr = tris[j];
+            put_vert(buf, vi, tr.a); vi = vi + 1;
+            put_vert(buf, vi, tr.b); vi = vi + 1;
+            put_vert(buf, vi, tr.c); vi = vi + 1;
+            j = j + 1;
+        }
+        if (STAGE >= 8) { draw_tris(win, tex, buf, vi); }
+        calls = calls + 1;
+        i = j;
+    }
+    acc = acc + calls;
+    batch_reset(b);
+    return calls;
+}
+
+// Flat path: front half still builds vertex objects, back half (batch, sort,
+// pack, draw) is flat buffers.
+fn render_flat(win, f, counts, mesh, mvp, texs, Wf: f64, Hf: f64) {
+    let m = 2.0 * Wf;
+    flat_reset(f);
+    for (t in mesh) {
+        let va = cv(mvp, t.pa, t.ua, t.va, t.l);
+        let vb = cv(mvp, t.pb, t.ub, t.vb, t.l);
+        let vc = cv(mvp, t.pc, t.uc, t.vc, t.l);
+        let ts = clip_tri_near(va, vb, vc);
+        for (tt in ts) {
+            let p0 = to_screen(tt[0], Wf, Hf);
+            let p1 = to_screen(tt[1], Wf, Hf);
+            let p2 = to_screen(tt[2], Wf, Hf);
+            let st = clip_tri_rect(p0, p1, p2, 0.0 - m, 0.0 - m, Wf + m, Hf + m);
+            for (s in st) { flat_push_obj(f, texs[t.ti], s[0], s[1], s[2]); }
+        }
+    }
+    if (STAGE <= 5) { return 0; }
+    flat_sort(f, counts, DLO, DHI);
+    if (STAGE == 6) { return 0; }
+    let calls = flat_flush(win, f, STAGE >= 8);
+    acc = acc + calls;
+    return calls;
+}
+
+// Fully flat path: NO per-vertex objects anywhere. Transform, clip test,
+// project and push are done on scalars. The near clip and guard-band clip are
+// reduced to accept/reject (the ~always-taken fast paths in clip.hml); a
+// straddling triangle falls back to the object path, which in a real frame is
+// a handful of triangles at the screen edge.
+fn render_flatraw(win, f, counts, mesh, mvp, texs, Wf: f64, Hf: f64) {
+    let m = 2.0 * Wf;
+    let m0 = mvp[0]; let m1 = mvp[1]; let m2 = mvp[2]; let m3 = mvp[3];
+    let m4 = mvp[4]; let m5 = mvp[5]; let m6 = mvp[6]; let m7 = mvp[7];
+    let m8 = mvp[8]; let m9 = mvp[9]; let m10 = mvp[10]; let m11 = mvp[11];
+    let m12 = mvp[12]; let m13 = mvp[13]; let m14 = mvp[14]; let m15 = mvp[15];
+    let lo = 0.0 - m; let hix = Wf + m; let hiy = Hf + m;
+    flat_reset(f);
+    for (t in mesh) {
+        let pa = t.pa; let pb = t.pb; let pc = t.pc;
+        let ax = m0*pa.x + m1*pa.y + m2*pa.z + m3;
+        let ay = m4*pa.x + m5*pa.y + m6*pa.z + m7;
+        let az = m8*pa.x + m9*pa.y + m10*pa.z + m11;
+        let aw = m12*pa.x + m13*pa.y + m14*pa.z + m15;
+        let bx = m0*pb.x + m1*pb.y + m2*pb.z + m3;
+        let by = m4*pb.x + m5*pb.y + m6*pb.z + m7;
+        let bz = m8*pb.x + m9*pb.y + m10*pb.z + m11;
+        let bw = m12*pb.x + m13*pb.y + m14*pb.z + m15;
+        let cx = m0*pc.x + m1*pc.y + m2*pc.z + m3;
+        let cy = m4*pc.x + m5*pc.y + m6*pc.z + m7;
+        let cz = m8*pc.x + m9*pc.y + m10*pc.z + m11;
+        let cw = m12*pc.x + m13*pc.y + m14*pc.z + m15;
+        // near clip, accept/reject fast path
+        if (az + aw <= 0.000001 || bz + bw <= 0.000001 || cz + cw <= 0.000001) { continue; }
+        let ia = 1.0 / aw; let ib = 1.0 / bw; let ic = 1.0 / cw;
+        let sax = floor((ax * ia * 0.5 + 0.5) * Wf + 0.5);
+        let say = floor((1.0 - (ay * ia * 0.5 + 0.5)) * Hf + 0.5);
+        let sbx = floor((bx * ib * 0.5 + 0.5) * Wf + 0.5);
+        let sby = floor((1.0 - (by * ib * 0.5 + 0.5)) * Hf + 0.5);
+        let scx = floor((cx * ic * 0.5 + 0.5) * Wf + 0.5);
+        let scy = floor((1.0 - (cy * ic * 0.5 + 0.5)) * Hf + 0.5);
+        // guard band, accept/reject fast path
+        if (sax < lo || sax > hix || say < lo || say > hiy ||
+            sbx < lo || sbx > hix || sby < lo || sby > hiy ||
+            scx < lo || scx > hix || scy < lo || scy > hiy) { continue; }
+        let cl = t.l * 255.0;
+        if (cl > 255.0) { cl = 255.0; } if (cl < 0.0) { cl = 0.0; }
+        if (STAGE <= 4) { acc = acc + sax + sby; continue; }
+        let da = az * ia; let db = bz * ib; let dc = cz * ic;
+        if (USE_VIEW_DEPTH) { da = aw; db = bw; dc = cw; }
+        flat_push_raw(f, texs[t.ti],
+            sax, say, da, t.ua, t.va, cl, cl, cl,
+            sbx, sby, db, t.ub, t.vb, cl, cl, cl,
+            scx, scy, dc, t.uc, t.vc, cl, cl, cl);
+    }
+    if (STAGE <= 5) { acc = acc + f.cnt; return 0; }
+    flat_sort(f, counts, DLO, DHI);
+    if (STAGE == 6) { return 0; }
+    let calls = flat_flush(win, f, STAGE >= 8);
+    acc = acc + calls;
+    return calls;
+}
+
+// Fully flat path writing SDL_Vertex bytes directly at push time; flush is a
+// 60-byte memcpy per triangle. Same front half as render_flatraw.
+fn render_flatsdl(win, f, counts, mesh, mvp, texs, Wf: f64, Hf: f64) {
+    let m = 2.0 * Wf;
+    let m0 = mvp[0]; let m1 = mvp[1]; let m2 = mvp[2]; let m3 = mvp[3];
+    let m4 = mvp[4]; let m5 = mvp[5]; let m6 = mvp[6]; let m7 = mvp[7];
+    let m8 = mvp[8]; let m9 = mvp[9]; let m10 = mvp[10]; let m11 = mvp[11];
+    let m12 = mvp[12]; let m13 = mvp[13]; let m14 = mvp[14]; let m15 = mvp[15];
+    let lo = 0.0 - m; let hix = Wf + m; let hiy = Hf + m;
+    sdlv_reset(f);
+    for (t in mesh) {
+        let pa = t.pa; let pb = t.pb; let pc = t.pc;
+        let ax = m0*pa.x + m1*pa.y + m2*pa.z + m3;
+        let ay = m4*pa.x + m5*pa.y + m6*pa.z + m7;
+        let az = m8*pa.x + m9*pa.y + m10*pa.z + m11;
+        let aw = m12*pa.x + m13*pa.y + m14*pa.z + m15;
+        let bx = m0*pb.x + m1*pb.y + m2*pb.z + m3;
+        let by = m4*pb.x + m5*pb.y + m6*pb.z + m7;
+        let bz = m8*pb.x + m9*pb.y + m10*pb.z + m11;
+        let bw = m12*pb.x + m13*pb.y + m14*pb.z + m15;
+        let cx = m0*pc.x + m1*pc.y + m2*pc.z + m3;
+        let cy = m4*pc.x + m5*pc.y + m6*pc.z + m7;
+        let cz = m8*pc.x + m9*pc.y + m10*pc.z + m11;
+        let cw = m12*pc.x + m13*pc.y + m14*pc.z + m15;
+        if (az + aw <= 0.000001 || bz + bw <= 0.000001 || cz + cw <= 0.000001) { continue; }
+        let ia = 1.0 / aw; let ib = 1.0 / bw; let ic = 1.0 / cw;
+        let sax = floor((ax * ia * 0.5 + 0.5) * Wf + 0.5);
+        let say = floor((1.0 - (ay * ia * 0.5 + 0.5)) * Hf + 0.5);
+        let sbx = floor((bx * ib * 0.5 + 0.5) * Wf + 0.5);
+        let sby = floor((1.0 - (by * ib * 0.5 + 0.5)) * Hf + 0.5);
+        let scx = floor((cx * ic * 0.5 + 0.5) * Wf + 0.5);
+        let scy = floor((1.0 - (cy * ic * 0.5 + 0.5)) * Hf + 0.5);
+        if (sax < lo || sax > hix || say < lo || say > hiy ||
+            sbx < lo || sbx > hix || sby < lo || sby > hiy ||
+            scx < lo || scx > hix || scy < lo || scy > hiy) { continue; }
+        let ci = i32(t.l * 255.0);
+        if (ci > 255) { ci = 255; } if (ci < 0) { ci = 0; }
+        if (STAGE <= 4) { acc = acc + sax + sby; continue; }
+        let dep = (az * ia + bz * ib + cz * ic) / 3.0;
+        if (USE_VIEW_DEPTH) { dep = (aw + bw + cw) / 3.0; }
+        sdlv_push_raw(f, texs[t.ti], dep,
+            sax, say, t.ua, t.va, ci, ci, ci,
+            sbx, sby, t.ub, t.vb, ci, ci, ci,
+            scx, scy, t.uc, t.vc, ci, ci, ci);
+    }
+    if (STAGE <= 5) { acc = acc + f.cnt; return 0; }
+    sdlv_sort(f, counts, DLO, DHI);
+    if (STAGE == 6) { return 0; }
+    let calls = sdlv_flush(win, f, STAGE >= 8);
+    acc = acc + calls;
+    return calls;
+}
+
+// ------------------------------------------------------------------- main ---
+
+fn main() {
+    let win = window_open("nightshade-bench", W, H, SCALE);
+    if (win == null) { eprint("window_open failed"); return; }
+
+    let texs = [];
+    for (let i = 0; i < NTEX; i++) {
+        if (i % 2 == 0) { texs.push(upload_texture(win, tex_grass(64, 64))); }
+        else { texs.push(upload_texture(win, tex_checker(64, 64, 4))); }
+    }
+
+    let mesh = build_mesh();
+    let cap = NTRIS + 64;
+    let b = batch_new(cap);
+    let f = flat_new(cap);
+    let fs = sdlv_new(cap);
+    let bs = bucket_new();
+    let counts = [];
+    for (let i = 0; i <= 2048; i++) { counts.push(0); }
+
+    let Wf: f64 = W; let Hf: f64 = H;
+    let eye = v3(0.0, 0.0, 0.0);
+    let proj = mat_perspective(FOVY, Wf / Hf, 0.1, 200.0);
+    let view = mat_look_at(eye, v3(0.0, 0.0, 0.0 - 1.0), v3(0.0, 1.0, 0.0));
+    let mvp = mat_mul(proj, view);
+
+    let calls = 0;
+    // warmup
+    for (let i = 0; i < WARMUP; i++) {
+        clear(win, 20, 24, 40);
+        if (PATH == "obj") { calls = render_obj(win, b, bs, mesh, mvp, texs, Wf, Hf); }
+        else if (PATH == "flat") { calls = render_flat(win, f, counts, mesh, mvp, texs, Wf, Hf); }
+        else if (PATH == "flatsdl") { calls = render_flatsdl(win, fs, counts, mesh, mvp, texs, Wf, Hf); }
+        else { calls = render_flatraw(win, f, counts, mesh, mvp, texs, Wf, Hf); }
+        if (PRESENT == 1) { present_geom(win); }
+        poll(win);
+    }
+
+    let t0 = ticks();
+    for (let i = 0; i < FRAMES; i++) {
+        clear(win, 20, 24, 40);
+        if (PATH == "obj") { calls = render_obj(win, b, bs, mesh, mvp, texs, Wf, Hf); }
+        else if (PATH == "flat") { calls = render_flat(win, f, counts, mesh, mvp, texs, Wf, Hf); }
+        else if (PATH == "flatsdl") { calls = render_flatsdl(win, fs, counts, mesh, mvp, texs, Wf, Hf); }
+        else { calls = render_flatraw(win, f, counts, mesh, mvp, texs, Wf, Hf); }
+        if (PRESENT == 1) { present_geom(win); }
+        poll(win);
+    }
+    let t1 = ticks();
+
+    // Optional image checksum: proves the optimized paths render the SAME frame
+    // as the reference object path, not just a faster one.
+    let csum: i64 = 0;
+    if (envi("BENCH_CHECKSUM", 0) == 1) {
+        let px = buffer(W * H * 3);
+        read_pixels(win, px);
+        let n = W * H * 3;
+        for (let i = 0; i < n; i++) {
+            csum = (csum * 31 + px[i]) % 1000000007;
+        }
+    }
+
+    let ms = (t1 - t0) / FRAMES;
+    let fps = 0.0;
+    if (ms > 0.0) { fps = 1000.0 / ms; }
+    let tps = fps * NTRIS;
+
+    print(`RESULT label=${LABEL} stage=${STAGE} path=${PATH} sort=${SORT} tris=${NTRIS} ` +
+          `layers=${LAYERS} tex=${NTEX} texmode=${TEXMODE} res=${W}x${H} scale=${SCALE} ` +
+          `calls=${calls} frames=${FRAMES} ms_per_frame=${ms} fps=${fps} tris_per_sec=${tps} ` +
+          `acc=${i64(acc) % 1000003} depth=${DEPTH} key=${DEPTHKEY} ` +
+          `inversions=${verify_bad}/${verify_n} maxviol=${verify_max} csum=${csum}`);
+
+    window_close(win);
+}
+
+main();
