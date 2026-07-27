@@ -27,7 +27,7 @@ earlier wave created.
 | C | `tools/ci_imports.sh` passes: import wall intact, no legacy-module import, every top-level variable `g_`-prefixed |
 | D | No object/array literal, no closure, no `defer`, no `try`, no `throw`, no template string in any function that runs per-frame or per-element |
 | E | The task's verification program prints `PASS n/n` and exits 0, run **compiled**, headless |
-| F | **Every function parameter is `p_`-prefixed.** `hemlockc`'s inliner does not alpha-rename inlined bodies, so a caller local sharing a callee parameter's name emits invalid C (`HEMLOCK_ISSUES.md` H-1 — fixed only on a branch, not on `main`). `fn mix(p_s: i32)` is always safe; `fn mix(s: i32)` breaks the build the day someone writes `let s = ...` at a call site. This is a hard build break, not a silent miscompile, so it is cheap — but it is also cheap to avoid. |
+| F | **Every parameter of a HOT function is `p_`-prefixed.** ⚠ **Rationale corrected — H-1 is fixed and merged** (hemlock PR #627, `e2946c1c`, in `main` at `cb7fbfaa`; re-verified on the merged build). A caller local sharing a parameter name no longer breaks the build — the compiler just declines to inline, costing **0.9 ns/call** (~0.3 % of frame budget). The convention survives on rule **A1** instead: parameters are never unboxed, so a hot function copies them into typed locals, and that idiom needs two distinct names. Measured **1.19×, 8.4 ns/call**. Apply to hot functions; a cold `fn f(x, y, z)` is fine and clearer. Do not cite H-1 as a live bug. See `CLAUDE.md` §4. |
 
 ---
 
