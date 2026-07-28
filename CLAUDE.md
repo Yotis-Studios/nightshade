@@ -236,6 +236,7 @@ fn project(p_x: f64, p_y: f64, p_z: f64, p_n: i32): f64 {
 | A7 | Struct-of-arrays above ~1000 members (0.150 vs 0.265 ms/tick) |
 | A8 | Allocate every buffer once at startup; reuse via `clear()` / overwrite |
 | A9 | Hand-inline `clamp`/`min`/`max`/`abs` in the innermost loop (19.6 → 14.0 ns) |
+| A9b | **Keep hot-function argument counts low — Hemlock calls cost ~10 ns PER ARGUMENT.** 6 args = 59 ns, 10 args = 103 ns, with empty bodies. Argument marshalling dominates small predicates: the clip accept path spends 131 of its 189 ns/tri purely on the calling convention. Pass an index into a buffer the callee already holds, or inline the body. |
 | A10 | `x++` not `x = x + 1` for counters that cannot legitimately overflow (89 vs 209 ms — `+` emits the overflow check) |
 | A11 | Cache `a.length` in a typed local before a loop |
 | A12 | One `SDL_RenderGeometry` per texture run — never per triangle |
