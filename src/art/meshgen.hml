@@ -133,6 +133,55 @@ export let MG_MAT_GLASS    = 9;
 // is two pixels of bright grain, which is exactly what a specular band is.
 export let MG_MAT_SPEC     = 7;
 export let MG_MAT_NSFLORA  = 23;
+
+// ---------------------------------------------------------------------------
+// THE TWO VIEWMODEL MATERIALS — round 4. THIS IS THE FIX FOR "THE GUN IS A
+// DARK LUMP". Read the measurement before you change either number.
+// ---------------------------------------------------------------------------
+// The rendered pixel is `albedo x light x AO x TEXEL`. Rounds 1-3 tuned the
+// first three terms and never measured the fourth, and the fourth was eating
+// the model. Measured on the real ATLAS_WORLD (texgen seed 1337), per texel of
+// a 32x32 cell:
+//
+//     CELL_METAL_PANEL (27)   min  84   mean 153   max 188     -> x0.33 .. x0.74
+//     CELL_SNOW         (7)   min 127   mean 192   max 243     -> x0.50 .. x0.95
+//
+// Two separate failures come out of that:
+//
+// 1. THE MEAN. The whole weapon except the highlight slot was MG_MAT_METAL, so
+//    the four-step ladder arrived on screen multiplied by 0.60 on average and
+//    by 0.33 wherever a face happened to land on a seam texel. A DARK face
+//    authored at 46 rendered at 11. That is the p5 = 12 the gate measured.
+//
+// 2. THE VARIANCE, which is worse. The tile swings 84..188 — a 104-luminance
+//    random field — while the ladder's own steps are ~70 apart. At 4 cm/texel
+//    on an object that is 90 px across, that field is not detail, it is noise
+//    that is LOUDER than the value structure it is painted on. It is why the
+//    round-3 rail read as a mottled smear rather than an edge.
+//
+// So the viewmodel gets its own two materials, each a small WINDOW inside a
+// cell the harness already binds, chosen by scanning every window of the real
+// atlas for the flattest bright patch:
+//
+//   MG_MAT_VMSKIN  METAL_PANEL texels x10..17, y4..11   lum 176.3 .. 187.6
+//                  the interior of the top plate, clear of the rivet bosses
+//                  (x6..9, x24..27), the vertical seams (x1..2, x29..30) and
+//                  the tile's lower half where it darkens. x0.691 .. x0.736 —
+//                  a +-5.6 grain, which is exactly the "grain at +-6" CLAUDE.md
+//                  §9 rule 2 asks for, instead of a +-52 one.
+//
+//   MG_MAT_VMRAIL  SNOW texels x22..29, y2..3           lum 240 .. 243
+//                  the flat bright band of the highlight tile. x0.94 .. x0.95,
+//                  so a slot-3 face whose vertex byte clips renders at 240+ as
+//                  a SOLID band rather than as salt-and-pepper between 127 and
+//                  243. This is what makes the rail an edge.
+//
+// Both are derived at build time from the rect the harness bound to
+// MG_MAT_METAL / MG_MAT_SPEC (see mg_uv_window in meshgen_build_all), so they
+// follow the atlas rather than hardcoding a UV. Ids 11 and 12 are free: the
+// harness binds 0-6 and 8-10, and meshgen self-binds 7 and 23.
+export let MG_MAT_VMSKIN   = 11;
+export let MG_MAT_VMRAIL   = 12;
 export let MG_MAT_COUNT    = 24;
 
 // u0,v0,u1,v1 per material. Default: cell (m%8, m/8) of an 8x8 grid with a
@@ -162,6 +211,25 @@ export fn meshgen_set_material_uv(p_mat: i32, p_u0: f64, p_v0: f64,
     let i: i32 = p_mat * 4;
     g_mg_uv[i] = p_u0; g_mg_uv[i + 1] = p_v0;
     g_mg_uv[i + 2] = p_u1; g_mg_uv[i + 3] = p_v1;
+}
+
+// Point one material at a TEXEL WINDOW inside another material's bound rect.
+// x/y are texel indices 0..31 inside the source cell. `atlas_cell_uv` hands
+// meshgen the rect spanning texel CENTRES 0.5 .. 31.5, so the centre of texel
+// k sits at fraction k/31 across it — which is what makes this exact under
+// nearest sampling (SDL_RENDER_SCALE_QUALITY is 0) with no bleed into the
+// neighbouring texels.
+fn mg_uv_window(p_dst: i32, p_src: i32,
+                p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64) {
+    let s: i32 = p_src * 4;
+    let u0: f64 = g_mg_uv[s];      let v0: f64 = g_mg_uv[s + 1];
+    let du: f64 = (g_mg_uv[s + 2] - u0) / 31.0;
+    let dv: f64 = (g_mg_uv[s + 3] - v0) / 31.0;
+    let d: i32 = p_dst * 4;
+    g_mg_uv[d]     = u0 + du * p_x0;
+    g_mg_uv[d + 1] = v0 + dv * p_y0;
+    g_mg_uv[d + 2] = u0 + du * p_x1;
+    g_mg_uv[d + 3] = v0 + dv * p_y1;
 }
 
 fn mg_u(p_mat: i32, p_s: f64): f64 {
@@ -502,6 +570,77 @@ export fn mg_box(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
                  p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
     let out: i32 = mg_box_ex(p_m, p_cx, p_cy, p_cz, p_hx, p_hy, p_hz,
                              0.0, 0.0, 1.0, p_mat, p_chi, p_clo, p_ao);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_vm_shell — a viewmodel box with its three invisible faces deleted.
+// 6 triangles, not 12.
+// ---------------------------------------------------------------------------
+// A viewmodel is the one object in the game whose view direction is a BUILD
+// TIME CONSTANT: the weapon is emitted at a fixed offset from the eye and
+// carries a fixed cant, so the same three faces of every part are drawn in
+// every frame of the whole game. Which three was MEASURED, not derived, and
+// the answer is NOT the one the rest of this file assumed — see the block
+// below `g_wp_side_ax`. Building the Sparrow as +Y / -Z / +X shells and
+// rendering it produced `tris.drawn` 1500 -> 1381 and an EMPTY SCREEN: all 120
+// were backface-rejected. The set the rasteriser keeps is:
+//
+//     -Y   45.0 % of the drawn area   the big plate the eye reads as the body
+//     +Z   27.7 %                     the trailing facet
+//     -X   27.3 %                     the flank
+//
+// so those are the three built here. The three deleted ones need the view
+// direction to swing 19 deg in weapon space (the tightest pair is +-X, |dot|
+// 0.326) before any of them could appear; weapon sway is a couple of degrees.
+// The three kept faces exactly tile a box's projected hexagon, so the
+// silhouette is bit-identical to the 12-triangle version.
+//
+// This is where the viewmodel triangle budget comes from: 20 parts at 12 tris
+// was 240 submitted of which 120 were rejected every single frame; 20 parts at
+// 6 is 120 submitted and 120 drawn. Same model, same silhouette, half the
+// submission and no wasted transform.
+//
+// Colour: -Y is the biggest drawn facet, so it takes `chi` at full AO — it is
+// this model's "top plate" in everything but name. The other two take the
+// side split, which `g_wp_side_ax/az` aims at -X (hi) and +Z (the step below).
+fn mg_vm_shell(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+               p_hx: f64, p_hy: f64, p_hz: f64,
+               p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let mat: i32 = p_mat;
+    let ao: f64 = p_ao;
+    let aob: f64 = p_ao * 0.86;
+    let x0: f64 = p_cx - p_hx;  let x1: f64 = p_cx + p_hx;
+    let z0: f64 = p_cz - p_hz;  let z1: f64 = p_cz + p_hz;
+    let yb: f64 = p_cy - p_hy;  let yt: f64 = p_cy + p_hy;
+    let t0: i32 = mesh_tri_count(m);
+
+    // -Y — the largest drawn facet. Windings are copied verbatim from
+    // mg_box_ex so the baked face normals are identical to a full box's.
+    let e = mg_v(m, x0, yb, z0, 0.0, 0.0, mat, p_chi, ao);
+    let f = mg_v(m, x1, yb, z0, 1.0, 0.0, mat, p_chi, ao);
+    let g = mg_v(m, x1, yb, z1, 1.0, 1.0, mat, p_chi, ao);
+    let h = mg_v(m, x0, yb, z1, 0.0, 1.0, mat, p_chi, ao);
+    mesh_quad(m, e, f, g, h);
+
+    // +Z — the trailing facet
+    let sc_pz: i32 = mg_side_col(p_clo, p_chi, 0.0, 1.0);
+    let i0 = mg_v(m, x0, yb, z1, 0.0, 1.0, mat, sc_pz, aob);
+    let i1 = mg_v(m, x1, yb, z1, 1.0, 1.0, mat, sc_pz, aob);
+    let i2 = mg_v(m, x1, yt, z1, 1.0, 0.0, mat, sc_pz, ao);
+    let i3 = mg_v(m, x0, yt, z1, 0.0, 0.0, mat, sc_pz, ao);
+    mesh_quad(m, i0, i1, i2, i3);
+
+    // -X — the flank the player looks at
+    let sc_nx: i32 = mg_side_col(p_clo, p_chi, -1.0, 0.0);
+    let l0 = mg_v(m, x0, yb, z0, 0.0, 1.0, mat, sc_nx, aob);
+    let l1 = mg_v(m, x0, yb, z1, 1.0, 1.0, mat, sc_nx, aob);
+    let l2 = mg_v(m, x0, yt, z1, 1.0, 0.0, mat, sc_nx, ao);
+    let l3 = mg_v(m, x0, yt, z0, 0.0, 0.0, mat, sc_nx, ao);
+    mesh_quad(m, l0, l1, l2, l3);
+
+    let out: i32 = mesh_tri_count(m) - t0;
     return out;
 }
 
@@ -1897,10 +2036,79 @@ fn build_npc(p_m) {
 //
 // which is a genuine four-step ramp carrying BOTH halves of CLAUDE.md §8's
 // contrast pair on the one object that is in every frame.
-let g_vm_lum_body: f64 = 152.0;
-let g_vm_lum_dark: f64 = 46.0;
-let g_vm_lum_furn: f64 = 118.0;
-let g_vm_lum_spec: f64 = 232.0;
+// ---------------------------------------------------------------------------
+// ROUND-4 REVISION — the ladder above was never wrong, it was never ARRIVING.
+// ---------------------------------------------------------------------------
+// Round 3 authored DARK 46 / FURN 118 / BODY 152 / SPEC 232 and the gate then
+// measured the weapon at median luminance 31 with 43-47 % of its own pixels
+// under 30. Both statements were true at once, and here is the whole chain,
+// measured rather than argued:
+//
+//  a) The BAKED VERTEX COLOURS ARE FINE and they are already scene-invariant.
+//     Median baked vertex luminance over the Sparrow, by scene keyframe:
+//        ridge_golden 74.2   hub_dawn 73.7   ns_bloom 73.8
+//        storm 74.1          noon     78.7
+//     The dedicated viewmodel rig and its exposure floor work: the weapon does
+//     NOT go black at dusk with the world. Weighted by projected area over the
+//     faces the camera can see, the baked luminance is 165, and only 4 % of
+//     that area is under 45. So "the viewmodel is being lit by the world's
+//     ambient/sun term" — the standing hypothesis for this bug — is FALSE.
+//     MG_KIND_WEAPON is set and `meshgen_bake_all` takes the weapon branch.
+//
+//  b) THE TEXEL WAS EATING IT. See MG_MAT_VMSKIN. Calibrated by rebuilding the
+//     weapon with a white albedo and a unit rig, so the rendered pixel IS the
+//     texel: over the weapon's own mask the multiplier measured p5 0.235,
+//     median 0.53. That, not the rig, is the missing 3x.
+//
+//  c) THE DARK SLOT HAD TAKEN OVER THE MODEL. Rebuilt with one flat hue per
+//     slot and counted on the real render, the Sparrow's screen area was
+//        BODY 19.6 %   DARK 29.9 %   FURN 27.5 %   SPEC 23.0 %
+//     A slot whose job is to CUT NOTCHES was 30 % of the object, and its single
+//     largest member was the BUTT PLATE — the nearest, biggest, most-looked-at
+//     element on the model — rendering at luminance 11-25. That black mass at
+//     the lower right of every frame is what round 2 filed as "a detached
+//     floating parallelogram": it is not detached, it is the same value as the
+//     vignetted grass behind it, so its silhouette dissolves.
+//
+// With MG_MAT_VMSKIN's flat x0.72 in place the chain is finally predictable.
+// Measured light x AO on the three visible faces is 1.15 (flank), 1.14 (rear)
+// and 1.60+ (top, which clips), and `mg_side_col` puts the flank at t = 0.97
+// and the rear at t = 0.67 of the way from lo to hi, so:
+//
+//     rendered_flank ~ albedo x 0.80     rendered_rear ~ albedo x 0.67
+//     rendered_top   ~ min(albedo x 1.6, 255) x 0.72
+//
+// The ladder below therefore lands on screen as roughly
+//
+//     DARK   27 /  32 /  46      the notches: sights, ports, gas block, guard
+//     FURN   75 /  90 / 129      polymer and wood: grip, stock, handguard, mag
+//     BODY  112 / 135 / 184      receiver, barrel, magwell, butt plate
+//     SPEC  240 .. 243           the rail, flat, on every face it turns
+//
+// which is a four-step ramp with real gaps between the steps, and it still
+// carries both halves of CLAUDE.md §8's contrast pair on the one object that
+// is in every frame.
+// ROUND-4, SECOND PASS. The values above were set against light multipliers
+// measured on the CULLED hemisphere, and once the key was turned around every
+// one of them was 40 % too hot: the weapon rendered at median 135 with 23 % of
+// its own pixels over luminance 220, i.e. a white plastic prop. Re-measured on
+// the faces that are actually drawn, `light x AO` is
+//
+//     -Y  1.51-1.75   +Z  1.09-1.27   -X  1.09-1.27
+//
+// and `mg_side_col` puts +Z at t = 0.852 and -X at t = 0.987 of hi. Folding in
+// MG_MAT_VMSKIN's flat x0.72, the ladder below lands on screen at
+//
+//     DARK   24 /  27 /  40      the notches; supplies the sub-30 half of §8
+//     FURN   59 /  68 / 103      polymer and wood
+//     BODY   95 / 110 / 143      receiver, barrel, magwell, butt plate
+//     SPEC  224 .. 243           the rail, and only the rail
+//
+// in the order (+Z trailing facet / -X flank / -Y plate).
+let g_vm_lum_body: f64 = 150.0;
+let g_vm_lum_dark: f64 = 26.0;
+let g_vm_lum_furn: f64 = 62.0;
+let g_vm_lum_spec: f64 = 236.0;
 let g_vm_sat_metal: f64 = 0.10;
 let g_vm_sat_furn: f64 = 0.26;
 // hi -> lo within a slot. `lo` only ever reaches the screen through the -Z rear
@@ -1929,8 +2137,14 @@ let g_vm_lo_step: f64 = 0.55;
 // azimuth below is chosen so that the flank is essentially `hi` (t = 0.97) and
 // the rear is a clear step below it (t = 0.67), which gives every box a lit
 // flank and a darker trailing facet instead of the coin-flip it had before.
-let g_wp_side_ax: f64 =  0.940;
-let g_wp_side_az: f64 = -0.341;
+//
+// ROUND-4 CORRECTION — same 180 degree error, same fix. The azimuth below put
+// `hi` on +X and the step below it on -Z: both are culled. Negated, it puts
+// `hi` on the -X flank (t = 0.97) and the step on the +Z trailing facet
+// (t = 0.67), which are two of the three faces that actually reach the screen.
+// The third, -Y, is given `chi` outright by `mg_vm_shell`.
+let g_wp_side_ax: f64 = -0.940;
+let g_wp_side_az: f64 =  0.341;
 
 fn wpn_parts(p_m, p_tab: array<f64>, p_n: i32,
              p_c0: i32, p_c1: i32, p_c2: i32, p_c3: i32) {
@@ -1952,7 +2166,7 @@ fn wpn_parts(p_m, p_tab: array<f64>, p_n: i32,
         let slot: i32 = i32(p_tab[o + 6]);
         let hi: i32 = body_hi;
         let lo: i32 = body_lo;
-        let mat: i32 = MG_MAT_METAL;
+        let mat: i32 = MG_MAT_VMSKIN;
         if (slot == 1) { hi = dark_hi; lo = dark_lo; }
         if (slot == 2) { hi = furn_hi; lo = furn_lo; }
         let ao: f64 = p_tab[o + 7];
@@ -1964,10 +2178,10 @@ fn wpn_parts(p_m, p_tab: array<f64>, p_n: i32,
         // TILE, and the tile is CELL_SNOW: 127 at its darkest, 242 at its
         // brightest. Measured before this line the brightest pixel anywhere on
         // the weapon was 133 and the frame's only >220 pixel was a HUD glyph.
-        if (slot == 3) { hi = spec_hi; lo = spec_lo; mat = MG_MAT_SPEC; ao = ao * 1.50; }
-        mg_box(m, p_tab[o], p_tab[o + 1], p_tab[o + 2],
-               p_tab[o + 3], p_tab[o + 4], p_tab[o + 5],
-               mat, hi, lo, ao);
+        if (slot == 3) { hi = spec_hi; lo = spec_lo; mat = MG_MAT_VMRAIL; ao = ao * 1.25; }
+        mg_vm_shell(m, p_tab[o], p_tab[o + 1], p_tab[o + 2],
+                    p_tab[o + 3], p_tab[o + 4], p_tab[o + 5],
+                    mat, hi, lo, ao);
         i++;
     }
     g_mg_sun_ax = save_ax; g_mg_sun_az = save_az;
@@ -2018,18 +2232,18 @@ fn wpn_parts(p_m, p_tab: array<f64>, p_n: i32,
 //     jumping straight from 20 to 240.
 let g_wp_sparrow: array<f64> = [
     0.0,   0.056, 0.060, 0.037, 0.050, 0.170, 0, 1.00,   // receiver
-    0.0,   0.113, 0.055, 0.026, 0.011, 0.160, 3, 1.00,   // TOP RAIL — the rim
+    0.0,   0.113, 0.070, 0.011, 0.011, 0.118, 3, 1.00,   // TOP RAIL — the rim
     0.0,   0.136,-0.052, 0.012, 0.021, 0.014, 1, 1.00,   // rear sight (notch)
-    0.046, 0.090,-0.020, 0.014, 0.010, 0.030, 3, 1.00,   // charging handle SPEC
-    0.041, 0.062, 0.100, 0.006, 0.021, 0.050, 1, 0.96,   // ejection port RIGHT
+   -0.046, 0.090,-0.020, 0.014, 0.010, 0.030, 3, 1.00,   // charging handle SPEC (visible flank)
+   -0.040, 0.062, 0.100, 0.007, 0.021, 0.050, 1, 0.96,   // ejection port (visible flank)
     0.0,   0.012, 0.105, 0.031, 0.030, 0.044, 0, 0.96,   // magwell (body)
-    0.0,  -0.056, 0.118, 0.026, 0.062, 0.038, 2, 0.92,   // magazine
-    0.0,  -0.126, 0.120, 0.031, 0.013, 0.043, 1, 0.90,   // mag baseplate (dark)
+    0.0,  -0.050, 0.112, 0.028, 0.064, 0.040, 2, 0.92,   // magazine
+    0.0,  -0.118, 0.112, 0.030, 0.016, 0.042, 1, 0.90,   // mag baseplate (dark)
     0.0,  -0.048,-0.020, 0.026, 0.058, 0.034, 2, 0.92,   // pistol grip
     0.0,   0.006, 0.048, 0.021, 0.008, 0.034, 1, 0.90,   // trigger guard
     0.0,   0.056,-0.185, 0.026, 0.038, 0.092, 2, 0.94,   // stock tube
-    0.0,   0.104,-0.185, 0.018, 0.009, 0.080, 3, 0.98,   // comb SPEC — rim, rear
-    0.0,   0.052,-0.291, 0.030, 0.048, 0.022, 1, 0.90,   // butt plate (dark)
+    0.0,   0.104,-0.185, 0.010, 0.009, 0.062, 3, 0.98,   // comb SPEC — rim, rear
+    0.0,   0.052,-0.291, 0.030, 0.048, 0.022, 0, 0.90,   // butt plate (BODY)
     0.0,   0.058, 0.300, 0.034, 0.036, 0.078, 2, 0.96,   // handguard
     0.0,   0.100, 0.300, 0.024, 0.008, 0.074, 0, 0.98,   // handguard cap (body)
     0.0,   0.006, 0.315, 0.018, 0.040, 0.024, 2, 0.90,   // fore grip (under)
@@ -2042,7 +2256,7 @@ let g_wp_sparrow: array<f64> = [
 // Tinker SMG — stubby, very long straight magazine, side-folded stock.
 let g_wp_tinker: array<f64> = [
     0.0,   0.056, 0.050, 0.036, 0.050, 0.120, 0, 1.00,   // receiver
-    0.0,   0.112, 0.050, 0.030, 0.011, 0.116, 3, 1.00,   // rail SPEC
+    0.0,   0.112, 0.050, 0.014, 0.011, 0.116, 3, 1.00,   // rail SPEC
     0.0,   0.062, 0.195, 0.015, 0.015, 0.060, 1, 0.98,   // barrel
     0.0,   0.062, 0.278, 0.030, 0.030, 0.038, 0, 1.00,   // shroud / comp
     0.0,   0.056, 0.165, 0.028, 0.030, 0.046, 2, 0.96,   // handguard
@@ -2055,10 +2269,10 @@ let g_wp_tinker: array<f64> = [
     0.0,   0.008, 0.020, 0.020, 0.008, 0.030, 1, 0.90,   // trigger guard
     0.0,   0.024, 0.135, 0.024, 0.032, 0.030, 2, 0.94,   // fore grip
    -0.056, 0.070,-0.020, 0.020, 0.013, 0.075, 2, 0.94,   // FOLDED stock, LEFT
-   -0.056, 0.070,-0.105, 0.026, 0.028, 0.018, 1, 0.90,   // folded butt (dark)
+   -0.056, 0.070,-0.105, 0.026, 0.028, 0.018, 0, 0.90,   // folded butt (BODY)
    -0.032, 0.074,-0.020, 0.011, 0.010, 0.022, 3, 0.96,   // stock hinge SPEC
-    0.046, 0.084, 0.030, 0.014, 0.011, 0.028, 3, 1.00,   // charging handle SPEC
-    0.040, 0.058, 0.060, 0.007, 0.022, 0.042, 1, 0.96,   // ejection port
+   -0.046, 0.084, 0.030, 0.014, 0.011, 0.028, 3, 1.00,   // charging handle SPEC (visible flank)
+   -0.040, 0.058, 0.060, 0.007, 0.022, 0.042, 1, 0.96,   // ejection port (visible flank)
     0.0,   0.014, 0.075, 0.030, 0.026, 0.040, 0, 0.94,   // magwell
     0.0,   0.062,-0.075, 0.030, 0.034, 0.030, 0, 0.96    // rear receiver cap
 ];
@@ -2066,7 +2280,7 @@ let g_wp_tinker: array<f64> = [
 // Bellows pump shotgun — fat fore-end, tube under a wide barrel, shell saddle.
 let g_wp_bellows: array<f64> = [
     0.0,   0.058, 0.050, 0.040, 0.054, 0.135, 0, 1.00,   // receiver
-    0.0,   0.116, 0.050, 0.034, 0.011, 0.130, 3, 1.00,   // receiver top SPEC
+    0.0,   0.116, 0.050, 0.016, 0.011, 0.130, 3, 1.00,   // receiver top SPEC
     0.0,   0.074, 0.300, 0.023, 0.023, 0.145, 1, 0.98,   // barrel (dark bar)
     0.0,   0.074, 0.460, 0.027, 0.027, 0.024, 0, 1.00,   // choke
     0.0,   0.028, 0.300, 0.017, 0.017, 0.140, 1, 0.94,   // magazine tube
@@ -2076,11 +2290,11 @@ let g_wp_bellows: array<f64> = [
     0.0,  -0.038,-0.030, 0.028, 0.058, 0.036, 2, 0.92,   // grip
     0.0,   0.006, 0.028, 0.022, 0.008, 0.032, 1, 0.90,   // trigger guard
     0.0,   0.052,-0.125, 0.030, 0.046, 0.115, 2, 0.94,   // stock
-    0.0,   0.048,-0.240, 0.036, 0.060, 0.026, 1, 0.90,   // butt pad (dark)
-    0.0,   0.106,-0.155, 0.026, 0.015, 0.072, 3, 0.98,   // comb line SPEC
+    0.0,   0.048,-0.240, 0.036, 0.060, 0.026, 2, 0.90,   // butt pad (FURN)
+    0.0,   0.106,-0.155, 0.012, 0.015, 0.072, 3, 0.98,   // comb line SPEC
    -0.044, 0.070,-0.060, 0.010, 0.028, 0.062, 2, 0.92,   // shell saddle LEFT
    -0.052, 0.088,-0.060, 0.013, 0.013, 0.054, 0, 0.94,   // saddle shells
-    0.044, 0.048, 0.050, 0.008, 0.018, 0.034, 1, 0.96,   // ejection port RIGHT
+   -0.044, 0.048, 0.050, 0.008, 0.018, 0.034, 1, 0.96,   // ejection port (visible flank)
     0.0,   0.020, 0.050, 0.032, 0.014, 0.042, 1, 0.92,   // loading gate underside
     0.0,   0.074, 0.155, 0.027, 0.026, 0.028, 0, 0.98,   // barrel ring
     0.0,   0.110,-0.030, 0.016, 0.010, 0.032, 3, 1.00,   // rear rib SPEC
@@ -2090,33 +2304,33 @@ let g_wp_bellows: array<f64> = [
 // Longshadow marksman — very long barrel, big scope, splayed bipod.
 let g_wp_longshadow: array<f64> = [
     0.0,   0.056, 0.020, 0.034, 0.050, 0.165, 0, 1.00,   // receiver
-    0.0,   0.110, 0.020, 0.030, 0.011, 0.155, 3, 1.00,   // rail SPEC
+    0.0,   0.110, 0.020, 0.014, 0.011, 0.155, 3, 1.00,   // rail SPEC
     0.0,   0.060, 0.320, 0.016, 0.016, 0.155, 1, 0.98,   // barrel mid (dark)
     0.0,   0.060, 0.560, 0.013, 0.013, 0.090, 1, 0.98,   // barrel front (dark)
     0.0,   0.060, 0.670, 0.022, 0.022, 0.028, 0, 1.00,   // muzzle brake
-    0.0,   0.156, 0.060, 0.022, 0.022, 0.115, 1, 1.00,   // scope tube (dark)
+    0.0,   0.156, 0.060, 0.022, 0.022, 0.115, 0, 1.00,   // scope tube (BODY)
     0.0,   0.156, 0.180, 0.029, 0.029, 0.024, 0, 1.00,   // objective bell
     0.0,   0.156,-0.062, 0.026, 0.026, 0.022, 0, 1.00,   // eyepiece
-    0.0,   0.183, 0.060, 0.018, 0.010, 0.100, 3, 1.00,   // scope top SPEC
+    0.0,   0.183, 0.060, 0.010, 0.010, 0.100, 3, 1.00,   // scope top SPEC
     0.0,   0.128, 0.100, 0.013, 0.016, 0.015, 2, 0.96,   // front ring
     0.0,   0.128,-0.020, 0.013, 0.016, 0.015, 2, 0.96,   // rear ring
     0.0,   0.054, 0.205, 0.030, 0.032, 0.060, 2, 0.96,   // handguard
    -0.058, 0.004, 0.285, 0.009, 0.052, 0.009, 1, 0.90,   // bipod LEFT leg
     0.058, 0.004, 0.285, 0.009, 0.052, 0.009, 1, 0.90,   // bipod RIGHT leg
-    0.046, 0.072,-0.030, 0.013, 0.011, 0.032, 3, 1.00,   // bolt handle SPEC
+   -0.046, 0.072,-0.030, 0.013, 0.011, 0.032, 3, 1.00,   // bolt handle SPEC (visible flank)
     0.0,  -0.042,-0.012, 0.026, 0.056, 0.036, 2, 0.92,   // thumbhole grip
     0.0,  -0.024, 0.105, 0.024, 0.034, 0.040, 2, 0.90,   // magazine
     0.0,   0.052,-0.165, 0.028, 0.044, 0.120, 2, 0.94,   // stock
-    0.0,   0.048,-0.292, 0.032, 0.058, 0.026, 1, 0.90,   // butt (dark)
-    0.0,   0.108,-0.195, 0.024, 0.016, 0.078, 3, 0.98    // cheek riser SPEC
+    0.0,   0.048,-0.292, 0.032, 0.058, 0.026, 2, 0.90,   // butt (FURN)
+    0.0,   0.108,-0.195, 0.012, 0.016, 0.078, 3, 0.98    // cheek riser SPEC
 ];
 
 // Kestrel revolver — fat cylinder, top strap, ejector rod on ONE side, no stock.
 let g_wp_kestrel: array<f64> = [
     0.0,   0.060, 0.020, 0.022, 0.032, 0.062, 0, 1.00,   // frame
-    0.0,   0.097, 0.020, 0.020, 0.010, 0.060, 3, 1.00,   // top strap SPEC
+    0.0,   0.097, 0.020, 0.011, 0.010, 0.060, 3, 1.00,   // top strap SPEC
     0.0,   0.060, 0.015, 0.038, 0.038, 0.040, 0, 1.00,   // CYLINDER (fat, central)
-    0.0,   0.100, 0.015, 0.028, 0.011, 0.034, 3, 1.00,   // cylinder flute SPEC
+    0.0,   0.100, 0.015, 0.014, 0.011, 0.034, 3, 1.00,   // cylinder flute SPEC
     0.0,   0.060, 0.115, 0.014, 0.014, 0.062, 1, 0.98,   // barrel (dark)
     0.0,   0.060, 0.184, 0.018, 0.018, 0.013, 0, 1.00,   // muzzle crown
     0.0,   0.088, 0.115, 0.008, 0.010, 0.058, 3, 1.00,   // barrel top rib SPEC
@@ -2124,26 +2338,26 @@ let g_wp_kestrel: array<f64> = [
     0.0,   0.096,-0.032, 0.011, 0.011, 0.011, 1, 1.00,   // rear notch
    -0.032, 0.034, 0.095, 0.011, 0.011, 0.050, 1, 0.96,   // ejector rod LEFT
    -0.032, 0.034, 0.152, 0.014, 0.014, 0.011, 0, 0.98,   // ejector head LEFT
-    0.028, 0.058, 0.000, 0.008, 0.022, 0.026, 1, 0.94,   // loading gate RIGHT
+   -0.028, 0.058, 0.000, 0.008, 0.022, 0.026, 1, 0.94,   // loading gate (visible flank)
     0.0,   0.090,-0.058, 0.013, 0.017, 0.017, 3, 1.00,   // hammer spur SPEC
     0.0,   0.062,-0.058, 0.015, 0.019, 0.015, 0, 1.00,   // hammer body
     0.0,   0.012, 0.008, 0.014, 0.022, 0.009, 1, 0.92,   // trigger
     0.0,   0.002, 0.008, 0.021, 0.008, 0.032, 1, 0.90,   // guard bar
     0.0,  -0.048,-0.034, 0.026, 0.062, 0.034, 2, 0.92,   // grip
     0.0,  -0.106,-0.056, 0.022, 0.030, 0.030, 2, 0.88,   // grip heel
-    0.028,-0.048,-0.034, 0.007, 0.050, 0.028, 2, 0.94,   // grip panel RIGHT only
+   -0.028,-0.048,-0.034, 0.007, 0.050, 0.028, 2, 0.94,   // grip panel (visible flank)
     0.0,  -0.030,-0.062, 0.020, 0.044, 0.010, 3, 0.94    // backstrap SPEC
 ];
 
 // Emberlance — fat launcher tube with a side drum and a front grip.
 let g_wp_emberlance: array<f64> = [
     0.0,   0.070, 0.100, 0.044, 0.044, 0.185, 0, 1.00,   // main tube
-    0.0,   0.122, 0.100, 0.034, 0.011, 0.176, 3, 1.00,   // tube top SPEC
+    0.0,   0.122, 0.100, 0.016, 0.011, 0.176, 3, 1.00,   // tube top SPEC
     0.0,   0.070, 0.330, 0.054, 0.054, 0.046, 0, 1.00,   // muzzle bell
     0.0,   0.070,-0.110, 0.048, 0.048, 0.032, 0, 0.98,   // breech cap
-    0.056, 0.070, 0.020, 0.028, 0.056, 0.056, 2, 0.94,   // DRUM, right side
-    0.056, 0.070, 0.020, 0.032, 0.032, 0.064, 3, 0.92,   // drum band SPEC
-    0.056, 0.070, 0.020, 0.021, 0.021, 0.076, 1, 0.96,   // drum axle (dark)
+   -0.056, 0.070, 0.020, 0.028, 0.056, 0.056, 2, 0.94,   // DRUM, visible flank
+   -0.056, 0.070, 0.020, 0.032, 0.032, 0.064, 3, 0.92,   // drum band SPEC
+   -0.056, 0.070, 0.020, 0.021, 0.021, 0.076, 1, 0.96,   // drum axle (dark)
     0.0,   0.134, 0.020, 0.013, 0.013, 0.052, 1, 1.00,   // top sight rail
     0.0,   0.156, 0.020, 0.009, 0.011, 0.015, 1, 1.00,   // sight post
     0.0,  -0.038,-0.020, 0.028, 0.058, 0.036, 2, 0.92,   // grip
@@ -2151,9 +2365,9 @@ let g_wp_emberlance: array<f64> = [
     0.0,   0.006, 0.165, 0.026, 0.048, 0.028, 2, 0.94,   // front grip
     0.0,   0.030, 0.165, 0.032, 0.015, 0.032, 1, 0.94,   // front grip collar
     0.0,   0.070,-0.200, 0.028, 0.036, 0.062, 2, 0.94,   // stock
-    0.0,   0.066,-0.272, 0.034, 0.048, 0.026, 1, 0.90,   // butt (dark)
-   -0.048, 0.070, 0.145, 0.011, 0.026, 0.072, 2, 0.92,   // LEFT heat shield
-   -0.048, 0.106, 0.145, 0.009, 0.011, 0.064, 3, 0.96,   // shield rib SPEC
+    0.0,   0.066,-0.272, 0.034, 0.048, 0.026, 2, 0.90,   // butt (FURN)
+    0.048, 0.070, 0.145, 0.011, 0.026, 0.072, 2, 0.92,   // heat shield, far side
+    0.048, 0.106, 0.145, 0.009, 0.011, 0.064, 3, 0.96,   // shield rib SPEC
     0.0,   0.070, 0.245, 0.048, 0.048, 0.017, 0, 0.98,   // barrel band
     0.0,   0.070, 0.000, 0.048, 0.048, 0.017, 0, 0.98,   // rear band
     0.0,   0.024, 0.100, 0.032, 0.017, 0.062, 1, 0.92    // underside rail
@@ -2342,7 +2556,25 @@ fn mg_lift_floor(p_m, p_floor: f64, p_knee: f64): i32 {
 // three so that every face the player sees gets SOME key and none of them is
 // left on fill alone — which is what a straight-down key did, and why the first
 // two attempts at this fix rendered as a flat mass.
-let g_mg_vm_lx: f64 = 0.500; let g_mg_vm_ly: f64 = 0.570; let g_mg_vm_lz: f64 = -0.652;
+//
+// ROUND-4 CORRECTION — THE KEY WAS AIMED AT THE CULLED HEMISPHERE.
+//
+// Everything above is the right idea pointed 180 degrees the wrong way. The
+// three faces listed above (+Y top, -Z rear, +X flank) are the three the
+// rasteriser REJECTS; the drawn set is (-Y, +Z, -X). Measured, by building the
+// weapon as 6-triangle shells of each set in turn and reading `tris.drawn`:
+// +Y/-Z/+X gives 0 drawn and a blank screen, -Y/+Z/-X gives 120 drawn and the
+// weapon. It is also what the pixels said all along: the effective vertex
+// luminance the rasteriser samples, recovered per pixel by dividing the real
+// render by a white-albedo calibration render, has median 72 — and 72 is what
+// the -Y / +Z / -X faces bake to, while the +Y / -Z / +X set the rig was aimed
+// at bakes to an area-weighted 165.
+//
+// So the key is negated. Nothing else about the rig changes: same 9:1 ratio,
+// same exposure floor, same hue handling. Every drawn face now gets a real
+// key term (ndl 0.57 / 0.65 / 0.50 on -Y / +Z / -X before the cant) instead of
+// zero, which is the other half of why the weapon was a dark lump.
+let g_mg_vm_lx: f64 = -0.500; let g_mg_vm_ly: f64 = -0.570; let g_mg_vm_lz: f64 = 0.652;
 
 // The rig is specified as a VALUE RATIO, not as a pair of colours, because the
 // world's ambient/sun split cannot produce one:
@@ -2662,6 +2894,14 @@ export fn meshgen_build_all(): i32 {
         i++;
     }
 
+    // The two viewmodel materials are texel windows inside the cells the
+    // harness bound to MG_MAT_METAL and MG_MAT_SPEC, resolved HERE — after
+    // `art_bind_materials` has run and before a single weapon vertex is
+    // written. See the MG_MAT_VMSKIN block at the top of this file for the
+    // atlas measurements that chose these two rectangles.
+    mg_uv_window(MG_MAT_VMSKIN, MG_MAT_METAL, 10.0, 4.0, 17.0, 11.0);
+    mg_uv_window(MG_MAT_VMRAIL, MG_MAT_SPEC,  22.0, 2.0, 29.0,  3.0);
+
     let three_q: f64 = 0.62;      // 3/4 view for props and characters
     let side: f64 = 1.5708;       // weapons read side-on
 
@@ -2727,12 +2967,16 @@ export fn meshgen_build_all(): i32 {
     mesh_begin(g_mg_mesh[MESH_NPC]); build_npc(g_mg_mesh[MESH_NPC]); mg_finish(MESH_NPC);
 
     // ---- viewmodels -----------------------------------------------------
-    mg_register(MESH_SPARROW_VM,    "sparrow_vm",    260, MG_KIND_WEAPON, side, 300);
-    mg_register(MESH_TINKER_VM,     "tinker_vm",     260, MG_KIND_WEAPON, side, 300);
-    mg_register(MESH_BELLOWS_VM,    "bellows_vm",    260, MG_KIND_WEAPON, side, 300);
-    mg_register(MESH_LONGSHADOW_VM, "longshadow_vm", 260, MG_KIND_WEAPON, side, 300);
-    mg_register(MESH_KESTREL_VM,    "kestrel_vm",    260, MG_KIND_WEAPON, side, 300);
-    mg_register(MESH_EMBERLANCE_VM, "emberlance_vm", 260, MG_KIND_WEAPON, side, 300);
+    // 20 parts x 6 tris. `mg_vm_shell` deletes the three faces a viewmodel can
+    // never turn toward the eye, so the budget is 120 submitted rather than 240
+    // submitted / 120 drawn. The cap stays generous for a future weapon with
+    // more parts; the round-4 task ceiling is 140.
+    mg_register(MESH_SPARROW_VM,    "sparrow_vm",    120, MG_KIND_WEAPON, side, 160);
+    mg_register(MESH_TINKER_VM,     "tinker_vm",     120, MG_KIND_WEAPON, side, 160);
+    mg_register(MESH_BELLOWS_VM,    "bellows_vm",    120, MG_KIND_WEAPON, side, 160);
+    mg_register(MESH_LONGSHADOW_VM, "longshadow_vm", 120, MG_KIND_WEAPON, side, 160);
+    mg_register(MESH_KESTREL_VM,    "kestrel_vm",    120, MG_KIND_WEAPON, side, 160);
+    mg_register(MESH_EMBERLANCE_VM, "emberlance_vm", 120, MG_KIND_WEAPON, side, 160);
     let w: i32 = MESH_SPARROW_VM;
     while (w <= MESH_EMBERLANCE_VM) {
         mesh_begin(g_mg_mesh[w]);

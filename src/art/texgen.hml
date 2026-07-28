@@ -140,11 +140,65 @@ export let CELL_PAINT_OCHRE = 37;
 export let CELL_WINDOW      = 38;
 export let CELL_DOOR        = 39;
 
+// ---------------------------------------------------------------------------
+// ROW 5 — DECALS.  These are NOT materials and they are NOT sampled opaquely.
+// ---------------------------------------------------------------------------
+// Cells 0..39 are surfaces: every texel is opaque and the vertex colour only
+// darkens them.  Cells 40 and 41 are the first two GROUND-CONTACT DECALS, and
+// they are the only cells in ATLAS_WORLD that carry a real alpha ramp.
+//
+// WHY THAT IS LEGAL, AND WHY IT IS THE WHOLE POINT.  `shot.hml` uploads
+// ATLAS_WORLD with `BLEND_BLEND` (its own §6 comment says so), so SDL composites
+// a world texel as `dst = src*srcA + dst*(1-srcA)` with `srcA = texel.a *
+// vertex.a / 255`.  Every generator before this one writes `a = 255` and so
+// never notices.  A shadow, though, is not a surface — it is a *modifier of the
+// surface underneath it*, and the only way to author one that fades out instead
+// of ending on a hard rectangle is to put the falloff in ALPHA.
+//
+// This matters because the round-3 critique was, verbatim, that contact shadows
+// "read as detached blue-grey smears a metre in front of the object that cast
+// them".  Two separate faults produced that sentence and only one of them is
+// placement:
+//
+//   1. PLACEMENT (not this file).  `tools/shot.hml`'s `sm_shadow` offsets the
+//      whole far edge of the quad down-sun by `p_len` metres.  Reported.
+//   2. THE DECAL ART (this file).  There *was no decal art*.  `sm_shadow` draws
+//      `CELL_DIRT` and `meshgen.hml`'s `MESH_BLOB` draws `CELL_CONCRETE` —
+//      i.e. both "shadows" in the project are lit ground materials with mortar
+//      joints and clods in them, tinted dark and butted against the grass on a
+//      hard polygon edge.  A hard-edged rectangle of a DIFFERENT MATERIAL is
+//      exactly what the eye reads as "a smear pasted on the hill", and no
+//      amount of re-aiming the quad fixes it, because the edge is the tell.
+//
+// So the two cells below are the missing art: a soft-edged occlusion blob and a
+// wall-foot skirt, both of which fade to `a = 0` at their rim and therefore have
+// NO edge at all.  They are shaped for the two consumers that exist:
+//
+//   CELL_SHADOW    the alpha field is an L1 (diamond) falloff, because
+//                  `meshgen.hml`'s `build_blob` maps the kite's four corners to
+//                  uv (0.5,0) (1,0.5) (0.5,1) (0,0.5) — the quad samples exactly
+//                  the inscribed diamond |u-0.5| + |v-0.5| <= 0.5, so an L1
+//                  falloff that reaches zero on that boundary reaches zero on
+//                  every edge of the kite.  A Euclidean falloff would leave
+//                  a ~74/255 step along the kite's four edges.  Drawn on a
+//                  plain square quad instead it is a soft diamond blob, which
+//                  is also correct for a building skirt corner.
+//   CELL_AO_SKIRT  alpha 255 along v = 1 falling to 0 at v ~ 0.55 and above,
+//                  wrapping horizontally, so a 1-quad band laid along a wall
+//                  foot darkens the ground into the wall and dies out upwards.
+//                  This is the "darken the ground where it meets a vertical
+//                  surface" half, which no cell in this atlas could express.
+//
+// NEITHER CELL IS SAMPLED BY ANYTHING YET.  Binding them costs one line each in
+// files this task does not own; the exact lines are in the task report.
+export let CELL_SHADOW      = 40;
+export let CELL_AO_SKIRT    = 41;
+
 export let CELL_DEBUG_GRID  = 61;
 
-// Rows 5-7 (entity skins, weapon skins, decals and signage) are not produced
+// The rest of rows 5-7 (entity skins, weapon skins, signage) are not produced
 // here: ARCHITECTURE §5 gives texgen exactly the eight world-surface generators
-// and those cells belong to later tasks.  They are left untouched.
+// and those cells belong to later tasks.  They are left as the magenta tile.
 
 // ---------------------------------------------------------------------------
 // palette families — for the "<= 2 families plus black" rule
@@ -445,6 +499,38 @@ fn put(p_a: object, p_x: i32, p_y: i32, p_i: i32) {
     d[o + 1] = g_lg[i];
     d[o + 2] = g_lb[i];
     d[o + 3] = 255;
+}
+
+// The decal writer: the same LUT index `put` takes, plus an explicit alpha.
+// Kept separate so that the 40 material generators cannot accidentally emit a
+// non-opaque texel — `put` still hard-writes 255 and always will.
+fn put_a(p_x: i32, p_y: i32, p_i: i32, p_a: i32) {
+    let i: i32 = p_i;
+    if (i < 0) { return; }
+    if (i >= TG_LUT_MAX) { return; }
+    if (p_x < 0) { return; }
+    if (p_y < 0) { return; }
+    if (p_x >= g_tw) { return; }
+    if (p_y >= g_th) { return; }
+    let al: i32 = p_a;
+    if (al < 0) { al = 0; }
+    if (al > 255) { al = 255; }
+    let d = g_data;
+    let o: i32 = ((g_oy + p_y) * g_aw + (g_ox + p_x)) * 4;
+    d[o] = g_lr[i];
+    d[o + 1] = g_lg[i];
+    d[o + 2] = g_lb[i];
+    d[o + 3] = al;
+}
+
+// Is this cell a decal (alpha-carrying) rather than a material?  The self-test
+// swaps its assertion set on this.
+export fn texgen_cell_is_decal(p_cell: i32): i32 {
+    let c: i32 = p_cell;
+    let out: i32 = 0;
+    if (c == CELL_SHADOW) { out = 1; }
+    if (c == CELL_AO_SKIRT) { out = 1; }
+    return out;
 }
 
 // Record which families this tile used, so the self-test can check the
@@ -1760,17 +1846,78 @@ export fn tg_leaf(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
         }
     }
 
-    // Small clumps = individual leaf masses.  8 texels ~ 32 cm of canopy.
+    // -----------------------------------------------------------------------
+    // WHY THIS TILE GREW A SECOND SCALE AND AN EMBOSS
+    // -----------------------------------------------------------------------
+    // Round 3's critique was "three identical lollipop trees".  Half of that is
+    // mesh silhouette, which this file does not own.  The other half is
+    // measurable here and it was entirely real: built from one period-8 field,
+    // LEAF_PINE measured the FLATTEST coarse structure of all 41 tiles —
+    // 4-texel band 9.7 and 8-texel band 6.3, against 14.9 / 9.0 for GRASS_A and
+    // 23.8 / 21.9 for CONCRETE.  A canopy is drawn as two or three flat panels
+    // ~30 x 12 px on screen, each one mapping the WHOLE cell, so a tile with no
+    // structure above 8 texels puts a uniform green plate on screen.  That
+    // plate is the lollipop.
+    //
+    // Two things fix it and neither costs a triangle:
+    //
+    //  1. A CANOPY-MASS FIELD at period 16 — the coarsest a 32-texel tile can
+    //     carry, because `fld_fbm`'s lattice is `32 / period` and period 32
+    //     degenerates to a single lattice point, i.e. a constant.  This is the
+    //     "one side of the crown is in light, the other is not" term.
+    //  2. AN EMBOSS along -y on that same field, exactly the trick `tg_grass`
+    //     already uses on its tussocks: a central difference gives every mass a
+    //     lit upper edge and a shaded lower one.  A leaf mass with a top and a
+    //     bottom is a volume; without it, foliage is wallpaper.
+    //
+    // The emboss also RAISES the coarse Haar bands, so the E1/Ec shimmer ratio
+    // this file guards gets better rather than worse.
     let per: i32 = 8;
     if (v == 3) { per = 4; }
     let voidt: f64 = 0.950;
     if (v == 3) { voidt = 0.925; }
 
+    // Per-variant weights.  These are what make the four foliage cells four
+    // different plants instead of one green at four brightnesses: DECID is
+    // broad soft masses, PINE is layered fronds, AUTUMN is loose and clumpy,
+    // BUSH is dense and fine.
+    let cw: f64 = 0.44;         // weight on the canopy-mass field
+    let ke: f64 = 0.58;         // emboss weight
+    let sh: f64 = 1.55;         // sharpening of the composite
+    if (v == 1) { cw = 0.50; ke = 0.72; sh = 1.42; }   // PINE
+    if (v == 2) { cw = 0.40; ke = 0.52; sh = 1.62; }   // AUTUMN
+    if (v == 3) { cw = 0.34; ke = 0.44; sh = 1.70; }   // BUSH
+    if (v == 4) { cw = 0.38; ke = 0.50; sh = 1.66; }   // NS FLORA
+
     fld_fbm(g_fa, per, sd + SEED_LEAF, 3);
+    fld_norm(g_fa, 0.20);
+
+    if (v == 1) {
+        // PINE only: the masses are FRONDS — coarse across, fine down — so the
+        // crown reads as stacked horizontal layers rather than as a shrub.
+        // 16 x 4 both divide 32, so it still wraps (see fld_fbm_a's note).
+        fld_fbm_a(g_fb, 16, 4, sd + SEED_LEAF + 61, 2);
+    } else {
+        fld_fbm(g_fb, 16, sd + SEED_LEAF + 61, 2);
+    }
+    fld_norm(g_fb, 0.20);
+
+    let bw: f64 = 1.0 - cw;
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        let up: i32 = ((y - 1) % g_th + g_th) % g_th * g_tw;
+        let dn: i32 = ((y + 1) % g_th + g_th) % g_th * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let e: f64 = g_fb[up + x] - g_fb[dn + x];
+            g_fd[base + x] = g_fa[base + x] * bw + g_fb[base + x] * cw + e * ke;
+        }
+    }
+    fld_norm(g_fd, 0.215);
+
     for (let y = 0; y < g_th; y++) {
         let base: i32 = y * g_tw;
         for (let x = 0; x < g_tw; x++) {
-            let n: f64 = ctr(g_fa[base + x], 1.75);
+            let n: f64 = ctr(g_fd[base + x], sh);
             n = tg_grain(n, x, y, sd + 109);
             let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
             // DARK VOIDS: gaps between leaves.  Kept to 2-texel clusters so they
@@ -1866,6 +2013,169 @@ export fn tg_snow(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
 // reaches a screenshot must be impossible to miss (CLAUDE.md §9.7).  It is an
 // 8-texel checker, not a 1-texel one, so it does not itself shimmer.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ROW 5 — THE GROUND-CONTACT DECALS
+// ---------------------------------------------------------------------------
+// See the CELL_SHADOW / CELL_AO_SKIRT declarations for why these exist and why
+// they are the only alpha-carrying cells in the atlas.  Three shared choices:
+//
+// THE OCCLUSION COLOUR IS COOL AND IT IS A VALUE RAMP, NOT A FLAT TONE.  §8 of
+// CLAUDE.md: "sky and shadows are cool".  The ramp runs GRANITE_LO darkened to
+// 0.78-of-the-way-to-UI_BLACK (luminance 29) up to GRANITE_LO itself (93), one
+// palette family, eight steps, dithered by the same Bayer path every material
+// uses.  A shadow with a value ramp in it reads as an occlusion gradient; a
+// shadow that is one flat tone reads as a decal of a shadow, which is the exact
+// failure the critic named.
+//
+// ALPHA IS QUANTIZED TO 16 LEVELS AND BAYER-DITHERED, NOT LEFT SMOOTH.  A
+// continuous 0..255 alpha ramp is not a thing a 1998 renderer produced and it
+// bands anyway once it lands on 8-bit destination pixels.  16 levels + the 4x4
+// ordered dither is the same treatment §7.3 gives every value boundary in this
+// file, and it makes the rim dissolve into the ground instead of stepping.
+//
+// THE RIM REACHES EXACTLY ZERO.  Not 8, not 4.  A decal that ends at alpha 8 is
+// a decal with a visible edge, and the edge is what makes an object read as
+// pasted on.  Both generators are written so the boundary texel is 0 by
+// construction rather than by luck.
+// ---------------------------------------------------------------------------
+
+// Shared: the cool 8-step occlusion ramp, slots 0 (deepest) .. 7 (rim).
+fn tg_occl_ramp() {
+    tg_base(tg_mix(g_GRANITE_LO, g_UI_BLACK, 0.78), FAM_GRANITE,
+            tg_mix(g_GRANITE_LO, g_UI_BLACK, 0.42), FAM_GRANITE,
+            g_GRANITE_LO, FAM_GRANITE, 4);
+}
+
+// Shared: 16-level ordered-dither of a 0..1 coverage into a 0..255 alpha.
+fn tg_alpha_dither(p_s: f64, p_x: i32, p_y: i32): i32 {
+    let s: f64 = clampf(p_s, 0.0, 1.0);
+    let q: f64 = s * 15.0;
+    let qi: i32 = i32(floor(q));
+    if (qi < 0) { qi = 0; }
+    if (qi > 15) { qi = 15; }
+    if (q - f64(qi) > bayer4(p_x, p_y)) { qi = qi + 1; }
+    if (qi > 15) { qi = 15; }
+    let out: i32 = qi * 17;
+    return out;
+}
+
+// CELL_SHADOW — the contact / cast occlusion blob.
+//
+// The alpha field is `f(t) * g(v)` where
+//   t = 1 - 2*(|u-0.5| + |v-0.5|)   is the L1 depth inside the inscribed
+//                                    diamond: 1 at the centre, 0 on the
+//                                    diamond boundary, negative outside it;
+//   g(v)                            biases the density toward the UP-SUN half
+//                                    (v -> 1), which is where the caster's own
+//                                    footprint sits in `build_blob`'s uv layout.
+// `meshgen.hml` already carries a core/tail split in VERTEX colour along the
+// same axis, so the two compound instead of fighting: the waist and the up-sun
+// tip get a dense dark contact patch, the down-sun tip a thin pale cast tail.
+//
+// A hash perturbation of t breaks the perfect ellipse — a mathematically
+// circular shadow under a chunky low-poly prop is its own kind of sticker — but
+// it is applied to t BEFORE the boundary clamp, so the rim still lands on zero.
+export fn tg_shadow_decal(p_a: object, p_cell: i32, p_seed: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    tile_begin(a, p_cell);
+    tg_occl_ramp();
+    tg_grain_amt(3);
+
+    // The lumpiness field: period 8, one octave pair, so it wobbles the rim on
+    // a ~4-texel scale and never on a 1-texel one.
+    fld_fbm(g_fa, 8, sd + SEED_STONE + 17, 2);
+    fld_norm(g_fa, 0.16);
+
+    let inv: f64 = 1.0 / f64(g_tw);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        let v: f64 = (f64(y) + 0.5) * inv;
+        let dv: f64 = v - 0.5;
+        if (dv < 0.0) { dv = 0.0 - dv; }
+        // g(v): 0.68 at the down-sun tip (v = 0), 1.0 from the waist up.
+        let gv: f64 = 0.68 + 0.32 * clampf(v * 2.0, 0.0, 1.0);
+        for (let x = 0; x < g_tw; x++) {
+            let u: f64 = (f64(x) + 0.5) * inv;
+            let du: f64 = u - 0.5;
+            if (du < 0.0) { du = 0.0 - du; }
+            let t: f64 = 1.0 - 2.0 * (du + dv);
+            if (t < 0.0) { t = 0.0; }
+            // ⚠ THE LUMPINESS IS MULTIPLICATIVE, NOT ADDITIVE.  An additive
+            // wobble pushes texels ON the diamond boundary back above zero —
+            // measured, 8 of them — and eight opaque texels sitting on the
+            // kite's own edge is a hard rim, which is the exact defect this
+            // cell exists to remove.  Scaling by `t` makes the wobble vanish
+            // into the rim, so alpha 0 on the boundary is guaranteed by the
+            // algebra rather than by a clamp that fires afterwards.
+            t = t * (1.0 + (g_fa[base + x] - 0.5) * 0.90);
+            if (t < 0.0) { t = 0.0; }
+            if (t > 1.0) { t = 1.0; }
+            // plateau over the inner 62 %, smoothstep over the rest
+            let s: f64 = t * 1.612903225806452;
+            if (s > 1.0) { s = 1.0; }
+            s = s * s * (3.0 - 2.0 * s);
+            s = s * gv;
+            put_a(x, y, tg_ramp_pick(g_ramp, TG_RAMP_N,
+                                     tg_grain(1.0 - s, x, y, sd + 71), x, y),
+                  tg_alpha_dither(s, x, y));
+        }
+    }
+    tile_end(p_cell);
+}
+
+// CELL_AO_SKIRT — the wall-foot band.
+//
+// "Buildings have zero darkening where wall meets ground" was the other half of
+// the critique, and no material cell can express it: a wall tile darkens the
+// WALL, and what is missing is darkening on the GROUND, running along the
+// footprint, dying out within half a metre.  This cell is that band.  Laid on a
+// ground-parallel quad hugging a facade (v = 1 at the wall, v = 0 half a metre
+// out) it is opaque against the masonry and gone by the time it reaches open
+// grass, with a noise-wobbled outer edge so the falloff is not a ruled line.
+//
+// It wraps horizontally (the wobble is a period-8 field), so one band quad can
+// run the whole length of a facade at any tiling factor.
+export fn tg_ao_skirt(p_a: object, p_cell: i32, p_seed: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    tile_begin(a, p_cell);
+    tg_occl_ramp();
+    tg_grain_amt(3);
+
+    fld_fbm(g_fa, 8, sd + SEED_STONE + 53, 2);
+    fld_norm(g_fa, 0.18);
+
+    let inv: f64 = 1.0 / f64(g_th);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        let v: f64 = (f64(y) + 0.5) * inv;
+        // 0 at v = 0.50 and below, 1 at the wall line v = 1.  The band is kept
+        // clear of the top quarter by more than the wobble's own amplitude, so
+        // "the skirt dies out before the far edge" is true by construction and
+        // not by luck — the self-test asserts it.
+        let t0: f64 = (v - 0.50) * 2.0;
+        // The wobble is faded out where t0 saturates, so the OUTER edge of the
+        // band is ragged and the wall line itself stays solid.  Measured: with
+        // the wobble applied uniformly the wall-line row came out at mean alpha
+        // 188, i.e. a skirt that is already 26 % transparent where it touches
+        // the masonry, which is exactly the gap the critic saw.
+        let wob: f64 = 1.0 - clampf(t0, 0.0, 1.0);
+        for (let x = 0; x < g_tw; x++) {
+            let t: f64 = t0 + (g_fa[base + x] - 0.5) * 0.62 * wob;
+            if (t < 0.0) { t = 0.0; }
+            if (t > 1.0) { t = 1.0; }
+            // squared, so the darkening hugs the wall line instead of washing
+            // half the quad — AO falls off fast and a linear ramp looks like fog
+            let s: f64 = t * t;
+            put_a(x, y, tg_ramp_pick(g_ramp, TG_RAMP_N,
+                                     tg_grain(1.0 - s, x, y, sd + 73), x, y),
+                  tg_alpha_dither(s, x, y));
+        }
+    }
+    tile_end(p_cell);
+}
+
 export fn tg_debug_grid(p_a: object, p_cell: i32) {
     let a: object = p_a;
     tile_begin(a, p_cell);
@@ -1974,19 +2284,40 @@ export fn texgen_build_world_atlas(p_a: object, p_seed: i32): i32 {
 
     tg_debug_grid(a, CELL_DEBUG_GRID);
 
-    // Rows 5-7 are entity skins, weapon skins, decals and signage: ARCHITECTURE
-    // §5 gives texgen exactly the eight world-surface generators, so those cells
-    // belong to later tasks.  Until then they are the MISSING tile, magenta, not
-    // the buffer's zero-fill: a black cell in a screenshot reads as shadow and
-    // hides the bug, magenta is impossible to miss (CLAUDE.md §9.7).  A later
-    // task simply overwrites the cell.
+    // The rest of rows 5-7 are entity skins, weapon skins and signage:
+    // ARCHITECTURE §5 gives texgen exactly the eight world-surface generators,
+    // so those cells belong to later tasks.  Until then they are the MISSING
+    // tile, magenta, not the buffer's zero-fill: a black cell in a screenshot
+    // reads as shadow and hides the bug, magenta is impossible to miss
+    // (CLAUDE.md §9.7).  A later task simply overwrites the cell.
+    //
+    // ⚠ MISSING RUNS BEFORE THE DECALS.  `tg_missing` goes through
+    // `atlas_px_rgb`, which forces alpha to 255; if it ran afterwards it would
+    // silently make the decals opaque rectangles.
     for (let c = 40; c < 64; c++) {
         if (c != CELL_DEBUG_GRID) { tg_missing(a, c); }
     }
 
+    // row 5 — the ground-contact decals (alpha-carrying; see their declaration)
+    tg_shadow_decal(a, CELL_SHADOW, sd + 51);
+    tg_ao_skirt(a, CELL_AO_SKIRT, sd + 52);
+
+    // ⚠ THIS RETURN IS 41 AND NOT 43 ON PURPOSE.  It counts MATERIAL cells, and
+    // `tools/shot.hml --selftest` pins it with an equality
+    // (`eqi("texgen generated all 41 world tiles", g_world_cells, 41)`).  The
+    // two decals are not materials and are reported separately by
+    // `texgen_decal_count()`.  When the harness owner binds the decals they
+    // should switch that assertion to `texgen_material_count() +
+    // texgen_decal_count()`; changing the number here from a file this task
+    // does not own would red-light a self-test in a file it does not own either.
     let out: i32 = 41;
     return out;
 }
+
+// The two counts the line above talks about, so a caller never has to know
+// which cells happen to be decals.
+export fn texgen_material_count(): i32 { let out: i32 = 41; return out; }
+export fn texgen_decal_count(): i32 { let out: i32 = 2; return out; }
 
 // Was this cell produced by texgen?  The self-test and texview use it to skip
 // the cells that belong to later tasks.
@@ -2004,7 +2335,7 @@ let g_cell_names: array<string> = [
         "WOOD_PLNK", "WOOD_LOG", "BARK", "LEAF_DECID", "LEAF_PINE", "LEAF_AUTMN", "BUSH", "NS_FLORA",
         "CONCRETE", "CONC_STAIN", "BRICK", "METAL_PNL", "METAL_RUST", "GRATE", "PIPE", "VENT",
         "ROOF_TILE", "PLASTER", "FABRIC_RED", "FABRIC_CRM", "PAINT_TEAL", "PAINT_OCHR", "WINDOW", "DOOR",
-        "-", "-", "-", "-", "-", "-", "-", "-",
+        "SHADOW", "AO_SKIRT", "-", "-", "-", "-", "-", "-",
         "-", "-", "-", "-", "-", "-", "-", "-",
         "-", "-", "-", "-", "-", "DEBUG_GRID", "-", "-"
 ];
@@ -2285,6 +2616,78 @@ export fn texgen_self_test(p_a: object): i32 {
     checks = checks + 1;
     if (seam_fail > 0) { fails = fails + seam_fail; }
 
+    // ---- the alpha contract ------------------------------------------------
+    // ATLAS_WORLD is uploaded BLEND, so alpha is live on every cell whether a
+    // generator meant it to be or not.  Three assertions keep that honest:
+    // materials must be fully opaque, and each decal must actually reach both
+    // rails of its own falloff.
+    let opaque_fail: i32 = 0;
+    for (let cell = 0; cell < 64; cell++) {
+        if (texgen_cell_generated(cell) == 0) { continue; }
+        if (texgen_cell_is_decal(cell) != 0) { continue; }
+        let cx: i32 = atlas_cell_x(a, cell);
+        let cy: i32 = atlas_cell_y(a, cell);
+        let bad: i32 = 0;
+        for (let y = 0; y < atlas_cell_h(a); y++) {
+            for (let x = 0; x < atlas_cell_w(a); x++) {
+                let t: u32 = atlas_get(a, cx + x, cy + y);
+                if (i32((t >> 24) & 255) != 255) { bad = bad + 1; }
+            }
+        }
+        if (bad > 0) {
+            opaque_fail = opaque_fail + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: ${bad} non-opaque texels in a MATERIAL cell`);
+        }
+    }
+    checks = checks + 1;
+    if (opaque_fail > 0) { fails = fails + opaque_fail; }
+
+    // CELL_SHADOW: opaque somewhere, and ZERO on and outside the inscribed
+    // diamond, which is the region `meshgen.hml`'s kite maps to its own edges.
+    // A single non-zero texel out there is a hard rim on the decal, which is
+    // the whole defect this cell exists to remove.
+    let sx: i32 = atlas_cell_x(a, CELL_SHADOW);
+    let sy: i32 = atlas_cell_y(a, CELL_SHADOW);
+    let scw: i32 = atlas_cell_w(a);
+    let sch: i32 = atlas_cell_h(a);
+    let amax: i32 = 0;
+    let rim_bad: i32 = 0;
+    for (let y = 0; y < sch; y++) {
+        let v: f64 = (f64(y) + 0.5) / f64(sch) - 0.5;
+        if (v < 0.0) { v = 0.0 - v; }
+        for (let x = 0; x < scw; x++) {
+            let u: f64 = (f64(x) + 0.5) / f64(scw) - 0.5;
+            if (u < 0.0) { u = 0.0 - u; }
+            let al: i32 = i32((atlas_get(a, sx + x, sy + y) >> 24) & 255);
+            if (al > amax) { amax = al; }
+            if (u + v >= 0.5) { if (al != 0) { rim_bad = rim_bad + 1; } }
+        }
+    }
+    checks = checks + 1;
+    if (amax < 255) { fails = fails + 1;
+        print(`  FAIL SHADOW: peak alpha ${amax} < 255 (the contact patch is translucent)`); }
+    checks = checks + 1;
+    if (rim_bad > 0) { fails = fails + 1;
+        print(`  FAIL SHADOW: ${rim_bad} non-zero alpha texels on/outside the inscribed diamond`); }
+
+    // CELL_AO_SKIRT: opaque along the wall line (the last row), gone by the top.
+    let kx: i32 = atlas_cell_x(a, CELL_AO_SKIRT);
+    let ky: i32 = atlas_cell_y(a, CELL_AO_SKIRT);
+    let bot: i32 = 0;
+    let top: i32 = 0;
+    for (let x = 0; x < scw; x++) {
+        bot = bot + i32((atlas_get(a, kx + x, ky + sch - 1) >> 24) & 255);
+        for (let y = 0; y < 8; y++) {
+            top = top + i32((atlas_get(a, kx + x, ky + y) >> 24) & 255);
+        }
+    }
+    checks = checks + 1;
+    if (bot < 200 * scw) { fails = fails + 1;
+        print(`  FAIL AO_SKIRT: wall-line row mean alpha ${divi(bot, scw)} < 200`); }
+    checks = checks + 1;
+    if (top != 0) { fails = fails + 1;
+        print(`  FAIL AO_SKIRT: top quarter carries alpha (mean ${divi(top, scw * 8)}), it must die out`); }
+
     print("---------------------------------------------------------------------------------");
     print(`tiles generated : ${tiles}`);
     if (worst_cell >= 0) {
@@ -2296,8 +2699,9 @@ export fn texgen_self_test(p_a: object): i32 {
 }
 
 export fn texgen_assert_count(): i32 {
-    // 7 per generated tile + 2 dither unit tests + 1 seam sweep
-    let out: i32 = 41 * 7 + 3;
+    // 7 per generated tile (41 materials + 2 decals) + 2 dither unit tests
+    // + 1 seam sweep + 1 material-opacity sweep + 4 decal alpha assertions
+    let out: i32 = 43 * 7 + 8;
     return out;
 }
 

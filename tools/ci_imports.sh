@@ -354,14 +354,39 @@ if [ "$WARNS" -gt 0 ]; then
 fi
 rm -f "$WARNBUF"
 
+# ---------------------------------------------------------------------------
+# R7 — the harness must never carry its own copy of the frame graph.
+#
+# tools/shot.hml currently defines a private `frame_render` because it was built
+# in Wave 2, before src/render/world_render.hml existed. W3-7 re-owns shot.hml
+# and rewires it to the real one. This rule makes forgetting that impossible.
+#
+# Why it is worth a CI rule: Wave 2 shipped a visual harness carrying ~650 lines
+# of STAND-IN ART, so every committed screenshot depicted art the game did not
+# use, and every probe passed. A harness holding a private copy of the thing it
+# is meant to photograph is the same defect one layer up — and a second frame
+# graph would drift from the real one silently, exactly as the art did.
+# ---------------------------------------------------------------------------
+RULE_FAIL[R7]=0
+REAL_FG="$NS_ROOT/src/render/world_render.hml"
+SHOT="$NS_ROOT/tools/shot.hml"
+if [ -f "$REAL_FG" ] && [ -f "$SHOT" ]; then
+    if grep -qE '^[[:space:]]*(export[[:space:]]+)?fn[[:space:]]+frame_render[[:space:]]*\(' "$SHOT"; then
+        err R7 "tools/shot.hml defines its own frame_render, but src/render/world_render.hml exists. The harness MUST import the real frame graph (W3-7) or it will silently drift from the game."
+    fi
+    if ! grep -qE 'from[[:space:]]+"\.\./src/render/world_render\.hml"' "$SHOT"; then
+        err R7 "tools/shot.hml does not import src/render/world_render.hml. It must render through the REAL frame path, never a parallel one."
+    fi
+fi
+
 echo
 printf '   files=%d imports=%d warnings=%d hex-exemptions=%d\n' \
        "$N_FILES" "$N_IMPORTS" "$WARNS" "$HEX_EXEMPT"
-for r in R1 R2 R3 R4 R5 R6; do
+for r in R1 R2 R3 R4 R5 R6 R7; do
     if [ "${RULE_FAIL[$r]}" -eq 0 ]; then printf '   %-3s PASS\n' "$r"
     else printf '   %-3s FAIL (%d)\n' "$r" "${RULE_FAIL[$r]}"; fi
 done
-echo "   RULES 6/6 checked"
+echo "   RULES 7/7 checked"
 if [ "$FAIL" -ne 0 ]; then echo "CI_IMPORTS FAIL"; exit 1; fi
 echo "CI_IMPORTS PASS"
 exit 0
