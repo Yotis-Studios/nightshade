@@ -100,6 +100,87 @@ and local names to fresh uniques at the inline site before substitution.
 
 ---
 
+## 🔴 H-7 — `ptr == null` is FALSE in compiled code for a NULL pointer returned from FFI
+### Live on `main` (`cb7fbfaa`). Silent wrong behaviour, not a crash. **Worst severity so far.**
+
+An FFI function that returns a NULL `ptr` compares **false** against `null` when
+compiled, and **true** when interpreted:
+
+```hemlock
+import "libSDL2-2.0.so.0";
+extern fn SDL_Init(f: u32): i32;
+extern fn SDL_GetWindowFromID(id: u32): ptr;   // returns NULL for a bogus id
+fn main() {
+    SDL_Init(32);
+    let p = SDL_GetWindowFromID(999999);        // guaranteed NULL
+    print(`p == null       -> ${p == null}`);
+    print(`p == ptr_null() -> ${p == ptr_null()}`);
+}
+main();
+```
+```
+compiled     : p == null -> false     p == ptr_null() -> true      <-- WRONG
+interpreted  : p == null -> true      p == ptr_null() -> true
+```
+
+`typeof(p)` is `"ptr"` in both. So the value is a null pointer; only the `== null`
+comparison disagrees.
+
+### Why this is the most dangerous issue in this file
+It silently disables error handling. Every guard of the form
+`if (handle == null) { ...fail... }` is **dead code in a compiled build**, so a
+failed allocation is carried forward as if it were a valid handle and the program
+dies later, somewhere unrelated.
+
+This was **not hypothetical**: `wobbleweed/src/sdl.hml` at `HEAD` had exactly this
+shape at four sites — `if (win == null)`, `if (ren == null)`, `if (tex == null)` —
+so a failed `SDL_CreateWindow` or `SDL_CreateRenderer` was never detected in the
+shipping (compiled) configuration. Found by the Gate 0 auditor; independently
+reproduced by the orchestrator on a freshly built compiler.
+
+### Workaround (in force across this project)
+**Never compare a `ptr` to `null`. Always use `ptr_null()`.** It is correct on both
+backends. Every Wave-1 module that checks an SDL handle (`batch`, `atlas`,
+`target`, `audio`, `mesh`, `engine`) must obey this.
+
+### Suggested fix
+Make the compiled `==`/`!=` path treat a null `ptr` as equal to `null`, matching
+the interpreter. This is a parity bug — `make parity` should have a test for
+`ptr`-vs-`null` comparison and currently does not.
+
+---
+
+## ⚪ H-8 — `extern fn` resolution is LAZY on both backends (probably by design — but document it)
+
+A program that declares an extern for a symbol that **does not exist** builds and
+runs cleanly, exit 0, on both backends, as long as the function is never called.
+
+Consequence for testing: the acceptance criterion "every declared extern resolves
+at runtime" **cannot** be discharged by a probe exiting 0. It needs either a real
+`dlsym` check or a call-graph coverage argument. Worth one line in the FFI docs,
+since the natural assumption is that binding happens at load.
+
+---
+
+## ❌ NOT A BUG — `u64 >>` divergence (retracted)
+
+Gate 0 reported that `hemlockc` emitted an arithmetic (sign-propagating) right
+shift for `u64` while the interpreter emitted a logical one:
+```
+let b: u64 = 10241477005482035122;  b >> 1
+  compiled: 14344110539595793369    interpreted: 5120738502741017561
+```
+**This does not reproduce on current `main`.** Both backends now return the
+correct `5120738502741017561`, and `(u64 all-ones) >> 60` gives `15` on both.
+
+**Root cause: a stale compiler.** `/usr/local/bin/hemlockc` is dated **July 12**
+and predates both the user's "30+ interpreter/compiler divergences" merge
+(`ed12be28`) and the inliner fix (`e2946c1c`). Agents invoking `hemlockc` from
+`PATH` were testing a two-week-old toolchain. See the toolchain warning at the
+top of `CLAUDE.md`.
+
+---
+
 ## 🟠 H-2 — `array.sort` is a different algorithm per backend, and the compiled one is O(n²) on sorted input
 
 Reported by the engine recon agent, consistent with observed timings.

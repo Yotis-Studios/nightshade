@@ -3,6 +3,39 @@
 PS1/N64-aesthetic open-world FPS. Hemlock, on the Wobbleweed engine. **Ships compiled.**
 **60 fps is the floor. 2500 triangles is the budget. 320×240 is the resolution.**
 
+---
+
+## 🛑 RULE 0 — VERIFY YOUR COMPILER BEFORE YOU TRUST A MEASUREMENT.
+
+**Status: `PATH` is CURRENT as of 2026-07-27 20:37.** `/usr/local/bin/hemlockc` was refreshed by the
+user and now carries both the inliner fix and the interpreter/compiler divergence fixes. Plain
+`hemlockc` / `hemlock` are fine to use.
+
+**Run this check once per session anyway.** It takes 15 seconds and it already caught one full wave
+of bad data:
+```sh
+cat > /tmp/v.hml <<'EOF'
+fn mix(s: i32): i32 { return s + 7; }
+fn main() { let s: i32 = 100; let b: u64 = 10241477005482035122; print(mix(s)); print(b >> 1); }
+main();
+EOF
+hemlockc /tmp/v.hml -o /tmp/v && /tmp/v      # MUST print 107 then 5120738502741017561
+```
+A stale compiler either fails to build line 1 (the inliner bug, H-1) or prints
+`14344110539595793369` for the shift. If either happens, stop and say so.
+
+> **Why this rule exists.** Through Wave 0, `/usr/local/bin` was dated **July 12** — two weeks behind
+> `main` — and it silently produced *wrong answers rather than errors*. A Gate 0 auditor filed a
+> "`u64 >>` is sign-propagating in the compiler" bug that was **entirely an artifact of that stale
+> binary**, and every Wave 0 performance number had to be re-measured. Fresh source in the repo does
+> not mean fresh binary on `PATH`.
+
+**Corollary:** a toolchain bug is not real until you reproduce it on a compiler built from current
+`main`. Check `docs/HEMLOCK_ISSUES.md` before filing — H-7 (`ptr == null`) is real; the `u64 >>`
+entry is retracted.
+
+If you ever need to bypass `PATH`, the repo build is at `/home/nbeerbower/Projects/hemlock/hemlockc`.
+
 Read before you write code:
 - `docs/ARCHITECTURE.md` — what exists, why, and the exact file list
 - `docs/ENGINE_GAPS.md` — engine work items `G1`–`G22`

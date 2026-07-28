@@ -14,16 +14,26 @@ These were checked directly on this machine. Trust them over inference.
 ## SDL  (UPDATED — the user installed libsdl2-dev + libsdl2-mixer-dev)
 - Headers now present: `/usr/include/SDL2/` (78 files). **Grep these for constants
   and struct offsets — they are authoritative.**
-- ### !!! VERSION SKEW — THE ONE TRAP TO REMEMBER !!!
-  **Headers are SDL 2.0.20. The runtime shared library is still SDL 2.0.18**
-  (`libSDL2-2.0.so.0 -> libSDL2-2.0.so.0.18.2`; `pkg-config --modversion sdl2`
-  reports 2.0.20 and therefore LIES about what will actually load).
-  A symbol can exist in the header and **still fail to resolve at runtime.**
-  **RULE: never call an SDL function added after 2.0.18.** Check the
-  `\version This function is available since SDL 2.0.x` line in the header
-  doc-comment before binding anything new, and smoke-test that the symbol
-  actually resolves. `SDL_RenderGeometry` (2.0.18) is safe — it is exactly at
-  the boundary.
+- ### ~~VERSION SKEW~~ — **RETRACTED. There is no skew. I was wrong.**
+  **Runtime and headers are BOTH SDL 2.0.20.** Verified by calling
+  `SDL_GetVersion()` at runtime -> `2.0.20`, matching
+  `SDL_PATCHLEVEL 20` in the header and `pkg-config --modversion sdl2`.
+
+  **My error:** I inferred "runtime is 2.0.18" from the filename
+  `libSDL2-2.0.so.0.18.2`. That inference is invalid — SDL's shared-object
+  version is deliberately *offset* from the release version, and SDL **2.0.20**
+  ships as `libSDL2-2.0.so.0.18.2`. The `SDL_GetRevision()` hash `b424665e`
+  quoted earlier in this document is likewise the **2.0.20** tag, not 2.0.18.
+
+  **Consequence:** the "never bind anything newer than 2.0.18" rule was based on
+  a false premise. It is retained anyway as a harmless conservative ceiling —
+  and it costs nothing, because `grep "available since SDL 2.0.19\|2.0.20"` over
+  all headers returns **zero hits** (those releases added no new functions).
+  `SDL_RenderGeometry` and `SDL_RenderSetVSync` (both 2.0.18) remain the newest
+  APIs in use.
+
+  **Lesson worth keeping:** do not infer a library's version from its filename.
+  Call the version API.
 - **SDL2_mixer IS available**: headers `/usr/include/SDL2/SDL_mixer.h`, runtime
   `libSDL2_mixer-2.0.so.0` -> **linked version 2.0.4** (verified at runtime).
 
