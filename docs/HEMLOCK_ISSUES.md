@@ -195,7 +195,36 @@ top of `CLAUDE.md`.
 
 ---
 
-## 🟠 H-2 — `array.sort` is a different algorithm per backend, and the compiled one is O(n²) on sorted input
+## ✅ H-2 — `array.sort` is a different algorithm per backend, and the compiled one is O(n²) on sorted input
+### FIXED UPSTREAM in `0950dda5` (PR #629), shipped in **v2.9.1** (`ba41b0bf`).
+### Both backends now use a **stable merge sort**. Re-verified:
+
+```
+                     v2.8 (old)              v2.9.1 (now)
+2000 random           2.95 ms                 <1 ms
+2000 ALREADY SORTED   107 ms                  <1 ms     <- the 36x input-order cliff is gone
+2000 reversed         -                       <1 ms
+2000 all-equal        -                       <1 ms     <- degenerate pivot, previously worst case
+20000 sorted          -                       1 ms
+200000 ALREADY SORTED SEGFAULT (O(n) depth)   4 ms      <- no stack overflow
+```
+All runs verified actually sorted (`out-of-order = 0`).
+
+**Consequence for this project — the bucket sort stays, but for a smaller reason.** Measured at our
+real frame scale (2500 triangles, compiled, baseline subtracted):
+```
+array.sort(closure) : 0.535 ms/frame
+bucket sort (O(n))  : 0.330 ms/frame     -> 1.62x
+```
+So `batch.hml`'s bucket sort wins by **0.2 ms/frame (~1.2 % of the 11 ms render budget)** rather
+than by two orders of magnitude. Keep it — it is faster, O(n), and input-order independent — but
+`array.sort` is now a viable fallback and is safe off the hot path. See `CLAUDE.md` §1.1.
+
+Original analysis follows.
+
+---
+
+## ~~H-2 (original report)~~
 
 Reported by the engine recon agent, consistent with observed timings.
 

@@ -56,7 +56,7 @@ Each is measured. Each has cost someone a day already.
 
 | # | Never | Instead | Measured |
 |---|---|---|---|
-| 1 | `array.sort(cmp)` on per-frame data | bucket counting sort on quantized depth | 143 ms → 0.39 ms at 2000 tris; **and it segfaults** on a presorted 200 k array |
+| 1 | ~~`array.sort(cmp)` on per-frame data~~ **DOWNGRADED — see §1.1. Still prefer the bucket sort, but this is no longer a catastrophe.** | bucket counting sort on quantized depth | **0.535 → 0.330 ms** at 2500 tris on v2.9.1. Was 143 ms + segfault on v2.8. |
 | 2 | Allocate an object per vertex / triangle / particle / tick | native `f64` locals, write straight to the buffer | 11.36 → 2.04 ms/frame; an 8-field literal is **260 ns** |
 | 3 | A top-level variable without a `g_` prefix | `g_frame`, `g_world` — and never reuse those names as locals | 423 → 222 ms/50 M. Silent. No warning. |
 | 4 | A hot function parameter without a `p_` prefix | `fn mix(p_s: i32)` | **1.19×, 8.4 ns/call** — it is what makes the copy-to-typed-local idiom (A1) expressible. See the corrected rationale below. |
@@ -66,6 +66,44 @@ Each is measured. Each has cost someone a day already.
 | 8 | A closure literal anywhere in a function with a hot loop | hoist it out, or delete it | de-optimizes the **entire enclosing block** — escape analysis is conservative |
 | 9 | `x * 1.0` to make a float | `f64(x)` | folded to `x`, keeps `i32`, **throws** on `array<f64>.push` |
 | 10 | `import * as ns` then `ns.f()` on a hot path | named import | 644 → 213 ms/20 M |
+
+### 1.1 Rule 1 was written against a compiler that no longer exists
+
+Hemlock **v2.9.1** (`0950dda5`, PR #629) replaced `array.sort()`'s non-randomized Lomuto quicksort
+with a **stable merge sort**. Rule 1's original numbers came from the old one and are obsolete.
+Re-measured on v2.9.1, compiled, 2500 depths over the 72 m fog range, 200 reps, `make()` baseline
+subtracted:
+
+```
+array.sort(closure) : 0.535 ms/frame
+bucket sort (O(n))  : 0.330 ms/frame       -> bucket is 1.62x faster
+```
+
+And the failure mode is gone entirely — the old cliff was **input-order dependent**, which mattered
+because a camera moving through a world hands the sorter nearly-sorted data every frame:
+
+```
+             v2.8 (old)              v2.9.1 (now)
+2000 random   2.95 ms                 <1 ms
+2000 SORTED   107 ms                  <1 ms      <- the 36x cliff is gone
+200k SORTED   SEGFAULT (O(n) depth)   4 ms       <- no stack overflow
+```
+
+**What this changes:**
+- **Keep the bucket sort in `batch.hml`.** It is still faster, still O(n), still immune to input
+  order, and it is already built. But its justification is now "**0.2 ms/frame, ~1.2 % of the
+  11 ms render budget**", not "the alternative is catastrophic".
+- **`array.sort` is now a legitimate fallback.** If the bucket sort has a correctness problem —
+  ordering artifacts at a bucket boundary, say — falling back is a real option costing 0.2 ms, not
+  a 36x blowup. That de-risks W1-1 considerably.
+- **`array.sort` is now safe off the hot path** (loading, asset build, editor tooling, debug
+  reports). Previously it was effectively banned everywhere for fear of the presorted case.
+- Both backends now use the same stable merge sort, so sorted output no longer diverges between
+  interpreter and compiler.
+
+> This is the second time a rule outlived its reason (see the `p_` prefix in §4). When a toolchain
+> bug behind a rule gets fixed, **re-measure and rewrite the rule** — do not leave a number in this
+> file that no longer reproduces. A rule nobody can reproduce is a rule nobody will respect.
 
 ---
 
