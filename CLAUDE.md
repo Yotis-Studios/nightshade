@@ -7,9 +7,9 @@ PS1/N64-aesthetic open-world FPS. Hemlock, on the Wobbleweed engine. **Ships com
 
 ## 🛑 RULE 0 — VERIFY YOUR COMPILER BEFORE YOU TRUST A MEASUREMENT.
 
-**Status: `PATH` is CURRENT as of 2026-07-27 20:37 — Hemlock v2.9.0** (`07661c98`). It carries the
-inliner fix (H-1), the 30+ interpreter/compiler divergence fixes, and the `ptr == null` parity fix
-(H-7). Plain `hemlockc` / `hemlock` are fine to use.
+**Status: `PATH` is CURRENT as of 2026-07-27 21:11 — Hemlock v2.9.1** (`e41c08c2`). It carries the
+inliner fix (H-1), the 30+ interpreter/compiler divergence fixes, the `ptr == null` parity fix
+(H-7), and the `array.sort` stable merge sort (H-2). Plain `hemlockc` / `hemlock` are fine to use.
 
 **Run this check once per session anyway.** It takes 15 seconds and it already caught one full wave
 of bad data:
@@ -32,9 +32,9 @@ A stale compiler either fails to build line 1 (the inliner bug, H-1) or prints
 
 **Corollary:** a toolchain bug is not real until you reproduce it on the *current* compiler. Check
 `docs/HEMLOCK_ISSUES.md` before filing. Of the issues found so far, **H-1, H-3 and H-7 are all now
-fixed upstream**, and the `u64 >>` entry was never a bug at all — it was a stale binary. The live
-ones are H-2 (`array.sort` is quadratic on sorted input, compiled), H-4/H-5 (diagnostics and number
-formatting), H-6 (`import` is positional for FFI) and H-8 (extern resolution is lazy).
+fixed upstream**, as is H-2 (`array.sort`, in v2.9.1), and the `u64 >>` entry was never a bug at all
+— it was a stale binary. The only live ones are H-4/H-5 (diagnostics and number formatting),
+H-6 (`import` is positional for FFI) and H-8 (extern resolution is lazy). None block us.
 
 If you ever need to bypass `PATH`, the repo build is at `/home/nbeerbower/Projects/hemlock/hemlockc`.
 
