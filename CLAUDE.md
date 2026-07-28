@@ -7,7 +7,7 @@ PS1/N64-aesthetic open-world FPS. Hemlock, on the Wobbleweed engine. **Ships com
 
 ## 🛑 RULE 0 — VERIFY YOUR COMPILER BEFORE YOU TRUST A MEASUREMENT.
 
-**Status: `PATH` is CURRENT as of 2026-07-27 20:37.** `/usr/local/bin/hemlockc` was refreshed by the
+**Status: `PATH` is CURRENT as of 2026-07-27 20:37 — Hemlock v2.9.0** (`07661c98`). It carries the inliner fix (H-1), the 30+ divergence fixes, and the `ptr == null` parity fix (H-7).
 user and now carries both the inliner fix and the interpreter/compiler divergence fixes. Plain
 `hemlockc` / `hemlock` are fine to use.
 

@@ -100,8 +100,22 @@ and local names to fresh uniques at the inline site before substitution.
 
 ---
 
-## 🔴 H-7 — `ptr == null` is FALSE in compiled code for a NULL pointer returned from FFI
-### Live on `main` (`cb7fbfaa`). Silent wrong behaviour, not a crash. **Worst severity so far.**
+## ✅ H-7 — `ptr == null` is FALSE in compiled code for a NULL pointer returned from FFI
+### FIXED UPSTREAM in `563b1ade` ("fix: make `ptr == null` true for a NULL pointer in compiled
+### code (H-7)"), merged as PR #628, shipped in **v2.9.0** (`07661c98`). Re-verified:
+
+```
+compiled     : p == null -> true      p == ptr_null() -> true
+interpreted  : p == null -> true      p == ptr_null() -> true
+```
+
+**RULE 0b is therefore no longer load-bearing.** `ptr == null` is now correct on both backends.
+Keep using `ptr_null()` where it is already written — it is explicit and reads well, and there is
+no reason to churn working code — but a `== null` handle guard is no longer a silent bug.
+
+Original analysis retained below, because the *class* of defect is worth remembering: a comparison
+that silently disagrees between backends turns every error-handling guard into dead code, and no
+test suite notices, because the happy path is unaffected.
 
 An FFI function that returns a NULL `ptr` compares **false** against `null` when
 compiled, and **true** when interpreted:
