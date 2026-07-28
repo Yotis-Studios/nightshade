@@ -4,22 +4,43 @@ Every number here was measured by the orchestrator on the shipping toolchain
 (**Hemlock v2.9.1**, `hemlockc -O1`, headless, 320×240), not taken from a spec.
 Supersedes the projected figures in `ARCHITECTURE.md` §8 where they disagree.
 
-> ### ⚠ MEASUREMENT HYGIENE — THIS MACHINE HAS A HEAVY BACKGROUND WORKLOAD
-> A `llama-server` process on this box runs at **~1700 % CPU (≈17 of 24 cores)**
-> intermittently. Timings swing by **50 %** depending on whether it is active:
-> ```
-> bucket sort @2500, load  2.01 :  0.403 / 0.376 / 0.377 ms   <- the figures below
-> bucket sort @2500, load 24.85 :  0.653 / 0.636 / 0.622 ms   <- same binary, same input
-> ```
-> The table below was captured at **load ≈ 2**. Under full saturation every stage
-> inflates similarly, putting the frame at ≈ 8 ms rather than 5.3 ms — **still
-> inside the 11 ms budget**, so the verdict is robust either way. But:
+> ### ⚠ HOW TO TIME ANYTHING ON THIS MACHINE — READ BEFORE WRITING A PERF ASSERTION
 >
-> **Check `uptime` before recording any timing, and re-run if load > ~4.**
-> A probe that "fails" a timing assertion on a loaded box is reporting the load,
-> not the code. `probe_batch`'s three `< 0.5 ms` sort assertions fail at load 24
-> and pass at load 2, with a byte-identical binary. Prefer CPU time over wall
-> time where the probe supports it (`probe_emit` reports both, and they agree).
+> This box **permanently** shares ~17 of its 24 cores with a `llama-server`
+> (~1700 % CPU). **That is a fixed constraint — do not wait for a quiet machine,
+> and never gate a build on one.** Measure so that contention does not matter.
+>
+> **The required recipe** (both parts — either alone is insufficient):
+> 1. **CPU time, not wall time.** Use `__clock()`. It excludes intervals when the
+>    process is descheduled.
+> 2. **Minimum of N batches, not the mean.** Preemption can only make a sample
+>    *slower*, so the mean drifts with load while the minimum stays near true cost.
+>    `TRIALS = 7` works well.
+>
+> Measured on one byte-identical binary, `probe_batch`'s bucket sort @2500:
+> ```
+> mean  + wall, load  2.01 : 0.403 ms      <- what an idle box reports
+> mean  + wall, load 24.85 : 0.653 ms      +62 %   naive timing
+> min-7 + wall, load 34.88 : 0.574 ms      +42 %   min alone
+> min-7 + CPU , load 32.99 : 0.521 ms      +29 %   both  <- as good as it gets
+> ```
+>
+> **There is a floor of ~30 % that no methodology removes**, because CPU time does
+> not exclude *cache and memory-bandwidth* contention from 17 busy cores. Accept it.
+>
+> **Therefore: set thresholds to catch regressions, not to certify a quiet
+> machine.** `probe_batch`'s sort bound is **1.0 ms**, not the 0.5 ms an idle
+> measurement suggests. It still catches everything that matters — the O(n²) sort
+> this replaced measured **107–143 ms** on the same input, and a comparison-closure
+> sort costs 0.535 ms. A 2× margin loses no real signal and eliminates false
+> failures that would otherwise train everyone to ignore red probes.
+>
+> **Keep the ratio assertions tight.** The load-bearing check is not "0.4 ms" but
+> **"cost varies < 40 % across random/ramp/flat"** — that is what proves the sort is
+> input-order independent. Contention inflates all three distributions roughly
+> equally, so the *ratio* stays honest even when absolute numbers do not. A real
+> input-order cliff shows up as thousands of percent, not tens. Measured under full
+> load: **7.5 % spread, PASS 60/60**.
 
 ## Verdict: **the 2500-triangle budget holds.** Comfortably, in the shipping configuration.
 
@@ -101,15 +122,33 @@ Four dynamic point lights cost **4.9 ms** — more than the entire rest of the
 frame. It technically fits, with ~0.8 ms spare, but that leaves nothing for
 overdraw, HUD, post-FX or a bad frame.
 
-**Recommendation (not yet ratified):** cap *dynamic* point lights at **2**, and
-bake the rest into vertex colour at mesh-build time — `mesh.hml` already supports
-`mesh_bake_light`, so static lanterns and windows cost zero per frame. Muzzle
-flash and explosions are the cases that genuinely must be dynamic, and there are
-rarely more than two at once.
+### ✅ RATIFIED BY THE PROJECT OWNER — **dynamic point lights are capped at 2.**
 
-**This is a design decision, not an engine one** — it changes what the art can
-do, so it belongs to whoever owns the look, not to the renderer. Flagging rather
-than deciding.
+`MAX_DYNAMIC_LIGHTS = 2`. Everything else is **baked into vertex colour at
+mesh-build time** via `mesh.hml`'s `mesh_bake_light`, so static lanterns, windows,
+fires and signage cost **zero per frame**.
+
+Measured consequence — this is what buys the frame back:
+
+| Configuration | emit + pack | Frame total | of 11 ms |
+|---|---|---|---|
+| Fog + sun only | 3.57 ms | ≈ 5.3 ms | 48 % |
+| **+ 2 dynamic lights (shipping cap)** | **≈ 6.0 ms** | **≈ 7.7 ms** | **70 %** |
+| + 4 dynamic lights (rejected) | 8.47 ms | ≈ 10.2 ms | 93 % |
+
+Reserve the two dynamic slots for what genuinely must move: **muzzle flash** and
+**explosions/fire**. Rarely more than two at once, and when there are, the
+nearest two win — priority by `distance² / intensity`, evaluated per frame.
+
+**Implementation notes for whoever owns `shade.hml` and the light manager:**
+- `RenderEnv` already reserves 4 light slots. Keep the layout; just never fill
+  more than 2. Do not shrink the array — a future budget may afford 3, and
+  changing the flat-array layout is a breaking change across `emit.hml`.
+- Enforce the cap in the *light manager*, not in `shade.hml`. The engine takes
+  a count and must stay generic (**R1**) — a hard-coded 2 in the engine is a game
+  rule leaking into a reusable renderer.
+- Baked lighting is not free at *build* time. Budget it in the ≤ 400 ms boot
+  allowance, behind the title card.
 
 ---
 

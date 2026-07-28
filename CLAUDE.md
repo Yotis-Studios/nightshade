@@ -107,6 +107,23 @@ because a camera moving through a world hands the sorter nearly-sorted data ever
 
 ---
 
+## 1.2 TIMING: this machine is permanently busy. Measure accordingly.
+
+A `llama-server` holds ~17 of 24 cores. **Do not wait for a quiet machine and never gate a build on
+one.** Every perf assertion must use **`__clock()` (CPU time) + minimum-of-N batches** (`TRIALS = 7`).
+Mean-of-wall-time drifts 62 % with load; the recipe above cuts that to ~29 %, and the residual is
+cache/bandwidth contention that no methodology removes.
+
+**Set thresholds to catch regressions, not to certify an idle box.** `probe_batch`'s sort bound is
+1.0 ms even though it measures 0.4 ms idle — the regression it guards against costs 107–143 ms.
+False-failing probes train everyone to ignore red, which is far more expensive than a loose bound.
+
+**Prefer ratio assertions to absolute ones.** "Cost varies < 40 % across random/ramp/flat" survives
+contention because all three inflate together; "< 0.5 ms" does not. Full details and the measured
+comparison table: `docs/BUDGET_ACTUAL.md`.
+
+---
+
 ## 2. HOW TO BUILD, RUN, TEST, SCREENSHOT
 
 ```bash
