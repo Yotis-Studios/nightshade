@@ -4,6 +4,23 @@ Every number here was measured by the orchestrator on the shipping toolchain
 (**Hemlock v2.9.1**, `hemlockc -O1`, headless, 320×240), not taken from a spec.
 Supersedes the projected figures in `ARCHITECTURE.md` §8 where they disagree.
 
+> ### ⚠ MEASUREMENT HYGIENE — THIS MACHINE HAS A HEAVY BACKGROUND WORKLOAD
+> A `llama-server` process on this box runs at **~1700 % CPU (≈17 of 24 cores)**
+> intermittently. Timings swing by **50 %** depending on whether it is active:
+> ```
+> bucket sort @2500, load  2.01 :  0.403 / 0.376 / 0.377 ms   <- the figures below
+> bucket sort @2500, load 24.85 :  0.653 / 0.636 / 0.622 ms   <- same binary, same input
+> ```
+> The table below was captured at **load ≈ 2**. Under full saturation every stage
+> inflates similarly, putting the frame at ≈ 8 ms rather than 5.3 ms — **still
+> inside the 11 ms budget**, so the verdict is robust either way. But:
+>
+> **Check `uptime` before recording any timing, and re-run if load > ~4.**
+> A probe that "fails" a timing assertion on a loaded box is reporting the load,
+> not the code. `probe_batch`'s three `< 0.5 ms` sort assertions fail at load 24
+> and pass at load 2, with a byte-identical binary. Prefer CPU time over wall
+> time where the probe supports it (`probe_emit` reports both, and they agree).
+
 ## Verdict: **the 2500-triangle budget holds.** Comfortably, in the shipping configuration.
 
 | Stage | Measured @2500 tris | Source |
