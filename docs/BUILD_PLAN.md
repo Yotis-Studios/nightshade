@@ -316,6 +316,48 @@ All eleven code against `ARCHITECTURE.md` §2.3 (the vertex buffer contract) and
 
 ---
 
+## W3-0 — Extract the frame graph, then build the walkaround  ★ DO THIS FIRST IN WAVE 3
+
+**Why this is task zero.** The project owner wants to *play* the world and give human feedback
+before gameplay is designed against untested assumptions. That request is worth more than its face
+value, because delivering it forces an architectural fix we owe anyway.
+
+`tools/shot.hml` currently defines its own `frame_render` (line 2195). `ARCHITECTURE.md` §5 assigns
+that function to `src/render/world_render.hml`, and `ci_imports.sh` **R7** now fails the build the
+moment `world_render.hml` exists while `shot.hml` still has a private copy. A naive walkaround would
+add a *third* frame graph and make the drift worse.
+
+So:
+
+1. **Extract** `frame_render` / `frame_init` / `frame_batches` out of `tools/shot.hml` into
+   `src/render/world_render.hml`, unchanged in behaviour. This is W3-7's deliverable, done first
+   because two consumers now need it.
+2. **Rewire `shot.hml`** to import it. R7 must go green, and **every one of the 9 scenes must still
+   render byte-identically** to its committed PNG — that is the proof the extraction was behaviour-
+   preserving. A single changed pixel means it was not.
+3. **Build `tools/walk.hml`** — interactive, importing the *same* `world_render.hml`:
+   - mouse-look (`SDL_SetRelativeMouseMode`, verified working in W0-1) + WASD, shift to sprint
+   - **a fly toggle** (F): noclip free-cam for inspecting the world, vs walking at player height
+   - live time-of-day scrub (`[` / `]`) and a weather toggle — the day cycle is the game's metronome
+     and it should be feel-able, not screenshot-able
+   - scene/POI teleports on the number keys, reusing `shot.hml`'s scene registry
+   - an on-screen frame budget readout: triangles submitted/drawn, draw calls, ms, using `stats.hml`
+   - runs on the real display at ×3 upscale, 60 fps target
+4. **Ship it as a build the owner can run**, with the controls printed on start.
+
+**Acceptance:**
+- R7 PASS with `world_render.hml` present.
+- All 9 `shot.hml` scenes byte-identical to their committed PNGs after the extraction.
+- `walk.hml` holds 60 fps on the real display at the 2500-triangle budget; the readout proves it.
+- `hemlockc -O1` builds both; neither defines a second frame graph
+  (`grep -c "fn frame_render" tools/*.hml` must be 0).
+
+**This is the first time anyone will move through this world.** Expect it to surface things no
+screenshot can: movement speed, fog density at walking pace, terrain readability while turning,
+whether the horizon has anything worth walking toward.
+
+---
+
 ## ⚠ WAVE 3 IS RESEQUENCED — run it as three sub-waves, not one
 
 Applying the wave-construction rule above. As originally written, Wave 3 contains a **five-deep
