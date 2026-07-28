@@ -1,0 +1,564 @@
+// =============================================================================
+//  replay.hml — the determinism gate.                          W2-13.
+// =============================================================================
+//
+//  Record a command stream and a per-tick position hash. Replay the recorded
+//  stream into a fresh world. Every tick's hash must match BIT FOR BIT.
+//
+//      hemlockc -O1 tools/replay.hml -o /tmp/replay && /tmp/replay --verify
+//
+//  WHY THIS IS THE GATE, and not "the sim looks right"
+//  ---------------------------------------------------------------------------
+//  v2 client prediction is a reproduction problem: the client re-runs the same
+//  commands the server will run and must land on the same numbers. If replay
+//  diverges by one ULP on tick 4000, prediction rubber-bands months later in a
+//  way that reproduces on one machine, in one movement state, at one frame
+//  rate. Catching it here costs 4 seconds.
+//
+//  WHAT IS CHECKED
+//  ---------------------------------------------------------------------------
+//   1. the recorded run's folded hash equals the golden constant that
+//      `simtest.hml` also asserts (the two tools cannot drift apart silently);
+//   2. every command rebuilt from the recorded wire fields hashes identically
+//      to the command that was sent (q -> dq -> q is idempotent, W2-9);
+//   3. every one of the 10 000 per-tick world hashes matches;
+//   4. NO COSMETIC FIRES DURING REPLAY. `world.replaying == 1` makes
+//      `st_effects()` a no-op — ARCHITECTURE §3: replaying 8 commands must
+//      produce 0 sounds;
+//   5. a NEGATIVE CONTROL: one bit is flipped in the recorded stream and the
+//      replay must NOTICE. A determinism checker that cannot detect a
+//      difference is decoration.
+//
+//  THE DUPLICATED BLOCK — read before you edit it
+//  ---------------------------------------------------------------------------
+//  `st_mix` / `st_hash_world` / `st_script` / `st_effects` / `st_tick` /
+//  `st_populate` below are BYTE-IDENTICAL to `simtest.hml`'s. Hemlock runs a
+//  module's top-level statements at import, so a tool that is also a program
+//  cannot be imported without running it — the two gates are therefore
+//  self-contained on purpose (you can copy either one plus `src/` to a bare box
+//  and run it). `g_ST_GOLDEN` is what keeps them honest: change the tick body
+//  in one file and that file's golden assertion fails immediately.
+//
+//  When W4 lands `src/sim/sim.hml`, both files delete their stand-in and call
+//  `sim_step(w, tick)`, and the golden is re-pinned once.
+//
+//  IMPORTS: `src/sim/**`, `src/core/**`, `@stdlib/math`, `@stdlib/process`.
+//  No SDL, no wobbleweed, no wall clock. `nm /tmp/replay | grep -c SDL_` == 0.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sin, cos, sqrt } from "@stdlib/math";
+
+import { g_TICK_DT, g_SPEED_WALK, g_SPEED_SPRINT, g_ACCEL_GROUND,
+         g_FRICTION_GROUND, g_AIR_CONTROL, g_GRAVITY, g_JUMP_IMPULSE } from "../src/core/config.hml";
+
+import { rng_new, rng_seed, rng_f11 } from "../src/sim/rng.hml";
+import { RNG_AI, RNG_WORLDGEN } from "../src/sim/rng.hml";
+
+import { cmd_new, cmd_set, cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, cmd_btn,
+         cmd_hash, cmd_wire_ok, dq_ang, dq_axis,
+         BTN_FIRE, BTN_JUMP, BTN_SPRINT } from "../src/sim/command.hml";
+
+import { world_new_cap, world_spawn, world_spawn_player, world_count,
+         world_set_tick, world_set_replaying, world_replaying, world_id_of,
+         world_check, world_reset_session, KIND_AI } from "../src/sim/world.hml";
+
+import { history_new, history_reset, history_capture } from "../src/sim/history.hml";
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION — must match simtest.hml
+// ---------------------------------------------------------------------------
+let g_ST_TICKS: i32 = 10000;
+let g_ST_SEED: i32  = 1337;
+let g_ST_AI: i32    = 63;
+let g_ST_CAP: i32   = 128;
+
+// The shared determinism anchor. Identical to simtest.hml's.
+let g_ST_GOLDEN: u64 = 16594734899016964914;
+
+// The recorded stream: nine i32 per tick, exactly the nine fields that go on
+// the wire (NETWORKING §11.2). No bools, no floats, no nulls — this array IS
+// the packet, minus the framing.
+let g_RP_FIELDS: i32 = 9;
+
+// ---------------------------------------------------------------------------
+// ASSERTIONS
+// ---------------------------------------------------------------------------
+// Cold-path number -> string. Template strings are banned per-frame (N3);
+// every use in this file is in the report or an assertion message.
+fn sv(p_v): string {
+    let out: string = `${p_v}`;
+    return out;
+}
+
+let g_asserts: i32 = 0;
+let g_pass: i32 = 0;
+
+fn ck(p_ok: i32, p_msg: string) {
+    g_asserts = g_asserts + 1;
+    if (p_ok == 1) { g_pass = g_pass + 1; }
+    else { print("  FAIL: " + p_msg); }
+}
+
+// ---------------------------------------------------------------------------
+// THE POSITION HASH — u64 only (CLAUDE.md A13: i32/i64 * + - TRAP on overflow)
+// ---------------------------------------------------------------------------
+// FNV-1a-flavoured, fed quantized millimetres so the hash is a statement about
+// the simulation and not about the last bit of an f64.
+fn st_mix(p_h: u64, p_k: i32): u64 {
+    let h: u64 = p_h;
+    let k: i32 = p_k;
+    let u: u64 = u64(k & 2147483647);       // reinterpret i32 as its u32 bits
+    if (k < 0) { u = u + 2147483648; }
+    h = h ^ u;
+    h = h * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+// Fold the whole transform group of the world into the running hash.
+fn st_hash_world(p_h: u64, p_w: object): u64 {
+    let w: object = p_w;
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let yaw: array<f64> = w.yaw;
+    let n: i32 = w.count;
+    let h: u64 = p_h;
+    let i: i32 = 0;
+    while (i < n) {
+        h = st_mix(h, i32(px[i] * 1000.0));
+        h = st_mix(h, i32(py[i] * 1000.0));
+        h = st_mix(h, i32(pz[i] * 1000.0));
+        h = st_mix(h, i32(yaw[i] * 10000.0));
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE SCRIPTED INPUT — a function of (tick, seed) and nothing else
+// ---------------------------------------------------------------------------
+// No wall clock, no @stdlib/random, no input device. It walks forward, strafes
+// every other 2 seconds, sprints half the time, jumps on a prime cadence and
+// fires on another, so the button field is never constant and the movement
+// never settles into a fixed point.
+fn st_script(p_c: object, p_rs: array, p_tick: i32, p_seed: i32) {
+    let t: i32 = p_tick;
+    rng_seed(p_rs, p_seed, RNG_AI, t, 0);
+    let jitter: f64 = rng_f11(p_rs) * 0.02;
+
+    let yw: f64 = f64(t) * 0.004 + jitter;
+    let mx: f64 = 0.0;
+    let my: f64 = 1.0;
+    if ((t % 240) >= 120) { mx = 1.0; my = 0.0; }
+
+    let btn: i32 = 0;
+    if ((t % 97) == 0)  { btn = btn | BTN_JUMP; }
+    if ((t % 13) == 0)  { btn = btn | BTN_FIRE; }
+    if ((t % 300) < 150) { btn = btn | BTN_SPRINT; }
+
+    cmd_set(p_c, t, 17, mx, my, yw, 0.15, btn, 0, t);
+}
+
+// ---------------------------------------------------------------------------
+// COSMETICS — the thing that must NOT happen during a replay
+// ---------------------------------------------------------------------------
+// Stands in for `sim_effects()`. ARCHITECTURE §3: replaying 8 commands must
+// produce 0 sounds. `replay.hml` asserts this counter stays at 0 for the whole
+// replay pass.
+let g_effects: i32 = 0;
+
+fn st_effects(p_w: object, p_c: object) {
+    let w: object = p_w;
+    if (w.replaying == 1) { return; }
+    if (cmd_btn(p_c, BTN_FIRE) == 1) { g_effects = g_effects + 1; }
+}
+
+// ---------------------------------------------------------------------------
+// THE TICK — the Wave-2 stand-in for sim_step(world, tick)
+// ---------------------------------------------------------------------------
+// Hot: 64..512 entities x 10 000 ticks. Written to the CLAUDE.md §4 skeleton —
+// parameters copied into typed locals, SoA arrays hoisted before the loop,
+// no allocation, no object literal, no closure, no defer, no try, no throw.
+fn st_tick(p_w: object, p_c: object) {
+    let w: object = p_w;
+    let c: object = p_c;
+
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let vx: array<f64> = w.vx;
+    let vy: array<f64> = w.vy;
+    let vz: array<f64> = w.vz;
+    let yaw: array<f64> = w.yaw;
+    let pitch: array<f64> = w.pitch;
+    let n: i32 = w.count;
+
+    let dt: f64 = g_TICK_DT;
+
+    // ---- input, dequantized exactly as the server would read it -----------
+    let mx: f64 = cmd_move_x(c);
+    let my: f64 = cmd_move_y(c);
+    let yw: f64 = cmd_yaw(c);
+    let pt: f64 = cmd_pitch(c);
+    let jump: i32 = cmd_btn(c, BTN_JUMP);
+    let sprint: i32 = cmd_btn(c, BTN_SPRINT);
+
+    let sy: f64 = sin(yw);
+    let cy: f64 = cos(yw);
+    let wx: f64 = mx * cy + my * sy;
+    let wz: f64 = 0.0 - mx * sy + my * cy;
+
+    let spd: f64 = g_SPEED_WALK;
+    if (sprint == 1) { spd = g_SPEED_SPRINT; }
+
+    // ---- slot 0: the player ------------------------------------------------
+    let ax: f64 = vx[0];
+    let ay: f64 = vy[0];
+    let az: f64 = vz[0];
+    let grounded: i32 = 0;
+    if (py[0] <= 0.0) { grounded = 1; }
+
+    if (grounded == 1) {
+        let fr: f64 = 1.0 - g_FRICTION_GROUND * dt;
+        if (fr < 0.0) { fr = 0.0; }
+        ax = ax * fr;
+        az = az * fr;
+        ax = ax + wx * g_ACCEL_GROUND * dt;
+        az = az + wz * g_ACCEL_GROUND * dt;
+        if (jump == 1) { ay = g_JUMP_IMPULSE; }
+    } else {
+        ax = ax + wx * g_ACCEL_GROUND * g_AIR_CONTROL * dt;
+        az = az + wz * g_ACCEL_GROUND * g_AIR_CONTROL * dt;
+    }
+
+    let sp2: f64 = ax * ax + az * az;
+    let lim: f64 = spd * spd;
+    if (sp2 > lim) {
+        let s: f64 = sqrt(lim / sp2);
+        ax = ax * s;
+        az = az * s;
+    }
+    ay = ay - g_GRAVITY * dt;
+
+    px[0] = px[0] + ax * dt;
+    py[0] = py[0] + ay * dt;
+    pz[0] = pz[0] + az * dt;
+    if (py[0] < 0.0) {
+        py[0] = 0.0;
+        if (ay < 0.0) { ay = 0.0; }
+    }
+    vx[0] = ax;
+    vy[0] = ay;
+    vz[0] = az;
+    yaw[0] = yw;
+    pitch[0] = pt;
+
+    // ---- slots 1..n-1: a deterministic orbit-and-seek ----------------------
+    // Seek plus a tangential term, so the swarm never converges to a fixed
+    // point and the hash keeps moving for all 10 000 ticks. (A converged sim
+    // makes a determinism test pass for the wrong reason.)
+    let tx: f64 = px[0];
+    let tz: f64 = pz[0];
+    let step: f64 = 2.6 * dt;
+    let i: i32 = 1;
+    while (i < n) {
+        let ex: f64 = px[i];
+        let ez: f64 = pz[i];
+        let dx: f64 = tx - ex;
+        let dz: f64 = tz - ez;
+        let d2: f64 = dx * dx + dz * dz;
+        if (d2 > 0.0001) {
+            let inv: f64 = 1.0 / sqrt(d2);
+            let ux: f64 = dx * inv;
+            let uz: f64 = dz * inv;
+            ex = ex + (ux + (0.0 - uz) * 0.6) * step;
+            ez = ez + (uz + ux * 0.6) * step;
+        }
+        px[i] = ex;
+        pz[i] = ez;
+        yaw[i] = yaw[i] + 0.017;
+        if (yaw[i] > 6.283185307179586) { yaw[i] = yaw[i] - 6.283185307179586; }
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WORLD SETUP — identical every trial, so seven runs are seven reproductions
+// ---------------------------------------------------------------------------
+// Returns the player's SLOT. `world_spawn_player` takes a player slot 1..64 and
+// returns the dense slot it landed in — the entity's *id* is the player slot,
+// which both tools assert through `world_id_of`, because an id scheme that
+// drifts is a bug that first shows up in a packet three waves later.
+fn st_populate(p_w: object, p_rs: array, p_seed: i32): i32 {
+    let w: object = p_w;
+    world_reset_session(w, p_seed);
+
+    let pslot: i32 = world_spawn_player(w, 1);
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    px[0] = 0.0; py[0] = 0.0; pz[0] = 0.0;
+
+    let n: i32 = g_ST_AI;
+    let i: i32 = 0;
+    while (i < n) {
+        let id: i32 = world_spawn(w, KIND_AI, 0);
+        rng_seed(p_rs, p_seed, RNG_WORLDGEN, 0, id);
+        let slot: i32 = i + 1;
+        px[slot] = rng_f11(p_rs) * 20.0;
+        py[slot] = 0.0;
+        pz[slot] = rng_f11(p_rs) * 20.0;
+        i++;
+    }
+    let out: i32 = pslot;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// RECORD
+// ---------------------------------------------------------------------------
+// Writes the NINE WIRE FIELDS straight out of the command. Reading the raw
+// quantized fields is the serializer's job and only the serializer's job — the
+// simulation itself reads through `cmd_yaw` / `cmd_move_x` and never touches
+// them (command.hml's contract).
+fn rp_record(p_w: object, p_h: object, p_c: object, p_rs: array, p_ticks: i32,
+             p_stream: array<i32>, p_chash: array<i32>, p_thash: array): u64 {
+    let w: object = p_w;
+    let hist: object = p_h;
+    let c: object = p_c;
+    let rs: array = p_rs;
+    let ticks: i32 = p_ticks;
+    let stream: array<i32> = p_stream;
+    let chash: array<i32> = p_chash;
+    let thash: array = p_thash;
+
+    let h: u64 = 14695981039346656037;
+    let t: i32 = 0;
+    while (t < ticks) {
+        st_script(c, rs, t, w.seed);
+
+        let b: i32 = t * 9;
+        stream[b]     = c.tick;
+        stream[b + 1] = c.dt_ms;
+        stream[b + 2] = c.move_x;
+        stream[b + 3] = c.move_y;
+        stream[b + 4] = c.yaw_q;
+        stream[b + 5] = c.pitch_q;
+        stream[b + 6] = c.buttons;
+        stream[b + 7] = c.weapon_sel;
+        stream[b + 8] = c.seq;
+        chash[t] = cmd_hash(c);
+
+        world_set_tick(w, t);
+        st_tick(w, c);
+        history_capture(hist, w);
+        st_effects(w, c);
+        h = st_hash_world(h, w);
+        thash[t] = h;
+        t++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// REPLAY
+// ---------------------------------------------------------------------------
+// Returns the first divergent tick, or -1 for a clean replay. `g_rp_kind` says
+// which half diverged: 1 = the command did not rebuild, 2 = the world did not
+// reproduce.
+let g_rp_kind: i32 = 0;
+let g_rp_matches: i32 = 0;
+let g_rp_cmd_matches: i32 = 0;
+let g_rp_final: u64 = 0;
+
+fn rp_replay(p_w: object, p_h: object, p_c: object, p_ticks: i32,
+             p_stream: array<i32>, p_chash: array<i32>, p_thash: array): i32 {
+    let w: object = p_w;
+    let hist: object = p_h;
+    let c: object = p_c;
+    let ticks: i32 = p_ticks;
+    let stream: array<i32> = p_stream;
+    let chash: array<i32> = p_chash;
+    let thash: array = p_thash;
+
+    g_rp_kind = 0;
+    g_rp_matches = 0;
+    g_rp_cmd_matches = 0;
+
+    let h: u64 = 14695981039346656037;
+    let t: i32 = 0;
+    while (t < ticks) {
+        let b: i32 = t * 9;
+        // Rebuild from the wire fields, through the same dequantize/quantize
+        // path the server uses. q -> dq -> q is idempotent (W2-9), so the
+        // rebuilt command must hash identically to the one that was sent.
+        cmd_set(c, stream[b], stream[b + 1],
+                dq_axis(stream[b + 2]), dq_axis(stream[b + 3]),
+                dq_ang(stream[b + 4]), dq_ang(stream[b + 5]),
+                stream[b + 6], stream[b + 7], stream[b + 8]);
+
+        if (cmd_hash(c) != chash[t]) {
+            g_rp_kind = 1;
+            g_rp_final = h;
+            let bad1: i32 = t;
+            return bad1;
+        }
+        g_rp_cmd_matches = g_rp_cmd_matches + 1;
+
+        world_set_tick(w, t);
+        st_tick(w, c);
+        history_capture(hist, w);
+        st_effects(w, c);            // a no-op: w.replaying == 1
+        h = st_hash_world(h, w);
+
+        if (h != thash[t]) {
+            g_rp_kind = 2;
+            g_rp_final = h;
+            let bad2: i32 = t;
+            return bad2;
+        }
+        g_rp_matches = g_rp_matches + 1;
+        t++;
+    }
+    g_rp_final = h;
+    let out: i32 = 0 - 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------------------------
+fn main() {
+    print("== replay: determinism gate ==");
+    print("  ticks       " + sv(g_ST_TICKS));
+    print("  entities    " + sv(g_ST_AI + 1));
+    print("  seed        " + sv(g_ST_SEED));
+
+    let ticks: i32 = g_ST_TICKS;
+
+    // preallocate the whole recording once (A8/N6)
+    let stream: array<i32> = [];
+    let chash: array<i32> = [];
+    let thash: array = [];
+    let i: i32 = 0;
+    while (i < ticks * g_RP_FIELDS) { stream.push(0); i++; }
+    i = 0;
+    while (i < ticks) { chash.push(0); thash.push(0); i++; }
+
+    let w: object = world_new_cap(g_ST_CAP);
+    let hist: object = history_new(g_ST_CAP);
+    let c: object = cmd_new();
+    let rs: array = rng_new();
+
+    // ---- RECORD ------------------------------------------------------------
+    let pid0: i32 = st_populate(w, rs, g_ST_SEED);
+    world_set_replaying(w, 0);
+    g_effects = 0;
+    let rec: u64 = rp_record(w, hist, c, rs, ticks, stream, chash, thash);
+    let fx_record: i32 = g_effects;
+    let count_record: i32 = world_count(w);
+    print("  recorded    " + sv(ticks) + " ticks, hash " + sv(rec));
+    print("  cosmetics   " + sv(fx_record) + " fired while recording");
+
+    // ---- REPLAY ------------------------------------------------------------
+    st_populate(w, rs, g_ST_SEED);
+    history_reset(hist);
+    world_set_replaying(w, 1);
+    g_effects = 0;
+    let bad: i32 = rp_replay(w, hist, c, ticks, stream, chash, thash);
+    let fx_replay: i32 = g_effects;
+    print("  replayed    " + sv(g_rp_matches) + "/" + sv(ticks) + " ticks matched, hash " + sv(g_rp_final));
+    print("  cosmetics   " + sv(fx_replay) + " fired while replaying (must be 0)");
+
+    // ---- assertions --------------------------------------------------------
+    let g_ok: i32 = 0;
+    if (rec == g_ST_GOLDEN) { g_ok = 1; }
+    ck(g_ok, "recorded hash " + sv(rec) + " != the golden " + sv(g_ST_GOLDEN)
+             + " that simtest.hml also asserts");
+
+    let clean: i32 = 0;
+    if (bad < 0) { clean = 1; }
+    ck(clean, "replay diverged at tick " + sv(bad) + " (kind " + sv(g_rp_kind)
+              + ": 1 = command rebuild, 2 = world state)");
+
+    let all_t: i32 = 0;
+    if (g_rp_matches == ticks) { all_t = 1; }
+    ck(all_t, "every one of " + sv(ticks) + " per-tick hashes must match, got " + sv(g_rp_matches));
+
+    let all_c: i32 = 0;
+    if (g_rp_cmd_matches == ticks) { all_c = 1; }
+    ck(all_c, "every one of " + sv(ticks) + " commands must rebuild identically, got " + sv(g_rp_cmd_matches));
+
+    let same_final: i32 = 0;
+    if (g_rp_final == rec) { same_final = 1; }
+    ck(same_final, "replay final hash " + sv(g_rp_final) + " != recorded " + sv(rec));
+
+    let fxr: i32 = 0;
+    if (fx_record > 0) { fxr = 1; }
+    ck(fxr, "cosmetics must fire while recording, got " + sv(fx_record));
+
+    let fxp: i32 = 0;
+    if (fx_replay == 0) { fxp = 1; }
+    ck(fxp, "ZERO cosmetics may fire while replaying (ARCHITECTURE §3), got " + sv(fx_replay));
+
+    let rep: i32 = 0;
+    if (world_replaying(w) == 1) { rep = 1; }
+    ck(rep, "world.replaying must still be 1 after the replay pass");
+
+    let pid_ok: i32 = 0;
+    if (world_id_of(w, pid0) == 1) { pid_ok = 1; }
+    ck(pid_ok, "world_spawn_player returns a SLOT; the id in that slot must be the "
+               + "player slot 1, got " + sv(world_id_of(w, pid0)) + " in slot " + sv(pid0));
+
+    let chk: i32 = world_check(w);
+    let chk_ok: i32 = 0;
+    if (chk == 0) { chk_ok = 1; }
+    ck(chk_ok, "world_check must report a consistent sparse set, got " + sv(chk));
+
+    let cnt: i32 = 0;
+    if (world_count(w) == count_record) { cnt = 1; }
+    ck(cnt, "replay must end with the same entity count as the recording");
+
+    // ---- THE NEGATIVE CONTROL ---------------------------------------------
+    // Flip the lowest bit of one yaw quantum, 40 % of the way in. A replay
+    // that does not notice is not a gate. The stream is restored afterwards.
+    let probe: i32 = (ticks * 4) / 10;
+    let at: i32 = probe * 9 + 4;
+    let keep: i32 = stream[at];
+    stream[at] = keep ^ 1;
+    st_populate(w, rs, g_ST_SEED);
+    history_reset(hist);
+    world_set_replaying(w, 1);
+    let caught: i32 = rp_replay(w, hist, c, ticks, stream, chash, thash);
+    stream[at] = keep;
+
+    let neg_ok: i32 = 0;
+    if (caught >= 0) {
+        if (caught <= probe) { neg_ok = 1; }
+    }
+    ck(neg_ok, "NEGATIVE CONTROL: a single flipped bit at tick " + sv(probe)
+               + " must be detected at or before that tick, got " + sv(caught)
+               + " (kind " + sv(g_rp_kind) + ")");
+
+    let neg_kind: i32 = 0;
+    if (g_rp_kind == 1) { neg_kind = 1; }
+    ck(neg_kind, "the flipped wire bit must be caught by the COMMAND hash (kind 1), got kind " + sv(g_rp_kind));
+
+    // ---- the assertion COUNT is itself an assertion -------------------------
+    let expect: i32 = 13;
+    let count_ok: i32 = 0;
+    if (g_asserts == expect) { count_ok = 1; }
+    g_asserts = g_asserts + 1;
+    if (count_ok == 1) { g_pass = g_pass + 1; }
+    else { print("  FAIL: assertion COUNT is " + sv(g_asserts - 1) + ", expected " + sv(expect)); }
+
+    print("PASS " + sv(g_pass) + "/" + sv(g_asserts));
+    if (g_pass != g_asserts) { exit(1); }
+}
+
+main();

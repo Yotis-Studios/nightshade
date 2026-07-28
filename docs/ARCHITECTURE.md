@@ -373,31 +373,180 @@ one-line `// LEGACY — not on the shipping path. See ENGINE_GAPS.md.` header an
 | File | Purpose | Exports |
 |---|---|---|
 | `config.hml` | Every tunable constant, all `g_`-prefixed. Resolution, tick, budgets, `FOG_FAR` cap, chunk size, entity caps, atlas sizes. **Nothing else in the game hardcodes a number that appears here.** | `g_TICK_HZ, g_TICK_MS, g_TICK_DT, g_RES_W, g_RES_H, g_MAX_TRIS_WORLD, g_MAX_TRIS_FX, g_MAX_TRIS_HUD, g_FOG_FAR_CAP, g_CHUNK_M, g_CHUNK_GRID, g_RING_RADIUS, g_MAX_ENTS, g_MAX_PARTICLES, g_NB_BUCKETS, ...` |
-| `mathx.hml` | Hand-inlined scalar helpers + the noise stack. **All hashing in `i64` with an explicit 32-bit mask** (i32 `*` throws). | `xhash2, xhash3, h01, vnoise, fbm2, bayer4, smoothstep, clampf, lerpf, minf, maxf, absf, deg2rad` |
+| `mathx.hml` | Scalar helpers + the noise stack. **All hashing in `u64` with an explicit 32-bit mask.** *(Corrected by W2-2: `i64` also traps — two masked 32-bit values multiplied reach 2^64, which overflows i64. `u64` wraps on both backends and is the only container in which "mask after every multiply" is total. Verified: `i64 9223372036854775807 * 2` throws; the same in u64 wraps.)* Zero imports; calls the `__floor` / `__clamp` builtins directly. | `xhash2, xhash3, h01, h01_3, vnoise, fbm2, bayer4, bayer4i, smoothstep, smooth01, clampf, clamp01, lerpf, minf, maxf, absf, absi, mini, maxi, clampi, floori, deg2rad, rad2deg` |
+
+#### 5.2a `config.hml` / `mathx.hml` — exact signatures (added by W2-2)
+
+`config.hml` exports **~250 `g_`-prefixed constants** in 18 numbered sections: fixed timestep,
+resolution, triangle budget, millisecond budget, camera/fog/light, shade tier + its fog ladder,
+world/chunk/LOD, entity caps, player, weapon+enemy *shapes*, wave director, day cycle,
+progression, lanterns, atlases/texture rules, audio, net shapes, juice timings. The two
+load-bearing ones are `g_FOG_FAR_CAP = 72.0` and `g_MAX_DYNAMIC_LIGHTS = 2`.
+
+**Deliberately NOT in `config.hml`:** colours (they are `art/palette.hml`) and per-row data
+*tables* — the six weapons, the six enemies, the loot bands, the ToD keyframes and the HUD
+element rects are parallel arrays living in their owning modules. `config.hml` carries the
+*shape* of each (row counts, index constants, caps) so the owning module can size itself.
+Two GDD ladders are rescaled by D2 (`72/140`) and the derivation is commented in place: the
+per-tier fog distances (140/120/95/75/55/38 → 72/62/49/39/28/20 m) and the LOD ring radii
+(48/96 → 24/48 m).
+
+```hemlock
+// ---- scalar helpers: thin wrappers over the __clamp/__min/__max/__abs builtins.
+//      In an INNERMOST loop call the builtin directly — measured 12.2 ns vs
+//      13.7 ns hand-inlined ifs, 19.3 ns for @stdlib's alias, 22.0 ns for these.
+fn absf(p_a: f64): f64
+fn minf(p_a: f64, p_b: f64): f64
+fn maxf(p_a: f64, p_b: f64): f64
+fn clampf(p_v: f64, p_lo: f64, p_hi: f64): f64
+fn clamp01(p_v: f64): f64                       // the case that dominates
+fn lerpf(p_a: f64, p_b: f64, p_t: f64): f64
+fn smooth01(p_t: f64): f64                      // t*t*(3-2t), t clamped to [0,1]
+fn smoothstep(p_e0: f64, p_e1: f64, p_x: f64): f64      // GLSL semantics
+fn deg2rad(p_d: f64): f64
+fn rad2deg(p_r: f64): f64
+fn absi(p_a: i32): i32
+fn mini(p_a: i32, p_b: i32): i32
+fn maxi(p_a: i32, p_b: i32): i32
+fn clampi(p_v: i32, p_lo: i32, p_hi: i32): i32
+fn floori(p_x: f64): i32                        // floor, NOT truncate: floori(-2.1) == -3
+
+// ---- hashing.  Returns a full 32-bit value carried in a u64.
+fn xhash2(p_x: i32, p_y: i32, p_seed: i32): u64
+fn xhash3(p_x: i32, p_y: i32, p_z: i32, p_seed: i32): u64
+fn h01(p_x: i32, p_y: i32, p_seed: i32): f64            // xhash2 mapped to [0,1)
+fn h01_3(p_x: i32, p_y: i32, p_z: i32, p_seed: i32): f64
+
+// ---- ordered dither (ART_BIBLE §7.2).  Dither EVERY ramp boundary.
+fn bayer4i(p_x: i32, p_y: i32): i32             // 0..15
+fn bayer4(p_x: i32, p_y: i32): f64              // 0..15/16, the threshold form
+
+// ---- value noise.  `p_cell` is the lattice cell size in the SAME UNITS as
+//      x and y (texels for texgen, metres for worldgen); `p_wrap` is the
+//      repeat length in those units, and <= 0 disables wrapping.
+//      GUARANTEE: when p_cell divides p_wrap,
+//          vnoise(x + wrap, y, cell, wrap, s) == vnoise(x, y, cell, wrap, s)
+//      BIT-EXACTLY, which is what makes a 32x32 atlas cell seamless.
+//      fbm2 is 3 octaves at 0.60/0.28/0.12 with cell halving and seeds
+//      s, s+31, s+97 (ART_BIBLE §7.2 verbatim); it tiles when cell*4 divides
+//      wrap.  Both return [0, 1).
+fn vnoise(p_x: f64, p_y: f64, p_cell: f64, p_wrap: i32, p_seed: i32): f64
+fn fbm2(p_x: f64, p_y: f64, p_cell: f64, p_wrap: i32, p_seed: i32): f64
+```
+
+> **COST, MEASURED (W2-2, `hemlockc -O1`, `__clock` min-of-7, load avg 4.0).** `xhash2` **280 ns**,
+> `vnoise` **1.25 µs**, `fbm2` **3.7 µs** per call. Hemlock's `u64` arithmetic is boxed (~11 ns per
+> operation), and `vnoise` runs 44 of them across its four inlined corner hashes. **Consequence for
+> `texgen.hml` (W2-5) and `skygen.hml` (W2-6): do not call `fbm2` per texel.** Measured on the
+> ART_BIBLE §7.3 grass recipe (two `fbm2` + one `h01` + one `bayer4` per texel): **8.02 ms for one
+> 32×32 tile → 514 ms for a 64-tile atlas**, against a 200 ms budget. The same tile's *lattice* is
+> only 84 hash evaluations (2×2 + 4×4 + 8×8 corners) — **0.08 ms** — so evaluate each octave's
+> lattice once per tile and bilinear-interpolate per texel, which is 100× cheaper and produces the
+> identical field. `vnoise`/`fbm2` remain the right call for per-vertex worldgen (81 samples per
+> chunk), for tools, and for any lattice-sparse use.
 
 ### 5.3 `nightshade/src/art/` — the procedural art pipeline
 
 | File | Purpose | Exports |
 |---|---|---|
-| `palette.hml` | Every colour from ART_BIBLE §3, as `g_`-prefixed packed `i32` (0xRRGGBB) plus `pal_r/g/b` unpackers. **Nothing anywhere else names a colour.** | `g_GRASS_MID, g_NS_CORE, g_UI_AMBER, … (≈110 constants), pal_r, pal_g, pal_b, pal_pack, pal_lerp` |
+| `palette.hml` | Every colour from ART_BIBLE §3, as `g_`-prefixed packed `i32` (0xRRGGBB) plus `pal_r/g/b` unpackers. **Nothing anywhere else names a colour.** Also carries the ART_BIBLE §5.1 per-keyframe sky/cloud colours (`g_SKY_ZENITH_DAWN` … `g_CLOUD_SHADOW_DEEP`, 5 rows × 7 keyframes), the §4.4 emissive `g_WINDOW_LIGHT` and the §13.7 `g_DEBUG_MAGENTA`, because the "no hex outside this file" law (CLAUDE.md §8, `ci_imports.sh` R4) has to hold for `tod.hml` and `skygen.hml` too. **125 colour constants.** Zero imports; pure data. | `g_GRASS_MID, g_NS_CORE, g_UI_AMBER, … (125 colour constants), pal_r, pal_g, pal_b, pal_pack, pal_lerp, pal_lerp_q, pal_lum, pal_table, pal_names, pal_families, pal_selftest, g_PAL_COUNT, g_PAL_FAM_SKY..g_PAL_FAM_DEBUG, g_PAL_FAM_COUNT, g_PAL_SELFTEST_ASSERTS` |
 | `tod.hml` | The ART_BIBLE §5 keyframe table remapped onto the 16-minute day (D6), interpolation, weather overrides, lightning. Writes the engine `RenderEnv`. | `tod_eval, tod_phase, tod_sky_keys, tod_set_weather, tod_lightning_fire, TOD_DAWN..TOD_DEEP, WX_CLEAR/OVERCAST/RAIN/STORM/BLOOM` |
 | `texgen.hml` | ART_BIBLE §7.2 primitives + §7.3 generators + the §7.4 8×8 packer → `ATLAS_WORLD` (256×256). | `texgen_build_world_atlas, tg_grass, tg_dirt, tg_stone, tg_wood, tg_metal, tg_concrete, tg_leaf, tg_snow, tg_ramp_pick, tg_grain, CELL_*` (cell index constants) |
-| `skygen.hml` | ART_BIBLE §11 panorama: dithered gradient, two cloud layers with lit-top/shadow-bottom, sun/moon/halo, star field with a fixed seed. Incremental re-bake, 20 rows/frame. | `skygen_build, skygen_mark_dirty, skygen_rebake_slice, skygen_tex` |
+| `skygen.hml` | ART_BIBLE §11 panorama: dithered gradient, two cloud layers with lit-top/shadow-bottom, sun/moon/halo, star field with a fixed seed. Incremental re-bake, 20 rows/frame. | `skygen_build, skygen_mark_dirty, skygen_rebake_slice, skygen_tex`, plus the key-block interface in §5.3.1 |
 | `fxgen.hml` | `ATLAS_FX` (128×128, 16×16 cells): muzzle ×3, tracer, sparks, explosion ×6, ember, smoke ×3, glow cards ×2, enemy eye, loot beam, rain streak, lightning, dust, splash, XP mote. | `fxgen_build_atlas, FX_MUZZLE_0, FX_TRACER, FX_GLOW_S, FX_GLOW_L, …` |
 | `hudgen.hml` | `ATLAS_HUD` (128×128): `FONT_MICRO` 4×6 and `FONT_BIG` 8×12 as packed bitfields, icons, crosshair parts, minimap chrome, vignette gradient strip. | `hudgen_build_atlas, hud_font_micro, hud_font_big, HUD_ICON_*` |
-| `meshgen.hml` | The procedural mesh DSL and every world mesh: tree LOD0/1/2, bush, rock, crate, barrel, lantern post, enemy ×6 (rigid parts), NPC, weapon viewmodels ×6. Bakes vertex colour + AO at build time. | `mg_box, mg_prism, mg_taper, mg_fan_disc, mg_lathe, meshgen_build_all, MESH_TREE0, MESH_HUSK, MESH_SPARROW_VM, …` |
+| `meshgen.hml` | The procedural mesh DSL and every world mesh: tree LOD0/1/2, bush, rock, crate, barrel, lantern post, contact blob, enemy ×6 × 3 LODs (rigid parts), NPC, weapon viewmodels ×6 — **34 meshes, 3270 triangles, built in ~45 ms**. Bakes vertex colour + creased AO at build time, then applies a soft luminance floor of 72 (`MG_LUM_FLOOR`) so no vertex in the game is darker than the atlas minimum. UVs are bound per MATERIAL, not per atlas cell: `assets.hml` calls `meshgen_set_material_uv(MG_MAT_*, u0,v0,u1,v1)` with texgen's `CELL_*` rects **before** `meshgen_build_all()`. | `mg_box, mg_box_ex, mg_prism, mg_taper, mg_fan_disc, mg_lathe, mg_spike, mg_panel, mg_ground_quad, mg_set_jitter, meshgen_build_all, meshgen_bake_all, meshgen_set_material_uv, meshgen_set_sun_azimuth, meshgen_mesh, meshgen_name, meshgen_tris, meshgen_budget, meshgen_kind, meshgen_radius, meshgen_view_yaw, meshgen_count, meshgen_enemy_mesh, mg_head_shoulder, mg_head_width, mg_shoulder_width, mg_protrusion, mg_protrusion_axis, MESH_TREE0/1/2, MESH_BUSH, MESH_ROCK, MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_WISP0..MESH_BULWARK2 (class ×3 LODs), MESH_NPC, MESH_SPARROW_VM..MESH_EMBERLANCE_VM, MESH_COUNT, ENEMY_WISP..ENEMY_BULWARK, MG_MAT_*, MG_KIND_*, MG_LUM_FLOOR` |
 | `biome.hml` | Per-biome palettes, texture cell selection, prop density, `FOG_FAR` override, triangle-budget policy. (Wave 4.) | `biome_of, biome_params, BIOME_HOLLOWFIELD..BIOME_DEEPSHADE` |
 | `weather.hml` | Weather state machine + rain/snow/fog-bank emitters. (Wave 4.) | `weather_step, weather_emit` |
 | `hubgen.hml` | Ember Hollow's modular building meshes and layout. (Wave 4.) | `hubgen_build, hub_layout` |
+
+#### 5.3a `tod.hml` — exact signatures (added by W2-4; `skygen.hml` and the view code code against these)
+
+```hemlock
+tod_eval(env: array<f64>, day_t: f64, wx: i32)   // frame graph stage 6; fills the RenderEnv
+tod_sky_keys(out: array<f64>)                    // out.length >= TODSKY_COUNT (22); 0..1 colours
+tod_phase(day_t: f64): i32                       // TOD_PHASE_DAWN/DAY/DUSK/NIGHT
+tod_phase_t(day_t: f64): f64                     // 0..1 through the current phase (the dusk horn)
+tod_phase_start(phase: i32): f64
+tod_is_night(day_t: f64): i32
+tod_key_anchor(key: i32): f64                    // day fraction of TOD_DAWN..TOD_DEEP
+tod_key_field(key: i32, field: i32): f64         // raw keyframe row, for tools
+tod_clock_hours(day_t: f64): f64                 // the ART_BIBLE wall clock, for the debug overlay
+tod_t_from_tick(tick: i32): f64                  // tick -> day fraction (57 600 ticks/day)
+tod_wrap(t: f64): f64
+tod_set_weather(wx: i32)                         // immediate; passing a new wx to tod_eval crossfades
+tod_weather(): i32      tod_weather_mix(): f64
+tod_lightning_fire()    tod_lightning_active(): i32
+tod_lightning_frame(): i32                       // -1 idle, 0/1 flash, 2 recovery
+tod_lightning_alpha(): f64                       // alpha of the full-screen additive quad fx_emit draws
+tod_set_mist_band(bottom_y: f64, thickness: f64) // §6.4; view code sets it per frame
+tod_set_bounce_tint(r: f64, g: f64, b: f64)      // biome.hml tints the grass bounce
+tod_state(field: i32): f64   tod_mist_density(): f64   tod_reset()
+```
+
+`TODSKY_*` indices: `ZENITH_R/G/B 0-2, MID 3-5, HORIZON 6-8, CLOUD_LIT 9-11, CLOUD_SHADOW 12-14,
+STAR_ALPHA 15, HALO 16, MOON 17 (0 sun … 1 moon, crossfades), BODY_X/Y/Z 18-20, CLOUD_COVER 21`.
+`TODSKY_BODY_*` is also the key-light direction, so the disc and the shadows can never disagree.
+**`tod_eval` sets `RIM` to zero** (ART_BIBLE §4.2 — rim is per entity class, not per environment);
+entity emit sets its own rim from the horizon band it reads out of `tod_sky_keys`.
+
+#### 5.3.1 The `skygen` <-> `tod` key block (added by W2-6)
+
+`skygen.hml` does **not** import `tod.hml`. The dependency is inverted: skygen publishes a flat
+`array<f64>` layout, tod fills it, and the caller hands it over. Flat, not an object — it is copied
+once per re-bake and read from the row loop, and A7/N8 both say a struct buys nothing here. This
+keeps skygen unit-testable with no ToD clock and keeps `src/art/**` free of a cycle.
+
+```
+skygen_keys_new(): array<f64>              // a zeroed block of SKYK_COUNT (26)
+skygen_keys_default(k: array<f64>)         // the NOON keyframe, from palette.hml only
+skygen_set_keys(k: array<f64>)             // takes effect at the next mark_dirty/build
+skygen_set_clock(t_seconds: f64)           // drives cloud drift (0.6 / 1.4 px/s)
+skygen_set_features(mask: i32)             // SKYF_CLOUDS/STARS/SUN/MOON/MILKYWAY/ALL
+skygen_init()                              // idempotent; no SDL
+skygen_bake_all(): i32                     // CPU-only full bake, no window needed
+skygen_build(win): ptr                     // bake + atlas_upload(BLEND_NONE)
+skygen_mark_dirty()                        // snapshot keys, schedule a rolling re-bake
+skygen_rebake_slice(): i32                 // next slice + one dirty-rect upload; 0 when clean
+skygen_dirty_rows(): i32
+skygen_set_slice_rows(n: i32)              // the rows/frame dial, default SKY_ROWS_PER_SLICE
+skygen_slice_rows(): i32
+skygen_tex() / skygen_atlas() / skygen_w() / skygen_h()
+skygen_sun_uv(out, off) / skygen_moon_uv(out, off) / skygen_sun_is_up(): i32
+skygen_seam(out, off)                      // the fog-derived horizon colour, rgb 0..255
+skygen_row_cloud(y): i32 / skygen_star_count(): i32     // bake statistics, for the harness
+```
+
+Key block slots (`SKYK_*`, channels 0..255, multipliers and alphas 0..1):
+
+| Slot | Field | Slot | Field |
+|---|---|---|---|
+| 0..2 | `SKY_ZENITH` r,g,b | 15..17 | `FOG_TINT_MUL` r,g,b (0..1) |
+| 3..5 | `SKY_MID` r,g,b | 18 | `STAR_ALPHA` |
+| 6..8 | `SKY_HORIZON` r,g,b | 19..21 | `SUN_DIR` x,y,z |
+| 9..11 | `CLOUD_LIT` r,g,b | 22 | sun halo radius, px (34; 56 at DAWN/GOLDEN) |
+| 12..14 | `CLOUD_SHADOW` r,g,b | 23 | sun halo falloff exponent (1.8; 1.2 at DAWN/GOLDEN) |
+| | | 24 | `MOON_PHASE` 0..1 (0 new, 0.5 full) |
+| | | 25 | `CLOUD_COVER_BIAS`, subtracted from the coverage threshold |
+
+**`tod.hml` (W2-4) owes exactly one function against this**: fill a caller-supplied
+`array<f64>` of `SKYK_COUNT` from the interpolated §5.1 keyframe plus the weather override. The
+name reserved in §5.3 is `tod_sky_keys`; W2-6 assumed nothing about its signature.
+
+**§11.5 reconciliation.** The §5.1 table authors `SKY_HORIZON` and `FOG_TINT_MUL` independently and
+they do not agree (NOON implies a "mid-grey" of (221,250,247); GOLDEN implies (266,219,155)).
+skygen derives the panorama's horizon band from the fog, per §11.5, at the authored horizon's
+luminance: `seam = FOG_TINT_MUL * (luma(SKY_HORIZON) / luma(FOG_TINT_MUL))`. The seam therefore
+carries the fog's hue — which is what shows as a skyline seam — at the art director's value.
 
 ### 5.4 `nightshade/src/sim/` — the simulation (headless; the future dedicated server)
 
 | File | Purpose | Exports |
 |---|---|---|
-| `rng.hml` | Seeded xorshift128 with **separate streams**, seeded from `(world_seed, stream_id, tick, entity_id)`. `@stdlib/random` is banned here. | `rng_seed, rng_next, rng_f01, rng_range, rng_pick, RNG_LOOT, RNG_SPREAD, RNG_AI, RNG_WORLDGEN, RNG_DIRECTOR` |
-| `command.hml` | `InputCommand` (9 integers, **no bools, no floats, no nulls**) + button bits + quantize/dequantize. Quantized **at construction** so prediction uses the exact value the server will. | `cmd_new, cmd_set, cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, BTN_FIRE..BTN_INV, q_ang, dq_ang` |
-| `world.hml` | The SoA `World`: identity / transform / state / owner-only / server-only groups, sparse-set ids, `world_spawn`/`world_despawn` (swap-with-last), kind-partitioned id ranges. | `world_new, world_spawn, world_despawn, world_slot_of, world_id_of, world_reset, KIND_*, ID_PLAYER_BASE, ID_AI_BASE, ID_PROJ_BASE, ID_PICKUP_BASE` |
-| `history.hml` | Transform ring buffer, `HISTORY_TICKS = 32`, flat `px[(slot*32)+ring]`. Called every tick even in v1. | `history_new, history_capture, history_sample` |
+| `rng.hml` | Seeded xorshift128 (4x32-bit lanes) with **separate streams**, seeded from `(world_seed, stream_id, tick, entity_id)` through splitmix64. `@stdlib/random` is banned here; the module imports **nothing**. State is a caller-owned 4-slot `array` so reseeding allocates nothing. **W2-9 signatures:** `rng_new(): array` · `rng_seed(st, world_seed, stream, tick, entity)` · `rng_u32(st): u64` (0..2^32-1, the core draw) · `rng_next(st): i32` (0..2^31-1) · `rng_f01(st): f64` [0,1) · `rng_f11(st): f64` (-1,1) · `rng_pick(st, n): i32` [0,n) rejection-sampled · `rng_range(st, lo, hi): i32` **inclusive** · `rng_chance(st, num, den): i32` 0/1 · `rng_copy(dst, src)` · `rng_state_hash(st): i32`. | `rng_new, rng_seed, rng_u32, rng_next, rng_f01, rng_f11, rng_pick, rng_range, rng_chance, rng_copy, rng_state_hash, RNG_LOOT, RNG_SPREAD, RNG_AI, RNG_WORLDGEN, RNG_DIRECTOR, RNG_STREAMS, RNG_LANES` |
+| `command.hml` | `InputCommand` (9 integers, **no bools, no floats, no nulls**) + button bits + quantize/dequantize. Quantized **at construction** so prediction uses the exact value the server will. Imports **nothing**. **W2-9 signatures:** `cmd_new(): object` · `cmd_set(c, tick, dt_ms, mx: f64, my: f64, yaw_rad: f64, pitch_rad: f64, buttons, weapon, seq)` — takes RADIANS and [-1,1] axes, quantizes and clamps inside · `cmd_copy(dst, src)` · `cmd_yaw(c): f64` [0,TAU) · `cmd_pitch(c): f64` (-PI,PI] · `cmd_move_x/y(c): f64` [-1,1] · `cmd_btn(c, bit): i32` 0/1 · `cmd_wire_ok(c): i32` 0 = legal, else a bit per bad field · `cmd_hash(c): i32` · `q_ang(f64): i32` / `dq_ang(i32): f64` / `q_axis(f64): i32` / `dq_axis(i32): f64`. **`q_ang` ROUNDS, it does not truncate** — NETWORKING.md §11.1's pseudo-code truncates and is therefore not idempotent; `src/net/quantize.hml` (W2-12) must round to match. | `cmd_new, cmd_set, cmd_copy, cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, cmd_btn, cmd_wire_ok, cmd_hash, BTN_FIRE..BTN_INV, BTN_ALL, q_ang, dq_ang, q_axis, dq_axis, CMD_FIELDS, CMD_STRIDE, ANG_STEPS, ANG_SCALE, AXIS_STEPS, CMD_TAU, CMD_PI, CMD_MAX_TICK, CMD_MAX_DT_MS, CMD_MAX_WEAPON` |
+| `world.hml` | The SoA `World`: identity / transform / state / owner-only / server-only groups, sparse-set ids, `world_spawn`/`world_despawn` (swap-with-last), kind-partitioned id ranges. Imports nothing — pure storage. **Signatures (W2-10, as built):** `world_new(): object` (cap = `WORLD_CAP_DEFAULT` 512, mirrors `g_MAX_ENTS`) · `world_new_cap(cap): object` · `world_spawn(w, kind, owner): i32` returns a slot or `SLOT_NONE` (-1); refuses `KIND_PLAYER` · `world_spawn_player(w, pslot): i32` (a player id **is** its slot, 1..64, positional per NETWORKING §7.1) · `world_despawn(w, slot): i32` / `world_despawn_id(w, id): i32` · `world_slot_of(w, id): i32` / `world_id_of(w, slot): i32` / `world_alive(w, id): i32` · `world_check(w): i32` (0 = consistent; tools/CI, O(cap)) · `world_reset(w)` keeps the id allocators, `world_reset_session(w, seed)` rewinds them. Per-entity systems **hoist the field arrays** (`let px = w.px;` — never annotate the hoist, see W2-10 report) rather than calling an accessor. | `world_new, world_new_cap, world_spawn, world_spawn_player, world_despawn, world_despawn_id, world_slot_of, world_id_of, world_alive, world_kind_of, world_owner_of, world_count, world_cap, world_tick, world_set_tick, world_seed, world_set_seed, world_replaying, world_set_replaying, world_check, world_reset, world_reset_session, world_id_class, world_kind_range_base, world_next_id, world_spawn_count, world_despawn_count, world_spawn_fail_count, KIND_NONE/PLAYER/AI/NPC/PROJECTILE/PICKUP/PROP/LANTERN/COSMETIC/COUNT, ID_NONE, ID_PLAYER_BASE, ID_PLAYER_MAX, ID_AI_BASE, ID_AI_MAX, ID_PROJ_BASE, ID_PROJ_MAX, ID_PICKUP_BASE, ID_PICKUP_MAX, ID_COSMETIC_BASE, ID_COSMETIC_MIN, SLOT_NONE, WORLD_CAP_DEFAULT, EF_VISIBLE/DEAD/HIT_FLASH/GROUNDED/INVULN/NO_REPLICATE` |
+| `history.hml` | Transform ring buffer, `HISTORY_TICKS = 32`, flat `px[(slot*32)+ring]`. Called every tick even in v1. Every cell also stores the occupying **id**, because `world_despawn` recycles slots — a slot-only rewind would return the wrong body. **Signatures (W2-10, as built):** `history_new(cap): object` · `history_capture(h, w)` (once per tick, O(live count), 0.024 ms @256) · `history_sample(h, slot, id, tick, out): i32` writes `out[HIST_PX..HIST_PITCH]`, returns 1/0, never allocates · `history_find_slot(h, id, tick): i32` is the O(n) fallback when the slot changed · `history_sample_id(h, id, tick, out): i32` combines the two. | `history_new, history_reset, history_capture, history_sample, history_sample_id, history_find_slot, history_ring_of, history_head_tick, history_count_at, history_depth, history_capture_count, HISTORY_TICKS, HISTORY_MASK, HIST_PX, HIST_PY, HIST_PZ, HIST_YAW, HIST_PITCH, HIST_FIELDS, HIST_MISS` |
 | `chunk.hml` | Chunk storage: `buffer(u16)` heights (cm), `buffer(u8)` biome + baked light, sparse edit overlay, dirty flags, LRU cache. | `chunk_key, chunk_get, chunk_height_at, chunk_normal_at, chunk_set_edit, chunk_evict, CHUNK_N` |
 | `worldgen.hml` | Pure `f(seed, cx, cz) → chunk`. 3-octave value noise height, temperature/moisture biome fields, per-chunk POI hash roll. No I/O, no globals. | `worldgen_chunk, worldgen_height, worldgen_biome, worldgen_poi_roll, worldgen_shade_tier` |
 | `daycycle.hml` | tick → day fraction, phase, shade-tier phase bonus, dusk-horn edge. Pure. | `day_frac, day_phase, day_tier_bonus, day_is_night, PHASE_DAWN..PHASE_NIGHT` |
@@ -472,6 +621,7 @@ one-line `// LEGACY — not on the shipping path. See ENGINE_GAPS.md.` header an
 | `packetdump.hml` | Hexdump + decode of a captured `S_SNAPSHOT`; asserts every field's byte offset. |
 | `palette_preview.hml` | Dumps a PNG swatch sheet of the whole palette and every ToD keyframe applied to a test sphere. **Built before texgen**, so palette errors are caught before they are baked into fifty tiles. |
 | `texview.hml` | Dumps `ATLAS_WORLD`, `ATLAS_FX`, `ATLAS_HUD`, `TEX_SKY` to PNG, with a grid overlay and cell labels. |
+| `meshgen.hml` | **(added by W2-8.)** The driver for `src/art/meshgen.hml`. `--verify` is the W2-8 acceptance suite (163 assertions: budgets, asymmetry, head:shoulder, protrusions, weapon silhouettes, the luminance floor, determinism). `--contact-sheet <png>` renders every mesh at 32×32, 12 px and 6 px on light and dark backgrounds for the visual critic; `--inspect <png>` at 96 px; `--big <id> --out <png>` at 256 px. Software-rasterized in Hemlock: **no SDL is linked.** |
 | `benchframe.hml` | Per-stage frame ablation against the live renderer; prints the §4 stage table. Regression gate for the budget. |
 | `ci_imports.sh` | Greps the import wall (§1.1), the `g_` prefix rule, and the legacy-import ban. |
 | `ci_unbox.sh` | `hemlockc -c --emit-c` + grep for `double`/`int32_t` on the ~12 hottest locals named in `CLAUDE.md`. |

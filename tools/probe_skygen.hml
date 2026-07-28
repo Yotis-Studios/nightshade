@@ -1,0 +1,677 @@
+// ---------------------------------------------------------------------------
+// probe_skygen.hml — acceptance probe for src/art/skygen.hml.   (Nightshade W2-6)
+//
+//   hemlockc -O1 tools/probe_skygen.hml -o /tmp/probe_skygen
+//   SDL_VIDEODRIVER=dummy /tmp/probe_skygen --out docs/shots/sky_sheet.png
+//
+// Exits 0 only if every assertion passed AND the number of assertions executed
+// is exactly the number this file says it should execute.  A probe that exits 0
+// while printing FAIL is worse than no probe, and so is one that silently skips
+// half its checks.
+//
+// BUILD_PLAN W2-6 acceptance, in order:
+//   A. No visible banding: max adjacent-row luminance step <= 2 after dither.
+//   B. Clouds never touch the horizon line.
+//   C. The horizon band matches fog_tint applied to mid-grey (no skyline seam).
+//   D. The sun position tracks SUN_DIR.
+//   E. A full re-bake completes in 8 frames at <= 0.6 ms/frame.
+//   F. Constellations are identical across runs.
+// plus G: an incremental re-bake is byte-identical to a full bake, which is the
+// thing that actually breaks if the 20-rows-per-frame cursor is wrong.
+//
+// ---------------------------------------------------------------------------
+// THE ToD FIXTURES BELOW ARE A TEST FIXTURE, NOT AN AUTHORING SITE.
+// ---------------------------------------------------------------------------
+// tod.hml (W2-4) is the shipping source of truth for the ART_BIBLE §5.1
+// keyframe table and it does not exist yet.  These four rows are transcribed
+// here so skygen can be proved against more than one keyframe.  They live in
+// tools/, outside the `no hex outside palette.hml` grep, and they must be
+// deleted the moment tod.hml can fill a key block.
+// ---------------------------------------------------------------------------
+
+import { floor, sqrt, atan2, asin, divi } from "@stdlib/math";
+import { exit } from "@stdlib/process";
+import { exists } from "@stdlib/fs";
+
+import { SKY_W, SKY_H, SKY_ROWS_PER_SLICE,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER, SKYK_COUNT,
+         SKYF_CLOUDS, SKYF_STARS, SKYF_SUN, SKYF_MOON, SKYF_MILKYWAY, SKYF_ALL,
+         skygen_init, skygen_keys_new, skygen_set_keys, skygen_set_features,
+         skygen_set_clock, skygen_bake_all, skygen_build, skygen_mark_dirty,
+         skygen_rebake_slice, skygen_dirty_rows, skygen_atlas, skygen_tex,
+         skygen_sun_uv, skygen_moon_uv, skygen_sun_is_up, skygen_seam,
+         skygen_star_count, skygen_row_cloud, skygen_set_slice_rows,
+         skygen_slice_rows } from "../src/art/skygen.hml";
+
+import { pal_r, pal_g, pal_b, g_SUN_DISC } from "../src/art/palette.hml";
+
+import { window_open_ex, window_close } from "../../wobbleweed/src/sdl.hml";
+import { write_png } from "../../wobbleweed/src/png.hml";
+
+// ---------------------------------------------------------------------------
+// assertion plumbing
+// ---------------------------------------------------------------------------
+
+let g_ck_n = 0;
+let g_ck_fail = 0;
+
+fn ck(name: string, cond: i32) {
+    g_ck_n = g_ck_n + 1;
+    if (cond == 1) {
+        print(`  ok   ${name}`);
+    } else {
+        g_ck_fail = g_ck_fail + 1;
+        print(`  FAIL ${name}`);
+    }
+}
+
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    if (frac < 100) { fs = `0${fs}`; }
+    if (frac < 10) { fs = `00${frac}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// ToD fixtures (see the header warning)
+// ---------------------------------------------------------------------------
+
+const TOD_DAWN = 0;
+const TOD_NOON = 1;
+const TOD_GOLDEN = 2;
+const TOD_NIGHT = 3;
+
+fn setk(k: array<f64>, o: i32, a: f64, b: f64, c: f64) {
+    k[o] = a; k[o + 1] = b; k[o + 2] = c;
+}
+
+fn fixture(p_which: i32): array<f64> {
+    let k: array<f64> = skygen_keys_new();
+    let w: i32 = p_which;
+    k[SKYK_MOON_PHASE] = 0.32;
+    k[SKYK_CLOUD_COVER] = 0.0;
+    k[SKYK_HALO_R] = 34.0;
+    k[SKYK_HALO_EXP] = 1.8;
+    if (w == TOD_DAWN) {
+        setk(k, SKYK_ZEN, 42.0, 58.0, 114.0);
+        setk(k, SKYK_MID, 122.0, 90.0, 150.0);
+        setk(k, SKYK_HOR, 232.0, 164.0, 104.0);
+        setk(k, SKYK_CLOUD_LIT, 255.0, 208.0, 160.0);
+        setk(k, SKYK_CLOUD_SHADOW, 142.0, 110.0, 136.0);
+        setk(k, SKYK_FOG, 0.86, 0.62, 0.52);
+        setk(k, SKYK_SUN, 0.94, 0.10, 0.32);
+        k[SKYK_STAR_ALPHA] = 0.15;
+        k[SKYK_HALO_R] = 56.0;
+        k[SKYK_HALO_EXP] = 1.2;
+    }
+    if (w == TOD_NOON) {
+        setk(k, SKYK_ZEN, 44.0, 95.0, 184.0);
+        setk(k, SKYK_MID, 78.0, 143.0, 214.0);
+        setk(k, SKYK_HOR, 168.0, 210.0, 232.0);
+        setk(k, SKYK_CLOUD_LIT, 242.0, 240.0, 228.0);
+        setk(k, SKYK_CLOUD_SHADOW, 150.0, 163.0, 184.0);
+        setk(k, SKYK_FOG, 0.76, 0.84, 0.94);
+        setk(k, SKYK_SUN, 0.18, 0.96, 0.22);
+        k[SKYK_STAR_ALPHA] = 0.0;
+    }
+    if (w == TOD_GOLDEN) {
+        setk(k, SKYK_ZEN, 46.0, 74.0, 142.0);
+        setk(k, SKYK_MID, 138.0, 90.0, 130.0);
+        setk(k, SKYK_HOR, 255.0, 158.0, 68.0);
+        setk(k, SKYK_CLOUD_LIT, 255.0, 192.0, 112.0);
+        setk(k, SKYK_CLOUD_SHADOW, 142.0, 90.0, 114.0);
+        setk(k, SKYK_FOG, 0.96, 0.72, 0.44);
+        setk(k, SKYK_SUN, -0.72, 0.42, -0.55);
+        k[SKYK_STAR_ALPHA] = 0.0;
+        k[SKYK_HALO_R] = 56.0;
+        k[SKYK_HALO_EXP] = 1.2;
+    }
+    if (w == TOD_NIGHT) {
+        setk(k, SKYK_ZEN, 12.0, 16.0, 40.0);
+        setk(k, SKYK_MID, 20.0, 26.0, 56.0);
+        setk(k, SKYK_HOR, 38.0, 48.0, 78.0);
+        setk(k, SKYK_CLOUD_LIT, 58.0, 66.0, 96.0);
+        setk(k, SKYK_CLOUD_SHADOW, 26.0, 32.0, 56.0);
+        setk(k, SKYK_FOG, 0.18, 0.22, 0.36);
+        setk(k, SKYK_SUN, -0.30, -0.55, -0.78);
+        k[SKYK_STAR_ALPHA] = 1.0;
+    }
+    return k;
+}
+
+fn tod_name(w: i32): string {
+    if (w == TOD_DAWN) { return "DAWN"; }
+    if (w == TOD_NOON) { return "NOON"; }
+    if (w == TOD_GOLDEN) { return "GOLDEN"; }
+    return "NIGHT";
+}
+
+// ---------------------------------------------------------------------------
+// panorama readers
+// ---------------------------------------------------------------------------
+
+fn row_mean_luma(p_y: i32): f64 {
+    let d: buffer = skygen_atlas().data;
+    let o: i32 = p_y * SKY_W * 4;
+    let acc: f64 = 0.0;
+    let x: i32 = 0;
+    while (x < SKY_W) {
+        acc = acc + 0.299 * f64(d[o]) + 0.587 * f64(d[o + 1]) + 0.114 * f64(d[o + 2]);
+        o = o + 4;
+        x = x + 1;
+    }
+    let out: f64 = acc / f64(SKY_W);
+    return out;
+}
+
+fn row_mean_ch(p_y: i32, p_c: i32): f64 {
+    let d: buffer = skygen_atlas().data;
+    let o: i32 = p_y * SKY_W * 4 + p_c;
+    let acc: f64 = 0.0;
+    let x: i32 = 0;
+    while (x < SKY_W) { acc = acc + f64(d[o]); o = o + 4; x = x + 1; }
+    let out: f64 = acc / f64(SKY_W);
+    return out;
+}
+
+// FNV-1a over the whole panorama, 32-bit, all mixing in i64 with an explicit
+// mask (A13).  It is deliberately NOT u64: a u64 accumulator round-trips
+// through a double on at least one path here and silently loses the low bits,
+// which would make a "constellations are identical" check that cannot fail.
+fn pano_hash(): i64 {
+    let d: buffer = skygen_atlas().data;
+    let n: i32 = SKY_W * SKY_H * 4;
+    let h: i64 = 2166136261;
+    let i: i32 = 0;
+    while (i < n) {
+        h = (h ^ i64(d[i])) & 4294967295;
+        h = (h * 16777619) & 4294967295;
+        i = i + 1;
+    }
+    let out: i64 = h;
+    return out;
+}
+
+fn pano_copy(): buffer {
+    let d: buffer = skygen_atlas().data;
+    let n: i32 = SKY_W * SKY_H * 4;
+    let c: buffer = buffer(n);
+    memcpy(buffer_ptr(c), buffer_ptr(d), n);
+    return c;
+}
+
+fn pano_diff(p_a: buffer): i32 {
+    let d: buffer = skygen_atlas().data;
+    let a: buffer = p_a;
+    let n: i32 = SKY_W * SKY_H * 4;
+    let bad: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (d[i] != a[i]) { bad = bad + 1; }
+        i = i + 1;
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// timing — RULE T: __clock() CPU time, minimum of 7 batches.  A busy machine
+// can only make a sample slower, so the minimum reports the code and the mean
+// reports the llama-server.
+// ---------------------------------------------------------------------------
+
+const TRIALS = 7;
+
+fn slice_ms(p_cycles: i32): f64 {
+    let cycles: i32 = p_cycles;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let r: i32 = 0;
+        while (r < cycles) {
+            skygen_mark_dirty();
+            let s: i32 = 0;
+            while (s < 8) { skygen_rebake_slice(); s = s + 1; }
+            r = r + 1;
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(cycles * 8);
+        if (t == 0) { best = ms; }
+        if (ms < best) { best = ms; }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn full_ms(p_reps: i32): f64 {
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let r: i32 = 0;
+        while (r < reps) { skygen_bake_all(); r = r + 1; }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(reps);
+        if (t == 0) { best = ms; }
+        if (ms < best) { best = ms; }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PNG contact sheet: four keyframes stacked, at 1:1.
+// ---------------------------------------------------------------------------
+
+fn sheet_blit(p_rgb: buffer, p_slot: i32) {
+    let d: buffer = skygen_atlas().data;
+    let rgb: buffer = p_rgb;
+    let base: i32 = p_slot * SKY_H * SKY_W * 3;
+    let i: i32 = 0;
+    let n: i32 = SKY_W * SKY_H;
+    while (i < n) {
+        rgb[base + i * 3] = d[i * 4];
+        rgb[base + i * 3 + 1] = d[i * 4 + 1];
+        rgb[base + i * 3 + 2] = d[i * 4 + 2];
+        i = i + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+fn main() {
+    print("probe_skygen — W2-6 sky panorama");
+    print(`panorama ${SKY_W}x${SKY_H}, ${SKY_ROWS_PER_SLICE} rows/slice, key block ${SKYK_COUNT} slots`);
+
+    skygen_init();
+    print(`stars generated: ${skygen_star_count()}`);
+
+    // ----------------------------------------------------------------- A ---
+    // Banding.  Measured on the gradient alone: clouds, stars and the sun are
+    // supposed to change the row mean, so leaving them in would test nothing.
+    print("A. gradient banding (features off)");
+    skygen_set_features(0);
+    let worst_band: f64 = 0.0;
+    let worst_band_tod: i32 = 0;
+    let worst_texel: f64 = 0.0;
+    let w: i32 = 0;
+    while (w < 4) {
+        skygen_set_keys(fixture(w));
+        skygen_bake_all();
+        let prev: f64 = row_mean_luma(0);
+        let y: i32 = 1;
+        while (y < SKY_H) {
+            let cur: f64 = row_mean_luma(y);
+            let dd: f64 = cur - prev;
+            if (dd < 0.0) { dd = 0.0 - dd; }
+            if (dd > worst_band) { worst_band = dd; worst_band_tod = w; }
+            prev = cur;
+            y = y + 1;
+        }
+        // the raw per-texel step, for the record
+        let d: buffer = skygen_atlas().data;
+        y = 1;
+        while (y < SKY_H) {
+            let o: i32 = y * SKY_W * 4;
+            let op: i32 = (y - 1) * SKY_W * 4;
+            let x: i32 = 0;
+            while (x < SKY_W) {
+                let l1: f64 = 0.299 * f64(d[o]) + 0.587 * f64(d[o + 1]) + 0.114 * f64(d[o + 2]);
+                let l0: f64 = 0.299 * f64(d[op]) + 0.587 * f64(d[op + 1]) + 0.114 * f64(d[op + 2]);
+                let dd2: f64 = l1 - l0;
+                if (dd2 < 0.0) { dd2 = 0.0 - dd2; }
+                if (dd2 > worst_texel) { worst_texel = dd2; }
+                o = o + 4; op = op + 4;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        w = w + 1;
+    }
+    print(`   max adjacent-row mean-luma step ${f3(worst_band)} (worst at ${tod_name(worst_band_tod)})`);
+    print(`   max adjacent-row per-texel step ${f3(worst_texel)} (dither noise, not banding)`);
+    let a1: i32 = 0;
+    if (worst_band <= 2.0) { a1 = 1; }
+    ck("A1 max adjacent-row mean luminance step <= 2", a1);
+    // A flat run of identical rows IS a band.  With dither the row mean should
+    // never repeat exactly across a 126-luma ramp.
+    skygen_set_keys(fixture(TOD_NOON));
+    skygen_bake_all();
+    let flat: i32 = 0;
+    let y2: i32 = 1;
+    while (y2 < SKY_H) {
+        if (row_mean_luma(y2) == row_mean_luma(y2 - 1)) { flat = flat + 1; }
+        y2 = y2 + 1;
+    }
+    print(`   rows whose mean equals the row above: ${flat}`);
+    let a2: i32 = 0;
+    if (flat <= 4) { a2 = 1; }
+    ck("A2 <= 4 flat row pairs at NOON (dither is live)", a2);
+
+    // ----------------------------------------------------------------- B ---
+    print("B. clouds never touch the horizon");
+    skygen_set_features(SKYF_ALL);
+    let lowest: i32 = -1;
+    let cloud_total: i32 = 0;
+    w = 0;
+    while (w < 4) {
+        skygen_set_keys(fixture(w));
+        skygen_bake_all();
+        let y: i32 = 0;
+        while (y < SKY_H) {
+            let c: i32 = skygen_row_cloud(y);
+            cloud_total = cloud_total + c;
+            if (c > 0) { if (y > lowest) { lowest = y; } }
+            y = y + 1;
+        }
+        w = w + 1;
+    }
+    print(`   lowest cloud row ${lowest} of ${SKY_H - 1} (v = ${f3(f64(lowest) / f64(SKY_H - 1))}); ${cloud_total} cloud texels over 4 keyframes`);
+    let b1: i32 = 0;
+    if (lowest <= SKY_H - 24) { b1 = 1; }
+    ck("B1 no cloud texel within 24 rows of the horizon", b1);
+    let b2: i32 = 0;
+    if (cloud_total > 12000) { b2 = 1; }
+    ck("B2 the cloud layers actually produced clouds (> 12k texels)", b2);
+
+    // ----------------------------------------------------------------- C ---
+    // The horizon band must be fog_tint applied to a grey.  skygen derives the
+    // grey from the authored SKY_HORIZON's luminance, so what is checked is
+    // that the baked band has the FOG's hue at the HORIZON's value.
+    print("C. horizon band == fog_tint * mid-grey");
+    let seam: array<f64> = [0.0, 0.0, 0.0];
+    let c_ok: i32 = 1;
+    let c_hue_ok: i32 = 1;
+    let worst_seam: f64 = 0.0;
+    let worst_hue: f64 = 0.0;
+    skygen_set_features(0);
+    w = 0;
+    while (w < 4) {
+        let k: array<f64> = fixture(w);
+        skygen_set_keys(k);
+        skygen_bake_all();
+        skygen_seam(seam, 0);
+        // the panorama row at V = 0.96, which §11.1 puts exactly on the seam
+        let yb: i32 = i32(0.96 * f64(SKY_H - 1) + 0.5);
+        let c: i32 = 0;
+        while (c < 3) {
+            let got: f64 = row_mean_ch(yb, c);
+            let want: f64 = seam[c];
+            let e: f64 = got - want;
+            if (e < 0.0) { e = 0.0 - e; }
+            if (e > worst_seam) { worst_seam = e; }
+            if (e > 2.0) { c_ok = 0; }
+            c = c + 1;
+        }
+        // hue: the seam's channel ratios must equal FOG_TINT_MUL's exactly
+        let fr: f64 = k[SKYK_FOG];
+        let fg: f64 = k[SKYK_FOG + 1];
+        let fb: f64 = k[SKYK_FOG + 2];
+        let sr: f64 = seam[0]; let sg: f64 = seam[1]; let sb: f64 = seam[2];
+        let h1: f64 = sg * fr - sr * fg;
+        let h2: f64 = sb * fr - sr * fb;
+        if (h1 < 0.0) { h1 = 0.0 - h1; }
+        if (h2 < 0.0) { h2 = 0.0 - h2; }
+        if (h1 > worst_hue) { worst_hue = h1; }
+        if (h2 > worst_hue) { worst_hue = h2; }
+        if (h1 > 0.001) { c_hue_ok = 0; }
+        if (h2 > 0.001) { c_hue_ok = 0; }
+        print(`   ${tod_name(w)}: seam (${f3(seam[0])}, ${f3(seam[1])}, ${f3(seam[2])}) fog (${f3(fr)}, ${f3(fg)}, ${f3(fb)})`);
+        w = w + 1;
+    }
+    print(`   worst baked-vs-derived channel error ${f3(worst_seam)}; worst hue cross-product ${f3(worst_hue)}`);
+    ck("C1 baked V=0.96 row equals the fog-derived seam within 2/255", c_ok);
+    ck("C2 the seam is exactly FOG_TINT_MUL's hue", c_hue_ok);
+
+    // ----------------------------------------------------------------- D ---
+    print("D. sun position tracks SUN_DIR");
+    let uv: array<f64> = [0.0, 0.0];
+    let k2: array<f64> = fixture(TOD_NOON);
+    // straight up -> the zenith row
+    setk(k2, SKYK_SUN, 0.0, 1.0, 0.0);
+    skygen_set_keys(k2); skygen_bake_all(); skygen_sun_uv(uv, 0);
+    let d1: i32 = 0;
+    if (uv[1] < 0.001) { d1 = 1; }
+    ck("D1 SUN_DIR (0,1,0) puts the sun at V = 0 (zenith)", d1);
+    // due +Z -> U = W/2 and the horizon row
+    setk(k2, SKYK_SUN, 0.0, 0.0, 1.0);
+    skygen_set_keys(k2); skygen_bake_all(); skygen_sun_uv(uv, 0);
+    let e1: f64 = uv[0] - 256.0;
+    if (e1 < 0.0) { e1 = 0.0 - e1; }
+    let e2: f64 = uv[1] - 159.0;
+    if (e2 < 0.0) { e2 = 0.0 - e2; }
+    let d2: i32 = 0;
+    if (e1 < 0.01) { if (e2 < 0.01) { d2 = 1; } }
+    ck("D2 SUN_DIR (0,0,1) puts the sun at U = 256, V = 159", d2);
+    // due +X -> a quarter turn round the panorama
+    setk(k2, SKYK_SUN, 1.0, 0.0, 0.0);
+    skygen_set_keys(k2); skygen_bake_all(); skygen_sun_uv(uv, 0);
+    let e3: f64 = uv[0] - 384.0;
+    if (e3 < 0.0) { e3 = 0.0 - e3; }
+    let d3: i32 = 0;
+    if (e3 < 0.01) { d3 = 1; }
+    ck("D3 SUN_DIR (1,0,0) is a quarter panorama east of that", d3);
+    // and the disc is actually THERE in the texels, not just in the accessor
+    setk(k2, SKYK_SUN, 0.66, 0.60, 0.45);
+    skygen_set_keys(k2);
+    skygen_set_features(SKYF_SUN);
+    skygen_bake_all();
+    skygen_sun_uv(uv, 0);
+    let dr: i32 = pal_r(g_SUN_DISC);
+    let dg: i32 = pal_g(g_SUN_DISC);
+    let db: i32 = pal_b(g_SUN_DISC);
+    let dbuf: buffer = skygen_atlas().data;
+    let cx: f64 = 0.0;
+    let cy: f64 = 0.0;
+    let cn: i32 = 0;
+    let yy: i32 = 0;
+    while (yy < SKY_H) {
+        let o: i32 = yy * SKY_W * 4;
+        let xx: i32 = 0;
+        while (xx < SKY_W) {
+            if (dbuf[o] == dr) { if (dbuf[o + 1] == dg) { if (dbuf[o + 2] == db) {
+                cx = cx + f64(xx); cy = cy + f64(yy); cn = cn + 1;
+            } } }
+            o = o + 4;
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    let d4: i32 = 0;
+    if (cn > 200) {
+        cx = cx / f64(cn);
+        cy = cy / f64(cn);
+        let ex: f64 = cx - uv[0];
+        let ey: f64 = cy - uv[1];
+        if (ex < 0.0) { ex = 0.0 - ex; }
+        if (ey < 0.0) { ey = 0.0 - ey; }
+        print(`   disc centroid (${f3(cx)}, ${f3(cy)}) vs derived (${f3(uv[0])}, ${f3(uv[1])}), ${cn} disc texels`);
+        if (ex < 1.5) { if (ey < 1.5) { d4 = 1; } }
+    }
+    ck("D4 the baked disc centroid lands on the derived sun U,V", d4);
+    // below the horizon the sun is gone and the moon is up
+    skygen_set_keys(fixture(TOD_NIGHT));
+    skygen_bake_all();
+    let d5: i32 = 0;
+    if (skygen_sun_is_up() == 0) { d5 = 1; }
+    ck("D5 SUN_DIR below the horizon selects the moon", d5);
+    skygen_moon_uv(uv, 0);
+    let d6: i32 = 0;
+    if (uv[1] >= 0.0) { if (uv[1] < f64(SKY_H)) { d6 = 1; } }
+    ck("D6 the moon is on the panorama when the sun is not", d6);
+
+    // ----------------------------------------------------------------- G ---
+    // The incremental path must reproduce the full bake exactly, or the sky
+    // shears every time the ToD moves.
+    print("G. incremental re-bake == full bake");
+    skygen_set_features(SKYF_ALL);
+    skygen_set_keys(fixture(TOD_GOLDEN));
+    skygen_set_clock(0.0);
+    skygen_bake_all();
+    let golden: buffer = pano_copy();
+    skygen_set_keys(fixture(TOD_NOON));
+    skygen_bake_all();                       // scribble over it
+    skygen_set_keys(fixture(TOD_GOLDEN));
+    skygen_mark_dirty();
+    let frames: i32 = 0;
+    while (skygen_dirty_rows() > 0) {
+        let n: i32 = skygen_rebake_slice();
+        if (n <= 0) { frames = 999; }
+        frames = frames + 1;
+        if (frames > 64) { skygen_mark_dirty(); frames = 999; }
+    }
+    print(`   full refresh took ${frames} frames`);
+    let g1: i32 = 0;
+    if (frames == 8) { g1 = 1; }
+    ck("G1 a full re-bake completes in exactly 8 frames", g1);
+    let bad: i32 = pano_diff(golden);
+    print(`   differing bytes vs the full bake: ${bad}`);
+    let g2: i32 = 0;
+    if (bad == 0) { g2 = 1; }
+    ck("G2 incremental output is byte-identical to a full bake", g2);
+    let g3: i32 = 0;
+    if (skygen_rebake_slice() == 0) { g3 = 1; }
+    ck("G3 a clean panorama re-bakes nothing", g3);
+
+    // ----------------------------------------------------------------- F ---
+    // Constellations.  Two independent night bakes in this process must agree
+    // bit-for-bit, and the printed hash must match between separate runs of
+    // this binary (the harness diffs two runs' stdout).
+    print("F. constellations are fixed");
+    skygen_set_features(SKYF_STARS + SKYF_MILKYWAY);
+    skygen_set_keys(fixture(TOD_NIGHT));
+    skygen_bake_all();
+    let h1: i64 = pano_hash();
+    let stars1: i32 = skygen_star_count();
+    skygen_set_keys(fixture(TOD_NOON));
+    skygen_bake_all();
+    skygen_set_keys(fixture(TOD_NIGHT));
+    skygen_bake_all();
+    let h2: i64 = pano_hash();
+    print(`   STARFIELD_HASH=${h1}  stars=${stars1}`);
+    let f1: i32 = 0;
+    if (h1 == h2) { f1 = 1; }
+    ck("F1 two night bakes produce an identical star field", f1);
+    let f2: i32 = 0;
+    if (stars1 > 400) { if (stars1 < 1400) { f2 = 1; } }
+    ck("F2 star count is in the ART_BIBLE §11.4 density range", f2);
+
+    // ----------------------------------------------------------------- E ---
+    // RULE T: min-of-7 on __clock() CPU time.  The bound is a REGRESSION GUARD
+    // at ~2x the loaded measurement, not a certification of an idle box; the
+    // spec figure (0.6 ms) is reported separately and explicitly.
+    print("E. re-bake cost");
+    skygen_set_features(SKYF_ALL);
+    skygen_set_keys(fixture(TOD_GOLDEN));
+    let ms_slice: f64 = slice_ms(4);
+    let ms_full: f64 = full_ms(4);
+    print(`   slice (${skygen_slice_rows()} rows): ${f3(ms_slice)} ms/frame   [spec 0.600 ms/frame]`);
+    print(`   full bake (${SKY_H} rows):  ${f3(ms_full)} ms         [boot budget 400 ms total]`);
+    // The cost is linear in rows, so report the dial setting that DOES fit the
+    // 0.6 ms sky slot, and how many frames a refresh then takes.
+    let per_row: f64 = ms_slice / f64(skygen_slice_rows());
+    let fits: i32 = i32(0.6 / per_row);
+    if (fits < 1) { fits = 1; }
+    let frames_needed: i32 = divi(SKY_H + fits - 1, fits);
+    print(`   -> ${fits} rows/frame fits 0.600 ms; a full refresh is then ${frames_needed} frames (${f3(f64(frames_needed) / 60.0)} s)`);
+    let e_spec: i32 = 0;
+    if (ms_slice <= 0.6) { e_spec = 1; }
+    ck("E1 slice <= 0.600 ms/frame at 20 rows (the BUDGET_ACTUAL sky line)", e_spec);
+    // RULE T: the guard is set at ~2x the LOADED measurement so it catches a
+    // real regression without failing on machine state.  Measured at the time
+    // of writing, min-of-7 on __clock() CPU time, hemlockc -O1, on a 24-core
+    // box permanently sharing ~17 cores with a llama-server (load average 25):
+    //     slice, 20 rows   1.27 - 1.56 ms   (three consecutive runs)
+    //     full bake        10.1 - 11.1 ms
+    // BUDGET_ACTUAL puts the residual contention inflation that no methodology
+    // removes at ~30 %, so the idle figures are around 1.0 ms and 8 ms.
+    let e_guard: i32 = 0;
+    if (ms_slice <= 3.7) { e_guard = 1; }
+    ck("E2 regression guard: slice <= 3.700 ms (2x loaded)", e_guard);
+    let e_full: i32 = 0;
+    if (ms_full <= 28.0) { e_full = 1; }
+    ck("E3 regression guard: full bake <= 28 ms (2x loaded) of the 400 ms boot", e_full);
+    // The dial has to actually work, or the mitigation above is fiction.
+    skygen_set_slice_rows(8);
+    skygen_mark_dirty();
+    let df: i32 = 0;
+    while (skygen_dirty_rows() > 0) { skygen_rebake_slice(); df = df + 1; if (df > 40) { df = 999; } }
+    print(`   at 8 rows/frame a refresh takes ${df} frames`);
+    let e_dial: i32 = 0;
+    if (df == 20) { e_dial = 1; }
+    ck("E4 skygen_set_slice_rows(8) gives a 20-frame refresh", e_dial);
+    skygen_set_slice_rows(20);
+
+    // ------------------------------------------------------------ upload ---
+    print("H. SDL upload path");
+    let win = window_open_ex("skygen", 320, 240, 1, 0);
+    let h_ok: i32 = 0;
+    if (win != null) {
+        skygen_set_keys(fixture(TOD_GOLDEN));
+        let t = skygen_build(win);
+        if (t != ptr_null()) {
+            skygen_mark_dirty();
+            let s: i32 = 0;
+            while (s < 8) { skygen_rebake_slice(); s = s + 1; }
+            h_ok = 1;
+        }
+    } else {
+        print("   no window (no video driver) — upload path skipped, assertion still counted");
+    }
+    ck("H1 skygen_build uploads and 8 dirty-rect slices succeed", h_ok);
+
+    // -------------------------------------------------------------- sheet --
+    let rgb: buffer = buffer(SKY_W * SKY_H * 3 * 4);
+    skygen_set_features(SKYF_ALL);
+    skygen_set_clock(0.0);
+    let s2: i32 = 0;
+    while (s2 < 4) {
+        let order: i32 = s2;
+        if (order == 0) { skygen_set_keys(fixture(TOD_DAWN)); }
+        if (order == 1) { skygen_set_keys(fixture(TOD_NOON)); }
+        if (order == 2) { skygen_set_keys(fixture(TOD_GOLDEN)); }
+        if (order == 3) { skygen_set_keys(fixture(TOD_NIGHT)); }
+        skygen_bake_all();
+        sheet_blit(rgb, s2);
+        s2 = s2 + 1;
+    }
+    // docs/shots/ is where the visual critic looks; the directory belongs to
+    // W2-11 but the file is a runtime output, not a source edit.  W3-7 folds
+    // this sheet into texview.hml and this block goes away.
+    if (exists("docs/shots")) {
+        write_png("docs/shots/sky_panorama.png", rgb, SKY_W, SKY_H * 4);
+        print("wrote docs/shots/sky_panorama.png  (DAWN / NOON / GOLDEN / NIGHT, top to bottom)");
+    } else {
+        write_png("/tmp/sky_panorama.png", rgb, SKY_W, SKY_H * 4);
+        print("wrote /tmp/sky_panorama.png  (DAWN / NOON / GOLDEN / NIGHT, top to bottom)");
+    }
+    if (win != null) { window_close(win); }
+
+    // --------------------------------------------------------------- exit --
+    const EXPECTED = 22;
+    print(`assertions run ${g_ck_n} (expected ${EXPECTED}), failed ${g_ck_fail}`);
+    if (g_ck_n != EXPECTED) {
+        print("PROBE INVALID: assertion count mismatch");
+        exit(1);
+    }
+    if (g_ck_fail != 0) {
+        print("PROBE FAILED");
+        exit(1);
+    }
+    print("PROBE PASSED");
+}
+
+main();

@@ -1,0 +1,719 @@
+// probe_tod.hml — verification program for W2-4 (src/art/tod.hml).
+//
+// Run COMPILED. Headless, no SDL, no window.
+//     hemlockc -O1 tools/probe_tod.hml -o /tmp/probe_tod && /tmp/probe_tod
+//
+// Prints one line per measurement, then `PASS n/n`, and exits 0 only if every
+// assertion held AND the assertion count is the expected one (so a skipped
+// branch cannot shrink numerator and denominator together and still read green).
+//
+// The sweep is EVERY ONE of the 57 600 ticks of the 16-minute day, in each of
+// the five weather states — 288 005 evaluations — plus the day wrap, the
+// lightning sequence and two weather crossfades. Every invariant below is
+// checked on every tick; the assertions report the worst value seen.
+//
+//   W2-4 acceptance                                   asserted in section
+//   ambient + sun <= (1,1,1) at every keyframe          [2]
+//   ... and at every interpolated point                 [3] A
+//   ambient never below 0.14 in any channel             [3] B
+//   fog_far never exceeds 72 m in any state             [3] C
+//   ambient is always the complement of the sun         [3] E, F
+//   no discontinuity > 4 % per frame in any channel     [3] I, [6]
+
+import { exit } from "@stdlib/process";
+import {
+    env_new, env_field,
+    ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z,
+    ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+    ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+    ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+    ENV_RIM_R, ENV_RIM_G, ENV_RIM_B,
+    ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+    ENV_FOG_ALPHA_MAX, ENV_MIST_DENSITY, ENV_MIST_TOP, ENV_MIST_BOTTOM
+} from "../../wobbleweed/src/shade.hml";
+import {
+    tod_eval, tod_reset, tod_set_weather, tod_weather_mix, tod_sky_keys,
+    tod_phase, tod_phase_start, tod_phase_t, tod_key_anchor, tod_key_field,
+    tod_clock_hours, tod_t_from_tick, tod_lightning_fire, tod_lightning_alpha,
+    tod_lightning_frame, tod_is_night, tod_mist_density, tod_state,
+    TOD_DAWN, TOD_MORNING, TOD_NOON, TOD_GOLDEN, TOD_DUSK, TOD_NIGHT, TOD_DEEP,
+    TOD_KEY_COUNT, TOD_PHASE_DAWN, TOD_PHASE_DAY, TOD_PHASE_DUSK,
+    TOD_PHASE_NIGHT, TOD_PHASE_COUNT,
+    WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM, WX_BLOOM, WX_COUNT,
+    TOD_DAY_TICKS, TOD_DAY_SECONDS, TOD_FOG_FAR_CAP, TOD_FOG_NEAR_MIN,
+    TOD_AMBIENT_FLOOR, TOD_MIST_MAX, TOD_FADE_WEATHER, TOD_FADE_BLOOM,
+    TODSKY_COUNT, TODSKY_ZENITH_R, TODSKY_HORIZON_R, TODSKY_HORIZON_G,
+    TODSKY_HORIZON_B, TODSKY_CLOUD_LIT_R, TODSKY_STAR_ALPHA, TODSKY_MOON,
+    TODSKY_BODY_Y, TODSKY_CLOUD_COVER
+} from "../src/art/tod.hml";
+// The two files W2-4 depends on. Asserted against, not re-typed: if palette.hml
+// re-authors a sky row or config.hml moves a phase boundary, this probe fails
+// instead of the game quietly rendering last week's sky.
+import {
+    pal_r, pal_g, pal_b,
+    g_SKY_ZENITH_DAWN, g_SKY_ZENITH_MORNING, g_SKY_ZENITH_NOON,
+    g_SKY_ZENITH_GOLDEN, g_SKY_ZENITH_DUSK, g_SKY_ZENITH_NIGHT, g_SKY_ZENITH_DEEP,
+    g_SKY_HORIZON_DAWN, g_SKY_HORIZON_MORNING, g_SKY_HORIZON_NOON,
+    g_SKY_HORIZON_GOLDEN, g_SKY_HORIZON_DUSK, g_SKY_HORIZON_NIGHT,
+    g_SKY_HORIZON_DEEP
+} from "../src/art/palette.hml";
+import {
+    g_FOG_FAR_CAP, g_FOG_NEAR_MIN, g_MIST_HEIGHT, g_DAY_SECONDS, g_DAY_TICKS,
+    g_PHASE_DAWN_END, g_PHASE_DAY_END, g_PHASE_DUSK_END
+} from "../src/core/config.hml";
+
+// Every assertion below is unconditional; this is the count.
+let EXPECTED_ASSERTIONS = 83;
+
+// The discontinuity budget: 4 % of full scale, per frame, in any channel.
+let DELTA_MAX = 0.04;
+// "Never grey": the ambient's most and least intense channels must differ.
+let CHROMA_MIN = 0.04;
+// The fog tint is derived from the horizon band, so it must stay near it.
+// ART_BIBLE §6.6; the authored dusk row is the loosest at 0.298.
+let FOG_HORIZON_MAX = 0.35;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(label: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${label}`); }
+}
+fn note(s: string) { g_notes.push(s); }
+
+fn f4(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 10000.0 + 0.5);
+    let whole: i64 = scaled / 10000;
+    let frac: i64 = scaled - whole * 10000;
+    let fs: string = `${frac}`;
+    if (frac < 1000) { fs = `0${fs}`; }
+    if (frac < 100) { fs = `0${fs}`; }
+    if (frac < 10) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+fn wxname(p_w: i32): string {
+    let w: i32 = p_w;
+    if (w == WX_CLEAR) { return "CLEAR"; }
+    if (w == WX_OVERCAST) { return "OVERCAST"; }
+    if (w == WX_RAIN) { return "RAIN"; }
+    if (w == WX_STORM) { return "STORM"; }
+    return "BLOOM";
+}
+
+// ---------------------------------------------------------------------------
+// The watch vector: every channel the discontinuity rule applies to, on a
+// common 0..1 scale so one bound covers all of them. Fog distances are divided
+// by the 72 m cap.
+// ---------------------------------------------------------------------------
+let W_COUNT = 29;
+
+fn watch_fill(p_env: array<f64>, p_sky: array<f64>, p_out: array<f64>) {
+    let e: array<f64> = p_env;
+    let s: array<f64> = p_sky;
+    let o: array<f64> = p_out;
+    o[0] = env_field(e, ENV_SUN_R);
+    o[1] = env_field(e, ENV_SUN_G);
+    o[2] = env_field(e, ENV_SUN_B);
+    o[3] = env_field(e, ENV_AMB_R);
+    o[4] = env_field(e, ENV_AMB_G);
+    o[5] = env_field(e, ENV_AMB_B);
+    o[6] = env_field(e, ENV_BOUNCE_R);
+    o[7] = env_field(e, ENV_BOUNCE_G);
+    o[8] = env_field(e, ENV_BOUNCE_B);
+    o[9] = env_field(e, ENV_FOG_R);
+    o[10] = env_field(e, ENV_FOG_G);
+    o[11] = env_field(e, ENV_FOG_B);
+    o[12] = env_field(e, ENV_FOG_NEAR) / TOD_FOG_FAR_CAP;
+    o[13] = env_field(e, ENV_FOG_FAR) / TOD_FOG_FAR_CAP;
+    o[14] = env_field(e, ENV_FOG_ALPHA_MAX);
+    o[15] = env_field(e, ENV_MIST_DENSITY);
+    o[16] = s[TODSKY_ZENITH_R];
+    o[17] = s[TODSKY_ZENITH_R + 1];
+    o[18] = s[TODSKY_ZENITH_R + 2];
+    o[19] = s[TODSKY_HORIZON_R];
+    o[20] = s[TODSKY_HORIZON_G];
+    o[21] = s[TODSKY_HORIZON_B];
+    o[22] = s[TODSKY_CLOUD_LIT_R];
+    o[23] = s[TODSKY_CLOUD_LIT_R + 1];
+    o[24] = s[TODSKY_CLOUD_LIT_R + 2];
+    o[25] = s[TODSKY_STAR_ALPHA];
+    o[26] = env_field(e, ENV_SUN_X);
+    o[27] = env_field(e, ENV_SUN_Y);
+    o[28] = env_field(e, ENV_SUN_Z);
+}
+
+fn zeros(p_n: i32): array<f64> {
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0.0); i = i + 1; }
+    return a;
+}
+
+// Worst-case accumulators for one sweep. Kept as globals so the sweep body
+// stays a plain loop.
+let g_max_sum: f64 = 0.0;
+let g_min_amb: f64 = 9.0;
+let g_max_far: f64 = 0.0;
+let g_min_near: f64 = 9999.0;
+let g_bad_fogband: i32 = 0;
+let g_min_chroma: f64 = 9.0;
+let g_bad_warm: i32 = 0;
+let g_bad_mist: i32 = 0;
+let g_max_dirlen: f64 = 0.0;
+let g_min_diry: f64 = 9.0;
+let g_max_delta: f64 = 0.0;
+let g_max_delta_ch: i32 = -1;
+let g_max_fog_hor: f64 = 0.0;
+
+fn sweep_reset() {
+    g_max_sum = 0.0;
+    g_min_amb = 9.0;
+    g_max_far = 0.0;
+    g_min_near = 9999.0;
+    g_bad_fogband = 0;
+    g_min_chroma = 9.0;
+    g_bad_warm = 0;
+    g_bad_mist = 0;
+    g_max_dirlen = 0.0;
+    g_min_diry = 9.0;
+    g_max_delta = 0.0;
+    g_max_delta_ch = -1;
+    g_max_fog_hor = 0.0;
+}
+
+// Fold one evaluated frame into the accumulators. `p_prev_valid` is 0 on the
+// first frame of a sweep, where there is no previous frame to difference.
+fn sweep_accum(p_cur: array<f64>, p_prev: array<f64>, p_prev_valid: i32,
+               p_sky: array<f64>, p_check_fog_horizon: i32) {
+    let c: array<f64> = p_cur;
+    let p: array<f64> = p_prev;
+    let s: array<f64> = p_sky;
+
+    // ambient + sun per channel
+    let i: i32 = 0;
+    while (i < 3) {
+        let sum: f64 = c[i] + c[3 + i];
+        if (sum > g_max_sum) { g_max_sum = sum; }
+        if (c[3 + i] < g_min_amb) { g_min_amb = c[3 + i]; }
+        i = i + 1;
+    }
+
+    // fog band
+    let far: f64 = c[13] * TOD_FOG_FAR_CAP;
+    let near: f64 = c[12] * TOD_FOG_FAR_CAP;
+    if (far > g_max_far) { g_max_far = far; }
+    if (near < g_min_near) { g_min_near = near; }
+    if (near < TOD_FOG_NEAR_MIN - 0.000001 || far <= near) { g_bad_fogband = g_bad_fogband + 1; }
+
+    // ambient is never grey ...
+    let ar: f64 = c[3];
+    let ag: f64 = c[4];
+    let ab: f64 = c[5];
+    let amax: f64 = ar;
+    if (ag > amax) { amax = ag; }
+    if (ab > amax) { amax = ab; }
+    let amin: f64 = ar;
+    if (ag < amin) { amin = ag; }
+    if (ab < amin) { amin = ab; }
+    let chroma: f64 = amax - amin;
+    if (chroma < g_min_chroma) { g_min_chroma = chroma; }
+
+    // ... and never warmer than the key light (warmth = red minus blue).
+    let aw: f64 = ar - ab;
+    let sw: f64 = c[0] - c[2];
+    if (aw > sw + 0.000000001) { g_bad_warm = g_bad_warm + 1; }
+
+    // mist
+    let mist: f64 = c[15];
+    if (mist < 0.0 || mist > TOD_MIST_MAX + 0.000000001) { g_bad_mist = g_bad_mist + 1; }
+
+    // key direction: unit, and never from below the horizon
+    let dx: f64 = c[26];
+    let dy: f64 = c[27];
+    let dz: f64 = c[28];
+    let dl0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+    let dl: f64 = dl0 - 1.0;
+    if (dl < 0.0) { dl = 0.0 - dl; }
+    if (dl > g_max_dirlen) { g_max_dirlen = dl; }
+    if (dy < g_min_diry) { g_min_diry = dy; }
+
+    // fog tint against the horizon band it is derived from
+    if (p_check_fog_horizon != 0) {
+        let k: i32 = 0;
+        while (k < 3) {
+            let d: f64 = c[9 + k] - s[TODSKY_HORIZON_R + k];
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > g_max_fog_hor) { g_max_fog_hor = d; }
+            k = k + 1;
+        }
+    }
+
+    // per-frame discontinuity
+    if (p_prev_valid != 0) {
+        let j: i32 = 0;
+        while (j < W_COUNT) {
+            let d: f64 = c[j] - p[j];
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > g_max_delta) { g_max_delta = d; g_max_delta_ch = j; }
+            j = j + 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timing, CLAUDE.md RULE T: __clock() CPU time, minimum of TRIALS batches.
+// ---------------------------------------------------------------------------
+let TRIALS = 7;
+
+fn eval_us(p_env: array<f64>, p_reps: i32): f64 {
+    let e: array<f64> = p_env;
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < reps) {
+            tod_eval(e, f64(i) / f64(reps), WX_CLEAR);
+            i = i + 1;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_tod — W2-4 time of day");
+    print("");
+
+    let env: array<f64> = env_new();
+    let sky: array<f64> = zeros(TODSKY_COUNT);
+    let wa: array<f64> = zeros(W_COUNT);
+    let wb: array<f64> = zeros(W_COUNT);
+
+    // -----------------------------------------------------------------------
+    print("[1] the D6 remap: 16 minutes, Dawn 2 / Day 7 / Dusk 2 / Night 5");
+    // -----------------------------------------------------------------------
+    let inc: i32 = 1;
+    let k: i32 = 1;
+    while (k < TOD_KEY_COUNT) {
+        if (tod_key_anchor(k) <= tod_key_anchor(k - 1)) { inc = 0; }
+        k = k + 1;
+    }
+    if (tod_key_anchor(TOD_DAWN) != 0.0) { inc = 0; }
+    if (tod_key_anchor(TOD_DEEP) >= 1.0) { inc = 0; }
+    ok("the seven keyframe anchors are strictly increasing over [0,1)", inc == 1);
+
+    let mins_dawn: f64 = (tod_phase_start(TOD_PHASE_DAY) - tod_phase_start(TOD_PHASE_DAWN)) * 16.0;
+    let mins_day: f64 = (tod_phase_start(TOD_PHASE_DUSK) - tod_phase_start(TOD_PHASE_DAY)) * 16.0;
+    let mins_dusk: f64 = (tod_phase_start(TOD_PHASE_NIGHT) - tod_phase_start(TOD_PHASE_DUSK)) * 16.0;
+    let mins_night: f64 = (1.0 - tod_phase_start(TOD_PHASE_NIGHT)) * 16.0;
+    print(`  phases: dawn ${f4(mins_dawn)} / day ${f4(mins_day)} / dusk ${f4(mins_dusk)} / night ${f4(mins_night)} min`);
+    ok("Dawn lasts 2 minutes", mins_dawn == 2.0);
+    ok("Day lasts 7 minutes", mins_day == 7.0);
+    ok("Dusk lasts 2 minutes", mins_dusk == 2.0);
+    ok("Night lasts 5 minutes", mins_night == 5.0);
+
+    ok("MORNING, GOLDEN and NIGHT sit exactly on phase boundaries",
+       tod_key_anchor(TOD_MORNING) == tod_phase_start(TOD_PHASE_DAY)
+       && tod_key_anchor(TOD_GOLDEN) == tod_phase_start(TOD_PHASE_DUSK)
+       && tod_key_anchor(TOD_NIGHT) == tod_phase_start(TOD_PHASE_NIGHT));
+
+    ok("tick 0 and tick 57600 are the same instant of the day",
+       tod_t_from_tick(0) == 0.0 && tod_t_from_tick(TOD_DAY_TICKS) == 0.0
+       && tod_t_from_tick(TOD_DAY_TICKS - 1) < 1.0);
+
+    // Each keyframe must land in the phase D6 assigns it, and the phase must be
+    // constant between two consecutive boundaries.
+    let phase_ok: i32 = 1;
+    if (tod_phase(0.0) != TOD_PHASE_DAWN) { phase_ok = 0; }
+    if (tod_phase(0.124) != TOD_PHASE_DAWN) { phase_ok = 0; }
+    if (tod_phase(tod_key_anchor(TOD_MORNING)) != TOD_PHASE_DAY) { phase_ok = 0; }
+    if (tod_phase(tod_key_anchor(TOD_NOON)) != TOD_PHASE_DAY) { phase_ok = 0; }
+    if (tod_phase(tod_key_anchor(TOD_GOLDEN)) != TOD_PHASE_DUSK) { phase_ok = 0; }
+    if (tod_phase(tod_key_anchor(TOD_DUSK)) != TOD_PHASE_DUSK) { phase_ok = 0; }
+    if (tod_phase(tod_key_anchor(TOD_NIGHT)) != TOD_PHASE_NIGHT) { phase_ok = 0; }
+    if (tod_phase(tod_key_anchor(TOD_DEEP)) != TOD_PHASE_NIGHT) { phase_ok = 0; }
+    if (tod_is_night(tod_key_anchor(TOD_DEEP)) != 1) { phase_ok = 0; }
+    if (tod_is_night(tod_key_anchor(TOD_NOON)) != 0) { phase_ok = 0; }
+    ok("every keyframe falls in the phase D6 assigns it", phase_ok == 1);
+
+    // The ART_BIBLE clock must run forward all day and wrap exactly once.
+    let clock_ok: i32 = 1;
+    let wraps: i32 = 0;
+    let prev_h: f64 = tod_clock_hours(0.0);
+    let ci: i32 = 1;
+    while (ci <= 1600) {
+        let h: f64 = tod_clock_hours(f64(ci) / 1600.0);
+        if (h < prev_h) {
+            wraps = wraps + 1;
+            if (prev_h < 20.0) { clock_ok = 0; }
+        }
+        prev_h = h;
+        ci = ci + 1;
+    }
+    if (wraps != 1) { clock_ok = 0; }
+    ok("the ART_BIBLE wall clock runs forward and wraps once per day", clock_ok == 1);
+
+    let hd: f64 = tod_clock_hours(tod_key_anchor(TOD_DAWN));
+    let hn: f64 = tod_clock_hours(tod_key_anchor(TOD_NOON));
+    let hg: f64 = tod_clock_hours(tod_key_anchor(TOD_GOLDEN));
+    print(`  clock at DAWN ${f4(hd)}h, NOON ${f4(hn)}h, GOLDEN ${f4(hg)}h`);
+    ok("the keyframe anchors read back their ART_BIBLE clock times",
+       hd == 5.5 && hn == 12.0 && hg == 18.25);
+
+    ok("every ToD tunable is core/config.hml's, not a second copy",
+       TOD_FOG_FAR_CAP == g_FOG_FAR_CAP && TOD_FOG_NEAR_MIN == g_FOG_NEAR_MIN
+       && TOD_DAY_SECONDS == g_DAY_SECONDS && TOD_DAY_TICKS == g_DAY_TICKS
+       && tod_phase_start(TOD_PHASE_DAY) == g_PHASE_DAWN_END
+       && tod_phase_start(TOD_PHASE_DUSK) == g_PHASE_DAY_END
+       && tod_phase_start(TOD_PHASE_NIGHT) == g_PHASE_DUSK_END);
+
+    // The sky rows are palette.hml's colours; KF_ZEN_R is field 19 and
+    // KF_HOR_R is field 25 of the keyframe row.
+    let pal_ok: i32 = 1;
+    let zens: array = [g_SKY_ZENITH_DAWN, g_SKY_ZENITH_MORNING, g_SKY_ZENITH_NOON,
+                       g_SKY_ZENITH_GOLDEN, g_SKY_ZENITH_DUSK, g_SKY_ZENITH_NIGHT,
+                       g_SKY_ZENITH_DEEP];
+    let hors: array = [g_SKY_HORIZON_DAWN, g_SKY_HORIZON_MORNING, g_SKY_HORIZON_NOON,
+                       g_SKY_HORIZON_GOLDEN, g_SKY_HORIZON_DUSK, g_SKY_HORIZON_NIGHT,
+                       g_SKY_HORIZON_DEEP];
+    let pk: i32 = 0;
+    while (pk < TOD_KEY_COUNT) {
+        let z: i32 = zens[pk];
+        let h: i32 = hors[pk];
+        if (adiff(tod_key_field(pk, 19), f64(pal_r(z)) / 255.0) > 0.000000001) { pal_ok = 0; }
+        if (adiff(tod_key_field(pk, 20), f64(pal_g(z)) / 255.0) > 0.000000001) { pal_ok = 0; }
+        if (adiff(tod_key_field(pk, 21), f64(pal_b(z)) / 255.0) > 0.000000001) { pal_ok = 0; }
+        if (adiff(tod_key_field(pk, 25), f64(pal_r(h)) / 255.0) > 0.000000001) { pal_ok = 0; }
+        if (adiff(tod_key_field(pk, 26), f64(pal_g(h)) / 255.0) > 0.000000001) { pal_ok = 0; }
+        if (adiff(tod_key_field(pk, 27), f64(pal_b(h)) / 255.0) > 0.000000001) { pal_ok = 0; }
+        pk = pk + 1;
+    }
+    ok("every ToD sky row is palette.hml's colour, unpacked (CLAUDE.md §8)", pal_ok == 1);
+
+    // -----------------------------------------------------------------------
+    print("[2] the seven keyframes reproduce ART_BIBLE §5.1 exactly");
+    // -----------------------------------------------------------------------
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    let noon_sum_err: f64 = 0.0;
+    let kk: i32 = 0;
+    while (kk < TOD_KEY_COUNT) {
+        tod_reset();
+        tod_set_weather(WX_CLEAR);
+        tod_eval(env, tod_key_anchor(kk), WX_CLEAR);
+        let bad: i32 = 0;
+        // KF_ field indices: SUN_R 4, AMB_R 7, TINT_R 13, NEAR 16, FAR 17,
+        // ALPHA_MAX 18 — the table row this keyframe was authored as.
+        let f: i32 = 0;
+        while (f < 3) {
+            if (adiff(env_field(env, ENV_SUN_R + f), tod_key_field(kk, 4 + f)) > 0.000000001) { bad = 1; }
+            if (adiff(env_field(env, ENV_AMB_R + f), tod_key_field(kk, 7 + f)) > 0.000000001) { bad = 1; }
+            if (adiff(env_field(env, ENV_FOG_R + f), tod_key_field(kk, 13 + f)) > 0.000000001) { bad = 1; }
+            f = f + 1;
+        }
+        if (adiff(env_field(env, ENV_FOG_NEAR), tod_key_field(kk, 16)) > 0.000000001) { bad = 1; }
+        if (adiff(env_field(env, ENV_FOG_FAR), tod_key_field(kk, 17)) > 0.000000001) { bad = 1; }
+        if (adiff(env_field(env, ENV_FOG_ALPHA_MAX), tod_key_field(kk, 18)) > 0.000000001) { bad = 1; }
+        // ambient + sun <= 1 at the keyframe itself
+        let ci2: i32 = 0;
+        while (ci2 < 3) {
+            let sum: f64 = env_field(env, ENV_AMB_R + ci2) + env_field(env, ENV_SUN_R + ci2);
+            if (sum > 1.0) { bad = 1; }
+            if (kk == TOD_NOON) {
+                let e2: f64 = adiff(sum, 1.0);
+                if (e2 > noon_sum_err) { noon_sum_err = e2; }
+            }
+            ci2 = ci2 + 1;
+        }
+        ok(`keyframe ${kk} matches the ART_BIBLE row and sums to <= 1`, bad == 0);
+        kk = kk + 1;
+    }
+    print(`  |ambient + sun - 1| at NOON: ${f4(noon_sum_err * 1000000000000.0)}e-12`);
+    ok("ambient + sun is EXACTLY (1,1,1) at NOON", noon_sum_err < 0.000000000001);
+
+    // -----------------------------------------------------------------------
+    print(`[3] full-day sweep: all ${TOD_DAY_TICKS} ticks x ${WX_COUNT} weathers, plus the wrap`);
+    // -----------------------------------------------------------------------
+    let wx: i32 = 0;
+    while (wx < WX_COUNT) {
+        tod_reset();
+        tod_set_weather(wx);
+        sweep_reset();
+        let check_hor: i32 = 0;
+        if (wx == WX_CLEAR) { check_hor = 1; }
+        let tick: i32 = 0;
+        let valid: i32 = 0;
+        while (tick <= TOD_DAY_TICKS) {
+            let t: f64 = tod_t_from_tick(tick);
+            tod_eval(env, t, wx);
+            tod_sky_keys(sky);
+            if (tick % 2 == 0) {
+                watch_fill(env, sky, wa);
+                sweep_accum(wa, wb, valid, sky, check_hor);
+            } else {
+                watch_fill(env, sky, wb);
+                sweep_accum(wb, wa, valid, sky, check_hor);
+            }
+            valid = 1;
+            tick = tick + 1;
+        }
+        let nm: string = wxname(wx);
+        print(`  ${nm}: max(amb+sun) ${f4(g_max_sum)}  min amb ${f4(g_min_amb)}  fog ${f4(g_min_near)}..${f4(g_max_far)} m  min chroma ${f4(g_min_chroma)}  max d/frame ${f4(g_max_delta)} (ch ${g_max_delta_ch})  min dir.y ${f4(g_min_diry)}`);
+        ok(`${nm}: ambient + sun <= 1 in every channel on every tick`, g_max_sum <= 1.0);
+        ok(`${nm}: ambient never below 0.14 in any channel`, g_min_amb >= TOD_AMBIENT_FLOOR);
+        ok(`${nm}: fog_far never exceeds 72 m`, g_max_far <= TOD_FOG_FAR_CAP);
+        ok(`${nm}: fog_near >= 3 m and fog_far > fog_near on every tick`, g_bad_fogband == 0);
+        ok(`${nm}: ambient is never grey`, g_min_chroma >= CHROMA_MIN);
+        ok(`${nm}: ambient is never warmer than the key light`, g_bad_warm == 0);
+        ok(`${nm}: mist density stays in [0, 0.85]`, g_bad_mist == 0);
+        ok(`${nm}: the key direction is unit and never from below the horizon`,
+           g_max_dirlen < 0.000000001 && g_min_diry > 0.05);
+        ok(`${nm}: no channel moves more than 4 % in one frame`, g_max_delta <= DELTA_MAX);
+        if (wx == WX_CLEAR) {
+            print(`  CLEAR: max |fog tint - sky horizon| ${f4(g_max_fog_hor)}`);
+            ok("the fog tint tracks the sky horizon band all day", g_max_fog_hor <= FOG_HORIZON_MAX);
+            note(`clear-day fog tint is within ${f4(g_max_fog_hor)} of the horizon band (ART_BIBLE §6.6)`);
+        }
+        wx = wx + 1;
+    }
+
+    // -----------------------------------------------------------------------
+    print("[4] lightning: 2 flash frames, 1 recovery frame, then gone");
+    // -----------------------------------------------------------------------
+    tod_reset();
+    tod_set_weather(WX_STORM);
+    let tstorm: f64 = tod_key_anchor(TOD_NIGHT) + 0.01;
+    tod_eval(env, tstorm, WX_STORM);
+    let base_ar: f64 = env_field(env, ENV_AMB_R);
+    let base_sr: f64 = env_field(env, ENV_SUN_R);
+
+    tod_lightning_fire();
+    let lok0: i32 = 1;
+    let lok1: i32 = 1;
+    let lok2: i32 = 1;
+    let lok3: i32 = 1;
+    let lalpha: i32 = 1;
+    let linv: i32 = 1;
+
+    let step: i32 = 0;
+    while (step < 4) {
+        let a0: f64 = tod_lightning_alpha();
+        tod_eval(env, tstorm + f64(step + 1) * 0.0000173611, WX_STORM);
+        let ar2: f64 = env_field(env, ENV_AMB_R);
+        let ag2: f64 = env_field(env, ENV_AMB_G);
+        let ab2: f64 = env_field(env, ENV_AMB_B);
+        let sr2: f64 = env_field(env, ENV_SUN_R);
+        let sg2: f64 = env_field(env, ENV_SUN_G);
+        let sb2: f64 = env_field(env, ENV_SUN_B);
+        if (step == 0 || step == 1) {
+            if (a0 != 0.55) { lalpha = 0; }
+            let flash: bool = ar2 == 0.90 && ag2 == 0.92 && ab2 == 1.00
+                              && sr2 == 0.10 && sg2 == 0.08 && sb2 == 0.00;
+            if (step == 0 && !flash) { lok0 = 0; }
+            if (step == 1 && !flash) { lok1 = 0; }
+        }
+        if (step == 2) {
+            if (a0 != 0.0) { lalpha = 0; }
+            if (ar2 != 0.55 || ag2 != 0.57 || ab2 != 0.66) { lok2 = 0; }
+        }
+        if (step == 3) {
+            if (a0 != 0.0) { lalpha = 0; }
+            if (adiff(ar2, base_ar) > 0.001 || adiff(sr2, base_sr) > 0.001) { lok3 = 0; }
+        }
+        // the invariants hold DURING the flash too
+        let ci3: i32 = 0;
+        while (ci3 < 3) {
+            let am2: f64 = env_field(env, ENV_AMB_R + ci3);
+            let su2: f64 = env_field(env, ENV_SUN_R + ci3);
+            if (am2 + su2 > 1.0) { linv = 0; }
+            if (am2 < TOD_AMBIENT_FLOOR) { linv = 0; }
+            ci3 = ci3 + 1;
+        }
+        let amx: f64 = ar2; if (ag2 > amx) { amx = ag2; } if (ab2 > amx) { amx = ab2; }
+        let amn: f64 = ar2; if (ag2 < amn) { amn = ag2; } if (ab2 < amn) { amn = ab2; }
+        if (amx - amn < CHROMA_MIN) { linv = 0; }
+        if (ar2 - ab2 > sr2 - sb2 + 0.000000001) { linv = 0; }
+        step = step + 1;
+    }
+    ok("lightning frame 0 is the blue-white flash", lok0 == 1);
+    ok("lightning frame 1 is the blue-white flash", lok1 == 1);
+    ok("lightning frame 2 is the (0.55,0.57,0.66) recovery step", lok2 == 1);
+    ok("lightning frame 3 has returned to the storm state", lok3 == 1);
+    ok("the additive lightning quad is at alpha 0.55 for exactly 2 frames", lalpha == 1);
+    ok("every invariant holds during the lightning sequence", linv == 1);
+
+    // -----------------------------------------------------------------------
+    print("[5] weather crossfades");
+    // -----------------------------------------------------------------------
+    // CLEAR -> STORM at noon, one frame at a time, with the discontinuity and
+    // the invariants checked across the whole fade.
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    sweep_reset();
+    let t0: f64 = tod_key_anchor(TOD_NOON);
+    let dt: f64 = 1.0 / f64(TOD_DAY_TICKS);
+    let fi: i32 = 0;
+    let valid2: i32 = 0;
+    let fade_frames: i32 = -1;
+    while (fi < 900) {
+        let t: f64 = t0 + f64(fi) * dt;
+        let wnow: i32 = WX_CLEAR;
+        if (fi >= 60) { wnow = WX_STORM; }
+        tod_eval(env, t, wnow);
+        tod_sky_keys(sky);
+        if (fi % 2 == 0) {
+            watch_fill(env, sky, wa);
+            sweep_accum(wa, wb, valid2, sky, 0);
+        } else {
+            watch_fill(env, sky, wb);
+            sweep_accum(wb, wa, valid2, sky, 0);
+        }
+        if (fade_frames < 0 && fi >= 60 && tod_weather_mix() >= 1.0) {
+            fade_frames = fi - 60;
+        }
+        valid2 = 1;
+        fi = fi + 1;
+    }
+    print(`  CLEAR->STORM: max d/frame ${f4(g_max_delta)} (ch ${g_max_delta_ch}), fade ${fade_frames} frames, max(amb+sun) ${f4(g_max_sum)}, min amb ${f4(g_min_amb)}, max fog_far ${f4(g_max_far)}`);
+    ok("a weather crossfade moves no channel more than 4 % in a frame", g_max_delta <= DELTA_MAX);
+    ok("every invariant holds during a weather crossfade",
+       g_max_sum <= 1.0 && g_min_amb >= TOD_AMBIENT_FLOOR && g_max_far <= TOD_FOG_FAR_CAP
+       && g_bad_fogband == 0 && g_bad_warm == 0 && g_bad_mist == 0);
+    let want_w: i32 = i32(TOD_FADE_WEATHER * 60.0);
+    ok("a weather front crosses over in TOD_FADE_WEATHER seconds",
+       fade_frames >= want_w - 1 && fade_frames <= want_w + 1);
+
+    // The corrupted zone fades in over 3 s (ART_BIBLE §5.2 note 3).
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    sweep_reset();
+    let bi: i32 = 0;
+    let bloom_frames: i32 = -1;
+    let valid3: i32 = 0;
+    while (bi < 600) {
+        let t: f64 = t0 + f64(bi) * dt;
+        let wnow: i32 = WX_CLEAR;
+        if (bi >= 30) { wnow = WX_BLOOM; }
+        tod_eval(env, t, wnow);
+        tod_sky_keys(sky);
+        if (bi % 2 == 0) {
+            watch_fill(env, sky, wa);
+            sweep_accum(wa, wb, valid3, sky, 0);
+        } else {
+            watch_fill(env, sky, wb);
+            sweep_accum(wb, wa, valid3, sky, 0);
+        }
+        if (bloom_frames < 0 && bi >= 30 && tod_weather_mix() >= 1.0) {
+            bloom_frames = bi - 30;
+        }
+        valid3 = 1;
+        bi = bi + 1;
+    }
+    let want_b: i32 = i32(TOD_FADE_BLOOM * 60.0);
+    print(`  CLEAR->BLOOM: fade ${bloom_frames} frames (want ${want_b}), max d/frame ${f4(g_max_delta)}`);
+    ok("the corrupted-zone override fades in over 3 s and stays smooth",
+       bloom_frames >= want_b - 1 && bloom_frames <= want_b + 1 && g_max_delta <= DELTA_MAX);
+
+    // -----------------------------------------------------------------------
+    print("[6] determinism, and what tod_eval does NOT touch");
+    // -----------------------------------------------------------------------
+    let e1: array<f64> = env_new();
+    let e2: array<f64> = env_new();
+    tod_reset(); tod_set_weather(WX_RAIN);
+    tod_eval(e1, 0.4321, WX_RAIN);
+    tod_reset(); tod_set_weather(WX_RAIN);
+    tod_eval(e2, 0.4321, WX_RAIN);
+    let same: i32 = 1;
+    let q: i32 = 0;
+    while (q < 29) {
+        if (env_field(e1, q) != env_field(e2, q)) { same = 0; }
+        q = q + 1;
+    }
+    ok("the same day_t and weather produce a bit-identical RenderEnv", same == 1);
+
+    ok("tod_eval leaves the world rim at zero (ART_BIBLE §4.2)",
+       env_field(e1, ENV_RIM_R) == 0.0 && env_field(e1, ENV_RIM_G) == 0.0
+       && env_field(e1, ENV_RIM_B) == 0.0);
+    ok("the mist band is g_MIST_HEIGHT thick above its floor (ART_BIBLE §6.4)",
+       adiff(env_field(e1, ENV_MIST_TOP) - env_field(e1, ENV_MIST_BOTTOM), g_MIST_HEIGHT) < 0.000000001);
+    ok("tod_mist_density agrees with the env it just wrote",
+       tod_mist_density() == env_field(e1, ENV_MIST_DENSITY));
+
+    // Sky keys must be a usable panorama description at every hour.
+    tod_reset(); tod_set_weather(WX_CLEAR);
+    tod_eval(env, tod_key_anchor(TOD_DEEP), WX_CLEAR);
+    tod_sky_keys(sky);
+    let deep_star: f64 = sky[TODSKY_STAR_ALPHA];
+    let deep_moon: f64 = sky[TODSKY_MOON];
+    let deep_body_y: f64 = sky[TODSKY_BODY_Y];
+    tod_eval(env, tod_key_anchor(TOD_NOON), WX_CLEAR);
+    tod_sky_keys(sky);
+    let noon_star: f64 = sky[TODSKY_STAR_ALPHA];
+    let noon_moon: f64 = sky[TODSKY_MOON];
+    print(`  sky keys: DEEP star ${f4(deep_star)} moon ${f4(deep_moon)} body.y ${f4(deep_body_y)} | NOON star ${f4(noon_star)} moon ${f4(noon_moon)}`);
+    ok("the sky is starless with a sun at noon and starlit with a moon at DEEP",
+       noon_star == 0.0 && noon_moon == 0.0 && deep_star == 1.0 && deep_moon == 1.0
+       && deep_body_y > 0.5);
+
+    tod_reset(); tod_set_weather(WX_STORM);
+    tod_eval(env, tod_key_anchor(TOD_DEEP), WX_STORM);
+    tod_sky_keys(sky);
+    ok("a storm sky is fully covered and shows no stars",
+       sky[TODSKY_CLOUD_COVER] == 1.0 && sky[TODSKY_STAR_ALPHA] == 0.0);
+
+    // -----------------------------------------------------------------------
+    print("[7] cost of tod_eval (RULE T: __clock CPU time, min of 7 batches)");
+    // -----------------------------------------------------------------------
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    let us: f64 = eval_us(env, 20000);
+    print(`  tod_eval: ${f4(us)} us/call, once per frame`);
+    note(`tod_eval costs ${f4(us)} us/frame == ${f4(us / 166.7)} % of the 16.67 ms frame`);
+    // REGRESSION GUARD, not a frame-budget assertion (CLAUDE.md §1.2). Measured
+    // on this box, which permanently shares ~17 of 24 cores with a llama-server:
+    // 4.7 - 7.7 us/call across runs (min-of-7 CPU time). There is no idle
+    // number to quote — the box is never idle — so the guard sits at 20 us,
+    // ~2.6x the worst loaded reading, and catches anything that turns this cold
+    // once-per-frame call into a per-vertex-shaped cost.
+    ok("tod_eval stays under the 20 us/frame regression guard", us < 20.0);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    if (g_n != EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+fn adiff(p_a: f64, p_b: f64): f64 {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let out: f64 = d;
+    return out;
+}
+
+main();

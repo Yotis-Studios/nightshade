@@ -1,0 +1,829 @@
+// probe_sim_world.hml — acceptance probe for W2-10 (src/sim/world.hml and
+// src/sim/history.hml).
+//
+// BUILD_PLAN W2-10 names `probe_sim_core.hml` as the verifier, but that file is
+// OWNED BY W2-9 and W2-9 is running in the same wave. Editing it would break
+// the disjoint-ownership rule (CLAUDE.md §3), so W2-10's assertions live here
+// instead. Both probes should be run by the Wave 2 gate. Reported.
+//
+// Run COMPILED, from the nightshade repo root:
+//     hemlockc -O1 tools/probe_sim_world.hml -o /tmp/psw && /tmp/psw
+//
+// It links no SDL and needs no display: `src/sim/**` is behind the import wall
+// (verified: `nm /tmp/psw | grep -c SDL_` is 0).
+//
+// RUN IT COMPILED. Interpreted, all 171 correctness assertions still pass and
+// the output is byte-identical, but the two TIMING assertions fail: the
+// interpreter measures history_capture at 0.217 ms/tick against 0.024 ms
+// compiled (9x). `hemlockc` is the ground truth for every number in this
+// project (CLAUDE.md §2).
+//
+// The probe asserts its own ASSERTION COUNT as well as its pass count, so a
+// silently-skipped block fails the build instead of printing a smaller green
+// number (`EXPECTED_ASSERTS` below).
+//
+// The five acceptance criteria of W2-10, and where each is checked:
+//   1. 512 spawn/despawn cycles leave sparse/dense consistent  -> test_cycles
+//   2. ids are never reused within a session                   -> test_cycles
+//   3. every field carries a one-word replication comment      -> test_source
+//   4. history_capture at 256 entities <= 0.08 ms/tick         -> test_timing
+//   5. no field is an object / entity reference / closure      -> test_source
+//      (including the required CI grep for `.target =`)
+
+import { exit } from "@stdlib/process";
+import { read_file, exists } from "@stdlib/fs";
+
+import {
+    world_new, world_new_cap, world_spawn, world_spawn_player,
+    world_despawn, world_despawn_id, world_slot_of, world_id_of, world_alive,
+    world_kind_of, world_owner_of, world_count, world_cap, world_tick,
+    world_set_tick, world_seed, world_set_seed, world_replaying,
+    world_set_replaying, world_check, world_reset, world_reset_session,
+    world_id_class, world_kind_range_base, world_next_id,
+    world_spawn_fail_count, world_spawn_count, world_despawn_count,
+    KIND_NONE, KIND_PLAYER, KIND_AI, KIND_NPC, KIND_PROJECTILE, KIND_PICKUP,
+    KIND_PROP, KIND_LANTERN, KIND_COSMETIC, KIND_COUNT,
+    ID_NONE, ID_PLAYER_BASE, ID_PLAYER_MAX, ID_AI_BASE, ID_AI_MAX,
+    ID_PROJ_BASE, ID_PROJ_MAX, ID_PICKUP_BASE, ID_PICKUP_MAX,
+    ID_COSMETIC_BASE, ID_COSMETIC_MIN, SLOT_NONE, WORLD_CAP_DEFAULT,
+    EF_NO_REPLICATE
+} from "../src/sim/world.hml";
+
+import {
+    history_new, history_reset, history_capture, history_sample,
+    history_sample_id, history_find_slot, history_ring_of, history_head_tick,
+    history_count_at, history_depth, history_capture_count,
+    HISTORY_TICKS, HIST_PX, HIST_PY, HIST_PZ, HIST_YAW, HIST_PITCH,
+    HIST_FIELDS, HIST_MISS
+} from "../src/sim/history.hml";
+
+// ---------------------------------------------------------------------------
+// The expected number of assertions. If a block is skipped, short-circuits, or
+// is deleted, the count changes and the probe fails even though every executed
+// assertion passed. Update it deliberately, never to make red go green.
+// ---------------------------------------------------------------------------
+let EXPECTED_ASSERTS = 173;
+
+let g_n = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ok(p_cond: i32, p_name: string) {
+    g_n = g_n + 1;
+    if (p_cond == 1) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}`);
+    }
+}
+
+fn eqi(p_a: i32, p_b: i32, p_name: string) {
+    let a: i32 = p_a;
+    let b: i32 = p_b;
+    let c: i32 = 0;
+    if (a == b) { c = 1; }
+    if (c == 0) { print(`        got ${a}, want ${b}`); }
+    ok(c, p_name);
+}
+
+fn eqf(p_a: f64, p_b: f64, p_name: string) {
+    let a: f64 = p_a;
+    let b: f64 = p_b;
+    let d: f64 = a - b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let c: i32 = 0;
+    if (d < 0.000000001) { c = 1; }
+    if (c == 0) { print(`        got ${a}, want ${b}`); }
+    ok(c, p_name);
+}
+
+fn tru(p_c: i32, p_name: string) { ok(p_c, p_name); }
+
+// f64 -> fixed-3 string, so a timing number never prints in scientific form
+// (HEMLOCK_ISSUES H-5). Copied from probe_batch; tool code, not a hot path.
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    if (frac < 100) { fs = `0${fs}`; }
+    if (frac < 10) { fs = `00${frac}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// A deterministic xorshift64 for the probe itself. NOT the sim's RNG (that is
+// W2-9's rng.hml) — this only decides which slot the probe despawns next, and
+// it is here so the 512-cycle test is byte-reproducible from run to run.
+// All mixing in u64: i32/i64 `*` and `<<` TRAP on overflow (CLAUDE.md A13).
+// ---------------------------------------------------------------------------
+fn xs64(p_s: u64): u64 {
+    let s: u64 = p_s;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 7);
+    s = s ^ (s << 17);
+    let out: u64 = s;
+    return out;
+}
+
+fn xs_i(p_s: u64, p_mod: i32): i32 {
+    let m: i32 = p_mod;
+    if (m < 1) { let z: i32 = 0; return z; }
+    let v: i32 = i32((p_s >> 33) & 1073741823);
+    let out: i32 = v % m;
+    return out;
+}
+
+// ===========================================================================
+// 1. CONSTRUCTION AND CONSTANTS
+// ===========================================================================
+fn test_construct() {
+    print("-- construction and id ranges");
+    let w: object = world_new();
+    eqi(world_cap(w), WORLD_CAP_DEFAULT, "world_new uses WORLD_CAP_DEFAULT");
+    eqi(world_count(w), 0, "a new world is empty");
+    eqi(world_check(w), 0, "a new world is consistent");
+    eqi(world_tick(w), 0, "tick starts at 0");
+    eqi(world_replaying(w), 0, "replaying starts at 0");
+
+    let s: object = world_new_cap(8);
+    eqi(world_cap(s), 8, "world_new_cap honours the cap");
+
+    // The id ranges are disjoint and ordered (NETWORKING §7.1).
+    tru(ID_PLAYER_MAX < ID_AI_BASE ? 1 : 0, "player range is below AI range");
+    tru(ID_AI_MAX < ID_PROJ_BASE ? 1 : 0, "AI range is below projectile range");
+    tru(ID_PROJ_MAX < ID_PICKUP_BASE ? 1 : 0, "projectile range is below pickup range");
+    tru(ID_COSMETIC_BASE < ID_NONE ? 1 : 0, "cosmetic ids are negative");
+
+    // world_id_class classifies from the id alone, with no world.
+    eqi(world_id_class(1), KIND_PLAYER, "id 1 classifies as a player");
+    eqi(world_id_class(64), KIND_PLAYER, "id 64 classifies as a player");
+    eqi(world_id_class(1000), KIND_AI, "id 1000 classifies as AI");
+    eqi(world_id_class(500000), KIND_PROJECTILE, "id 500000 classifies as a projectile");
+    eqi(world_id_class(1000000), KIND_PICKUP, "id 1000000 classifies as a pickup");
+    eqi(world_id_class(-3), KIND_COSMETIC, "a negative id classifies as cosmetic");
+    eqi(world_id_class(0), KIND_NONE, "id 0 is NONE");
+    eqi(world_id_class(65), KIND_NONE, "an id in no range is NONE");
+
+    eqi(world_kind_range_base(KIND_NPC), ID_AI_BASE, "NPCs share the AI id range");
+    eqi(world_kind_range_base(KIND_LANTERN), ID_PICKUP_BASE, "lanterns share the pickup id range");
+}
+
+// ===========================================================================
+// 2. SPAWN / DESPAWN BASICS
+// ===========================================================================
+fn test_basics() {
+    print("-- spawn / despawn / lookup");
+    let w: object = world_new_cap(16);
+
+    let s0: i32 = world_spawn(w, KIND_AI, 0);
+    eqi(s0, 0, "the first spawn takes slot 0");
+    let id0: i32 = world_id_of(w, s0);
+    tru(id0 >= ID_AI_BASE && id0 <= ID_AI_MAX ? 1 : 0, "an AI id lands in the AI range");
+    eqi(world_slot_of(w, id0), s0, "world_slot_of round-trips");
+    eqi(world_kind_of(w, s0), KIND_AI, "kind is recorded");
+    eqi(world_count(w), 1, "count is 1 after one spawn");
+    eqi(world_alive(w, id0), 1, "the spawned id is alive");
+    eqi(world_check(w), 0, "consistent after one spawn");
+
+    eqi(world_despawn(w, s0), 1, "despawn reports success");
+    eqi(world_count(w), 0, "count is 0 after the despawn");
+    eqi(world_slot_of(w, id0), SLOT_NONE, "a dead id no longer resolves");
+    eqi(world_alive(w, id0), 0, "a dead id is not alive");
+    eqi(world_check(w), 0, "consistent after the despawn");
+    eqi(world_despawn(w, 0), 0, "despawning an empty slot is a no-op, not a throw");
+
+    // Ids are not reused after a despawn.
+    let s1: i32 = world_spawn(w, KIND_AI, 0);
+    let id1: i32 = world_id_of(w, s1);
+    tru(id1 != id0 ? 1 : 0, "the slot is reused, the id is not");
+    eqi(s1, 0, "slots ARE reused (swap-with-last compaction)");
+
+    // Owner is identity and is carried.
+    let s2: i32 = world_spawn(w, KIND_PROJECTILE, 3);
+    eqi(world_owner_of(w, s2), 3, "owner is recorded on spawn");
+    let id2: i32 = world_id_of(w, s2);
+    eqi(world_id_class(id2), KIND_PROJECTILE, "a projectile id classifies as one");
+
+    eqi(world_despawn_id(w, id2), 1, "world_despawn_id removes by id");
+    eqi(world_despawn_id(w, id2), 0, "removing a dead id is a no-op");
+    eqi(world_check(w), 0, "consistent after despawn-by-id");
+}
+
+// ===========================================================================
+// 3. PLAYER IDS ARE POSITIONAL
+// ===========================================================================
+fn test_players() {
+    print("-- positional player ids");
+    let w: object = world_new_cap(16);
+
+    let s: i32 = world_spawn_player(w, 1);
+    tru(s >= 0 ? 1 : 0, "player 1 spawns");
+    eqi(world_id_of(w, s), 1, "player 1's entity id IS 1");
+    eqi(world_kind_of(w, s), KIND_PLAYER, "kind is KIND_PLAYER");
+    eqi(world_owner_of(w, s), 1, "a player owns itself");
+
+    eqi(world_spawn_player(w, 1), SLOT_NONE, "a live player slot cannot be spawned twice");
+    eqi(world_spawn_player(w, 0), SLOT_NONE, "player slot 0 is rejected");
+    eqi(world_spawn_player(w, ID_PLAYER_MAX + 1), SLOT_NONE, "player slot 65 is rejected");
+    eqi(world_spawn(w, KIND_PLAYER, 2), SLOT_NONE, "world_spawn refuses KIND_PLAYER");
+    eqi(world_spawn(w, KIND_NONE, 0), SLOT_NONE, "world_spawn refuses KIND_NONE");
+    eqi(world_spawn(w, KIND_COUNT, 0), SLOT_NONE, "world_spawn refuses an out-of-range kind");
+
+    // Respawn: the id is a reservation, so it comes back. That is the one and
+    // only id that is ever seen twice, and it is prescribed by NETWORKING §7.1.
+    world_despawn(w, s);
+    let s2: i32 = world_spawn_player(w, 1);
+    eqi(world_id_of(w, s2), 1, "player 1 keeps id 1 across a respawn");
+    eqi(world_check(w), 0, "consistent after a player respawn");
+}
+
+// ===========================================================================
+// 4. SWAP-WITH-LAST MOVES EVERY REPLICATION GROUP INTACT
+// ===========================================================================
+fn test_swap_integrity() {
+    print("-- swap-with-last field integrity");
+    let w: object = world_new_cap(16);
+    let a: i32 = world_spawn(w, KIND_AI, 0);
+    let b: i32 = world_spawn(w, KIND_AI, 0);
+    let c: i32 = world_spawn(w, KIND_AI, 0);
+    let id_c: i32 = world_id_of(w, c);
+
+    // Write one field from each of the five replication groups into slot c.
+    let f_st: array<i32> = w.spawn_tick;    f_st[c] = 77;          // identity
+    let f_px: array<f64> = w.px;            f_px[c] = 12.5;        // transform
+    let f_yaw: array<f64> = w.yaw;          f_yaw[c] = -1.25;      // transform
+    let f_hp: array<i32> = w.hp;            f_hp[c] = 93;          // state
+    let f_am: array<i32> = w.ammo_mag;      f_am[c] = 6;           // owner
+    let f_ait: array<i32> = w.ai_target_id; f_ait[c] = 4242;       // server
+
+    // Despawn the middle: c must land in b's slot with all five groups intact.
+    eqi(world_despawn(w, b), 1, "despawn the middle slot");
+    eqi(world_count(w), 2, "count drops to 2");
+    eqi(world_slot_of(w, id_c), b, "the moved entity's id now resolves to the vacated slot");
+
+    eqi(f_st[b], 77, "identity field survives the swap");
+    eqf(f_px[b], 12.5, "transform position survives the swap");
+    eqf(f_yaw[b], -1.25, "transform angle survives the swap");
+    eqi(f_hp[b], 93, "state field survives the swap");
+    eqi(f_am[b], 6, "owner-only field survives the swap");
+    eqi(f_ait[b], 4242, "server-only field survives the swap");
+
+    // The vacated tail slot must be scrubbed, not left holding a stale copy.
+    eqi(f_st[2], 0, "the vacated tail slot's identity field is cleared");
+    eqf(f_px[2], 0.0, "the vacated tail slot's transform is cleared");
+    eqi(f_hp[2], 0, "the vacated tail slot's state is cleared");
+    eqi(f_ait[2], ID_NONE, "the vacated tail slot's server field is cleared");
+    eqi(world_check(w), 0, "consistent after the swap");
+
+    // A slot handed out again must not inherit anything.
+    let d: i32 = world_spawn(w, KIND_AI, 0);
+    eqi(d, 2, "the freed slot is handed out again");
+    eqi(f_hp[d], 0, "a recycled slot starts from zero");
+    let ai: i32 = a;
+    eqi(ai, 0, "slot a was untouched by the swap");
+}
+
+// ===========================================================================
+// 5. CAPACITY EXHAUSTION FAILS LOUDLY, NEVER CORRUPTS
+// ===========================================================================
+fn test_capacity() {
+    print("-- capacity exhaustion");
+    let w: object = world_new_cap(8);
+    let i: i32 = 0;
+    let good: i32 = 1;
+    while (i < 8) {
+        if (world_spawn(w, KIND_AI, 0) != i) { good = 0; }
+        i++;
+    }
+    eqi(good, 1, "8 spawns fill an 8-slot world");
+    eqi(world_count(w), 8, "the world is full");
+    eqi(world_spawn(w, KIND_AI, 0), SLOT_NONE, "the 9th spawn returns SLOT_NONE");
+    eqi(world_spawn_fail_count(w), 1, "the failure is counted, not silent");
+    eqi(world_check(w), 0, "a full, over-subscribed world is still consistent");
+    eqi(world_spawn_count(w), 8, "spawn count is exact");
+    world_despawn(w, 0);
+    eqi(world_despawn_count(w), 1, "despawn count is exact");
+    eqi(world_check(w), 0, "consistent after the overflow and a despawn");
+}
+
+// ===========================================================================
+// 6. 512 SPAWN/DESPAWN CYCLES  — the headline acceptance criterion
+// ===========================================================================
+// Every cycle spawns 1..4 entities of assorted kinds and despawns 0..4 random
+// LIVE SLOTS (not tail slots), which is what actually exercises the
+// swap-with-last + sparse-fix path. `world_check` runs after every single
+// cycle, so a corruption is attributed to the cycle that caused it.
+fn test_cycles() {
+    print("-- 512 spawn/despawn cycles");
+    let w: object = world_new_cap(512);
+    let minted: array<i32> = [];
+    let kinds: array<i32> = [];
+    kinds.push(KIND_AI);
+    kinds.push(KIND_NPC);
+    kinds.push(KIND_PROJECTILE);
+    kinds.push(KIND_PICKUP);
+    kinds.push(KIND_COSMETIC);
+
+    let s: u64 = 88172645463325252;
+    let bad_check: i32 = 0;
+    let bad_resolve: i32 = 0;
+    let first_bad_cycle: i32 = -1;
+    let cyc: i32 = 0;
+    while (cyc < 512) {
+        s = xs64(s);
+        let nsp: i32 = xs_i(s, 4) + 1;
+        let k: i32 = 0;
+        while (k < nsp) {
+            s = xs64(s);
+            let kd: i32 = kinds[xs_i(s, 5)];
+            let slot: i32 = world_spawn(w, kd, 0);
+            if (slot >= 0) { minted.push(world_id_of(w, slot)); }
+            k++;
+        }
+        s = xs64(s);
+        let nde: i32 = xs_i(s, 5);
+        k = 0;
+        while (k < nde) {
+            let n: i32 = world_count(w);
+            if (n > 0) {
+                s = xs64(s);
+                world_despawn(w, xs_i(s, n));
+            }
+            k++;
+        }
+        if (world_check(w) != 0) {
+            bad_check++;
+            if (first_bad_cycle < 0) { first_bad_cycle = cyc; }
+        }
+        // Independently of world_check: every live slot must resolve both ways.
+        let n2: i32 = world_count(w);
+        let j: i32 = 0;
+        while (j < n2) {
+            let id: i32 = world_id_of(w, j);
+            if (world_slot_of(w, id) != j) { bad_resolve++; }
+            j++;
+        }
+        cyc++;
+    }
+
+    print(`   after 512 cycles: count=${world_count(w)} spawned=${world_spawn_count(w)} despawned=${world_despawn_count(w)} ids_minted=${minted.length}`);
+    eqi(bad_check, 0, "sparse/dense consistent after every one of 512 cycles");
+    eqi(bad_resolve, 0, "every live slot resolves id->slot->id, every cycle");
+    eqi(first_bad_cycle, -1, "no cycle corrupted the sparse set");
+    eqi(world_check(w), 0, "final world_check is clean");
+    eqi(world_spawn_fail_count(w), 0, "no spawn failed (the world never overflowed)");
+    tru(minted.length >= 512 ? 1 : 0, "the test actually minted a meaningful number of ids");
+    tru(world_count(w) > 0 ? 1 : 0, "the world is non-empty at the end");
+
+    // ---- ids are never reused within a session -------------------------
+    // O(n^2) over ~1300 ids. Brute force on purpose: a hash here could share a
+    // bug with the hash under test.
+    let dup: i32 = 0;
+    let m: i32 = minted.length;
+    let i: i32 = 0;
+    while (i < m) {
+        let a: i32 = minted[i];
+        let j2: i32 = i + 1;
+        while (j2 < m) {
+            if (minted[j2] == a) { dup++; }
+            j2++;
+        }
+        i++;
+    }
+    eqi(dup, 0, "no id was ever minted twice in the session");
+
+    // Ids stay inside their kind's range no matter how much churn happened.
+    let out_of_range: i32 = 0;
+    i = 0;
+    while (i < m) {
+        let id: i32 = minted[i];
+        if (world_id_class(id) == KIND_NONE) { out_of_range++; }
+        i++;
+    }
+    eqi(out_of_range, 0, "every minted id falls in a declared kind range");
+
+    // ---- world_reset does NOT rewind the allocators ---------------------
+    let next_ai_before: i32 = world_next_id(w, KIND_AI);
+    world_reset(w);
+    eqi(world_count(w), 0, "world_reset empties the world");
+    eqi(world_check(w), 0, "world_reset leaves a consistent sparse set");
+    eqi(world_next_id(w, KIND_AI), next_ai_before, "world_reset does NOT reuse ids");
+    let after: i32 = world_spawn(w, KIND_AI, 0);
+    tru(world_id_of(w, after) >= next_ai_before ? 1 : 0, "the first post-reset id is still fresh");
+
+    // ---- world_reset_session is the only thing that rewinds them --------
+    world_reset_session(w, 1234);
+    eqi(world_next_id(w, KIND_AI), ID_AI_BASE, "world_reset_session rewinds the allocators");
+    eqi(world_seed(w), 1234, "world_reset_session sets the seed");
+    eqi(world_tick(w), 0, "world_reset_session rewinds the tick");
+}
+
+// ===========================================================================
+// 7. HISTORY RING CORRECTNESS
+// ===========================================================================
+fn test_history() {
+    print("-- history ring");
+    let w: object = world_new_cap(64);
+    let h: object = history_new(64);
+    let out: array<f64> = [];
+    let z: i32 = 0;
+    while (z < HIST_FIELDS) { out.push(0.0); z++; }
+
+    eqi(history_depth(), 32, "HISTORY_TICKS is 32");
+    eqi(HISTORY_TICKS, 32, "the exported constant is 32");
+    eqi(history_head_tick(h), -1, "a cold ring has no head tick");
+    eqi(history_sample(h, 0, 1000, 0, out), 0, "sampling a cold ring misses");
+    eqi(history_ring_of(h, 0), HIST_MISS, "ring_of on a cold ring misses");
+
+    // Three entities that move one unit per tick, so every captured value is a
+    // function of (slot, tick) and a wrong ring is instantly visible.
+    let a: i32 = world_spawn(w, KIND_AI, 0);
+    let b: i32 = world_spawn(w, KIND_AI, 0);
+    let c: i32 = world_spawn(w, KIND_AI, 0);
+    let id_a: i32 = world_id_of(w, a);
+    let id_b: i32 = world_id_of(w, b);
+    let id_c: i32 = world_id_of(w, c);
+
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let yaw: array<f64> = w.yaw;
+    let pit: array<f64> = w.pitch;
+
+    let t: i32 = 0;
+    while (t < 40) {
+        world_set_tick(w, t);
+        let n: i32 = world_count(w);
+        let i: i32 = 0;
+        while (i < n) {
+            px[i] = f64(t) * 10.0 + f64(i);
+            py[i] = f64(t) * 100.0 + f64(i);
+            pz[i] = 0.0 - (f64(t) + f64(i));
+            yaw[i] = f64(t) * 0.25;
+            pit[i] = f64(i) * 0.5;
+            i++;
+        }
+        history_capture(h, w);
+        t++;
+    }
+
+    eqi(history_capture_count(h), 40, "40 captures were recorded");
+    eqi(history_head_tick(h), 39, "the head holds the newest tick");
+    eqi(history_count_at(h, 39), 3, "3 entities were live at the newest tick");
+
+    // Newest tick.
+    eqi(history_sample(h, a, id_a, 39, out), 1, "sample the newest tick");
+    eqf(out[HIST_PX], 390.0, "newest px is exact");
+    eqf(out[HIST_PY], 3900.0, "newest py is exact");
+    eqf(out[HIST_PZ], -39.0, "newest pz is exact");
+    eqf(out[HIST_YAW], 9.75, "newest yaw is exact");
+    eqf(out[HIST_PITCH], 0.0, "newest pitch is exact");
+
+    // The oldest tick still inside a 32-deep window is 39 - 31 = 8.
+    eqi(history_sample(h, c, id_c, 8, out), 1, "sample the oldest tick in the window");
+    eqf(out[HIST_PX], 82.0, "oldest px is exact for slot 2");
+    eqf(out[HIST_PITCH], 1.0, "oldest pitch is exact for slot 2");
+
+    // One tick past the window must miss, not alias onto a live ring cell.
+    eqi(history_sample(h, a, id_a, 7, out), 0, "one tick past the window misses");
+    eqi(history_ring_of(h, 7), HIST_MISS, "ring_of one tick past the window misses");
+    eqi(history_sample(h, a, id_a, 40, out), 0, "a future tick misses");
+    eqi(history_sample(h, a, id_a, -1, out), 0, "a negative tick misses");
+
+    // A mid-window tick.
+    eqi(history_sample(h, b, id_b, 20, out), 1, "sample a mid-window tick");
+    eqf(out[HIST_PX], 201.0, "mid-window px is exact for slot 1");
+
+    // An id that never existed misses even in a live slot.
+    eqi(history_sample(h, a, 999999, 39, out), 0, "a wrong id in a live slot misses");
+    // A slot beyond the live count at that tick misses.
+    eqi(history_sample(h, 10, id_a, 39, out), 0, "a slot past n_of[ring] misses");
+
+    // find_slot / sample_id resolve without knowing the slot.
+    eqi(history_find_slot(h, id_c, 30), c, "history_find_slot finds the right slot");
+    eqi(history_find_slot(h, 424242, 30), HIST_MISS, "history_find_slot misses an unknown id");
+    eqi(history_sample_id(h, id_b, 30, out), 1, "history_sample_id resolves by id alone");
+    eqf(out[HIST_PX], 301.0, "sample_id returns the right entity's position");
+
+    // ---- SLOT CHURN: the reason every cell carries an id ----------------
+    // Despawn slot 0. c (the tail) is swapped into slot 0. Old history cells
+    // for slot 0 belong to `a`, so a naive slot-indexed rewind of `c` would
+    // return a's body. It must MISS on the fast path and be recoverable with
+    // history_find_slot.
+    world_despawn(w, a);
+    eqi(world_slot_of(w, id_c), 0, "the tail entity was swapped into slot 0");
+    eqi(history_sample(h, 0, id_c, 39, out), 0, "a recycled slot misses instead of rewinding the wrong body");
+    eqi(history_find_slot(h, id_c, 39), 2, "find_slot recovers the entity's slot at that tick");
+    eqi(history_sample_id(h, id_c, 39, out), 1, "sample_id still resolves across the slot change");
+    eqf(out[HIST_PX], 392.0, "and returns c's position, not a's");
+
+    // Shrinking then capturing must shrink n_of too.
+    world_set_tick(w, 40);
+    history_capture(h, w);
+    eqi(history_count_at(h, 40), 2, "n_of tracks the shrunken world");
+    eqi(history_sample(h, 2, id_c, 40, out), 0, "the vacated slot is not readable at the new tick");
+
+    // Reset.
+    history_reset(h);
+    eqi(history_head_tick(h), -1, "history_reset clears the ring");
+    eqi(history_capture_count(h), 0, "history_reset clears the capture count");
+    eqi(history_sample(h, 0, id_b, 39, out), 0, "nothing is readable after a reset");
+
+    // Ring wrap over more than one full lap.
+    let w2: object = world_new_cap(8);
+    let h2: object = history_new(8);
+    world_spawn(w2, KIND_AI, 0);
+    let id2: i32 = world_id_of(w2, 0);
+    let px2: array<f64> = w2.px;
+    let t2: i32 = 0;
+    while (t2 < 200) {
+        world_set_tick(w2, t2);
+        px2[0] = f64(t2);
+        history_capture(h2, w2);
+        t2++;
+    }
+    eqi(history_head_tick(h2), 199, "the ring survives 200 laps-worth of captures");
+    eqi(history_sample(h2, 0, id2, 199, out), 1, "the newest tick is readable after wrapping");
+    eqf(out[HIST_PX], 199.0, "and is the right value");
+    eqi(history_sample(h2, 0, id2, 168, out), 1, "the 32nd-oldest tick is readable");
+    eqf(out[HIST_PX], 168.0, "and is the right value");
+    eqi(history_sample(h2, 0, id2, 167, out), 0, "the 33rd-oldest tick has been overwritten");
+}
+
+// ===========================================================================
+// 8. TIMING — history_capture at 256 entities
+// ===========================================================================
+// RULE T (CLAUDE.md §1.2, BUDGET_ACTUAL): __clock() CPU time, minimum of 7
+// batches. This box permanently shares ~17 of 24 cores with a llama-server, so
+// the bound below is a REGRESSION GUARD set at ~2x the loaded measurement, not
+// a certification of an idle machine. Both numbers are in the assertion text.
+let TRIALS = 7;
+
+fn capture_ms(p_h: object, p_w: object, p_reps: i32): f64 {
+    let h: object = p_h;
+    let w: object = p_w;
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < reps) { history_capture(h, w); i++; }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(reps);
+        if (t == 0 || ms < best) { best = ms; }
+        t++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn test_timing() {
+    print("-- history_capture timing (RULE T: __clock CPU time, min of 7)");
+    let w: object = world_new_cap(512);
+    let h: object = history_new(512);
+    let i: i32 = 0;
+    while (i < 256) { world_spawn(w, KIND_AI, 0); i++; }
+    eqi(world_count(w), 256, "256 entities are live for the timing run");
+
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    i = 0;
+    while (i < 256) {
+        px[i] = f64(i) * 1.5;
+        py[i] = f64(i) * 0.25;
+        pz[i] = f64(i) * -3.0;
+        i++;
+    }
+
+    // Warm the arrays, then measure.
+    let warm: i32 = 0;
+    while (warm < 200) { history_capture(h, w); warm++; }
+
+    let ms256: f64 = capture_ms(h, w, 400);
+    print(`   history_capture @256 ents : ${f3(ms256)} ms/tick   (budget 0.080)`);
+
+    // Scaling check: 64 entities must cost roughly a quarter. A ratio assertion
+    // survives contention where an absolute one does not (BUDGET_ACTUAL).
+    let w2: object = world_new_cap(512);
+    let h2: object = history_new(512);
+    i = 0;
+    while (i < 64) { world_spawn(w2, KIND_AI, 0); i++; }
+    warm = 0;
+    while (warm < 200) { history_capture(h2, w2); warm++; }
+    let ms64: f64 = capture_ms(h2, w2, 400);
+    print(`   history_capture @64  ents : ${f3(ms64)} ms/tick`);
+
+    // ACCEPTANCE: <= 0.08 ms/tick at 256 entities. Measured 0.0239 ms under
+    // full load on this box; the criterion's own 0.080 is already a 3.3x guard
+    // band, so it is used verbatim rather than loosened further.
+    let c1: i32 = 0;
+    if (ms256 <= 0.08) { c1 = 1; }
+    ok(c1, `history_capture @256 <= 0.080 ms/tick (measured ${f3(ms256)} loaded)`);
+
+    // Regression guard at ~2x the loaded measurement, per RULE T.
+    let c2: i32 = 0;
+    if (ms256 <= 0.050) { c2 = 1; }
+    ok(c2, `history_capture @256 <= 0.050 ms/tick regression guard, set at ~2x the 0.0239 ms measured under load (17 of 24 cores busy); an idle box reads lower. Measured now: ${f3(ms256)}`);
+
+    // O(count), not O(cap): 4x the entities must not cost more than 6x.
+    let c3: i32 = 0;
+    if (ms64 > 0.0) {
+        if (ms256 / ms64 < 6.0) { c3 = 1; }
+    }
+    ok(c3, `capture is O(count) not O(cap): 256/64 cost ratio ${f3(ms256 / ms64)} < 6.0`);
+
+    eqi(history_capture_count(h), 200 + 7 * 400, "every timed capture actually ran");
+}
+
+// ===========================================================================
+// 9. SOURCE-LEVEL STRUCTURAL ASSERTIONS
+// ===========================================================================
+// These are the CI greps W2-10 requires, run inside the probe so they cannot be
+// forgotten when tools/ci_imports.sh (owned by W2-13) is written. They read the
+// two source files this task owns.
+fn find_src(p_rel: string): string {
+    let rel: string = p_rel;
+    let a: string = `src/sim/${rel}`;
+    if (exists(a)) { return a; }
+    let b: string = `../src/sim/${rel}`;
+    if (exists(b)) { return b; }
+    let c: string = `/home/nbeerbower/Projects/nightshade/src/sim/${rel}`;
+    return c;
+}
+
+// Everything before the first `//` on a line. Every grep below runs on CODE
+// only — a prose mention of `@stdlib/random` in a header comment explaining why
+// it is banned must not trip the check that it is banned.
+fn code_of(p_line: string): string {
+    let parts: array = p_line.split("//");
+    let out: string = parts[0];
+    return out;
+}
+
+// The first word of the trailing `//` comment, lower-cased by construction.
+// "" when the line has no comment.
+fn comment_word(p_line: string): string {
+    let parts: array = p_line.split("//");
+    if (parts.length < 2) { let none: string = ""; return none; }
+    let cm: string = parts[1];
+    let words: array = cm.trim().split(" ");
+    let out: string = words[0];
+    return out;
+}
+
+// How many CODE occurrences of `p_needle` are there?
+fn count_lines_with(p_src: string, p_needle: string): i32 {
+    let lines: array = p_src.split("\n");
+    let n: i32 = lines.length;
+    let hits: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let c: string = code_of(lines[i]);
+        if (c.contains(p_needle)) { hits++; }
+        i++;
+    }
+    let out: i32 = hits;
+    return out;
+}
+
+// For every line that declares an SoA field array, take the FIRST WORD of its
+// trailing comment and count how many name `p_group`. First-word, not
+// substring: `owner: zeros_i(cap),  // identity (player slot; 0 = server)`
+// must count as identity, not as server.
+fn count_group(p_src: string, p_decl: string, p_group: string): i32 {
+    let lines: array = p_src.split("\n");
+    let n: i32 = lines.length;
+    let hits: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let l: string = lines[i];
+        let c: string = code_of(l);
+        if (c.contains(p_decl)) {
+            if (comment_word(l) == p_group) { hits++; }
+        }
+        i++;
+    }
+    let out: i32 = hits;
+    return out;
+}
+
+// Every field-declaration line must carry SOME group word as its first word.
+fn count_untagged(p_src: string, p_decl: string): i32 {
+    let lines: array = p_src.split("\n");
+    let n: i32 = lines.length;
+    let bad: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let l: string = lines[i];
+        let c: string = code_of(l);
+        if (c.contains(p_decl)) {
+            let g: string = comment_word(l);
+            let tagged: i32 = 0;
+            if (g == "identity") { tagged = 1; }
+            if (g == "transform") { tagged = 1; }
+            if (g == "state") { tagged = 1; }
+            if (g == "owner") { tagged = 1; }
+            if (g == "server") { tagged = 1; }
+            if (g == "bookkeeping") { tagged = 1; }
+            if (tagged == 0) { bad++; print(`        untagged field: ${c.trim()}`); }
+        }
+        i++;
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+fn test_source() {
+    print("-- source-level structural checks (the CI greps)");
+    let wpath: string = find_src("world.hml");
+    let hpath: string = find_src("history.hml");
+    tru(exists(wpath) ? 1 : 0, "src/sim/world.hml is readable");
+    tru(exists(hpath) ? 1 : 0, "src/sim/history.hml is readable");
+    let ws: string = read_file(wpath);
+    let hs: string = read_file(hpath);
+    let both: string = ws + hs;
+
+    // ---- THE REQUIRED CI GREP -------------------------------------------
+    // `.target =` is the signature of storing a direct entity reference
+    // (`e.target = other_entity`). The world stores `ai_target_id`, an i32.
+    eqi(count_lines_with(both, ".target ="), 0, "CI grep: no `.target =` object assignment anywhere in src/sim");
+    eqi(count_lines_with(both, ".target="), 0, "CI grep: no `.target=` object assignment either");
+
+    // ---- no field is an object, a closure, or a foreign import -----------
+    eqi(count_lines_with(both, "@stdlib/random"), 0, "no @stdlib/random under src/sim");
+    eqi(count_lines_with(both, "wobbleweed"), 0, "no wobbleweed import under src/sim");
+    eqi(count_lines_with(both, "gn.hml"), 0, "no gn.hml import under src/sim");
+    eqi(count_lines_with(both, "@stdlib/time"), 0, "no wall clock under src/sim");
+    eqi(count_lines_with(both, "SDL_"), 0, "no SDL symbol under src/sim");
+    eqi(count_lines_with(both, "=>"), 0, "no closure literal (=>) under src/sim");
+    eqi(count_lines_with(both, "defer "), 0, "no defer under src/sim");
+    eqi(count_lines_with(both, "try {"), 0, "no try under src/sim");
+    eqi(count_lines_with(both, "throw "), 0, "no throw under src/sim");
+    eqi(count_lines_with(both, " spawn("), 0, "no bare `spawn(` (the deep-copying builtin) under src/sim");
+    // A field whose initialiser is an object literal would read `name: {`.
+    eqi(count_lines_with(ws, ": {"), 0, "no field of World is an object literal");
+    eqi(count_lines_with(hs, ": {"), 0, "no field of History is an object literal");
+    // The import statement count: world.hml and history.hml import nothing.
+    eqi(count_lines_with(both, "import "), 0, "world.hml and history.hml import nothing at all");
+
+    // ---- every field carries a one-word replication-group comment --------
+    eqi(count_untagged(ws, "zeros_i(cap)"), 0, "every i32 field of World is tagged with its group");
+    eqi(count_untagged(ws, "zeros_f(cap)"), 0, "every f64 field of World is tagged with its group");
+    eqi(count_untagged(ws, "zeros_i(hcap)"), 0, "every sparse-set array of World is tagged");
+    eqi(count_untagged(hs, "zeros_i(cells)"), 0, "every i32 field of History is tagged");
+    eqi(count_untagged(hs, "zeros_f(cells)"), 0, "every f64 field of History is tagged");
+
+    // And the groups are populated as designed — a field silently moving group
+    // changes the packet layout, so the counts are pinned.
+    eqi(count_group(ws, "zeros_i(cap)", "identity"), 4, "World has 4 identity fields");
+    eqi(count_group(ws, "zeros_f(cap)", "transform"), 8, "World has 8 transform fields");
+    let st_i: i32 = count_group(ws, "zeros_i(cap)", "state");
+    let st_f: i32 = count_group(ws, "zeros_f(cap)", "state");
+    eqi(st_i + st_f, 9, "World has 9 state fields");
+    eqi(count_group(ws, "zeros_i(cap)", "owner"), 6, "World has 6 owner-only fields");
+    let sv_i: i32 = count_group(ws, "zeros_i(cap)", "server");
+    let sv_f: i32 = count_group(ws, "zeros_f(cap)", "server");
+    eqi(sv_i + sv_f, 5, "World has 5 server-only fields");
+    eqi(count_group(hs, "zeros_f(cells)", "transform"), 5, "History captures exactly the 5 transform fields");
+    eqi(count_group(hs, "zeros_i(cells)", "identity"), 1, "History carries the identity id per cell");
+
+    // Documented, not merely true: the five group names appear in the header.
+    tru(ws.contains("identity   written once at spawn") ? 1 : 0, "the replication groups are documented in world.hml");
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_sim_world — W2-10 (src/sim/world.hml, src/sim/history.hml)");
+    test_construct();
+    test_basics();
+    test_players();
+    test_swap_integrity();
+    test_capacity();
+    test_cycles();
+    test_history();
+    test_timing();
+    test_source();
+
+    print("");
+    if (g_n != EXPECTED_ASSERTS) {
+        print(`ASSERTION COUNT MISMATCH: ran ${g_n}, expected ${EXPECTED_ASSERTS}`);
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+    print(`PASS ${g_pass}/${g_n}`);
+}
+
+main();

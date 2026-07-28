@@ -1,0 +1,250 @@
+// rng.hml — the simulation's ONLY source of randomness.
+//
+// W2-9. Owner: the sim. `@stdlib/random` is banned in this directory and this
+// module imports NOTHING — not @stdlib/math, not @stdlib/time, not SDL. That is
+// deliberate: `src/sim/**` is the future dedicated server, it must link headless,
+// and every number it produces must be reproducible from a seed alone.
+//
+// ---------------------------------------------------------------------------
+// THE GENERATOR — Marsaglia xorshift128, four 32-bit lanes
+// ---------------------------------------------------------------------------
+//   t = x ^ (x << 11)
+//   x = y;  y = z;  z = w
+//   w = w ^ (w >> 19) ^ t ^ (t >> 8)          -> the output, 32 bits
+//
+// Period 2^128 - 1. Every lane is held masked to 32 bits inside a `u64` slot.
+// **All mixing is in u64** (CLAUDE.md A13): i32/i64 `* + -` TRAP on overflow in
+// Hemlock, u64 wraps. A textbook LCG written in i64 throws on the first call.
+//
+// ---------------------------------------------------------------------------
+// THE STATE — a 4-element `array`, allocated once, reseeded in place
+// ---------------------------------------------------------------------------
+// `rng_new()` allocates; `rng_seed(st, ...)` overwrites in place and allocates
+// nothing (CLAUDE.md A8/N6). Callers keep one state per system for the whole
+// process and reseed per (tick, entity) event.
+//
+//   st[0..3]   u64, each holding a 32-bit lane
+//
+// ---------------------------------------------------------------------------
+// THE STREAMS — seeded from (world_seed, stream_id, tick, entity_id)
+// ---------------------------------------------------------------------------
+// Two systems drawing on the same tick must not share a sequence, or adding a
+// loot roll silently changes every bullet's spread. Each system owns a stream id
+// and the four inputs are folded through splitmix64 so neighbouring tuples are
+// decorrelated. Measured: 25 uniformity chi-squares and 10 pairwise-independence
+// chi-squares over 100 000 draws all pass at p = 0.001 (see probe_sim_core).
+//
+// NAMING NOTE (reported to the orchestrator): CLAUDE.md §1 rule 3 asks for a `g_`
+// prefix on top-level variables; ARCHITECTURE.md §5.4 names these exports
+// `RNG_LOOT` etc. and W2-10/W2-12 are coding against that list right now. §5 wins
+// here. The rule-3 measurement is about *hot* top-level reads: none of these are
+// read on a hot path (a stream id is passed once per seed), and every constant
+// used inside the generator is a function-local literal so no top-level read
+// happens per draw at all.
+
+// ---------------------------------------------------------------------------
+// STREAM IDS — one per system that draws. Never reuse, never renumber.
+// ---------------------------------------------------------------------------
+export let RNG_LOOT     = 0;   // rarity rolls, affix rolls, drop tables
+export let RNG_SPREAD   = 1;   // weapon spread / bloom cone
+export let RNG_AI       = 2;   // steering jitter, tell timing, barks
+export let RNG_WORLDGEN  = 3;  // terrain, biome, POI rolls, prop scatter
+export let RNG_DIRECTOR = 4;   // wave composition, spawn ring selection
+export let RNG_STREAMS  = 5;   // count — the next stream id gets 5
+
+export let RNG_LANES    = 4;   // state size, in array slots
+
+// ---------------------------------------------------------------------------
+// INTERNALS
+// ---------------------------------------------------------------------------
+
+// Two's-complement reinterpretation of an i32 as a 32-bit unsigned value.
+// `u64(v)` throws on a negative v, and `v & 0x7FFFFFFF` would drop the sign bit,
+// so route through f64 (exact for every magnitude below 2^53).
+fn u32_of(p_v: i32): u64 {
+    let v: i32 = p_v;
+    if (v >= 0) {
+        let a: u64 = u64(v);
+        return a;
+    }
+    let b: u64 = u64(f64(v) + 4294967296.0);
+    return b;
+}
+
+// splitmix64 finalizer. Avalanches a 64-bit counter into a 64-bit hash.
+// Constants are function-local literals so nothing reads a top-level slot here.
+fn sm64(p_z: u64): u64 {
+    let z: u64 = p_z;
+    z = (z ^ (z >> 30)) * 13787848793156543929;
+    z = (z ^ (z >> 27)) * 10723151780598845931;
+    let out: u64 = z ^ (z >> 31);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PUBLIC API
+// ---------------------------------------------------------------------------
+
+// Allocate one generator state. Do this at startup, never per frame (N6).
+// The returned state is already seeded to the (0,0,0,0) tuple, so it is usable
+// without a rng_seed call; production code should always seed explicitly.
+export fn rng_new(): array {
+    let st = [0, 0, 0, 0];
+    rng_seed(st, 0, 0, 0, 0);
+    return st;
+}
+
+// Seed `st` in place from the four simulation coordinates. Allocation-free.
+//   p_world_seed : the world's seed (any i32, including negative)
+//   p_stream     : RNG_LOOT .. RNG_DIRECTOR
+//   p_tick       : the sim tick this draw belongs to
+//   p_entity     : entity id, or 0 for a non-entity draw
+// The same four numbers always produce the same sequence, on every backend,
+// forever. Changing this function changes every world.
+export fn rng_seed(p_st: array, p_world_seed: i32, p_stream: i32, p_tick: i32, p_entity: i32) {
+    let st: array = p_st;
+    let a: u64 = u32_of(p_world_seed);
+    let b: u64 = u32_of(p_stream);
+    let c: u64 = u32_of(p_tick);
+    let d: u64 = u32_of(p_entity);
+
+    // Fold the four coordinates into one 64-bit word. Distinct odd multipliers
+    // so a change in any single coordinate moves the whole word.
+    let s: u64 = a * 6364136223846793005 + 1442695040888963407;
+    s = s ^ (b * 14029467366897019727);
+    s = s ^ (c * 1609587929392839161);
+    s = s ^ (d * 11400714819323198485);
+
+    let h0: u64 = sm64(s + 11400714819323198485);
+    let h1: u64 = sm64(h0 + 11400714819323198485);
+
+    st[0] = h0 & 4294967295;
+    st[1] = (h0 >> 32) & 4294967295;
+    st[2] = h1 & 4294967295;
+    st[3] = (h1 >> 32) & 4294967295;
+
+    // xorshift128 is absorbing at the all-zero state. splitmix64 makes that
+    // astronomically unlikely, but "astronomically unlikely" is not "never".
+    if (st[0] == 0) {
+        if (st[1] == 0) {
+            if (st[2] == 0) {
+                if (st[3] == 0) { st[3] = 2463534242; }
+            }
+        }
+    }
+
+    // Warm-up: exactly FOUR discards, which is how many draws it takes for all
+    // four seeded lanes to have entered the output path (draw 1 uses only lanes
+    // 0 and 3). It is NOT here for statistical reasons — measured, 100 000 seeds
+    // per stream, worst-of-5 seed-uniformity chi2 / worst-of-10 pairwise
+    // independence chi2 (crit 330.6 / 296.4 at p = 0.001):
+    //     warm=0  291.7 / 249.7      warm=2  285.7 / 246.8
+    //     warm=1  278.0 / 262.1      warm=4  265.3 / 257.6      warm=8  259.2 / 254.2
+    // splitmix64 has already done the decorrelation; every setting passes. Four
+    // costs ~1.4 us less per seed than eight and still guarantees lane coverage.
+    let i = 0;
+    while (i < 4) { rng_u32(st); i++; }
+}
+
+// The core draw: a full 32-bit unsigned value in a u64, 0 .. 4294967295.
+// This is the function every other draw is defined in terms of; if you need
+// determinism-critical bytes, use this one.
+export fn rng_u32(p_st: array): u64 {
+    let st: array = p_st;
+    let x: u64 = st[0];
+    let t: u64 = (x ^ (x << 11)) & 4294967295;
+    st[0] = st[1];
+    st[1] = st[2];
+    st[2] = st[3];
+    let w: u64 = st[3];
+    let nw: u64 = (w ^ (w >> 19) ^ t ^ (t >> 8)) & 4294967295;
+    st[3] = nw;
+    let out: u64 = nw;
+    return out;
+}
+
+// A non-negative i32, 0 .. 2147483647. The general-purpose integer draw.
+export fn rng_next(p_st: array): i32 {
+    let v: u64 = rng_u32(p_st);
+    let out: i32 = i32(v >> 1);
+    return out;
+}
+
+// A f64 in [0, 1). 32 bits of mantissa; exactly representable, never returns 1.0.
+export fn rng_f01(p_st: array): f64 {
+    let v: u64 = rng_u32(p_st);
+    let out: f64 = f64(v) * 2.3283064365386963e-10;   // * 2^-32
+    return out;
+}
+
+// A f64 in (-1, 1). Symmetric, for spread cones and jitter.
+export fn rng_f11(p_st: array): f64 {
+    let v: u64 = rng_u32(p_st);
+    let out: f64 = f64(v) * 4.656612873077393e-10 - 1.0;   // * 2^-31 - 1
+    return out;
+}
+
+// Uniform index in [0, n). Rejection-sampled, so it is exactly uniform rather
+// than modulo-biased — biased loot tables are the classic silent RNG bug.
+// The rejection loop is deterministic: it consumes a seed-determined number of
+// draws, identical on every backend.
+export fn rng_pick(p_st: array, p_n: i32): i32 {
+    let n: i32 = p_n;
+    if (n <= 1) {
+        let z: i32 = 0;
+        return z;
+    }
+    let nn: u64 = u64(n);
+    let limit: u64 = 4294967296 - (4294967296 % nn);
+    let v: u64 = rng_u32(p_st);
+    while (v >= limit) { v = rng_u32(p_st); }
+    let out: i32 = i32(v % nn);
+    return out;
+}
+
+// Uniform integer in [lo, hi], INCLUSIVE of both ends.
+export fn rng_range(p_st: array, p_lo: i32, p_hi: i32): i32 {
+    let lo: i32 = p_lo;
+    let hi: i32 = p_hi;
+    if (hi <= lo) {
+        let z: i32 = lo;
+        return z;
+    }
+    let out: i32 = lo + rng_pick(p_st, hi - lo + 1);
+    return out;
+}
+
+// True (1) with probability p_num / p_den. Integer arguments on purpose: a
+// float probability in the sim is a float on the wire (NETWORKING §3.7).
+export fn rng_chance(p_st: array, p_num: i32, p_den: i32): i32 {
+    let num: i32 = p_num;
+    let den: i32 = p_den;
+    if (num <= 0) { let z: i32 = 0; return z; }
+    if (num >= den) { let o: i32 = 1; return o; }
+    let r: i32 = rng_pick(p_st, den);
+    let out: i32 = 0;
+    if (r < num) { out = 1; }
+    return out;
+}
+
+// Copy a generator state. Used by replay/rewind: a rewound sim must resume the
+// exact sequence it was on, which means snapshotting the lanes, not the seed.
+export fn rng_copy(p_dst: array, p_src: array) {
+    let dst: array = p_dst;
+    let src: array = p_src;
+    dst[0] = src[0];
+    dst[1] = src[1];
+    dst[2] = src[2];
+    dst[3] = src[3];
+}
+
+// A 31-bit fingerprint of the lanes, for determinism gates and replay hashes.
+// Does NOT advance the generator.
+export fn rng_state_hash(p_st: array): i32 {
+    let st: array = p_st;
+    let h: u64 = st[0] | (st[1] << 32);
+    let g: u64 = st[2] | (st[3] << 32);
+    let m: u64 = sm64(sm64(h) ^ (g * 14029467366897019727));
+    let out: i32 = i32((m >> 33) & 2147483647);
+    return out;
+}

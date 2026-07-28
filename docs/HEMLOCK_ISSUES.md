@@ -365,3 +365,166 @@ Workaround: group each library's externs directly under its own `import`.
 SDL2 **headers are 2.0.20** while the **runtime `.so` is 2.0.18**, and
 `pkg-config --modversion sdl2` reports 2.0.20. A symbol can exist in the header
 and still fail to resolve at runtime. Do not bind any SDL API newer than 2.0.18.
+
+---
+
+## 🟠 H-9 — `u64` arithmetic has no fast path in codegen; every operation is a boxed generic call
+
+**Found by W2-9** (`src/sim/rng.hml`) on **v2.9.1** (`e41c08c2`), compiled `-O1`.
+
+The emitted C dispatches every binary operator through a two-step type test:
+
+```c
+HmlValue r = hml_both_i32(a, b) ? hml_i32_bit_xor(a, b)
+           : (hml_both_i64(a, b) ? hml_i64_bit_xor(a, b)
+           : hml_binary_op(HML_OP_BIT_XOR, a, b));
+```
+
+There is a fast path for `i32` and one for `i64`. **There is none for `u64`**, so
+every `u64` `^ & | << >> + *` falls through to `hml_binary_op` on boxed
+`HmlValue`s, with `hml_retain_if_needed` / `hml_release_if_needed` around each
+temporary. `u64` locals annotated `let x: u64 = ...` are still re-boxed after
+being unboxed for the operation itself.
+
+### Repro — the same xorshift128 step, u64 vs i64 lanes (both 32-bit masked)
+
+```hemlock
+fn step_u64(p_st: array): u64 {
+    let st: array = p_st;
+    let x: u64 = st[0];
+    let t: u64 = (x ^ (x << 11)) & 4294967295;
+    st[0] = st[1]; st[1] = st[2]; st[2] = st[3];
+    let w: u64 = st[3];
+    let nw: u64 = (w ^ (w >> 19) ^ t ^ (t >> 8)) & 4294967295;
+    st[3] = nw;
+    let out: u64 = nw;
+    return out;
+}
+// identical body with every `u64` replaced by `i64`
+```
+
+Measured, `hemlockc -O1`, `__clock()` CPU time, min of 7 batches of 2 000 000
+(RULE T; this box shares ~17 of 24 cores with a `llama-server`):
+
+```
+u64 lanes, state in array<any>   341.6 ns/draw
+u64 lanes, state in an object    340.9 ns/draw
+u64 lanes, state in globals      199.6 ns/draw
+u64 lanes, state in array<f64>   357.1 ns/draw
+i64 lanes, state in array<any>   199.9 ns/draw     <- 1.71x faster
+empty loop floor                  34.6 ns/iter
+```
+
+**The storage form is irrelevant** (three representations within 1 %); the cost is
+the operator dispatch. Swapping `u64` → `i64` on the *same* body is 1.71×.
+
+### Why it matters here
+
+`CLAUDE.md` A13 requires all hash/PRNG mixing in `u64` or `i64` because `i32`/`i64`
+`* + -` **trap** on overflow. `u64` is the only safe choice when a wrapping
+*multiply* is needed (splitmix64, FNV), and that is exactly the code paying this
+tax. Nightshade keeps `u64` deliberately — `src/sim/rng.hml` costs 253 ns/draw and
+~150 draws/tick is 0.04 ms, so it is not worth trading away overflow safety — but
+a project doing bulk hashing would feel this.
+
+### Severity
+
+🟠 Performance only. **Results are correct on both backends** — W2-9 verified the
+u64 generator bit-identical interpreted vs compiled over 1 M seeded tuples and
+1 M sequential draws. Not a blocker; a 1.7× left on the table.
+
+### Suggested fix
+
+Add `hml_both_u64(a, b) ? hml_u64_<op>(a, b)` to the same dispatch chain that
+already special-cases `i32` and `i64`.
+
+---
+
+## 🟠 H-10 — `f64(u64_value)` is signed-wrong above 2^63, on BOTH backends
+
+**Found by W2-9** on **v2.9.1**. Consistent between interpreter and compiler, so
+it is not a divergence — it is the same wrong answer twice.
+
+```hemlock
+fn main() {
+    print(f64(u64(9223372036854775807)));   //  9.22337e+18   correct
+    print(f64(u64(9223372036854775808)));   // -9.22337e+18   WRONG, want +9.22e18
+    print(f64(u64(18446744073709551615)));  // -1            WRONG, want +1.845e19
+}
+main();
+```
+
+The conversion evidently routes through `int64_t` rather than `uint64_t`. Any
+`u64` hash value converted to `f64` (the obvious way to turn a hash into a
+`[0,1)` float) silently becomes negative for half of all inputs.
+
+### Workaround in force in this project
+
+Never hand a `u64` wider than 32 bits to `f64()`. `src/sim/rng.hml` masks to 32
+bits first (`f64(v)` where `v <= 4294967295`), which is exact and safe.
+`docs/ARCHITECTURE.md` §5.4 records this in the `rng.hml` row.
+
+### Severity
+
+🟠 Silent wrong answer, easy to trip, trivial to avoid once known.
+
+---
+
+## 🔴 H-11 — a later same-name `let` at function scope silently RETYPES an earlier block-scoped `let` (compiled only)
+
+**Found:** 2026-07-28, W2-8 (`tools/meshgen.hml`). **Compiler:** v2.9.1 (`e41c08c2`), the
+current one. **Backends disagree:** the interpreter is right, the compiler is wrong.
+
+`hemlockc` appears to hoist every `let` in a function body into one flat frame keyed by NAME,
+using the LAST declaration's type. A `let a: f64` inside a loop body and a `let a: i32` written
+*after* the loop at function scope become one `i32` slot, so every float written to the inner `a`
+is truncated. No warning, no error, and the shadowing declaration can be a hundred lines away.
+
+### Repro (self-contained, current compiler)
+
+```hemlock
+fn f(): f64 {
+    let out: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < 1) {
+        let a: f64 = 0.987;      // block-scoped f64
+        out = a;
+        i++;
+    }
+    let a: i32 = 5;              // same name, function scope, i32 — DECLARED LATER
+    return out;
+}
+print("f() = " + f());
+```
+
+```
+hemlockc repro.hml -o /tmp/repro && /tmp/repro     ->  f() = 0.0        WRONG
+hemlock  repro.hml                                 ->  f() = 0.987      correct
+```
+
+Delete the trailing `let a: i32 = 5;` and the compiled build prints `0.987`.
+
+### Why this is dangerous
+
+It is CLAUDE.md §1 rule 3 (the `g_` prefix rule) all over again, but *inside* a function and
+*without* the "top-level" cue that makes rule 3 teachable. In W2-8 it silently turned every
+computed asymmetry ratio into `0.000`, which read as "every mesh is bilaterally symmetric" —
+a plausible-looking failure that cost a full debugging cycle to trace back to a variable name
+reused four blocks later for a loop counter.
+
+Names at risk are exactly the short ones two unrelated blocks both reach for: `a`, `b`, `d`,
+`i`, `n`, `x`, `t`.
+
+### Workaround (in force in `src/art/meshgen.hml` and `tools/meshgen.hml`)
+
+Never reuse a name for two different types inside one function, even in disjoint blocks. Give
+each block's locals a distinct prefix (`axm`/`azm`/`asym`, `ca`/`cb`, `ea`/`eb`).
+
+### Suggested real fix
+
+Alpha-rename block-scoped locals in codegen, or refuse to merge two declarations of the same
+name whose types differ and emit a diagnostic.
+
+### Severity
+
+🔴 Silent wrong answer, compiled-only, no diagnostic, and the two declarations can be far apart.

@@ -1,0 +1,604 @@
+// packing.hml — fixed-stride blob writer / reader. W2-12.
+//
+// Bulk state is packed by hand into fixed-stride byte blobs and carried as ONE
+// `buffer` element, never as one element per field. Measured, 32 entities x
+// 7 fields (NETWORKING.md §3.6):
+//
+//     layout A, one add() per field : 777 B, 0.184 ms compiled
+//     layout B, packed blobs        : 397 B, 0.026 ms compiled     <- this file
+//
+// 0.184 ms is 60 % of the entire 0.3 ms networking budget for ONE snapshot.
+// That is why §11.1 is a rule and not a preference.
+//
+// ---------------------------------------------------------------------------
+// THE 255-BYTE CAP IS THE SHAPE OF THE PROTOCOL
+// ---------------------------------------------------------------------------
+// gn.hml writes a buffer element's length into a u8 and throws at 256
+// (NETWORKING §3.7, verified). So a snapshot is a SEQUENCE of <= 255-byte
+// blobs, not one big blob. At the 20-byte entity stride that is exactly
+// 12 entities per 240-byte blob, and `pack_new` refuses to hand out more than
+// 255 bytes so the mistake cannot reach a socket.
+//
+// ---------------------------------------------------------------------------
+// THE RUNTIME ASSERTION — no bool, no null, ever
+// ---------------------------------------------------------------------------
+// Both are verified gn.hml failure modes and both are silent-ish:
+//
+//   bool : `Packet.add(true); build()` THROWS. gm_convert's determine_type
+//          lists TYPEID_BOOL in its integer branch and then evaluates
+//          `data >= 0`, which Hemlock rejects for bools. (NETWORKING §3.1)
+//   null : `p.add(1); p.add(null); p.add(3)` builds a 9-byte packet whose
+//          decoded element count is ONE. A null does not error — it
+//          TRUNCATES THE REST OF THE PACKET. (NETWORKING §3.2)
+//
+// The null case is the dangerous one: it looks like it worked. So every pack
+// entry point checks `typeid()` and refuses, counting the refusal in
+// `pack_bad()`. A refusal writes nothing and advances nothing, so a bad field
+// cannot shift every later field by its own width.
+//
+// The check is two integer compares against a builtin's return value — not a
+// `typeof()` string compare. gm_convert made the same call for the same
+// reason.
+//
+// ---------------------------------------------------------------------------
+// NO THROWS, ANYWHERE
+// ---------------------------------------------------------------------------
+// CLAUDE.md rule 7: a throw leaks ~192 B of heap locals, compiled. This module
+// runs per entity per snapshot. Every failure path returns a sentinel (-1) and
+// bumps a counter instead. Overflow drops the write; it never writes past cap
+// and it never smashes the arena — the same contract `batch_reserve` gives the
+// vertex pool.
+
+// The gn.hml buffer-element cap. Hard.
+export let PACK_MAX_BLOB: i32 = 255;
+
+// Strides that must fit inside it (mirrored in protocol.hml, asserted there).
+export let ENT_STRIDE: i32 = 20;
+export let ENTS_PER_BLOB: i32 = 12;      // 12 * 20 = 240 <= 255
+export let CMD_STRIDE: i32 = 20;
+export let CMDS_PER_BLOB: i32 = 12;      // protocol caps C_INPUT at 8 anyway
+export let EV_STRIDE: i32 = 16;
+export let EVS_PER_BLOB: i32 = 15;       // 15 * 16 = 240 <= 255
+export let LOCAL_STRIDE: i32 = 24;
+
+// ---------------------------------------------------------------------------
+// Packer := { buf, cap, pos, ovf, bad, clamped }
+//   pos      bytes written so far
+//   ovf      writes refused for want of room
+//   bad      writes refused for being a bool or a null
+//   clamped  1 if pack_new() was asked for more than 255 bytes
+// Allocate once at startup and pack_reset() per use (CLAUDE.md A8/N6).
+// ---------------------------------------------------------------------------
+export fn pack_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    let clamped: i32 = 0;
+    if (cap < 1) { cap = 1; }
+    if (cap > PACK_MAX_BLOB) { cap = PACK_MAX_BLOB; clamped = 1; }
+    return { buf: buffer(cap), cap: cap, pos: 0, ovf: 0, bad: 0, clamped: clamped };
+}
+
+export fn pack_reset(p_p: object) {
+    let p: object = p_p;
+    p.pos = 0;
+    p.ovf = 0;
+    p.bad = 0;
+}
+
+export fn pack_pos(p_p: object): i32 { let out: i32 = p_p.pos; return out; }
+export fn pack_cap(p_p: object): i32 { let out: i32 = p_p.cap; return out; }
+export fn pack_ovf(p_p: object): i32 { let out: i32 = p_p.ovf; return out; }
+export fn pack_bad(p_p: object): i32 { let out: i32 = p_p.bad; return out; }
+export fn pack_clamped(p_p: object): i32 { let out: i32 = p_p.clamped; return out; }
+export fn pack_buf(p_p: object) { return p_p.buf; }
+
+// The wire assertion. 0 = this value must never reach a packet.
+// Exported so protocol.hml can screen loose elements with the same test.
+export fn pack_is_wire_safe(p_v): i32 {
+    let t: i32 = typeid(p_v);
+    if (t == TYPEID_BOOL) { return 0; }      // gn.hml THROWS on build()
+    if (t == TYPEID_NULL) { return 0; }      // gn.hml TRUNCATES the packet
+    return 1;
+}
+
+// Room check + wire check. Returns the write offset, or -1.
+fn pack_take(p_p: object, p_n: i32, p_v): i32 {
+    let p: object = p_p;
+    let n: i32 = p_n;
+    if (pack_is_wire_safe(p_v) == 0) { p.bad = p.bad + 1; return -1; }
+    let pos: i32 = p.pos;
+    if (pos + n > p.cap) { p.ovf = p.ovf + 1; return -1; }
+    p.pos = pos + n;
+    let out: i32 = pos;
+    return out;
+}
+
+// Every writer returns the offset it wrote at, or -1 if it wrote nothing.
+export fn pack_u8(p_p: object, p_v): i32 {
+    let at: i32 = pack_take(p_p, 1, p_v);
+    if (at < 0) { return -1; }
+    p_p.buf.write_u8(at, p_v & 255);
+    return at;
+}
+
+export fn pack_i8(p_p: object, p_v): i32 {
+    let at: i32 = pack_take(p_p, 1, p_v);
+    if (at < 0) { return -1; }
+    p_p.buf.write_i8(at, p_v);
+    return at;
+}
+
+export fn pack_u16(p_p: object, p_v): i32 {
+    let at: i32 = pack_take(p_p, 2, p_v);
+    if (at < 0) { return -1; }
+    p_p.buf.write_u16_le(at, p_v & 65535);
+    return at;
+}
+
+export fn pack_i16(p_p: object, p_v): i32 {
+    let at: i32 = pack_take(p_p, 2, p_v);
+    if (at < 0) { return -1; }
+    p_p.buf.write_i16_le(at, p_v);
+    return at;
+}
+
+export fn pack_u32(p_p: object, p_v): i32 {
+    let at: i32 = pack_take(p_p, 4, p_v);
+    if (at < 0) { return -1; }
+    p_p.buf.write_u32_le(at, p_v);
+    return at;
+}
+
+export fn pack_i32(p_p: object, p_v): i32 {
+    let at: i32 = pack_take(p_p, 4, p_v);
+    if (at < 0) { return -1; }
+    p_p.buf.write_i32_le(at, p_v);
+    return at;
+}
+
+// Skip n bytes, zero-filled. Used to reserve a field whose value is not known
+// yet. Never used to express "absent" — absence is a presence bitmask plus
+// omission, never a null placeholder (NETWORKING §3.2).
+export fn pack_zero(p_p: object, p_n: i32): i32 {
+    let p: object = p_p;
+    let n: i32 = p_n;
+    let pos: i32 = p.pos;
+    if (pos + n > p.cap) { p.ovf = p.ovf + 1; return -1; }
+    let i: i32 = 0;
+    while (i < n) { p.buf.write_u8(pos + i, 0); i++; }
+    p.pos = pos + n;
+    let out: i32 = pos;
+    return out;
+}
+
+// Hand the blob to the protocol layer as an OWNED buffer of exactly `pos`
+// bytes.
+//
+// ⚠ The copy is not optional and it is not a performance oversight. A snapshot
+// holds SEVERAL blobs at once and they are all built by the SAME packer: a
+// 32-entity snapshot resets this packer three times before the message is
+// serialized. Returning `p.buf` (or a slice of it, which is a view) would make
+// all three elements alias one 240-byte region, and every entity in blobs 0
+// and 1 would silently arrive carrying blob 2's data. That bug was written,
+// measured at 160 lost fields, and is the reason this line copies.
+//
+// A zero-length blob is never emitted: an empty buffer element is legal on the
+// wire but is always a bug on our side, so pack_flush returns null and the
+// caller must omit the element entirely rather than push a placeholder.
+export fn pack_flush(p_p: object) {
+    let p: object = p_p;
+    let pos: i32 = p.pos;
+    if (pos < 1) { return null; }
+    return p.buf.read_bytes(0, pos);
+}
+
+// The borrowed form: valid only until the next pack_reset() on this packer.
+// Use it when the blob is consumed before the packer is touched again. If you
+// are not certain, use pack_flush.
+export fn pack_view(p_p: object) {
+    let p: object = p_p;
+    let pos: i32 = p.pos;
+    if (pos < 1) { return null; }
+    if (pos == p.cap) { return p.buf; }
+    return p.buf.slice(0, pos);
+}
+
+// ---------------------------------------------------------------------------
+// Unpacker := { buf, len, pos, ovf }
+// `ovf` counts reads that ran off the end. A short/malformed blob yields
+// zeroes and a non-zero ovf; it never throws and never reads out of bounds.
+// ---------------------------------------------------------------------------
+export fn unpack_new(p_buf): object {
+    let b = p_buf;
+    if (b == null) { return { buf: buffer(1), len: 0, pos: 0, ovf: 1 }; }
+    return { buf: b, len: b.length, pos: 0, ovf: 0 };
+}
+
+export fn unpack_reset(p_u: object) {
+    let u: object = p_u;
+    u.pos = 0;
+    u.ovf = 0;
+}
+
+export fn unpack_pos(p_u: object): i32 { let out: i32 = p_u.pos; return out; }
+export fn unpack_len(p_u: object): i32 { let out: i32 = p_u.len; return out; }
+export fn unpack_ovf(p_u: object): i32 { let out: i32 = p_u.ovf; return out; }
+export fn unpack_remaining(p_u: object): i32 {
+    let out: i32 = p_u.len - p_u.pos;
+    return out;
+}
+
+fn unpack_take(p_u: object, p_n: i32): i32 {
+    let u: object = p_u;
+    let n: i32 = p_n;
+    let pos: i32 = u.pos;
+    if (pos + n > u.len) { u.ovf = u.ovf + 1; return -1; }
+    u.pos = pos + n;
+    let out: i32 = pos;
+    return out;
+}
+
+export fn unpack_u8(p_u: object): i32 {
+    let at: i32 = unpack_take(p_u, 1);
+    if (at < 0) { return 0; }
+    let out: i32 = i32(p_u.buf.read_u8(at));
+    return out;
+}
+
+export fn unpack_i8(p_u: object): i32 {
+    let at: i32 = unpack_take(p_u, 1);
+    if (at < 0) { return 0; }
+    let out: i32 = i32(p_u.buf.read_i8(at));
+    return out;
+}
+
+export fn unpack_u16(p_u: object): i32 {
+    let at: i32 = unpack_take(p_u, 2);
+    if (at < 0) { return 0; }
+    let out: i32 = i32(p_u.buf.read_u16_le(at));
+    return out;
+}
+
+export fn unpack_i16(p_u: object): i32 {
+    let at: i32 = unpack_take(p_u, 2);
+    if (at < 0) { return 0; }
+    let out: i32 = i32(p_u.buf.read_i16_le(at));
+    return out;
+}
+
+// u32 is returned as i64 because a u32 near 2^32 does not fit an i32 and
+// Hemlock's i32 arithmetic TRAPS rather than wrapping (CLAUDE.md A13).
+// Entity ids top out at 2 000 000 so the i64 costs nothing in practice.
+export fn unpack_u32(p_u: object): i64 {
+    let at: i32 = unpack_take(p_u, 4);
+    if (at < 0) { return 0; }
+    let out: i64 = i64(p_u.buf.read_u32_le(at));
+    return out;
+}
+
+export fn unpack_i32(p_u: object): i32 {
+    let at: i32 = unpack_take(p_u, 4);
+    if (at < 0) { return 0; }
+    let out: i32 = i32(p_u.buf.read_i32_le(at));
+    return out;
+}
+
+export fn unpack_skip(p_u: object, p_n: i32): i32 {
+    let at: i32 = unpack_take(p_u, p_n);
+    if (at < 0) { return -1; }
+    return at;
+}
+
+// ===========================================================================
+// THE BULK RECORD CODECS — one call per BLOB, not one per field
+// ===========================================================================
+// Measured, 32 entities, compiled, __clock CPU time, min of 7, on this box:
+//
+//     stateful pack_u32/pack_i32/... per field   57.9 us      <- 200 ns/field
+//     inline writes, no wire check                5.9 us
+//     inline writes + the full wire gate          9.3 us      <- this code
+//
+// 200 ns per field is not the buffer write (that is ~20 ns). It is two nested
+// function calls plus five object-field accesses per field, times 288 fields.
+// CLAUDE.md A9b in its purest form: "argument marshalling dominates small
+// predicates — pass an index into a buffer the callee already holds."
+//
+// So the general pack_*/unpack_* API above stays exactly as it is — it is the
+// right shape for headers, for the 8-command input packet, for tooling, and it
+// is what the self-test hammers — and the 240-byte bulk blobs get these, which
+// hoist the SoA arrays into locals once per blob (CLAUDE.md A11, N4) and write
+// the record inline.
+//
+// ---------------------------------------------------------------------------
+// THE WIRE GATE SURVIVES THE OPTIMIZATION. It gets CHEAPER.
+// ---------------------------------------------------------------------------
+// Hemlock's integer typeids are 0..7 (I8, I16, I32, I64, U8, U16, U32, U64);
+// F32 is 8, F64 9, BOOL 10, STRING 11, BUFFER 14, NULL 21. OR-ing values that
+// are all <= 7 can only produce a value <= 7, and any value >= 8 sets a bit
+// that survives the OR. So
+//
+//     (typeid(a) | typeid(b) | ... | typeid(i)) <= 7
+//
+// is a SOUND check that all nine fields are integers — one compare for the
+// whole record instead of nine calls. A record that fails is ZERO-FILLED and
+// counted, never omitted: omitting it would shift every later record in the
+// blob by one stride and silently corrupt the whole snapshot.
+//
+// The writers take the PACKER, not a bare buffer, so `pk.cap` still bounds the
+// write and `pack_flush(pk)` still returns exactly what was written — the bulk
+// path is an optimization of the general API, not an escape from it.
+//
+// These functions duck-type the NetEnts / NetEvs / CmdQ shapes declared in
+// protocol.hml. There is no import cycle — packing.hml imports nothing — and
+// the coupling is the same stride contract this file already owns.
+
+let g_bulk_bad: i32 = 0;
+
+export fn pack_bulk_bad(): i32 { let out: i32 = g_bulk_bad; return out; }
+export fn pack_bulk_bad_reset() { g_bulk_bad = 0; }
+
+// True when every Hemlock integer type, and nothing else, is present.
+export let PACK_INT_TYPEID_MAX: i32 = 7;
+
+export fn pack_is_wire_int(p_v): i32 {
+    let t: i32 = typeid(p_v);
+    if (t > PACK_INT_TYPEID_MAX) { return 0; }
+    return 1;
+}
+
+// --- entity records: 20 bytes each -----------------------------------------
+//   +0 u32 id  +4 i32 px_q  +8 i32 pz_q  +12 i16 py_q
+//   +14 u16 yaw_q  +16 u8 pitch_q  +17 u8 anim  +18 u8 hp_pct  +19 u8 flags
+export fn pack_ent_blob(p_pk: object, p_e: object, p_from: i32, p_to: i32): i32 {
+    let pk: object = p_pk;
+    let b = pk.buf;
+    let e: object = p_e;
+    let room: i32 = pk.cap / ENT_STRIDE;
+    let a_id: array = e.id;
+    let a_px: array = e.px_q;
+    let a_py: array = e.py_q;
+    let a_pz: array = e.pz_q;
+    let a_yaw: array = e.yaw_q;
+    let a_pit: array = e.pitch_q;
+    let a_an: array = e.anim;
+    let a_hp: array = e.hp_pct;
+    let a_fl: array = e.flags;
+    let to: i32 = p_to;
+    if (to - p_from > room) { pk.ovf = pk.ovf + 1; to = p_from + room; }
+    let k: i32 = p_from;
+    let off: i32 = 0;
+    while (k < to) {
+        let v0 = a_id[k]; let v1 = a_px[k]; let v2 = a_pz[k];
+        let v3 = a_py[k]; let v4 = a_yaw[k]; let v5 = a_pit[k];
+        let v6 = a_an[k]; let v7 = a_hp[k]; let v8 = a_fl[k];
+        let tt: i32 = typeid(v0) | typeid(v1) | typeid(v2) | typeid(v3) | typeid(v4)
+                    | typeid(v5) | typeid(v6) | typeid(v7) | typeid(v8);
+        if (tt > 7) {
+            g_bulk_bad = g_bulk_bad + 1;
+            let z: i32 = 0;
+            while (z < ENT_STRIDE) { b.write_u8(off + z, 0); z++; }
+        } else {
+            b.write_u32_le(off, v0);
+            b.write_i32_le(off + 4, v1);
+            b.write_i32_le(off + 8, v2);
+            b.write_i16_le(off + 12, v3);
+            b.write_u16_le(off + 14, v4);
+            b.write_u8(off + 16, v5 & 255);
+            b.write_u8(off + 17, v6 & 255);
+            b.write_u8(off + 18, v7 & 255);
+            b.write_u8(off + 19, v8 & 255);
+        }
+        off = off + ENT_STRIDE;
+        k++;
+    }
+    pk.pos = off;
+    let out: i32 = off;
+    return out;
+}
+
+// Appends p_n entities from p_blob into p_e (which must have room).
+// Returns the number appended, or -1 if the blob is short or p_e is full.
+export fn unpack_ent_blob(p_blob, p_e: object, p_n: i32): i32 {
+    let b = p_blob;
+    let e: object = p_e;
+    let n: i32 = p_n;
+    if (b == null) { return -1; }
+    if (b.length < n * ENT_STRIDE) { return -1; }
+    let base: i32 = e.count;
+    if (base + n > e.cap) { return -1; }
+    let a_id: array = e.id;
+    let a_px: array = e.px_q;
+    let a_py: array = e.py_q;
+    let a_pz: array = e.pz_q;
+    let a_yaw: array = e.yaw_q;
+    let a_pit: array = e.pitch_q;
+    let a_an: array = e.anim;
+    let a_hp: array = e.hp_pct;
+    let a_fl: array = e.flags;
+    let off: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = base + i;
+        a_id[k] = i32(b.read_u32_le(off));
+        a_px[k] = b.read_i32_le(off + 4);
+        a_pz[k] = b.read_i32_le(off + 8);
+        a_py[k] = i32(b.read_i16_le(off + 12));
+        a_yaw[k] = i32(b.read_u16_le(off + 14));
+        a_pit[k] = i32(b.read_u8(off + 16));
+        a_an[k] = i32(b.read_u8(off + 17));
+        a_hp[k] = i32(b.read_u8(off + 18));
+        a_fl[k] = i32(b.read_u8(off + 19));
+        off = off + ENT_STRIDE;
+        i++;
+    }
+    e.count = base + n;
+    let out: i32 = n;
+    return out;
+}
+
+// --- event records: 16 bytes each ------------------------------------------
+//   +0 u8 type  +1 u8 sub  +2 u32 actor  +6 u32 target
+//   +10 i16 x_q  +12 i16 y_q  +14 i16 z_q
+export fn pack_ev_blob(p_pk: object, p_v: object, p_from: i32, p_to: i32): i32 {
+    let pk: object = p_pk;
+    let b = pk.buf;
+    let v: object = p_v;
+    let room: i32 = pk.cap / EV_STRIDE;
+    let a_ty: array = v.type;
+    let a_sb: array = v.sub;
+    let a_ac: array = v.actor;
+    let a_tg: array = v.target;
+    let a_x: array = v.x_q;
+    let a_y: array = v.y_q;
+    let a_z: array = v.z_q;
+    let to: i32 = p_to;
+    if (to - p_from > room) { pk.ovf = pk.ovf + 1; to = p_from + room; }
+    let k: i32 = p_from;
+    let off: i32 = 0;
+    while (k < to) {
+        let v0 = a_ty[k]; let v1 = a_sb[k]; let v2 = a_ac[k]; let v3 = a_tg[k];
+        let v4 = a_x[k]; let v5 = a_y[k]; let v6 = a_z[k];
+        let tt: i32 = typeid(v0) | typeid(v1) | typeid(v2) | typeid(v3)
+                    | typeid(v4) | typeid(v5) | typeid(v6);
+        if (tt > 7) {
+            g_bulk_bad = g_bulk_bad + 1;
+            let z: i32 = 0;
+            while (z < EV_STRIDE) { b.write_u8(off + z, 0); z++; }
+        } else {
+            b.write_u8(off, v0 & 255);
+            b.write_u8(off + 1, v1 & 255);
+            b.write_u32_le(off + 2, v2);
+            b.write_u32_le(off + 6, v3);
+            b.write_i16_le(off + 10, v4);
+            b.write_i16_le(off + 12, v5);
+            b.write_i16_le(off + 14, v6);
+        }
+        off = off + EV_STRIDE;
+        k++;
+    }
+    pk.pos = off;
+    let out: i32 = off;
+    return out;
+}
+
+export fn unpack_ev_blob(p_blob, p_v: object, p_n: i32): i32 {
+    let b = p_blob;
+    let v: object = p_v;
+    let n: i32 = p_n;
+    if (b == null) { return -1; }
+    if (b.length < n * EV_STRIDE) { return -1; }
+    let base: i32 = v.count;
+    if (base + n > v.cap) { return -1; }
+    let a_ty: array = v.type;
+    let a_sb: array = v.sub;
+    let a_ac: array = v.actor;
+    let a_tg: array = v.target;
+    let a_x: array = v.x_q;
+    let a_y: array = v.y_q;
+    let a_z: array = v.z_q;
+    let off: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = base + i;
+        a_ty[k] = i32(b.read_u8(off));
+        a_sb[k] = i32(b.read_u8(off + 1));
+        a_ac[k] = i32(b.read_u32_le(off + 2));
+        a_tg[k] = i32(b.read_u32_le(off + 6));
+        a_x[k] = i32(b.read_i16_le(off + 10));
+        a_y[k] = i32(b.read_i16_le(off + 12));
+        a_z[k] = i32(b.read_i16_le(off + 14));
+        off = off + EV_STRIDE;
+        i++;
+    }
+    v.count = base + n;
+    let out: i32 = n;
+    return out;
+}
+
+// --- command records: 20 bytes each ----------------------------------------
+//   +0 u32 tick  +4 u32 seq  +8 i8 move_x  +9 i8 move_y
+//   +10 u16 yaw_q  +12 u16 pitch_q  +14 u32 buttons  +18 u8 weapon_sel
+//   +19 u8 dt_ms
+export fn pack_cmd_blob(p_pk: object, p_q: object, p_from: i32, p_to: i32): i32 {
+    let pk: object = p_pk;
+    let b = pk.buf;
+    let q: object = p_q;
+    let room: i32 = pk.cap / CMD_STRIDE;
+    let a_tk: array = q.tick;
+    let a_sq: array = q.seq;
+    let a_mx: array = q.move_x;
+    let a_my: array = q.move_y;
+    let a_yw: array = q.yaw_q;
+    let a_pt: array = q.pitch_q;
+    let a_bt: array = q.buttons;
+    let a_ws: array = q.weapon_sel;
+    let a_dt: array = q.dt_ms;
+    let to: i32 = p_to;
+    if (to - p_from > room) { pk.ovf = pk.ovf + 1; to = p_from + room; }
+    let k: i32 = p_from;
+    let off: i32 = 0;
+    while (k < to) {
+        let v0 = a_tk[k]; let v1 = a_sq[k]; let v2 = a_mx[k];
+        let v3 = a_my[k]; let v4 = a_yw[k]; let v5 = a_pt[k];
+        let v6 = a_bt[k]; let v7 = a_ws[k]; let v8 = a_dt[k];
+        let tt: i32 = typeid(v0) | typeid(v1) | typeid(v2) | typeid(v3) | typeid(v4)
+                    | typeid(v5) | typeid(v6) | typeid(v7) | typeid(v8);
+        if (tt > 7) {
+            g_bulk_bad = g_bulk_bad + 1;
+            let z: i32 = 0;
+            while (z < CMD_STRIDE) { b.write_u8(off + z, 0); z++; }
+        } else {
+            b.write_u32_le(off, v0);
+            b.write_u32_le(off + 4, v1);
+            b.write_i8(off + 8, v2);
+            b.write_i8(off + 9, v3);
+            b.write_u16_le(off + 10, v4 & 65535);
+            b.write_u16_le(off + 12, v5 & 65535);
+            b.write_u32_le(off + 14, v6);
+            b.write_u8(off + 18, v7 & 255);
+            b.write_u8(off + 19, v8 & 255);
+        }
+        off = off + CMD_STRIDE;
+        k++;
+    }
+    pk.pos = off;
+    let out: i32 = off;
+    return out;
+}
+
+export fn unpack_cmd_blob(p_blob, p_q: object, p_n: i32): i32 {
+    let b = p_blob;
+    let q: object = p_q;
+    let n: i32 = p_n;
+    if (b == null) { return -1; }
+    if (b.length < n * CMD_STRIDE) { return -1; }
+    let base: i32 = q.count;
+    if (base + n > q.cap) { return -1; }
+    let a_tk: array = q.tick;
+    let a_sq: array = q.seq;
+    let a_mx: array = q.move_x;
+    let a_my: array = q.move_y;
+    let a_yw: array = q.yaw_q;
+    let a_pt: array = q.pitch_q;
+    let a_bt: array = q.buttons;
+    let a_ws: array = q.weapon_sel;
+    let a_dt: array = q.dt_ms;
+    let off: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = base + i;
+        a_tk[k] = i32(b.read_u32_le(off));
+        a_sq[k] = i32(b.read_u32_le(off + 4));
+        a_mx[k] = i32(b.read_i8(off + 8));
+        a_my[k] = i32(b.read_i8(off + 9));
+        a_yw[k] = i32(b.read_u16_le(off + 10));
+        a_pt[k] = i32(b.read_u16_le(off + 12));
+        a_bt[k] = i32(b.read_u32_le(off + 14));
+        a_ws[k] = i32(b.read_u8(off + 18));
+        a_dt[k] = i32(b.read_u8(off + 19));
+        off = off + CMD_STRIDE;
+        i++;
+    }
+    q.count = base + n;
+    let out: i32 = n;
+    return out;
+}

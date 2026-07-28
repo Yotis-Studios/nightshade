@@ -1,0 +1,857 @@
+// tools/meshgen.hml — the driver for `src/art/meshgen.hml` (Nightshade W2-8).
+//
+//   hemlockc -O1 tools/meshgen.hml -o /tmp/meshgen
+//   /tmp/meshgen --verify                       # the acceptance suite
+//   /tmp/meshgen --contact-sheet docs/shots/meshgen_contact.png
+//   /tmp/meshgen --list
+//
+// No SDL. The contact sheet is rasterized in Hemlock straight into an RGB
+// buffer and written with the engine's PNG writer, so it runs anywhere,
+// including a machine with no display and no X.
+//
+// WHY THE CONTACT SHEET EXISTS
+// ---------------------------------------------------------------------------
+// ART_BIBLE 8.1: an enemy is 12 px tall at 30 m and 6 px at 60 m. Every
+// judgement about silhouette has to be made at THAT size, not at the size a
+// modelling tool shows you. The sheet renders every mesh at 32x32, 12 px and
+// 6 px, on a light background and a dark one, and the harsh visual critic looks
+// at the small ones.
+//
+// WHAT `--verify` PROVES (W2-8 acceptance)
+// ---------------------------------------------------------------------------
+//   A  every mesh is within +-10 % of its ART_BIBLE 8.3 triangle budget
+//   B  every mesh is ASYMMETRIC: mirroring its orthographic silhouette across
+//      the model's own x = 0 or z = 0 plane changes at least 8 % of the
+//      covered pixels
+//   C  the six enemy classes have head:shoulder ratios that differ pairwise by
+//      at least 0.25
+//   D  every class's signature protrusion measures >= 0.45 m beyond the body
+//   E  the six weapons have pairwise-distinct 32x32 silhouettes (IoU <= 0.80)
+//   F  no baked vertex colour has luminance below 72
+//   G  the bake transforms each normal exactly once and never again
+//   H  the build is deterministic: two builds agree bit-for-bit on colour
+//   I  no asset exceeds the 260-triangle cap
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos, PI } from "@stdlib/math";
+
+import { mesh_tri_count, mesh_vert_count, mesh_vert_pos, mesh_vert_rgb,
+         mesh_normal_xform_count } from "../../wobbleweed/src/mesh.hml";
+import { write_png } from "../../wobbleweed/src/png.hml";
+
+import { pal_r, pal_g, pal_b, g_SKY_HORIZON, g_GRASS_LO, g_STONE_MID,
+         g_UI_WHITE, g_UI_BLACK, g_UI_AMBER } from "../src/art/palette.hml";
+
+import { meshgen_build_all, meshgen_count, meshgen_mesh, meshgen_name,
+         meshgen_budget, meshgen_kind, meshgen_tris, meshgen_view_yaw,
+         mg_head_shoulder, mg_protrusion, mg_protrusion_axis,
+         MESH_COUNT, MESH_SPARROW_VM, MESH_EMBERLANCE_VM, ENEMY_COUNT,
+         MG_KIND_WEAPON, MG_LUM_FLOOR } from "../src/art/meshgen.hml";
+
+let TRIALS = 7;
+let EXPECT_ASSERTS = 163;
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_count: i32 = 0;
+
+fn ck(p_ok: i32, p_what: string) {
+    g_count++;
+    if (p_ok == 1) { g_pass++; } else { g_fail++; print("  FAIL  " + p_what); }
+}
+
+fn f2(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 100.0 + 0.5);
+    let whole: i64 = scaled / 100;
+    let frac: i64 = scaled - whole * 100;
+    let fs: string = "" + frac;
+    if (frac < 10) { fs = "0" + frac; }
+    let s: string = "" + whole + "." + fs;
+    if (neg == 1) { s = "-" + s; }
+    let out: string = s;
+    return out;
+}
+
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = "" + frac;
+    if (frac < 100) { fs = "0" + fs; }
+    if (frac < 10) { fs = "00" + frac; }
+    let out: string = "" + whole + "." + fs;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// a tiny orthographic software rasterizer
+// ---------------------------------------------------------------------------
+// Painter-sorted flat triangles, no texture, no z-buffer — exactly the
+// information a 12 px silhouette carries. Vertex colour is the BAKED colour, so
+// what the sheet shows is what the game draws (modulo the atlas multiply).
+
+let g_vx: array<f64> = [];
+let g_vy: array<f64> = [];
+let g_vz: array<f64> = [];
+let g_ti: array<i32> = [];
+let g_td: array<f64> = [];
+
+// Project every vertex of a mesh into a size x size tile, orthographic, yaw
+// about +Y then pitch about +X. Fills g_vx/g_vy (pixel) and g_vz (depth).
+fn project(p_m, p_yaw: f64, p_pitch: f64, p_size: i32) {
+    let m = p_m;
+    let n: i32 = mesh_vert_count(m);
+    let cy: f64 = cos(p_yaw); let sy: f64 = sin(p_yaw);
+    let cp: f64 = cos(p_pitch); let sp: f64 = sin(p_pitch);
+    g_vx = []; g_vy = []; g_vz = [];
+    let minx: f64 = 0.0; let maxx: f64 = 0.0;
+    let miny: f64 = 0.0; let maxy: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < n) {
+        let x: f64 = mesh_vert_pos(m, i, 0);
+        let y: f64 = mesh_vert_pos(m, i, 1);
+        let z: f64 = mesh_vert_pos(m, i, 2);
+        let rx: f64 = x * cy + z * sy;
+        let rz: f64 = z * cy - x * sy;
+        let ry: f64 = y * cp - rz * sp;
+        // The eye is ABOVE the model, so a higher point must sort NEARER.
+        // (`+ y * sp` here puts the camera under the floor and paints every
+        // object's underside over its top.)
+        let dz: f64 = rz * cp - y * sp;
+        g_vx.push(rx); g_vy.push(ry); g_vz.push(dz);
+        if (i == 0) { minx = rx; maxx = rx; miny = ry; maxy = ry; }
+        if (rx < minx) { minx = rx; } if (rx > maxx) { maxx = rx; }
+        if (ry < miny) { miny = ry; } if (ry > maxy) { maxy = ry; }
+        i++;
+    }
+    let w: f64 = maxx - minx;
+    let h: f64 = maxy - miny;
+    let span: f64 = w;
+    if (h > span) { span = h; }
+    if (span <= 0.0) { span = 1.0; }
+    let s: f64 = (f64(p_size) - 1.4) / span;
+    let ox: f64 = (f64(p_size) - w * s) * 0.5;
+    let oy: f64 = (f64(p_size) - h * s) * 0.5;
+    i = 0;
+    while (i < n) {
+        g_vx[i] = (g_vx[i] - minx) * s + ox;
+        g_vy[i] = f64(p_size) - ((g_vy[i] - miny) * s + oy);
+        i++;
+    }
+}
+
+// Depth-sort the triangles, far first. Insertion sort: <= 260 triangles.
+fn depth_sort(p_m) {
+    let m = p_m;
+    let nt: i32 = mesh_tri_count(m);
+    g_ti = []; g_td = [];
+    let t: i32 = 0;
+    while (t < nt) {
+        let a: i32 = t * 3;
+        let d: f64 = (g_vz[a] + g_vz[a + 1] + g_vz[a + 2]) / 3.0;
+        g_ti.push(t); g_td.push(d);
+        t++;
+    }
+    // Descending by depth: FARTHEST first, so the painter overwrites it with
+    // whatever is in front. (Getting this backwards paints every model's far
+    // side over its near side and a solid box comes out looking hollow.)
+    let i: i32 = 1;
+    while (i < nt) {
+        let ki: i32 = g_ti[i];
+        let kd: f64 = g_td[i];
+        let j: i32 = i - 1;
+        let go: i32 = 1;
+        while (go == 1) {
+            go = 0;
+            if (j >= 0) {
+                if (g_td[j] < kd) {
+                    g_ti[j + 1] = g_ti[j]; g_td[j + 1] = g_td[j];
+                    j--; go = 1;
+                }
+            }
+        }
+        g_ti[j + 1] = ki; g_td[j + 1] = kd;
+        i++;
+    }
+}
+
+// Fill one triangle into an RGB buffer (or a 1-byte-per-pixel mask when
+// p_mask == 1 and p_dst is the mask buffer).
+fn fill_tri(p_dst: buffer, p_dw: i32, p_dh: i32, p_ox: i32, p_oy: i32,
+            p_clipw: i32, p_cliph: i32,
+            p_ax: f64, p_ay: f64, p_bx: f64, p_by: f64, p_cx: f64, p_cy: f64,
+            p_r: i32, p_g: i32, p_b: i32, p_mask: i32) {
+    let ax: f64 = p_ax; let ay: f64 = p_ay;
+    let bx: f64 = p_bx; let by: f64 = p_by;
+    let cx: f64 = p_cx; let cy: f64 = p_cy;
+    let area: f64 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (area == 0.0) { return; }
+    let sgn: f64 = 1.0;
+    if (area < 0.0) { sgn = -1.0; }
+
+    let x0: i32 = i32(ax); let x1: i32 = i32(ax);
+    let y0: i32 = i32(ay); let y1: i32 = i32(ay);
+    if (i32(bx) < x0) { x0 = i32(bx); } if (i32(bx) > x1) { x1 = i32(bx); }
+    if (i32(cx) < x0) { x0 = i32(cx); } if (i32(cx) > x1) { x1 = i32(cx); }
+    if (i32(by) < y0) { y0 = i32(by); } if (i32(by) > y1) { y1 = i32(by); }
+    if (i32(cy) < y0) { y0 = i32(cy); } if (i32(cy) > y1) { y1 = i32(cy); }
+    x0 = x0 - 1; y0 = y0 - 1; x1 = x1 + 1; y1 = y1 + 1;
+    if (x0 < 0) { x0 = 0; } if (y0 < 0) { y0 = 0; }
+    if (x1 >= p_clipw) { x1 = p_clipw - 1; }
+    if (y1 >= p_cliph) { y1 = p_cliph - 1; }
+
+    let py: i32 = y0;
+    while (py <= y1) {
+        let px: i32 = x0;
+        while (px <= x1) {
+            let fx: f64 = f64(px) + 0.5;
+            let fy: f64 = f64(py) + 0.5;
+            let e0: f64 = ((bx - ax) * (fy - ay) - (by - ay) * (fx - ax)) * sgn;
+            let e1: f64 = ((cx - bx) * (fy - by) - (cy - by) * (fx - bx)) * sgn;
+            let e2: f64 = ((ax - cx) * (fy - cy) - (ay - cy) * (fx - cx)) * sgn;
+            if (e0 >= 0.0) { if (e1 >= 0.0) { if (e2 >= 0.0) {
+                if (p_mask == 1) {
+                    p_dst[py * p_dw + px] = 1;
+                } else {
+                    let o: i32 = ((py + p_oy) * p_dw + (px + p_ox)) * 3;
+                    p_dst[o] = p_r; p_dst[o + 1] = p_g; p_dst[o + 2] = p_b;
+                }
+            } } }
+            px++;
+        }
+        py++;
+    }
+}
+
+// Render mesh `p_id` into `p_dst` (RGB) at (p_ox,p_oy), tile size p_size.
+fn draw_mesh(p_dst: buffer, p_dw: i32, p_dh: i32, p_id: i32,
+             p_size: i32, p_ox: i32, p_oy: i32, p_yaw: f64, p_pitch: f64) {
+    let m = meshgen_mesh(p_id);
+    project(m, p_yaw, p_pitch, p_size);
+    depth_sort(m);
+    let nt: i32 = mesh_tri_count(m);
+    let k: i32 = 0;
+    while (k < nt) {
+        let t: i32 = g_ti[k];
+        let a: i32 = t * 3;
+        let r: i32 = i32((mesh_vert_rgb(m, a, 0) + mesh_vert_rgb(m, a + 1, 0) + mesh_vert_rgb(m, a + 2, 0)) / 3);
+        let g: i32 = i32((mesh_vert_rgb(m, a, 1) + mesh_vert_rgb(m, a + 1, 1) + mesh_vert_rgb(m, a + 2, 1)) / 3);
+        let b: i32 = i32((mesh_vert_rgb(m, a, 2) + mesh_vert_rgb(m, a + 1, 2) + mesh_vert_rgb(m, a + 2, 2)) / 3);
+        fill_tri(p_dst, p_dw, p_dh, p_ox, p_oy, p_size, p_size,
+                 g_vx[a], g_vy[a], g_vx[a + 1], g_vy[a + 1], g_vx[a + 2], g_vy[a + 2],
+                 r, g, b, 0);
+        k++;
+    }
+}
+
+// Silhouette mask, 1 byte per pixel, size x size.
+fn mask_mesh(p_id: i32, p_size: i32, p_yaw: f64, p_pitch: f64): buffer {
+    let m = meshgen_mesh(p_id);
+    let n: i32 = p_size * p_size;
+    let msk: buffer = buffer(n);
+    let i: i32 = 0;
+    while (i < n) { msk[i] = 0; i++; }
+    project(m, p_yaw, p_pitch, p_size);
+    let nt: i32 = mesh_tri_count(m);
+    let t: i32 = 0;
+    while (t < nt) {
+        let a: i32 = t * 3;
+        fill_tri(msk, p_size, p_size, 0, 0, p_size, p_size,
+                 g_vx[a], g_vy[a], g_vx[a + 1], g_vy[a + 1], g_vx[a + 2], g_vy[a + 2],
+                 1, 1, 1, 1);
+        t++;
+    }
+    let out: buffer = msk;
+    return out;
+}
+
+// Mirror mismatch: |M xor mirror(M)| / |M or mirror(M)|.
+fn mirror_mismatch(p_msk: buffer, p_size: i32): f64 {
+    let n: i32 = p_size;
+    let diff: i32 = 0;
+    let uni: i32 = 0;
+    let y: i32 = 0;
+    while (y < n) {
+        let x: i32 = 0;
+        while (x < n) {
+            let a: i32 = p_msk[y * n + x];
+            let b: i32 = p_msk[y * n + (n - 1 - x)];
+            if (a != b) { diff++; }
+            if (a == 1) { uni++; } else { if (b == 1) { uni++; } }
+            x++;
+        }
+        y++;
+    }
+    if (uni == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = f64(diff) / f64(uni);
+    return out;
+}
+
+fn mask_iou(p_a: buffer, p_b: buffer, p_n: i32): f64 {
+    let inter: i32 = 0;
+    let uni: i32 = 0;
+    let i: i32 = 0;
+    while (i < p_n) {
+        let a: i32 = p_a[i]; let b: i32 = p_b[i];
+        if (a == 1) { if (b == 1) { inter++; } }
+        if (a == 1) { uni++; } else { if (b == 1) { uni++; } }
+        i++;
+    }
+    if (uni == 0) { let z: f64 = 1.0; return z; }
+    let out: f64 = f64(inter) / f64(uni);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// a 3x5 digit stamp, so the sheet labels itself
+// ---------------------------------------------------------------------------
+let g_digits: array<i32> = [
+    31599, 9362, 29671, 29647, 23497, 31183, 31215, 29257, 31727, 31695
+];
+
+fn stamp_digit(p_dst: buffer, p_dw: i32, p_x: i32, p_y: i32, p_d: i32,
+               p_r: i32, p_g: i32, p_b: i32, p_sc: i32) {
+    let bits: i32 = g_digits[p_d];
+    let row: i32 = 0;
+    while (row < 5) {
+        let col: i32 = 0;
+        while (col < 3) {
+            let bit: i32 = (bits >> (14 - (row * 3 + col))) & 1;
+            if (bit == 1) {
+                let sy: i32 = 0;
+                while (sy < p_sc) {
+                    let sx: i32 = 0;
+                    while (sx < p_sc) {
+                        let o: i32 = ((p_y + row * p_sc + sy) * p_dw + (p_x + col * p_sc + sx)) * 3;
+                        p_dst[o] = p_r; p_dst[o + 1] = p_g; p_dst[o + 2] = p_b;
+                        sx++;
+                    }
+                    sy++;
+                }
+            }
+            col++;
+        }
+        row++;
+    }
+}
+
+fn stamp_num(p_dst: buffer, p_dw: i32, p_x: i32, p_y: i32, p_n: i32,
+             p_r: i32, p_g: i32, p_b: i32, p_sc: i32): i32 {
+    let v: i32 = p_n;
+    let digs: array<i32> = [];
+    if (v == 0) { digs.push(0); }
+    while (v > 0) { digs.push(v % 10); v = i32(v / 10); }
+    let k: i32 = digs.length - 1;
+    let x: i32 = p_x;
+    while (k >= 0) {
+        stamp_digit(p_dst, p_dw, x, p_y, digs[k], p_r, p_g, p_b, p_sc);
+        x = x + 4 * p_sc;
+        k--;
+    }
+    let out: i32 = x;
+    return out;
+}
+
+fn fill_rect(p_dst: buffer, p_dw: i32, p_x: i32, p_y: i32, p_w: i32, p_h: i32,
+             p_r: i32, p_g: i32, p_b: i32) {
+    let y: i32 = 0;
+    while (y < p_h) {
+        let x: i32 = 0;
+        while (x < p_w) {
+            let o: i32 = ((p_y + y) * p_dw + (p_x + x)) * 3;
+            p_dst[o] = p_r; p_dst[o + 1] = p_g; p_dst[o + 2] = p_b;
+            x++;
+        }
+        y++;
+    }
+}
+
+// Blit a size x size tile rendered into a scratch buffer, magnified p_z times.
+let g_tile: buffer = buffer(4);
+
+fn tile_render(p_id: i32, p_size: i32, p_yaw: f64, p_pitch: f64,
+               p_bgr: i32, p_bgg: i32, p_bgb: i32) {
+    g_tile = buffer(p_size * p_size * 3);
+    fill_rect(g_tile, p_size, 0, 0, p_size, p_size, p_bgr, p_bgg, p_bgb);
+    draw_mesh(g_tile, p_size, p_size, p_id, p_size, 0, 0, p_yaw, p_pitch);
+}
+
+fn tile_blit(p_dst: buffer, p_dw: i32, p_x: i32, p_y: i32, p_size: i32, p_z: i32) {
+    let y: i32 = 0;
+    while (y < p_size * p_z) {
+        let x: i32 = 0;
+        while (x < p_size * p_z) {
+            let s: i32 = (i32(y / p_z) * p_size + i32(x / p_z)) * 3;
+            let o: i32 = ((p_y + y) * p_dw + (p_x + x)) * 3;
+            p_dst[o] = g_tile[s]; p_dst[o + 1] = g_tile[s + 1]; p_dst[o + 2] = g_tile[s + 2];
+            x++;
+        }
+        y++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the contact sheet
+// ---------------------------------------------------------------------------
+let CELL_W = 132;
+let CELL_H = 120;
+let COLS = 6;
+
+fn contact_sheet(p_path: string): i32 {
+    let n: i32 = meshgen_count();
+    let rows: i32 = i32((n + COLS - 1) / COLS);
+    let W: i32 = COLS * CELL_W;
+    let H: i32 = rows * CELL_H;
+    let img: buffer = buffer(W * H * 3);
+
+    let br: i32 = pal_r(g_STONE_MID); let bg: i32 = pal_g(g_STONE_MID); let bb: i32 = pal_b(g_STONE_MID);
+    fill_rect(img, W, 0, 0, W, H, br, bg, bb);
+
+    let lr: i32 = pal_r(g_SKY_HORIZON); let lg: i32 = pal_g(g_SKY_HORIZON); let lb: i32 = pal_b(g_SKY_HORIZON);
+    let dr: i32 = pal_r(g_GRASS_LO); let dg: i32 = pal_g(g_GRASS_LO); let db: i32 = pal_b(g_GRASS_LO);
+    let wr: i32 = pal_r(g_UI_WHITE); let wg: i32 = pal_g(g_UI_WHITE); let wb: i32 = pal_b(g_UI_WHITE);
+    let ar: i32 = pal_r(g_UI_AMBER); let ag: i32 = pal_g(g_UI_AMBER); let ab: i32 = pal_b(g_UI_AMBER);
+    let kr: i32 = pal_r(g_UI_BLACK); let kg: i32 = pal_g(g_UI_BLACK); let kb: i32 = pal_b(g_UI_BLACK);
+
+    let id: i32 = 0;
+    while (id < n) {
+        let cx: i32 = (id % COLS) * CELL_W;
+        let cy: i32 = i32(id / COLS) * CELL_H;
+        let yaw: f64 = meshgen_view_yaw(id);
+        let pitch: f64 = 0.30;
+
+        // cell frame
+        fill_rect(img, W, cx, cy, CELL_W, 1, kr, kg, kb);
+        fill_rect(img, W, cx, cy, 1, CELL_H, kr, kg, kb);
+
+        // 32x32, light background, magnified 2x  — "what it looks like"
+        tile_render(id, 32, yaw, pitch, lr, lg, lb);
+        tile_blit(img, W, cx + 2, cy + 2, 32, 2);
+
+        // 12 px (30 m), dark background, magnified 4x — "the class read"
+        tile_render(id, 12, yaw, pitch, dr, dg, db);
+        tile_blit(img, W, cx + 70, cy + 2, 12, 4);
+
+        // 32x32 on the dark background at 1:1 — the value-contrast check
+        tile_render(id, 32, yaw, pitch, dr, dg, db);
+        tile_blit(img, W, cx + 2, cy + 68, 32, 1);
+
+        // 12 px at 1:1 and 6 px (60 m) at 1:1 — actual size, no excuses
+        tile_render(id, 12, yaw, pitch, dr, dg, db);
+        tile_blit(img, W, cx + 38, cy + 68, 12, 1);
+        tile_render(id, 6, yaw, pitch, lr, lg, lb);
+        tile_blit(img, W, cx + 54, cy + 68, 6, 1);
+
+        // 6 px magnified 4x — what the smudge actually is
+        tile_render(id, 6, yaw, pitch, dr, dg, db);
+        tile_blit(img, W, cx + 70, cy + 56, 6, 4);
+
+        // labels: id (white) and triangle count (amber)
+        let ex: i32 = stamp_num(img, W, cx + 4, cy + 104, id, wr, wg, wb, 2);
+        stamp_num(img, W, ex + 6, cy + 104, meshgen_tris(id), ar, ag, ab, 2);
+        id++;
+    }
+
+    write_png(p_path, img, W, H);
+    print("contact sheet: " + p_path + "  " + W + "x" + H + "  " + n + " meshes");
+    let out: i32 = 1;
+    return out;
+}
+
+// A detail sheet: every mesh at 96x96 on the light background, three-quarter
+// view. This is NOT the readability test — the 12 px tiles on the contact sheet
+// are — it is the sheet you look at when a mesh is wrong and you need to see
+// which part of it is wrong.
+fn inspect_sheet(p_path: string): i32 {
+    let n: i32 = meshgen_count();
+    let cols: i32 = 6;
+    let cw: i32 = 100;
+    let chh: i32 = 112;
+    let rows: i32 = i32((n + cols - 1) / cols);
+    let W: i32 = cols * cw;
+    let H: i32 = rows * chh;
+    let img: buffer = buffer(W * H * 3);
+    fill_rect(img, W, 0, 0, W, H,
+              pal_r(g_STONE_MID), pal_g(g_STONE_MID), pal_b(g_STONE_MID));
+    let id: i32 = 0;
+    while (id < n) {
+        let cx: i32 = (id % cols) * cw;
+        let cy: i32 = i32(id / cols) * chh;
+        tile_render(id, 96, meshgen_view_yaw(id), 0.26,
+                    pal_r(g_SKY_HORIZON), pal_g(g_SKY_HORIZON), pal_b(g_SKY_HORIZON));
+        tile_blit(img, W, cx + 2, cy + 2, 96, 1);
+        let ex: i32 = stamp_num(img, W, cx + 4, cy + 100, id,
+                                pal_r(g_UI_WHITE), pal_g(g_UI_WHITE), pal_b(g_UI_WHITE), 2);
+        stamp_num(img, W, ex + 6, cy + 100, meshgen_tris(id),
+                  pal_r(g_UI_AMBER), pal_g(g_UI_AMBER), pal_b(g_UI_AMBER), 2);
+        id++;
+    }
+    write_png(p_path, img, W, H);
+    print("inspect sheet: " + p_path + "  " + W + "x" + H);
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// the acceptance suite
+// ---------------------------------------------------------------------------
+
+fn colour_checksum(): i32 {
+    let sum: u64 = 1469598103934665603;
+    let id: i32 = 0;
+    while (id < MESH_COUNT) {
+        let m = meshgen_mesh(id);
+        let nv: i32 = mesh_vert_count(m);
+        let i: i32 = 0;
+        while (i < nv) {
+            let v: u64 = u64(mesh_vert_rgb(m, i, 0) + mesh_vert_rgb(m, i, 1) * 256
+                             + mesh_vert_rgb(m, i, 2) * 65536);
+            sum = (sum ^ v) * 1099511628211;
+            i++;
+        }
+        id++;
+    }
+    let out: i32 = i32(sum & 1073741823);
+    return out;
+}
+
+fn min_luma(p_id: i32): i32 {
+    let m = meshgen_mesh(p_id);
+    let nv: i32 = mesh_vert_count(m);
+    let lo: i32 = 999;
+    let i: i32 = 0;
+    while (i < nv) {
+        let r: f64 = f64(mesh_vert_rgb(m, i, 0));
+        let g: f64 = f64(mesh_vert_rgb(m, i, 1));
+        let b: f64 = f64(mesh_vert_rgb(m, i, 2));
+        let l: i32 = i32(0.299 * r + 0.587 * g + 0.114 * b);
+        if (l < lo) { lo = l; }
+        i++;
+    }
+    let out: i32 = lo;
+    return out;
+}
+
+fn verify(): i32 {
+    print("");
+    print("W2-8 meshgen acceptance");
+    print("=======================");
+
+    // --- build, timed under RULE T ---------------------------------------
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        meshgen_build_all();
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0;
+        if (t == 0) { best = ms; } else { if (ms < best) { best = ms; } }
+        t++;
+    }
+    let total: i32 = 0;
+    let id: i32 = 0;
+    while (id < MESH_COUNT) { total = total + meshgen_tris(id); id++; }
+    print("build: " + f2(best) + " ms (min of " + TRIALS + ", CPU time), "
+          + MESH_COUNT + " meshes, " + total + " triangles");
+
+    // --- A: triangle budgets ---------------------------------------------
+    print("");
+    print("A  triangle budgets (ART_BIBLE 8.3, +-10 %)");
+    let maxtris: i32 = 0;
+    id = 0;
+    while (id < MESH_COUNT) {
+        let got: i32 = meshgen_tris(id);
+        let want: i32 = meshgen_budget(id);
+        if (got > maxtris) { maxtris = got; }
+        let lo: f64 = f64(want) * 0.9;
+        let hi: f64 = f64(want) * 1.1;
+        let ok: i32 = 0;
+        if (f64(got) >= lo - 0.001) { if (f64(got) <= hi + 0.001) { ok = 1; } }
+        let dev: f64 = 100.0 * (f64(got) - f64(want)) / f64(want);
+        if (ok == 0) {
+            print("  " + meshgen_name(id) + ": " + got + " tris, budget " + want
+                  + " (" + f2(dev) + " %)");
+        }
+        ck(ok, meshgen_name(id) + " tris " + got + " vs budget " + want
+              + " (" + f2(dev) + " %)");
+        id++;
+    }
+    print("  " + MESH_COUNT + " meshes checked, largest asset " + maxtris + " tris");
+    ck(if_le(maxtris, 260), "no asset exceeds the 260-triangle cap (max " + maxtris + ")");
+
+    // --- B: asymmetry -----------------------------------------------------
+    print("");
+    print("B  asymmetry: no mesh survives a mirror across x=0 or z=0 unchanged");
+    print("   (orthographic 32x32 silhouette; front and top views mirror x, side view mirrors z)");
+    let worst: f64 = 9.0;
+    let worst_name: string = "";
+    id = 0;
+    while (id < MESH_COUNT) {
+        let mfront: buffer = mask_mesh(id, 32, 0.0, 0.0);
+        let mtop: buffer = mask_mesh(id, 32, 0.0, PI * 0.5);
+        let mside: buffer = mask_mesh(id, 32, PI * 0.5, 0.0);
+        let axm: f64 = mirror_mismatch(mfront, 32);
+        let atm: f64 = mirror_mismatch(mtop, 32);
+        let azm: f64 = mirror_mismatch(mside, 32);
+        let ax_best: f64 = axm;
+        if (atm > ax_best) { ax_best = atm; }
+        let asym: f64 = ax_best;
+        if (azm > asym) { asym = azm; }
+        if (asym < worst) { worst = asym; worst_name = meshgen_name(id); }
+        let ok: i32 = 0;
+        if (asym >= 0.08) { ok = 1; }
+        if (ok == 0) {
+            print("  " + meshgen_name(id) + ": front-x " + f3(axm) + ", top-x " + f3(atm)
+                  + ", side-z " + f3(azm));
+        }
+        ck(ok, meshgen_name(id) + " asymmetry " + f3(asym)
+              + " (front-x " + f3(axm) + " top-x " + f3(atm) + " side-z " + f3(azm) + ")");
+        id++;
+    }
+    print("  least asymmetric mesh: " + worst_name + " at " + f3(worst)
+          + " (threshold 0.080)");
+
+    // ART_BIBLE 8.2.1 is specifically about BILATERAL symmetry, and it is
+    // specifically about enemies. Hold the six classes to the strict x=0 test.
+    let ba: i32 = 0;
+    while (ba < ENEMY_COUNT) {
+        let eid: i32 = 9 + ba * 3;
+        let mf: buffer = mask_mesh(eid, 32, 0.0, 0.0);
+        let mt: buffer = mask_mesh(eid, 32, 0.0, PI * 0.5);
+        let bx: f64 = mirror_mismatch(mf, 32);
+        let bt: f64 = mirror_mismatch(mt, 32);
+        if (bt > bx) { bx = bt; }
+        let ok2: i32 = 0;
+        if (bx >= 0.08) { ok2 = 1; }
+        print("  " + meshgen_name(eid) + " bilateral (x=0) mismatch " + f3(bx));
+        ck(ok2, meshgen_name(eid) + " bilateral asymmetry " + f3(bx));
+        ba++;
+    }
+
+    // --- C: head:shoulder -------------------------------------------------
+    print("");
+    print("C  head:shoulder ratios (ART_BIBLE 8.2.2, pairwise >= 0.25 apart)");
+    let ca: i32 = 0;
+    while (ca < ENEMY_COUNT) {
+        print("  class " + ca + " (" + meshgen_name(9 + ca * 3) + ")  1 : "
+              + f2(mg_head_shoulder(ca)));
+        ca++;
+    }
+    ca = 0;
+    while (ca < ENEMY_COUNT) {
+        let cb: i32 = ca + 1;
+        while (cb < ENEMY_COUNT) {
+            let d: f64 = mg_head_shoulder(ca) - mg_head_shoulder(cb);
+            if (d < 0.0) { d = 0.0 - d; }
+            let ok: i32 = 0;
+            if (d >= 0.25) { ok = 1; }
+            if (ok == 0) { print("  classes " + ca + "," + cb + " differ by only " + f2(d)); }
+            ck(ok, "head:shoulder " + ca + " vs " + cb + " differ " + f2(d));
+            cb++;
+        }
+        ca++;
+    }
+
+    // --- D: signature protrusions ----------------------------------------
+    print("");
+    print("D  signature protrusions (ART_BIBLE 8.2.3, >= 0.45 m)");
+    let di: i32 = 0;
+    while (di < ENEMY_COUNT) {
+        let plen: f64 = mg_protrusion(di);
+        let ok: i32 = 0;
+        if (plen >= 0.45) { ok = 1; }
+        print("  " + meshgen_name(9 + di * 3) + "  " + f2(plen) + " m beyond the body, axis "
+              + mg_protrusion_axis(di));
+        ck(ok, "class " + di + " protrusion " + f2(plen) + " m");
+        di++;
+    }
+    // and no two classes point their signature the same way
+    let pa: i32 = 0;
+    while (pa < ENEMY_COUNT) {
+        let pb: i32 = pa + 1;
+        while (pb < ENEMY_COUNT) {
+            let ok2: i32 = 0;
+            if (mg_protrusion_axis(pa) != mg_protrusion_axis(pb)) { ok2 = 1; }
+            if (ok2 == 0) {
+                print("  classes " + pa + "," + pb + " share axis "
+                      + mg_protrusion_axis(pa));
+            }
+            ck(ok2, "protrusion axis " + pa + " vs " + pb);
+            pb++;
+        }
+        pa++;
+    }
+
+    // --- E: weapon silhouettes -------------------------------------------
+    print("");
+    print("E  weapon silhouettes (32x32 side view, pairwise IoU <= 0.80)");
+    let masks: array = [];
+    let wi: i32 = MESH_SPARROW_VM;
+    while (wi <= MESH_EMBERLANCE_VM) {
+        masks.push(mask_mesh(wi, 32, PI * 0.5, 0.0));
+        wi++;
+    }
+    let worst_iou: f64 = 0.0;
+    let ea: i32 = 0;
+    while (ea < 6) {
+        let eb: i32 = ea + 1;
+        while (eb < 6) {
+            let iou: f64 = mask_iou(masks[ea], masks[eb], 1024);
+            if (iou > worst_iou) { worst_iou = iou; }
+            let ok: i32 = 0;
+            if (iou <= 0.80) { ok = 1; }
+            if (ok == 0) {
+                print("  " + meshgen_name(MESH_SPARROW_VM + ea) + " vs "
+                      + meshgen_name(MESH_SPARROW_VM + eb) + " IoU " + f3(iou));
+            }
+            ck(ok, "weapon IoU " + ea + "," + eb + " = " + f3(iou));
+            eb++;
+        }
+        ea++;
+    }
+    print("  worst pair IoU " + f3(worst_iou) + " (threshold 0.800)");
+
+    // --- F: luminance floor ----------------------------------------------
+    print("");
+    print("F  baked vertex luminance floor (>= " + MG_LUM_FLOOR + ")");
+    let glo: i32 = 999;
+    id = 0;
+    while (id < MESH_COUNT) {
+        let lo: i32 = min_luma(id);
+        if (lo < glo) { glo = lo; }
+        let ok: i32 = 0;
+        if (lo >= MG_LUM_FLOOR) { ok = 1; }
+        if (ok == 0) { print("  " + meshgen_name(id) + " min luma " + lo); }
+        ck(ok, meshgen_name(id) + " min luma " + lo);
+        id++;
+    }
+    print("  darkest vertex in the whole library: luma " + glo);
+
+    // --- G: the bake is the only normal transform ------------------------
+    print("");
+    print("G  normal transforms");
+    let nverts: i32 = 0;
+    id = 0;
+    while (id < MESH_COUNT) { nverts = nverts + mesh_vert_count(meshgen_mesh(id)); id++; }
+    let before: i32 = mesh_normal_xform_count();
+    let mid: i32 = 0;
+    while (mid < MESH_COUNT) {
+        let mm = meshgen_mesh(mid);
+        let k: i32 = 0;
+        while (k < 8) { mesh_tri_count(mm); k++; }
+        mid++;
+    }
+    let after: i32 = mesh_normal_xform_count();
+    print("  " + nverts + " vertices baked; counter frozen at " + after
+          + " across 272 read-only mesh accesses");
+    ck(if_eq(before, after), "zero normal transforms outside the bake");
+
+    // --- H: determinism ---------------------------------------------------
+    print("");
+    print("H  determinism");
+    let c1: i32 = colour_checksum();
+    meshgen_build_all();
+    let c2: i32 = colour_checksum();
+    print("  colour checksum " + c1 + " / " + c2);
+    ck(if_eq(c1, c2), "two builds produce identical vertex colour");
+
+    // --- I: build-time budget (regression guard, RULE T) -------------------
+    print("");
+    print("I  build time");
+    print("  " + f2(best) + " ms of the 400 ms boot budget (ARCHITECTURE 6)");
+    ck(if_le(i32(best), 120), "meshgen_build_all under the 120 ms regression guard ("
+                              + f2(best) + " ms)");
+
+    print("");
+    print("assertions executed: " + g_count + " (expected " + EXPECT_ASSERTS + ")");
+    if (g_count != EXPECT_ASSERTS) {
+        print("ASSERTION COUNT MISMATCH");
+        g_fail++;
+    }
+    if (g_fail == 0) {
+        print("PASS " + g_pass + "/" + g_count);
+        let ok: i32 = 0;
+        return ok;
+    }
+    print("FAIL " + g_fail + " of " + g_count);
+    let bad: i32 = 1;
+    return bad;
+}
+
+fn if_le(p_a: i32, p_b: i32): i32 {
+    let out: i32 = 0;
+    if (p_a <= p_b) { out = 1; }
+    return out;
+}
+fn if_eq(p_a: i32, p_b: i32): i32 {
+    let out: i32 = 0;
+    if (p_a == p_b) { out = 1; }
+    return out;
+}
+
+fn list_meshes() {
+    meshgen_build_all();
+    let id: i32 = 0;
+    while (id < MESH_COUNT) {
+        print("" + id + "  " + meshgen_name(id) + "  " + meshgen_tris(id)
+              + " tris (budget " + meshgen_budget(id) + ", kind "
+              + meshgen_kind(id) + ")");
+        id++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// entry
+// ---------------------------------------------------------------------------
+let g_mode: string = "--verify";
+let g_out: string = "docs/shots/meshgen_contact.png";
+let g_big: i32 = 0;
+let g_ai: i32 = 0;
+while (g_ai < args.length) {
+    if (args[g_ai] == "--contact-sheet") { g_mode = "--contact-sheet"; }
+    if (args[g_ai] == "--verify") { g_mode = "--verify"; }
+    if (args[g_ai] == "--list") { g_mode = "--list"; }
+    if (args[g_ai] == "--inspect") { g_mode = "--inspect"; }
+    if (args[g_ai] == "--big") { g_mode = "--big"; g_big = i32(args[g_ai + 1]); }
+    if (args[g_ai] == "--out") { g_out = args[g_ai + 1]; }
+    g_ai++;
+}
+if (g_mode == "--contact-sheet") {
+    if (args.length > 1) {
+        let last: string = args[args.length - 1];
+        if (last != "--contact-sheet") { g_out = last; }
+    }
+    meshgen_build_all();
+    contact_sheet(g_out);
+    exit(0);
+}
+if (g_mode == "--inspect") {
+    if (args.length > 1) {
+        let last2: string = args[args.length - 1];
+        if (last2 != "--inspect") { g_out = last2; }
+    }
+    meshgen_build_all();
+    inspect_sheet(g_out);
+    exit(0);
+}
+if (g_mode == "--big") {
+    meshgen_build_all();
+    let bimg: buffer = buffer(256 * 256 * 3 * 2);
+    fill_rect(bimg, 512, 0, 0, 512, 256,
+              pal_r(g_SKY_HORIZON), pal_g(g_SKY_HORIZON), pal_b(g_SKY_HORIZON));
+    tile_render(g_big, 256, meshgen_view_yaw(g_big), 0.26,
+                pal_r(g_SKY_HORIZON), pal_g(g_SKY_HORIZON), pal_b(g_SKY_HORIZON));
+    tile_blit(bimg, 512, 0, 0, 256, 1);
+    tile_render(g_big, 256, meshgen_view_yaw(g_big) + PI * 0.5, 0.10,
+                pal_r(g_GRASS_LO), pal_g(g_GRASS_LO), pal_b(g_GRASS_LO));
+    tile_blit(bimg, 512, 256, 0, 256, 1);
+    write_png(g_out, bimg, 512, 256);
+    print("big: " + meshgen_name(g_big) + " -> " + g_out);
+    exit(0);
+}
+if (g_mode == "--list") { list_meshes(); exit(0); }
+exit(verify());

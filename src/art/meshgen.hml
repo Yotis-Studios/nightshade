@@ -1,0 +1,1835 @@
+// meshgen.hml — the procedural mesh DSL and every mesh in Nightshade.
+//
+// Nightshade W2-8. Implements ARCHITECTURE.md D5 ("assets/ stays empty"):
+// there is no OBJ file, no modelling tool and no importer. Every triangle the
+// game ever draws that is not terrain, HUD or FX is built HERE, at boot, by a
+// five-primitive DSL, and lit ONCE by `mesh_bake_light` so that a static prop
+// costs ZERO normal transforms per frame (ENGINE_GAPS G19).
+//
+//   mg_box       an axis-aligned box, optionally skewed and tapered   12 tris
+//   mg_prism     an n-sided prism about +Y, optional fan caps      2n..4n tris
+//   mg_taper     a tapered n-sided tube between two arbitrary points   2n tris
+//   mg_fan_disc  an n-sided fan disc, up- or down-facing               n tris
+//   mg_lathe     a surface of revolution through a radius profile   2n(k-1) tris
+//
+// Everything else in this file is composition. That is the whole point: a
+// parametric builder is *better* than a modelling tool below ~260 triangles,
+// because per-instance variation (yaw, scale, colour jitter) is free and the
+// asset is a diff, not a binary.
+//
+// ---------------------------------------------------------------------------
+// THE FIVE RULES THIS FILE OBEYS
+// ---------------------------------------------------------------------------
+// 1. ART_BIBLE 8.2.1 — ASYMMETRY IS MANDATORY. A bilaterally symmetric
+//    silhouette has no orientation cue at 12 px. Every mesh here has at least
+//    one feature that breaks the x = 0 mirror, and `tools/meshgen.hml --verify`
+//    measures it by mirroring the 32x32 silhouette and counting the mismatch.
+// 2. ART_BIBLE 8.2.2 — a distinct head:shoulder ratio per enemy class. It is
+//    the primary class read at 12 px. Exported as `mg_head_shoulder(class)`.
+// 3. ART_BIBLE 8.2.3 — one signature protrusion per class, >= 0.45 m so it is
+//    3 px at 30 m. Measured geometrically at build time against the AABB of
+//    the body built BEFORE the protrusion was added.
+// 4. ART_BIBLE 8.2.5/8.2.6 — value-block every model in vertex colour, and
+//    NEVER black. `mg_bake_all` applies a soft luminance floor of 72 after the
+//    light bake, so no vertex in the game is darker than the atlas minimum.
+// 5. CLAUDE.md 8 — no colour is named here. Every colour is a `g_` constant
+//    imported from `palette.hml`. There is not one hex literal in this file.
+//
+// ---------------------------------------------------------------------------
+// TEXTURE COORDINATES
+// ---------------------------------------------------------------------------
+// A mesh vertex carries a UV into ATLAS_WORLD, whose cell layout belongs to
+// `texgen.hml` (W2-5). meshgen does not — must not — know which cell is bark.
+// It works in MATERIAL IDS (`MG_MAT_*`) and keeps a UV rect per material, which
+// `assets.hml` overrides from texgen's `CELL_*` before calling
+// `meshgen_build_all()`:
+//
+//     meshgen_set_material_uv(MG_MAT_BARK, u0, v0, u1, v1);   // from atlas_cell_uv
+//     meshgen_build_all();
+//
+// The defaults are an 8x8 grid with a half-texel inset on a 256x256 atlas, so
+// the meshes are correct-looking even if nobody calls the setter.
+//
+// Each face maps the whole cell rect (no tiling): the atlas cannot repeat
+// without bleeding, and at 4 cm/texel a prop face is smaller than a cell
+// anyway.
+
+import { sqrt, sin, cos, atan2, PI } from "@stdlib/math";
+
+import { mesh_new, mesh_begin, mesh_vert, mesh_vert_n, mesh_vert_ao,
+         mesh_tri, mesh_quad, mesh_end, mesh_bake_light,
+         mesh_tri_count, mesh_vert_count, mesh_vert_pos, mesh_vert_rgb,
+         mesh_buf, mesh_radius } from "../../../wobbleweed/src/mesh.hml";
+
+import { pal_r, pal_g, pal_b, pal_pack,
+         g_BARK_HI, g_BARK_LO, g_LEAF_HI, g_LEAF_MID, g_LEAF_LO,
+         g_LEAF_SICK, g_PINE_HI, g_PINE_LO,
+         g_GRASS_DRY, g_DIRT_MID, g_DIRT_LO, g_MUD, g_SAND,
+         g_STONE_HI, g_STONE_MID, g_STONE_LO, g_STONE_MOSS,
+         g_GRANITE_HI, g_GRANITE_LO,
+         g_CONCRETE_HI, g_CONCRETE_MID,
+         g_WOOD_HI, g_WOOD_MID, g_WOOD_LO,
+         g_RUST, g_RUST_DARK,
+         g_STEEL_HI, g_STEEL_MID, g_STEEL_LO,
+         g_GUNMETAL_HI, g_GUNMETAL_LO, g_BRASS, g_BRASS_LO, g_POLYMER,
+         g_NS_MID, g_NS_CORE, g_NIGHTSHADE_FLORA, g_ICHOR,
+         g_FABRIC_RED, g_FABRIC_CREAM, g_PAINT_TEAL, g_PAINT_OCHRE,
+         g_UI_BLACK } from "./palette.hml";
+
+// ---------------------------------------------------------------------------
+// materials
+// ---------------------------------------------------------------------------
+
+export let MG_MAT_BARK     = 0;
+export let MG_MAT_LEAF     = 1;
+export let MG_MAT_STONE    = 2;
+export let MG_MAT_WOOD     = 3;
+export let MG_MAT_METAL    = 4;
+export let MG_MAT_CONCRETE = 5;
+export let MG_MAT_CLOTH    = 6;
+export let MG_MAT_HIDE     = 7;
+export let MG_MAT_DIRT     = 8;
+export let MG_MAT_GLASS    = 9;
+export let MG_MAT_COUNT    = 10;
+
+// u0,v0,u1,v1 per material. Default: cell (m%8, m/8) of an 8x8 grid with a
+// half-texel inset for a 256x256 atlas (0.5/256 == 0.001953125).
+let g_mg_uv: array<f64> = [];
+
+fn mg_uv_defaults() {
+    g_mg_uv = [];
+    let inset: f64 = 0.001953125;
+    let i: i32 = 0;
+    while (i < MG_MAT_COUNT) {
+        let cx: f64 = f64(i % 8);
+        let cy: f64 = f64(i32(i / 8));   // `/` yields f64 in Hemlock; truncate explicitly
+        g_mg_uv.push(cx * 0.125 + inset);
+        g_mg_uv.push(cy * 0.125 + inset);
+        g_mg_uv.push((cx + 1.0) * 0.125 - inset);
+        g_mg_uv.push((cy + 1.0) * 0.125 - inset);
+        i++;
+    }
+}
+mg_uv_defaults();
+
+// Bind a material to an atlas cell rect. Call BEFORE meshgen_build_all():
+// UVs are baked into the vertex arena and are not patchable afterwards.
+export fn meshgen_set_material_uv(p_mat: i32, p_u0: f64, p_v0: f64,
+                                  p_u1: f64, p_v1: f64) {
+    let i: i32 = p_mat * 4;
+    g_mg_uv[i] = p_u0; g_mg_uv[i + 1] = p_v0;
+    g_mg_uv[i + 2] = p_u1; g_mg_uv[i + 3] = p_v1;
+}
+
+fn mg_u(p_mat: i32, p_s: f64): f64 {
+    let i: i32 = p_mat * 4;
+    let a: f64 = g_mg_uv[i];
+    let b: f64 = g_mg_uv[i + 2];
+    let out: f64 = a + (b - a) * p_s;
+    return out;
+}
+fn mg_vv(p_mat: i32, p_t: f64): f64 {
+    let i: i32 = p_mat * 4;
+    let a: f64 = g_mg_uv[i + 1];
+    let b: f64 = g_mg_uv[i + 3];
+    let out: f64 = a + (b - a) * p_t;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// deterministic build-time noise (A13: every mix in u64, never i32)
+// ---------------------------------------------------------------------------
+
+fn mg_hash(p_i: i32): i32 {
+    let x: u64 = u64(p_i) + 2654435769;
+    x = x * 6364136223846793005;
+    x = x ^ (x >> 31);
+    x = x * 11400714819323198485;
+    x = x ^ (x >> 29);
+    let out: i32 = i32(x & 1073741823);
+    return out;
+}
+
+// 0..1
+fn mg_h01(p_i: i32): f64 {
+    let h: i32 = mg_hash(p_i);
+    let out: f64 = f64(h) / 1073741824.0;
+    return out;
+}
+
+// -1..1
+fn mg_hs(p_i: i32): f64 {
+    let out: f64 = mg_h01(p_i) * 2.0 - 1.0;
+    return out;
+}
+
+// Radial jitter applied by the round builders. This is what makes a rock a
+// rock and not a hexagon, and it is what makes a hexagonal canopy disc read as
+// mass. Set it, build, set it back to zero.
+let g_mg_jit: f64 = 0.0;
+let g_mg_seed: i32 = 0;
+
+export fn mg_set_jitter(p_amt: f64, p_seed: i32) {
+    g_mg_jit = p_amt;
+    g_mg_seed = p_seed;
+}
+
+fn mg_ring_scale(p_k: i32): f64 {
+    if (g_mg_jit <= 0.0) { let one: f64 = 1.0; return one; }
+    let out: f64 = 1.0 + g_mg_jit * mg_hs(g_mg_seed * 131 + p_k * 7 + 3);
+    return out;
+}
+
+// Same, but varying per profile RING as well as per side. mg_lathe uses this so
+// a stack of rings is irregular in both axes instead of being a scaled copy of
+// one outline — a lathe jittered only around the axis is still a solid of
+// revolution and still mirror-symmetric. The (ring, k) pair is the only input,
+// so the shared ring between two bands gets the same radius from both and the
+// surface never cracks.
+fn mg_ring_scale2(p_ring: i32, p_k: i32): f64 {
+    if (g_mg_jit <= 0.0) { let one: f64 = 1.0; return one; }
+    let out: f64 = 1.0 + g_mg_jit * mg_hs(g_mg_seed * 131 + p_ring * 911 + p_k * 7 + 3);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// colour helpers — packed 0xRRGGBB in, packed out. No colour is NAMED here.
+// ---------------------------------------------------------------------------
+
+fn mg_mix(p_a: i32, p_b: i32, p_t: f64): i32 {
+    let t: f64 = p_t;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    let r: i32 = i32(f64(pal_r(p_a)) + (f64(pal_r(p_b)) - f64(pal_r(p_a))) * t + 0.5);
+    let g: i32 = i32(f64(pal_g(p_a)) + (f64(pal_g(p_b)) - f64(pal_g(p_a))) * t + 0.5);
+    let b: i32 = i32(f64(pal_b(p_a)) + (f64(pal_b(p_b)) - f64(pal_b(p_a))) * t + 0.5);
+    let out: i32 = pal_pack(r, g, b);
+    return out;
+}
+
+fn mg_scale(p_c: i32, p_f: f64): i32 {
+    let r: i32 = i32(f64(pal_r(p_c)) * p_f + 0.5);
+    let g: i32 = i32(f64(pal_g(p_c)) * p_f + 0.5);
+    let b: i32 = i32(f64(pal_b(p_c)) * p_f + 0.5);
+    if (r > 255) { r = 255; } if (g > 255) { g = 255; } if (b > 255) { b = 255; }
+    let out: i32 = pal_pack(r, g, b);
+    return out;
+}
+
+// The sun azimuth used for the build-time "lit side / shadow side" albedo split
+// on round things (ART_BIBLE 8.4: BARK_HI on the +SUN_DIR side, BARK_LO
+// opposite). NOON SUN_DIR is (0.18, 0.96, 0.22); its horizontal part is what
+// matters here.
+let g_mg_sun_ax: f64 = 0.6325;
+let g_mg_sun_az: f64 = 0.7746;
+
+export fn meshgen_set_sun_azimuth(p_x: f64, p_z: f64) {
+    let l: f64 = sqrt(p_x * p_x + p_z * p_z);
+    if (l > 0.0) { g_mg_sun_ax = p_x / l; g_mg_sun_az = p_z / l; }
+}
+
+// Albedo for a surface whose outward horizontal direction is (dx,dz).
+fn mg_side_col(p_lo: i32, p_hi: i32, p_dx: f64, p_dz: f64): i32 {
+    let l: f64 = sqrt(p_dx * p_dx + p_dz * p_dz);
+    let t: f64 = 0.5;
+    if (l > 0.0) {
+        t = 0.5 + 0.5 * ((p_dx / l) * g_mg_sun_ax + (p_dz / l) * g_mg_sun_az);
+    }
+    let out: i32 = mg_mix(p_lo, p_hi, t);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// vertex helpers
+// ---------------------------------------------------------------------------
+
+fn mg_v(p_m, p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_t: f64,
+        p_mat: i32, p_col: i32, p_ao: f64): i32 {
+    let i: i32 = mesh_vert(p_m, p_x, p_y, p_z,
+                           mg_u(p_mat, p_s), mg_vv(p_mat, p_t),
+                           pal_r(p_col), pal_g(p_col), pal_b(p_col));
+    mesh_vert_ao(p_m, i, p_ao);
+    let out: i32 = i;
+    return out;
+}
+
+fn mg_vn(p_m, p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_t: f64,
+         p_mat: i32, p_col: i32, p_ao: f64,
+         p_nx: f64, p_ny: f64, p_nz: f64): i32 {
+    let i: i32 = mesh_vert_n(p_m, p_x, p_y, p_z,
+                             mg_u(p_mat, p_s), mg_vv(p_mat, p_t),
+                             pal_r(p_col), pal_g(p_col), pal_b(p_col),
+                             p_nx, p_ny, p_nz);
+    mesh_vert_ao(p_m, i, p_ao);
+    let out: i32 = i;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_box — the workhorse. 12 triangles.
+// ---------------------------------------------------------------------------
+// `p_tdx`/`p_tdz` shear the top face and `p_ts` scales it: a box, a wedge, a
+// tapered post and a leaning crate are all the same call. AO carries a vertical
+// gradient (bottom x0.84) so every box has a built-in top-lit read even before
+// the light bake — ART_BIBLE 8.2.5.
+export fn mg_box_ex(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+                    p_hx: f64, p_hy: f64, p_hz: f64,
+                    p_tdx: f64, p_tdz: f64, p_ts: f64,
+                    p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let mat: i32 = p_mat;
+    let ao: f64 = p_ao;
+    let aob: f64 = p_ao * 0.84;
+    let cmid: i32 = mg_mix(p_clo, p_chi, 0.58);
+
+    let x0b: f64 = p_cx - p_hx;          let x1b: f64 = p_cx + p_hx;
+    let z0b: f64 = p_cz - p_hz;          let z1b: f64 = p_cz + p_hz;
+    let x0t: f64 = p_cx + p_tdx - p_hx * p_ts;
+    let x1t: f64 = p_cx + p_tdx + p_hx * p_ts;
+    let z0t: f64 = p_cz + p_tdz - p_hz * p_ts;
+    let z1t: f64 = p_cz + p_tdz + p_hz * p_ts;
+    let yb: f64 = p_cy - p_hy;           let yt: f64 = p_cy + p_hy;
+
+    let t0: i32 = mesh_tri_count(m);
+
+    // +Y  (top)
+    let a = mg_v(m, x0t, yt, z0t, 0.0, 0.0, mat, p_chi, ao);
+    let b = mg_v(m, x0t, yt, z1t, 0.0, 1.0, mat, p_chi, ao);
+    let c = mg_v(m, x1t, yt, z1t, 1.0, 1.0, mat, p_chi, ao);
+    let d = mg_v(m, x1t, yt, z0t, 1.0, 0.0, mat, p_chi, ao);
+    mesh_quad(m, a, b, c, d);
+
+    // -Y  (bottom) — the darkest face, it only ever sees bounce
+    let e = mg_v(m, x0b, yb, z0b, 0.0, 0.0, mat, p_clo, aob * 0.86);
+    let f = mg_v(m, x1b, yb, z0b, 1.0, 0.0, mat, p_clo, aob * 0.86);
+    let g = mg_v(m, x1b, yb, z1b, 1.0, 1.0, mat, p_clo, aob * 0.86);
+    let h = mg_v(m, x0b, yb, z1b, 0.0, 1.0, mat, p_clo, aob * 0.86);
+    mesh_quad(m, e, f, g, h);
+
+    // +Z
+    let sc_pz: i32 = mg_side_col(p_clo, p_chi, 0.0, 1.0);
+    let i0 = mg_v(m, x0b, yb, z1b, 0.0, 1.0, mat, sc_pz, aob);
+    let i1 = mg_v(m, x1b, yb, z1b, 1.0, 1.0, mat, sc_pz, aob);
+    let i2 = mg_v(m, x1t, yt, z1t, 1.0, 0.0, mat, sc_pz, ao);
+    let i3 = mg_v(m, x0t, yt, z1t, 0.0, 0.0, mat, sc_pz, ao);
+    mesh_quad(m, i0, i1, i2, i3);
+
+    // -Z
+    let sc_nz: i32 = mg_side_col(p_clo, p_chi, 0.0, -1.0);
+    let j0 = mg_v(m, x1b, yb, z0b, 0.0, 1.0, mat, sc_nz, aob);
+    let j1 = mg_v(m, x0b, yb, z0b, 1.0, 1.0, mat, sc_nz, aob);
+    let j2 = mg_v(m, x0t, yt, z0t, 1.0, 0.0, mat, sc_nz, ao);
+    let j3 = mg_v(m, x1t, yt, z0t, 0.0, 0.0, mat, sc_nz, ao);
+    mesh_quad(m, j0, j1, j2, j3);
+
+    // +X
+    let sc_px: i32 = mg_side_col(p_clo, p_chi, 1.0, 0.0);
+    let k0 = mg_v(m, x1b, yb, z1b, 0.0, 1.0, mat, sc_px, aob);
+    let k1 = mg_v(m, x1b, yb, z0b, 1.0, 1.0, mat, sc_px, aob);
+    let k2 = mg_v(m, x1t, yt, z0t, 1.0, 0.0, mat, sc_px, ao);
+    let k3 = mg_v(m, x1t, yt, z1t, 0.0, 0.0, mat, sc_px, ao);
+    mesh_quad(m, k0, k1, k2, k3);
+
+    // -X
+    let sc_nx: i32 = mg_side_col(p_clo, p_chi, -1.0, 0.0);
+    let l0 = mg_v(m, x0b, yb, z0b, 0.0, 1.0, mat, sc_nx, aob);
+    let l1 = mg_v(m, x0b, yb, z1b, 1.0, 1.0, mat, sc_nx, aob);
+    let l2 = mg_v(m, x0t, yt, z1t, 1.0, 0.0, mat, sc_nx, ao);
+    let l3 = mg_v(m, x0t, yt, z0t, 0.0, 0.0, mat, sc_nx, ao);
+    mesh_quad(m, l0, l1, l2, l3);
+
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+export fn mg_box(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+                 p_hx: f64, p_hy: f64, p_hz: f64,
+                 p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let out: i32 = mg_box_ex(p_m, p_cx, p_cy, p_cz, p_hx, p_hy, p_hz,
+                             0.0, 0.0, 1.0, p_mat, p_chi, p_clo, p_ao);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_prism — n-sided prism about +Y. caps: 0 none, 1 top, 2 bottom, 3 both.
+// ---------------------------------------------------------------------------
+export fn mg_prism(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+                   p_r: f64, p_h: f64, p_sides: i32, p_yaw: f64, p_caps: i32,
+                   p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let n: i32 = p_sides;
+    let yb: f64 = p_cy - p_h * 0.5;
+    let yt: f64 = p_cy + p_h * 0.5;
+    let t0: i32 = mesh_tri_count(m);
+    let step: f64 = 2.0 * PI / f64(n);
+    let ao: f64 = p_ao;
+    let aob: f64 = p_ao * 0.84;
+
+    let k: i32 = 0;
+    while (k < n) {
+        let a0: f64 = p_yaw + step * f64(k);
+        let a1: f64 = p_yaw + step * f64(k + 1);
+        let s0: f64 = mg_ring_scale(k);
+        let s1: f64 = mg_ring_scale((k + 1) % n);
+        let dx0: f64 = cos(a0); let dz0: f64 = sin(a0);
+        let dx1: f64 = cos(a1); let dz1: f64 = sin(a1);
+        let x0: f64 = p_cx + dx0 * p_r * s0; let z0: f64 = p_cz + dz0 * p_r * s0;
+        let x1: f64 = p_cx + dx1 * p_r * s1; let z1: f64 = p_cz + dz1 * p_r * s1;
+        let c0: i32 = mg_side_col(p_clo, p_chi, dx0, dz0);
+        let c1: i32 = mg_side_col(p_clo, p_chi, dx1, dz1);
+        let u0: f64 = f64(k) / f64(n);
+        let u1: f64 = f64(k + 1) / f64(n);
+        let v0 = mg_vn(m, x0, yb, z0, u0, 1.0, p_mat, c0, aob, dx0, 0.0, dz0);
+        let v1 = mg_vn(m, x1, yb, z1, u1, 1.0, p_mat, c1, aob, dx1, 0.0, dz1);
+        let v2 = mg_vn(m, x1, yt, z1, u1, 0.0, p_mat, c1, ao,  dx1, 0.0, dz1);
+        let v3 = mg_vn(m, x0, yt, z0, u0, 0.0, p_mat, c0, ao,  dx0, 0.0, dz0);
+        mesh_quad(m, v0, v1, v2, v3);
+        k++;
+    }
+
+    if ((p_caps & 1) == 1) {
+        mg_fan_disc(m, p_cx, yt, p_cz, p_r, n, p_yaw, p_mat, p_chi, p_chi, ao, 1.0);
+    }
+    if ((p_caps & 2) == 2) {
+        mg_fan_disc(m, p_cx, yb, p_cz, p_r, n, p_yaw, p_mat, p_clo, p_clo,
+                    aob * 0.86, -1.0);
+    }
+
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_taper — a tapered tube between two arbitrary points. 2n triangles, no
+// caps. This is the primitive that makes a KINKED trunk possible (ART_BIBLE
+// 8.4: "Segment 2 kinks 8-12 degrees. NEVER straight.").
+// ---------------------------------------------------------------------------
+export fn mg_taper(p_m, p_x0: f64, p_y0: f64, p_z0: f64,
+                   p_x1: f64, p_y1: f64, p_z1: f64,
+                   p_r0: f64, p_r1: f64, p_sides: i32,
+                   p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let n: i32 = p_sides;
+    let t0: i32 = mesh_tri_count(m);
+
+    // orthonormal frame around the axis
+    let ax: f64 = p_x1 - p_x0; let ay: f64 = p_y1 - p_y0; let az: f64 = p_z1 - p_z0;
+    let al: f64 = sqrt(ax * ax + ay * ay + az * az);
+    if (al <= 0.0) { let zero: i32 = 0; return zero; }
+    ax = ax / al; ay = ay / al; az = az / al;
+    let ux: f64 = 1.0; let uy: f64 = 0.0; let uz: f64 = 0.0;
+    if (ay * ay < 0.9) { ux = 0.0; uy = 1.0; uz = 0.0; }
+    // e0 = normalize(cross(u, a)), e1 = cross(a, e0)
+    let e0x: f64 = uy * az - uz * ay;
+    let e0y: f64 = uz * ax - ux * az;
+    let e0z: f64 = ux * ay - uy * ax;
+    let e0l: f64 = sqrt(e0x * e0x + e0y * e0y + e0z * e0z);
+    e0x = e0x / e0l; e0y = e0y / e0l; e0z = e0z / e0l;
+    let e1x: f64 = ay * e0z - az * e0y;
+    let e1y: f64 = az * e0x - ax * e0z;
+    let e1z: f64 = ax * e0y - ay * e0x;
+
+    let step: f64 = 2.0 * PI / f64(n);
+    let ao: f64 = p_ao;
+    let aob: f64 = p_ao * 0.88;
+
+    let k: i32 = 0;
+    while (k < n) {
+        let a0: f64 = step * f64(k);
+        let a1: f64 = step * f64(k + 1);
+        let c0: f64 = cos(a0); let s0: f64 = sin(a0);
+        let c1: f64 = cos(a1); let s1: f64 = sin(a1);
+        let j0: f64 = mg_ring_scale(k);
+        let j1: f64 = mg_ring_scale((k + 1) % n);
+
+        let n0x: f64 = e0x * c0 + e1x * s0;
+        let n0y: f64 = e0y * c0 + e1y * s0;
+        let n0z: f64 = e0z * c0 + e1z * s0;
+        let n1x: f64 = e0x * c1 + e1x * s1;
+        let n1y: f64 = e0y * c1 + e1y * s1;
+        let n1z: f64 = e0z * c1 + e1z * s1;
+
+        let b0x: f64 = p_x0 + n0x * p_r0 * j0;
+        let b0y: f64 = p_y0 + n0y * p_r0 * j0;
+        let b0z: f64 = p_z0 + n0z * p_r0 * j0;
+        let b1x: f64 = p_x0 + n1x * p_r0 * j1;
+        let b1y: f64 = p_y0 + n1y * p_r0 * j1;
+        let b1z: f64 = p_z0 + n1z * p_r0 * j1;
+        let t1x: f64 = p_x1 + n1x * p_r1 * j1;
+        let t1y: f64 = p_y1 + n1y * p_r1 * j1;
+        let t1z: f64 = p_z1 + n1z * p_r1 * j1;
+        let t2x: f64 = p_x1 + n0x * p_r1 * j0;
+        let t2y: f64 = p_y1 + n0y * p_r1 * j0;
+        let t2z: f64 = p_z1 + n0z * p_r1 * j0;
+
+        let col0: i32 = mg_side_col(p_clo, p_chi, n0x, n0z);
+        let col1: i32 = mg_side_col(p_clo, p_chi, n1x, n1z);
+        let u0: f64 = f64(k) / f64(n);
+        let u1: f64 = f64(k + 1) / f64(n);
+
+        let q0 = mg_vn(m, b0x, b0y, b0z, u0, 1.0, p_mat, col0, aob, n0x, n0y, n0z);
+        let q1 = mg_vn(m, b1x, b1y, b1z, u1, 1.0, p_mat, col1, aob, n1x, n1y, n1z);
+        let q2 = mg_vn(m, t1x, t1y, t1z, u1, 0.0, p_mat, col1, ao,  n1x, n1y, n1z);
+        let q3 = mg_vn(m, t2x, t2y, t2z, u0, 0.0, p_mat, col0, ao,  n0x, n0y, n0z);
+        mesh_quad(m, q0, q1, q2, q3);
+        k++;
+    }
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_fan_disc — n triangles. p_face is +1 (up) or -1 (down).
+// The rim normal is tilted outward so the disc reads as a dome rather than a
+// plate once the light is baked: this is what turns "hexagon" into "canopy".
+// ---------------------------------------------------------------------------
+export fn mg_fan_disc(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+                      p_r: f64, p_sides: i32, p_yaw: f64,
+                      p_mat: i32, p_ccen: i32, p_crim: i32,
+                      p_ao: f64, p_face: f64): i32 {
+    let m = p_m;
+    let n: i32 = p_sides;
+    let t0: i32 = mesh_tri_count(m);
+    let step: f64 = 2.0 * PI / f64(n);
+    let fy: f64 = 1.0;
+    if (p_face < 0.0) { fy = -1.0; }
+
+    // The centre is raised by 28 % of the radius. A flat fan reads as a plate
+    // edge-on and a canopy built from plates looks like a palm tree; a domed
+    // fan keeps a silhouette from every angle for the same triangle count.
+    let cen = mg_vn(m, p_cx, p_cy + 0.28 * p_r * fy, p_cz, 0.5, 0.5,
+                    p_mat, p_ccen, p_ao, 0.0, fy, 0.0);
+    let k: i32 = 0;
+    while (k < n) {
+        let a0: f64 = p_yaw + step * f64(k);
+        let a1: f64 = p_yaw + step * f64(k + 1);
+        let j0: f64 = mg_ring_scale(k);
+        let j1: f64 = mg_ring_scale((k + 1) % n);
+        let dx0: f64 = cos(a0); let dz0: f64 = sin(a0);
+        let dx1: f64 = cos(a1); let dz1: f64 = sin(a1);
+        let x0: f64 = p_cx + dx0 * p_r * j0; let z0: f64 = p_cz + dz0 * p_r * j0;
+        let x1: f64 = p_cx + dx1 * p_r * j1; let z1: f64 = p_cz + dz1 * p_r * j1;
+        let c0: i32 = mg_side_col(mg_scale(p_crim, 0.88), p_crim, dx0, dz0);
+        let c1: i32 = mg_side_col(mg_scale(p_crim, 0.88), p_crim, dx1, dz1);
+        let v0 = mg_vn(m, x0, p_cy, z0, 0.5 + dx0 * 0.5, 0.5 + dz0 * 0.5,
+                       p_mat, c0, p_ao * 0.92, dx0 * 0.55, fy, dz0 * 0.55);
+        let v1 = mg_vn(m, x1, p_cy, z1, 0.5 + dx1 * 0.5, 0.5 + dz1 * 0.5,
+                       p_mat, c1, p_ao * 0.92, dx1 * 0.55, fy, dz1 * 0.55);
+        if (fy > 0.0) { mesh_tri(m, cen, v1, v0); } else { mesh_tri(m, cen, v0, v1); }
+        k++;
+    }
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_lathe — surface of revolution through (radius, y) profile rings.
+// Rings with r == 0 collapse into a fan, so a bottle, a barrel and a bulb are
+// one call. 2 * sides * (rings-1) triangles at most.
+// ---------------------------------------------------------------------------
+export fn mg_lathe(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+                   p_prof_r: array<f64>, p_prof_y: array<f64>, p_rings: i32,
+                   p_sides: i32, p_mat: i32,
+                   p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let n: i32 = p_sides;
+    let rings: i32 = p_rings;
+    let t0: i32 = mesh_tri_count(m);
+    let step: f64 = 2.0 * PI / f64(n);
+    let ymin: f64 = p_prof_y[0];
+    let ymax: f64 = p_prof_y[rings - 1];
+    let yspan: f64 = ymax - ymin;
+    if (yspan <= 0.0) { yspan = 1.0; }
+
+    let ri: i32 = 0;
+    while (ri < rings - 1) {
+        let r0: f64 = p_prof_r[ri];
+        let r1: f64 = p_prof_r[ri + 1];
+        let y0: f64 = p_cy + p_prof_y[ri];
+        let y1: f64 = p_cy + p_prof_y[ri + 1];
+        let tv0: f64 = 1.0 - (p_prof_y[ri] - ymin) / yspan;
+        let tv1: f64 = 1.0 - (p_prof_y[ri + 1] - ymin) / yspan;
+        let ao0: f64 = p_ao * (0.84 + 0.16 * (1.0 - tv0));
+        let ao1: f64 = p_ao * (0.84 + 0.16 * (1.0 - tv1));
+        // outward slope for the normal
+        let dr: f64 = r1 - r0;
+        let dy: f64 = y1 - y0;
+        let sl: f64 = sqrt(dr * dr + dy * dy);
+        let ny: f64 = 0.0;
+        if (sl > 0.0) { ny = 0.0 - dr / sl; }
+
+        let k: i32 = 0;
+        while (k < n) {
+            let a0: f64 = step * f64(k);
+            let a1: f64 = step * f64(k + 1);
+            let j0: f64 = mg_ring_scale2(ri, k);
+            let j1: f64 = mg_ring_scale2(ri, (k + 1) % n);
+            let k0: f64 = mg_ring_scale2(ri + 1, k);
+            let k1: f64 = mg_ring_scale2(ri + 1, (k + 1) % n);
+            let dx0: f64 = cos(a0); let dz0: f64 = sin(a0);
+            let dx1: f64 = cos(a1); let dz1: f64 = sin(a1);
+            let c0: i32 = mg_side_col(p_clo, p_chi, dx0, dz0);
+            let c1: i32 = mg_side_col(p_clo, p_chi, dx1, dz1);
+            let u0: f64 = f64(k) / f64(n);
+            let u1: f64 = f64(k + 1) / f64(n);
+
+            if (r0 <= 0.0) {
+                if (r1 > 0.0) {
+                    let a = mg_vn(m, p_cx, y0, p_cz, 0.5, tv0, p_mat, c0, ao0, 0.0, -1.0, 0.0);
+                    let b = mg_vn(m, p_cx + dx0 * r1 * k0, y1, p_cz + dz0 * r1 * k0,
+                                  u0, tv1, p_mat, c0, ao1, dx0, ny, dz0);
+                    let c = mg_vn(m, p_cx + dx1 * r1 * k1, y1, p_cz + dz1 * r1 * k1,
+                                  u1, tv1, p_mat, c1, ao1, dx1, ny, dz1);
+                    mesh_tri(m, a, c, b);
+                }
+            } else {
+                if (r1 <= 0.0) {
+                    let a = mg_vn(m, p_cx, y1, p_cz, 0.5, tv1, p_mat, c0, ao1, 0.0, 1.0, 0.0);
+                    let b = mg_vn(m, p_cx + dx0 * r0 * j0, y0, p_cz + dz0 * r0 * j0,
+                                  u0, tv0, p_mat, c0, ao0, dx0, ny, dz0);
+                    let c = mg_vn(m, p_cx + dx1 * r0 * j1, y0, p_cz + dz1 * r0 * j1,
+                                  u1, tv0, p_mat, c1, ao0, dx1, ny, dz1);
+                    mesh_tri(m, a, b, c);
+                } else {
+                    let q0 = mg_vn(m, p_cx + dx0 * r0 * j0, y0, p_cz + dz0 * r0 * j0,
+                                   u0, tv0, p_mat, c0, ao0, dx0, ny, dz0);
+                    let q1 = mg_vn(m, p_cx + dx1 * r0 * j1, y0, p_cz + dz1 * r0 * j1,
+                                   u1, tv0, p_mat, c1, ao0, dx1, ny, dz1);
+                    let q2 = mg_vn(m, p_cx + dx1 * r1 * k1, y1, p_cz + dz1 * r1 * k1,
+                                   u1, tv1, p_mat, c1, ao1, dx1, ny, dz1);
+                    let q3 = mg_vn(m, p_cx + dx0 * r1 * k0, y1, p_cz + dz0 * r1 * k0,
+                                   u0, tv1, p_mat, c0, ao1, dx0, ny, dz0);
+                    mesh_quad(m, q0, q1, q2, q3);
+                }
+            }
+            k++;
+        }
+        ri++;
+    }
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_spike — a 4-triangle tetrahedral protrusion from base point to tip.
+// This is the signature-protrusion primitive (antenna, spine, tendril, barrel).
+// ---------------------------------------------------------------------------
+export fn mg_spike(p_m, p_bx: f64, p_by: f64, p_bz: f64,
+                   p_tx: f64, p_ty: f64, p_tz: f64, p_w: f64,
+                   p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let t0: i32 = mesh_tri_count(m);
+    let ax: f64 = p_tx - p_bx; let ay: f64 = p_ty - p_by; let az: f64 = p_tz - p_bz;
+    let al: f64 = sqrt(ax * ax + ay * ay + az * az);
+    if (al <= 0.0) { let zero: i32 = 0; return zero; }
+    ax = ax / al; ay = ay / al; az = az / al;
+    let ux: f64 = 1.0; let uy: f64 = 0.0; let uz: f64 = 0.0;
+    if (ay * ay < 0.9) { ux = 0.0; uy = 1.0; uz = 0.0; }
+    let e0x: f64 = uy * az - uz * ay;
+    let e0y: f64 = uz * ax - ux * az;
+    let e0z: f64 = ux * ay - uy * ax;
+    let e0l: f64 = sqrt(e0x * e0x + e0y * e0y + e0z * e0z);
+    e0x = e0x / e0l; e0y = e0y / e0l; e0z = e0z / e0l;
+    let e1x: f64 = ay * e0z - az * e0y;
+    let e1y: f64 = az * e0x - ax * e0z;
+    let e1z: f64 = ax * e0y - ay * e0x;
+
+    let px: array<f64> = [];
+    let py: array<f64> = [];
+    let pz: array<f64> = [];
+    let k: i32 = 0;
+    while (k < 3) {
+        let a: f64 = 2.0 * PI * f64(k) / 3.0;
+        let c: f64 = cos(a); let s: f64 = sin(a);
+        px.push(p_bx + (e0x * c + e1x * s) * p_w);
+        py.push(p_by + (e0y * c + e1y * s) * p_w);
+        pz.push(p_bz + (e0z * c + e1z * s) * p_w);
+        k++;
+    }
+
+    let b0 = mg_v(m, px[0], py[0], pz[0], 0.0, 1.0, p_mat, p_clo, p_ao * 0.86);
+    let b1 = mg_v(m, px[1], py[1], pz[1], 1.0, 1.0, p_mat, p_clo, p_ao * 0.86);
+    let b2 = mg_v(m, px[2], py[2], pz[2], 0.5, 1.0, p_mat, p_clo, p_ao * 0.86);
+    let tip = mg_v(m, p_tx, p_ty, p_tz, 0.5, 0.0, p_mat, p_chi, p_ao);
+    mesh_tri(m, b0, b1, tip);
+    mesh_tri(m, b1, b2, tip);
+    mesh_tri(m, b2, b0, tip);
+    mesh_tri(m, b2, b1, b0);
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// A flat 2-triangle panel in the XY plane at z, facing +Z. Used for enemy
+// NS_MID accent panels, the contact blob and weapon detail plates.
+export fn mg_panel(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
+                   p_hx: f64, p_hy: f64, p_mat: i32, p_col: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let t0: i32 = mesh_tri_count(m);
+    let a = mg_vn(m, p_cx - p_hx, p_cy - p_hy, p_cz, 0.0, 1.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
+    let b = mg_vn(m, p_cx + p_hx, p_cy - p_hy, p_cz, 1.0, 1.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
+    let c = mg_vn(m, p_cx + p_hx, p_cy + p_hy, p_cz, 1.0, 0.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
+    let d = mg_vn(m, p_cx - p_hx, p_cy + p_hy, p_cz, 0.0, 0.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
+    mesh_quad(m, a, b, c, d);
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// A flat 2-triangle quad in the XZ plane facing +Y — the contact shadow blob.
+export fn mg_ground_quad(p_m, p_r: f64, p_mat: i32, p_col: i32, p_ao: f64): i32 {
+    let m = p_m;
+    let t0: i32 = mesh_tri_count(m);
+    let a = mg_vn(m, -p_r, 0.0, -p_r, 0.0, 0.0, p_mat, p_col, p_ao, 0.0, 1.0, 0.0);
+    let b = mg_vn(m, -p_r, 0.0,  p_r, 0.0, 1.0, p_mat, p_col, p_ao, 0.0, 1.0, 0.0);
+    let c = mg_vn(m,  p_r, 0.0,  p_r, 1.0, 1.0, p_mat, p_col, p_ao, 0.0, 1.0, 0.0);
+    let d = mg_vn(m,  p_r, 0.0, -p_r, 1.0, 0.0, p_mat, p_col, p_ao, 0.0, 1.0, 0.0);
+    mesh_quad(m, a, b, c, d);
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ===========================================================================
+// THE REGISTRY
+// ===========================================================================
+
+export let MESH_TREE0     = 0;
+export let MESH_TREE1     = 1;
+export let MESH_TREE2     = 2;
+export let MESH_BUSH      = 3;
+export let MESH_ROCK      = 4;
+export let MESH_CRATE     = 5;
+export let MESH_BARREL    = 6;
+export let MESH_LANTERN   = 7;
+export let MESH_BLOB      = 8;
+
+export let MESH_WISP0     = 9;
+export let MESH_WISP1     = 10;
+export let MESH_WISP2     = 11;
+export let MESH_MOTE0     = 12;
+export let MESH_MOTE1     = 13;
+export let MESH_MOTE2     = 14;
+export let MESH_HUSK0     = 15;
+export let MESH_HUSK1     = 16;
+export let MESH_HUSK2     = 17;
+export let MESH_SPITTER0  = 18;
+export let MESH_SPITTER1  = 19;
+export let MESH_SPITTER2  = 20;
+export let MESH_WARDEN0   = 21;
+export let MESH_WARDEN1   = 22;
+export let MESH_WARDEN2   = 23;
+export let MESH_BULWARK0  = 24;
+export let MESH_BULWARK1  = 25;
+export let MESH_BULWARK2  = 26;
+
+export let MESH_NPC       = 27;
+
+export let MESH_SPARROW_VM    = 28;
+export let MESH_TINKER_VM     = 29;
+export let MESH_BELLOWS_VM    = 30;
+export let MESH_LONGSHADOW_VM = 31;
+export let MESH_KESTREL_VM    = 32;
+export let MESH_EMBERLANCE_VM = 33;
+
+export let MESH_COUNT     = 34;
+
+// enemy classes (index into the six-class tables)
+export let ENEMY_WISP    = 0;
+export let ENEMY_MOTE    = 1;
+export let ENEMY_HUSK    = 2;
+export let ENEMY_SPITTER = 3;
+export let ENEMY_WARDEN  = 4;
+export let ENEMY_BULWARK = 5;
+export let ENEMY_COUNT   = 6;
+
+// kinds, for tooling
+export let MG_KIND_PROP   = 0;
+export let MG_KIND_ENEMY  = 1;
+export let MG_KIND_NPC    = 2;
+export let MG_KIND_WEAPON = 3;
+
+let g_mg_mesh: array = [];
+let g_mg_name: array = [];
+let g_mg_budget: array<i32> = [];
+let g_mg_kind: array<i32> = [];
+let g_mg_view: array<f64> = [];      // preferred contact-sheet yaw, radians
+let g_mg_built: i32 = 0;
+
+// Per-class measurements, filled in during the build. These are the numbers
+// ART_BIBLE 8.2.2 / 8.2.3 are asserted against.
+let g_mg_head_w: array<f64> = [];
+let g_mg_sh_w: array<f64> = [];
+let g_mg_prot_len: array<f64> = [];
+let g_mg_prot_axis: array<i32> = [];
+
+export fn meshgen_count(): i32 { let out: i32 = MESH_COUNT; return out; }
+export fn meshgen_is_built(): i32 { let out: i32 = g_mg_built; return out; }
+export fn meshgen_mesh(p_id: i32) { return g_mg_mesh[p_id]; }
+export fn meshgen_name(p_id: i32): string { let out: string = g_mg_name[p_id]; return out; }
+export fn meshgen_budget(p_id: i32): i32 { let out: i32 = g_mg_budget[p_id]; return out; }
+export fn meshgen_kind(p_id: i32): i32 { let out: i32 = g_mg_kind[p_id]; return out; }
+export fn meshgen_view_yaw(p_id: i32): f64 { let out: f64 = g_mg_view[p_id]; return out; }
+export fn meshgen_tris(p_id: i32): i32 {
+    let out: i32 = mesh_tri_count(g_mg_mesh[p_id]);
+    return out;
+}
+export fn meshgen_radius(p_id: i32): f64 {
+    let out: f64 = mesh_radius(g_mg_mesh[p_id]);
+    return out;
+}
+
+// The enemy mesh for a class at a LOD level (0 near, 1 mid, 2 far).
+export fn meshgen_enemy_mesh(p_class: i32, p_lod: i32): i32 {
+    let out: i32 = MESH_WISP0 + p_class * 3 + p_lod;
+    return out;
+}
+
+// shoulder width / head width — ART_BIBLE 8.2.2, the primary 12 px class read.
+export fn mg_head_shoulder(p_class: i32): f64 {
+    let out: f64 = g_mg_sh_w[p_class] / g_mg_head_w[p_class];
+    return out;
+}
+export fn mg_head_width(p_class: i32): f64 { let out: f64 = g_mg_head_w[p_class]; return out; }
+export fn mg_shoulder_width(p_class: i32): f64 { let out: f64 = g_mg_sh_w[p_class]; return out; }
+// signature protrusion length in metres — ART_BIBLE 8.2.3, must be >= 0.45.
+export fn mg_protrusion(p_class: i32): f64 { let out: f64 = g_mg_prot_len[p_class]; return out; }
+export fn mg_protrusion_axis(p_class: i32): i32 { let out: i32 = g_mg_prot_axis[p_class]; return out; }
+
+fn mg_register(p_id: i32, p_name: string, p_budget: i32, p_kind: i32,
+               p_view: f64, p_cap: i32) {
+    g_mg_mesh[p_id] = mesh_new(p_cap);
+    g_mg_name[p_id] = p_name;
+    g_mg_budget[p_id] = p_budget;
+    g_mg_kind[p_id] = p_kind;
+    g_mg_view[p_id] = p_view;
+}
+
+// ===========================================================================
+// FLORA — ART_BIBLE 8.4
+// ===========================================================================
+//
+// Trunk:  6-sided tapered prism, 4 vertical segments, radius 0.22 -> 0.13 m,
+//         BARK_HI on the +SUN_DIR side and BARK_LO opposite (mg_side_col does
+//         this for every round primitive), kinked 8-12 degrees at segment 2.
+// Canopy: 3 hexagonal discs, radii 2.1/1.7/1.1 at 3.4/4.4/5.1 m, each rotated
+//         20 degrees from the last and offset 0.15-0.3 m laterally in a
+//         deterministic pseudo-random direction. Each disc is a TOP fan
+//         (LEAF_HI at the centre, which catches the sun, -> LEAF_MID at the
+//         rim) and a BOTTOM fan at LEAF_LO * 0.75. That vertical value break is
+//         what turns "hexagon" into "mass".
+// Branch: ONE asymmetric stub at 2.6 m, 4 tris.
+//
+//   4 x 12 (trunk) + 3 x 12 (canopy) + 4 (branch) = 88 tris
+//
+// ART_BIBLE 8.3 budgets the tree at 96; 88 is -8.3 %, inside the +-10 % band.
+// The bible's own arithmetic ("3 canopy discs (24 each) + tapered trunk (24)")
+// cannot be satisfied with the 4-segment trunk and hexagonal discs the same
+// section specifies: 4 segments x 6 sides x 2 = 48 tris of trunk alone. The
+// explicit geometry wins over the arithmetic; the difference is 8 triangles.
+fn build_tree0(p_m, p_seed: i32) {
+    let m = p_m;
+    let seed: i32 = p_seed;
+
+    // --- trunk, 4 segments, kink at segment 2 -----------------------------
+    let kink: f64 = (8.0 + 4.0 * mg_h01(seed * 7 + 1)) * PI / 180.0;
+    let kdir: f64 = mg_h01(seed * 7 + 2) * 2.0 * PI;
+    let ys: array<f64> = [0.0, 0.95, 1.90, 2.80, 3.60];
+    let rs: array<f64> = [0.220, 0.196, 0.172, 0.150, 0.130];
+    let xs: array<f64> = [0.0, 0.0, 0.0, 0.0, 0.0];
+    let zs: array<f64> = [0.0, 0.0, 0.0, 0.0, 0.0];
+    let dx: f64 = 0.0; let dz: f64 = 0.0;
+    let s: i32 = 1;
+    while (s < 5) {
+        if (s >= 2) {
+            let seg: f64 = ys[s] - ys[s - 1];
+            let lean: f64 = sin(kink) * seg;
+            dx = dx + cos(kdir) * lean * (0.55 + 0.45 * f64(s - 1));
+            dz = dz + sin(kdir) * lean * (0.55 + 0.45 * f64(s - 1));
+        }
+        xs[s] = dx; zs[s] = dz;
+        s++;
+    }
+    mg_set_jitter(0.05, seed + 11);
+    s = 0;
+    while (s < 4) {
+        mg_taper(m, xs[s], ys[s], zs[s], xs[s + 1], ys[s + 1], zs[s + 1],
+                 rs[s], rs[s + 1], 6, MG_MAT_BARK, g_BARK_HI, g_BARK_LO, 0.94);
+        s++;
+    }
+    mg_set_jitter(0.0, 0);
+
+    // --- one asymmetric branch stub at 2.6 m ------------------------------
+    let bdir: f64 = kdir + 2.2;
+    let bx: f64 = xs[3] * 0.9; let bz: f64 = zs[3] * 0.9;
+    mg_spike(m, bx, 2.55, bz,
+             bx + cos(bdir) * 1.05, 3.05, bz + sin(bdir) * 1.05, 0.085,
+             MG_MAT_BARK, g_BARK_HI, g_BARK_LO, 0.90);
+
+    // --- canopy: 3 hexagonal discs ----------------------------------------
+    // Radii from ART_BIBLE 8.4. The heights are pulled down from 3.4/4.4/5.1 to
+    // 3.05/3.85/4.50: at the published spacing three domed discs do not touch
+    // and the tree reads as a palm. Overlapping them is what makes "mass".
+    let cr: array<f64> = [2.10, 1.72, 1.15];
+    let ch: array<f64> = [3.05, 3.85, 4.50];
+    let leaf_bot: i32 = mg_scale(g_LEAF_LO, 0.75);
+    let d: i32 = 0;
+    while (d < 3) {
+        let ang: f64 = mg_h01(seed * 13 + d * 3 + 5) * 2.0 * PI;
+        let off: f64 = 0.15 + 0.15 * mg_h01(seed * 13 + d * 3 + 6);
+        let ox: f64 = xs[4] * 0.6 + cos(ang) * off;
+        let oz: f64 = zs[4] * 0.6 + sin(ang) * off;
+        let yaw: f64 = f64(d) * 20.0 * PI / 180.0;
+        mg_set_jitter(0.10, seed + d * 29 + 3);
+        mg_fan_disc(m, ox, ch[d], oz, cr[d], 6, yaw, MG_MAT_LEAF,
+                    g_LEAF_HI, g_LEAF_MID, 1.0, 1.0);
+        mg_fan_disc(m, ox, ch[d] - 0.30, oz, cr[d] * 0.94, 6, yaw, MG_MAT_LEAF,
+                    leaf_bot, leaf_bot, 0.80, -1.0);
+        mg_set_jitter(0.0, 0);
+        d++;
+    }
+}
+
+// LOD1: 8-sided single-segment trunk (16) + one hex disc top+bottom (12) +
+// one hex top fan (6) = 34 tris, exactly the ART_BIBLE 8.3 budget.
+fn build_tree1(p_m, p_seed: i32) {
+    let m = p_m;
+    let seed: i32 = p_seed;
+    let kdir: f64 = mg_h01(seed * 7 + 2) * 2.0 * PI;
+    let lean: f64 = 0.13;
+    mg_set_jitter(0.04, seed + 5);
+    mg_taper(m, 0.0, 0.0, 0.0,
+             cos(kdir) * lean, 3.55, sin(kdir) * lean,
+             0.215, 0.132, 8, MG_MAT_BARK, g_BARK_HI, g_BARK_LO, 0.94);
+    mg_set_jitter(0.10, seed + 6);
+    let ox: f64 = cos(kdir) * (lean + 0.22);
+    let oz: f64 = sin(kdir) * (lean + 0.22);
+    mg_fan_disc(m, ox, 3.45, oz, 2.05, 6, 0.0, MG_MAT_LEAF,
+                g_LEAF_HI, g_LEAF_MID, 1.0, 1.0);
+    mg_fan_disc(m, ox, 3.15, oz, 1.90, 6, 0.0, MG_MAT_LEAF,
+                mg_scale(g_LEAF_LO, 0.75), mg_scale(g_LEAF_LO, 0.75), 0.80, -1.0);
+    mg_fan_disc(m, ox * 0.4 - 0.38, 4.15, oz * 0.4 + 0.22, 1.30, 6, 0.6,
+                MG_MAT_LEAF, g_LEAF_HI, g_LEAF_MID, 1.0, 1.0);
+    mg_set_jitter(0.0, 0);
+}
+
+// LOD2: two crossed quads, both faces, 8 tris. No texture detail survives at
+// 45 m; what survives is a dark mass with a lit top.
+fn build_tree2(p_m, p_seed: i32) {
+    let m = p_m;
+    let w: f64 = 1.95;
+    let y0: f64 = 0.85;
+    let y1: f64 = 5.05;
+    let top: i32 = g_LEAF_MID;
+    let bot: i32 = mg_scale(g_LEAF_LO, 0.82);
+    let k: i32 = 0;
+    while (k < 2) {
+        let a: f64 = 0.35 + f64(k) * PI * 0.5;
+        let dx: f64 = cos(a) * w; let dz: f64 = sin(a) * w;
+        // asymmetric: the second card is narrower, offset and taller, so the
+        // silhouette has a shoulder on one side. Two identical crossed quads
+        // are a plus sign from every angle and read as a bush, not a tree.
+        let sx: f64 = 0.0; let sz: f64 = 0.0;
+        let hy: f64 = 0.0;
+        if (k == 1) { sx = 1.05; sz = -0.25; hy = 0.70; }
+        let a0 = mg_vn(m, sx - dx, y0, sz - dz, 0.0, 1.0, MG_MAT_LEAF, bot, 0.86, -dz, 0.35, dx);
+        let a1 = mg_vn(m, sx + dx, y0, sz + dz, 1.0, 1.0, MG_MAT_LEAF, bot, 0.86, -dz, 0.35, dx);
+        let a2 = mg_vn(m, sx + dx, y1 + hy, sz + dz, 1.0, 0.0, MG_MAT_LEAF, top, 1.0, -dz, 0.35, dx);
+        let a3 = mg_vn(m, sx - dx, y1 + hy, sz - dz, 0.0, 0.0, MG_MAT_LEAF, top, 1.0, -dz, 0.35, dx);
+        mesh_quad(m, a0, a1, a2, a3);
+        let b0 = mg_vn(m, sx + dx, y0, sz + dz, 0.0, 1.0, MG_MAT_LEAF, bot, 0.86, dz, 0.35, -dx);
+        let b1 = mg_vn(m, sx - dx, y0, sz - dz, 1.0, 1.0, MG_MAT_LEAF, bot, 0.86, dz, 0.35, -dx);
+        let b2 = mg_vn(m, sx - dx, y1 + hy, sz - dz, 1.0, 0.0, MG_MAT_LEAF, top, 1.0, dz, 0.35, -dx);
+        let b3 = mg_vn(m, sx + dx, y1 + hy, sz + dz, 0.0, 0.0, MG_MAT_LEAF, top, 1.0, dz, 0.35, -dx);
+        mesh_quad(m, b0, b1, b2, b3);
+        k++;
+    }
+}
+
+// Bush, 22 tris: a hex dome (6 top fan + 12 skirt band) plus a 4-tri sprig
+// leaning out of one side. The sprig is the orientation cue.
+fn build_bush(p_m, p_seed: i32) {
+    let m = p_m;
+    let seed: i32 = p_seed;
+    mg_set_jitter(0.16, seed + 21);
+    mg_taper(m, 0.0, 0.02, 0.0, 0.06, 0.46, -0.04, 0.62, 0.40, 6,
+             MG_MAT_LEAF, g_LEAF_MID, mg_scale(g_LEAF_LO, 0.80), 0.90);
+    mg_fan_disc(m, 0.06, 0.52, -0.04, 0.40, 6, 0.5, MG_MAT_LEAF,
+                g_LEAF_HI, g_LEAF_MID, 1.0, 1.0);
+    mg_set_jitter(0.0, 0);
+    let a: f64 = mg_h01(seed * 3 + 7) * 2.0 * PI;
+    mg_spike(m, 0.10, 0.36, 0.02,
+             0.10 + cos(a) * 0.62, 0.78, 0.02 + sin(a) * 0.62, 0.09,
+             MG_MAT_LEAF, g_LEAF_HI, g_LEAF_MID, 0.94);
+}
+
+// Rock, 18 tris: a 6-sided lathe through three profile rings, the last one
+// collapsed to a point so the top closes into a cone (12 + 6). Heavy radial
+// jitter means no two facets match and no two instances look alike under a
+// random yaw. Sits ON the ground: no bottom cap, nobody sees it.
+let g_rock_r: array<f64> = [0.58, 0.40, 0.0];
+let g_rock_y: array<f64> = [0.0, 0.30, 0.46];
+fn build_rock(p_m, p_seed: i32) {
+    let m = p_m;
+    mg_set_jitter(0.36, p_seed + 41);
+    mg_lathe(m, 0.0, 0.0, 0.0, g_rock_r, g_rock_y, 3, 6,
+             MG_MAT_STONE, g_STONE_HI, g_STONE_LO, 0.94);
+    mg_set_jitter(0.0, 0);
+}
+
+// Crate, 12 tris: a single skewed, tapered box. A cube is the most symmetric
+// object possible, so this one leans and its lid is offset — at 12 px that lean
+// is the entire read.
+fn build_crate(p_m) {
+    mg_box_ex(p_m, 0.0, 0.42, 0.0, 0.40, 0.42, 0.40,
+              0.09, -0.05, 0.93, MG_MAT_WOOD, g_WOOD_HI, g_WOOD_LO, 0.95);
+}
+
+// Barrel, 24 tris: 8-sided body band (16) + top fan (8), staves dented by the
+// radial jitter. It LEANS: a plumb-vertical cylinder is mirror-symmetric from
+// every horizontal angle and therefore invisible as an orientation cue, and a
+// leaning barrel also reads as debris rather than as level furniture.
+fn build_barrel(p_m, p_seed: i32) {
+    let m = p_m;
+    mg_set_jitter(0.13, p_seed + 61);
+    mg_taper(m, 0.0, 0.0, 0.0, 0.155, 0.845, 0.05, 0.31, 0.28, 8,
+             MG_MAT_METAL, g_RUST, g_RUST_DARK, 0.93);
+    mg_fan_disc(m, 0.155, 0.845, 0.05, 0.28, 8, 0.2, MG_MAT_METAL,
+                g_STEEL_MID, g_RUST, 1.0, 1.0);
+    mg_set_jitter(0.0, 0);
+}
+
+// Lantern post, 40 tris: 6-sided post (12) + base flare fan (6) + lantern head
+// box (12) + a side bracket arm (12 -> 4 with a spike). The arm is on ONE side.
+// This is the object the whole game's progression hangs off, so it gets a
+// silhouette nobody can mistake at 30 m.
+fn build_lantern(p_m) {
+    let m = p_m;
+    mg_prism(m, 0.0, 1.15, 0.0, 0.088, 2.30, 6, 0.0, 0,
+             MG_MAT_METAL, g_STEEL_MID, g_STEEL_LO, 0.92);          // 12
+    mg_fan_disc(m, 0.0, 0.10, 0.0, 0.26, 6, 0.0, MG_MAT_STONE,
+                g_STONE_HI, g_STONE_MID, 0.92, 1.0);                 // 6
+    mg_box(m, 0.0, 2.52, 0.0, 0.17, 0.22, 0.17,
+           MG_MAT_METAL, g_BRASS, g_BRASS_LO, 1.0);                  // 12
+    mg_box(m, 0.0, 2.76, 0.0, 0.21, 0.04, 0.21,
+           MG_MAT_METAL, g_BRASS, g_BRASS_LO, 1.0);                  // 12
+    mg_spike(m, 0.14, 2.40, 0.0, 0.62, 2.62, 0.0, 0.05,
+             MG_MAT_METAL, g_STEEL_HI, g_STEEL_LO, 0.95);            // 4
+    mg_panel(m, 0.0, 2.52, 0.175, 0.11, 0.15, MG_MAT_GLASS, g_NS_CORE, 1.0);
+}
+
+// Contact shadow blob, 2 tris. ART_BIBLE 4.3.1: "the highest-value 2 triangles
+// in the project". Every prop and every entity gets one.
+//
+// It is NOT a square: the blob is sheared away from the sun's horizontal
+// direction and stretched along it, because that is where a shadow goes. That
+// also makes the only 2-triangle mesh in the library obey the asymmetry rule
+// instead of needing an exemption from it.
+fn build_blob(p_m) {
+    let m = p_m;
+    let col: i32 = mg_mix(g_UI_BLACK, g_DIRT_LO, 0.55);
+    let sx: f64 = 0.0 - g_mg_sun_ax;
+    let sz: f64 = 0.0 - g_mg_sun_az;
+    let e: f64 = 0.42;                  // elongation along the shadow direction
+    let ox: f64 = sx * 0.30;
+    let oz: f64 = sz * 0.30;
+    let a = mg_vn(m, ox - 1.0 - sx * e, 0.0, oz - 1.0 - sz * e, 0.0, 0.0,
+                  MG_MAT_DIRT, col, 1.0, 0.0, 1.0, 0.0);
+    let b = mg_vn(m, ox - 1.0 + sx * e, 0.0, oz + 1.0 + sz * e, 0.0, 1.0,
+                  MG_MAT_DIRT, col, 0.94, 0.0, 1.0, 0.0);
+    let c = mg_vn(m, ox + 1.0 + sx * e, 0.0, oz + 1.0 + sz * e, 1.0, 1.0,
+                  MG_MAT_DIRT, col, 1.0, 0.0, 1.0, 0.0);
+    let d = mg_vn(m, ox + 1.0 - sx * e, 0.0, oz - 1.0 - sz * e, 1.0, 0.0,
+                  MG_MAT_DIRT, col, 0.94, 0.0, 1.0, 0.0);
+    mesh_quad(m, a, b, c, d);
+}
+
+// ===========================================================================
+// ENEMIES — six classes, three LODs, rigid part hierarchies
+// ===========================================================================
+//
+// ART_BIBLE 8.2.2 head:shoulder ratios, spread so that no two classes are
+// within 0.25 of each other:
+//
+//   Wisp 1.05 | Spitter 1.35 | Husk 1.70 | Mote 2.10 | Warden 2.60 | Bulwark 3.20
+//
+// and 8.2.3 signature protrusions, each >= 0.45 m and each on a different axis:
+//
+//   Wisp     trailing tail spike        -Z
+//   Mote     hanging tendril            -Y
+//   Husk     backpack antenna           +Y
+//   Spitter  side-mounted spout          +X
+//   Warden   forward shoulder ram        +Z
+//   Bulwark  oversized left arm + spike -X
+
+// per-class body proportions, indexed by ENEMY_*
+//                                 wisp  mote  husk  spit  ward  bulw
+let g_hu_height: array<f64>   = [ 0.55, 0.90, 1.85, 2.05, 2.30, 3.20 ];
+// head half-width, then shoulder half-width == head * the ratio above. The
+// heads are deliberately large: a 0.26 m head on a 1.85 m body is 1.4 px wide
+// at 30 m and disappears. PS1 characters are chunky for exactly this reason.
+let g_hu_head_hw: array<f64>  = [ 0.180,0.115,0.155,0.150,0.150,0.175 ];
+let g_hu_sh_hw: array<f64>    = [ 0.189,0.2415,0.2635,0.2025,0.390,0.560 ];
+// Protrusion lengths are the SPIKE lengths; what ART_BIBLE 8.2.3 asks for is
+// how far the spike reaches BEYOND the body, which is what mg_measure_class
+// reports and what --verify asserts. These values were tuned until every class
+// measures >= 0.50 m of clear overhang.
+let g_hu_prot: array<f64>     = [ 0.62, 0.66, 1.02, 0.86, 1.20, 1.50 ];
+// Six classes, six DIFFERENT protrusion axes, so no two classes read the same
+// at 12 px: 0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z.
+let g_hu_axis: array<i32>     = [ 5,    3,    2,    0,    4,    1 ];
+
+fn hu_body_col(p_class: i32): i32 {
+    if (p_class == ENEMY_WISP)    { let c: i32 = g_NIGHTSHADE_FLORA; return c; }
+    if (p_class == ENEMY_MOTE)    { let c: i32 = g_ICHOR; return c; }
+    if (p_class == ENEMY_HUSK)    { let c: i32 = g_MUD; return c; }
+    if (p_class == ENEMY_SPITTER) { let c: i32 = g_STONE_MOSS; return c; }
+    if (p_class == ENEMY_WARDEN)  { let c: i32 = g_GRANITE_LO; return c; }
+    let c: i32 = g_STONE_MID;
+    return c;
+}
+fn hu_limb_col(p_class: i32): i32 {
+    if (p_class == ENEMY_WISP)    { let c: i32 = g_NS_MID; return c; }
+    if (p_class == ENEMY_MOTE)    { let c: i32 = g_NS_MID; return c; }
+    if (p_class == ENEMY_HUSK)    { let c: i32 = g_DIRT_MID; return c; }
+    if (p_class == ENEMY_SPITTER) { let c: i32 = g_LEAF_SICK; return c; }
+    if (p_class == ENEMY_WARDEN)  { let c: i32 = g_STEEL_MID; return c; }
+    let c: i32 = g_GRANITE_HI;
+    return c;
+}
+
+// The humanoid classes (Husk, Spitter, Warden, Bulwark) share one part
+// hierarchy driven by the proportion table. LOD0 186 tris, LOD1 90, LOD2 28
+// against ART_BIBLE 8.3's 180 / 90 / 28.
+fn build_humanoid(p_m, p_class: i32, p_lod: i32) {
+    let m = p_m;
+    let cls: i32 = p_class;
+    let h: f64 = g_hu_height[cls];
+    let hw: f64 = g_hu_head_hw[cls];
+    let sw: f64 = g_hu_sh_hw[cls];
+    let body: i32 = hu_body_col(cls);
+    let limb: i32 = hu_limb_col(cls);
+    let dark: i32 = mg_scale(body, 0.78);
+    // ART_BIBLE 8.2.5 — value-block the model at build time: head and upper
+    // torso brighter, legs darker. This is a built-in top-lit gradient that
+    // survives any lighting condition and is what stops a character reading as
+    // one flat blob at 12 px, where no lighting detail survives.
+    let vhi: i32 = mg_scale(body, 1.30);
+    let vlo: i32 = mg_scale(limb, 0.82);
+    let lhi: i32 = mg_scale(limb, 1.14);
+
+    let leg_top: f64 = h * 0.47;
+    let hip_y: f64 = leg_top + h * 0.05;
+    let torso_y: f64 = h * 0.68;
+    let sh_y: f64 = h * 0.80;
+    let head_y: f64 = h - hw * 1.05;
+    let lean: f64 = h * 0.035;          // forward lean, every class hunches a little
+    let hip_hw: f64 = sw * 0.74;
+    let arm_r: f64 = sw * 0.30;
+    let leg_r: f64 = sw * 0.34;
+    // The Bulwark's read at 12 px is "one arm is wrong". It gets an oversized
+    // LEFT arm — by scaling the existing boxes, not by adding new ones, so the
+    // miniboss stays inside the same 186/88/28 triangle envelope as the rest.
+    let larm_r: f64 = arm_r;
+    if (cls == ENEMY_BULWARK) { larm_r = arm_r * 1.75; }
+
+    if (p_lod == 2) {
+        // box-man: head + body + protrusion. 28 tris.
+        mg_box(m, 0.0, h * 0.42, lean * 0.4, sw * 0.86, h * 0.42, sw * 0.70,
+               MG_MAT_HIDE, body, vlo, 0.95);
+        mg_box_ex(m, hw * 0.30, head_y, lean, hw, hw * 1.05, hw * 0.92,
+                  hw * 0.22, 0.0, 0.92, MG_MAT_HIDE, vhi, body, 1.0);
+    } else {
+        if (p_lod == 1) {
+            // head, torso, pelvis, 2 arms, 2 legs = 84
+            mg_box_ex(m, hw * 0.28, head_y, lean, hw, hw * 1.05, hw * 0.92,
+                      hw * 0.24, 0.0, 0.92, MG_MAT_HIDE, vhi, body, 1.0);
+            mg_box_ex(m, 0.0, torso_y, lean * 0.7, sw, h * 0.13, sw * 0.72,
+                      0.0, lean * 0.5, 0.86, MG_MAT_HIDE, vhi, dark, 0.98);
+            mg_box(m, 0.0, hip_y, 0.0, hip_hw, h * 0.07, hip_hw * 0.66,
+                   MG_MAT_HIDE, body, dark, 0.92);
+            mg_box_ex(m, 0.0 - sw - larm_r * 0.7, torso_y - h * 0.06, lean * 0.4,
+                      larm_r, h * 0.20, larm_r,
+                      0.0 - larm_r * 0.9, larm_r * 1.4, 0.86,
+                      MG_MAT_HIDE, limb, dark, 0.92);
+            mg_box_ex(m, sw + arm_r * 0.7, torso_y - h * 0.09, lean * 0.4,
+                      arm_r * 0.92, h * 0.22, arm_r * 0.92,
+                      arm_r * 0.5, 0.0 - arm_r * 1.8, 0.86,
+                      MG_MAT_HIDE, limb, dark, 0.92);
+            mg_box(m, 0.0 - hip_hw * 0.55, leg_top * 0.5, 0.0,
+                   leg_r, leg_top * 0.5, leg_r, MG_MAT_HIDE, vlo, dark, 0.86);
+            mg_box_ex(m, hip_hw * 0.55, leg_top * 0.5, 0.0,
+                      leg_r, leg_top * 0.5, leg_r, 0.0, leg_r * 1.2, 1.0,
+                      MG_MAT_HIDE, vlo, dark, 0.86);
+        } else {
+            // LOD0: 14 boxes + pauldron + panel + spike
+            // head (cocked: skewed and offset, ART_BIBLE 8.2.1)
+            mg_box_ex(m, hw * 0.30, head_y, lean, hw, hw * 1.05, hw * 0.92,
+                      hw * 0.26, hw * 0.10, 0.90, MG_MAT_HIDE, vhi, body, 1.0);
+            // upper torso / lower torso / pelvis — a descending value ramp
+            mg_box_ex(m, 0.0, sh_y - h * 0.04, lean * 0.8, sw, h * 0.08, sw * 0.70,
+                      0.0, lean * 0.4, 0.94, MG_MAT_HIDE, vhi, body, 1.0);
+            mg_box_ex(m, 0.0, torso_y - h * 0.03, lean * 0.5, sw * 0.86, h * 0.09, sw * 0.66,
+                      0.0, lean * 0.4, 0.90, MG_MAT_HIDE, body, dark, 0.96);
+            mg_box(m, 0.0, hip_y, 0.0, hip_hw, h * 0.06, hip_hw * 0.66,
+                   MG_MAT_HIDE, body, dark, 0.90);
+            // left arm (upper + lower), hanging — oversized on the Bulwark
+            mg_box_ex(m, 0.0 - sw - larm_r * 0.8, sh_y - h * 0.10, lean * 0.5,
+                      larm_r, h * 0.11, larm_r, 0.0 - larm_r * 0.6, larm_r, 0.90,
+                      MG_MAT_HIDE, limb, dark, 0.94);
+            mg_box_ex(m, 0.0 - sw - larm_r * 1.6, sh_y - h * 0.29, lean * 0.9,
+                      larm_r * 0.86, h * 0.10, larm_r * 0.86, 0.0, larm_r * 1.6, 0.86,
+                      MG_MAT_HIDE, limb, dark, 0.90);
+            // right arm (upper + lower), raised — the asymmetric pose
+            mg_box_ex(m, sw + arm_r * 0.8, sh_y - h * 0.06, lean * 0.5,
+                      arm_r * 0.94, h * 0.11, arm_r * 0.94, arm_r * 0.8, 0.0 - arm_r, 0.90,
+                      MG_MAT_HIDE, lhi, limb, 0.96);
+            mg_box_ex(m, sw + arm_r * 2.0, sh_y - h * 0.20, 0.0 - lean * 1.2,
+                      arm_r * 0.80, h * 0.10, arm_r * 0.80, arm_r * 0.4, 0.0 - arm_r * 2.0, 0.86,
+                      MG_MAT_HIDE, limb, dark, 0.90);
+            // legs
+            mg_box(m, 0.0 - hip_hw * 0.56, leg_top * 0.74, 0.0,
+                   leg_r, leg_top * 0.26, leg_r, MG_MAT_HIDE, vlo, dark, 0.88);
+            mg_box_ex(m, 0.0 - hip_hw * 0.58, leg_top * 0.26, 0.02,
+                      leg_r * 0.86, leg_top * 0.26, leg_r * 0.86, 0.0, 0.0 - leg_r * 0.5, 0.94,
+                      MG_MAT_HIDE, vlo, dark, 0.84);
+            mg_box(m, hip_hw * 0.56, leg_top * 0.74, 0.03,
+                   leg_r, leg_top * 0.26, leg_r, MG_MAT_HIDE, vlo, dark, 0.88);
+            mg_box_ex(m, hip_hw * 0.58, leg_top * 0.26, 0.05,
+                      leg_r * 0.86, leg_top * 0.26, leg_r * 0.86, 0.0, leg_r * 0.6, 0.94,
+                      MG_MAT_HIDE, vlo, dark, 0.84);
+            // feet — the right one is planted forward, the left is dragged
+            mg_box(m, 0.0 - hip_hw * 0.58, leg_r * 0.55, 0.0 - leg_r * 0.4,
+                   leg_r * 0.92, leg_r * 0.55, leg_r * 1.7, MG_MAT_HIDE, dark, dark, 0.82);
+            mg_box(m, hip_hw * 0.58, leg_r * 0.55, leg_r * 1.1,
+                   leg_r * 0.92, leg_r * 0.55, leg_r * 1.9, MG_MAT_HIDE, dark, dark, 0.82);
+            // ONE pauldron, left shoulder only (ART_BIBLE 8.2.1)
+            mg_box_ex(m, 0.0 - sw - arm_r * 0.5, sh_y + h * 0.01, lean * 0.5,
+                      sw * 0.42, h * 0.045, sw * 0.50, 0.0 - sw * 0.16, 0.0, 0.72,
+                      MG_MAT_METAL, limb, dark, 1.0);
+            // NS_MID accent panel on the chest (violet = hostile, CLAUDE.md 8)
+            mg_panel(m, 0.0 - sw * 0.18, sh_y - h * 0.05, sw * 0.62 + 0.008,
+                     sw * 0.26, h * 0.045, MG_MAT_HIDE, g_NS_MID, 1.0);
+        }
+    }
+
+    // --- the signature protrusion, always last so it can be measured -------
+    let plen: f64 = g_hu_prot[cls];
+    let ax: i32 = g_hu_axis[cls];
+    let bxx: f64 = 0.0; let byy: f64 = 0.0; let bzz: f64 = 0.0;
+    let txx: f64 = 0.0; let tyy: f64 = 0.0; let tzz: f64 = 0.0;
+    if (ax == 2) {
+        // backpack antenna / shoulder spine: up and back, off-centre
+        bxx = 0.0 - sw * 0.55; byy = sh_y; bzz = 0.0 - sw * 0.45;
+        txx = bxx - plen * 0.26; tyy = byy + plen * 0.92; tzz = bzz - plen * 0.24;
+    } else {
+        if (ax == 0) {
+            // side spout, right side, angled forward and up
+            bxx = sw * 0.75; byy = sh_y - h * 0.02; bzz = 0.0;
+            txx = bxx + plen * 0.86; tyy = byy + plen * 0.34; tzz = bzz + plen * 0.36;
+        } else {
+            if (ax == 1) {
+                // oversized left arm terminating in a spike
+                bxx = 0.0 - sw * 1.05; byy = sh_y - h * 0.16; bzz = 0.0;
+                txx = bxx - plen * 0.80; tyy = byy - plen * 0.50; tzz = bzz + plen * 0.30;
+            } else {
+                // forward shoulder ram: the Warden's whole design is "stop
+                // shooting the front, go around", so its signature reaches
+                // FORWARD off one shoulder rather than up off its back.
+                bxx = 0.0 - sw * 0.42; byy = sh_y + h * 0.01; bzz = sw * 0.55;
+                txx = bxx - plen * 0.22; tyy = byy + plen * 0.24; tzz = bzz + plen * 0.94;
+            }
+        }
+    }
+    let w: f64 = sw * 0.28;
+    if (w > 0.12) { w = 0.12; }
+    mg_spike(m, bxx, byy, bzz, txx, tyy, tzz, w,
+             MG_MAT_METAL, hu_limb_col(cls), mg_scale(hu_limb_col(cls), 0.72), 1.0);
+}
+
+// Wisp — a floating shard cluster, no humanoid form at all. 24 / 12 / 6 tris.
+fn build_wisp(p_m, p_lod: i32) {
+    let m = p_m;
+    let core: i32 = g_NIGHTSHADE_FLORA;
+    let hot: i32 = g_NS_CORE;
+    if (p_lod == 2) {
+        mg_fan_disc(m, 0.0, 0.42, 0.0, 0.17, 3, 0.4, MG_MAT_HIDE, hot, core, 1.0, 1.0);
+        mg_fan_disc(m, 0.0, 0.38, 0.0, 0.16, 3, 0.4, MG_MAT_HIDE, core, core, 0.9, -1.0);
+        return;
+    }
+    if (p_lod == 1) {
+        mg_set_jitter(0.18, 71);
+        mg_taper(m, 0.0, 0.30, 0.0, 0.03, 0.52, 0.0, 0.17, 0.10, 3,
+                 MG_MAT_HIDE, hot, core, 1.0);                      // 6
+        mg_set_jitter(0.0, 0);
+        mg_spike(m, 0.0, 0.40, 0.06, 0.0, 0.30, 0.62, 0.07,
+                 MG_MAT_HIDE, hot, core, 0.94);                     // 4
+        mg_panel(m, 0.06, 0.44, 0.14, 0.06, 0.05, MG_MAT_HIDE, hot, 1.0);  // 2
+        return;
+    }
+    // LOD0: 24
+    mg_set_jitter(0.22, 73);
+    mg_taper(m, 0.0, 0.24, 0.0, 0.04, 0.56, 0.02, 0.18, 0.09, 4,
+             MG_MAT_HIDE, hot, core, 1.0);                          // 8
+    mg_set_jitter(0.0, 0);
+    mg_fan_disc(m, 0.04, 0.56, 0.02, 0.09, 4, 0.3, MG_MAT_HIDE, hot, core, 1.0, 1.0);  // 4
+    // one big shard on the left, one small on the right — asymmetry
+    mg_spike(m, -0.10, 0.44, 0.0, -0.46, 0.60, -0.10, 0.06,
+             MG_MAT_HIDE, hot, core, 0.96);                         // 4
+    mg_spike(m, 0.11, 0.34, 0.0, 0.30, 0.24, 0.06, 0.045,
+             MG_MAT_HIDE, hot, core, 0.96);                         // 4
+    // trailing tail spike, -Z, 0.55 m — the signature protrusion
+    mg_spike(m, 0.0, 0.36, -0.10, 0.0, 0.30, -0.62, 0.05,
+             MG_MAT_HIDE, hot, core, 0.94);                         // 4
+}
+
+// Mote — a slow bulb with a hanging tendril. 32 / 16 / 8 tris.
+fn build_mote(p_m, p_lod: i32) {
+    let m = p_m;
+    let body: i32 = g_ICHOR;
+    let skin: i32 = g_NS_MID;
+    if (p_lod == 2) {
+        mg_taper(m, 0.0, 0.30, 0.0, 0.0, 0.62, 0.0, 0.21, 0.10, 3,
+                 MG_MAT_HIDE, body, skin, 1.0);                      // 6
+        // the tendril survives as a 2-tri card at 9 px; a tetrahedron would
+        // cost 4 and blow the 8-triangle budget
+        mg_panel(m, 0.07, 0.06, 0.03, 0.035, 0.26, MG_MAT_HIDE, skin, 0.9);  // 2
+        return;
+    }
+    if (p_lod == 1) {
+        mg_set_jitter(0.12, 83);
+        mg_taper(m, 0.0, 0.24, 0.0, 0.02, 0.64, 0.0, 0.21, 0.09, 4,
+                 MG_MAT_HIDE, body, skin, 1.0);                      // 8
+        mg_set_jitter(0.0, 0);
+        mg_fan_disc(m, 0.02, 0.64, 0.0, 0.09, 4, 0.0, MG_MAT_HIDE, skin, body, 1.0, 1.0); // 4
+        mg_spike(m, 0.06, 0.26, 0.02, 0.10, 0.0 - 0.32, 0.05, 0.05,
+                 MG_MAT_HIDE, skin, body, 0.9);                      // 4
+        return;
+    }
+    // LOD0: 32
+    mg_set_jitter(0.14, 87);
+    mg_taper(m, 0.0, 0.20, 0.0, 0.03, 0.50, 0.0, 0.21, 0.17, 6,
+             MG_MAT_HIDE, body, skin, 1.0);                          // 12
+    mg_taper(m, 0.03, 0.50, 0.0, 0.05, 0.74, 0.02, 0.17, 0.06, 6,
+             MG_MAT_HIDE, skin, body, 1.0);                          // 12
+    mg_set_jitter(0.0, 0);
+    mg_fan_disc(m, 0.05, 0.74, 0.02, 0.06, 4, 0.0, MG_MAT_HIDE, skin, body, 1.0, 1.0); // 4
+    // hanging tendril, -Y, 0.60 m — the signature protrusion
+    mg_spike(m, 0.07, 0.22, 0.03, 0.13, 0.0 - 0.38, 0.07, 0.05,
+             MG_MAT_HIDE, skin, body, 0.88);                         // 4
+}
+
+// ===========================================================================
+// NPC — hub-only, always LOD0, 210 tris against ART_BIBLE 8.3's 220.
+// Warm palette, NO violet: violet means hostile (CLAUDE.md 8).
+// ===========================================================================
+fn build_npc(p_m) {
+    let m = p_m;
+    let h: f64 = 1.75;
+    let hw: f64 = 0.115;
+    let sw: f64 = 0.230;                 // ratio 2.00, distinct from every enemy
+    let cloth: i32 = g_FABRIC_CREAM;
+    let coat: i32 = g_PAINT_TEAL;
+    let skin: i32 = g_SAND;
+    let dark: i32 = mg_scale(coat, 0.74);
+
+    let leg_top: f64 = h * 0.46;
+    let hip_y: f64 = leg_top + h * 0.05;
+    let sh_y: f64 = h * 0.80;
+    let head_y: f64 = h - hw * 1.15;
+    let arm_r: f64 = sw * 0.26;
+    let leg_r: f64 = sw * 0.30;
+    let hip_hw: f64 = sw * 0.74;
+
+    // head + torso stack (turned head: the "someone is looking at you" cue)
+    mg_box_ex(m, 0.0 - hw * 0.24, head_y, 0.02, hw, hw * 1.15, hw * 0.92,
+              0.0 - hw * 0.20, hw * 0.16, 0.94, MG_MAT_CLOTH, skin, mg_scale(skin, 0.76), 1.0);
+    mg_box_ex(m, 0.0, sh_y - h * 0.04, 0.0, sw, h * 0.08, sw * 0.58,
+              0.0, 0.0, 0.96, MG_MAT_CLOTH, coat, dark, 1.0);
+    mg_box_ex(m, 0.0, h * 0.66, 0.0, sw * 0.90, h * 0.10, sw * 0.55,
+              0.0, 0.0, 0.94, MG_MAT_CLOTH, coat, dark, 0.96);
+    mg_box(m, 0.0, hip_y, 0.0, hip_hw, h * 0.06, hip_hw * 0.68,
+           MG_MAT_CLOTH, cloth, mg_scale(cloth, 0.78), 0.92);
+    // arms
+    mg_box_ex(m, 0.0 - sw - arm_r * 0.8, sh_y - h * 0.10, 0.0,
+              arm_r, h * 0.11, arm_r, 0.0 - arm_r * 0.4, 0.0, 0.92,
+              MG_MAT_CLOTH, coat, dark, 0.94);
+    mg_box_ex(m, 0.0 - sw - arm_r * 1.3, sh_y - h * 0.28, arm_r * 1.2,
+              arm_r * 0.88, h * 0.10, arm_r * 0.88, 0.0, arm_r * 1.8, 0.90,
+              MG_MAT_CLOTH, skin, mg_scale(skin, 0.76), 0.90);
+    mg_box_ex(m, sw + arm_r * 0.8, sh_y - h * 0.09, 0.0,
+              arm_r, h * 0.11, arm_r, arm_r * 0.4, 0.0, 0.92,
+              MG_MAT_CLOTH, coat, dark, 0.94);
+    mg_box_ex(m, sw + arm_r * 1.5, sh_y - h * 0.26, 0.0 - arm_r * 1.5,
+              arm_r * 0.88, h * 0.10, arm_r * 0.88, 0.0, 0.0 - arm_r * 1.6, 0.90,
+              MG_MAT_CLOTH, skin, mg_scale(skin, 0.76), 0.90);
+    // legs + boots
+    mg_box(m, 0.0 - hip_hw * 0.56, leg_top * 0.72, 0.0,
+           leg_r, leg_top * 0.28, leg_r, MG_MAT_CLOTH, cloth, mg_scale(cloth, 0.78), 0.90);
+    mg_box(m, 0.0 - hip_hw * 0.56, leg_top * 0.26, 0.0,
+           leg_r * 0.9, leg_top * 0.26, leg_r * 0.9, MG_MAT_CLOTH, cloth, mg_scale(cloth, 0.72), 0.86);
+    mg_box(m, hip_hw * 0.56, leg_top * 0.72, 0.02,
+           leg_r, leg_top * 0.28, leg_r, MG_MAT_CLOTH, cloth, mg_scale(cloth, 0.78), 0.90);
+    mg_box(m, hip_hw * 0.56, leg_top * 0.26, 0.04,
+           leg_r * 0.9, leg_top * 0.26, leg_r * 0.9, MG_MAT_CLOTH, cloth, mg_scale(cloth, 0.72), 0.86);
+    mg_box(m, 0.0 - hip_hw * 0.56, leg_r * 0.5, 0.0 - leg_r * 0.5,
+           leg_r * 0.94, leg_r * 0.5, leg_r * 1.8, MG_MAT_CLOTH, g_WOOD_LO, g_WOOD_LO, 0.82);
+    mg_box(m, hip_hw * 0.56, leg_r * 0.5, leg_r * 0.6,
+           leg_r * 0.94, leg_r * 0.5, leg_r * 1.8, MG_MAT_CLOTH, g_WOOD_LO, g_WOOD_LO, 0.82);
+    // charm: brimmed hat (2 boxes), a satchel on ONE hip, a scarf
+    mg_box_ex(m, 0.0 - hw * 0.24, head_y + hw * 1.30, 0.02, hw * 1.05, hw * 0.42, hw * 1.05,
+              0.0, 0.0, 0.86, MG_MAT_CLOTH, g_PAINT_OCHRE, mg_scale(g_PAINT_OCHRE, 0.72), 1.0);
+    mg_box(m, 0.0 - hw * 0.24, head_y + hw * 0.92, 0.02, hw * 1.85, hw * 0.10, hw * 1.75,
+           MG_MAT_CLOTH, g_PAINT_OCHRE, mg_scale(g_PAINT_OCHRE, 0.68), 1.0);
+    mg_box_ex(m, sw * 1.10, hip_y - h * 0.04, 0.0 - sw * 0.30,
+              sw * 0.34, h * 0.070, sw * 0.22, 0.0, 0.0, 0.92,
+              MG_MAT_CLOTH, g_WOOD_MID, g_WOOD_LO, 0.94);
+    mg_box_ex(m, 0.0, sh_y + h * 0.028, 0.0, sw * 0.62, h * 0.022, sw * 0.52,
+              0.0 - sw * 0.30, 0.0, 0.90, MG_MAT_CLOTH, g_FABRIC_RED,
+              mg_scale(g_FABRIC_RED, 0.74), 1.0);
+    // a tool held in the right hand — the NPC's asymmetric read
+    mg_spike(m, sw + arm_r * 1.5, sh_y - h * 0.26, 0.0 - arm_r * 2.2,
+             sw + arm_r * 1.5, sh_y - h * 0.02, 0.0 - arm_r * 5.6, 0.045,
+             MG_MAT_WOOD, g_WOOD_HI, g_WOOD_LO, 0.96);
+}
+
+// ===========================================================================
+// VIEWMODEL WEAPONS — ART_BIBLE 8.5
+// ===========================================================================
+// Local space: origin at the grip, +Z is the muzzle direction, +Y up, +X right.
+//
+// Each weapon is a flat part table, 8 numbers per part:
+//     cx, cy, cz, hx, hy, hz, colour-slot(0..3), ao
+// plus a per-weapon 4-colour ramp. 12 tris per part. The table form is what
+// makes six weapons tunable without six hundred lines of call sites, and it is
+// what lets `--verify` prove the six 32x32 silhouettes differ.
+//
+// Value law (8.5): slot 0 is the top/lit surface, slot 1 the underside, slot 2
+// the furniture, slot 3 the 1-texel STEEL_HI specular line along the receiver
+// and barrel top. That fake highlight is what makes it read as metal at 320x240.
+
+fn wpn_parts(p_m, p_tab: array<f64>, p_n: i32,
+             p_c0: i32, p_c1: i32, p_c2: i32, p_c3: i32) {
+    let m = p_m;
+    let i: i32 = 0;
+    while (i < p_n) {
+        let o: i32 = i * 8;
+        let slot: i32 = i32(p_tab[o + 6]);
+        let hi: i32 = p_c0;
+        let lo: i32 = p_c1;
+        if (slot == 1) { hi = p_c1; lo = mg_scale(p_c1, 0.80); }
+        if (slot == 2) { hi = p_c2; lo = mg_scale(p_c2, 0.78); }
+        if (slot == 3) { hi = p_c3; lo = p_c0; }
+        mg_box(m, p_tab[o], p_tab[o + 1], p_tab[o + 2],
+               p_tab[o + 3], p_tab[o + 4], p_tab[o + 5],
+               MG_MAT_METAL, hi, lo, p_tab[o + 7]);
+        i++;
+    }
+}
+
+// Sparrow AR — long, straight, carry handle, curved 2-box magazine.
+let g_wp_sparrow: array<f64> = [
+    0.0,   0.055, 0.10,  0.035, 0.048, 0.170, 0, 1.00,   // receiver
+    0.0,   0.104, 0.10,  0.030, 0.006, 0.165, 3, 1.00,   // top rail specular
+    0.0,   0.062, 0.34,  0.016, 0.016, 0.075, 0, 0.98,   // barrel base
+    0.0,   0.062, 0.47,  0.011, 0.011, 0.070, 0, 0.98,   // barrel
+    0.0,   0.062, 0.55,  0.018, 0.018, 0.020, 0, 1.00,   // muzzle brake
+    0.0,   0.058, 0.29,  0.028, 0.030, 0.060, 2, 0.96,   // handguard 1
+    0.0,   0.058, 0.40,  0.025, 0.027, 0.055, 2, 0.96,   // handguard 2
+    0.0,   0.092, 0.40,  0.008, 0.020, 0.010, 0, 1.00,   // front sight post
+    0.0,   0.098, 0.16,  0.010, 0.014, 0.014, 0, 1.00,   // rear sight
+    0.0,   0.116, 0.10,  0.010, 0.014, 0.120, 0, 1.00,   // carry handle bar
+    0.0,   0.104, 0.02,  0.010, 0.020, 0.014, 0, 1.00,   // handle rear post
+    0.0,  -0.045, 0.13,  0.024, 0.055, 0.038, 2, 0.90,   // magazine upper
+    0.012,-0.135, 0.15,  0.022, 0.045, 0.034, 2, 0.86,   // magazine lower (curved)
+    0.0,  -0.040, 0.00,  0.024, 0.055, 0.032, 2, 0.92,   // pistol grip
+    0.0,   0.010, 0.05,  0.020, 0.006, 0.030, 1, 0.90,   // trigger guard bar
+    0.0,   0.030, 0.075, 0.006, 0.024, 0.006, 1, 0.90,   // trigger guard front
+    0.0,   0.055,-0.10,  0.024, 0.036, 0.100, 2, 0.94,   // stock tube
+    0.0,   0.058,-0.20,  0.030, 0.050, 0.028, 2, 0.94,   // butt plate
+    0.0,   0.098,-0.13,  0.020, 0.010, 0.060, 2, 0.96,   // cheek rest
+    0.042, 0.078, 0.03,  0.012, 0.010, 0.028, 0, 1.00,   // charging handle (RIGHT only)
+    0.038, 0.062, 0.10,  0.006, 0.018, 0.040, 3, 1.00    // ejection port cover (RIGHT only)
+];
+
+// Tinker SMG — stubby, very long straight magazine, side-folded stock.
+let g_wp_tinker: array<f64> = [
+    0.0,   0.055, 0.06,  0.032, 0.046, 0.115, 0, 1.00,   // receiver
+    0.0,   0.100, 0.06,  0.026, 0.006, 0.110, 3, 1.00,   // rail specular
+    0.0,   0.062, 0.20,  0.014, 0.014, 0.055, 0, 0.98,   // barrel
+    0.0,   0.062, 0.28,  0.026, 0.026, 0.040, 0, 1.00,   // shroud / comp
+    0.0,   0.058, 0.17,  0.024, 0.026, 0.040, 2, 0.96,   // handguard
+    0.0,   0.092, 0.24,  0.007, 0.016, 0.008, 0, 1.00,   // front post
+    0.0,   0.096, 0.00,  0.009, 0.012, 0.012, 0, 1.00,   // rear aperture
+    0.0,  -0.075, 0.08,  0.020, 0.090, 0.030, 2, 0.88,   // long magazine upper
+    0.0,  -0.215, 0.08,  0.018, 0.055, 0.028, 2, 0.84,   // long magazine lower
+    0.0,  -0.035,-0.03,  0.023, 0.052, 0.030, 2, 0.92,   // grip
+    0.0,   0.012, 0.02,  0.018, 0.006, 0.026, 1, 0.90,   // guard bar
+    0.0,   0.030, 0.042, 0.006, 0.022, 0.006, 1, 0.90,   // guard front
+    0.0,   0.030, 0.14,  0.022, 0.024, 0.030, 2, 0.94,   // front grip
+   -0.052, 0.070,-0.02,  0.020, 0.012, 0.070, 2, 0.94,   // FOLDED stock, LEFT side
+   -0.052, 0.070,-0.10,  0.024, 0.026, 0.016, 2, 0.94,   // folded butt
+   -0.030, 0.070,-0.02,  0.010, 0.008, 0.020, 0, 0.96,   // stock hinge
+    0.040, 0.080, 0.04,  0.010, 0.008, 0.024, 0, 1.00,   // charging handle RIGHT
+    0.0,   0.100, 0.12,  0.014, 0.008, 0.026, 3, 1.00,   // top plate
+    0.0,   0.020, 0.06,  0.026, 0.014, 0.022, 1, 0.92,   // mag well
+    0.0,   0.062,-0.06,  0.026, 0.030, 0.030, 0, 0.96    // rear receiver cap
+];
+
+// Bellows pump shotgun — fat fore-end, tube under a wide barrel, shell saddle.
+let g_wp_bellows: array<f64> = [
+    0.0,   0.058, 0.06,  0.036, 0.050, 0.130, 0, 1.00,   // receiver
+    0.0,   0.106, 0.06,  0.030, 0.006, 0.120, 3, 1.00,   // receiver top specular
+    0.0,   0.072, 0.30,  0.021, 0.021, 0.140, 0, 0.98,   // barrel
+    0.0,   0.072, 0.45,  0.024, 0.024, 0.022, 0, 1.00,   // choke
+    0.0,   0.030, 0.30,  0.016, 0.016, 0.135, 0, 0.94,   // magazine tube
+    0.0,   0.048, 0.22,  0.040, 0.040, 0.085, 2, 0.96,   // PUMP fore-end (fat)
+    0.0,   0.048, 0.13,  0.034, 0.034, 0.020, 2, 0.94,   // pump collar
+    0.0,   0.094, 0.42,  0.006, 0.012, 0.008, 3, 1.00,   // bead sight
+    0.0,  -0.035,-0.02,  0.026, 0.055, 0.034, 2, 0.92,   // grip
+    0.0,   0.010, 0.03,  0.020, 0.006, 0.030, 1, 0.90,   // guard
+    0.0,   0.032, 0.058, 0.006, 0.022, 0.006, 1, 0.90,   // guard front
+    0.0,   0.052,-0.12,  0.028, 0.042, 0.110, 2, 0.94,   // stock
+    0.0,   0.048,-0.23,  0.034, 0.056, 0.026, 2, 0.94,   // butt pad
+    0.0,   0.098,-0.15,  0.022, 0.010, 0.070, 2, 0.96,   // comb
+   -0.040, 0.070,-0.06,  0.008, 0.026, 0.060, 2, 0.92,   // shell saddle LEFT
+   -0.048, 0.086,-0.06,  0.012, 0.012, 0.052, 1, 0.94,   // saddle shells
+    0.040, 0.048, 0.06,  0.008, 0.016, 0.030, 0, 0.98,   // ejection port RIGHT
+    0.0,   0.024, 0.06,  0.030, 0.012, 0.040, 1, 0.92,   // loading gate underside
+    0.0,   0.072, 0.16,  0.024, 0.022, 0.030, 0, 0.98,   // barrel ring
+    0.0,   0.104,-0.02,  0.014, 0.010, 0.030, 3, 1.00    // rear rib
+];
+
+// Longshadow marksman — very long barrel, big scope, splayed bipod.
+let g_wp_longshadow: array<f64> = [
+    0.0,   0.055, 0.02,  0.032, 0.046, 0.160, 0, 1.00,   // receiver
+    0.0,   0.102, 0.02,  0.026, 0.006, 0.150, 3, 1.00,   // rail specular
+    0.0,   0.060, 0.32,  0.015, 0.015, 0.150, 0, 0.98,   // barrel mid
+    0.0,   0.060, 0.55,  0.012, 0.012, 0.090, 0, 0.98,   // barrel front
+    0.0,   0.060, 0.66,  0.020, 0.020, 0.026, 0, 1.00,   // muzzle brake
+    0.0,   0.150, 0.06,  0.020, 0.020, 0.110, 0, 1.00,   // scope tube
+    0.0,   0.150, 0.17,  0.026, 0.026, 0.022, 0, 1.00,   // objective bell
+    0.0,   0.150,-0.06,  0.023, 0.023, 0.020, 0, 1.00,   // eyepiece
+    0.0,   0.124, 0.10,  0.012, 0.014, 0.014, 2, 0.96,   // front ring
+    0.0,   0.124,-0.02,  0.012, 0.014, 0.014, 2, 0.96,   // rear ring
+    0.0,   0.055, 0.20,  0.026, 0.028, 0.055, 2, 0.96,   // handguard
+   -0.055, 0.006, 0.28,  0.008, 0.048, 0.008, 1, 0.90,   // bipod LEFT leg
+    0.055, 0.006, 0.28,  0.008, 0.048, 0.008, 1, 0.90,   // bipod RIGHT leg
+    0.0,   0.038, 0.30,  0.030, 0.010, 0.014, 1, 0.92,   // bipod yoke
+    0.0,  -0.040,-0.01,  0.024, 0.052, 0.034, 2, 0.92,   // thumbhole grip
+    0.0,   0.008, 0.04,  0.020, 0.006, 0.028, 1, 0.90,   // guard
+    0.0,  -0.020, 0.10,  0.022, 0.030, 0.038, 2, 0.90,   // magazine
+    0.0,   0.052,-0.16,  0.026, 0.040, 0.115, 2, 0.94,   // stock
+    0.0,   0.048,-0.28,  0.030, 0.054, 0.026, 2, 0.94,   // butt
+    0.0,   0.100,-0.19,  0.020, 0.014, 0.075, 2, 0.96,   // cheek riser
+    0.040, 0.070,-0.03,  0.010, 0.010, 0.030, 0, 1.00    // bolt handle RIGHT
+];
+
+// Kestrel revolver — cylinder, top strap, ejector rod on ONE side, no stock.
+let g_wp_kestrel: array<f64> = [
+    0.0,   0.060, 0.02,  0.020, 0.030, 0.060, 0, 1.00,   // frame
+    0.0,   0.092, 0.02,  0.016, 0.006, 0.058, 3, 1.00,   // top strap specular
+    0.0,   0.060, 0.02,  0.034, 0.034, 0.036, 0, 1.00,   // CYLINDER (fat, central)
+    0.0,   0.060, 0.11,  0.013, 0.013, 0.060, 0, 0.98,   // barrel
+    0.0,   0.060, 0.175, 0.016, 0.016, 0.012, 0, 1.00,   // muzzle crown
+    0.0,   0.086, 0.11,  0.007, 0.010, 0.056, 3, 1.00,   // barrel top rib
+    0.0,   0.096, 0.165, 0.005, 0.014, 0.006, 0, 1.00,   // front blade sight
+    0.0,   0.092,-0.03,  0.010, 0.010, 0.010, 0, 1.00,   // rear notch
+   -0.030, 0.036, 0.09,  0.010, 0.010, 0.048, 0, 0.96,   // ejector rod LEFT
+   -0.030, 0.036, 0.145, 0.013, 0.013, 0.010, 0, 0.98,   // ejector head LEFT
+    0.026, 0.058, 0.00,  0.008, 0.020, 0.024, 1, 0.94,   // loading gate RIGHT
+    0.0,   0.086,-0.055, 0.012, 0.016, 0.016, 0, 1.00,   // hammer spur
+    0.0,   0.062,-0.055, 0.014, 0.018, 0.014, 0, 1.00,   // hammer body
+    0.0,   0.014, 0.01,  0.014, 0.020, 0.008, 1, 0.92,   // trigger
+    0.0,   0.006, 0.01,  0.020, 0.006, 0.030, 1, 0.90,   // guard bar
+    0.0,   0.026, 0.038, 0.006, 0.020, 0.006, 1, 0.90,   // guard front
+    0.0,  -0.045,-0.03,  0.024, 0.058, 0.032, 2, 0.92,   // grip
+    0.0,  -0.100,-0.05,  0.020, 0.028, 0.028, 2, 0.88,   // grip heel
+    0.026,-0.045,-0.03,  0.006, 0.046, 0.026, 2, 0.94,   // right grip panel
+   -0.026,-0.045,-0.03,  0.006, 0.046, 0.026, 2, 0.94,   // left grip panel
+    0.0,   0.030,-0.02,  0.022, 0.014, 0.026, 1, 0.94    // frame underside
+];
+
+// Emberlance — fat launcher tube with a side drum and a front grip.
+let g_wp_emberlance: array<f64> = [
+    0.0,   0.070, 0.10,  0.040, 0.040, 0.180, 0, 1.00,   // main tube
+    0.0,   0.114, 0.10,  0.030, 0.006, 0.170, 3, 1.00,   // tube top specular
+    0.0,   0.070, 0.32,  0.048, 0.048, 0.045, 0, 1.00,   // muzzle bell
+    0.0,   0.070,-0.10,  0.044, 0.044, 0.030, 0, 0.98,   // breech cap
+    0.052, 0.070, 0.02,  0.026, 0.052, 0.052, 2, 0.94,   // DRUM, right side
+    0.052, 0.070, 0.02,  0.030, 0.030, 0.060, 1, 0.92,   // drum band
+    0.0,   0.126, 0.02,  0.012, 0.012, 0.050, 0, 1.00,   // top sight rail
+    0.0,   0.144, 0.02,  0.008, 0.010, 0.014, 0, 1.00,   // sight post
+    0.0,  -0.035,-0.02,  0.026, 0.056, 0.034, 2, 0.92,   // grip
+    0.0,   0.014, 0.03,  0.020, 0.006, 0.030, 1, 0.90,   // guard
+    0.0,   0.034, 0.058, 0.006, 0.022, 0.006, 1, 0.90,   // guard front
+    0.0,   0.010, 0.16,  0.024, 0.045, 0.026, 2, 0.94,   // front grip
+    0.0,   0.030, 0.16,  0.030, 0.014, 0.030, 1, 0.94,   // front grip collar
+    0.0,   0.070,-0.19,  0.026, 0.034, 0.060, 2, 0.94,   // stock
+    0.0,   0.066,-0.26,  0.032, 0.046, 0.024, 2, 0.94,   // butt
+   -0.044, 0.070, 0.14,  0.010, 0.024, 0.070, 1, 0.92,   // LEFT heat shield
+   -0.044, 0.104, 0.14,  0.008, 0.010, 0.062, 3, 0.96,   // shield rib
+    0.0,   0.070, 0.24,  0.044, 0.044, 0.016, 0, 0.98,   // barrel band
+    0.0,   0.070, 0.00,  0.044, 0.044, 0.016, 0, 0.98,   // rear band
+    0.0,   0.026, 0.10,  0.030, 0.016, 0.060, 1, 0.92,   // underside rail
+    0.052, 0.070, 0.02,  0.020, 0.020, 0.070, 0, 0.96    // drum axle
+];
+
+fn build_weapon(p_m, p_id: i32) {
+    let m = p_m;
+    if (p_id == MESH_SPARROW_VM) {
+        wpn_parts(m, g_wp_sparrow, 21, g_GUNMETAL_HI, g_GUNMETAL_LO, g_POLYMER, g_STEEL_HI);
+        return;
+    }
+    if (p_id == MESH_TINKER_VM) {
+        wpn_parts(m, g_wp_tinker, 20, g_STEEL_MID, g_STEEL_LO, g_POLYMER, g_STEEL_HI);
+        return;
+    }
+    if (p_id == MESH_BELLOWS_VM) {
+        wpn_parts(m, g_wp_bellows, 20, g_GUNMETAL_HI, g_GUNMETAL_LO, g_WOOD_MID, g_STEEL_HI);
+        return;
+    }
+    if (p_id == MESH_LONGSHADOW_VM) {
+        wpn_parts(m, g_wp_longshadow, 21, g_GUNMETAL_HI, g_GUNMETAL_LO, g_WOOD_HI, g_STEEL_HI);
+        return;
+    }
+    if (p_id == MESH_KESTREL_VM) {
+        wpn_parts(m, g_wp_kestrel, 21, g_STEEL_MID, g_STEEL_LO, g_WOOD_HI, g_BRASS);
+        return;
+    }
+    wpn_parts(m, g_wp_emberlance, 21, g_GUNMETAL_HI, g_GUNMETAL_LO, g_BRASS_LO, g_BRASS);
+}
+
+// ===========================================================================
+// THE BAKE — light once, then never touch a normal again (ENGINE_GAPS G19)
+// ===========================================================================
+//
+// NOON keyframe from ART_BIBLE 5.1. AMBIENT + SUN == (1,1,1) exactly, which is
+// the invariant that makes a sun-facing surface render at its authored albedo.
+let g_mg_sun_x: f64 = 0.18;
+let g_mg_sun_y: f64 = 0.96;
+let g_mg_sun_z: f64 = 0.22;
+let g_mg_sun_r: f64 = 0.58; let g_mg_sun_g: f64 = 0.56; let g_mg_sun_b: f64 = 0.50;
+let g_mg_amb_r: f64 = 0.42; let g_mg_amb_g: f64 = 0.44; let g_mg_amb_b: f64 = 0.50;
+let g_mg_bnc_r: f64 = 0.13; let g_mg_bnc_g: f64 = 0.16; let g_mg_bnc_b: f64 = 0.07;
+
+// ART_BIBLE 8.2.6 / CLAUDE.md 8: NEVER BLACK. The world atlas has a minimum
+// albedo luminance of 72 and vertex colour can only darken, so an unmodified
+// bake puts unlit faces well below that floor and characters merge into one
+// dark blob at range. This is a soft floor, not a clamp: luminance below 96 is
+// compressed into [72, 96] instead of being clipped, so the value ordering the
+// bake produced survives. Hue is preserved (the whole triple is scaled).
+export let MG_LUM_FLOOR = 72;
+let g_mg_lum_knee: f64 = 96.0;
+
+fn mg_lift_floor(p_m): i32 {
+    let m = p_m;
+    let n: i32 = mesh_vert_count(m);
+    let vb: ptr = mesh_buf(m);
+    let cache: array<i32> = m.ac;
+    let knee: f64 = g_mg_lum_knee;
+    let floor_l: f64 = f64(MG_LUM_FLOOR);
+    let lifted: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let o: i32 = i * 24 + 20;
+        let r: f64 = f64(ptr_deref_u8(ptr_offset(vb, o, 1)));
+        let g: f64 = f64(ptr_deref_u8(ptr_offset(vb, o + 1, 1)));
+        let b: f64 = f64(ptr_deref_u8(ptr_offset(vb, o + 2, 1)));
+        let lum: f64 = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (lum < knee) {
+            let want: f64 = floor_l + (knee - floor_l) * (lum / knee);
+            let s: f64 = 1.0;
+            if (lum > 0.5) { s = want / lum; } else { r = want; g = want; b = want; }
+            if (lum > 0.5) { r = r * s; g = g * s; b = b * s; }
+            let ir: i32 = i32(r + 0.5); let ig: i32 = i32(g + 0.5); let ib: i32 = i32(b + 0.5);
+            if (ir > 255) { ir = 255; } if (ig > 255) { ig = 255; } if (ib > 255) { ib = 255; }
+            ptr_write_u8(ptr_offset(vb, o, 1), ir);
+            ptr_write_u8(ptr_offset(vb, o + 1, 1), ig);
+            ptr_write_u8(ptr_offset(vb, o + 2, 1), ib);
+            cache[i] = ir + ig * 256 + ib * 65536;
+            lifted++;
+        }
+        i++;
+    }
+    let out: i32 = lifted;
+    return out;
+}
+
+// Re-light every mesh. `tod.hml` may call this when the keyframe moves far
+// enough to matter; it is a build-time cost, not a frame cost, and it is the
+// ONLY thing in the whole game that transforms a mesh normal.
+export fn meshgen_bake_all(p_lx: f64, p_ly: f64, p_lz: f64,
+                           p_sr: f64, p_sg: f64, p_sb: f64,
+                           p_ar: f64, p_ag: f64, p_ab: f64,
+                           p_br: f64, p_bg: f64, p_bb: f64): i32 {
+    let total: i32 = 0;
+    let i: i32 = 0;
+    while (i < MESH_COUNT) {
+        let m = g_mg_mesh[i];
+        total = total + mesh_bake_light(m, p_lx, p_ly, p_lz,
+                                        p_sr, p_sg, p_sb,
+                                        p_ar, p_ag, p_ab,
+                                        p_br, p_bg, p_bb);
+        mg_lift_floor(m);
+        i++;
+    }
+    let out: i32 = total;
+    return out;
+}
+
+// ===========================================================================
+// meshgen_build_all — the whole asset library, ~40 meshes, once, at boot
+// ===========================================================================
+
+fn mg_measure_class(p_class: i32, p_id: i32, p_before_v: i32) {
+    // The signature protrusion is always the last thing a class builder adds,
+    // so "how far does the mesh reach beyond the body it had before the
+    // protrusion" is measurable rather than asserted. ART_BIBLE 8.2.3.
+    let m = g_mg_mesh[p_id];
+    let n: i32 = mesh_vert_count(m);
+    let x0: f64 = 0.0; let x1: f64 = 0.0;
+    let y0: f64 = 0.0; let y1: f64 = 0.0;
+    let z0: f64 = 0.0; let z1: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < p_before_v) {
+        let x: f64 = mesh_vert_pos(m, i, 0);
+        let y: f64 = mesh_vert_pos(m, i, 1);
+        let z: f64 = mesh_vert_pos(m, i, 2);
+        if (i == 0) { x0 = x; x1 = x; y0 = y; y1 = y; z0 = z; z1 = z; }
+        if (x < x0) { x0 = x; } if (x > x1) { x1 = x; }
+        if (y < y0) { y0 = y; } if (y > y1) { y1 = y; }
+        if (z < z0) { z0 = z; } if (z > z1) { z1 = z; }
+        i++;
+    }
+    let best: f64 = 0.0;
+    i = p_before_v;
+    while (i < n) {
+        let x: f64 = mesh_vert_pos(m, i, 0);
+        let y: f64 = mesh_vert_pos(m, i, 1);
+        let z: f64 = mesh_vert_pos(m, i, 2);
+        let d: f64 = 0.0;
+        if (x0 - x > d) { d = x0 - x; }
+        if (x - x1 > d) { d = x - x1; }
+        if (y0 - y > d) { d = y0 - y; }
+        if (y - y1 > d) { d = y - y1; }
+        if (z0 - z > d) { d = z0 - z; }
+        if (z - z1 > d) { d = z - z1; }
+        if (d > best) { best = d; }
+        i++;
+    }
+    g_mg_prot_len[p_class] = best;
+}
+
+fn mg_finish(p_id: i32) {
+    mesh_end(g_mg_mesh[p_id]);
+}
+
+export fn meshgen_build_all(): i32 {
+    g_mg_mesh = []; g_mg_name = []; g_mg_budget = [];
+    g_mg_kind = []; g_mg_view = [];
+    let i: i32 = 0;
+    while (i < MESH_COUNT) {
+        g_mg_mesh.push(0); g_mg_name.push(""); g_mg_budget.push(0);
+        g_mg_kind.push(0); g_mg_view.push(0.0);
+        i++;
+    }
+    g_mg_head_w = []; g_mg_sh_w = []; g_mg_prot_len = []; g_mg_prot_axis = [];
+    i = 0;
+    while (i < ENEMY_COUNT) {
+        g_mg_head_w.push(g_hu_head_hw[i] * 2.0);
+        g_mg_sh_w.push(g_hu_sh_hw[i] * 2.0);
+        g_mg_prot_len.push(0.0);
+        g_mg_prot_axis.push(g_hu_axis[i]);
+        i++;
+    }
+
+    let three_q: f64 = 0.62;      // 3/4 view for props and characters
+    let side: f64 = 1.5708;       // weapons read side-on
+
+    // ---- props ----------------------------------------------------------
+    mg_register(MESH_TREE0,   "tree_lod0",  96, MG_KIND_PROP, three_q, 128);
+    mg_register(MESH_TREE1,   "tree_lod1",  34, MG_KIND_PROP, three_q, 64);
+    mg_register(MESH_TREE2,   "tree_lod2",   8, MG_KIND_PROP, three_q, 16);
+    mg_register(MESH_BUSH,    "bush",       22, MG_KIND_PROP, three_q, 48);
+    mg_register(MESH_ROCK,    "rock",       18, MG_KIND_PROP, three_q, 32);
+    mg_register(MESH_CRATE,   "crate",      12, MG_KIND_PROP, three_q, 24);
+    mg_register(MESH_BARREL,  "barrel",     24, MG_KIND_PROP, three_q, 40);
+    mg_register(MESH_LANTERN, "lantern",    48, MG_KIND_PROP, three_q, 72);
+    mg_register(MESH_BLOB,    "contact_blob", 2, MG_KIND_PROP, 0.0, 4);
+
+    mesh_begin(g_mg_mesh[MESH_TREE0]);   build_tree0(g_mg_mesh[MESH_TREE0], 3);   mg_finish(MESH_TREE0);
+    mesh_begin(g_mg_mesh[MESH_TREE1]);   build_tree1(g_mg_mesh[MESH_TREE1], 3);   mg_finish(MESH_TREE1);
+    mesh_begin(g_mg_mesh[MESH_TREE2]);   build_tree2(g_mg_mesh[MESH_TREE2], 3);   mg_finish(MESH_TREE2);
+    mesh_begin(g_mg_mesh[MESH_BUSH]);    build_bush(g_mg_mesh[MESH_BUSH], 9);     mg_finish(MESH_BUSH);
+    mesh_begin(g_mg_mesh[MESH_ROCK]);    build_rock(g_mg_mesh[MESH_ROCK], 17);    mg_finish(MESH_ROCK);
+    mesh_begin(g_mg_mesh[MESH_CRATE]);   build_crate(g_mg_mesh[MESH_CRATE]);      mg_finish(MESH_CRATE);
+    mesh_begin(g_mg_mesh[MESH_BARREL]);  build_barrel(g_mg_mesh[MESH_BARREL], 23); mg_finish(MESH_BARREL);
+    mesh_begin(g_mg_mesh[MESH_LANTERN]); build_lantern(g_mg_mesh[MESH_LANTERN]);  mg_finish(MESH_LANTERN);
+    mesh_begin(g_mg_mesh[MESH_BLOB]);    build_blob(g_mg_mesh[MESH_BLOB]);        mg_finish(MESH_BLOB);
+
+    // ---- enemies --------------------------------------------------------
+    let names: array<string> = ["wisp", "mote", "husk", "spitter", "warden", "bulwark"];
+    let bud0: array<i32> = [24, 32, 180, 180, 180, 180];
+    let bud1: array<i32> = [12, 16, 90, 90, 90, 90];
+    let bud2: array<i32> = [6, 8, 28, 28, 28, 28];
+    let cls: i32 = 0;
+    while (cls < ENEMY_COUNT) {
+        let lod: i32 = 0;
+        while (lod < 3) {
+            let id: i32 = MESH_WISP0 + cls * 3 + lod;
+            let bud: i32 = bud0[cls];
+            if (lod == 1) { bud = bud1[cls]; }
+            if (lod == 2) { bud = bud2[cls]; }
+            mg_register(id, names[cls] + "_lod" + lod, bud, MG_KIND_ENEMY,
+                        three_q, bud * 2 + 24);
+            let m = g_mg_mesh[id];
+            mesh_begin(m);
+            if (cls == ENEMY_WISP) {
+                build_wisp(m, lod);
+            } else {
+                if (cls == ENEMY_MOTE) {
+                    build_mote(m, lod);
+                } else {
+                    build_humanoid(m, cls, lod);
+                }
+            }
+            // measure the protrusion off the LOD0 mesh only
+            if (lod == 0) {
+                mg_measure_class(cls, id, mesh_vert_count(m) - 12);
+            }
+            mg_finish(id);
+            lod++;
+        }
+        cls++;
+    }
+
+    // ---- NPC ------------------------------------------------------------
+    mg_register(MESH_NPC, "npc", 220, MG_KIND_NPC, three_q, 260);
+    mesh_begin(g_mg_mesh[MESH_NPC]); build_npc(g_mg_mesh[MESH_NPC]); mg_finish(MESH_NPC);
+
+    // ---- viewmodels -----------------------------------------------------
+    mg_register(MESH_SPARROW_VM,    "sparrow_vm",    260, MG_KIND_WEAPON, side, 300);
+    mg_register(MESH_TINKER_VM,     "tinker_vm",     260, MG_KIND_WEAPON, side, 300);
+    mg_register(MESH_BELLOWS_VM,    "bellows_vm",    260, MG_KIND_WEAPON, side, 300);
+    mg_register(MESH_LONGSHADOW_VM, "longshadow_vm", 260, MG_KIND_WEAPON, side, 300);
+    mg_register(MESH_KESTREL_VM,    "kestrel_vm",    260, MG_KIND_WEAPON, side, 300);
+    mg_register(MESH_EMBERLANCE_VM, "emberlance_vm", 260, MG_KIND_WEAPON, side, 300);
+    let w: i32 = MESH_SPARROW_VM;
+    while (w <= MESH_EMBERLANCE_VM) {
+        mesh_begin(g_mg_mesh[w]);
+        build_weapon(g_mg_mesh[w], w);
+        mg_finish(w);
+        w++;
+    }
+
+    // ---- light it, once -------------------------------------------------
+    meshgen_bake_all(g_mg_sun_x, g_mg_sun_y, g_mg_sun_z,
+                     g_mg_sun_r, g_mg_sun_g, g_mg_sun_b,
+                     g_mg_amb_r, g_mg_amb_g, g_mg_amb_b,
+                     g_mg_bnc_r, g_mg_bnc_g, g_mg_bnc_b);
+
+    g_mg_built = 1;
+    let total: i32 = 0;
+    i = 0;
+    while (i < MESH_COUNT) { total = total + mesh_tri_count(g_mg_mesh[i]); i++; }
+    let out: i32 = total;
+    return out;
+}

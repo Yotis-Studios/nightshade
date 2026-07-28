@@ -1,0 +1,252 @@
+// quantize.hml — the wire grid. W2-12.
+//
+// NETWORKING.md §11.1, restated because it is the whole point of this file:
+//
+//   "Quantization is not a networking detail. It is a simulation detail."
+//
+// The authority quantizes its OWN transform state to the wire grid once per
+// snapshot (`px = wire_pos(px)`), so the client's predicted number and the
+// server's authoritative number are the *same* number, bit for bit. If the
+// server keeps full-precision f64 and only quantizes on send, every client
+// carries a permanent ~2 mm disagreement, the reconciliation epsilon fires on
+// every single tick, and the player micro-stutters forever (anti-pattern 21).
+// That bug is unfixable later without re-tuning the entire movement model, and
+// it costs one function call to avoid now.
+//
+// ---------------------------------------------------------------------------
+// THE GRIDS
+// ---------------------------------------------------------------------------
+//   pos    1/256 m   = 3.906 mm   i32  ->  +-8388 km      (horizontal axes)
+//   pos16  1/256 m   = 3.906 mm   i16  ->  +-127.99 m     (vertical axis)
+//   ang    TAU/65536 = 0.0055 deg u16  ->  wraps, always in [0, 65535]
+//   ang8   TAU/256   = 1.406 deg  u8   ->  non-local pitch only
+//   vel    1/128 m/s = 7.8 mm/s   i16  ->  +-255.99 m/s
+//   evpos  1/16 m    = 6.25 cm    i16  ->  +-2047.9 m     (event impact points)
+//
+// ---------------------------------------------------------------------------
+// WHY EVERY q_* CLAMPS INSTEAD OF THROWING
+// ---------------------------------------------------------------------------
+// CLAUDE.md rule 7: `throw` leaks ~192 B of heap locals per throw, compiled.
+// A quantizer sits on the per-entity path, so a throw there is a memory leak
+// with a frame-rate cost. Out-of-range input is clamped to the representable
+// end of the grid and counted in `q_clamp_count()`. A non-zero clamp count in
+// a packet dump is the diagnostic; a leak is not.
+//
+// The i32 conversion is also the reason clamping is mandatory rather than
+// tidy: `i32(x)` on a value past 2^31 is undefined, and `i32 + - *` TRAP on
+// overflow in Hemlock (CLAUDE.md A13). Clamp first, convert second, always.
+//
+// ---------------------------------------------------------------------------
+// DUPLICATION NOTICE — read before editing
+// ---------------------------------------------------------------------------
+// `src/sim/command.hml` (W2-9) also exports `q_ang` / `dq_ang`, because the
+// import wall forbids `src/sim/**` from importing `src/net/**`. The two
+// definitions MUST agree bit for bit; ANG_SCALE below is the canonical value
+// from NETWORKING.md §11.1 and the sim copy is required to match it exactly.
+// If you change a scale here, change it there in the same commit.
+
+import { floor, TAU } from "@stdlib/math";
+
+// --- scales -----------------------------------------------------------------
+// Reciprocals are exact binary fractions, so dq is a multiply, not a divide,
+// and the round trip is exact rather than nearly-exact.
+export let POS_SCALE: f64 = 256.0;
+export let POS_INV: f64 = 0.00390625;              // 1/256
+export let ANG_SCALE: f64 = 10430.378350470453;    // 65536 / TAU
+export let ANG_INV: f64 = 0.00009587379924285257;  // TAU / 65536
+export let ANG8_SCALE: f64 = 40.74366543152521;    // 256 / TAU
+export let ANG8_INV: f64 = 0.02454369260617026;    // TAU / 256
+export let VEL_SCALE: f64 = 128.0;
+export let VEL_INV: f64 = 0.0078125;               // 1/128
+export let EVPOS_SCALE: f64 = 16.0;
+export let EVPOS_INV: f64 = 0.0625;                // 1/16
+
+// --- representable limits, in world units -----------------------------------
+export let POS_MAX: f64 = 8388607.0;               // i32 / 256
+export let POS16_MAX: f64 = 127.99;                // i16 / 256
+export let VEL_MAX: f64 = 255.99;                  // i16 / 128
+export let EVPOS_MAX: f64 = 2047.9;                // i16 / 16
+
+// --- integer limits ---------------------------------------------------------
+export let U16_MAX: i32 = 65535;
+export let U8_MAX: i32 = 255;
+export let I16_MIN: i32 = -32768;
+export let I16_MAX: i32 = 32767;
+
+// Diagnostic only. Never gates behaviour; a clamp is a data bug, not a fault.
+let g_q_clamps: i32 = 0;
+
+export fn q_clamp_count(): i32 { let out: i32 = g_q_clamps; return out; }
+export fn q_clamp_reset() { g_q_clamps = 0; }
+
+// Round half away from zero, deterministically, without @stdlib round's
+// tie policy. Input is pre-clamped by every caller, so the i32() is safe.
+fn q_round(p_x: f64): i32 {
+    let x: f64 = p_x;
+    if (x >= 0.0) {
+        let a: i32 = i32(floor(x + 0.5));
+        return a;
+    }
+    let b: i32 = i32(floor(0.0 - x + 0.5));
+    let out: i32 = 0 - b;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// POSITION — horizontal axes, i32
+// ---------------------------------------------------------------------------
+export fn q_pos(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v > POS_MAX) { v = POS_MAX; g_q_clamps = g_q_clamps + 1; }
+    if (v < 0.0 - POS_MAX) { v = 0.0 - POS_MAX; g_q_clamps = g_q_clamps + 1; }
+    let out: i32 = q_round(v * POS_SCALE);
+    return out;
+}
+
+export fn dq_pos(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q) * POS_INV;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// POSITION — vertical axis, i16. World height must stay inside +-128 m.
+// ---------------------------------------------------------------------------
+export fn q_pos16(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v > POS16_MAX) { v = POS16_MAX; g_q_clamps = g_q_clamps + 1; }
+    if (v < 0.0 - POS16_MAX) { v = 0.0 - POS16_MAX; g_q_clamps = g_q_clamps + 1; }
+    let out: i32 = q_round(v * POS_SCALE);
+    return out;
+}
+
+export fn dq_pos16(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q) * POS_INV;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// ANGLE — u16, absolute, wrapping. Never a delta (NETWORKING §8.2): a late or
+// lost command must not rotate the player by the wrong amount, and the server
+// clamps turn rate by comparing consecutive absolutes.
+// ---------------------------------------------------------------------------
+export fn q_ang(p_a: f64): i32 {
+    let a: f64 = p_a;
+    let scaled: f64 = a * ANG_SCALE;
+    // wrap into [0, 65536) before the i32 conversion so a huge accumulated
+    // yaw can never overflow the conversion.
+    let w: f64 = scaled - floor(scaled * 0.0000152587890625) * 65536.0;  // /65536
+    // Round, do not truncate. dq_ang multiplies by TAU/65536 and q_ang by its
+    // reciprocal; the two are not exact inverses in binary, so truncation loses
+    // the code on 8 of the 65536 values. Rounding makes q_ang(dq_ang(q)) == q
+    // for every code, which is what prediction compares against.
+    let q: i32 = i32(floor(w + 0.5));
+    let out: i32 = q & 65535;
+    return out;
+}
+
+export fn dq_ang(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q & 65535) * ANG_INV;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// ANGLE — u8. Non-local entity pitch only: 1.4 deg is invisible on a 12 px
+// silhouette and it buys a byte back in the 20-byte entity stride.
+// ---------------------------------------------------------------------------
+export fn q_ang8(p_a: f64): i32 {
+    let a: f64 = p_a;
+    let scaled: f64 = a * ANG8_SCALE;
+    let w: f64 = scaled - floor(scaled * 0.00390625) * 256.0;            // /256
+    let q: i32 = i32(floor(w + 0.5));
+    let out: i32 = q & 255;
+    return out;
+}
+
+export fn dq_ang8(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q & 255) * ANG8_INV;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// VELOCITY — i16, 1/128 m/s. Replicated so the client can extrapolate a remote
+// entity between 20 Hz snapshots instead of teleporting it.
+// ---------------------------------------------------------------------------
+export fn q_vel(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v > VEL_MAX) { v = VEL_MAX; g_q_clamps = g_q_clamps + 1; }
+    if (v < 0.0 - VEL_MAX) { v = 0.0 - VEL_MAX; g_q_clamps = g_q_clamps + 1; }
+    let out: i32 = q_round(v * VEL_SCALE);
+    return out;
+}
+
+export fn dq_vel(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q) * VEL_INV;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// EVENT POSITION — i16, 1/16 m, relative to the receiving player. 6.25 cm is
+// plenty for an impact decal and it keeps an event at 16 bytes.
+// ---------------------------------------------------------------------------
+export fn q_evpos(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v > EVPOS_MAX) { v = EVPOS_MAX; g_q_clamps = g_q_clamps + 1; }
+    if (v < 0.0 - EVPOS_MAX) { v = 0.0 - EVPOS_MAX; g_q_clamps = g_q_clamps + 1; }
+    let out: i32 = q_round(v * EVPOS_SCALE);
+    return out;
+}
+
+export fn dq_evpos(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q) * EVPOS_INV;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE SNAP-TO-GRID HELPERS — call these on the authority's own state.
+//
+//     w.px[s] = wire_pos(w.px[s]);
+//
+// This is the line that stops reconciliation from firing forever. It is the
+// single highest-value function in this file and it does nothing visible.
+// ---------------------------------------------------------------------------
+export fn wire_pos(p_v: f64): f64 {
+    let out: f64 = dq_pos(q_pos(p_v));
+    return out;
+}
+
+export fn wire_pos16(p_v: f64): f64 {
+    let out: f64 = dq_pos16(q_pos16(p_v));
+    return out;
+}
+
+export fn wire_ang(p_a: f64): f64 {
+    let out: f64 = dq_ang(q_ang(p_a));
+    return out;
+}
+
+export fn wire_vel(p_v: f64): f64 {
+    let out: f64 = dq_vel(q_vel(p_v));
+    return out;
+}
+
+// Command axes: -127..127, quantized AT CONSTRUCTION (NETWORKING §8.2) so the
+// prediction path uses the exact integer the server will.
+export fn q_axis(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v > 1.0) { v = 1.0; }
+    if (v < -1.0) { v = -1.0; }
+    let out: i32 = q_round(v * 127.0);
+    return out;
+}
+
+export fn dq_axis(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q) * 0.007874015748031496;   // 1/127
+    return out;
+}

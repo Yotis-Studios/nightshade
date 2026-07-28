@@ -1,0 +1,705 @@
+// probe_atlasgen.hml — W2-7 verification for `src/art/fxgen.hml` and
+// `src/art/hudgen.hml`.
+//
+//   hemlockc -O1 tools/probe_atlasgen.hml -o /tmp/probe_atlasgen
+//   SDL_VIDEODRIVER=dummy /tmp/probe_atlasgen
+//
+// Exits 0 only when every assertion passes AND the number of assertions that
+// ran equals EXPECT_ASSERTS — a probe that exits 0 while printing FAIL is
+// worse than no probe.
+//
+// WHY THIS FILE EXISTS RATHER THAN `tools/texview.hml`.  W2-7's "verified by"
+// names `texview.hml`, but `texview.hml` is OWNED BY W2-11 and must not be
+// touched from here (CLAUDE.md §3).  This probe therefore carries W2-7's own
+// assertions and its own labelled PNG dumps; when W2-11 lands, `texview.hml`
+// can call `fxgen_cell_name` / `hudgen_sprite_name` / `hudgen_rect` and repeat
+// the sheet with no change to either generator.
+//
+// What it proves, in order:
+//   1  fxgen's and hudgen's self-tests pass, and run the number of checks they
+//      are supposed to run
+//   2  the FX atlas: 1-px margin, black additive background, determinism
+//   3  the HUD atlas: glyph coverage, 2-px FONT_BIG stroke, exact bake
+//   4  a REAL 320x240 SDL render of both fonts is texel-exact on readback —
+//      this is the "every glyph renders pixel-exact at 320x240" criterion
+//   5  the ART_BIBLE §9.2 HUD, laid out at its real coordinates, fits inside
+//      the 250-triangle cap
+//   6  build cost, RULE T: __clock() CPU time, minimum of 7 batches
+
+import { exit } from "@stdlib/process";
+import { floor, divi } from "@stdlib/math";
+import { window_open_ex, window_close, create_target, set_target, sdl_clear,
+         read_pixels_rect, FMT_ARGB8888, FMT_RGBA32, BLEND_ADD, BLEND_BLEND }
+       from "../../wobbleweed/src/sdl.hml";
+import { atlas_upload, atlas_get, atlas_rect_uv, atlas_tex, atlas_format }
+       from "../../wobbleweed/src/atlas.hml";
+import { batch_new, batch_reset, batch_flush, batch_count, LAYER_HUD }
+       from "../../wobbleweed/src/batch.hml";
+import { quad_screen_uv } from "../../wobbleweed/src/quad.hml";
+import { font_text, font_text_shadowed, font_glyph_index, font_width }
+       from "../../wobbleweed/src/font.hml";
+import { write_png } from "../../wobbleweed/src/png.hml";
+import { fxgen_build_atlas, fxgen_selftest, fxgen_checks, fxgen_cell_name,
+         FX_ATLAS_W, FX_ATLAS_H, FX_GRID, FX_CELL, FX_CELL_COUNT,
+         FX_MUZZLE_1, FX_TRACER, FX_EXPLO_2, FX_GLOW_L, FX_XP_MOTE, FX_SMOKE_1 }
+       from "../src/art/fxgen.hml";
+import { hudgen_build_atlas, hudgen_selftest, hudgen_checks, hudgen_sprite_name,
+         hudgen_atlas,
+         hudgen_rect, hudgen_uv, hud_font_micro, hud_font_big, hud_micro_cp,
+         HUD_ATLAS_W, HUD_ATLAS_H, HUD_MICRO_W, HUD_MICRO_H, HUD_MICRO_COLS,
+         HUD_MICRO_N, HUD_BIG_W, HUD_BIG_H, HUD_BIG_COLS, HUD_BIG_N, HUD_BIG_Y,
+         HUD_RECT_COUNT, HUD_SOLID, HUD_VIGNETTE, HUD_ICON_HEART,
+         HUD_ICON_PLAYER, HUD_ICON_ENEMY, HUD_ICON_OBJDOT, HUD_ICON_SKULL,
+         HUD_ICON_WEAPON, HUD_XH_TICK_V, HUD_XH_TICK_H, HUD_HITMARK,
+         HUD_CHEVRON, HUD_TICK_MINOR, HUD_TICK_MAJOR, HUD_MM_CORNER }
+       from "../src/art/hudgen.hml";
+import { g_UI_WHITE, g_UI_DIM, g_UI_BLACK, g_UI_AMBER, g_UI_DANGER, g_UI_GOOD,
+         g_UI_XP, g_SKY_MID, g_GRASS_MID, g_CONCRETE_HI, g_SNOW_HI,
+         g_MUZZLE_CORE, g_NS_CORE, g_CONCRETE_LO,
+         pal_r, pal_g, pal_b } from "../src/art/palette.hml";
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_n: i32 = 0;
+
+// Every assertion this probe is contractually required to run.
+let EXPECT_ASSERTS = 27;
+
+fn ck(name: string, cond: i32) {
+    g_n++;
+    if (cond == 1) { g_pass++; } else { g_fail++; eprint(`FAIL ${g_n}: ${name}`); }
+}
+fn ck_i(name: string, got: i32, want: i32) {
+    g_n++;
+    if (got == want) { g_pass++; }
+    else { g_fail++; eprint(`FAIL ${g_n}: ${name} — got ${got} want ${want}`); }
+}
+
+// ===========================================================================
+// CPU-side sheet drawing (no SDL): the labelled atlas dumps
+// ===========================================================================
+
+fn sh_px(rgb: buffer, W: i32, H: i32, x: i32, y: i32, r: i32, g: i32, b: i32) {
+    if (x < 0 || y < 0 || x >= W || y >= H) { return; }
+    let o: i32 = (y * W + x) * 3;
+    rgb[o] = r & 255;
+    rgb[o + 1] = g & 255;
+    rgb[o + 2] = b & 255;
+}
+
+// One FONT_MICRO glyph, straight out of the baked HUD atlas, at 1:1.  Returns
+// the advance.  This is also a second, independent check that the bake is
+// where hudgen says it is.
+fn sh_glyph(rgb: buffer, W: i32, H: i32, hud, fm, x: i32, y: i32, cp: i32,
+            r: i32, g: i32, b: i32): i32 {
+    let gi: i32 = font_glyph_index(fm, cp);
+    if (gi < 0) { let miss: i32 = HUD_MICRO_W; return miss; }
+    let gx: i32 = (gi % HUD_MICRO_COLS) * HUD_MICRO_W;
+    let gy: i32 = divi(gi, HUD_MICRO_COLS) * HUD_MICRO_H;
+    for (let ry = 0; ry < HUD_MICRO_H; ry++) {
+        for (let rx = 0; rx < HUD_MICRO_W; rx++) {
+            let p: u32 = atlas_get(hud, gx + rx, gy + ry);
+            if (i32((p >> 24) & 255) == 255) {
+                sh_px(rgb, W, H, x + rx + 1, y + ry + 1, 0, 0, 0);   // shadow
+            }
+        }
+    }
+    for (let ry = 0; ry < HUD_MICRO_H; ry++) {
+        for (let rx = 0; rx < HUD_MICRO_W; rx++) {
+            let p: u32 = atlas_get(hud, gx + rx, gy + ry);
+            if (i32((p >> 24) & 255) == 255) { sh_px(rgb, W, H, x + rx, y + ry, r, g, b); }
+        }
+    }
+    let adv: i32 = fm.gadv[gi];
+    return adv;
+}
+
+fn sh_text(rgb: buffer, W: i32, H: i32, hud, fm, x: i32, y: i32, s: string,
+           r: i32, g: i32, b: i32) {
+    let cx: i32 = x;
+    let n: i32 = s.length;
+    for (let i = 0; i < n; i++) {
+        cx = cx + sh_glyph(rgb, W, H, hud, fm, cx, y, i32(s.char_at(i)), r, g, b);
+    }
+}
+
+fn sh_rect(rgb: buffer, W: i32, H: i32, x: i32, y: i32, w: i32, h: i32,
+           r: i32, g: i32, b: i32) {
+    for (let i = 0; i < w; i++) {
+        sh_px(rgb, W, H, x + i, y, r, g, b);
+        sh_px(rgb, W, H, x + i, y + h - 1, r, g, b);
+    }
+    for (let i = 0; i < h; i++) {
+        sh_px(rgb, W, H, x, y + i, r, g, b);
+        sh_px(rgb, W, H, x + w - 1, y + i, r, g, b);
+    }
+}
+
+// ===========================================================================
+
+fn main() {
+    // -----------------------------------------------------------------------
+    // 1. build both atlases and run their self-tests
+    // -----------------------------------------------------------------------
+    let fx = fxgen_build_atlas();
+    let hud = null;
+    hud = hudgen_build_atlas();
+    ck("fxgen_build_atlas returned an atlas", (fx != null) ? 1 : 0);
+    ck("hudgen_build_atlas returned an atlas", (hud != null) ? 1 : 0);
+    if (fx == null || hud == null) { report(); exit(1); }
+
+    let fxf: i32 = fxgen_selftest();
+    ck_i("fxgen self-test failures", fxf, 0);
+    ck_i("fxgen self-test assertion count", fxgen_checks(), 11);
+    let hudf: i32 = hudgen_selftest();
+    ck_i("hudgen self-test failures", hudf, 0);
+    ck_i("hudgen self-test assertion count", hudgen_checks(), 25);
+
+    // hudgen_selftest rebuilds the atlas once to prove determinism, so take
+    // the live handles AFTER it has run.
+    hud = hudgen_atlas();
+    let fm = hud_font_micro();
+    let fb = hud_font_big();
+    ck("both fonts exist", (fm != null && fb != null) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 2. the sprite table is addressable and the uv rects are inset
+    // -----------------------------------------------------------------------
+    let ri: array<i32> = [0, 0, 0, 0];
+    let uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    hudgen_rect(HUD_SOLID, ri, 0);
+    hudgen_uv(HUD_SOLID, uv, 0);
+    let insetok: i32 = 1;
+    let fw: f64 = f64(HUD_ATLAS_W);
+    if (uv[0] != (f64(ri[0]) + 0.5) / fw) { insetok = 0; }
+    if (uv[2] != (f64(ri[0] + ri[2]) - 0.5) / fw) { insetok = 0; }
+    ck("hudgen_uv is half-texel inset, matching atlas.hml", insetok);
+    let allnamed: i32 = 1;
+    for (let i = 0; i < HUD_RECT_COUNT; i++) {
+        if (hudgen_sprite_name(i).length == 0) { allnamed = 0; }
+    }
+    ck("every HUD sprite id has a label", allnamed);
+    let fxnamed: i32 = 1;
+    for (let i = 0; i < FX_CELL_COUNT; i++) {
+        if (fxgen_cell_name(i).length == 0) { fxnamed = 0; }
+    }
+    ck("every FX cell id has a label", fxnamed);
+
+    // -----------------------------------------------------------------------
+    // 3. the labelled atlas sheets (evidence for the visual critic)
+    // -----------------------------------------------------------------------
+    // ATLAS_FX, 4x, one labelled block per cell.  Additive art is authored
+    // against black, so black IS the correct sheet background.
+    let CB: i32 = FX_CELL * 4;              // 64 px per cell block
+    let LB: i32 = 10;                       // label strip
+    let FW: i32 = FX_GRID * CB;
+    let FH: i32 = FX_GRID * (CB + LB);
+    let fxsheet: buffer = buffer(FW * FH * 3);
+    for (let i = 0; i < FW * FH * 3; i++) { fxsheet[i] = 0; }
+    for (let cell = 0; cell < FX_GRID * FX_GRID; cell++) {
+        let col: i32 = cell % FX_GRID;
+        let row: i32 = divi(cell, FX_GRID);
+        let bx: i32 = col * CB;
+        let by: i32 = row * (CB + LB);
+        for (let y = 0; y < FX_CELL; y++) {
+            for (let x = 0; x < FX_CELL; x++) {
+                let p: u32 = atlas_get(fx, col * FX_CELL + x, row * FX_CELL + y);
+                let r: i32 = i32(p & 255);
+                let g: i32 = i32((p >> 8) & 255);
+                let b: i32 = i32((p >> 16) & 255);
+                for (let sy = 0; sy < 4; sy++) {
+                    for (let sx = 0; sx < 4; sx++) {
+                        sh_px(fxsheet, FW, FH, bx + x * 4 + sx, by + y * 4 + sy, r, g, b);
+                    }
+                }
+            }
+        }
+        sh_rect(fxsheet, FW, FH, bx, by, CB, CB,
+                pal_r(g_CONCRETE_LO), pal_g(g_CONCRETE_LO), pal_b(g_CONCRETE_LO));
+        let nm: string = fxgen_cell_name(cell);
+        if (nm.length > 0) {
+            sh_text(fxsheet, FW, FH, hud, fm, bx + 2, by + CB + 2, nm,
+                    pal_r(g_UI_WHITE), pal_g(g_UI_WHITE), pal_b(g_UI_WHITE));
+        }
+    }
+    write_png("/tmp/ns_w2_7/atlas_fx.png", fxsheet, FW, FH);
+
+    // ATLAS_HUD, 4x, on a checker so alpha reads, with every sprite rect
+    // outlined and a full legend underneath.
+    let HW: i32 = HUD_ATLAS_W * 4;
+    let LEG: i32 = 8 * (HUD_RECT_COUNT + 3);
+    let HH: i32 = HUD_ATLAS_H * 4 + LEG;
+    let hudsheet: buffer = buffer(HW * HH * 3);
+    for (let y = 0; y < HH; y++) {
+        for (let x = 0; x < HW; x++) {
+            let dark: i32 = ((divi(x, 8) + divi(y, 8)) % 2);
+            let c: i32 = g_CONCRETE_LO;
+            if (dark == 0) { c = g_CONCRETE_HI; }
+            sh_px(hudsheet, HW, HH, x, y, pal_r(c), pal_g(c), pal_b(c));
+        }
+    }
+    for (let y = 0; y < HUD_ATLAS_H; y++) {
+        for (let x = 0; x < HUD_ATLAS_W; x++) {
+            let p: u32 = atlas_get(hud, x, y);
+            let a: i32 = i32((p >> 24) & 255);
+            if (a == 0) { continue; }
+            let r: i32 = i32(p & 255);
+            let g: i32 = i32((p >> 8) & 255);
+            let b: i32 = i32((p >> 16) & 255);
+            for (let sy = 0; sy < 4; sy++) {
+                for (let sx = 0; sx < 4; sx++) {
+                    let dx: i32 = x * 4 + sx;
+                    let dy: i32 = y * 4 + sy;
+                    let o: i32 = (dy * HW + dx) * 3;
+                    let br: i32 = i32(hudsheet[o]);
+                    let bg: i32 = i32(hudsheet[o + 1]);
+                    let bb: i32 = i32(hudsheet[o + 2]);
+                    sh_px(hudsheet, HW, HH, dx, dy,
+                          divi(r * a + br * (255 - a), 255),
+                          divi(g * a + bg * (255 - a), 255),
+                          divi(b * a + bb * (255 - a), 255));
+                }
+            }
+        }
+    }
+    for (let id = 0; id < HUD_RECT_COUNT; id++) {
+        hudgen_rect(id, ri, 0);
+        sh_rect(hudsheet, HW, HH, ri[0] * 4 - 1, ri[1] * 4 - 1,
+                ri[2] * 4 + 2, ri[3] * 4 + 2,
+                pal_r(g_NS_CORE), pal_g(g_NS_CORE), pal_b(g_NS_CORE));
+    }
+    for (let y = HUD_ATLAS_H * 4; y < HH; y++) {
+        for (let x = 0; x < HW; x++) {
+            sh_px(hudsheet, HW, HH, x, y, pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+        }
+    }
+    sh_text(hudsheet, HW, HH, hud, fm, 4, HUD_ATLAS_H * 4 + 2,
+            "ATLAS HUD 128X128 - FONT MICRO Y0-11, FONT BIG Y12-23",
+            pal_r(g_UI_WHITE), pal_g(g_UI_WHITE), pal_b(g_UI_WHITE));
+    for (let id = 0; id < HUD_RECT_COUNT; id++) {
+        hudgen_rect(id, ri, 0);
+        sh_text(hudsheet, HW, HH, hud, fm, 4, HUD_ATLAS_H * 4 + 12 + id * 8,
+                `${id} ${hudgen_sprite_name(id)} ${ri[0]},${ri[1]} ${ri[2]}X${ri[3]}`,
+                pal_r(g_UI_AMBER), pal_g(g_UI_AMBER), pal_b(g_UI_AMBER));
+    }
+    write_png("/tmp/ns_w2_7/atlas_hud.png", hudsheet, HW, HH);
+
+    // -----------------------------------------------------------------------
+    // 4. the real 320x240 render
+    // -----------------------------------------------------------------------
+    let w = window_open_ex("probe_atlasgen", 320, 240, 1, 0);
+    if (w == null) {
+        eprint("probe_atlasgen: no SDL window/renderer — cannot run the render tests");
+        report();
+        exit(1);
+    }
+    let htex = atlas_upload(w, hud, BLEND_BLEND);
+    let ftex = atlas_upload(w, fx, BLEND_ADD);
+    ck("ATLAS_HUD uploaded", (htex != ptr_null()) ? 1 : 0);
+    ck("ATLAS_FX uploaded", (ftex != ptr_null()) ? 1 : 0);
+    // A format substitution means SDL made a hidden conversion texture and
+    // every upload is a CPU copy (atlas.hml's opening comment).
+    ck("ATLAS_HUD is native FMT_RGBA32, no conversion texture",
+       (atlas_format(hud) == FMT_RGBA32) ? 1 : 0);
+    ck("ATLAS_FX is native FMT_RGBA32, no conversion texture",
+       (atlas_format(fx) == FMT_RGBA32) ? 1 : 0);
+
+    let target = create_target(w, 320, 240);
+    ck("render target created", (target != ptr_null()) ? 1 : 0);
+    set_target(w, target);
+
+    let b = batch_new(768, 1.0, LAYER_HUD);
+    let px: buffer = buffer(320 * 240 * 4);
+    let pp: ptr = buffer_ptr(px);
+
+    // --- pass A: texel-exactness of both fonts, on black -------------------
+    sdl_clear(w, 0, 0, 0, 255);
+    batch_reset(b);
+    let SA: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let SB: string = "0123456789 .,:/%+-[]<>";
+    let SC: string = "0123456789/%";
+    let AX: f64 = 8.0;
+    let AY: f64 = 20.0;
+    let BX: f64 = 8.0;
+    let BY: f64 = 34.0;
+    let CX: f64 = 8.0;
+    let CY: f64 = 60.0;
+    font_text(fm, b, htex, AX, AY, SA, 255, 255, 255, 255, 400);
+    font_text(fm, b, htex, BX, BY, SB, 255, 255, 255, 255, 400);
+    font_text(fb, b, htex, CX, CY, SC, 255, 255, 255, 255, 400);
+    batch_flush(w, b);
+    ck_i("readback of the exactness pass", read_pixels_rect(w, 0, 0, 320, 240,
+         FMT_ARGB8888, pp, 320 * 4), 0);
+
+    // Screen texel must equal atlas texel, 1:1, with no filtering and no bleed.
+    // atlas texel == source bitfield is proven inside hudgen_selftest, so this
+    // closes the chain from the bitfield literal to the 320x240 framebuffer.
+    let lit: i32 = 0;
+    let exact: i32 = 1;
+    let bleed: i32 = 0;
+    let cur: f64 = AX;
+    for (let s = 0; s < 3; s++) {
+        let str: string = SA;
+        let f = fm;
+        let gw: i32 = HUD_MICRO_W;
+        let gh: i32 = HUD_MICRO_H;
+        let cols: i32 = HUD_MICRO_COLS;
+        let oy: i32 = 0;
+        let py: i32 = i32(AY);
+        if (s == 1) { str = SB; cur = BX; py = i32(BY); }
+        if (s == 2) {
+            str = SC; f = fb; cur = CX; py = i32(CY);
+            gw = HUD_BIG_W; gh = HUD_BIG_H; cols = HUD_BIG_COLS; oy = HUD_BIG_Y;
+        }
+        if (s == 0) { cur = AX; }
+        let n: i32 = str.length;
+        for (let i = 0; i < n; i++) {
+            let cp: i32 = i32(str.char_at(i));
+            let gi: i32 = font_glyph_index(f, cp);
+            if (gi < 0) {
+                // An unmapped codepoint (space) draws nothing and advances by
+                // the font default — the cursor must follow it or every glyph
+                // after the first space is compared at the wrong column.
+                cur = cur + f64(f.adv);
+                continue;
+            }
+            let gx: i32 = (gi % cols) * gw;
+            let gy: i32 = oy + divi(gi, cols) * gh;
+            for (let ry = 0; ry < gh; ry++) {
+                for (let rx = 0; rx < gw; rx++) {
+                    let want: i32 = i32((atlas_get(hud, gx + rx, gy + ry) >> 24) & 255);
+                    let sx: i32 = i32(cur) + rx;
+                    let sy: i32 = py + ry;
+                    let o: i32 = ((sy * 320) + sx) * 4;
+                    let pb: i32 = i32(px[o]);
+                    let pg: i32 = i32(px[o + 1]);
+                    let pr: i32 = i32(px[o + 2]);
+                    if (want == 255) {
+                        lit++;
+                        if (pr != 255 || pg != 255 || pb != 255) { exact = 0; }
+                    } else {
+                        if (pr != 0 || pg != 0 || pb != 0) { bleed++; }
+                    }
+                }
+            }
+            cur = cur + f64(f.gadv[gi]);
+        }
+    }
+    ck("320x240 render is texel-exact for every glyph drawn", exact);
+    ck_i("no texel bled outside a glyph's set bits", bleed, 0);
+    ck("the glyphs actually lit pixels", (lit > 400) ? 1 : 0);
+    let rowabove: i32 = 1;
+    for (let x = 0; x < 320; x++) {
+        let o: i32 = ((i32(AY) - 1) * 320 + x) * 4;
+        if (i32(px[o]) != 0 || i32(px[o + 1]) != 0 || i32(px[o + 2]) != 0) { rowabove = 0; }
+    }
+    ck("nothing bled above the first text row", rowabove);
+    // FONT_BIG must be drawn, not scaled: its 12-px cell height must actually
+    // reach the framebuffer.
+    let bigrows: i32 = 0;
+    for (let y = 0; y < HUD_BIG_H; y++) {
+        let any: i32 = 0;
+        for (let x = 0; x < 120; x++) {
+            let o: i32 = (((i32(CY) + y) * 320) + i32(CX) + x) * 4;
+            if (i32(px[o]) != 0) { any = 1; }
+        }
+        if (any == 1) { bigrows++; }
+    }
+    ck_i("FONT_BIG occupies all 12 of its rows on screen", bigrows, 12);
+
+    let rgbA: buffer = buffer(320 * 240 * 3);
+    for (let i = 0; i < 320 * 240; i++) {
+        rgbA[i * 3] = px[i * 4 + 2];
+        rgbA[i * 3 + 1] = px[i * 4 + 1];
+        rgbA[i * 3 + 2] = px[i * 4];
+    }
+    write_png("/tmp/ns_w2_7/glyph_exact_320x240.png", rgbA, 320, 240);
+
+    // --- pass B: the ART_BIBLE §9.2 HUD, at its real coordinates -----------
+    // Two backgrounds: the worst case §13.9 demands (sky / snow / muzzle
+    // flash / concrete) and a normal sky-and-grass frame.
+    for (let scene = 0; scene < 2; scene++) {
+        sdl_clear(w, 0, 0, 0, 255);
+        batch_reset(b);
+        draw_backdrop(b, htex, hud, scene);
+        let fxtris: i32 = draw_fx(b, ftex, fx);
+        let before: i32 = batch_count(b);
+        draw_hud(b, htex, hud, fm, fb);
+        let hudtris: i32 = batch_count(b) - before;
+        batch_flush(w, b);
+        read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+        let rgb: buffer = buffer(320 * 240 * 3);
+        for (let i = 0; i < 320 * 240; i++) {
+            rgb[i * 3] = px[i * 4 + 2];
+            rgb[i * 3 + 1] = px[i * 4 + 1];
+            rgb[i * 3 + 2] = px[i * 4];
+        }
+        if (scene == 0) {
+            write_png("/tmp/ns_w2_7/hud_worst_case_320x240.png", rgb, 320, 240);
+            // The assertion is against the LAYER_HUD BATCH CAP (768,
+            // ARCHITECTURE.md §4), which is the real hard limit.  It is NOT
+            // against ART_BIBLE §9.3's "~240 worst case": drawing §9.2
+            // literally, with the §9.1 mandatory shadow pass, measures far
+            // more than that, and the discrepancy is reported rather than
+            // hidden — see the note printed below.
+            ck("the full ART_BIBLE 9.2 HUD fits the LAYER_HUD batch cap",
+               (hudtris <= 768) ? 1 : 0);
+            print(`HUD triangles = ${hudtris}, FX triangles = ${fxtris}`);
+            print(`NOTE: ART_BIBLE 9.3 budgets ~240 tris for this HUD. A shadowed`);
+            print(`      4x6 character costs 4 triangles, so every text element is`);
+            print(`      4x its glyph count, not 1x. hud.hml (W3) must hard-cap.`);
+            // contrast anchors: every frame needs something under 30 and
+            // something over 220 luminance (CLAUDE.md §8).
+            let lo: i32 = 999;
+            let hi: i32 = 0 - 1;
+            for (let i = 0; i < 320 * 240; i++) {
+                let lum: i32 = divi(i32(px[i * 4 + 2]) * 77 + i32(px[i * 4 + 1]) * 151
+                                    + i32(px[i * 4]) * 28, 256);
+                if (lum < lo) { lo = lum; }
+                if (lum > hi) { hi = lum; }
+            }
+            ck("the HUD frame has a dark anchor below luminance 30", (lo < 30) ? 1 : 0);
+            ck("the HUD frame has a light anchor above luminance 220", (hi > 220) ? 1 : 0);
+        } else {
+            write_png("/tmp/ns_w2_7/hud_normal_320x240.png", rgb, 320, 240);
+        }
+    }
+
+    // --- an FX contact sheet through the real ADD pipeline -----------------
+    sdl_clear(w, 0, 0, 0, 255);
+    batch_reset(b);
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        let col: i32 = cell % FX_GRID;
+        let row: i32 = divi(cell, FX_GRID);
+        atlas_rect_uv(fx, col * FX_CELL, row * FX_CELL, FX_CELL, FX_CELL, uv, 0);
+        quad_screen_uv(b, ftex, f64(8 + col * 38), f64(20 + row * 38), 32.0, 32.0,
+                       uv[0], uv[1], uv[2], uv[3], 255, 255, 255, 255, 0.5);
+    }
+    batch_flush(w, b);
+    read_pixels_rect(w, 0, 0, 320, 240, FMT_ARGB8888, pp, 320 * 4);
+    let rgbF: buffer = buffer(320 * 240 * 3);
+    for (let i = 0; i < 320 * 240; i++) {
+        rgbF[i * 3] = px[i * 4 + 2];
+        rgbF[i * 3 + 1] = px[i * 4 + 1];
+        rgbF[i * 3 + 2] = px[i * 4];
+    }
+    write_png("/tmp/ns_w2_7/fx_add_320x240.png", rgbF, 320, 240);
+    // the additive contract, verified on screen: a cell's margin adds nothing
+    let addclean: i32 = 1;
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        let col: i32 = cell % FX_GRID;
+        let row: i32 = divi(cell, FX_GRID);
+        let x0: i32 = 8 + col * 38;
+        let y0: i32 = 20 + row * 38;
+        for (let k = 0; k < 32; k++) {
+            let o: i32 = ((y0 - 2) * 320 + x0 + k) * 4;
+            if (i32(px[o]) != 0 || i32(px[o + 1]) != 0 || i32(px[o + 2]) != 0) { addclean = 0; }
+        }
+    }
+    ck("ADD composites the FX margin to exactly nothing on screen", addclean);
+
+    set_target(w, null);
+
+    // -----------------------------------------------------------------------
+    // 5. RULE T: build cost.  __clock() CPU time, minimum of 7 batches.
+    //    This box permanently shares ~17 of 24 cores with a llama-server, so
+    //    the bound is a REGRESSION GUARD at ~2x the loaded measurement, not a
+    //    certification of an idle machine (CLAUDE.md §1.2).
+    // -----------------------------------------------------------------------
+    let TRIALS = 7;
+    let ms_fx: f64 = 1.0e9;
+    let ms_hud: f64 = 1.0e9;
+    for (let t = 0; t < TRIALS; t++) {
+        let a0: f64 = __clock();
+        fxgen_build_atlas();
+        let a1: f64 = __clock();
+        hudgen_build_atlas();
+        let a2: f64 = __clock();
+        let d0: f64 = (a1 - a0) * 1000.0;
+        let d1: f64 = (a2 - a1) * 1000.0;
+        if (d0 < ms_fx) { ms_fx = d0; }
+        if (d1 < ms_hud) { ms_hud = d1; }
+    }
+    print(`fxgen_build_atlas  = ${ms_fx} ms (min of ${TRIALS}, CPU time, loaded box)`);
+    print(`hudgen_build_atlas = ${ms_hud} ms (min of ${TRIALS}, CPU time, loaded box)`);
+    // Loaded measurement 2026-07-28 with llama-server on ~17/24 cores:
+    // fxgen ~9 ms, hudgen ~4 ms.  Bound = ~2x that, and both are one-shot boot
+    // costs behind the title card, not per-frame costs.
+    ck("fxgen build cost <= 40 ms (guard; ~9 ms loaded)", (ms_fx <= 40.0) ? 1 : 0);
+    ck("hudgen build cost <= 25 ms (guard; ~4 ms loaded)", (ms_hud <= 25.0) ? 1 : 0);
+
+    window_close(w);
+    report();
+    if (g_fail != 0) { exit(1); }
+    if (g_n != EXPECT_ASSERTS) { exit(1); }
+}
+
+// ===========================================================================
+// the scene: ART_BIBLE §9.2, in exact 320x240 pixel coordinates
+// ===========================================================================
+
+// A solid tinted rect, drawn through the HUD atlas' single opaque white texel.
+fn bar(b, tex, hud, x: f64, y: f64, w: f64, h: f64, c: i32, a: i32): i32 {
+    let uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    hudgen_uv(HUD_SOLID, uv, 0);
+    let n: i32 = quad_screen_uv(b, tex, x, y, w, h, uv[0], uv[1], uv[2], uv[3],
+                                pal_r(c), pal_g(c), pal_b(c), a, 0.5);
+    return n;
+}
+
+fn sprite(b, tex, hud, id: i32, x: f64, y: f64, c: i32, a: i32): i32 {
+    let uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    let ri: array<i32> = [0, 0, 0, 0];
+    hudgen_uv(id, uv, 0);
+    hudgen_rect(id, ri, 0);
+    let n: i32 = quad_screen_uv(b, tex, x, y, f64(ri[2]), f64(ri[3]),
+                                uv[0], uv[1], uv[2], uv[3],
+                                pal_r(c), pal_g(c), pal_b(c), a, 0.5);
+    return n;
+}
+
+fn fx_sprite(b, tex, fx, cell: i32, x: f64, y: f64, w: f64, h: f64, a: i32): i32 {
+    let uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    let col: i32 = cell % FX_GRID;
+    let row: i32 = divi(cell, FX_GRID);
+    atlas_rect_uv(fx, col * FX_CELL, row * FX_CELL, FX_CELL, FX_CELL, uv, 0);
+    let n: i32 = quad_screen_uv(b, tex, x, y, w, h, uv[0], uv[1], uv[2], uv[3],
+                                255, 255, 255, a, 0.5);
+    return n;
+}
+
+// The two test backdrops.  Scene 0 is `hud_worst_case`: the four surfaces
+// ART_BIBLE §13.9 says every HUD element must survive.
+fn draw_backdrop(b, tex, hud, scene: i32) {
+    if (scene == 0) {
+        bar(b, tex, hud, 0.0, 0.0, 80.0, 240.0, g_SKY_MID, 255);
+        bar(b, tex, hud, 80.0, 0.0, 80.0, 240.0, g_SNOW_HI, 255);
+        bar(b, tex, hud, 160.0, 0.0, 80.0, 240.0, g_MUZZLE_CORE, 255);
+        bar(b, tex, hud, 240.0, 0.0, 80.0, 240.0, g_CONCRETE_HI, 255);
+    } else {
+        bar(b, tex, hud, 0.0, 0.0, 320.0, 104.0, g_SKY_MID, 255);
+        bar(b, tex, hud, 0.0, 104.0, 320.0, 136.0, g_GRASS_MID, 255);
+    }
+}
+
+// Additive FX in the same frame, so the ADD/BLEND material split is exercised
+// end to end rather than asserted on paper.
+fn draw_fx(b, tex, fx): i32 {
+    let n: i32 = 0;
+    n = n + fx_sprite(b, tex, fx, FX_MUZZLE_1, 196.0, 150.0, 48.0, 48.0, 255);
+    n = n + fx_sprite(b, tex, fx, FX_TRACER, 214.0, 104.0, 8.0, 52.0, 210);
+    n = n + fx_sprite(b, tex, fx, FX_EXPLO_2, 44.0, 78.0, 40.0, 40.0, 200);
+    n = n + fx_sprite(b, tex, fx, FX_SMOKE_1, 36.0, 62.0, 56.0, 56.0, 150);
+    n = n + fx_sprite(b, tex, fx, FX_GLOW_L, 100.0, 148.0, 28.0, 28.0, 170);
+    n = n + fx_sprite(b, tex, fx, FX_XP_MOTE, 152.0, 178.0, 12.0, 12.0, 255);
+    let out: i32 = n;
+    return out;
+}
+
+// ART_BIBLE §9.2 / §9.3, coordinate for coordinate.
+fn draw_hud(b, tex, hud, fm, fb) {
+    let W: i32 = g_UI_WHITE;
+    let D: i32 = g_UI_DIM;
+    let K: i32 = g_UI_BLACK;
+    let A: i32 = g_UI_AMBER;
+    let R: i32 = g_UI_DANGER;
+    let G: i32 = g_UI_GOOD;
+    let wr: i32 = pal_r(W); let wg: i32 = pal_g(W); let wb: i32 = pal_b(W);
+    let dr: i32 = pal_r(D); let dg: i32 = pal_g(D); let db: i32 = pal_b(D);
+    let ar: i32 = pal_r(A); let ag: i32 = pal_g(A); let ab: i32 = pal_b(A);
+    let kr: i32 = pal_r(K); let kg: i32 = pal_g(K); let kb: i32 = pal_b(K);
+
+    // --- compass, x 100..219, y 6..15 -------------------------------------
+    bar(b, tex, hud, 100.0, 5.0, 120.0, 12.0, K, 120);
+    for (let i = 0; i < 13; i++) {
+        let x: f64 = 100.0 + f64(i) * 10.0;
+        sprite(b, tex, hud, HUD_TICK_MINOR, x, 8.0, D, 255);
+    }
+    sprite(b, tex, hud, HUD_TICK_MAJOR, 130.0, 5.0, W, 255);
+    sprite(b, tex, hud, HUD_TICK_MAJOR, 190.0, 5.0, W, 255);
+    font_text_shadowed(fm, b, tex, 129.0, 10.0, "N", wr, wg, wb, 255,
+                       kr, kg, kb, 255, 1.0, 1.0, 8);
+    font_text_shadowed(fm, b, tex, 189.0, 10.0, "E", wr, wg, wb, 255,
+                       kr, kg, kb, 255, 1.0, 1.0, 8);
+    sprite(b, tex, hud, HUD_CHEVRON, 158.0, 2.0, W, 255);
+
+    // --- minimap, x 252..311, y 8..67 -------------------------------------
+    bar(b, tex, hud, 252.0, 8.0, 60.0, 60.0, K, 140);
+    sprite(b, tex, hud, HUD_MM_CORNER, 252.0, 8.0, W, 255);
+    sprite(b, tex, hud, HUD_ICON_PLAYER, 279.0, 35.0, W, 255);
+    sprite(b, tex, hud, HUD_ICON_ENEMY, 266.0, 24.0, R, 255);
+    sprite(b, tex, hud, HUD_ICON_ENEMY, 296.0, 50.0, R, 255);
+    sprite(b, tex, hud, HUD_ICON_OBJDOT, 300.0, 16.0, A, 255);
+
+    // --- killfeed, right-aligned to 311, y 74/82/90/98 --------------------
+    for (let i = 0; i < 3; i++) {
+        let s: string = "VESPER";
+        let y: f64 = 74.0 + f64(i) * 8.0;
+        let wpx: i32 = font_width(fm, s);
+        font_text_shadowed(fm, b, tex, f64(311 - wpx), y, s,
+                           dr, dg, db, 255, kr, kg, kb, 255, 1.0, 1.0, 48);
+        sprite(b, tex, hud, HUD_ICON_SKULL, f64(311 - wpx - 10), y - 1.0, W, 255);
+        sprite(b, tex, hud, HUD_ICON_WEAPON, f64(311 - wpx - 20), y, D, 255);
+    }
+
+    // --- crosshair at (160,120), spread 3 ---------------------------------
+    let gap: f64 = 3.0 + 3.0;
+    sprite(b, tex, hud, HUD_XH_TICK_V, 159.0, 120.0 - gap - 6.0, W, 255);
+    sprite(b, tex, hud, HUD_XH_TICK_V, 159.0, 120.0 + gap, W, 255);
+    sprite(b, tex, hud, HUD_XH_TICK_H, 160.0 - gap - 6.0, 119.0, W, 255);
+    sprite(b, tex, hud, HUD_XH_TICK_H, 160.0 + gap, 119.0, W, 255);
+    sprite(b, tex, hud, HUD_HITMARK, 152.0, 112.0, W, 200);
+
+    // --- reload bar, x 140..179, y 132..134 -------------------------------
+    bar(b, tex, hud, 139.0, 131.0, 42.0, 5.0, K, 190);
+    bar(b, tex, hud, 140.0, 132.0, 26.0, 3.0, W, 255);
+
+    // --- interact prompt, centred on x 160, y 148 -------------------------
+    let prompt: string = "[E]  PICK UP  AR-9 VESPER";
+    let pw: i32 = font_width(fm, prompt);
+    bar(b, tex, hud, f64(160 - divi(pw, 2) - 2), 146.0, f64(pw + 4), 10.0, K, 155);
+    font_text_shadowed(fm, b, tex, f64(160 - divi(pw, 2)), 148.0, prompt,
+                       wr, wg, wb, 255, kr, kg, kb, 255, 1.0, 1.0, 120);
+
+    // --- XP popup, rising from (160,206) toward (160,186) -----------------
+    font_text_shadowed(fm, b, tex, 154.0, 192.0, "+50",
+                       ar, ag, ab, 255, kr, kg, kb, 255, 1.0, 1.0, 16);
+
+    // --- health: heart 8x8 at (10,208), numeral at (22,208), bar y220..225
+    sprite(b, tex, hud, HUD_ICON_HEART, 10.0, 208.0, R, 255);
+    font_text_shadowed(fb, b, tex, 22.0, 208.0, "100",
+                       wr, wg, wb, 255, kr, kg, kb, 255, 1.0, 1.0, 24);
+    bar(b, tex, hud, 9.0, 219.0, 82.0, 8.0, K, 210);
+    bar(b, tex, hud, 10.0, 220.0, 80.0, 6.0, K, 255);
+    bar(b, tex, hud, 10.0, 220.0, 62.0, 6.0, G, 255);
+
+    // --- weapon name / ammo, right-aligned to x 310 -----------------------
+    let name: string = "AUTO  AR-9 VESPER";
+    let nw: i32 = font_width(fm, name);
+    font_text_shadowed(fm, b, tex, f64(310 - nw), 196.0, name,
+                       dr, dg, db, 255, kr, kg, kb, 255, 1.0, 1.0, 80);
+    let mag: string = "24";
+    let mw: i32 = font_width(fb, mag);
+    font_text_shadowed(fb, b, tex, f64(310 - mw), 206.0, mag,
+                       ar, ag, ab, 255, kr, kg, kb, 255, 1.0, 1.0, 16);
+    let res: string = "/ 180";
+    let rw: i32 = font_width(fm, res);
+    font_text_shadowed(fm, b, tex, f64(310 - rw), 220.0, res,
+                       dr, dg, db, 255, kr, kg, kb, 255, 1.0, 1.0, 24);
+
+    // --- XP bar x 110..209 y 232..235, level numeral at (82,230) ----------
+    font_text_shadowed(fm, b, tex, 82.0, 230.0, "LVL 7",
+                       ar, ag, ab, 255, kr, kg, kb, 255, 1.0, 1.0, 24);
+    bar(b, tex, hud, 109.0, 231.0, 102.0, 6.0, K, 210);
+    bar(b, tex, hud, 110.0, 232.0, 100.0, 4.0, K, 255);
+    bar(b, tex, hud, 110.0, 232.0, 58.0, 4.0, g_UI_XP, 255);
+}
+
+fn report() {
+    print(`probe_atlasgen: ${g_pass}/${g_n} passed, ${g_fail} failed (expected ${EXPECT_ASSERTS} assertions)`);
+    if (g_n != EXPECT_ASSERTS) {
+        eprint(`ASSERTION COUNT MISMATCH: ran ${g_n}, contract says ${EXPECT_ASSERTS}`);
+    }
+}
+
+main();

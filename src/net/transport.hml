@@ -1,0 +1,1437 @@
+// transport.hml — the Transport interface, LoopbackTransport, the v2 stub, and
+// the self-test. W2-12.
+//
+// ===========================================================================
+// v1 IS SINGLE-PLAYER AND LOOPBACK ONLY. NOTHING HERE OPENS A SOCKET.
+// ===========================================================================
+// The rule that makes multiplayer a layer instead of a rewrite (NETWORKING §5):
+//
+//   v1 single-player is a client and a server in one process, talking over an
+//   in-memory transport. The gameplay code never learns which one it is
+//   running under.
+//
+// So this file is a SHAPE, not a feature. Gameplay code sees `send_command` /
+// `poll_snapshot` and nothing else; whether the bytes crossed a socket or a
+// function call is not its business and never becomes its business.
+//
+// **This is the only file in the entire project that may ever import gn.hml**
+// (NETWORKING anti-pattern 18). In v1 it imports nothing of the sort — the
+// ship build links no networking at all. When v2 lands, the import goes here,
+// inside `transport_net`, and nowhere else. `client.recv_packet()` and
+// `client.run()` are BANNED even then: the first silently drops every packet
+// but the first in a frame (§3.3), the second blocks the render loop forever.
+//
+// ---------------------------------------------------------------------------
+// THE THREE DEBUG MODES, AND WHY EACH ONE EXISTS
+// ---------------------------------------------------------------------------
+// NS_FAKE_LATENCY_MS   one-way delay, milliseconds. RTT is 2x this.
+//     "A dev who has never run the game at 120 ms fake latency has not tested
+//     their feature." Prediction and reconciliation are only correct if they
+//     are EXERCISED, and in v1 the only way to exercise them is to fake the
+//     delay. Set NS_FAKE_LATENCY_MS=60 for a realistic 120 ms RTT.
+//
+// NS_FAKE_JITTER_MS    uniform +-jitter added to each one-way delay.
+//     Deterministic: it comes from a seeded xorshift64 in this file, not from
+//     @stdlib/random and not from a wall clock, so a jittered session replays
+//     identically. Jitter NEVER reorders a queue — gn.hml is WebSocket over
+//     TCP, there is no unreliable channel, and loss shows up as latency
+//     (head-of-line blocking), not as gaps (§3.8). Modelling reordering here
+//     would train the game against a network it will never meet.
+//
+// NS_LOOPBACK_SERIALIZE=1  every message round-trips through the REAL codec.
+//     A field that cannot be encoded — a bool (gn.hml throws), a null (silent
+//     truncation), a float outside f32 range — fails during single-player
+//     development instead of six months later on the first multiplayer build.
+//     Turn it on in CI. It is the single highest-value line in this file.
+//
+// ---------------------------------------------------------------------------
+// WHY THE LOOPBACK NEVER STORES A REFERENCE TO THE CALLER'S DATA
+// ---------------------------------------------------------------------------
+// `pack_flush()` hands back a VIEW into a packer that is reused on the next
+// message. Queueing that view would alias, and the second snapshot would
+// silently rewrite the first while it was still in flight. So both modes copy
+// on send and copy on poll:
+//
+//   serialize = 0 : the queue slot owns preallocated SoA arrays; send and poll
+//                   are integer copies. Zero allocation, zero codec.
+//   serialize = 1 : the queue slot owns the built wire bytes; poll re-parses.
+//
+// Both produce byte-identical caller-visible results — which is exactly what
+// the self-test asserts, and is what makes NS_LOOPBACK_SERIALIZE a real test
+// rather than a no-op.
+//
+// ---------------------------------------------------------------------------
+// THE CLOCK
+// ---------------------------------------------------------------------------
+// There is no wall clock in this file. The caller advances the transport's
+// notion of time once per TICK with `transport_set_tick(t, tick, tick_ms)`,
+// so delivery happens at tick boundaries and never instantaneously, and a
+// replay of the same tick sequence delivers the same messages on the same
+// ticks. `TICK_MS` itself lives in `src/core/config.hml`, which the import
+// wall keeps out of `src/net/`, so it arrives as an argument instead of being
+// duplicated here.
+
+import { exit } from "@stdlib/process";
+import { getenv, setenv, unsetenv } from "@stdlib/env";
+import { TAU } from "@stdlib/math";
+import {
+    pack_new, pack_reset, pack_flush, pack_is_wire_safe, pack_is_wire_int,
+    pack_bad, pack_ovf, pack_pos, pack_cap, pack_clamped,
+    pack_u8, pack_i8, pack_i16, pack_u32,
+    unpack_new, unpack_u8, unpack_i8, unpack_i16, unpack_u32, unpack_ovf,
+    pack_ent_blob, unpack_ent_blob, pack_bulk_bad, pack_bulk_bad_reset,
+    PACK_MAX_BLOB, PACK_INT_TYPEID_MAX, ENT_STRIDE, ENTS_PER_BLOB, CMD_STRIDE,
+    EV_STRIDE, EVS_PER_BLOB, LOCAL_STRIDE
+} from "./packing.hml";
+import {
+    q_pos, dq_pos, q_pos16, q_ang, dq_ang, q_ang8, dq_ang8, q_vel, q_evpos,
+    q_axis, wire_pos, q_clamp_count, q_clamp_reset
+} from "./quantize.hml";
+import {
+    proto_msg, proto_build, proto_load, proto_parse_frame,
+    proto_add, proto_audit, proto_audit_gameplay, proto_count, proto_get,
+    proto_net_id, proto_blob_count, proto_refused, proto_malformed,
+    proto_diag_reset,
+    cmdq_new, cmdq_reset, cmdq_count, cmdq_push, cmdq_push_cmd,
+    proto_write_input, proto_read_input,
+    netents_new, netents_reset, netents_count, netents_push, netents_push_q,
+    netlocal_new, netlocal_set, netlocal_x, netlocal_vy,
+    proto_write_snapshot, proto_read_snapshot,
+    netevs_new, netevs_reset, netevs_push, netevs_push_q, netevs_y,
+    proto_write_events, proto_read_events,
+    NET_C_INPUT, NET_S_SNAPSHOT, NET_S_EVENT, MAX_CMDS_PER_PACKET,
+    EV_HIT, EV_KILL, EF_ADS, EF_FIRING
+} from "./protocol.hml";
+
+// ---------------------------------------------------------------------------
+// Transport kinds and ring depths.
+// ---------------------------------------------------------------------------
+export let TRANSPORT_LOOPBACK: i32 = 0;
+export let TRANSPORT_NET: i32 = 1;      // v2 only; the stub below
+
+export let CMD_RING: i32 = 128;         // PENDING_CMD_CAP, NETWORKING §17.3
+export let SNAP_RING: i32 = 8;          // snapshots in flight; newest wins
+export let EV_RING: i32 = 128;
+
+export let DEFAULT_ENT_CAP: i32 = 64;   // 12 players + ~20 nearby, with slack
+
+// ---------------------------------------------------------------------------
+// Environment knobs. Read once, at construction. Explicit setters exist so a
+// tool can drive the same modes without touching the process environment.
+// ---------------------------------------------------------------------------
+// Digit lookup by comparison. Hemlock's stdlib has no char-to-code function
+// and `i32("xy")` THROWS, which is exactly what a knob parser must not do: a
+// typo in a debug environment variable is not worth a 192-byte heap leak and a
+// crashed game (CLAUDE.md rule 7).
+fn digit_of(p_c: string): i32 {
+    let c: string = p_c;
+    if (c == "0") { return 0; }
+    if (c == "1") { return 1; }
+    if (c == "2") { return 2; }
+    if (c == "3") { return 3; }
+    if (c == "4") { return 4; }
+    if (c == "5") { return 5; }
+    if (c == "6") { return 6; }
+    if (c == "7") { return 7; }
+    if (c == "8") { return 8; }
+    if (c == "9") { return 9; }
+    return -1;
+}
+
+fn env_i32(p_name: string, p_def: i32): i32 {
+    let s = getenv(p_name);
+    if (s == null) { let d: i32 = p_def; return d; }
+    let n: i32 = s.length;
+    if (n < 1) { let d2: i32 = p_def; return d2; }
+    let i: i32 = 0;
+    let sign: i32 = 1;
+    if (s[0] == "-") { sign = -1; i = 1; }
+    let acc: i32 = 0;
+    let digits: i32 = 0;
+    while (i < n) {
+        let d: i32 = digit_of(s[i]);
+        if (d < 0) { let d3: i32 = p_def; return d3; }
+        acc = acc * 10 + d;
+        if (acc > 100000000) { acc = 100000000; }
+        digits++;
+        i++;
+    }
+    if (digits < 1) { let d4: i32 = p_def; return d4; }
+    let out: i32 = acc * sign;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// LoopbackTransport
+//
+//   c2s : client -> server, one InputCommand per slot (SoA ring of 128)
+//   s2c : server -> client, one snapshot per slot (SoA ring of 8)
+//   ev  : server -> client, one event per slot (SoA ring of 128)
+//
+// Every ring carries a `ready` time in ms and a monotonic `last_ready` so
+// jitter can delay but never reorder.
+// ---------------------------------------------------------------------------
+export fn transport_loopback(): object {
+    let ent_cap: i32 = DEFAULT_ENT_CAP;
+    let t: object = {
+        mode: TRANSPORT_LOOPBACK,
+        is_authority: 1,              // loopback owns both ends of the wire
+        now_ms: 0.0,
+        tick: 0,
+        latency_ms: f64(env_i32("NS_FAKE_LATENCY_MS", 0)),
+        jitter_ms: f64(env_i32("NS_FAKE_JITTER_MS", 0)),
+        serialize: env_i32("NS_LOOPBACK_SERIALIZE", 0),
+        ent_cap: ent_cap,
+        rs: 88172645463325252,        // xorshift64 state; deterministic jitter
+
+        // ---- c2s command ring (SoA; one command per slot) ----
+        c_head: 0, c_count: 0, c_last_ready: 0.0,
+        c_ready: [], c_bytes: [],
+        c_tick: [], c_seq: [], c_mx: [], c_my: [],
+        c_yaw: [], c_pitch: [], c_btn: [], c_wsel: [], c_dt: [],
+
+        // ---- s2c snapshot ring (one NetEnts + NetLocal per slot) ----
+        s_head: 0, s_count: 0, s_last_ready: 0.0,
+        s_ready: [], s_pid: [], s_bytes: [], s_ents: [], s_local: [],
+
+        // ---- s2c event ring (SoA; one event per slot) ----
+        e_head: 0, e_count: 0, e_last_ready: 0.0,
+        e_ready: [], e_pid: [], e_bytes: [],
+        e_tick: [], e_type: [], e_sub: [], e_actor: [], e_target: [],
+        e_x: [], e_y: [], e_z: [],
+
+        // ---- scratch: built once, reused; never handed to a caller ----
+        msg: proto_msg(0),
+        rxmsg: proto_msg(0),
+        rxlist: [],
+        pk_ent: pack_new(ENTS_PER_BLOB * ENT_STRIDE),   // 240
+        pk_loc: pack_new(LOCAL_STRIDE),                 // 24
+        pk_cmd: pack_new(MAX_CMDS_PER_PACKET * CMD_STRIDE),
+        pk_ev: pack_new(EVS_PER_BLOB * EV_STRIDE),      // 240
+        txq: cmdq_new(MAX_CMDS_PER_PACKET),
+        txe: netevs_new(EVS_PER_BLOB),
+        txents: netents_new(ent_cap),
+        txlocal: netlocal_new(),
+
+        // ---- stats ----
+        st_cmd_sent: 0, st_cmd_recv: 0, st_cmd_dropped: 0,
+        st_snap_sent: 0, st_snap_recv: 0, st_snap_superseded: 0,
+        st_ev_sent: 0, st_ev_recv: 0, st_ev_dropped: 0,
+        st_bytes_c2s: 0, st_bytes_s2c: 0,
+        st_encode_fail: 0, st_decode_fail: 0
+    };
+
+    let i: i32 = 0;
+    while (i < CMD_RING) {
+        t.c_ready.push(0.0); t.c_bytes.push(null);
+        t.c_tick.push(0); t.c_seq.push(0); t.c_mx.push(0); t.c_my.push(0);
+        t.c_yaw.push(0); t.c_pitch.push(0); t.c_btn.push(0);
+        t.c_wsel.push(0); t.c_dt.push(0);
+        i++;
+    }
+    i = 0;
+    while (i < SNAP_RING) {
+        t.s_ready.push(0.0); t.s_pid.push(0); t.s_bytes.push(null);
+        t.s_ents.push(netents_new(ent_cap));
+        t.s_local.push(netlocal_new());
+        i++;
+    }
+    i = 0;
+    while (i < EV_RING) {
+        t.e_ready.push(0.0); t.e_pid.push(0); t.e_bytes.push(null);
+        t.e_tick.push(0); t.e_type.push(0); t.e_sub.push(0);
+        t.e_actor.push(0); t.e_target.push(0);
+        t.e_x.push(0); t.e_y.push(0); t.e_z.push(0);
+        i++;
+    }
+    return t;
+}
+
+// ---------------------------------------------------------------------------
+// v2 stub. It exists so `transport_*` call sites are already polymorphic, and
+// so the place gn.hml will be imported is already named and already the only
+// candidate. Every operation is a counted no-op; nothing throws.
+// ---------------------------------------------------------------------------
+export fn transport_net(): object {
+    return {
+        mode: TRANSPORT_NET,
+        is_authority: 0,
+        now_ms: 0.0, tick: 0,
+        latency_ms: 0.0, jitter_ms: 0.0, serialize: 1,
+        unsupported: 0,
+        st_cmd_sent: 0, st_cmd_recv: 0, st_cmd_dropped: 0,
+        st_snap_sent: 0, st_snap_recv: 0, st_snap_superseded: 0,
+        st_ev_sent: 0, st_ev_recv: 0, st_ev_dropped: 0,
+        st_bytes_c2s: 0, st_bytes_s2c: 0,
+        st_encode_fail: 0, st_decode_fail: 0
+    };
+}
+
+export fn transport_mode(p_t: object): i32 { let out: i32 = p_t.mode; return out; }
+export fn transport_is_authority(p_t: object): i32 { let out: i32 = p_t.is_authority; return out; }
+export fn transport_serialize(p_t: object): i32 { let out: i32 = p_t.serialize; return out; }
+export fn transport_latency_ms(p_t: object): f64 { let out: f64 = p_t.latency_ms; return out; }
+export fn transport_jitter_ms(p_t: object): f64 { let out: f64 = p_t.jitter_ms; return out; }
+export fn transport_rtt_ms(p_t: object): f64 { let out: f64 = p_t.latency_ms * 2.0; return out; }
+export fn transport_now_ms(p_t: object): f64 { let out: f64 = p_t.now_ms; return out; }
+
+export fn transport_set_latency(p_t: object, p_ms: f64) {
+    let v: f64 = p_ms;
+    if (v < 0.0) { v = 0.0; }
+    p_t.latency_ms = v;
+}
+export fn transport_set_jitter(p_t: object, p_ms: f64) {
+    let v: f64 = p_ms;
+    if (v < 0.0) { v = 0.0; }
+    p_t.jitter_ms = v;
+}
+export fn transport_set_serialize(p_t: object, p_on: i32) {
+    let v: i32 = 0;
+    if (p_on != 0) { v = 1; }
+    p_t.serialize = v;
+}
+export fn transport_seed(p_t: object, p_seed: i64) {
+    let s: u64 = u64(p_seed);
+    if (s == 0) { s = 88172645463325252; }
+    p_t.rs = s;
+}
+
+// Advance the transport clock. Call once per SIM TICK, before draining.
+// Messages become visible only at these boundaries — never instantaneously.
+export fn transport_set_tick(p_t: object, p_tick: i32, p_tick_ms: f64) {
+    let t: object = p_t;
+    t.tick = p_tick;
+    t.now_ms = f64(p_tick) * p_tick_ms;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic jitter. xorshift64, all mixing in u64 — i32/i64 * + - TRAP on
+// overflow in Hemlock (CLAUDE.md A13), and a textbook LCG in i64 throws.
+// ---------------------------------------------------------------------------
+fn t_rand01(p_t: object): f64 {
+    let x: u64 = p_t.rs;
+    x = x ^ (x << 13);
+    x = x ^ (x >> 7);
+    x = x ^ (x << 17);
+    p_t.rs = x;
+    let m: u64 = x % 1000003;
+    let out: f64 = f64(m) / 1000003.0;
+    return out;
+}
+
+// Delivery time for a message sent now. Monotonic per ring: TCP is ordered, so
+// jitter delays a message but can never let it overtake an earlier one.
+fn t_ready(p_t: object, p_last: f64): f64 {
+    let t: object = p_t;
+    let r: f64 = t.now_ms + t.latency_ms;
+    if (t.jitter_ms > 0.0) {
+        r = r + (t_rand01(t) * 2.0 - 1.0) * t.jitter_ms;
+    }
+    if (r < t.now_ms) { r = t.now_ms; }
+    if (r < p_last) { r = p_last; }
+    let out: f64 = r;
+    return out;
+}
+
+// ===========================================================================
+// CLIENT -> SERVER : commands
+// ===========================================================================
+
+// Send one InputCommand. `p_cmd` is the sim's InputCommand (9 integers,
+// quantized at construction). The transport copies it; it never keeps the
+// caller's object.
+export fn transport_send_command(p_t: object, p_cmd: object): i32 {
+    let t: object = p_t;
+    if (t.mode != TRANSPORT_LOOPBACK) { t.unsupported = t.unsupported + 1; return -1; }
+    let c: object = p_cmd;
+    let slot: i32 = 0;
+    if (t.c_count >= CMD_RING) {
+        // Drop the OLDEST. A stale command is worthless; a lost recent one is
+        // a visible hitch. Counted either way.
+        t.c_head = (t.c_head + 1) % CMD_RING;
+        t.c_count = t.c_count - 1;
+        t.st_cmd_dropped = t.st_cmd_dropped + 1;
+    }
+    slot = (t.c_head + t.c_count) % CMD_RING;
+    let r: f64 = t_ready(t, t.c_last_ready);
+    t.c_last_ready = r;
+    t.c_ready[slot] = r;
+    t.c_tick[slot] = c.tick;
+    t.c_seq[slot] = c.seq;
+    t.c_mx[slot] = c.move_x;
+    t.c_my[slot] = c.move_y;
+    t.c_yaw[slot] = c.yaw_q;
+    t.c_pitch[slot] = c.pitch_q;
+    t.c_btn[slot] = c.buttons;
+    t.c_wsel[slot] = c.weapon_sel;
+    t.c_dt[slot] = c.dt_ms;
+    t.c_bytes[slot] = null;
+
+    if (t.serialize == 1) {
+        cmdq_reset(t.txq);
+        cmdq_push(t.txq, c.tick, c.seq, c.move_x, c.move_y,
+                  c.yaw_q, c.pitch_q, c.buttons, c.weapon_sel, c.dt_ms);
+        proto_write_input(t.msg, t.pk_cmd, t.txq);
+        let b = proto_build(t.msg);
+        if (b == null) { t.st_encode_fail = t.st_encode_fail + 1; }
+        else {
+            t.c_bytes[slot] = b;
+            t.st_bytes_c2s = t.st_bytes_c2s + b.length;
+        }
+    }
+    t.c_count = t.c_count + 1;
+    t.st_cmd_sent = t.st_cmd_sent + 1;
+    return 1;
+}
+
+// Server side: drain every command whose delivery time has arrived into the
+// caller's CmdQ, oldest first. Returns how many were appended.
+export fn transport_poll_commands(p_t: object, p_q: object): i32 {
+    let t: object = p_t;
+    if (t.mode != TRANSPORT_LOOPBACK) { t.unsupported = t.unsupported + 1; return 0; }
+    let got: i32 = 0;
+    while (t.c_count > 0) {
+        let h: i32 = t.c_head;
+        if (t.c_ready[h] > t.now_ms) { break; }
+        if (t.serialize == 1) {
+            let b = t.c_bytes[h];
+            if (b == null) { t.st_decode_fail = t.st_decode_fail + 1; }
+            else {
+                if (proto_load(b, 2, b.length - 2, t.rxmsg) != 1) {
+                    t.st_decode_fail = t.st_decode_fail + 1;
+                } else {
+                    let n: i32 = proto_read_input(t.rxmsg, t.txq);
+                    if (n < 1) { t.st_decode_fail = t.st_decode_fail + 1; }
+                    else {
+                        let j: i32 = 0;
+                        while (j < n) {
+                            cmdq_push(p_q, t.txq.tick[j], t.txq.seq[j],
+                                      t.txq.move_x[j], t.txq.move_y[j],
+                                      t.txq.yaw_q[j], t.txq.pitch_q[j],
+                                      t.txq.buttons[j], t.txq.weapon_sel[j],
+                                      t.txq.dt_ms[j]);
+                            got++;
+                            j++;
+                        }
+                    }
+                }
+            }
+            t.c_bytes[h] = null;
+        } else {
+            cmdq_push(p_q, t.c_tick[h], t.c_seq[h], t.c_mx[h], t.c_my[h],
+                      t.c_yaw[h], t.c_pitch[h], t.c_btn[h], t.c_wsel[h], t.c_dt[h]);
+            got++;
+        }
+        t.c_head = (h + 1) % CMD_RING;
+        t.c_count = t.c_count - 1;
+        t.st_cmd_recv = t.st_cmd_recv + 1;
+    }
+    let out: i32 = got;
+    return out;
+}
+
+export fn transport_pending_commands(p_t: object): i32 { let out: i32 = p_t.c_count; return out; }
+
+// ===========================================================================
+// SERVER -> CLIENT : snapshots
+// ===========================================================================
+
+// Send a snapshot to player `p_pid`. `p_e` is a NetEnts already in wire units;
+// `p_local` is the owner-only block (may be null to omit it — never nulled
+// into the packet, which would truncate it).
+//
+// `p_baseline` is the v2 delta hook (NETWORKING §11.4): v1 always passes 0.
+// The argument exists so the delta work never has to touch a call site.
+export fn transport_send_snapshot(p_t: object, p_pid: i32, p_e: object,
+                                  p_local, p_baseline: i32): i32 {
+    let t: object = p_t;
+    if (t.mode != TRANSPORT_LOOPBACK) { t.unsupported = t.unsupported + 1; return -1; }
+    if (t.s_count >= SNAP_RING) {
+        t.s_head = (t.s_head + 1) % SNAP_RING;
+        t.s_count = t.s_count - 1;
+        t.st_snap_superseded = t.st_snap_superseded + 1;
+    }
+    let slot: i32 = (t.s_head + t.s_count) % SNAP_RING;
+    let r: f64 = t_ready(t, t.s_last_ready);
+    t.s_last_ready = r;
+    t.s_ready[slot] = r;
+    t.s_pid[slot] = p_pid;
+    t.s_bytes[slot] = null;
+
+    let e: object = p_e;
+    let dst: object = t.s_ents[slot];
+    netents_reset(dst);
+    dst.tick = e.tick;
+    dst.acked_seq = e.acked_seq;
+    dst.time_ms = e.time_ms;
+    let n: i32 = e.count;
+    if (n > dst.cap) { n = dst.cap; }
+    let i: i32 = 0;
+    while (i < n) {
+        netents_push_q(dst, e.id[i], e.px_q[i], e.py_q[i], e.pz_q[i],
+                       e.yaw_q[i], e.pitch_q[i], e.anim[i], e.hp_pct[i], e.flags[i]);
+        i++;
+    }
+    let dl: object = t.s_local[slot];
+    if (p_local == null) {
+        dl.hp = -1;                       // sentinel: "no owner block in this snapshot"
+    } else {
+        let sl: object = p_local;
+        dl.px_q = sl.px_q; dl.py_q = sl.py_q; dl.pz_q = sl.pz_q;
+        dl.vx_q = sl.vx_q; dl.vy_q = sl.vy_q; dl.vz_q = sl.vz_q;
+        dl.hp = sl.hp; dl.armor = sl.armor; dl.move_state = sl.move_state;
+        dl.weapon = sl.weapon; dl.ammo_mag = sl.ammo_mag;
+    }
+
+    if (t.serialize == 1) {
+        proto_write_snapshot(t.msg, t.pk_ent, t.pk_loc, e, p_local, p_baseline);
+        let b = proto_build(t.msg);
+        if (b == null) { t.st_encode_fail = t.st_encode_fail + 1; }
+        else {
+            t.s_bytes[slot] = b;
+            t.st_bytes_s2c = t.st_bytes_s2c + b.length;
+        }
+    }
+    t.s_count = t.s_count + 1;
+    t.st_snap_sent = t.st_snap_sent + 1;
+    return 1;
+}
+
+// Client side: take the NEWEST snapshot whose delivery time has arrived and
+// discard the older ready ones (§10.3: newer supersedes older; never queue
+// more than one). Returns 1 if p_e was filled, 0 if nothing was ready.
+export fn transport_poll_snapshot(p_t: object, p_e: object, p_local): i32 {
+    let t: object = p_t;
+    if (t.mode != TRANSPORT_LOOPBACK) { t.unsupported = t.unsupported + 1; return 0; }
+    let best: i32 = -1;
+    while (t.s_count > 0) {
+        let h: i32 = t.s_head;
+        if (t.s_ready[h] > t.now_ms) { break; }
+        if (best >= 0) { t.st_snap_superseded = t.st_snap_superseded + 1; }
+        best = h;
+        t.s_head = (h + 1) % SNAP_RING;
+        t.s_count = t.s_count - 1;
+    }
+    if (best < 0) { return 0; }
+
+    if (t.serialize == 1) {
+        let b = t.s_bytes[best];
+        t.s_bytes[best] = null;
+        if (b == null) { t.st_decode_fail = t.st_decode_fail + 1; return 0; }
+        if (proto_load(b, 2, b.length - 2, t.rxmsg) != 1) {
+            t.st_decode_fail = t.st_decode_fail + 1;
+            return 0;
+        }
+        if (proto_read_snapshot(t.rxmsg, p_e, p_local) < 0) {
+            t.st_decode_fail = t.st_decode_fail + 1;
+            return 0;
+        }
+    } else {
+        let src: object = t.s_ents[best];
+        let e: object = p_e;
+        netents_reset(e);
+        e.tick = src.tick; e.acked_seq = src.acked_seq; e.time_ms = src.time_ms;
+        let n: i32 = src.count;
+        if (n > e.cap) { n = e.cap; }
+        let i: i32 = 0;
+        while (i < n) {
+            netents_push_q(e, src.id[i], src.px_q[i], src.py_q[i], src.pz_q[i],
+                           src.yaw_q[i], src.pitch_q[i], src.anim[i],
+                           src.hp_pct[i], src.flags[i]);
+            i++;
+        }
+        if (p_local != null) {
+            let sl: object = t.s_local[best];
+            if (sl.hp >= 0) {
+                let l: object = p_local;
+                l.px_q = sl.px_q; l.py_q = sl.py_q; l.pz_q = sl.pz_q;
+                l.vx_q = sl.vx_q; l.vy_q = sl.vy_q; l.vz_q = sl.vz_q;
+                l.hp = sl.hp; l.armor = sl.armor; l.move_state = sl.move_state;
+                l.weapon = sl.weapon; l.ammo_mag = sl.ammo_mag;
+            }
+        }
+    }
+    t.st_snap_recv = t.st_snap_recv + 1;
+    return 1;
+}
+
+export fn transport_pending_snapshots(p_t: object): i32 { let out: i32 = p_t.s_count; return out; }
+
+// ===========================================================================
+// SERVER -> CLIENT : events
+// ===========================================================================
+
+// Send one authoritative event. In v1 the local server emits these into the
+// loopback and the client turns them into juice — which forces "the thing that
+// shows the hitmarker" to sit downstream of "the thing that decided a hit
+// happened". That ordering is the whole reason multiplayer will not change how
+// the game feels.
+export fn transport_send_event(p_t: object, p_pid: i32, p_tick: i32, p_type: i32,
+                               p_sub: i32, p_actor: i32, p_target: i32,
+                               p_xq: i32, p_yq: i32, p_zq: i32): i32 {
+    let t: object = p_t;
+    if (t.mode != TRANSPORT_LOOPBACK) { t.unsupported = t.unsupported + 1; return -1; }
+    if (t.e_count >= EV_RING) {
+        t.e_head = (t.e_head + 1) % EV_RING;
+        t.e_count = t.e_count - 1;
+        t.st_ev_dropped = t.st_ev_dropped + 1;
+    }
+    let slot: i32 = (t.e_head + t.e_count) % EV_RING;
+    let r: f64 = t_ready(t, t.e_last_ready);
+    t.e_last_ready = r;
+    t.e_ready[slot] = r;
+    t.e_pid[slot] = p_pid;
+    t.e_tick[slot] = p_tick;
+    t.e_type[slot] = p_type;
+    t.e_sub[slot] = p_sub;
+    t.e_actor[slot] = p_actor;
+    t.e_target[slot] = p_target;
+    t.e_x[slot] = p_xq;
+    t.e_y[slot] = p_yq;
+    t.e_z[slot] = p_zq;
+    t.e_bytes[slot] = null;
+
+    if (t.serialize == 1) {
+        netevs_reset(t.txe);
+        t.txe.tick = p_tick;
+        netevs_push_q(t.txe, p_type, p_sub, p_actor, p_target, p_xq, p_yq, p_zq);
+        proto_write_events(t.msg, t.pk_ev, t.txe);
+        let b = proto_build(t.msg);
+        if (b == null) { t.st_encode_fail = t.st_encode_fail + 1; }
+        else {
+            t.e_bytes[slot] = b;
+            t.st_bytes_s2c = t.st_bytes_s2c + b.length;
+        }
+    }
+    t.e_count = t.e_count + 1;
+    t.st_ev_sent = t.st_ev_sent + 1;
+    return 1;
+}
+
+// Drain every event whose delivery time has arrived into the caller's NetEvs.
+export fn transport_poll_events(p_t: object, p_v: object): i32 {
+    let t: object = p_t;
+    if (t.mode != TRANSPORT_LOOPBACK) { t.unsupported = t.unsupported + 1; return 0; }
+    let got: i32 = 0;
+    while (t.e_count > 0) {
+        let h: i32 = t.e_head;
+        if (t.e_ready[h] > t.now_ms) { break; }
+        if (t.serialize == 1) {
+            let b = t.e_bytes[h];
+            if (b == null) { t.st_decode_fail = t.st_decode_fail + 1; }
+            else {
+                if (proto_load(b, 2, b.length - 2, t.rxmsg) != 1) {
+                    t.st_decode_fail = t.st_decode_fail + 1;
+                } else {
+                    netevs_reset(t.txe);
+                    let n: i32 = proto_read_events(t.rxmsg, t.txe);
+                    if (n < 1) { t.st_decode_fail = t.st_decode_fail + 1; }
+                    else {
+                        p_v.tick = t.txe.tick;
+                        let j: i32 = 0;
+                        while (j < n) {
+                            netevs_push_q(p_v, t.txe.type[j], t.txe.sub[j],
+                                          t.txe.actor[j], t.txe.target[j],
+                                          t.txe.x_q[j], t.txe.y_q[j], t.txe.z_q[j]);
+                            got++;
+                            j++;
+                        }
+                    }
+                }
+            }
+            t.e_bytes[h] = null;
+        } else {
+            p_v.tick = t.e_tick[h];
+            netevs_push_q(p_v, t.e_type[h], t.e_sub[h], t.e_actor[h],
+                          t.e_target[h], t.e_x[h], t.e_y[h], t.e_z[h]);
+            got++;
+        }
+        t.e_head = (h + 1) % EV_RING;
+        t.e_count = t.e_count - 1;
+        t.st_ev_recv = t.st_ev_recv + 1;
+    }
+    let out: i32 = got;
+    return out;
+}
+
+export fn transport_pending_events(p_t: object): i32 { let out: i32 = p_t.e_count; return out; }
+
+// ---------------------------------------------------------------------------
+// Stats. Always compiled in — the only reason a budget can be defended is that
+// the path is instrumented (ARCHITECTURE §4).
+// ---------------------------------------------------------------------------
+export fn transport_stats(p_t: object): object {
+    let t: object = p_t;
+    return {
+        cmd_sent: t.st_cmd_sent, cmd_recv: t.st_cmd_recv, cmd_dropped: t.st_cmd_dropped,
+        snap_sent: t.st_snap_sent, snap_recv: t.st_snap_recv,
+        snap_superseded: t.st_snap_superseded,
+        ev_sent: t.st_ev_sent, ev_recv: t.st_ev_recv, ev_dropped: t.st_ev_dropped,
+        bytes_c2s: t.st_bytes_c2s, bytes_s2c: t.st_bytes_s2c,
+        encode_fail: t.st_encode_fail, decode_fail: t.st_decode_fail,
+        pending_cmd: t.c_count, pending_snap: t.s_count, pending_ev: t.e_count
+    };
+}
+
+export fn transport_stats_reset(p_t: object) {
+    let t: object = p_t;
+    t.st_cmd_sent = 0; t.st_cmd_recv = 0; t.st_cmd_dropped = 0;
+    t.st_snap_sent = 0; t.st_snap_recv = 0; t.st_snap_superseded = 0;
+    t.st_ev_sent = 0; t.st_ev_recv = 0; t.st_ev_dropped = 0;
+    t.st_bytes_c2s = 0; t.st_bytes_s2c = 0;
+    t.st_encode_fail = 0; t.st_decode_fail = 0;
+}
+
+// ===========================================================================
+// SELF-TEST MODE
+// ===========================================================================
+// Runs only when NS_SELFTEST is set, so importing this module from the game
+// costs one getenv at startup and nothing else. Run it compiled:
+//
+//     hemlockc -O1 src/net/transport.hml -o /tmp/ns_net
+//     NS_SELFTEST=1 /tmp/ns_net
+//
+// It asserts its own assertion COUNT as well as its pass count, so a skipped
+// branch cannot shrink numerator and denominator together and still read green.
+// ---------------------------------------------------------------------------
+
+let EXPECTED_ASSERTIONS: i32 = 144;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(p_label: string, p_cond: bool) {
+    g_n = g_n + 1;
+    if (p_cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${p_label}`); }
+}
+
+fn eqi(p_label: string, p_got: i32, p_want: i32) {
+    g_n = g_n + 1;
+    if (p_got == p_want) { g_pass = g_pass + 1; }
+    else { print(`  FAIL  ${p_label}: got ${p_got}, want ${p_want}`); }
+}
+
+fn note(p_s: string) { g_notes.push(p_s); }
+
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    if (frac < 100) { fs = `0${fs}`; }
+    if (frac < 10) { fs = `00${frac}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+fn absf(p_x: f64): f64 {
+    let x: f64 = p_x;
+    if (x < 0.0) { x = 0.0 - x; }
+    let out: f64 = x;
+    return out;
+}
+
+// A stand-in for the sim's InputCommand (src/sim/command.hml, W2-9): nine
+// integers, no bools, no floats, no nulls, quantized at construction.
+fn mk_cmd(p_tick: i32, p_seq: i32): object {
+    return {
+        tick: p_tick, seq: p_seq,
+        move_x: q_axis(0.5), move_y: q_axis(-1.0),
+        yaw_q: q_ang(2.0 + f64(p_tick) * 0.01), pitch_q: q_ang(0.2),
+        buttons: 1 + 8 + 512, weapon_sel: 3, dt_ms: 17
+    };
+}
+
+// Deterministic entity fill. Values chosen to exercise every field's sign and
+// range: negative x/z, sub-metre y, wrapping yaw, full-range flags.
+fn fill_ents(p_e: object, p_n: i32) {
+    let e: object = p_e;
+    let n: i32 = p_n;
+    netents_reset(e);
+    e.tick = 9001; e.acked_seq = 8123; e.time_ms = 123456;
+    let i: i32 = 0;
+    while (i < n) {
+        let fx: f64 = -640.0 + f64(i) * 41.5;
+        let fy: f64 = -12.25 + f64(i) * 0.375;
+        let fz: f64 = 2048.0 - f64(i) * 37.125;
+        let yaw: f64 = f64(i) * 0.37;
+        let pit: f64 = f64(i) * 0.11;
+        netents_push(e, 1000 + i * 7, fx, fy, fz, yaw, pit,
+                     i % 16, (i * 3) % 101, (i % 4) + EF_ADS + EF_FIRING);
+        i++;
+    }
+}
+
+// RULE T: CPU time (__clock) + minimum-of-N batches. This box permanently
+// shares ~17 of 24 cores with a llama-server; wall-clock means drift 62 % with
+// load, __clock + min-of-7 cuts that to ~29 %, and the residual is cache and
+// bandwidth contention that no methodology removes.
+let TRIALS: i32 = 7;
+
+fn bench_snapshot_ms(p_reps: i32, p_n: i32): f64 {
+    let reps: i32 = p_reps;
+    let e: object = netents_new(p_n);
+    let rx: object = netents_new(p_n);
+    let loc: object = netlocal_new();
+    let rxloc: object = netlocal_new();
+    let m: object = proto_msg(0);
+    let rm: object = proto_msg(0);
+    let pk: object = pack_new(ENTS_PER_BLOB * ENT_STRIDE);
+    let lpk: object = pack_new(LOCAL_STRIDE);
+    fill_ents(e, p_n);
+    netlocal_set(loc, 12.5, 3.25, -44.75, 4.5, -2.25, 0.125, 87, 25, 2, 1, 24);
+
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < reps) {
+            proto_write_snapshot(m, pk, lpk, e, loc, 0);
+            let b = proto_build(m);
+            proto_load(b, 2, b.length - 2, rm);
+            proto_read_snapshot(rm, rx, rxloc);
+            i++;
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(reps);
+        if (t == 0 || ms < best) { best = ms; }
+        t++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+export fn net_selftest(): i32 {
+    g_pass = 0;
+    g_n = 0;
+    proto_diag_reset();
+    q_clamp_reset();
+
+    // -----------------------------------------------------------------------
+    print("[1] quantize — the wire grid");
+    // -----------------------------------------------------------------------
+    let worst_pos: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < 4001) {
+        let v: f64 = -2000.0 + f64(i);
+        let d: f64 = absf(dq_pos(q_pos(v + 0.3333)) - (v + 0.3333));
+        if (d > worst_pos) { worst_pos = d; }
+        i++;
+    }
+    ok("q_pos/dq_pos error <= half a quantum (1/512 m)", worst_pos <= 0.001953125 + 0.0000001);
+    note(`worst q_pos round-trip error = ${f3(worst_pos * 1000.0)} mm (quantum 3.906 mm)`);
+
+    // Idempotence is the property that stops reconciliation firing forever.
+    let idem: i32 = 1;
+    i = 0;
+    while (i < 2000) {
+        let v: f64 = -900.0 + f64(i) * 0.9137;
+        if (q_pos(wire_pos(v)) != q_pos(v)) { idem = 0; }
+        i++;
+    }
+    eqi("dq_pos(q_pos(x)) is a fixed point of q_pos", idem, 1);
+
+    // Every u16 angle code must survive a full q->dq->q round trip.
+    let ang_bad: i32 = 0;
+    i = 0;
+    while (i < 65536) {
+        if (q_ang(dq_ang(i)) != i) { ang_bad++; }
+        i++;
+    }
+    eqi("q_ang(dq_ang(q)) == q for all 65536 codes", ang_bad, 0);
+
+    let ang8_bad: i32 = 0;
+    i = 0;
+    while (i < 256) {
+        if (q_ang8(dq_ang8(i)) != i) { ang8_bad++; }
+        i++;
+    }
+    eqi("q_ang8(dq_ang8(q)) == q for all 256 codes", ang8_bad, 0);
+
+    let wrap_bad: i32 = 0;
+    let inrange_bad: i32 = 0;
+    i = 0;
+    while (i < 720) {
+        let a: f64 = f64(i) * 0.0174532925199433;
+        let q0: i32 = q_ang(a);
+        if (q_ang(a + TAU) != q0) { wrap_bad++; }
+        if (q_ang(a - TAU * 3.0) != q0) { wrap_bad++; }
+        if (q0 < 0 || q0 > 65535) { inrange_bad++; }
+        i++;
+    }
+    eqi("q_ang wraps: q_ang(a) == q_ang(a +- k*TAU)", wrap_bad, 0);
+    eqi("q_ang is always in [0, 65535]", inrange_bad, 0);
+    eqi("q_ang(0) == 0", q_ang(0.0), 0);
+
+    ok("q_vel clamps above +255.99 m/s", q_vel(1.0e9) <= 32767);
+    ok("q_vel clamps below -255.99 m/s", q_vel(-1.0e9) >= -32768);
+    ok("q_pos clamps a runaway coordinate instead of trapping", q_pos(1.0e300) <= 2147483647);
+    ok("q_pos16 clamps to the +-128 m vertical range", q_pos16(1.0e6) <= 32767);
+    ok("q_pos16 clamps the negative end too", q_pos16(-1.0e6) >= -32768);
+    ok("clamps were counted, not silently swallowed", q_clamp_count() >= 5);
+    eqi("q_pos rounds half away from zero, symmetrically",
+        q_pos(0.001953125) + q_pos(-0.001953125), 0);
+    eqi("q_axis saturates at +127", q_axis(9.0), 127);
+    eqi("q_axis saturates at -127", q_axis(-9.0), -127);
+    eqi("q_evpos quantum is 1/16 m", q_evpos(1.0), 16);
+
+    // -----------------------------------------------------------------------
+    print("[2] packing — the 255-byte cap and the no-bool/no-null assertion");
+    // -----------------------------------------------------------------------
+    let pk: object = pack_new(1000);
+    eqi("pack_new refuses to exceed the 255-byte buffer-element cap", pack_cap(pk), PACK_MAX_BLOB);
+    eqi("...and says so", pack_clamped(pk), 1);
+
+    let p2: object = pack_new(8);
+    pack_reset(p2);
+    eqi("pack_u32 returns its write offset", pack_u32(p2, 123456), 0);
+    eqi("pack_i16 follows at +4", pack_i16(p2, -300), 4);
+    eqi("pack_u8 follows at +6", pack_u8(p2, 200), 6);
+    eqi("pack_i8 follows at +7", pack_i8(p2, -7), 7);
+    eqi("the packer is now exactly full", pack_pos(p2), 8);
+    eqi("one more byte is refused, not written", pack_u8(p2, 1), -1);
+    eqi("...and counted as an overflow", pack_ovf(p2), 1);
+
+    let u2: object = unpack_new(pack_flush(p2));
+    eqi("u32 survives", i32(unpack_u32(u2)), 123456);
+    eqi("i16 survives with its sign", unpack_i16(u2), -300);
+    eqi("u8 survives", unpack_u8(u2), 200);
+    eqi("i8 survives with its sign", unpack_i8(u2), -7);
+    eqi("reading past the end yields 0, never a throw", unpack_u8(u2), 0);
+    eqi("...and is counted", unpack_ovf(u2), 1);
+
+    let p3: object = pack_new(16);
+    pack_reset(p3);
+    eqi("a bool is REFUSED by the packer (gn.hml throws on build)", pack_u8(p3, true), -1);
+    eqi("a null is REFUSED by the packer (gn.hml truncates the packet)", pack_u32(p3, null), -1);
+    eqi("both refusals were counted", pack_bad(p3), 2);
+    eqi("...and neither advanced the cursor", pack_pos(p3), 0);
+    eqi("pack_is_wire_safe rejects a bool", pack_is_wire_safe(false), 0);
+    eqi("pack_is_wire_safe rejects a null", pack_is_wire_safe(null), 0);
+    eqi("pack_is_wire_safe accepts an integer", pack_is_wire_safe(7), 1);
+    eqi("pack_is_wire_safe accepts a buffer", pack_is_wire_safe(buffer(4)), 1);
+
+    let p4: object = pack_new(4);
+    pack_reset(p4);
+    ok("pack_flush of an empty packer returns null, never a 0-byte element",
+       pack_flush(p4) == null);
+
+    // The bulk path (one call per 240-byte blob) carries the SAME assertion as
+    // the per-field API, as a single OR-and-compare over the record's nine
+    // typeids. A poisoned record must be zero-filled and counted, NOT omitted:
+    // omitting it would shift every later entity in the blob by 20 bytes.
+    pack_bulk_bad_reset();
+    eqi("pack_is_wire_int accepts an integer", pack_is_wire_int(42), 1);
+    eqi("pack_is_wire_int rejects a bool", pack_is_wire_int(true), 0);
+    eqi("pack_is_wire_int rejects a null", pack_is_wire_int(null), 0);
+    eqi("pack_is_wire_int rejects a float", pack_is_wire_int(1.5), 0);
+    eqi("pack_is_wire_int rejects a buffer", pack_is_wire_int(buffer(2)), 0);
+    eqi("the integer typeid ceiling is 7 (I8..U64)", PACK_INT_TYPEID_MAX, 7);
+
+    let poison: object = netents_new(4);
+    netents_reset(poison);
+    netents_push_q(poison, 11, 100, 10, 200, 3, 4, 5, 6, 7);
+    netents_push_q(poison, 22, 300, 20, 400, 5, 6, 7, 8, 9);
+    netents_push_q(poison, 33, 500, 30, 600, 7, 8, 9, 10, 11);
+    let ppk: object = pack_new(ENTS_PER_BLOB * ENT_STRIDE);
+    pack_reset(ppk);
+    poison.flags[1] = true;                       // a bool, mid-blob
+    poison.anim[2] = null;                        // a null, mid-blob
+    eqi("a poisoned blob still writes its full stride",
+        pack_ent_blob(ppk, poison, 0, 3), 3 * ENT_STRIDE);
+    let pblob = pack_flush(ppk);
+    eqi("...and both bad records were counted", pack_bulk_bad(), 2);
+    eqi("the clean record before them is intact", i32(pblob.read_u32_le(0)), 11);
+    eqi("the poisoned record is zero-filled, not omitted",
+        i32(pblob.read_u32_le(ENT_STRIDE)), 0);
+    eqi("...and the NEXT record is still at its own stride offset",
+        i32(pblob.read_u32_le(ENT_STRIDE * 2)), 0);
+    let pback: object = netents_new(4);
+    netents_reset(pback);
+    eqi("a short blob is refused, not read out of bounds",
+        unpack_ent_blob(buffer(10), pback, 3), -1);
+    eqi("...and nothing was appended", netents_count(pback), 0);
+    pack_bulk_bad_reset();
+
+    eqi("12 entities x 20 B = 240 B, inside the 255 cap", ENTS_PER_BLOB * ENT_STRIDE, 240);
+    ok("...and the cap is respected", ENTS_PER_BLOB * ENT_STRIDE <= PACK_MAX_BLOB);
+    eqi("15 events x 16 B = 240 B", EVS_PER_BLOB * EV_STRIDE, 240);
+    eqi("the local-player block is 24 B", LOCAL_STRIDE, 24);
+    eqi("the command stride is 20 B", CMD_STRIDE, 20);
+
+    // -----------------------------------------------------------------------
+    print("[3] protocol — C_INPUT round trip, every field");
+    // -----------------------------------------------------------------------
+    let txq: object = cmdq_new(MAX_CMDS_PER_PACKET);
+    let rxq: object = cmdq_new(MAX_CMDS_PER_PACKET);
+    let m: object = proto_msg(0);
+    let rm: object = proto_msg(0);
+    let cpk: object = pack_new(MAX_CMDS_PER_PACKET * CMD_STRIDE);
+
+    cmdq_reset(txq);
+    i = 0;
+    while (i < MAX_CMDS_PER_PACKET) {
+        let c: object = mk_cmd(70000 + i, 90000 + i);
+        c.move_x = -127 + i * 20;
+        c.buttons = 1 << i;
+        c.weapon_sel = i;
+        c.dt_ms = 16 + (i % 2);
+        cmdq_push_cmd(txq, c);
+        i++;
+    }
+    eqi("8 commands staged", cmdq_count(txq), 8);
+    eqi("C_INPUT is 2 elements: the count and one blob", proto_write_input(m, cpk, txq), 2);
+    eqi("...with the right net_id", proto_net_id(m), NET_C_INPUT);
+    eqi("no unsafe element in a C_INPUT message", proto_audit(m), 0);
+    eqi("no float and no string either", proto_audit_gameplay(m), 0);
+
+    let cb = proto_build(m);
+    ok("C_INPUT builds without a throw", cb != null);
+    eqi("the framed packet is [u16 size][u16 net_id][elements]",
+        i32(cb.read_u16_le(0)), cb.length - 2);
+    eqi("the net_id is at byte 2", i32(cb.read_u16_le(2)), NET_C_INPUT);
+
+    eqi("C_INPUT re-parses", proto_load(cb, 2, cb.length - 2, rm), 1);
+    eqi("...to the same net_id", proto_net_id(rm), NET_C_INPUT);
+    eqi("...to 8 commands", proto_read_input(rm, rxq), 8);
+
+    let loss: i32 = 0;
+    i = 0;
+    while (i < 8) {
+        if (rxq.tick[i] != txq.tick[i]) { loss++; }
+        if (rxq.seq[i] != txq.seq[i]) { loss++; }
+        if (rxq.move_x[i] != txq.move_x[i]) { loss++; }
+        if (rxq.move_y[i] != txq.move_y[i]) { loss++; }
+        if (rxq.yaw_q[i] != txq.yaw_q[i]) { loss++; }
+        if (rxq.pitch_q[i] != txq.pitch_q[i]) { loss++; }
+        if (rxq.buttons[i] != txq.buttons[i]) { loss++; }
+        if (rxq.weapon_sel[i] != txq.weapon_sel[i]) { loss++; }
+        if (rxq.dt_ms[i] != txq.dt_ms[i]) { loss++; }
+        i++;
+    }
+    eqi("ZERO field loss across 8 commands x 9 fields", loss, 0);
+
+    // -----------------------------------------------------------------------
+    print("[4] protocol — S_SNAPSHOT, 32 entities, three blobs");
+    // -----------------------------------------------------------------------
+    let e32: object = netents_new(64);
+    let rx32: object = netents_new(64);
+    let loc: object = netlocal_new();
+    let rxloc: object = netlocal_new();
+    let epk: object = pack_new(ENTS_PER_BLOB * ENT_STRIDE);
+    let lpk: object = pack_new(LOCAL_STRIDE);
+    fill_ents(e32, 32);
+    netlocal_set(loc, 12.5, 3.25, -44.75, 4.5, -2.25, 0.125, 87, 25, 2, 1, 24);
+
+    eqi("32 entities need 3 blobs", proto_blob_count(32), 3);
+    eqi("12 entities need 1 blob", proto_blob_count(12), 1);
+    eqi("13 entities need 2 blobs", proto_blob_count(13), 2);
+    let nel: i32 = proto_write_snapshot(m, epk, lpk, e32, loc, 0);
+    eqi("S_SNAPSHOT is 4 header ints + 3 blobs + the owner block", nel, 8);
+    eqi("no unsafe element in an S_SNAPSHOT", proto_audit(m), 0);
+    eqi("no float and no string either", proto_audit_gameplay(m), 0);
+    eqi("blob 0 is a full 240 bytes", proto_get(m, 4).length, 240);
+    eqi("blob 2 carries the remaining 8 entities", proto_get(m, 6).length, 160);
+    eqi("the owner block is 24 bytes", proto_get(m, 7).length, 24);
+
+    let sb = proto_build(m);
+    ok("S_SNAPSHOT builds without a throw", sb != null);
+    note(`32-entity S_SNAPSHOT on the wire = ${sb.length} bytes (NETWORKING §11.3 predicts ~690)`);
+    ok("...and lands near the 690-byte budget", sb.length > 600 && sb.length < 780);
+
+    eqi("S_SNAPSHOT re-parses", proto_load(sb, 2, sb.length - 2, rm), 1);
+    eqi("...to 32 entities", proto_read_snapshot(rm, rx32, rxloc), 32);
+    eqi("...carrying the server tick", rx32.tick, 9001);
+    eqi("...the last-acked command seq", rx32.acked_seq, 8123);
+    eqi("...and the low 16 bits of server_time_ms", rx32.time_ms, 123456 & 65535);
+
+    let sloss: i32 = 0;
+    i = 0;
+    while (i < 32) {
+        if (rx32.id[i] != e32.id[i]) { sloss++; }
+        if (rx32.px_q[i] != e32.px_q[i]) { sloss++; }
+        if (rx32.py_q[i] != e32.py_q[i]) { sloss++; }
+        if (rx32.pz_q[i] != e32.pz_q[i]) { sloss++; }
+        if (rx32.yaw_q[i] != e32.yaw_q[i]) { sloss++; }
+        if (rx32.pitch_q[i] != e32.pitch_q[i]) { sloss++; }
+        if (rx32.anim[i] != e32.anim[i]) { sloss++; }
+        if (rx32.hp_pct[i] != e32.hp_pct[i]) { sloss++; }
+        if (rx32.flags[i] != e32.flags[i]) { sloss++; }
+        i++;
+    }
+    eqi("ZERO field loss across 32 entities x 9 fields", sloss, 0);
+
+    let lloss: i32 = 0;
+    if (rxloc.px_q != loc.px_q) { lloss++; }
+    if (rxloc.py_q != loc.py_q) { lloss++; }
+    if (rxloc.pz_q != loc.pz_q) { lloss++; }
+    if (rxloc.vx_q != loc.vx_q) { lloss++; }
+    if (rxloc.vy_q != loc.vy_q) { lloss++; }
+    if (rxloc.vz_q != loc.vz_q) { lloss++; }
+    if (rxloc.hp != loc.hp) { lloss++; }
+    if (rxloc.armor != loc.armor) { lloss++; }
+    if (rxloc.move_state != loc.move_state) { lloss++; }
+    if (rxloc.weapon != loc.weapon) { lloss++; }
+    if (rxloc.ammo_mag != loc.ammo_mag) { lloss++; }
+    eqi("ZERO field loss in the 24-byte owner-only block", lloss, 0);
+    ok("the owner block's position survives dequantization",
+       absf(netlocal_x(rxloc) - 12.5) < 0.004);
+    ok("...and so does its velocity", absf(netlocal_vy(rxloc) + 2.25) < 0.008);
+
+    // An empty snapshot is legal and must not emit a zero-length blob.
+    let e0: object = netents_new(4);
+    netents_reset(e0);
+    eqi("an empty snapshot is 4 header ints only", proto_write_snapshot(m, epk, lpk, e0, null, 0), 4);
+    let zb = proto_build(m);
+    ok("...and still builds", zb != null);
+    eqi("...and re-parses to zero entities", proto_load(zb, 2, zb.length - 2, rm), 1);
+    eqi("...really zero", proto_read_snapshot(rm, rx32, null), 0);
+
+    // -----------------------------------------------------------------------
+    print("[5] protocol — S_EVENT and frame batching");
+    // -----------------------------------------------------------------------
+    let evs: object = netevs_new(64);
+    let rxevs: object = netevs_new(64);
+    let vpk: object = pack_new(EVS_PER_BLOB * EV_STRIDE);
+    netevs_reset(evs);
+    evs.tick = 4242;
+    i = 0;
+    while (i < 20) {
+        netevs_push(evs, EV_HIT + (i % 3), i, 1000 + i, 2000 + i,
+                    f64(i) * 1.5 - 15.0, f64(i) * 0.25, 0.0 - f64(i) * 2.0);
+        i++;
+    }
+    let ne: i32 = proto_write_events(m, vpk, evs);
+    eqi("20 events are 2 header ints + 2 blobs", ne, 4);
+    eqi("no unsafe element in an S_EVENT", proto_audit(m), 0);
+    eqi("event blob 0 is a full 240 bytes", proto_get(m, 2).length, 240);
+    eqi("event blob 1 carries the remaining 5", proto_get(m, 3).length, 80);
+    let eb = proto_build(m);
+    eqi("S_EVENT re-parses", proto_load(eb, 2, eb.length - 2, rm), 1);
+    eqi("...to 20 events", proto_read_events(rm, rxevs), 20);
+    eqi("...carrying the tick", rxevs.tick, 4242);
+    let eloss: i32 = 0;
+    i = 0;
+    while (i < 20) {
+        if (rxevs.type[i] != evs.type[i]) { eloss++; }
+        if (rxevs.sub[i] != evs.sub[i]) { eloss++; }
+        if (rxevs.actor[i] != evs.actor[i]) { eloss++; }
+        if (rxevs.target[i] != evs.target[i]) { eloss++; }
+        if (rxevs.x_q[i] != evs.x_q[i]) { eloss++; }
+        if (rxevs.y_q[i] != evs.y_q[i]) { eloss++; }
+        if (rxevs.z_q[i] != evs.z_q[i]) { eloss++; }
+        i++;
+    }
+    eqi("ZERO field loss across 20 events x 7 fields", eloss, 0);
+
+    // One WebSocket frame may carry several concatenated packets, and
+    // recv_packet() silently drops all but the first — hence our own splitter.
+    let frame = buffer(cb.length + sb.length + eb.length);
+    frame.write_bytes(0, cb, cb.length);
+    frame.write_bytes(cb.length, sb, sb.length);
+    frame.write_bytes(cb.length + sb.length, eb, eb.length);
+    let msgs: array = [];
+    eqi("a 3-packet frame splits into 3 packets", proto_parse_frame(frame, msgs), 3);
+    eqi("...in order: C_INPUT", proto_net_id(msgs[0]), NET_C_INPUT);
+    eqi("...then S_SNAPSHOT", proto_net_id(msgs[1]), NET_S_SNAPSHOT);
+    eqi("...then S_EVENT", proto_net_id(msgs[2]), NET_S_EVENT);
+
+    // Truncation must be detected, not thrown on.
+    let trunc = frame.slice(0, cb.length + 5);
+    let before_mal: i32 = proto_malformed();
+    let got_t: i32 = proto_parse_frame(trunc, msgs);
+    eqi("a truncated frame yields only the whole packets", got_t, 1);
+    ok("...and is counted as malformed", proto_malformed() > before_mal);
+
+    // The build-side refusal: a bool or a null can never reach the wire.
+    let badm: object = proto_msg(NET_C_INPUT);
+    eqi("proto_add refuses a bool", proto_add(badm, true), -1);
+    eqi("proto_add refuses a null", proto_add(badm, null), -1);
+    eqi("...so the message stays empty", proto_count(badm), 0);
+    ok("...and the refusals were counted", proto_refused() >= 2);
+
+    // -----------------------------------------------------------------------
+    print("[6] transport — loopback, both serialize modes");
+    // -----------------------------------------------------------------------
+    let mode: i32 = 0;
+    let mode_loss: i32 = 0;
+    let mode_cmds: i32 = 0;
+    let mode_snaps: i32 = 0;
+    while (mode < 2) {
+        let t: object = transport_loopback();
+        transport_set_serialize(t, mode);
+        transport_set_latency(t, 0.0);
+        transport_set_jitter(t, 0.0);
+        transport_set_tick(t, 0, 16.6666666666666679);
+
+        let sq: object = cmdq_new(MAX_CMDS_PER_PACKET);
+        cmdq_reset(sq);
+        let k: i32 = 0;
+        while (k < 5) {
+            transport_send_command(t, mk_cmd(1000 + k, 2000 + k));
+            k++;
+        }
+        let n: i32 = transport_poll_commands(t, sq);
+        mode_cmds = mode_cmds + n;
+        if (n == 5) {
+            k = 0;
+            while (k < 5) {
+                let rc: object = mk_cmd(1000 + k, 2000 + k);
+                if (sq.tick[k] != rc.tick) { mode_loss++; }
+                if (sq.seq[k] != rc.seq) { mode_loss++; }
+                if (sq.move_x[k] != rc.move_x) { mode_loss++; }
+                if (sq.move_y[k] != rc.move_y) { mode_loss++; }
+                if (sq.yaw_q[k] != rc.yaw_q) { mode_loss++; }
+                if (sq.pitch_q[k] != rc.pitch_q) { mode_loss++; }
+                if (sq.buttons[k] != rc.buttons) { mode_loss++; }
+                if (sq.weapon_sel[k] != rc.weapon_sel) { mode_loss++; }
+                if (sq.dt_ms[k] != rc.dt_ms) { mode_loss++; }
+                k++;
+            }
+        } else { mode_loss = mode_loss + 999; }
+
+        transport_send_snapshot(t, 0, e32, loc, 0);
+        let rxe: object = netents_new(64);
+        let rxl: object = netlocal_new();
+        if (transport_poll_snapshot(t, rxe, rxl) == 1) {
+            mode_snaps++;
+            if (rxe.count != 32) { mode_loss = mode_loss + 999; }
+            else {
+                k = 0;
+                while (k < 32) {
+                    if (rxe.id[k] != e32.id[k]) { mode_loss++; }
+                    if (rxe.px_q[k] != e32.px_q[k]) { mode_loss++; }
+                    if (rxe.py_q[k] != e32.py_q[k]) { mode_loss++; }
+                    if (rxe.pz_q[k] != e32.pz_q[k]) { mode_loss++; }
+                    if (rxe.yaw_q[k] != e32.yaw_q[k]) { mode_loss++; }
+                    if (rxe.pitch_q[k] != e32.pitch_q[k]) { mode_loss++; }
+                    if (rxe.anim[k] != e32.anim[k]) { mode_loss++; }
+                    if (rxe.hp_pct[k] != e32.hp_pct[k]) { mode_loss++; }
+                    if (rxe.flags[k] != e32.flags[k]) { mode_loss++; }
+                    k++;
+                }
+                if (rxe.tick != e32.tick) { mode_loss++; }
+                if (rxl.hp != loc.hp) { mode_loss++; }
+                if (rxl.ammo_mag != loc.ammo_mag) { mode_loss++; }
+                if (rxl.px_q != loc.px_q) { mode_loss++; }
+            }
+        }
+
+        transport_send_event(t, 0, 77, EV_KILL, 2, 1001, 1002,
+                             q_evpos(1.5), q_evpos(-2.25), q_evpos(0.75));
+        let rxv: object = netevs_new(16);
+        netevs_reset(rxv);
+        if (transport_poll_events(t, rxv) != 1) { mode_loss = mode_loss + 999; }
+        else {
+            if (rxv.type[0] != EV_KILL) { mode_loss++; }
+            if (rxv.actor[0] != 1001) { mode_loss++; }
+            if (rxv.target[0] != 1002) { mode_loss++; }
+            if (rxv.x_q[0] != q_evpos(1.5)) { mode_loss++; }
+            if (absf(netevs_y(rxv, 0) + 2.25) > 0.032) { mode_loss++; }
+            if (rxv.tick != 77) { mode_loss++; }
+        }
+
+        let st: object = transport_stats(t);
+        if (st.encode_fail != 0) { mode_loss = mode_loss + 999; }
+        if (st.decode_fail != 0) { mode_loss = mode_loss + 999; }
+        if (mode == 1) {
+            if (st.bytes_c2s < 1) { mode_loss = mode_loss + 999; }
+            if (st.bytes_s2c < 1) { mode_loss = mode_loss + 999; }
+            note(`NS_LOOPBACK_SERIALIZE=1 moved ${st.bytes_c2s} B up, ${st.bytes_s2c} B down`);
+        }
+        mode++;
+    }
+    eqi("both modes delivered all 10 commands", mode_cmds, 10);
+    eqi("both modes delivered their snapshot", mode_snaps, 2);
+    eqi("NS_LOOPBACK_SERIALIZE=0 and =1 agree on EVERY field", mode_loss, 0);
+
+    // The three modes really do come from the environment. This is the knob a
+    // dev flips; if it silently did nothing, nobody would ever find out.
+    setenv("NS_FAKE_LATENCY_MS", "120");
+    setenv("NS_FAKE_JITTER_MS", "15");
+    setenv("NS_LOOPBACK_SERIALIZE", "1");
+    let tenv: object = transport_loopback();
+    ok("NS_FAKE_LATENCY_MS is read from the environment",
+       absf(transport_latency_ms(tenv) - 120.0) < 0.0001);
+    ok("NS_FAKE_JITTER_MS is read from the environment",
+       absf(transport_jitter_ms(tenv) - 15.0) < 0.0001);
+    eqi("NS_LOOPBACK_SERIALIZE is read from the environment",
+        transport_serialize(tenv), 1);
+    setenv("NS_FAKE_LATENCY_MS", "not-a-number");
+    let tbad: object = transport_loopback();
+    ok("a malformed knob falls back to the default instead of throwing",
+       absf(transport_latency_ms(tbad)) < 0.0001);
+    unsetenv("NS_FAKE_LATENCY_MS");
+    unsetenv("NS_FAKE_JITTER_MS");
+    unsetenv("NS_LOOPBACK_SERIALIZE");
+    let tdef: object = transport_loopback();
+    eqi("with nothing set, the loopback is instant and unserialized",
+        transport_serialize(tdef), 0);
+    ok("...and has no fake latency", absf(transport_latency_ms(tdef)) < 0.0001);
+
+    // -----------------------------------------------------------------------
+    print("[7] transport — fake latency, fake jitter, ordering");
+    // -----------------------------------------------------------------------
+    let TICK_MS: f64 = 16.6666666666666679;
+    let tl: object = transport_loopback();
+    transport_set_serialize(tl, 1);
+    transport_set_latency(tl, 100.0);
+    transport_set_jitter(tl, 0.0);
+    transport_set_tick(tl, 0, TICK_MS);
+    let lq: object = cmdq_new(MAX_CMDS_PER_PACKET);
+    transport_send_command(tl, mk_cmd(0, 0));
+    eqi("at 100 ms latency nothing arrives on the tick it was sent",
+        transport_poll_commands(tl, lq), 0);
+    transport_set_tick(tl, 5, TICK_MS);          // 83.3 ms
+    eqi("...nor at 83 ms", transport_poll_commands(tl, lq), 0);
+    transport_set_tick(tl, 6, TICK_MS);          // 100.0 ms
+    eqi("...and arrives on the first tick at or past 100 ms",
+        transport_poll_commands(tl, lq), 1);
+    ok("RTT is twice the one-way knob", absf(transport_rtt_ms(tl) - 200.0) < 0.0001);
+
+    // Jitter may delay but must never reorder: gn.hml is TCP, and loss shows
+    // up as latency (head-of-line blocking), never as a gap or a swap.
+    let tj: object = transport_loopback();
+    transport_set_serialize(tj, 0);
+    transport_set_latency(tj, 50.0);
+    transport_set_jitter(tj, 40.0);
+    transport_seed(tj, 12345);
+    let jq: object = cmdq_new(CMD_RING);
+    cmdq_reset(jq);
+    let sent: i32 = 0;
+    let tk: i32 = 0;
+    while (tk < 60) {
+        transport_set_tick(tj, tk, TICK_MS);
+        if (tk < 40) { transport_send_command(tj, mk_cmd(tk, tk)); sent++; }
+        transport_poll_commands(tj, jq);
+        tk++;
+    }
+    eqi("every jittered command was delivered exactly once", cmdq_count(jq), sent);
+    let order_bad: i32 = 0;
+    i = 1;
+    while (i < cmdq_count(jq)) {
+        if (jq.seq[i] <= jq.seq[i - 1]) { order_bad++; }
+        i++;
+    }
+    eqi("jitter never reorders the stream", order_bad, 0);
+
+    // Determinism: same seed, same tick sequence, same delivery ticks.
+    let da: array = [];
+    let db: array = [];
+    let run: i32 = 0;
+    while (run < 2) {
+        let td: object = transport_loopback();
+        transport_set_serialize(td, 0);
+        transport_set_latency(td, 50.0);
+        transport_set_jitter(td, 40.0);
+        transport_seed(td, 999);
+        let dq: object = cmdq_new(CMD_RING);
+        cmdq_reset(dq);
+        let last: i32 = 0;
+        tk = 0;
+        while (tk < 60) {
+            transport_set_tick(td, tk, TICK_MS);
+            if (tk < 40) { transport_send_command(td, mk_cmd(tk, tk)); }
+            transport_poll_commands(td, dq);
+            let now: i32 = cmdq_count(dq);
+            while (last < now) {
+                if (run == 0) { da.push(tk); } else { db.push(tk); }
+                last++;
+            }
+            tk++;
+        }
+        run++;
+    }
+    eqi("two seeded jitter runs deliver the same number of commands", da.length, db.length);
+    let det_bad: i32 = 0;
+    i = 0;
+    while (i < da.length) { if (da[i] != db[i]) { det_bad++; } i++; }
+    eqi("...on exactly the same ticks", det_bad, 0);
+
+    // -----------------------------------------------------------------------
+    print("[8] transport — supersede, drop, and the v2 stub");
+    // -----------------------------------------------------------------------
+    let ts: object = transport_loopback();
+    transport_set_serialize(ts, 0);
+    transport_set_latency(ts, 0.0);
+    transport_set_jitter(ts, 0.0);
+    transport_set_tick(ts, 10, TICK_MS);
+    i = 0;
+    while (i < 4) {
+        e32.tick = 500 + i;
+        transport_send_snapshot(ts, 0, e32, loc, 0);
+        i++;
+    }
+    let se: object = netents_new(64);
+    eqi("four ready snapshots collapse to one poll", transport_poll_snapshot(ts, se, null), 1);
+    eqi("...and it is the NEWEST", se.tick, 503);
+    eqi("...with the older three counted as superseded",
+        transport_stats(ts).snap_superseded, 3);
+    eqi("...leaving the queue empty", transport_pending_snapshots(ts), 0);
+    eqi("polling an empty queue returns 0, never a throw",
+        transport_poll_snapshot(ts, se, null), 0);
+    e32.tick = 9001;
+
+    let td2: object = transport_loopback();
+    transport_set_serialize(td2, 0);
+    transport_set_latency(td2, 100000.0);       // nothing will ever be ready
+    transport_set_jitter(td2, 0.0);
+    transport_set_tick(td2, 0, TICK_MS);
+    i = 0;
+    while (i < CMD_RING + 10) { transport_send_command(td2, mk_cmd(i, i)); i++; }
+    eqi("the command ring never exceeds its cap", transport_pending_commands(td2), CMD_RING);
+    eqi("...and the overflow dropped the OLDEST, counted", transport_stats(td2).cmd_dropped, 10);
+
+    let tn: object = transport_net();
+    eqi("the v2 stub reports its kind", transport_mode(tn), TRANSPORT_NET);
+    eqi("sending on it is a counted no-op, not a throw",
+        transport_send_command(tn, mk_cmd(0, 0)), -1);
+    eqi("polling it is a counted no-op too", transport_poll_commands(tn, lq), 0);
+    eqi("...and the refusals were counted", tn.unsupported, 2);
+
+    // -----------------------------------------------------------------------
+    print("[9] budget — RULE T: __clock CPU time, min of 7");
+    // -----------------------------------------------------------------------
+    let ms32: f64 = bench_snapshot_ms(400, 32);
+    let ms64: f64 = bench_snapshot_ms(200, 64);
+    note(`32-entity snapshot build+parse = ${f3(ms32 * 1000.0)} us (target <= 50 us)`);
+    note(`64-entity snapshot build+parse = ${f3(ms64 * 1000.0)} us`);
+    // The acceptance criterion is 0.05 ms; the LOADED measurement on this box is
+    // 0.030 ms. The bound below is 0.060 ms — ~2x loaded — because this machine
+    // permanently shares ~17 of 24 cores with a llama-server and cache/bandwidth
+    // contention inflates every reading 60-100 % no matter the methodology. A
+    // probe that fails on machine state rather than on code trains everyone to
+    // ignore red. The regression it guards against is real and enormous: the
+    // element-per-field layout costs 0.184 ms (NETWORKING §3.6), 6x this bound,
+    // and routing the bulk blobs back through the stateful per-field packer
+    // costs 0.106 ms, measured during this task.
+    ok("32-entity snapshot build+parse is inside 0.05 ms (the criterion)", ms32 < 0.050);
+    ok("...and inside the 0.060 ms regression guard (~2x loaded)", ms32 < 0.060);
+    ok("cost scales with entity count, not worse than linearly", ms64 < ms32 * 2.6);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni++; }
+    print("");
+    if (g_n != EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${EXPECTED_ASSERTIONS} — a branch was skipped`);
+        return 1;
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); return 0; }
+    print(`FAIL ${g_pass}/${g_n}`);
+    return 1;
+}
+
+// The self-test entry point. Guarded, so importing this module from the game
+// costs exactly one getenv and never prints or runs anything.
+if (getenv("NS_SELFTEST") != null) {
+    if (net_selftest() != 0) { exit(1); }
+}

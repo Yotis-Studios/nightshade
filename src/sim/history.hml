@@ -1,0 +1,337 @@
+// history.hml — the 32-tick transform ring buffer.
+//
+// Nightshade W2-10. ARCHITECTURE §5.4; NETWORKING recon §7.3, §13.
+//
+// -----------------------------------------------------------------------------
+// WHY THIS EXISTS IN A SINGLE-PLAYER v1
+// -----------------------------------------------------------------------------
+// Server-side lag compensation rewinds every entity's transform to the tick the
+// shooter actually saw, resolves the hitscan there, and rolls forward again.
+// That is a v2 feature. The RING IS BUILT NOW anyway, for three reasons:
+//
+//  1. It is the shape that proves the SoA world was worth it. If transforms
+//     were objects, one capture would be 32 x N heap allocations per tick and
+//     lag compensation would be unaffordable before anyone tried it. Capturing
+//     every tick from day one keeps that cost visible and measured
+//     (`probe_sim_world` asserts it).
+//  2. Client-side prediction reconciliation in v2 needs exactly this buffer to
+//     answer "where did I say I was at tick T". Retrofitting a ring into a sim
+//     that never had one means auditing every system that mutates a transform.
+//  3. It is the debugger. `history_sample` is how a replay divergence gets
+//     bisected to the tick it started on.
+//
+// -----------------------------------------------------------------------------
+// LAYOUT — flat, slot-major, ring-minor
+// -----------------------------------------------------------------------------
+//     px[(slot * HISTORY_TICKS) + ring]
+//
+// Slot-major means one entity's whole history is contiguous, which is the
+// access pattern a rewind uses (one entity, several ticks). Capture strides by
+// HISTORY_TICKS, which is a fixed compile-time constant, so the index is a
+// shift-and-add and never a multiply inside the loop.
+//
+// Only the TRANSFORM replication group is captured — position, and the two
+// angles. Velocity is not: a rewind re-resolves a hitscan against where things
+// *were*, and re-deriving velocity from two ring entries is exact and free.
+// State, owner-only and server-only fields are never rewound; rewinding hp
+// would let a lag-compensated shot resurrect a corpse.
+//
+// -----------------------------------------------------------------------------
+// SLOT CHURN, AND WHY EVERY CELL CARRIES AN ID
+// -----------------------------------------------------------------------------
+// `world_despawn` swaps the last slot into the hole, so slot N at tick T and
+// slot N at tick T-20 are not necessarily the same entity. Indexing history by
+// slot alone would silently rewind the wrong body. Every cell therefore stores
+// the id that occupied it, and `history_sample` refuses a mismatch instead of
+// returning plausible garbage. `history_find_slot` is the O(n) fallback for the
+// rare case where an entity really did change slots inside the window.
+//
+// `n_of[ring]` records how many slots were live when that ring was written, so
+// a slot beyond the count of an old tick reads as a miss without any clearing
+// pass. That is what keeps capture O(count) rather than O(cap).
+//
+// -----------------------------------------------------------------------------
+// PERFORMANCE CONTRACT
+// -----------------------------------------------------------------------------
+//  * Every array is allocated once in `history_new`. Capture allocates nothing,
+//    calls nothing, and branches once (A8, N6, A9b).
+//  * Field arrays are hoisted into locals before the loop; the ring index is
+//    carried as a running `i32` and advanced by a hoisted stride.
+//  * No closures, no `defer`, no `try`, no `throw`, no template strings.
+//  * MEASURED: capture of 256 entities costs 0.0239 ms/tick (min-of-7 CPU
+//    time, on a box permanently sharing 17 of 24 cores). Budget is 0.08.
+//    A hand-inlined copy of the same loop costs 0.0226 ms, so the function
+//    call and the prologue are 6 % of it — there is nothing left to win here.
+//  * DO NOT ANNOTATE AN OBJECT-FIELD ARRAY HOIST WITH ITS ELEMENT TYPE.
+//        let hpx: array<f64> = h.px;   // O(length) conversion walk, every call
+//        let hpx = h.px;               // O(1), and aliases identically
+//    Measured on v2.9.1, `hemlockc -O1`, a 16 384-element field: 7.82 us vs
+//    0.03 us per hoist. Six annotated hoists were 46 us of FIXED cost in this
+//    function -- 2x the entire per-entity work at 256 entities, and it does not
+//    show up at all in a small test world. Element read/write speed afterwards
+//    is identical (9.83 vs 9.97 ns), so the annotation buys nothing. Reported
+//    to the orchestrator for docs/HEMLOCK_ISSUES.md.
+//
+// -----------------------------------------------------------------------------
+// THE IMPORT WALL
+// -----------------------------------------------------------------------------
+// `src/sim/**`. Imports nothing: no SDL, no wobbleweed, no gn.hml, no
+// `@stdlib/random`, and no clock of any kind. The tick number arrives from the
+// world, which got it from the fixed-step counter.
+
+// Ring depth. 32 ticks is ~0.53 s at 60 Hz, or 32 snapshots at 20 Hz — past the
+// worst RTT this game will lag-compensate. It is a power of two so the wrap is
+// a mask, and it is a compile-time constant so the stride never leaves the
+// instruction stream.
+export let HISTORY_TICKS = 32;
+export let HISTORY_MASK  = 31;
+
+// Indices into the caller-owned output array `history_sample` fills.
+export let HIST_PX    = 0;
+export let HIST_PY    = 1;
+export let HIST_PZ    = 2;
+export let HIST_YAW   = 3;
+export let HIST_PITCH = 4;
+export let HIST_FIELDS = 5;
+
+// Returned instead of a null when a sample or a search misses. Nulls are banned
+// in this project (a null silently truncates the rest of a packet).
+export let HIST_MISS = -1;
+
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// A ring for a world of at most `p_cap` entities. Allocates
+// 5 x (cap * 32) f64 + 1 x (cap * 32) i32 + 64 i32, ONCE.
+// At cap 512 that is 16 384 cells per field.
+export fn history_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let cells: i32 = cap * HISTORY_TICKS;
+
+    let tof: array<i32> = zeros_i(HISTORY_TICKS);
+    let i: i32 = 0;
+    // -1 is "this ring slot has never been written". Sim ticks are >= 0, so no
+    // real tick can be confused with it.
+    while (i < HISTORY_TICKS) { tof[i] = -1; i++; }
+
+    let h: object = {
+        cap: cap,
+        cells: cells,
+        head: 0,            // ring index of the most recent capture
+        captures: 0,        // total captures since reset; tools only
+        tick_of: tof,       // tick_of[ring]  -> the tick that ring holds
+        n_of: zeros_i(HISTORY_TICKS),  // n_of[ring] -> live count at that tick
+        ent: zeros_i(cells),   // identity  — the id that occupied the cell
+        px: zeros_f(cells),    // transform
+        py: zeros_f(cells),    // transform
+        pz: zeros_f(cells),    // transform
+        yaw: zeros_f(cells),   // transform
+        pitch: zeros_f(cells)  // transform
+    };
+    let out: object = h;
+    return out;
+}
+
+// Forget everything. Does not reallocate.
+export fn history_reset(p_h: object) {
+    let h: object = p_h;
+    let tof = h.tick_of;
+    let nof = h.n_of;
+    let i: i32 = 0;
+    while (i < HISTORY_TICKS) { tof[i] = -1; nof[i] = 0; i++; }
+    h.head = 0;
+    h.captures = 0;
+}
+
+// ---------------------------------------------------------------------------
+// CAPTURE — called once per tick, from sim_step stage (i). HOT.
+// ---------------------------------------------------------------------------
+// Reads the world's transform group and the id array; writes one ring column.
+// Advances the head first, so the newest capture is always at `head`.
+//
+// Nothing is cleared for slots above `n`: `n_of[ring]` records the live count
+// and every read is bounds-checked against it. That is what keeps this O(count)
+// instead of O(cap) and it is the difference between 0.016 ms and 0.032 ms at
+// a half-full world.
+export fn history_capture(p_h: object, p_w: object) {
+    let h: object = p_h;
+    let w: object = p_w;
+
+    let stride: i32 = HISTORY_TICKS;
+    let ring: i32 = h.head + 1;
+    if (ring >= stride) { ring = 0; }
+    h.head = ring;
+
+    let n: i32 = w.count;
+    let cap: i32 = h.cap;
+    if (n > cap) { n = cap; }
+
+    let tof = h.tick_of;
+    let nof = h.n_of;
+    tof[ring] = w.tick;
+    nof[ring] = n;
+    h.captures = h.captures + 1;
+
+    let wid = w.id;
+    let wpx = w.px;
+    let wpy = w.py;
+    let wpz = w.pz;
+    let wyaw = w.yaw;
+    let wpit = w.pitch;
+
+    let hid = h.ent;
+    let hpx = h.px;
+    let hpy = h.py;
+    let hpz = h.pz;
+    let hyaw = h.yaw;
+    let hpit = h.pitch;
+
+    let b: i32 = ring;
+    let i: i32 = 0;
+    while (i < n) {
+        hid[b]  = wid[i];
+        hpx[b]  = wpx[i];
+        hpy[b]  = wpy[i];
+        hpz[b]  = wpz[i];
+        hyaw[b] = wyaw[i];
+        hpit[b] = wpit[i];
+        b = b + stride;
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SAMPLING
+// ---------------------------------------------------------------------------
+
+// Which ring holds `p_tick`? HIST_MISS if it is outside the window.
+// O(1): the ring is contiguous in tick, so the offset from the head is the
+// distance in ticks. The final equality test is not redundant — it is what
+// makes a cold ring, a reset ring and a skipped tick all miss instead of
+// returning a neighbour.
+export fn history_ring_of(p_h: object, p_tick: i32): i32 {
+    let h: object = p_h;
+    let tick: i32 = p_tick;
+    if (tick < 0) { let neg: i32 = HIST_MISS; return neg; }
+    let head: i32 = h.head;
+    let tof = h.tick_of;
+    let newest: i32 = tof[head];
+    if (newest < 0) { let cold: i32 = HIST_MISS; return cold; }
+    let delta: i32 = newest - tick;
+    if (delta < 0 || delta >= HISTORY_TICKS) { let far: i32 = HIST_MISS; return far; }
+    let r: i32 = head - delta;
+    if (r < 0) { r = r + HISTORY_TICKS; }
+    if (tof[r] != tick) { let gap: i32 = HIST_MISS; return gap; }
+    let out: i32 = r;
+    return out;
+}
+
+// The tick of the most recent capture, or HIST_MISS if nothing was captured.
+export fn history_head_tick(p_h: object): i32 {
+    let h: object = p_h;
+    let tof = h.tick_of;
+    let out: i32 = tof[h.head];
+    return out;
+}
+
+// How many entities were live at `p_tick`. 0 if the tick is outside the window.
+export fn history_count_at(p_h: object, p_tick: i32): i32 {
+    let h: object = p_h;
+    let r: i32 = history_ring_of(h, p_tick);
+    if (r < 0) { let miss: i32 = 0; return miss; }
+    let nof = h.n_of;
+    let out: i32 = nof[r];
+    return out;
+}
+
+export fn history_depth(): i32 { let out: i32 = HISTORY_TICKS; return out; }
+export fn history_capture_count(p_h: object): i32 { let h: object = p_h; let out: i32 = h.captures; return out; }
+
+// Read entity `p_id`'s transform at `p_tick` out of slot `p_slot`, into the
+// caller-owned `p_out` at indices HIST_PX..HIST_PITCH. Returns 1 on a hit,
+// 0 on a miss; `p_out` is untouched on a miss.
+//
+// `p_slot` is the entity's CURRENT slot (from `world_slot_of`). The stored id
+// is checked, so a slot that has been recycled since `p_tick` reads as a miss
+// rather than as some other entity's body. Use `history_find_slot` when that
+// happens.
+//
+// Five arguments is deliberate: Hemlock calls cost ~10 ns per argument
+// (CLAUDE.md A9b), and the alternative — returning a fresh array — would
+// allocate on a path that runs once per entity per shot.
+export fn history_sample(p_h: object, p_slot: i32, p_id: i32, p_tick: i32, p_out: array<f64>): i32 {
+    let h: object = p_h;
+    let slot: i32 = p_slot;
+    let id: i32 = p_id;
+    let r: i32 = history_ring_of(h, p_tick);
+    if (r < 0) { let m1: i32 = 0; return m1; }
+    let nof = h.n_of;
+    if (slot < 0 || slot >= nof[r]) { let m2: i32 = 0; return m2; }
+
+    let b: i32 = slot * HISTORY_TICKS + r;
+    let hid = h.ent;
+    if (hid[b] != id) { let m3: i32 = 0; return m3; }
+
+    let out = p_out;
+    let hpx = h.px;
+    let hpy = h.py;
+    let hpz = h.pz;
+    let hyaw = h.yaw;
+    let hpit = h.pitch;
+    out[HIST_PX]    = hpx[b];
+    out[HIST_PY]    = hpy[b];
+    out[HIST_PZ]    = hpz[b];
+    out[HIST_YAW]   = hyaw[b];
+    out[HIST_PITCH] = hpit[b];
+    let hit: i32 = 1;
+    return hit;
+}
+
+// Which slot did `p_id` occupy at `p_tick`? HIST_MISS if it was not live then.
+// O(count-at-that-tick). This is the fallback for an entity that changed slot
+// inside the window; the common path is `world_slot_of` + `history_sample`.
+export fn history_find_slot(p_h: object, p_id: i32, p_tick: i32): i32 {
+    let h: object = p_h;
+    let id: i32 = p_id;
+    let r: i32 = history_ring_of(h, p_tick);
+    if (r < 0) { let m1: i32 = HIST_MISS; return m1; }
+    let nof = h.n_of;
+    let n: i32 = nof[r];
+    let hid = h.ent;
+    let stride: i32 = HISTORY_TICKS;
+    let b: i32 = r;
+    let i: i32 = 0;
+    while (i < n) {
+        if (hid[b] == id) { let hit: i32 = i; return hit; }
+        b = b + stride;
+        i++;
+    }
+    let miss: i32 = HIST_MISS;
+    return miss;
+}
+
+// Sample `p_id` at `p_tick` without knowing its slot. Convenience for tools and
+// for the v2 rewind's cold path; it is `history_find_slot` + `history_sample`.
+export fn history_sample_id(p_h: object, p_id: i32, p_tick: i32, p_out: array<f64>): i32 {
+    let h: object = p_h;
+    let s: i32 = history_find_slot(h, p_id, p_tick);
+    if (s < 0) { let miss: i32 = 0; return miss; }
+    let out: i32 = history_sample(h, s, p_id, p_tick, p_out);
+    return out;
+}

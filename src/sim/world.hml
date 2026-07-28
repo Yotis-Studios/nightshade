@@ -1,0 +1,860 @@
+// world.hml — the authoritative entity world. Struct-of-arrays, grouped by
+// replication class, with a sparse-set id<->slot map.
+//
+// Nightshade W2-10. ARCHITECTURE §3, §5.4; NETWORKING recon §7.1–§7.2.
+//
+// -----------------------------------------------------------------------------
+// THE IMPORT WALL (CLAUDE.md §3)
+// -----------------------------------------------------------------------------
+// This file is inside `src/sim/**`. It may import ONLY `@stdlib/math`, other
+// `src/sim/**`, and `src/core/**`. It imports NOTHING at all, on purpose: the
+// world is pure storage, so it has no maths, no RNG, no clock and no I/O. That
+// makes it trivially headless and trivially the future dedicated server.
+//
+// There is no wall-clock read anywhere in this file. `w.tick` is set by the
+// caller (`sim_step`) from the fixed-step counter, never measured.
+//
+// -----------------------------------------------------------------------------
+// WHY SoA, AND WHY GROUPED BY REPLICATION CLASS
+// -----------------------------------------------------------------------------
+// An 8-field object literal costs 260 ns; a flat array write costs 3.5 ns
+// (ARCHITECTURE §2.1). At 256 entities an array-of-objects world costs 66 us
+// per tick just to *exist*, and the 32-tick history ring (history.hml) would be
+// 32 x N heap objects per tick, which makes lag compensation unaffordable
+// before it is written. Measured: SoA 0.150 ms/tick vs AoS 0.265 ms/tick.
+//
+// The grouping is not cosmetic. The five groups below ARE the packet layout
+// (NETWORKING §7.2): transform goes out every snapshot delta-compressed, state
+// goes out on change, owner-only goes to exactly one client, server-only never
+// leaves the process, identity goes out once at spawn. Every field carries a
+// ONE-WORD comment naming its group. If you cannot say which group a new field
+// is in, you do not understand the field yet — do not add it.
+//
+//   identity   written once at spawn, replicated once at spawn
+//   transform  replicated EVERY snapshot (20 Hz), delta-compressed
+//   state      replicated on change
+//   owner      replicated to the controlling client only
+//   server     never replicated, never authoritative anywhere else
+//
+// Client-only cosmetics (particles, decals, shells) are NOT in this struct at
+// all — they live in `src/render/fx.hml` with negative ids. `ID_COSMETIC_BASE`
+// below exists so that a cosmetic that *does* need to be a world entity can
+// never collide with a replicated id, and so a mistake is instantly visible.
+//
+// -----------------------------------------------------------------------------
+// THE THREE THINGS THAT ARE BANNED IN HERE
+// -----------------------------------------------------------------------------
+// 1. No field is an OBJECT. Every array below holds i32 or f64 scalars.
+// 2. No field is an ENTITY REFERENCE. `ai_target_id` and `last_hit_by` hold
+//    i32 *ids*, resolved through `world_slot_of` at the point of use. A direct
+//    reference survives neither a despawn nor a snapshot.
+// 3. No field is a CLOSURE. Closures cannot be snapshotted, serialized,
+//    rewound for lag compensation, or delta-compressed, and one closure
+//    literal de-optimizes the entire enclosing block (CLAUDE.md §1 rule 8).
+//
+// -----------------------------------------------------------------------------
+// PERFORMANCE CONTRACT
+// -----------------------------------------------------------------------------
+//  * `world_new_cap` allocates every array once. Nothing here allocates after
+//    that: spawn hands out a slot, despawn swaps with the last (A8, N6, N7).
+//  * Systems that touch every entity must HOIST the field arrays into locals
+//    before the loop and index them directly:
+//        let px = w.px;  let n: i32 = w.count;
+//        let i: i32 = 0; while (i < n) { px[i] = px[i] + vx[i] * dt; i++; }
+//    Never `w.px[i]` inside a hot loop, and never a per-entity accessor call
+//    (a free function is 9.6 ns, a method 29.2 ns, and Hemlock calls cost
+//    ~10 ns PER ARGUMENT — CLAUDE.md A9b).
+//  * DO NOT ANNOTATE AN OBJECT-FIELD ARRAY HOIST WITH ITS ELEMENT TYPE.
+//        let px: array<f64> = w.px;   // O(length) conversion walk, EVERY call
+//        let px = w.px;               // O(1), and aliases identically
+//    Measured on v2.9.1, `hemlockc -O1`, a 16 384-element field: 7.82 us vs
+//    0.03 us per hoist; element access afterwards is identical either way.
+//    `copy_slot` and `clear_slot` hoist 32 fields each, so at cap 512 the
+//    annotated form cost ~250 us PER DESPAWN. Every hoist in this file is
+//    deliberately unannotated. Reported for docs/HEMLOCK_ISSUES.md.
+//  * No closures, no `defer`, no `try`, no `throw`, no template strings on any
+//    path in this file.
+
+// ---------------------------------------------------------------------------
+// ENTITY KINDS
+// ---------------------------------------------------------------------------
+// Kind is identity: it is fixed for the life of the entity and decides which
+// id range the id came from.
+export let KIND_NONE       = 0;
+export let KIND_PLAYER     = 1;   // ids 1..64,  id == player slot (positional)
+export let KIND_AI         = 2;   // ids 1000..499999
+export let KIND_NPC        = 3;   // ids 1000..499999  (shares the AI range)
+export let KIND_PROJECTILE = 4;   // ids 500000..999999
+export let KIND_PICKUP     = 5;   // ids 1000000..2000000
+export let KIND_PROP       = 6;   // ids 1000000..2000000  (world interactable)
+export let KIND_LANTERN    = 7;   // ids 1000000..2000000  (world interactable)
+export let KIND_COSMETIC   = 8;   // negative ids, NEVER replicated
+export let KIND_COUNT      = 9;
+
+// ---------------------------------------------------------------------------
+// ID RANGES  (NETWORKING §7.1)
+// ---------------------------------------------------------------------------
+// Ids are i32, assigned by the authority ONLY, monotonically increasing inside
+// each range, and never reused within a session. Reserving a range per kind
+// makes classification a compare instead of a lookup and makes a packet dump
+// readable without a symbol table.
+//
+// The one deliberate exception: a PLAYER id is POSITIONAL. Player N always has
+// id N, for the whole session, so "is this entity my local player" is a
+// constant-time compare in the snapshot decoder and survives a respawn. That
+// is prescribed by NETWORKING §7.1 and it is the only id that is ever seen
+// twice; it is a reservation, not a reuse — `world_spawn_player` refuses if the
+// id is already live.
+export let ID_NONE          = 0;
+export let ID_PLAYER_BASE   = 1;
+export let ID_PLAYER_MAX    = 64;
+export let ID_AI_BASE       = 1000;
+export let ID_AI_MAX        = 499999;
+export let ID_PROJ_BASE     = 500000;
+export let ID_PROJ_MAX      = 999999;
+export let ID_PICKUP_BASE   = 1000000;
+export let ID_PICKUP_MAX    = 2000000;
+export let ID_COSMETIC_BASE = -1;         // descends: -1, -2, -3, ...
+export let ID_COSMETIC_MIN  = -2000000;
+
+// Returned by `world_spawn` when there is no slot or no id left, and by
+// `world_slot_of` when the id is not live. Never a null (a null silently
+// truncates the rest of a packet — CLAUDE.md §7).
+export let SLOT_NONE = -1;
+
+// ---------------------------------------------------------------------------
+// STATE FLAG BITS  (the `flags` field — replication group: state)
+// ---------------------------------------------------------------------------
+export let EF_VISIBLE    = 1;
+export let EF_DEAD       = 2;
+export let EF_HIT_FLASH  = 4;
+export let EF_GROUNDED   = 8;
+export let EF_INVULN     = 16;
+export let EF_NO_REPLICATE = 32;   // set on every cosmetic; the packer skips it
+
+// ---------------------------------------------------------------------------
+// CAPACITY
+// ---------------------------------------------------------------------------
+// Mirrors `g_MAX_ENTS` in src/core/config.hml. This module deliberately does
+// NOT import config.hml: the world is a leaf storage module and the future
+// dedicated server should be able to size it from the command line. The game
+// calls `world_new_cap(g_MAX_ENTS)`; `world_new()` is for tools and tests.
+export let WORLD_CAP_DEFAULT = 512;
+
+// ---------------------------------------------------------------------------
+// THE SPARSE SET
+// ---------------------------------------------------------------------------
+// `dense[slot] -> id` is a plain array of `cap`.
+//
+// The id side cannot be `sparse[id] -> slot`: ids run to 2 000 000 and are
+// never reused, so a direct-indexed array would be an 8 MB table that only
+// ever gets sparser. It is an open-addressed hash instead — the "explicit map"
+// NETWORKING §7.1 asks for — held in three parallel `array<i32>`:
+//
+//   sparse_id[h]  the id stored in probe cell h
+//   sparse[h]     the slot that id currently occupies   (the id -> slot value)
+//   sparse_st[h]  0 = empty, 1 = live, 2 = tombstone
+//
+// Linear probing, power-of-two capacity >= 4*cap, so the load factor never
+// exceeds 25 % and the average probe length stays ~1.1. Deletion writes a
+// tombstone; when live+tombstones reach half the table it is rebuilt from
+// `dense`, which is O(hcap) and happens on spawn, never in a hot loop.
+//
+// Everything is integer arithmetic on a fixed table, so the map is
+// bit-reproducible from the spawn/despawn order and adds no non-determinism.
+let HT_EMPTY = 0;
+let HT_LIVE  = 1;
+let HT_TOMB  = 2;
+
+// Round up to a power of two, minimum 64.
+fn ht_size_for(p_cap: i32): i32 {
+    let cap: i32 = p_cap;
+    let n: i32 = 64;
+    while (n < cap * 4) { n = n * 2; }
+    let out: i32 = n;
+    return out;
+}
+
+// Mix an i32 id into a table index. All mixing is done in u64 (CLAUDE.md A13:
+// i32/i64 `*` THROWS on overflow; u64 wraps, which is what a hash needs).
+// The id is reinterpreted as its exact u32 bit pattern first so that the
+// negative cosmetic ids hash as well as the positive replicated ones.
+fn ht_hash(p_id: i32, p_mask: i32): i32 {
+    let k: i32 = p_id;
+    let mask: i32 = p_mask;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    u = u * 11400714819323198485;      // 2^64 / phi, wraps by design
+    u = u ^ (u >> 31);
+    u = u * 14029467366897019727;
+    u = u ^ (u >> 29);
+    let out: i32 = i32(u >> 33) & mask;
+    return out;
+}
+
+// Probe for `p_id`. Returns the cell holding it, or SLOT_NONE.
+fn ht_find(p_w: object, p_id: i32): i32 {
+    let w: object = p_w;
+    let id: i32 = p_id;
+    let mask: i32 = w.hmask;
+    let st = w.sparse_st;
+    let key = w.sparse_id;
+    let h: i32 = ht_hash(id, mask);
+    let steps: i32 = 0;
+    let limit: i32 = mask + 1;
+    while (steps <= limit) {
+        let s: i32 = st[h];
+        if (s == HT_EMPTY) { let miss: i32 = SLOT_NONE; return miss; }
+        if (s == HT_LIVE) {
+            if (key[h] == id) { let hit: i32 = h; return hit; }
+        }
+        h = (h + 1) & mask;
+        steps++;
+    }
+    let out: i32 = SLOT_NONE;
+    return out;
+}
+
+// Rebuild the table from `dense`, dropping every tombstone. O(hcap + count).
+fn ht_rebuild(p_w: object) {
+    let w: object = p_w;
+    let mask: i32 = w.hmask;
+    let st = w.sparse_st;
+    let key = w.sparse_id;
+    let val = w.sparse;
+    let i: i32 = 0;
+    let hcap: i32 = mask + 1;
+    while (i < hcap) { st[i] = HT_EMPTY; key[i] = 0; val[i] = SLOT_NONE; i++; }
+
+    let dense = w.dense;
+    let n: i32 = w.count;
+    let k: i32 = 0;
+    while (k < n) {
+        let id: i32 = dense[k];
+        let h: i32 = ht_hash(id, mask);
+        while (st[h] == HT_LIVE) { h = (h + 1) & mask; }
+        st[h] = HT_LIVE;
+        key[h] = id;
+        val[h] = k;
+        k++;
+    }
+    w.hlive = n;
+    w.htomb = 0;
+}
+
+// Insert id -> slot. The caller guarantees `id` is not already live.
+fn ht_insert(p_w: object, p_id: i32, p_slot: i32) {
+    let w: object = p_w;
+    let id: i32 = p_id;
+    let slot: i32 = p_slot;
+    // Rebuild BEFORE inserting if the table is half consumed by live entries
+    // plus tombstones. hlive <= cap and hcap >= 4*cap, so after a rebuild
+    // there is always room.
+    if ((w.hlive + w.htomb) * 2 >= w.hmask + 1) { ht_rebuild(w); }
+
+    let mask: i32 = w.hmask;
+    let st = w.sparse_st;
+    let key = w.sparse_id;
+    let val = w.sparse;
+    let h: i32 = ht_hash(id, mask);
+    // Walk to the first cell that is not live. Linear probing keeps a chain
+    // continuous through tombstones, and the caller guarantees `id` is not
+    // already present, so landing on a tombstone means we may reclaim it --
+    // which is what stops heavy projectile churn from lengthening every chain
+    // between rebuilds.
+    while (st[h] == HT_LIVE) {
+        h = (h + 1) & mask;
+    }
+    if (st[h] == HT_TOMB) { w.htomb = w.htomb - 1; }
+    st[h] = HT_LIVE;
+    key[h] = id;
+    val[h] = slot;
+    w.hlive = w.hlive + 1;
+}
+
+// Point an already-live id at a different slot (used by the swap-with-last).
+fn ht_move(p_w: object, p_id: i32, p_slot: i32) {
+    let w: object = p_w;
+    let h: i32 = ht_find(w, p_id);
+    if (h >= 0) {
+        let val = w.sparse;
+        val[h] = p_slot;
+    }
+}
+
+// Tombstone `p_id`.
+fn ht_remove(p_w: object, p_id: i32) {
+    let w: object = p_w;
+    let h: i32 = ht_find(w, p_id);
+    if (h >= 0) {
+        let st = w.sparse_st;
+        let val = w.sparse;
+        st[h] = HT_TOMB;
+        val[h] = SLOT_NONE;
+        w.hlive = w.hlive - 1;
+        w.htomb = w.htomb + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CONSTRUCTION
+// ---------------------------------------------------------------------------
+
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// A world sized for the shipping entity cap. Tools and tests use this.
+export fn world_new(): object {
+    let out: object = world_new_cap(WORLD_CAP_DEFAULT);
+    return out;
+}
+
+// A world holding at most `p_cap` live entities.
+//
+// EVERY array is allocated here and never again. Spawn and despawn only move
+// indices around inside them.
+export fn world_new_cap(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let hcap: i32 = ht_size_for(cap);
+
+    let w: object = {
+        // ==== bookkeeping (not an entity field; never replicated) ==========
+        cap: cap,
+        count: 0,
+        tick: 0,              // set by sim_step from the fixed-step counter
+        seed: 0,              // world seed; rng.hml streams derive from it
+        replaying: 0,         // 1 => sim_effects() is skipped (ARCHITECTURE §3)
+        spawns: 0,
+        despawns: 0,
+        spawn_fail: 0,        // out of slots or out of ids; never silent
+
+        // ==== the sparse set ==============================================
+        dense: zeros_i(cap),          // bookkeeping  dense[slot] -> id
+        sparse: zeros_i(hcap),        // bookkeeping  hash cell -> slot
+        sparse_id: zeros_i(hcap),     // bookkeeping  hash cell -> id (probe key)
+        sparse_st: zeros_i(hcap),     // bookkeeping  hash cell -> EMPTY/LIVE/TOMB
+        hmask: hcap - 1,
+        hlive: 0,
+        htomb: 0,
+
+        // ==== id allocators, one per kind-partitioned range ================
+        next_ai: ID_AI_BASE,
+        next_proj: ID_PROJ_BASE,
+        next_pickup: ID_PICKUP_BASE,
+        next_cosmetic: ID_COSMETIC_BASE,
+
+        // ================== identity ======================================
+        // Written once at spawn. Replicated once, at spawn.
+        id: zeros_i(cap),             // identity
+        kind: zeros_i(cap),           // identity
+        owner: zeros_i(cap),          // identity  (player slot; 0 = server)
+        spawn_tick: zeros_i(cap),     // identity
+
+        // ================== transform =====================================
+        // Replicated EVERY snapshot (20 Hz), delta-compressed, and the only
+        // group history.hml captures.
+        px: zeros_f(cap),             // transform
+        py: zeros_f(cap),             // transform
+        pz: zeros_f(cap),             // transform
+        vx: zeros_f(cap),             // transform
+        vy: zeros_f(cap),             // transform
+        vz: zeros_f(cap),             // transform
+        yaw: zeros_f(cap),            // transform
+        pitch: zeros_f(cap),          // transform
+
+        // ================== state =========================================
+        // Replicated on change.
+        hp: zeros_i(cap),             // state
+        hp_max: zeros_i(cap),         // state
+        armor: zeros_i(cap),          // state
+        team: zeros_i(cap),           // state
+        anim: zeros_i(cap),           // state
+        anim_t: zeros_f(cap),         // state
+        flags: zeros_i(cap),          // state
+        model: zeros_i(cap),          // state
+        tint: zeros_i(cap),           // state
+
+        // ================== owner =========================================
+        // Replicated to the controlling client only.
+        weapon: zeros_i(cap),         // owner
+        ammo_mag: zeros_i(cap),       // owner
+        ammo_res: zeros_i(cap),       // owner
+        xp: zeros_i(cap),             // owner
+        level: zeros_i(cap),          // owner
+        wickmarks: zeros_i(cap),      // owner
+
+        // ================== server ========================================
+        // Never replicated. Must never influence a replicated field in a way
+        // a client also computes (NETWORKING §7.2 rule 2).
+        ai_state: zeros_i(cap),       // server
+        ai_target_id: zeros_i(cap),   // server  (an i32 ID, never a reference)
+        ai_timer: zeros_f(cap),       // server
+        loot_seed: zeros_i(cap),      // server
+        last_hit_by: zeros_i(cap)     // server  (an i32 ID, never a reference)
+    };
+
+    let sv = w.sparse;
+    let i: i32 = 0;
+    while (i < hcap) { sv[i] = SLOT_NONE; i++; }
+    let out: object = w;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// ID ALLOCATION
+// ---------------------------------------------------------------------------
+
+// Which id range does this kind draw from? Returns KIND_NONE's range for an
+// unknown kind, which makes the spawn fail loudly rather than mint a colliding
+// id.
+export fn world_kind_range_base(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    let out: i32 = ID_NONE;
+    if (k == KIND_PLAYER)     { out = ID_PLAYER_BASE; }
+    if (k == KIND_AI)         { out = ID_AI_BASE; }
+    if (k == KIND_NPC)        { out = ID_AI_BASE; }
+    if (k == KIND_PROJECTILE) { out = ID_PROJ_BASE; }
+    if (k == KIND_PICKUP)     { out = ID_PICKUP_BASE; }
+    if (k == KIND_PROP)       { out = ID_PICKUP_BASE; }
+    if (k == KIND_LANTERN)    { out = ID_PICKUP_BASE; }
+    if (k == KIND_COSMETIC)   { out = ID_COSMETIC_BASE; }
+    return out;
+}
+
+// Classify an id by range, without touching the world. This is what makes a
+// packet hexdump readable. Returns KIND_NONE for an id in no range.
+export fn world_id_class(p_id: i32): i32 {
+    let id: i32 = p_id;
+    let out: i32 = KIND_NONE;
+    if (id < 0) {
+        if (id >= ID_COSMETIC_MIN) { out = KIND_COSMETIC; }
+        return out;
+    }
+    if (id >= ID_PLAYER_BASE && id <= ID_PLAYER_MAX)   { out = KIND_PLAYER; }
+    if (id >= ID_AI_BASE     && id <= ID_AI_MAX)       { out = KIND_AI; }
+    if (id >= ID_PROJ_BASE   && id <= ID_PROJ_MAX)     { out = KIND_PROJECTILE; }
+    if (id >= ID_PICKUP_BASE && id <= ID_PICKUP_MAX)   { out = KIND_PICKUP; }
+    return out;
+}
+
+// Mint the next id for `p_kind`, or ID_NONE if that range is exhausted.
+// Monotonic inside the range; never reused within a session, including across
+// `world_reset`.
+fn next_id_for(p_w: object, p_kind: i32): i32 {
+    let w: object = p_w;
+    let k: i32 = p_kind;
+    let out: i32 = ID_NONE;
+    if (k == KIND_AI || k == KIND_NPC) {
+        let v: i32 = w.next_ai;
+        if (v <= ID_AI_MAX) { w.next_ai = v + 1; out = v; }
+        return out;
+    }
+    if (k == KIND_PROJECTILE) {
+        let v: i32 = w.next_proj;
+        if (v <= ID_PROJ_MAX) { w.next_proj = v + 1; out = v; }
+        return out;
+    }
+    if (k == KIND_PICKUP || k == KIND_PROP || k == KIND_LANTERN) {
+        let v: i32 = w.next_pickup;
+        if (v <= ID_PICKUP_MAX) { w.next_pickup = v + 1; out = v; }
+        return out;
+    }
+    if (k == KIND_COSMETIC) {
+        let v: i32 = w.next_cosmetic;
+        if (v >= ID_COSMETIC_MIN) { w.next_cosmetic = v - 1; out = v; }
+        return out;
+    }
+    // KIND_PLAYER never comes through here: a player id is positional.
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SPAWN / DESPAWN
+// ---------------------------------------------------------------------------
+
+// Reset one slot to the neutral value of every field. Called on spawn (so a
+// slot never inherits the previous occupant's state) and on the vacated tail
+// slot after a despawn (so a stale transform can never be read back).
+fn clear_slot(p_w: object, p_s: i32) {
+    let w: object = p_w;
+    let s: i32 = p_s;
+    // identity
+    let f_id = w.id;            f_id[s] = ID_NONE;
+    let f_kind = w.kind;        f_kind[s] = KIND_NONE;
+    let f_owner = w.owner;      f_owner[s] = 0;
+    let f_st = w.spawn_tick;    f_st[s] = 0;
+    // transform
+    let f_px = w.px;            f_px[s] = 0.0;
+    let f_py = w.py;            f_py[s] = 0.0;
+    let f_pz = w.pz;            f_pz[s] = 0.0;
+    let f_vx = w.vx;            f_vx[s] = 0.0;
+    let f_vy = w.vy;            f_vy[s] = 0.0;
+    let f_vz = w.vz;            f_vz[s] = 0.0;
+    let f_yaw = w.yaw;          f_yaw[s] = 0.0;
+    let f_pit = w.pitch;        f_pit[s] = 0.0;
+    // state
+    let f_hp = w.hp;            f_hp[s] = 0;
+    let f_hpm = w.hp_max;       f_hpm[s] = 0;
+    let f_arm = w.armor;        f_arm[s] = 0;
+    let f_team = w.team;        f_team[s] = 0;
+    let f_anim = w.anim;        f_anim[s] = 0;
+    let f_at = w.anim_t;        f_at[s] = 0.0;
+    let f_fl = w.flags;         f_fl[s] = 0;
+    let f_mdl = w.model;        f_mdl[s] = 0;
+    let f_tint = w.tint;        f_tint[s] = 0;
+    // owner
+    let f_wp = w.weapon;        f_wp[s] = 0;
+    let f_am = w.ammo_mag;      f_am[s] = 0;
+    let f_ar = w.ammo_res;      f_ar[s] = 0;
+    let f_xp = w.xp;            f_xp[s] = 0;
+    let f_lv = w.level;         f_lv[s] = 0;
+    let f_wm = w.wickmarks;     f_wm[s] = 0;
+    // server
+    let f_ais = w.ai_state;     f_ais[s] = 0;
+    let f_ait = w.ai_target_id; f_ait[s] = ID_NONE;
+    let f_aim = w.ai_timer;     f_aim[s] = 0.0;
+    let f_ls = w.loot_seed;     f_ls[s] = 0;
+    let f_lh = w.last_hit_by;   f_lh[s] = ID_NONE;
+}
+
+// Copy every field of slot `p_from` onto slot `p_to`. This is the entire
+// swap-with-last, and it is the reason no field may be an object: 32 scalar
+// copies, zero allocations, zero aliasing.
+fn copy_slot(p_w: object, p_to: i32, p_from: i32) {
+    let w: object = p_w;
+    let t: i32 = p_to;
+    let f: i32 = p_from;
+    // identity
+    let f_id = w.id;            f_id[t] = f_id[f];
+    let f_kind = w.kind;        f_kind[t] = f_kind[f];
+    let f_owner = w.owner;      f_owner[t] = f_owner[f];
+    let f_st = w.spawn_tick;    f_st[t] = f_st[f];
+    // transform
+    let f_px = w.px;            f_px[t] = f_px[f];
+    let f_py = w.py;            f_py[t] = f_py[f];
+    let f_pz = w.pz;            f_pz[t] = f_pz[f];
+    let f_vx = w.vx;            f_vx[t] = f_vx[f];
+    let f_vy = w.vy;            f_vy[t] = f_vy[f];
+    let f_vz = w.vz;            f_vz[t] = f_vz[f];
+    let f_yaw = w.yaw;          f_yaw[t] = f_yaw[f];
+    let f_pit = w.pitch;        f_pit[t] = f_pit[f];
+    // state
+    let f_hp = w.hp;            f_hp[t] = f_hp[f];
+    let f_hpm = w.hp_max;       f_hpm[t] = f_hpm[f];
+    let f_arm = w.armor;        f_arm[t] = f_arm[f];
+    let f_team = w.team;        f_team[t] = f_team[f];
+    let f_anim = w.anim;        f_anim[t] = f_anim[f];
+    let f_at = w.anim_t;        f_at[t] = f_at[f];
+    let f_fl = w.flags;         f_fl[t] = f_fl[f];
+    let f_mdl = w.model;        f_mdl[t] = f_mdl[f];
+    let f_tint = w.tint;        f_tint[t] = f_tint[f];
+    // owner
+    let f_wp = w.weapon;        f_wp[t] = f_wp[f];
+    let f_am = w.ammo_mag;      f_am[t] = f_am[f];
+    let f_ar = w.ammo_res;      f_ar[t] = f_ar[f];
+    let f_xp = w.xp;            f_xp[t] = f_xp[f];
+    let f_lv = w.level;         f_lv[t] = f_lv[f];
+    let f_wm = w.wickmarks;     f_wm[t] = f_wm[f];
+    // server
+    let f_ais = w.ai_state;     f_ais[t] = f_ais[f];
+    let f_ait = w.ai_target_id; f_ait[t] = f_ait[f];
+    let f_aim = w.ai_timer;     f_aim[t] = f_aim[f];
+    let f_ls = w.loot_seed;     f_ls[t] = f_ls[f];
+    let f_lh = w.last_hit_by;   f_lh[t] = f_lh[f];
+}
+
+// Take the next free slot and bind `p_id` to it. Private: every public spawn
+// path funnels through here so there is exactly one place that can be wrong.
+fn take_slot(p_w: object, p_id: i32, p_kind: i32, p_owner: i32): i32 {
+    let w: object = p_w;
+    let id: i32 = p_id;
+    let n: i32 = w.count;
+    if (n >= w.cap) { w.spawn_fail = w.spawn_fail + 1; let full: i32 = SLOT_NONE; return full; }
+
+    let s: i32 = n;
+    clear_slot(w, s);
+    let f_id = w.id;         f_id[s] = id;
+    let f_kind = w.kind;     f_kind[s] = p_kind;
+    let f_owner = w.owner;   f_owner[s] = p_owner;
+    let f_st = w.spawn_tick; f_st[s] = w.tick;
+    if (p_kind == KIND_COSMETIC) {
+        let f_fl = w.flags;  f_fl[s] = EF_NO_REPLICATE;
+    }
+
+    let dense = w.dense;
+    dense[s] = id;
+    ht_insert(w, id, s);
+    w.count = n + 1;
+    w.spawns = w.spawns + 1;
+    let out: i32 = s;
+    return out;
+}
+
+// Spawn an entity of `p_kind` controlled by player slot `p_owner` (0 = server).
+// Returns the slot, or SLOT_NONE if the world is full or the kind's id range is
+// exhausted. NEVER throws and never returns null.
+//
+// KIND_PLAYER is rejected here — a player id is positional, so use
+// `world_spawn_player`.
+export fn world_spawn(p_w: object, p_kind: i32, p_owner: i32): i32 {
+    let w: object = p_w;
+    let k: i32 = p_kind;
+    if (k == KIND_PLAYER || k <= KIND_NONE || k >= KIND_COUNT) {
+        w.spawn_fail = w.spawn_fail + 1;
+        let bad: i32 = SLOT_NONE;
+        return bad;
+    }
+    let id: i32 = next_id_for(w, k);
+    if (id == ID_NONE) {
+        w.spawn_fail = w.spawn_fail + 1;
+        let dry: i32 = SLOT_NONE;
+        return dry;
+    }
+    let out: i32 = take_slot(w, id, k, p_owner);
+    return out;
+}
+
+// Spawn player `p_pslot` (1..64). The entity's id IS the player slot, for the
+// whole session. Fails if the slot is out of range or already live.
+export fn world_spawn_player(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let ps: i32 = p_pslot;
+    if (ps < ID_PLAYER_BASE || ps > ID_PLAYER_MAX) {
+        w.spawn_fail = w.spawn_fail + 1;
+        let bad: i32 = SLOT_NONE;
+        return bad;
+    }
+    if (ht_find(w, ps) >= 0) {
+        w.spawn_fail = w.spawn_fail + 1;
+        let dup: i32 = SLOT_NONE;
+        return dup;
+    }
+    let out: i32 = take_slot(w, ps, KIND_PLAYER, ps);
+    return out;
+}
+
+// Remove the entity in `p_slot`. Swap-with-last, then fix `sparse`:
+//   * the despawned id is tombstoned,
+//   * the moved id is repointed at its new slot,
+//   * the vacated tail slot is cleared.
+// Returns 1 if something was removed, 0 if the slot was not live.
+export fn world_despawn(p_w: object, p_slot: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    let n: i32 = w.count;
+    if (s < 0 || s >= n) { let miss: i32 = 0; return miss; }
+
+    let dense = w.dense;
+    let gone: i32 = dense[s];
+    ht_remove(w, gone);
+
+    let last: i32 = n - 1;
+    if (s != last) {
+        copy_slot(w, s, last);
+        let moved: i32 = dense[last];
+        dense[s] = moved;
+        ht_move(w, moved, s);
+    }
+    clear_slot(w, last);
+    dense[last] = ID_NONE;
+    w.count = last;
+    w.despawns = w.despawns + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// Despawn by id. Returns 1 if something was removed.
+export fn world_despawn_id(p_w: object, p_id: i32): i32 {
+    let s: i32 = world_slot_of(p_w, p_id);
+    if (s < 0) { let miss: i32 = 0; return miss; }
+    let out: i32 = world_despawn(p_w, s);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// LOOKUP
+// ---------------------------------------------------------------------------
+
+// id -> slot, or SLOT_NONE. This is the ONLY legal way to follow an id.
+// Hot: it runs once per referenced entity per tick. Two arguments, one hash,
+// ~1.1 probes.
+export fn world_slot_of(p_w: object, p_id: i32): i32 {
+    let w: object = p_w;
+    let h: i32 = ht_find(w, p_id);
+    if (h < 0) { let miss: i32 = SLOT_NONE; return miss; }
+    let val = w.sparse;
+    let out: i32 = val[h];
+    return out;
+}
+
+// slot -> id, or ID_NONE.
+export fn world_id_of(p_w: object, p_slot: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    if (s < 0 || s >= w.count) { let miss: i32 = ID_NONE; return miss; }
+    let dense = w.dense;
+    let out: i32 = dense[s];
+    return out;
+}
+
+export fn world_alive(p_w: object, p_id: i32): i32 {
+    let s: i32 = world_slot_of(p_w, p_id);
+    let out: i32 = 0;
+    if (s >= 0) { out = 1; }
+    return out;
+}
+
+export fn world_kind_of(p_w: object, p_slot: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    if (s < 0 || s >= w.count) { let miss: i32 = KIND_NONE; return miss; }
+    let k = w.kind;
+    let out: i32 = k[s];
+    return out;
+}
+
+export fn world_owner_of(p_w: object, p_slot: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    if (s < 0 || s >= w.count) { let miss: i32 = 0; return miss; }
+    let o = w.owner;
+    let out: i32 = o[s];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// BOOKKEEPING ACCESSORS
+// ---------------------------------------------------------------------------
+// These exist for tools, tests and the packer. Per-entity systems must hoist
+// the field arrays instead of calling anything (CLAUDE.md A9b).
+
+export fn world_count(p_w: object): i32 { let w: object = p_w; let out: i32 = w.count; return out; }
+export fn world_cap(p_w: object): i32 { let w: object = p_w; let out: i32 = w.cap; return out; }
+export fn world_tick(p_w: object): i32 { let w: object = p_w; let out: i32 = w.tick; return out; }
+export fn world_set_tick(p_w: object, p_t: i32) { let w: object = p_w; w.tick = p_t; }
+export fn world_seed(p_w: object): i32 { let w: object = p_w; let out: i32 = w.seed; return out; }
+export fn world_set_seed(p_w: object, p_s: i32) { let w: object = p_w; w.seed = p_s; }
+export fn world_replaying(p_w: object): i32 { let w: object = p_w; let out: i32 = w.replaying; return out; }
+export fn world_set_replaying(p_w: object, p_r: i32) { let w: object = p_w; w.replaying = p_r; }
+export fn world_spawn_fail_count(p_w: object): i32 { let w: object = p_w; let out: i32 = w.spawn_fail; return out; }
+export fn world_spawn_count(p_w: object): i32 { let w: object = p_w; let out: i32 = w.spawns; return out; }
+export fn world_despawn_count(p_w: object): i32 { let w: object = p_w; let out: i32 = w.despawns; return out; }
+
+// Peek at the id allocators. Tools and the no-reuse assertion use these; the
+// sim never does.
+export fn world_next_id(p_w: object, p_kind: i32): i32 {
+    let w: object = p_w;
+    let k: i32 = p_kind;
+    let out: i32 = ID_NONE;
+    if (k == KIND_AI || k == KIND_NPC)   { out = w.next_ai; }
+    if (k == KIND_PROJECTILE)            { out = w.next_proj; }
+    if (k == KIND_PICKUP || k == KIND_PROP || k == KIND_LANTERN) { out = w.next_pickup; }
+    if (k == KIND_COSMETIC)              { out = w.next_cosmetic; }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// RESET
+// ---------------------------------------------------------------------------
+// Empties the world WITHOUT rewinding the id allocators. Ids stay unique for
+// the whole process, which is what "never reused within a session" means and
+// what makes a stale id in a late packet detectable instead of dangerous.
+// `world_reset_session` is the hard reset for a brand new session; only the
+// process entry point may call it.
+export fn world_reset(p_w: object) {
+    let w: object = p_w;
+    let n: i32 = w.count;
+    let i: i32 = 0;
+    while (i < n) { clear_slot(w, i); i++; }
+    let dense = w.dense;
+    i = 0;
+    while (i < n) { dense[i] = ID_NONE; i++; }
+    w.count = 0;
+    ht_rebuild(w);
+    w.spawns = 0;
+    w.despawns = 0;
+    w.spawn_fail = 0;
+}
+
+export fn world_reset_session(p_w: object, p_seed: i32) {
+    let w: object = p_w;
+    world_reset(w);
+    w.tick = 0;
+    w.seed = p_seed;
+    w.replaying = 0;
+    w.next_ai = ID_AI_BASE;
+    w.next_proj = ID_PROJ_BASE;
+    w.next_pickup = ID_PICKUP_BASE;
+    w.next_cosmetic = ID_COSMETIC_BASE;
+}
+
+// ---------------------------------------------------------------------------
+// INTEGRITY CHECK  (tests, CI and the `--verify` tools; never per frame)
+// ---------------------------------------------------------------------------
+// Returns 0 if the sparse set is consistent, or a non-zero code naming the
+// first violation found. Cheap enough to run every tick in simtest.
+//
+//   1  count out of range
+//   2  dense[slot] does not resolve back to slot
+//   3  a live hash cell points at a slot outside [0, count)
+//   4  a live hash cell disagrees with dense
+//   5  the live-cell count disagrees with count
+//   6  a tail slot past count was not cleared
+export fn world_check(p_w: object): i32 {
+    let w: object = p_w;
+    let n: i32 = w.count;
+    let cap: i32 = w.cap;
+    if (n < 0 || n > cap) { let e1: i32 = 1; return e1; }
+
+    let dense = w.dense;
+    let ids = w.id;
+    let i: i32 = 0;
+    while (i < n) {
+        let id: i32 = dense[i];
+        if (ids[i] != id) { let e2a: i32 = 2; return e2a; }
+        if (world_slot_of(w, id) != i) { let e2: i32 = 2; return e2; }
+        i++;
+    }
+
+    let st = w.sparse_st;
+    let key = w.sparse_id;
+    let val = w.sparse;
+    let hcap: i32 = w.hmask + 1;
+    let live: i32 = 0;
+    i = 0;
+    while (i < hcap) {
+        if (st[i] == HT_LIVE) {
+            let s: i32 = val[i];
+            if (s < 0 || s >= n) { let e3: i32 = 3; return e3; }
+            if (dense[s] != key[i]) { let e4: i32 = 4; return e4; }
+            live++;
+        }
+        i++;
+    }
+    if (live != n) { let e5: i32 = 5; return e5; }
+
+    i = n;
+    while (i < cap) {
+        if (dense[i] != ID_NONE || ids[i] != ID_NONE) { let e6: i32 = 6; return e6; }
+        i++;
+    }
+
+    let ok: i32 = 0;
+    return ok;
+}

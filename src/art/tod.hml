@@ -1,0 +1,1023 @@
+// tod.hml — the day/night cycle. W2-4.
+//
+// The ART_BIBLE §5.1 keyframe table, remapped onto the 16-minute day of
+// ARCHITECTURE decision D6, linearly interpolated, with the four §5.2 weather
+// variants, the corrupted-zone (NIGHTSHADE BLOOM) override, and the 2-frame
+// lightning sequence. Its one output is a filled engine `RenderEnv`.
+//
+// RULE R1: every colour in this project's atmosphere lives HERE, never in
+// wobbleweed. `shade.hml` owns the *model*; this file owns the *values*.
+//
+// ---------------------------------------------------------------------------
+// D6 — THE REMAP. This is the mapping table D6 says lives in this file.
+// ---------------------------------------------------------------------------
+// GAME_DESIGN owns pacing: the day is 16 real minutes, split
+//     Dawn 2 min | Day 7 min | Dusk 2 min | Night 5 min
+// ART_BIBLE owns the colours: seven keyframes on a 24-hour clock,
+//     DAWN 05:30  MORNING 08:00  NOON 12:00  GOLDEN 18:15
+//     DUSK 19:30  NIGHT 22:00    DEEP 02:00
+//
+// Both survive by placing each keyframe at the day fraction that preserves its
+// ART_BIBLE clock spacing *within* the gamedesign phase it belongs to:
+//
+//   phase   day_t range        keyframes in it     placement
+//   Dawn    0.0000 .. 0.1250   DAWN                phase start
+//   Day     0.1250 .. 0.5625   MORNING NOON GOLDEN MORNING at the start,
+//                                                  GOLDEN at the end, NOON at
+//                                                  (12:00-08:00)/(18:15-08:00)
+//                                                  = 0.3902 of the phase
+//   Dusk    0.5625 .. 0.6875   DUSK                (19:30-18:15)/(22:00-18:15)
+//                                                  = 1/3 of the phase
+//   Night   0.6875 .. 1.0000   NIGHT DEEP          NIGHT at the start, DEEP at
+//                                                  (02:00-22:00)/(05:30-22:00)
+//                                                  = 0.5333 of the phase
+//
+// giving the seven anchors below. GOLDEN sits exactly on the Day/Dusk boundary
+// and NIGHT exactly on the Dusk/Night boundary, so the phase a player is in and
+// the light they are standing in agree at every transition — which is what makes
+// "the dusk horn" (GAME_DESIGN) land on a visible change.
+//
+// 16 min = 960 s = 57 600 ticks at 60 Hz. One tick is 1/57600 of a day, so the
+// largest per-frame change of any channel in the table is ~0.0002 — three
+// orders of magnitude under the 4 %/frame discontinuity budget.
+//
+// ---------------------------------------------------------------------------
+// THE NIGHT KEY LIGHT — why the stored directions are not the ART_BIBLE ones
+// ---------------------------------------------------------------------------
+// ART_BIBLE §5.1 footnote 1: at night `SUN_RGB` is the moon term and the moon
+// uses `-SUN_DIR`. The engine has ONE directional key, so this file stores the
+// already-negated direction for NIGHT and DEEP. Two consequences, both wanted:
+//   * every stored key direction has y >= 0.08, so after interpolation the key
+//     NEVER comes from below the horizon (a light from below reads as a bug),
+//   * the swing from DUSK to NIGHT is a continuous 4800-frame sweep of the key
+//     across the sky (sun sets west, moon rises east) instead of the 180 degree
+//     pop you get from negating a direction the moment its y crosses zero.
+//
+// ---------------------------------------------------------------------------
+// INVARIANTS THIS FILE ENFORCES STRUCTURALLY (probe_tod.hml measures them)
+// ---------------------------------------------------------------------------
+//   1. ambient + sun <= 1 per channel, at every keyframe AND every interpolated
+//      point, in every weather, during lightning. The table is authored to
+//      satisfy it; `tod_eval` then clamps the SUN (never the ambient) so the
+//      guarantee survives float rounding and any future weather value.
+//   2. ambient >= 0.14 in every channel, always (ART_BIBLE §4.2: night is blue
+//      and dark, never black).
+//   3. fog_far <= 72 m, fog_near >= 3 m, fog_far > fog_near, always. Both
+//      bounds are core/config.hml's g_FOG_FAR_CAP / g_FOG_NEAR_MIN.
+//   4. ambient is the complement of the sun: never grey, and never warmer than
+//      the key light.
+//   5. mist density in [0, 0.85].
+//
+// ---------------------------------------------------------------------------
+// COST
+// ---------------------------------------------------------------------------
+// `tod_eval` runs ONCE per frame (frame graph stage 6). It allocates nothing —
+// the sample buffer and the two weather-parameter buffers are retained — and
+// costs a few microseconds. It is a cold function by CLAUDE.md's definition, so
+// it is written for clarity, not for the `p_`/copy-out idiom.
+
+import {
+    env_set_sun, env_set_ambient, env_set_bounce, env_set_rim,
+    env_set_fog, env_set_mist
+} from "../../../wobbleweed/src/shade.hml";
+// CLAUDE.md §8: palette.hml is the only file that names a colour. The seven
+// sky/cloud rows of the ART_BIBLE §5.1 table live there as packed colours; this
+// file owns their PLACEMENT IN TIME, not their values.
+import {
+    pal_r, pal_g, pal_b,
+    g_SKY_ZENITH_DAWN, g_SKY_ZENITH_MORNING, g_SKY_ZENITH_NOON,
+    g_SKY_ZENITH_GOLDEN, g_SKY_ZENITH_DUSK, g_SKY_ZENITH_NIGHT,
+    g_SKY_ZENITH_DEEP,
+    g_SKY_MID_DAWN, g_SKY_MID_MORNING, g_SKY_MID_NOON, g_SKY_MID_GOLDEN,
+    g_SKY_MID_DUSK, g_SKY_MID_NIGHT, g_SKY_MID_DEEP,
+    g_SKY_HORIZON_DAWN, g_SKY_HORIZON_MORNING, g_SKY_HORIZON_NOON,
+    g_SKY_HORIZON_GOLDEN, g_SKY_HORIZON_DUSK, g_SKY_HORIZON_NIGHT,
+    g_SKY_HORIZON_DEEP,
+    g_CLOUD_LIT_DAWN, g_CLOUD_LIT_MORNING, g_CLOUD_LIT_NOON,
+    g_CLOUD_LIT_GOLDEN, g_CLOUD_LIT_DUSK, g_CLOUD_LIT_NIGHT, g_CLOUD_LIT_DEEP,
+    g_CLOUD_SHADOW_DAWN, g_CLOUD_SHADOW_MORNING, g_CLOUD_SHADOW_NOON,
+    g_CLOUD_SHADOW_GOLDEN, g_CLOUD_SHADOW_DUSK, g_CLOUD_SHADOW_NIGHT,
+    g_CLOUD_SHADOW_DEEP
+} from "./palette.hml";
+// Every tunable this file uses is core/config.hml's, never a second copy.
+import {
+    g_FOG_FAR_CAP, g_FOG_NEAR_MIN, g_MIST_HEIGHT,
+    g_DAY_SECONDS, g_DAY_TICKS,
+    g_PHASE_DAWN_END, g_PHASE_DAY_END, g_PHASE_DUSK_END
+} from "../core/config.hml";
+
+// ===========================================================================
+// PUBLIC CONSTANTS
+// ===========================================================================
+
+// Keyframe ids. These index the table; they are NOT the gameplay phases.
+export let TOD_DAWN = 0;
+export let TOD_MORNING = 1;
+export let TOD_NOON = 2;
+export let TOD_GOLDEN = 3;
+export let TOD_DUSK = 4;
+export let TOD_NIGHT = 5;
+export let TOD_DEEP = 6;
+export let TOD_KEY_COUNT = 7;
+
+// The four gamedesign phases of D6.
+export let TOD_PHASE_DAWN = 0;
+export let TOD_PHASE_DAY = 1;
+export let TOD_PHASE_DUSK = 2;
+export let TOD_PHASE_NIGHT = 3;
+export let TOD_PHASE_COUNT = 4;
+
+// Weather. BLOOM is not weather — it is the corrupted-zone override — but it
+// rides the same crossfade machinery, so it lives in the same enum.
+export let WX_CLEAR = 0;
+export let WX_OVERCAST = 1;
+export let WX_RAIN = 2;
+export let WX_STORM = 3;
+export let WX_BLOOM = 4;
+export let WX_COUNT = 5;
+
+// D6: 16 real minutes per day, at the project's fixed 60 Hz tick.
+// Every tunable below is core/config.hml's; this file re-exports them under ToD
+// names so a caller of tod_* needs one import, and so that NOTHING here is a
+// second copy of a config number (CLAUDE.md §5.2).
+export let TOD_DAY_SECONDS: f64 = g_DAY_SECONDS;
+export let TOD_DAY_TICKS: i32 = g_DAY_TICKS;
+
+// Phase boundaries as day fractions (2 / 7 / 2 / 5 minutes of 16).
+export let TOD_PHASE_T_DAWN: f64 = 0.0;
+export let TOD_PHASE_T_DAY: f64 = g_PHASE_DAWN_END;
+export let TOD_PHASE_T_DUSK: f64 = g_PHASE_DAY_END;
+export let TOD_PHASE_T_NIGHT: f64 = g_PHASE_DUSK_END;
+
+// CLAUDE.md §6 / ARCHITECTURE §8: fog distance IS the triangle budget.
+export let TOD_FOG_FAR_CAP: f64 = g_FOG_FAR_CAP;
+// ART_BIBLE §6.6: fog on your own gun barrel looks broken.
+export let TOD_FOG_NEAR_MIN: f64 = g_FOG_NEAR_MIN;
+// ART_BIBLE §4.2: the ambient floor. Below this the image reads as a crash.
+export let TOD_AMBIENT_FLOOR = 0.14;
+// ART_BIBLE §6.4: valleys/swamp cap.
+export let TOD_MIST_MAX = 0.85;
+
+// Crossfade lengths in seconds. §5.2 footnote 3 gives the bloom one.
+export let TOD_FADE_WEATHER = 6.0;
+export let TOD_FADE_BLOOM = 3.0;
+
+// §5.2: the lightning flash is 2 frames, then 1 recovery frame.
+export let TOD_LIGHTNING_FLASH_FRAMES = 2;
+export let TOD_LIGHTNING_TAIL_FRAMES = 1;
+export let TOD_LIGHTNING_QUAD_ALPHA = 0.55;
+
+// ---------------------------------------------------------------------------
+// `tod_sky_keys` output layout. skygen.hml (W2-6) walks this.
+// All colours are 0..1 linear; multiply by 255 for a byte.
+// ---------------------------------------------------------------------------
+export let TODSKY_ZENITH_R = 0;
+export let TODSKY_ZENITH_G = 1;
+export let TODSKY_ZENITH_B = 2;
+export let TODSKY_MID_R = 3;
+export let TODSKY_MID_G = 4;
+export let TODSKY_MID_B = 5;
+export let TODSKY_HORIZON_R = 6;
+export let TODSKY_HORIZON_G = 7;
+export let TODSKY_HORIZON_B = 8;
+export let TODSKY_CLOUD_LIT_R = 9;
+export let TODSKY_CLOUD_LIT_G = 10;
+export let TODSKY_CLOUD_LIT_B = 11;
+export let TODSKY_CLOUD_SHADOW_R = 12;
+export let TODSKY_CLOUD_SHADOW_G = 13;
+export let TODSKY_CLOUD_SHADOW_B = 14;
+export let TODSKY_STAR_ALPHA = 15;
+export let TODSKY_HALO = 16;          // 0 none .. 1 the huge dawn/golden corona
+export let TODSKY_MOON = 17;          // 0 draw the sun disc, 1 the moon, blends
+export let TODSKY_BODY_X = 18;        // unit direction TO the drawn body ...
+export let TODSKY_BODY_Y = 19;        // ... which is also the key light, so the
+export let TODSKY_BODY_Z = 20;        //     disc and the shadows always agree
+export let TODSKY_CLOUD_COVER = 21;   // 0.25 clear .. 1.0 storm
+export let TODSKY_COUNT = 22;
+
+// ===========================================================================
+// THE KEYFRAME TABLE — ART_BIBLE §5.1, one row per keyframe, KF_STRIDE wide.
+// ===========================================================================
+let KF_ANCHOR = 0;        // day fraction (D6 remap)
+let KF_DIR_X = 1;         // key light direction, night rows already negated
+let KF_DIR_Y = 2;
+let KF_DIR_Z = 3;
+let KF_SUN_R = 4;
+let KF_SUN_G = 5;
+let KF_SUN_B = 6;
+let KF_AMB_R = 7;
+let KF_AMB_G = 8;
+let KF_AMB_B = 9;
+let KF_BOUNCE_R = 10;     // over grass; biome.hml (W4) tints it
+let KF_BOUNCE_G = 11;
+let KF_BOUNCE_B = 12;
+let KF_TINT_R = 13;       // FOG_TINT_MUL
+let KF_TINT_G = 14;
+let KF_TINT_B = 15;
+let KF_FOG_NEAR = 16;
+let KF_FOG_FAR = 17;
+let KF_FOG_ALPHA_MAX = 18;
+let KF_ZEN_R = 19;
+let KF_ZEN_G = 20;
+let KF_ZEN_B = 21;
+let KF_MID_R = 22;
+let KF_MID_G = 23;
+let KF_MID_B = 24;
+let KF_HOR_R = 25;
+let KF_HOR_G = 26;
+let KF_HOR_B = 27;
+let KF_CLIT_R = 28;
+let KF_CLIT_G = 29;
+let KF_CLIT_B = 30;
+let KF_CSHD_R = 31;
+let KF_CSHD_G = 32;
+let KF_CSHD_B = 33;
+let KF_STAR = 34;
+let KF_HALO = 35;
+let KF_MOON = 36;
+let KF_MIST = 37;         // §6.4 anchors: 0.0 noon, 0.55 dawn, 0.7 night
+let KF_CLOCK = 38;        // ART_BIBLE clock hour, for the debug overlay
+let KF_STRIDE = 39;
+
+// Sky colours are the ART_BIBLE bytes divided by 255. They are written as
+// fractions rather than hex so that palette.hml stays the only file in
+// nightshade/src that contains a hex colour literal (W2-3's CI grep); the
+// NOON column is byte-identical to palette's SKY_*/CLOUD_* entries, and the
+// other six columns are ToD-only values that D6 places in this file.
+let g_kf: array<f64> = [
+    // ---- DAWN 05:30 --------------------------------------------------------
+    0.0,
+    0.94, 0.10, 0.32,
+    0.80, 0.50, 0.28,
+    0.20, 0.18, 0.28,
+    0.09, 0.08, 0.04,
+    0.86, 0.62, 0.52,
+    8.0, 52.0, 1.0,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.15, 1.00, 0.0, 0.55, 5.5,
+    // ---- MORNING 08:00 -----------------------------------------------------
+    0.125,
+    0.66, 0.60, 0.45,
+    0.72, 0.64, 0.48,
+    0.28, 0.30, 0.38,
+    0.11, 0.13, 0.06,
+    0.82, 0.86, 0.94,
+    14.0, 66.0, 1.0,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.00, 0.35, 0.0, 0.22, 8.0,
+    // ---- NOON 12:00 --------------------------------------------------------
+    0.295731707317073,
+    0.18, 0.96, 0.22,
+    0.58, 0.56, 0.50,
+    0.42, 0.44, 0.50,
+    0.13, 0.16, 0.07,
+    0.76, 0.84, 0.94,
+    20.0, 72.0, 1.0,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.00, 0.25, 0.0, 0.00, 12.0,
+    // ---- GOLDEN 18:15 ------------------------------------------------------
+    0.5625,
+    -0.72, 0.42, -0.55,
+    0.76, 0.54, 0.24,
+    0.24, 0.22, 0.32,
+    0.12, 0.09, 0.04,
+    0.96, 0.72, 0.44,
+    12.0, 64.0, 1.0,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.00, 1.00, 0.0, 0.18, 18.25,
+    // ---- DUSK 19:30 --------------------------------------------------------
+    0.604166666666667,
+    -0.95, 0.08, -0.30,
+    0.44, 0.24, 0.30,
+    0.22, 0.20, 0.34,
+    0.06, 0.05, 0.05,
+    0.52, 0.42, 0.62,
+    6.0, 40.0, 0.90,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.35, 0.60, 0.0, 0.45, 19.5,
+    // ---- NIGHT 22:00 (direction negated: this is the moon) -----------------
+    0.6875,
+    0.30, 0.55, 0.78,
+    0.22, 0.24, 0.34,
+    0.16, 0.18, 0.30,
+    0.03, 0.04, 0.06,
+    0.18, 0.22, 0.36,
+    4.0, 26.0, 0.55,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    1.00, 0.00, 1.0, 0.70, 22.0,
+    // ---- DEEP 02:00 (direction negated: this is the moon) ------------------
+    0.854166666666667,
+    -0.20, 0.90, -0.39,
+    0.14, 0.16, 0.26,
+    0.14, 0.15, 0.26,
+    0.02, 0.03, 0.05,
+    0.13, 0.16, 0.30,
+    3.0, 22.0, 0.45,
+    // the five sky/cloud rows come from palette.hml (tod_bind_palette)
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    1.00, 0.00, 1.0, 0.70, 26.0
+];
+
+// The five sky/cloud rows of each keyframe are palette.hml's colours, unpacked
+// to 0..1 once at module load. Keeping them out of the literal above is what
+// makes palette.hml the single place a Nightshade colour is written down
+// (CLAUDE.md §8) while D6's placement-in-time stays here.
+fn tod_kf_sky(p_key: i32, p_zen: i32, p_mid: i32, p_hor: i32,
+              p_clit: i32, p_cshd: i32) {
+    let b: i32 = p_key * KF_STRIDE;
+    let inv: f64 = 1.0 / 255.0;
+    g_kf[b + KF_ZEN_R] = f64(pal_r(p_zen)) * inv;
+    g_kf[b + KF_ZEN_G] = f64(pal_g(p_zen)) * inv;
+    g_kf[b + KF_ZEN_B] = f64(pal_b(p_zen)) * inv;
+    g_kf[b + KF_MID_R] = f64(pal_r(p_mid)) * inv;
+    g_kf[b + KF_MID_G] = f64(pal_g(p_mid)) * inv;
+    g_kf[b + KF_MID_B] = f64(pal_b(p_mid)) * inv;
+    g_kf[b + KF_HOR_R] = f64(pal_r(p_hor)) * inv;
+    g_kf[b + KF_HOR_G] = f64(pal_g(p_hor)) * inv;
+    g_kf[b + KF_HOR_B] = f64(pal_b(p_hor)) * inv;
+    g_kf[b + KF_CLIT_R] = f64(pal_r(p_clit)) * inv;
+    g_kf[b + KF_CLIT_G] = f64(pal_g(p_clit)) * inv;
+    g_kf[b + KF_CLIT_B] = f64(pal_b(p_clit)) * inv;
+    g_kf[b + KF_CSHD_R] = f64(pal_r(p_cshd)) * inv;
+    g_kf[b + KF_CSHD_G] = f64(pal_g(p_cshd)) * inv;
+    g_kf[b + KF_CSHD_B] = f64(pal_b(p_cshd)) * inv;
+}
+
+fn tod_bind_palette() {
+    tod_kf_sky(TOD_DAWN, g_SKY_ZENITH_DAWN, g_SKY_MID_DAWN, g_SKY_HORIZON_DAWN,
+               g_CLOUD_LIT_DAWN, g_CLOUD_SHADOW_DAWN);
+    tod_kf_sky(TOD_MORNING, g_SKY_ZENITH_MORNING, g_SKY_MID_MORNING,
+               g_SKY_HORIZON_MORNING, g_CLOUD_LIT_MORNING, g_CLOUD_SHADOW_MORNING);
+    tod_kf_sky(TOD_NOON, g_SKY_ZENITH_NOON, g_SKY_MID_NOON, g_SKY_HORIZON_NOON,
+               g_CLOUD_LIT_NOON, g_CLOUD_SHADOW_NOON);
+    tod_kf_sky(TOD_GOLDEN, g_SKY_ZENITH_GOLDEN, g_SKY_MID_GOLDEN,
+               g_SKY_HORIZON_GOLDEN, g_CLOUD_LIT_GOLDEN, g_CLOUD_SHADOW_GOLDEN);
+    tod_kf_sky(TOD_DUSK, g_SKY_ZENITH_DUSK, g_SKY_MID_DUSK, g_SKY_HORIZON_DUSK,
+               g_CLOUD_LIT_DUSK, g_CLOUD_SHADOW_DUSK);
+    tod_kf_sky(TOD_NIGHT, g_SKY_ZENITH_NIGHT, g_SKY_MID_NIGHT,
+               g_SKY_HORIZON_NIGHT, g_CLOUD_LIT_NIGHT, g_CLOUD_SHADOW_NIGHT);
+    tod_kf_sky(TOD_DEEP, g_SKY_ZENITH_DEEP, g_SKY_MID_DEEP, g_SKY_HORIZON_DEEP,
+               g_CLOUD_LIT_DEEP, g_CLOUD_SHADOW_DEEP);
+}
+
+tod_bind_palette();
+
+// ===========================================================================
+// THE WEATHER TABLE — ART_BIBLE §5.2.
+//
+// Each variant is stored as a MULTIPLY-AND-ADD pair per quantity rather than as
+// a "lerp k toward target" pair, because mul/add is what makes a crossfade
+// between two weathers a plain lerp of the parameters. `amb' = amb*mul + add`
+// with (mul, add) = (1-k, k*target) is identical to `lerp(amb, target, k)`, and
+// halfway between CLEAR (1, 0) and OVERCAST (0.35, 0.65*target) it is exactly
+// `lerp(amb, target, 0.325)` — which the naive (k, target) form is NOT.
+// ===========================================================================
+let WP_SUN_SCALE = 0;
+let WP_AMB_MUL = 1;
+let WP_AMB_ADD_R = 2;
+let WP_AMB_ADD_G = 3;
+let WP_AMB_ADD_B = 4;
+let WP_TINT_R = 5;        // multiplies FOG_TINT_MUL
+let WP_TINT_G = 6;
+let WP_TINT_B = 7;
+let WP_NEAR_MUL = 8;
+let WP_NEAR_ADD = 9;
+let WP_FAR_MUL = 10;
+let WP_FAR_ADD = 11;
+let WP_MIST_ADD = 12;
+let WP_CLOUD_COVER = 13;
+let WP_STRIDE = 14;
+
+// MIST_ADD and CLOUD_COVER are not in §5.2; they are this file's reading of
+// "40 rain streak sprites" / "rain + lightning" / "drifting motes" as ground
+// mist and overcast, and of §6.4's density anchors. Everything else is the
+// table, transcribed: OVERCAST lerps ambient 0.65 toward (0.58,0.59,0.62), so
+// AMB_MUL = 0.35 and AMB_ADD = 0.65 * that target, and so on.
+let g_wp: array<f64> = [
+    // CLEAR — identity.
+    1.00, 1.00, 0.000000, 0.000000, 0.000000,
+    1.00, 1.00, 1.00,
+    1.0, 0.0, 1.0, 0.0,
+    0.00, 0.25,
+    // OVERCAST — sun x0.42, ambient lerp 0.65 -> (0.58,0.59,0.62), fog 10/48.
+    0.42, 0.35, 0.377000, 0.383500, 0.403000,
+    0.94, 0.95, 0.97,
+    0.0, 10.0, 0.0, 48.0,
+    0.10, 0.85,
+    // RAIN — sun x0.30, ambient lerp 0.70 -> (0.44,0.46,0.52), fog 6/34.
+    0.30, 0.30, 0.308000, 0.322000, 0.364000,
+    0.80, 0.84, 0.90,
+    0.0, 6.0, 0.0, 34.0,
+    0.25, 0.95,
+    // STORM — sun x0.20, ambient lerp 0.80 -> (0.30,0.31,0.38), fog 3/20.
+    0.20, 0.20, 0.240000, 0.248000, 0.304000,
+    0.60, 0.62, 0.72,
+    0.0, 3.0, 0.0, 20.0,
+    0.35, 1.00,
+    // NIGHTSHADE BLOOM — sun x0.55, ambient lerp 0.60 -> (0.22,0.14,0.32),
+    // violet fog tint, fog 5/30. The corrupted-zone override, §5.2 note 3.
+    0.55, 0.40, 0.132000, 0.084000, 0.192000,
+    0.66, 0.40, 0.92,
+    0.0, 5.0, 0.0, 30.0,
+    0.30, 0.50
+];
+
+// ===========================================================================
+// MUTABLE STATE (CLAUDE.md rule 3: every top-level mutable is g_-prefixed)
+// ===========================================================================
+
+// The interpolated keyframe, then mutated in place by weather and lightning.
+// Retained: tod_eval allocates nothing.
+let g_tod_s: array<f64> = [
+    0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+];
+
+// The blended weather parameters for this frame.
+let g_tod_wp: array<f64> = [
+    1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.25
+];
+
+let g_tod_wx_cur: i32 = 0;      // WX_CLEAR
+let g_tod_wx_prev: i32 = 0;
+let g_tod_wx_mix: f64 = 1.0;    // 0 = fully prev, 1 = fully cur
+let g_tod_wx_fade: f64 = 6.0;   // seconds for the crossfade in flight
+let g_tod_last_t: f64 = -1.0;   // last day_t seen, for the crossfade dt
+let g_tod_lightning: i32 = -1;  // frame index into the flash, -1 = idle
+let g_tod_mist_bottom: f64 = 0.0;
+let g_tod_mist_thickness: f64 = g_MIST_HEIGHT;
+let g_tod_bounce_tint_r: f64 = 1.0;
+let g_tod_bounce_tint_g: f64 = 1.0;
+let g_tod_bounce_tint_b: f64 = 1.0;
+
+// ===========================================================================
+// TIME MAPPING
+// ===========================================================================
+
+// Wrap any day fraction into [0, 1).
+export fn tod_wrap(p_t: f64): f64 {
+    let t: f64 = p_t;
+    if (t >= 0.0 && t < 1.0) { let o: f64 = t; return o; }
+    let w: f64 = t - f64(i32(t));
+    if (w < 0.0) { w = w + 1.0; }
+    if (w >= 1.0) { w = 0.0; }
+    let out: f64 = w;
+    return out;
+}
+
+// Tick index (0 .. 57599, or any multiple thereof) to a day fraction.
+export fn tod_t_from_tick(p_tick: i32): f64 {
+    let n: i32 = p_tick % TOD_DAY_TICKS;
+    if (n < 0) { n = n + TOD_DAY_TICKS; }
+    let out: f64 = f64(n) / f64(TOD_DAY_TICKS);
+    return out;
+}
+
+// Which of the four gamedesign phases day_t is in.
+export fn tod_phase(p_day_t: f64): i32 {
+    let t: f64 = tod_wrap(p_day_t);
+    if (t < TOD_PHASE_T_DAY) { let o: i32 = TOD_PHASE_DAWN; return o; }
+    if (t < TOD_PHASE_T_DUSK) { let o: i32 = TOD_PHASE_DAY; return o; }
+    if (t < TOD_PHASE_T_NIGHT) { let o: i32 = TOD_PHASE_DUSK; return o; }
+    let o: i32 = TOD_PHASE_NIGHT;
+    return o;
+}
+
+// Day fraction at which a phase begins.
+export fn tod_phase_start(p_phase: i32): f64 {
+    let p: i32 = p_phase;
+    if (p == TOD_PHASE_DAWN) { let o: f64 = TOD_PHASE_T_DAWN; return o; }
+    if (p == TOD_PHASE_DAY) { let o: f64 = TOD_PHASE_T_DAY; return o; }
+    if (p == TOD_PHASE_DUSK) { let o: f64 = TOD_PHASE_T_DUSK; return o; }
+    let o: f64 = TOD_PHASE_T_NIGHT;
+    return o;
+}
+
+// 0..1 progress through the current phase. The dusk horn fires at 1.0 of Dusk.
+export fn tod_phase_t(p_day_t: f64): f64 {
+    let t: f64 = tod_wrap(p_day_t);
+    let p: i32 = tod_phase(t);
+    let a: f64 = tod_phase_start(p);
+    let b: f64 = 1.0;
+    if (p < TOD_PHASE_NIGHT) { b = tod_phase_start(p + 1); }
+    let span: f64 = b - a;
+    let u: f64 = 0.0;
+    if (span > 0.0) { u = (t - a) / span; }
+    let out: f64 = u;
+    return out;
+}
+
+// The day fraction a keyframe is anchored at.
+export fn tod_key_anchor(p_key: i32): f64 {
+    let k: i32 = p_key;
+    if (k < 0) { k = 0; }
+    if (k >= TOD_KEY_COUNT) { k = TOD_KEY_COUNT - 1; }
+    let out: f64 = g_kf[k * KF_STRIDE + KF_ANCHOR];
+    return out;
+}
+
+// Raw table read, for tools and probes. `p_field` is a KF_* index; the public
+// ones are documented by tod_sky_keys' TODSKY_* layout, this is the internal
+// row. Returns 0 for an out-of-range request rather than throwing.
+export fn tod_key_field(p_key: i32, p_field: i32): f64 {
+    let k: i32 = p_key;
+    let f: i32 = p_field;
+    if (k < 0 || k >= TOD_KEY_COUNT || f < 0 || f >= KF_STRIDE) {
+        let z: f64 = 0.0;
+        return z;
+    }
+    let out: f64 = g_kf[k * KF_STRIDE + f];
+    return out;
+}
+
+// The ART_BIBLE wall-clock hour for a day fraction, 0..24, for the debug
+// overlay. Interpolates the keyframe clock times, so it runs fast through the
+// compressed phases and slow through the long ones — which is the whole point
+// of D6 and is exactly what the player experiences.
+// Deliberately does NOT go through tod_sample: sampling mutates the retained
+// state buffer, and a debug overlay must never be able to change what the frame
+// renders.
+export fn tod_clock_hours(p_day_t: f64): f64 {
+    let t: f64 = tod_wrap(p_day_t);
+    let i: i32 = tod_seg(t);
+    let t0: f64 = g_kf[i * KF_STRIDE + KF_ANCHOR];
+    let c0: f64 = g_kf[i * KF_STRIDE + KF_CLOCK];
+    let span: f64 = 0.0;
+    let c1: f64 = 0.0;
+    if (i == TOD_KEY_COUNT - 1) {
+        span = 1.0 - t0;
+        c1 = g_kf[KF_CLOCK] + 24.0;
+    } else {
+        span = g_kf[(i + 1) * KF_STRIDE + KF_ANCHOR] - t0;
+        c1 = g_kf[(i + 1) * KF_STRIDE + KF_CLOCK];
+    }
+    let u: f64 = 0.0;
+    if (span > 0.0) { u = (t - t0) / span; }
+    let h: f64 = c0 + (c1 - c0) * u;
+    if (h >= 24.0) { h = h - 24.0; }
+    let out: f64 = h;
+    return out;
+}
+
+// ===========================================================================
+// SAMPLING — linear interpolation between the two bracketing keyframes.
+// ===========================================================================
+
+// Index of the keyframe at or before t. TOD_DEEP means the wrap segment
+// DEEP -> DAWN, which spans the end of the day and the start of the next.
+fn tod_seg(p_t: f64): i32 {
+    let t: f64 = p_t;
+    let i: i32 = TOD_KEY_COUNT - 1;
+    while (i > 0) {
+        if (t >= g_kf[i * KF_STRIDE + KF_ANCHOR]) { let o: i32 = i; return o; }
+        i = i - 1;
+    }
+    let o: i32 = 0;
+    return o;
+}
+
+// Fill g_tod_s with the pure ToD state at day fraction t. No weather, no
+// lightning, no clamping — those are tod_eval's job.
+fn tod_sample(p_t: f64) {
+    let t: f64 = p_t;
+    let i: i32 = tod_seg(t);
+    let a: i32 = i * KF_STRIDE;
+    let t0: f64 = g_kf[a + KF_ANCHOR];
+    let j: i32 = i + 1;
+    let span: f64 = 0.0;
+    if (i == TOD_KEY_COUNT - 1) {
+        j = 0;
+        span = 1.0 - t0;
+    } else {
+        span = g_kf[j * KF_STRIDE + KF_ANCHOR] - t0;
+    }
+    let b: i32 = j * KF_STRIDE;
+    let u: f64 = 0.0;
+    if (span > 0.0) { u = (t - t0) / span; }
+    if (u < 0.0) { u = 0.0; }
+    if (u > 1.0) { u = 1.0; }
+
+    let s: array<f64> = g_tod_s;
+    let f: i32 = 1;
+    while (f < KF_STRIDE) {
+        let av: f64 = g_kf[a + f];
+        let bv: f64 = g_kf[b + f];
+        s[f] = av + (bv - av) * u;
+        f = f + 1;
+    }
+    s[KF_ANCHOR] = t;
+
+    // The clock wraps past midnight on the DEEP -> DAWN segment: DEEP is stored
+    // as 26.0 (02:00 of the next day) and DAWN as 5.5, so the target is 29.5.
+    if (j == 0) {
+        let c0: f64 = g_kf[a + KF_CLOCK];
+        let c1: f64 = g_kf[KF_CLOCK] + 24.0;
+        s[KF_CLOCK] = c0 + (c1 - c0) * u;
+    }
+
+    // A componentwise lerp of two unit vectors is not unit.
+    let dx: f64 = s[KF_DIR_X];
+    let dy: f64 = s[KF_DIR_Y];
+    let dz: f64 = s[KF_DIR_Z];
+    let l0: f64 = __sqrt(dx * dx + dy * dy + dz * dz);
+    let l: f64 = l0;
+    if (l > 0.0) {
+        let inv: f64 = 1.0 / l;
+        s[KF_DIR_X] = dx * inv;
+        s[KF_DIR_Y] = dy * inv;
+        s[KF_DIR_Z] = dz * inv;
+    } else {
+        s[KF_DIR_X] = 0.0;
+        s[KF_DIR_Y] = 1.0;
+        s[KF_DIR_Z] = 0.0;
+    }
+}
+
+// ===========================================================================
+// WEATHER
+// ===========================================================================
+
+// Set the weather with NO crossfade. Tools, probes, level load, and anything
+// that teleports the player use this; normal play just passes the new id to
+// tod_eval and gets the fade for free.
+export fn tod_set_weather(p_wx: i32) {
+    let w: i32 = p_wx;
+    if (w < 0 || w >= WX_COUNT) { w = WX_CLEAR; }
+    g_tod_wx_cur = w;
+    g_tod_wx_prev = w;
+    g_tod_wx_mix = 1.0;
+}
+
+export fn tod_weather(): i32 {
+    let out: i32 = g_tod_wx_cur;
+    return out;
+}
+
+// 0 while a crossfade is in flight, 1 when it has landed.
+export fn tod_weather_mix(): f64 {
+    let out: f64 = g_tod_wx_mix;
+    return out;
+}
+
+// Begin a crossfade to a new weather (or to/from the corrupted zone, which
+// fades over 3 s per §5.2 note 3 instead of the 6 s a weather front takes).
+fn tod_begin_weather(p_wx: i32) {
+    let w: i32 = p_wx;
+    if (w == g_tod_wx_cur) { return; }
+    // Snap the in-flight fade so a fade never starts from a third state.
+    if (g_tod_wx_mix >= 0.5) { g_tod_wx_prev = g_tod_wx_cur; }
+    g_tod_wx_cur = w;
+    g_tod_wx_mix = 0.0;
+    g_tod_wx_fade = TOD_FADE_WEATHER;
+    if (w == WX_BLOOM || g_tod_wx_prev == WX_BLOOM) {
+        g_tod_wx_fade = TOD_FADE_BLOOM;
+    }
+}
+
+// Blend the two weather parameter rows into g_tod_wp.
+fn tod_blend_weather() {
+    let pa: i32 = g_tod_wx_prev * WP_STRIDE;
+    let pb: i32 = g_tod_wx_cur * WP_STRIDE;
+    let m: f64 = g_tod_wx_mix;
+    let w: array<f64> = g_tod_wp;
+    let f: i32 = 0;
+    while (f < WP_STRIDE) {
+        let av: f64 = g_wp[pa + f];
+        let bv: f64 = g_wp[pb + f];
+        w[f] = av + (bv - av) * m;
+        f = f + 1;
+    }
+}
+
+// ===========================================================================
+// LIGHTNING — §5.2. Two frames of flash, one recovery frame, then nothing.
+// The 4-11 s interval is the weather system's business (W4); this is only the
+// sequence and it advances one frame per tod_eval call.
+// ===========================================================================
+export fn tod_lightning_fire() {
+    g_tod_lightning = 0;
+}
+
+// 1 while any frame of the sequence is showing.
+export fn tod_lightning_active(): i32 {
+    let o: i32 = 0;
+    if (g_tod_lightning >= 0) { o = 1; }
+    return o;
+}
+
+// Frame index into the sequence, -1 when idle. 0 and 1 are the flash, 2 is the
+// recovery frame.
+export fn tod_lightning_frame(): i32 {
+    let out: i32 = g_tod_lightning;
+    return out;
+}
+
+// Alpha for the full-screen additive LIGHTNING quad fx_emit draws, 0 when there
+// is nothing to draw.
+export fn tod_lightning_alpha(): f64 {
+    let o: f64 = 0.0;
+    if (g_tod_lightning >= 0 && g_tod_lightning < TOD_LIGHTNING_FLASH_FRAMES) {
+        o = TOD_LIGHTNING_QUAD_ALPHA;
+    }
+    let out: f64 = o;
+    return out;
+}
+
+// ===========================================================================
+// AUTHORING KNOBS the rest of the game owns
+// ===========================================================================
+
+// The ground-mist band, in world units. §6.4: bottom is the terrain height near
+// the camera, top is bottom + 1.6 m. The view code updates it each frame; until
+// it does, the band sits on y = 0.
+export fn tod_set_mist_band(p_bottom: f64, p_thickness: f64) {
+    g_tod_mist_bottom = p_bottom;
+    let th: f64 = p_thickness;
+    if (th < 0.01) { th = 0.01; }
+    g_tod_mist_thickness = th;
+}
+
+// §4.2: BOUNCE is the ground albedo x 0.10-0.16, so it changes with the biome.
+// The table holds the grass value; this tints it. biome.hml (W4) drives it.
+export fn tod_set_bounce_tint(p_r: f64, p_g: f64, p_b: f64) {
+    g_tod_bounce_tint_r = p_r;
+    g_tod_bounce_tint_g = p_g;
+    g_tod_bounce_tint_b = p_b;
+}
+
+// ===========================================================================
+// THE EVALUATOR — frame graph stage 6.
+// ===========================================================================
+
+// Fill `p_env` for day fraction `p_day_t` under weather `p_wx`. Advances the
+// weather crossfade and the lightning sequence by one frame.
+//
+// dt for the crossfade comes from the change in day_t (the day is
+// TOD_DAY_SECONDS long), never from a wall clock: the same tick sequence always
+// produces the same env, which is what lets a replay reproduce a screenshot. A
+// backwards or > half-day jump is a seek, and snaps the fade instead of fading.
+export fn tod_eval(p_env: array<f64>, p_day_t: f64, p_wx: i32) {
+    let env: array<f64> = p_env;
+    let t: f64 = tod_wrap(p_day_t);
+
+    let wx: i32 = p_wx;
+    if (wx < 0 || wx >= WX_COUNT) { wx = WX_CLEAR; }
+    tod_begin_weather(wx);
+
+    // Advance the crossfade.
+    if (g_tod_last_t < 0.0) {
+        g_tod_wx_mix = 1.0;
+    } else {
+        let dd: f64 = t - g_tod_last_t;
+        if (dd < 0.0) { dd = dd + 1.0; }
+        if (dd > 0.5) {
+            g_tod_wx_mix = 1.0;
+        } else if (g_tod_wx_mix < 1.0) {
+            let dsec: f64 = dd * TOD_DAY_SECONDS;
+            g_tod_wx_mix = g_tod_wx_mix + dsec / g_tod_wx_fade;
+            if (g_tod_wx_mix > 1.0) { g_tod_wx_mix = 1.0; }
+        }
+    }
+    g_tod_last_t = t;
+    if (g_tod_wx_mix >= 1.0) { g_tod_wx_prev = g_tod_wx_cur; }
+
+    tod_sample(t);
+    tod_blend_weather();
+
+    let s: array<f64> = g_tod_s;
+    let w: array<f64> = g_tod_wp;
+
+    // ---- weather over the keyframe ----------------------------------------
+    let ss: f64 = w[WP_SUN_SCALE];
+    let sr: f64 = s[KF_SUN_R] * ss;
+    let sg: f64 = s[KF_SUN_G] * ss;
+    let sb: f64 = s[KF_SUN_B] * ss;
+
+    let am: f64 = w[WP_AMB_MUL];
+    let ar: f64 = s[KF_AMB_R] * am + w[WP_AMB_ADD_R];
+    let ag: f64 = s[KF_AMB_G] * am + w[WP_AMB_ADD_G];
+    let ab: f64 = s[KF_AMB_B] * am + w[WP_AMB_ADD_B];
+
+    let tr: f64 = s[KF_TINT_R] * w[WP_TINT_R];
+    let tg: f64 = s[KF_TINT_G] * w[WP_TINT_G];
+    let tb: f64 = s[KF_TINT_B] * w[WP_TINT_B];
+
+    let fnear: f64 = s[KF_FOG_NEAR] * w[WP_NEAR_MUL] + w[WP_NEAR_ADD];
+    let ffar: f64 = s[KF_FOG_FAR] * w[WP_FAR_MUL] + w[WP_FAR_ADD];
+    let mist: f64 = s[KF_MIST] + w[WP_MIST_ADD];
+
+    // ---- the lightning override, §5.2 -------------------------------------
+    // Frames 0 and 1 blow the ambient out to a blue-white and kill the key;
+    // frame 2 is the recovery step that stops the return from being a cut.
+    let lf: i32 = g_tod_lightning;
+    if (lf >= 0) {
+        if (lf < TOD_LIGHTNING_FLASH_FRAMES) {
+            ar = 0.90; ag = 0.92; ab = 1.00;
+            sr = 0.10; sg = 0.08; sb = 0.00;
+        } else if (lf < TOD_LIGHTNING_FLASH_FRAMES + TOD_LIGHTNING_TAIL_FRAMES) {
+            ar = 0.55; ag = 0.57; ab = 0.66;
+        }
+        g_tod_lightning = lf + 1;
+        if (g_tod_lightning >= TOD_LIGHTNING_FLASH_FRAMES + TOD_LIGHTNING_TAIL_FRAMES) {
+            g_tod_lightning = -1;
+        }
+    }
+
+    // ---- the invariants, enforced, not hoped for --------------------------
+    // Ambient floor first (it is inviolable), then the sum: the SUN gives way,
+    // never the ambient, because a dark image is a bug and a slightly dimmer
+    // key is not.
+    if (ar < TOD_AMBIENT_FLOOR) { ar = TOD_AMBIENT_FLOOR; }
+    if (ag < TOD_AMBIENT_FLOOR) { ag = TOD_AMBIENT_FLOOR; }
+    if (ab < TOD_AMBIENT_FLOOR) { ab = TOD_AMBIENT_FLOOR; }
+    if (ar > 1.0) { ar = 1.0; }
+    if (ag > 1.0) { ag = 1.0; }
+    if (ab > 1.0) { ab = 1.0; }
+    if (sr < 0.0) { sr = 0.0; }
+    if (sg < 0.0) { sg = 0.0; }
+    if (sb < 0.0) { sb = 0.0; }
+    if (ar + sr > 1.0) { sr = 1.0 - ar; }
+    if (ag + sg > 1.0) { sg = 1.0 - ag; }
+    if (ab + sb > 1.0) { sb = 1.0 - ab; }
+
+    if (tr < 0.0) { tr = 0.0; }
+    if (tg < 0.0) { tg = 0.0; }
+    if (tb < 0.0) { tb = 0.0; }
+    if (tr > 1.0) { tr = 1.0; }
+    if (tg > 1.0) { tg = 1.0; }
+    if (tb > 1.0) { tb = 1.0; }
+
+    if (ffar > TOD_FOG_FAR_CAP) { ffar = TOD_FOG_FAR_CAP; }
+    if (fnear < TOD_FOG_NEAR_MIN) { fnear = TOD_FOG_NEAR_MIN; }
+    if (fnear > ffar - 1.0) { fnear = ffar - 1.0; }
+
+    if (mist < 0.0) { mist = 0.0; }
+    if (mist > TOD_MIST_MAX) { mist = TOD_MIST_MAX; }
+
+    // Write back so tod_sky_keys and the getters report what was actually used.
+    s[KF_SUN_R] = sr; s[KF_SUN_G] = sg; s[KF_SUN_B] = sb;
+    s[KF_AMB_R] = ar; s[KF_AMB_G] = ag; s[KF_AMB_B] = ab;
+    s[KF_TINT_R] = tr; s[KF_TINT_G] = tg; s[KF_TINT_B] = tb;
+    s[KF_FOG_NEAR] = fnear;
+    s[KF_FOG_FAR] = ffar;
+    s[KF_MIST] = mist;
+
+    // ---- fill the RenderEnv ------------------------------------------------
+    env_set_sun(env, s[KF_DIR_X], s[KF_DIR_Y], s[KF_DIR_Z], sr, sg, sb);
+    env_set_ambient(env, ar, ag, ab);
+    env_set_bounce(env,
+                   s[KF_BOUNCE_R] * g_tod_bounce_tint_r,
+                   s[KF_BOUNCE_G] * g_tod_bounce_tint_g,
+                   s[KF_BOUNCE_B] * g_tod_bounce_tint_b);
+    // §4.2: RIM is zero for terrain and architecture. Entity emit sets its own
+    // rim per class from tod_sky_keys' horizon band; the environment's default
+    // is none, or the world would look like it had a bug.
+    env_set_rim(env, 0.0, 0.0, 0.0);
+    env_set_fog(env, fnear, ffar, tr, tg, tb, s[KF_FOG_ALPHA_MAX]);
+    env_set_mist(env, g_tod_mist_bottom + g_tod_mist_thickness,
+                 g_tod_mist_bottom, mist);
+}
+
+// ===========================================================================
+// OUTPUTS FOR THE REST OF THE ART PIPELINE
+// ===========================================================================
+
+// Fill `p_out` (length >= TODSKY_COUNT) with the sky panorama parameters for
+// the state of the last tod_eval. skygen.hml bakes from these.
+export fn tod_sky_keys(p_out: array<f64>) {
+    let o: array<f64> = p_out;
+    let s: array<f64> = g_tod_s;
+
+    // Cloud cover closes the sky, hides the stars and kills the corona. CLEAR's
+    // 0.25 cover is the baseline scattering the sky always has, so it must NOT
+    // dim anything — only cover ABOVE that baseline does, and a storm hides it
+    // all. That keeps the ART_BIBLE §5.1 STAR_ALPHA column reachable on a clear
+    // night, which is the difference between a starfield and a smudge.
+    let cover: f64 = g_tod_wp[WP_CLOUD_COVER];
+    let occ: f64 = (cover - 0.25) / 0.75;
+    if (occ < 0.0) { occ = 0.0; }
+    if (occ > 1.0) { occ = 1.0; }
+    let clear_frac: f64 = 1.0 - occ;
+
+    let clr: f64 = s[KF_CLIT_R];
+    let clg: f64 = s[KF_CLIT_G];
+    let clb: f64 = s[KF_CLIT_B];
+    let csr: f64 = s[KF_CSHD_R];
+    let csg: f64 = s[KF_CSHD_G];
+    let csb: f64 = s[KF_CSHD_B];
+
+    // An overcast sky IS the cloud deck: dark undersides overhead, brightening
+    // toward the horizon. Blending the three ART_BIBLE bands toward the cloud
+    // colours by `occ` is what keeps the FOG (which is the ToD tint times the
+    // weather tint) matching the sky under weather — ART_BIBLE §6.6's anti-rule,
+    // and the reason a storm does not put a blue band above a black horizon.
+    let mr: f64 = 1.0 + (g_tod_wp[WP_TINT_R] - 1.0) * occ;
+    let mg: f64 = 1.0 + (g_tod_wp[WP_TINT_G] - 1.0) * occ;
+    let mb: f64 = 1.0 + (g_tod_wp[WP_TINT_B] - 1.0) * occ;
+
+    o[TODSKY_ZENITH_R] = (s[KF_ZEN_R] + (csr - s[KF_ZEN_R]) * occ) * mr;
+    o[TODSKY_ZENITH_G] = (s[KF_ZEN_G] + (csg - s[KF_ZEN_G]) * occ) * mg;
+    o[TODSKY_ZENITH_B] = (s[KF_ZEN_B] + (csb - s[KF_ZEN_B]) * occ) * mb;
+    let bandr: f64 = (csr + clr) * 0.5;
+    let bandg: f64 = (csg + clg) * 0.5;
+    let bandb: f64 = (csb + clb) * 0.5;
+    o[TODSKY_MID_R] = (s[KF_MID_R] + (bandr - s[KF_MID_R]) * occ) * mr;
+    o[TODSKY_MID_G] = (s[KF_MID_G] + (bandg - s[KF_MID_G]) * occ) * mg;
+    o[TODSKY_MID_B] = (s[KF_MID_B] + (bandb - s[KF_MID_B]) * occ) * mb;
+    o[TODSKY_HORIZON_R] = (s[KF_HOR_R] + (clr - s[KF_HOR_R]) * occ) * mr;
+    o[TODSKY_HORIZON_G] = (s[KF_HOR_G] + (clg - s[KF_HOR_G]) * occ) * mg;
+    o[TODSKY_HORIZON_B] = (s[KF_HOR_B] + (clb - s[KF_HOR_B]) * occ) * mb;
+    o[TODSKY_CLOUD_LIT_R] = clr * mr;
+    o[TODSKY_CLOUD_LIT_G] = clg * mg;
+    o[TODSKY_CLOUD_LIT_B] = clb * mb;
+    o[TODSKY_CLOUD_SHADOW_R] = csr * mr;
+    o[TODSKY_CLOUD_SHADOW_G] = csg * mg;
+    o[TODSKY_CLOUD_SHADOW_B] = csb * mb;
+
+    let star: f64 = s[KF_STAR] * clear_frac;
+    if (star < 0.0) { star = 0.0; }
+    o[TODSKY_STAR_ALPHA] = star;
+    o[TODSKY_HALO] = s[KF_HALO] * clear_frac;
+    o[TODSKY_MOON] = s[KF_MOON];
+    o[TODSKY_BODY_X] = s[KF_DIR_X];
+    o[TODSKY_BODY_Y] = s[KF_DIR_Y];
+    o[TODSKY_BODY_Z] = s[KF_DIR_Z];
+    o[TODSKY_CLOUD_COVER] = cover;
+}
+
+// The state of the last tod_eval, by KF_* index. Probes and the debug overlay
+// use it; nothing on the frame path needs it (read the env instead).
+export fn tod_state(p_field: i32): f64 {
+    let f: i32 = p_field;
+    if (f < 0 || f >= KF_STRIDE) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_tod_s[f];
+    return out;
+}
+
+// Ground-mist density in force after the last tod_eval, 0..TOD_MIST_MAX.
+export fn tod_mist_density(): f64 {
+    let out: f64 = g_tod_s[KF_MIST];
+    return out;
+}
+
+// 1 when the world is in a night phase — the pacing switch of §5.3 (short fog,
+// muzzle flashes as the primary light). Reads the phase, not the light, so the
+// sim and the renderer agree.
+export fn tod_is_night(p_day_t: f64): i32 {
+    let p: i32 = tod_phase(p_day_t);
+    let o: i32 = 0;
+    if (p == TOD_PHASE_NIGHT) { o = 1; }
+    return o;
+}
+
+// Reset the crossfade/lightning state. Tools and probes call it between sweeps
+// so one sweep cannot leak a half-finished fade into the next.
+export fn tod_reset() {
+    g_tod_wx_cur = WX_CLEAR;
+    g_tod_wx_prev = WX_CLEAR;
+    g_tod_wx_mix = 1.0;
+    g_tod_wx_fade = TOD_FADE_WEATHER;
+    g_tod_last_t = -1.0;
+    g_tod_lightning = -1;
+    g_tod_mist_bottom = 0.0;
+    g_tod_mist_thickness = g_MIST_HEIGHT;
+    g_tod_bounce_tint_r = 1.0;
+    g_tod_bounce_tint_g = 1.0;
+    g_tod_bounce_tint_b = 1.0;
+}

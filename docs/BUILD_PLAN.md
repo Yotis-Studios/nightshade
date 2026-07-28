@@ -31,6 +31,45 @@ earlier wave created.
 
 ---
 
+## ⛔ WAVE-CONSTRUCTION RULE — learned the hard way in Wave 2. Read before scheduling any wave.
+
+**A consumer and its producers must never be in the same parallel wave.**
+
+Wave 2 put `W2-11 shot.hml` — the visual verification harness — in the *same* parallel wave as
+`W2-3` palette, `W2-4` tod, `W2-5` texgen, `W2-6` skygen, `W2-7` fx/hud and `W2-8` meshgen, which
+are exactly the seven modules it must render. When the harness agent started, none of them existed.
+It did the only thing it could: wrote ~650 lines of **stand-in art** and rendered that instead.
+
+The result was worse than a build failure, because everything looked fine:
+
+- every committed screenshot depicted throwaway art, not the game
+- `docs/shots/tex_world.png` was labelled "ATLAS_WORLD" and showed soft cloudy mush, while the real
+  `texgen.hml` was producing 41 excellent tiles — so the evidence on disk **libelled a module that
+  had actually succeeded**
+- a real "weather bands are identical" bug was filed against `tod.hml` that was purely a property of
+  the stand-in
+- the failure was invisible to the probes: every probe passed, because each tested its own module
+
+**The tell:** an agent reporting that a dependency "did not exist at any point while I was building".
+That sentence is a scheduling defect, not an agent defect. The author disclosed it honestly and the
+gate caught it — but only because the gate was told to *look at the images* rather than check that
+files existed.
+
+### Rules that follow
+
+1. **A task that renders, integrates, or verifies another task's output belongs in the NEXT wave.**
+   Harnesses, contact sheets, integration smoke tests, golden-image tests: all downstream.
+2. **A "signatures only" dependency is legitimate; a "content" dependency is not.** Coding against a
+   signature from `ARCHITECTURE.md` §5 works because the signature is written down in advance.
+   Coding against *pixels that do not exist yet* cannot work — there is nothing to stand in for but
+   invention.
+3. **Never let an agent stub a dependency that is scheduled in its own wave.** If it must stub to
+   proceed, the wave is mis-scheduled. Stop and re-schedule rather than accept the stub.
+4. **Gates must inspect artefacts, not filenames.** "The PNG exists and the probe passed" would have
+   green-lit this. "Read the PNG and say whether it is the real art" caught it.
+
+---
+
 ## Wave 0 — Engine foundation (3 tasks)
 
 Everything in every later wave imports at least one of these three. They are mutually independent.
@@ -276,6 +315,33 @@ All eleven code against `ARCHITECTURE.md` §2.3 (the vertex buffer contract) and
 > both CI scripts pass and fail correctly.
 
 ---
+
+## ⚠ WAVE 3 IS RESEQUENCED — run it as three sub-waves, not one
+
+Applying the wave-construction rule above. As originally written, Wave 3 contains a **five-deep
+dependency chain inside a single "parallel" wave**:
+
+    W3-1 worldgen -> W3-2 chunk storage -> W3-3 meshing -> W3-4 terrain render -> W3-7 frame graph
+
+and `W3-7` is an *integrator* that composes five renderers (`W3-4`, `W3-8`, `W3-9`, `W3-10`,
+`W3-11`) built at the same moment. That is exactly the shape that produced the stand-in harness in
+Wave 2. Signature-level dependencies are fine; **integration and content dependencies are not.**
+
+Run instead as:
+
+| Sub-wave | Tasks | Why it can be parallel |
+|---|---|---|
+| **3a** | W3-1 worldgen, W3-2 chunk storage, W3-5 camera, W3-6 snapshot, W3-12 day cycle, W3-13 asset boot, W3-14 audio bank | all pure producers; depend only on Wave 2, which is complete |
+| **3b** | W3-3 meshing, W3-8 HUD, W3-9 post-FX, W3-10 client FX, W3-11 entity rendering | consume 3a's real output; disjoint from each other |
+| **3c** | W3-4 terrain rendering, W3-7 frame graph | the integrators — they need 3b's real output, not a promise of it |
+
+`GATE 3` (the art-direction milestone) runs after **3c**, because it judges a composed frame.
+
+**Same check applies to later waves before launching them:**
+- **Wave 4**: `W4-9` (sim step/snapshots) and `W4-11` (the game loop) are integrators of W4-1..W4-8;
+  `W4-13` benches the result. Split as 4a producers -> 4b `W4-9`/`W4-10` -> 4c `W4-11`/`W4-12`/`W4-13`.
+- **Wave 6**: `W6-3` (the money shots) and `W6-4` (budget enforcement) judge everything else, and
+  `W6-5` gates on the whole system. They are last by construction — keep them there.
 
 ## Wave 3 — World and render (14 tasks)
 

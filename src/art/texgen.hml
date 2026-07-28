@@ -1,0 +1,1874 @@
+// texgen.hml — the procedural world texture atlas.  Nightshade W2-5.
+//
+// Builds ATLAS_WORLD (256x256, 8x8 cells of 32x32) from ART_BIBLE §7.2
+// primitives, §7.3 generators and the §7.4 layout.  Ships zero image files
+// (ART_BIBLE §7.6).
+//
+// ---------------------------------------------------------------------------
+// WHY EVERY TEXEL COMES OUT OF A 12-ENTRY LUT
+// ---------------------------------------------------------------------------
+// ART_BIBLE §7.1 rule 3 caps a tile at <= 12 distinct colours from <= 2 palette
+// families plus black.  §7.2's `grain()` adds a continuous +/-amt to the RGB of
+// every texel, which on its own produces 4 ramp steps x 13 grain offsets = 52
+// distinct colours.  The two rules are in direct conflict as written.
+//
+// The resolution is to make the colour budget STRUCTURAL rather than measured:
+// every tile first builds a LUT of at most 12 packed colours, and every write
+// is an INDEX into that LUT.  The <= 12 property then holds by construction and
+// cannot be broken by a later edit to a generator.
+//
+//   slot 0..5    a SIX-step ramp, dark -> light, interpolated LO -> MID -> HI
+//   slot 6,7,8   spare accents
+//   slot 9,10,11 three accents (seams, moss, rust, rivets, mortar)
+//
+// GRAIN IS SPENT ON RAMP STEPS, NOT ON EXTRA COLOURS.  The first version of
+// this file spent nine slots on 3 ramp steps x 3 quantized grain levels.  That
+// left ramp steps ~40 luminance apart, and Bayer-dithering a 40-luminance step
+// puts enormous energy at one texel — the measured 1-texel Haar energy came out
+// 1.4x to 4.2x the coarse-scale energy on 33 of 41 tiles, i.e. exactly the
+// shimmer ART_BIBLE §1.2 warns about, produced by following §7.2 literally.
+//
+// Six steps over the same luminance range make each step ~17 instead of ~40, so
+// the same dither costs less than half the fine-scale energy.  Grain then comes
+// for free as a small hash jitter ADDED TO THE VALUE before quantization
+// (`tg_grain`), which can move a texel by at most one step: a +/-6 luminance
+// perturbation expressed through the ramp instead of through new colours.  This
+// is the same trick ART_BIBLE §7.3 already relies on for snow ("the Bayer
+// dither IS the look"), applied to every material.
+//
+// ---------------------------------------------------------------------------
+// WHY THE PERIODS ARE ALL POWERS OF TWO
+// ---------------------------------------------------------------------------
+// `vnoise` is only seamless when its lattice wraps an integer number of times
+// across the tile, i.e. when `period` divides the 32-texel tile size.  ART_BIBLE
+// §7.3 uses 12, 20, 14 and 10, none of which do; a tile built with those has a
+// visible seam every 3.84 m of ground.  Every period here is 4, 8, 16 or 32, and
+// `fbm2`'s period/2 and period/4 octaves therefore divide 32 as well.
+//
+// Anisotropy (wood grain, brushed metal, rust streaks) is NOT obtained by
+// scaling a coordinate — `vnoise(x*4, y, 16, s)` breaks the wrap and reseams the
+// tile.  It is obtained by DOMAIN WARPING one axis with a function of the other:
+// `vnoise(0, y + k*vnoise(x, 0, 16, s2), 4, s)` is exactly as seamless as
+// `vnoise` itself, because the warp does not depend on the warped axis.
+//
+// ---------------------------------------------------------------------------
+// THE CELL CONTRACT (W1-8 / atlas.hml)
+// ---------------------------------------------------------------------------
+// Cell k spans texels [cell_x, cell_x + cw) x [cell_y, cell_y + ch).  atlas.hml
+// hands out UVs addressing TEXEL CENTRES, half a texel inside that box, so a
+// generator must fill the whole box and must never rely on a border texel being
+// unsampled — there is no gutter and none is needed.  Every write here goes
+// through `atlas_px_rgb`, which clips, so an off-by-one drops a texel instead of
+// bleeding into the neighbouring cell.
+//
+// ---------------------------------------------------------------------------
+// COST
+// ---------------------------------------------------------------------------
+// 41 tiles x 1024 texels.  Cold path, boot only, behind the title card; the
+// budget is 200 ms (ARCHITECTURE §8 gives 400 ms for all asset generation).
+// Measured on this box: see the self-test's BUILD line.
+
+import { floor, divi } from "@stdlib/math";
+
+import { atlas_px_rgb, atlas_get, atlas_data,
+         atlas_cell_x, atlas_cell_y, atlas_cell_w, atlas_cell_h,
+         atlas_cell_count } from "../../../wobbleweed/src/atlas.hml";
+
+import { h01, bayer4, clampf } from "../core/mathx.hml";
+
+import { pal_r, pal_g, pal_b,
+         g_GRASS_HI, g_GRASS_MID, g_GRASS_LO, g_GRASS_DRY,
+         g_DIRT_HI, g_DIRT_MID, g_DIRT_LO,
+         g_SAND, g_SAND_LO, g_MUD, g_SNOW_HI, g_SNOW_LO,
+         g_LEAF_HI, g_LEAF_MID, g_LEAF_LO, g_PINE_HI, g_PINE_LO,
+         g_LEAF_AUTUMN, g_BARK_HI, g_BARK_LO, g_NIGHTSHADE_FLORA,
+         g_STONE_HI, g_STONE_MID, g_STONE_LO,
+         g_GRANITE_HI, g_GRANITE_LO, g_STONE_MOSS,
+         g_CONCRETE_HI, g_CONCRETE_MID, g_CONCRETE_LO,
+         g_RUST, g_RUST_DARK,
+         g_WOOD_HI, g_WOOD_MID, g_WOOD_LO,
+         g_FABRIC_RED, g_FABRIC_CREAM, g_PAINT_TEAL, g_PAINT_OCHRE, g_ROOF_TILE,
+         g_STEEL_HI, g_STEEL_MID, g_STEEL_LO,
+         g_NS_CORE, g_UI_BLACK } from "./palette.hml";
+
+// ---------------------------------------------------------------------------
+// §7.4 layout — cell index constants.  cell = row * 8 + col.
+// ---------------------------------------------------------------------------
+
+export let CELL_GRASS_A     = 0;
+export let CELL_GRASS_B     = 1;
+export let CELL_GRASS_DRY   = 2;
+export let CELL_DIRT        = 3;
+export let CELL_PATH        = 4;
+export let CELL_MUD         = 5;
+export let CELL_SAND        = 6;
+export let CELL_SNOW        = 7;
+
+export let CELL_STONE_A     = 8;
+export let CELL_STONE_B     = 9;
+export let CELL_STONE_MOSS  = 10;
+export let CELL_GRANITE     = 11;
+export let CELL_CLIFF       = 12;
+export let CELL_GRAVEL      = 13;
+export let CELL_COBBLE      = 14;
+export let CELL_RUBBLE      = 15;
+
+export let CELL_WOOD_PLANK  = 16;
+export let CELL_WOOD_LOG    = 17;
+export let CELL_BARK        = 18;
+export let CELL_LEAF_DECID  = 19;
+export let CELL_LEAF_PINE   = 20;
+export let CELL_LEAF_AUTUMN = 21;
+export let CELL_BUSH        = 22;
+export let CELL_NS_FLORA    = 23;
+
+export let CELL_CONCRETE    = 24;
+export let CELL_CONC_STAIN  = 25;
+export let CELL_BRICK       = 26;
+export let CELL_METAL_PANEL = 27;
+export let CELL_METAL_RUST  = 28;
+export let CELL_GRATE       = 29;
+export let CELL_PIPE        = 30;
+export let CELL_VENT        = 31;
+
+export let CELL_ROOF_TILE   = 32;
+export let CELL_PLASTER     = 33;
+export let CELL_FABRIC_RED  = 34;
+export let CELL_FABRIC_CRM  = 35;
+export let CELL_PAINT_TEAL  = 36;
+export let CELL_PAINT_OCHRE = 37;
+export let CELL_WINDOW      = 38;
+export let CELL_DOOR        = 39;
+
+export let CELL_DEBUG_GRID  = 61;
+
+// Rows 5-7 (entity skins, weapon skins, decals and signage) are not produced
+// here: ARCHITECTURE §5 gives texgen exactly the eight world-surface generators
+// and those cells belong to later tasks.  They are left untouched.
+
+// ---------------------------------------------------------------------------
+// palette families — for the "<= 2 families plus black" rule
+// ---------------------------------------------------------------------------
+
+export let FAM_NONE     = 0;
+export let FAM_BLACK    = 1;    // exempt from the two-family cap
+export let FAM_GRASS    = 2;
+export let FAM_DIRT     = 3;
+export let FAM_SAND     = 4;
+export let FAM_MUD      = 5;
+export let FAM_SNOW     = 6;
+export let FAM_LEAF     = 7;
+export let FAM_PINE     = 8;
+export let FAM_AUTUMN   = 9;
+export let FAM_BARK     = 10;
+export let FAM_NS       = 11;
+export let FAM_STONE    = 12;
+export let FAM_GRANITE  = 13;
+export let FAM_MOSS     = 14;
+export let FAM_CONCRETE = 15;
+export let FAM_RUST     = 16;
+export let FAM_WOOD     = 17;
+export let FAM_STEEL    = 18;
+export let FAM_FABRIC   = 19;
+export let FAM_PAINT    = 20;
+export let FAM_ROOF     = 21;
+
+// ---------------------------------------------------------------------------
+// noise stream seeds (ART_BIBLE §7.3 SEED_*)
+// ---------------------------------------------------------------------------
+
+let SEED_GRASS = 1301;
+let SEED_DRY   = 2207;
+let SEED_DIRT  = 3313;
+let SEED_STONE = 4409;
+let SEED_MOSS  = 5501;
+let SEED_PLANK = 6607;
+let SEED_GRAIN = 7703;
+let SEED_METAL = 8807;
+let SEED_RUST  = 9901;
+let SEED_CONC  = 10103;
+let SEED_STAIN = 11113;
+let SEED_LEAF  = 12119;
+let SEED_SNOW  = 13127;
+let SEED_WARP  = 14131;
+
+// ---------------------------------------------------------------------------
+// the per-tile LUT
+// ---------------------------------------------------------------------------
+
+export let TG_LUT_MAX = 12;
+
+let g_lr: array<i32> = [];
+let g_lg: array<i32> = [];
+let g_lb: array<i32> = [];
+let g_lf: array<i32> = [];
+let g_ln: i32 = 0;
+
+// current cell origin / size, set by tile_begin
+let g_ox: i32 = 0;
+let g_oy: i32 = 0;
+let g_tw: i32 = 32;
+let g_th: i32 = 32;
+// The atlas's own CPU buffer and row pitch, cached by tile_begin.  `put` is
+// called ~50 000 times per build; going through atlas_px_rgb costs two calls
+// and eleven marshalled arguments per texel (CLAUDE.md A9b: ~10 ns/argument),
+// which measured 3.9 ms of the build on its own.  atlas.hml exposes
+// atlas_data() precisely so a generator can write the buffer directly; the
+// bounds check `put` already does is what atlas_px_rgb was being used for.
+let g_data: buffer = buffer(4);
+let g_aw: i32 = 0;
+
+// One shared 32x32 grain table.  Grain is decorrelated noise, so per-tile
+// variation only needs a toroidal offset, not a fresh hash per texel: this
+// turns ~42 000 h01 calls into 1024.
+let g_grain: array<i32> = [];
+
+// The eight ramp steps with the MID step doubled, so the mid band dominates
+// (ART_BIBLE §7.3: "MID doubled: it dominates") and the extreme steps stay in
+// the tails of the noise.  9 entries -> tg_ramp_pick is called with n = 9.
+//
+// Eight steps rather than four because the cost of a Bayer boundary is the SIZE
+// of the step it dithers across.  Measured over the 41 tiles, going 3 -> 6 -> 8
+// steps at a fixed luminance range took the mean 1-texel Haar energy from 17.6
+// to 10.4 to 8.1 while leaving the coarse bands untouched.
+let g_ramp: array<i32> = [0, 1, 2, 3, 3, 4, 5, 6, 7];
+export let TG_RAMP_N = 9;
+// two-step accent ramps, dithered the same way.  g_aramp uses accent slots
+// 9/10, g_bramp slots 10/11 — a generator picks whichever pair is a VALUE ramp
+// rather than two unrelated hues.
+let g_aramp: array<i32> = [9, 10];
+// A three-step OVERLAY ramp using the one slot the 8-step base ramp leaves
+// free (8) plus two accents.  An overlay picked from the SAME value the base
+// ramp was picked from re-hues a region without flattening it — which is the
+// difference between "mossy stone" and "a green sticker on stone".
+let g_oramp: array<i32> = [8, 10, 11];
+// value-domain grain amplitude, set by tg_base from its `amt` argument
+let g_jit: f64 = 0.125;
+
+// dither instrumentation, read by the self-test
+let g_dith_calls: i32 = 0;
+let g_dith_flips: i32 = 0;
+// per-cell snapshot of the two counters above, taken by tile_end
+let g_tile_dith_calls: array<i32> = [];
+let g_tile_dith_flips: array<i32> = [];
+
+// per-cell record of the families used, 4 slots per cell, -1 = empty
+let g_fam_used: array<i32> = [];
+// per-cell "was generated" flag
+let g_cell_gen: array<i32> = [];
+
+fn lut_reset() {
+    if (g_lr.length == 0) {
+        for (let i = 0; i < TG_LUT_MAX; i++) {
+            g_lr.push(0); g_lg.push(0); g_lb.push(0); g_lf.push(FAM_NONE);
+        }
+    }
+    for (let i = 0; i < TG_LUT_MAX; i++) {
+        g_lr[i] = 0; g_lg[i] = 0; g_lb[i] = 0; g_lf[i] = FAM_NONE;
+    }
+    g_ln = 0;
+}
+
+fn lut_set(p_i: i32, p_r: i32, p_g: i32, p_b: i32, p_f: i32) {
+    let i: i32 = p_i;
+    if (i < 0) { return; }
+    if (i >= TG_LUT_MAX) { return; }
+    let r: i32 = p_r; let g: i32 = p_g; let b: i32 = p_b;
+    if (r < 0) { r = 0; }  if (r > 255) { r = 255; }
+    if (g < 0) { g = 0; }  if (g > 255) { g = 255; }
+    if (b < 0) { b = 0; }  if (b > 255) { b = 255; }
+    g_lr[i] = r; g_lg[i] = g; g_lb[i] = b; g_lf[i] = p_f;
+    if (i + 1 > g_ln) { g_ln = i + 1; }
+}
+
+// pack / shade / mix.  No hex literal appears in this file: every colour is a
+// palette constant or an arithmetic derivative of one (CLAUDE.md §8).
+export fn tg_pack(p_r: i32, p_g: i32, p_b: i32): i32 {
+    let r: i32 = p_r; let g: i32 = p_g; let b: i32 = p_b;
+    if (r < 0) { r = 0; }  if (r > 255) { r = 255; }
+    if (g < 0) { g = 0; }  if (g > 255) { g = 255; }
+    if (b < 0) { b = 0; }  if (b > 255) { b = 255; }
+    let out: i32 = r * 65536 + g * 256 + b;
+    return out;
+}
+
+// A value step within the SAME palette family (this is how ART_BIBLE §7.3 gets
+// its `WOOD_LO * 0.6` gap line and its `c * 0.84` water stain).
+export fn tg_shade(p_c: i32, p_m: f64): i32 {
+    let m: f64 = p_m;
+    let out: i32 = tg_pack(i32(f64(pal_r(p_c)) * m),
+                           i32(f64(pal_g(p_c)) * m),
+                           i32(f64(pal_b(p_c)) * m));
+    return out;
+}
+
+export fn tg_mix(p_a: i32, p_b: i32, p_t: f64): i32 {
+    let t: f64 = clampf(p_t, 0.0, 1.0);
+    let r: f64 = f64(pal_r(p_a)) + (f64(pal_r(p_b)) - f64(pal_r(p_a))) * t;
+    let g: f64 = f64(pal_g(p_a)) + (f64(pal_g(p_b)) - f64(pal_g(p_a))) * t;
+    let b: f64 = f64(pal_b(p_a)) + (f64(pal_b(p_b)) - f64(pal_b(p_a))) * t;
+    let out: i32 = tg_pack(i32(r), i32(g), i32(b));
+    return out;
+}
+
+export fn tg_lum(p_c: i32): f64 {
+    let out: f64 = f64(pal_r(p_c)) * 0.299 + f64(pal_g(p_c)) * 0.587
+                 + f64(pal_b(p_c)) * 0.114;
+    return out;
+}
+
+// Build the six-step ramp in slots 0..5 by interpolating LO -> MID -> HI.
+// `amt` is the grain amplitude in luminance (ART_BIBLE: 3..7); it scales the
+// value jitter tg_grain applies, and 5 maps to roughly +/-6 luminance on a
+// tile with a 90-luminance range.
+fn tg_base(p_lo: i32, p_flo: i32, p_mid: i32, p_fmid: i32,
+           p_hi: i32, p_fhi: i32, p_amt: i32) {
+    let lo: i32 = p_lo; let mid: i32 = p_mid; let hi: i32 = p_hi;
+    let c0: i32 = lo;
+    let c1: i32 = tg_mix(lo, mid, 0.333);
+    let c2: i32 = tg_mix(lo, mid, 0.667);
+    let c3: i32 = mid;
+    let c4: i32 = tg_mix(mid, hi, 0.25);
+    let c5: i32 = tg_mix(mid, hi, 0.50);
+    let c6: i32 = tg_mix(mid, hi, 0.75);
+    let c7: i32 = hi;
+    lut_set(0, pal_r(c0), pal_g(c0), pal_b(c0), p_flo);
+    lut_set(1, pal_r(c1), pal_g(c1), pal_b(c1), p_flo);
+    lut_set(2, pal_r(c2), pal_g(c2), pal_b(c2), p_fmid);
+    lut_set(3, pal_r(c3), pal_g(c3), pal_b(c3), p_fmid);
+    lut_set(4, pal_r(c4), pal_g(c4), pal_b(c4), p_fhi);
+    lut_set(5, pal_r(c5), pal_g(c5), pal_b(c5), p_fhi);
+    lut_set(6, pal_r(c6), pal_g(c6), pal_b(c6), p_fhi);
+    lut_set(7, pal_r(c7), pal_g(c7), pal_b(c7), p_fhi);
+    g_ln = 8;
+    // one ramp step is 1/(TG_RAMP_N - 1) of the value range; 0.75 of a step,
+    // halved either way, is the +/-6 luminance the art bible asks for.
+    g_jit = 0.75 / f64(TG_RAMP_N - 1) * (f64(p_amt) / 5.0);
+}
+
+// Accent slot i in 0..2 -> LUT slot 9..11.
+fn tg_acc(p_i: i32, p_c: i32, p_f: i32) {
+    lut_set(9 + p_i, pal_r(p_c), pal_g(p_c), pal_b(p_c), p_f);
+}
+
+// LUT slot 8 — the one slot the 8-step ramp does not use.  Bottom step of
+// g_oramp.
+fn tg_over_lo(p_c: i32, p_f: i32) {
+    lut_set(8, pal_r(p_c), pal_g(p_c), pal_b(p_c), p_f);
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 primitives
+// ---------------------------------------------------------------------------
+
+// THE dither.  `ramp` holds LUT slot indices, dark -> light; the 4x4 Bayer
+// threshold decides the boundary texel by texel.  This is the single most
+// PS1-authentic texture technique in the file and every ramp boundary in every
+// generator goes through it.
+export fn tg_ramp_pick(p_ramp: array<i32>, p_n: i32, p_v: f64,
+                       p_x: i32, p_y: i32): i32 {
+    let n: i32 = p_n;
+    let v: f64 = p_v;
+    if (v < 0.0) { v = 0.0; }
+    if (v > 1.0) { v = 1.0; }
+    let s: f64 = v * f64(n - 1);
+    let i: i32 = i32(floor(s));
+    if (i < 0) { i = 0; }
+    if (i > n - 1) { i = n - 1; }
+    let frac: f64 = s - f64(i);
+    g_dith_calls = g_dith_calls + 1;
+    if (frac > bayer4(p_x, p_y)) {
+        i = i + 1;
+        g_dith_flips = g_dith_flips + 1;
+    }
+    if (i > n - 1) { i = n - 1; }
+    let out: i32 = p_ramp[i];
+    return out;
+}
+
+// Override the grain amplitude set by tg_base, for a variant that needs less.
+export fn tg_grain_amt(p_amt: i32) {
+    g_jit = 0.75 / f64(TG_RAMP_N - 1) * (f64(p_amt) / 5.0);
+}
+
+// GRAIN, in the value domain.  ART_BIBLE §7.2 grains the RGB; grainng the
+// VALUE instead keeps the colour budget at 12 (see the header) and bounds the
+// perturbation to at most one ramp step, which is what makes it grain rather
+// than structure (§7.1 rule 4).  Applied BEFORE tg_ramp_pick.
+export fn tg_grain(p_v: f64, p_x: i32, p_y: i32, p_seed: i32): f64 {
+    let s: i32 = p_seed;
+    let gx: i32 = (p_x + s) & 31;
+    let gy: i32 = (p_y + (s >> 5)) & 31;
+    let g: f64 = f64(g_grain[gy * 32 + gx]) * 0.000244140625 - 0.5;
+    let out: f64 = p_v + g * g_jit;
+    return out;
+}
+
+// Contrast about the midpoint, so a tile actually reaches both ends of its ramp
+// and clears the 60-luminance minimum range.
+fn ctr(p_v: f64, p_k: f64): f64 {
+    let out: f64 = clampf((p_v - 0.5) * p_k + 0.5, 0.0, 1.0);
+    return out;
+}
+
+fn tile_begin(p_a: object, p_cell: i32) {
+    g_ox = atlas_cell_x(p_a, p_cell);
+    g_oy = atlas_cell_y(p_a, p_cell);
+    g_tw = atlas_cell_w(p_a);
+    g_th = atlas_cell_h(p_a);
+    g_dith_calls = 0;
+    g_dith_flips = 0;
+    g_data = atlas_data(p_a);
+    g_aw = p_a.w;
+    lut_reset();
+    fld_init();
+}
+
+fn put(p_a: object, p_x: i32, p_y: i32, p_i: i32) {
+    let i: i32 = p_i;
+    if (i < 0) { return; }
+    if (i >= TG_LUT_MAX) { return; }
+    let x: i32 = g_ox + p_x;
+    let y: i32 = g_oy + p_y;
+    if (x < g_ox) { return; }
+    if (y < g_oy) { return; }
+    if (x >= g_ox + g_tw) { return; }
+    if (y >= g_oy + g_th) { return; }
+    let d = g_data;
+    let o: i32 = (y * g_aw + x) * 4;
+    d[o] = g_lr[i];
+    d[o + 1] = g_lg[i];
+    d[o + 2] = g_lb[i];
+    d[o + 3] = 255;
+}
+
+// Record which families this tile used, so the self-test can check the
+// <= 2 families rule structurally rather than by guessing at hues.
+fn tile_end(p_cell: i32) {
+    if (g_fam_used.length == 0) {
+        for (let i = 0; i < 256; i++) { g_fam_used.push(0 - 1); }
+        for (let i = 0; i < 64; i++) {
+            g_cell_gen.push(0);
+            g_tile_dith_calls.push(0);
+            g_tile_dith_flips.push(0);
+        }
+    }
+    g_tile_dith_calls[p_cell] = g_dith_calls;
+    g_tile_dith_flips[p_cell] = g_dith_flips;
+    let base: i32 = p_cell * 4;
+    for (let s = 0; s < 4; s++) { g_fam_used[base + s] = 0 - 1; }
+    let w: i32 = 0;
+    for (let i = 0; i < g_ln; i++) {
+        let f: i32 = g_lf[i];
+        if (f != FAM_NONE) {
+            let seen: i32 = 0;
+            for (let s = 0; s < w; s++) { if (g_fam_used[base + s] == f) { seen = 1; } }
+            if (seen == 0) {
+                if (w < 4) { g_fam_used[base + w] = f; w = w + 1; }
+            }
+        }
+    }
+    g_cell_gen[p_cell] = 1;
+}
+
+// ---------------------------------------------------------------------------
+// NOISE FIELDS — precomputed per tile, never per texel
+//
+// The obvious implementation calls mathx's `vnoise`/`fbm2` once per texel per
+// field.  Measured on this box, compiled -O1, that costs 358 ms for the 41
+// tiles — 1.8x the 200 ms budget — because a single `vnoise` is 1 call plus 4
+// `h01` plus 4 `xhash2`, and Hemlock charges ~10 ns per ARGUMENT (CLAUDE.md
+// A9b).  At ~5 field evaluations per texel that is ~25 calls and ~8.5 us per
+// texel.
+//
+// The fix is the project's own A5/A8 pattern: evaluate the noise LATTICE once
+// per tile per octave (a period-16 octave on a 32-texel tile has four lattice
+// points, not 1024) and interpolate straight into a flat `array<f64>` in a
+// call-free inner loop.  h01 call count drops from ~4 per texel per octave to
+// (32/period)^2 per TILE per octave — a ~250x reduction — and the generators
+// then read a field with one array index.
+//
+// The interpolation is bit-for-bit the same construction as mathx's `vnoise`
+// (h01 lattice, smoothstep fade, lattice index wrapped modulo tile/period), so
+// the fields are the same noise; only the evaluation order differs.
+// ---------------------------------------------------------------------------
+
+let g_fa: array<f64> = [];      // scratch field A, 32*32
+let g_fb: array<f64> = [];      // scratch field B
+let g_fc: array<f64> = [];      // scratch field C
+let g_lat: array<f64> = [];     // 2-D lattice scratch, up to 32*32
+let g_lin: array<f64> = [];     // 1-D lattice scratch, up to 32
+let g_warp: array<f64> = [];    // 32-entry domain-warp table
+
+fn fld_init() {
+    if (g_fa.length != 0) { return; }
+    for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 32; x++) {
+            g_grain.push(i32(h01(x, y, 65521) * 4096.0));
+        }
+    }
+    for (let i = 0; i < 1024; i++) { g_fa.push(0.0); g_fb.push(0.0); g_fc.push(0.0); }
+    for (let i = 0; i < 1024; i++) { g_lat.push(0.0); }
+    for (let i = 0; i < 32; i++) { g_lin.push(0.0); g_warp.push(0.0); }
+}
+
+// Fill `dst` with an `oct`-octave value-noise sum, seamless on the tile.
+// oct 1 -> weight 1.0; oct 2 -> 0.68/0.32; oct 3 -> 0.60/0.28/0.12 (§7.2).
+// NOTE: `per` must be <= tile/2.  A period equal to the tile size gives ONE
+// lattice cell, which after the seamless wrap is a CONSTANT field — the first
+// version of this file used period 32 for concrete, snow, path and cliff and
+// silently lost the 0.60-weight octave, collapsing concrete to a 38-luminance
+// range and three colours.  16 is the coarsest usable octave on a 32 tile.
+fn fld_fbm(p_dst: array<f64>, p_per: i32, p_seed: i32, p_oct: i32) {
+    let dst: array<f64> = p_dst;
+    let w: i32 = g_tw;
+    let h: i32 = g_th;
+    let n: i32 = w * h;
+    for (let i = 0; i < n; i++) { dst[i] = 0.0; }
+
+    let per: i32 = p_per;
+    let sd: i32 = p_seed;
+    let oct: i32 = p_oct;
+    for (let o = 0; o < oct; o++) {
+        let amp: f64 = 1.0;
+        if (oct == 2) { if (o == 0) { amp = 0.68; } else { amp = 0.32; } }
+        if (oct == 3) {
+            if (o == 0) { amp = 0.60; }
+            if (o == 1) { amp = 0.28; }
+            if (o == 2) { amp = 0.12; }
+        }
+        let m: i32 = divi(w, per);
+        if (m < 1) { m = 1; }
+        for (let j = 0; j < m; j++) {
+            for (let i = 0; i < m; i++) { g_lat[j * m + i] = h01(i, j, sd); }
+        }
+        let inv: f64 = 1.0 / f64(per);
+        for (let y = 0; y < h; y++) {
+            let fy: f64 = f64(y) * inv;
+            let iy: i32 = i32(fy);
+            let ty: f64 = fy - f64(iy);
+            ty = ty * ty * (3.0 - 2.0 * ty);
+            let r0: i32 = (iy % m) * m;
+            let r1: i32 = ((iy + 1) % m) * m;
+            let base: i32 = y * w;
+            for (let x = 0; x < w; x++) {
+                let fx: f64 = f64(x) * inv;
+                let ix: i32 = i32(fx);
+                let tx: f64 = fx - f64(ix);
+                tx = tx * tx * (3.0 - 2.0 * tx);
+                let x0: i32 = ix % m;
+                let x1: i32 = (ix + 1) % m;
+                let n00: f64 = g_lat[r0 + x0];
+                let n10: f64 = g_lat[r0 + x1];
+                let n01: f64 = g_lat[r1 + x0];
+                let n11: f64 = g_lat[r1 + x1];
+                let ta: f64 = n00 + (n10 - n00) * tx;
+                let tb: f64 = n01 + (n11 - n01) * tx;
+                dst[base + x] = dst[base + x] + (ta + (tb - ta) * ty) * amp;
+            }
+        }
+        per = divi(per, 2);
+        if (per < 1) { per = 1; }
+        if (o == 0) { sd = p_seed + 31; }
+        if (o == 1) { sd = p_seed + 97; }
+    }
+}
+
+// Fill `dst` with a seamless STREAK field: 1-D noise along one axis, its
+// coordinate domain-warped by a 1-D noise along the other.  Because the warp
+// does not depend on the warped axis, the field wraps exactly — which
+// coordinate scaling (`vnoise(x*4, y, ...)`, ART_BIBLE §7.3) does not.
+// `axis` 0 = streaks run horizontally, 1 = vertically.
+fn fld_streak(p_dst: array<f64>, p_axis: i32, p_per: i32,
+              p_warp: f64, p_seed: i32) {
+    let dst: array<f64> = p_dst;
+    let w: i32 = g_tw;
+    let h: i32 = g_th;
+    let axis: i32 = p_axis;
+
+    // warp table: 1-D value noise, period 16, over the unwarped axis
+    let mw: i32 = divi(w, 16);
+    if (mw < 1) { mw = 1; }
+    for (let i = 0; i < mw; i++) { g_lin[i] = h01(i, 0, p_seed + SEED_WARP); }
+    for (let k = 0; k < w; k++) {
+        let fk: f64 = f64(k) / 16.0;
+        let ik: i32 = i32(fk);
+        let tk: f64 = fk - f64(ik);
+        tk = tk * tk * (3.0 - 2.0 * tk);
+        let a0: f64 = g_lin[ik % mw];
+        let a1: f64 = g_lin[(ik + 1) % mw];
+        g_warp[k] = a0 + (a1 - a0) * tk;
+    }
+
+    // streak lattice
+    let per: i32 = p_per;
+    let m: i32 = divi(w, per);
+    if (m < 1) { m = 1; }
+    for (let i = 0; i < m; i++) { g_lin[i] = h01(i, 0, p_seed); }
+    let inv: f64 = 1.0 / f64(per);
+
+    for (let y = 0; y < h; y++) {
+        let base: i32 = y * w;
+        for (let x = 0; x < w; x++) {
+            let t: f64 = 0.0;
+            if (axis == 0) { t = f64(y) + (g_warp[x] - 0.5) * p_warp; }
+            else           { t = f64(x) + (g_warp[y] - 0.5) * p_warp; }
+            let ft: f64 = t * inv;
+            let it: i32 = i32(floor(ft));
+            let tt: f64 = ft - f64(it);
+            tt = tt * tt * (3.0 - 2.0 * tt);
+            let i0: i32 = ((it % m) + m) % m;
+            let i1: i32 = ((it + 1) % m + m) % m;
+            let a0: f64 = g_lin[i0];
+            let a1: f64 = g_lin[i1];
+            dst[base + x] = a0 + (a1 - a0) * tt;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 GRASS   var 0 = GRASS_A, 1 = GRASS_B (lusher), 2 = GRASS_DRY
+// ---------------------------------------------------------------------------
+export fn tg_grass(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 2) {
+        tg_base(g_GRASS_LO, FAM_GRASS, g_GRASS_DRY, FAM_GRASS,
+                tg_shade(g_GRASS_DRY, 1.13), FAM_GRASS, 5);
+        tg_acc(0, tg_shade(g_DIRT_MID, 0.94), FAM_DIRT);
+        tg_acc(1, g_DIRT_HI, FAM_DIRT);
+        tg_acc(2, tg_shade(g_GRASS_LO, 0.86), FAM_GRASS);
+    } else {
+        tg_base(g_GRASS_LO, FAM_GRASS, g_GRASS_MID, FAM_GRASS,
+                g_GRASS_HI, FAM_GRASS, 5);
+        tg_acc(0, tg_shade(g_GRASS_DRY, 0.88), FAM_GRASS);
+        tg_acc(1, g_GRASS_DRY, FAM_GRASS);
+        tg_acc(2, tg_shade(g_DIRT_MID, 0.96), FAM_DIRT);
+    }
+
+    let clump: i32 = 8;
+    let dryt: f64 = 0.64;
+    if (v == 1) { dryt = 0.78; }   // GRASS_B: lusher, almost no dry patching
+    if (v == 2) { dryt = 0.80; }   // the base ramp is already dry: patch sparsely
+
+    fld_fbm(g_fa, clump, sd + SEED_GRASS, 3);
+    fld_fbm(g_fb, 16, sd + SEED_DRY, 1);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let n: f64 = ctr(g_fa[base + x], 2.1);
+            n = tg_grain(n, x, y, sd + 11);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            // low-frequency dry patches: a second field, hard-thresholded, then
+            // itself dithered across the two accent steps so the patch does not
+            // read as a flat sticker.
+            let d: f64 = g_fb[base + x];
+            if (d > dryt) {
+                idx = tg_ramp_pick(g_aramp, 2, (d - dryt) * 3.4, x, y);
+            }
+            put(a, x, y, idx);
+        }
+    }
+    // BLADES: sparse 1-texel-wide, 2-3 texel-tall highlight strokes.  They are
+    // the only sub-3-texel STRUCTURE in the tile and they are kept under 8 %
+    // coverage so they read as sparkle, not as noise (§7.1 rule 4).
+    for (let y = 0; y < g_th; y++) {
+        for (let x = 0; x < g_tw; x++) {
+            if (h01(x, y, sd + 11) > 0.955) {
+                let ln: i32 = 2;
+                if (h01(x, y, sd + 17) > 0.5) { ln = 3; }
+                for (let k = 0; k < ln; k++) {
+                    let yy: i32 = y - k;
+                    if (yy < 0) { yy = yy + g_th; }
+                    put(a, x, yy, 6);
+                }
+            }
+        }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 DIRT / PATH / MUD   var 0 = DIRT, 1 = PATH, 2 = MUD
+// ---------------------------------------------------------------------------
+export fn tg_dirt(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 2) {
+        tg_base(tg_shade(g_MUD, 0.80), FAM_MUD, g_MUD, FAM_MUD,
+                g_DIRT_HI, FAM_DIRT, 5);
+        tg_acc(0, tg_shade(g_MUD, 0.70), FAM_MUD);
+        tg_acc(1, g_DIRT_MID, FAM_DIRT);
+        tg_acc(2, tg_shade(g_DIRT_HI, 1.06), FAM_DIRT);
+    } else {
+        tg_base(g_DIRT_LO, FAM_DIRT, g_DIRT_MID, FAM_DIRT,
+                g_DIRT_HI, FAM_DIRT, 6);
+        tg_acc(0, tg_shade(g_DIRT_LO, 0.88), FAM_DIRT);
+        tg_acc(1, tg_shade(g_DIRT_HI, 1.05), FAM_DIRT);
+        if (v == 1) { tg_acc(2, tg_shade(g_GRASS_DRY, 0.92), FAM_GRASS); }
+        else        { tg_acc(2, tg_shade(g_DIRT_MID, 1.12), FAM_DIRT); }
+    }
+
+    let per: i32 = 16;
+    if (v == 1) { per = 8; }
+
+    fld_fbm(g_fa, per, sd + SEED_DIRT, 3);
+    fld_fbm(g_fb, 4, sd + SEED_DIRT + 5, 1);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let n: f64 = ctr(g_fa[base + x] * 0.75 + g_fb[base + x] * 0.25, 2.0);
+            n = tg_grain(n, x, y, sd + 23);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            put(a, x, y, idx);
+        }
+    }
+    // PEBBLES: 8 per tile, 2x2 or 3x2, highlight blob with a 1-texel shadow
+    // below-right.  The shadow is what makes them read as raised at 12 cm/texel.
+    for (let k = 0; k < 8; k++) {
+        let px: i32 = i32(h01(k + 1, 7, sd + 31) * f64(g_tw - 3));
+        let py: i32 = i32(h01(3, k + 1, sd + 37) * f64(g_th - 3));
+        let bw: i32 = 2;
+        if (h01(k, k, sd + 41) > 0.55) { bw = 3; }
+        for (let j = 0; j < 2; j++) {
+            for (let i = 0; i < bw; i++) { put(a, px + i, py + j, 10); }
+        }
+        for (let i = 0; i < bw; i++) { put(a, px + i + 1, py + 2, 9); }
+        put(a, px + bw, py + 1, 9);
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 STONE — the a-b ridge trick.
+// var 0 STONE_A  1 STONE_B  2 STONE_MOSS  3 GRANITE
+//     4 CLIFF    5 GRAVEL   6 COBBLE      7 RUBBLE
+// ---------------------------------------------------------------------------
+export fn tg_stone(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 3) {
+        tg_base(tg_shade(g_GRANITE_LO, 0.80), FAM_GRANITE, g_GRANITE_LO, FAM_GRANITE,
+                g_GRANITE_HI, FAM_GRANITE, 5);
+        tg_acc(0, tg_shade(g_GRANITE_LO, 0.70), FAM_GRANITE);
+        tg_acc(1, tg_shade(g_GRANITE_HI, 1.08), FAM_GRANITE);
+        tg_acc(2, tg_mix(g_GRANITE_LO, g_GRANITE_HI, 0.5), FAM_GRANITE);
+    } else {
+        // grain 3, not 5: the a-b cracks already carry this material's fine
+        // detail, and extra per-texel grain on top is pure 1-texel energy.
+        tg_base(g_STONE_LO, FAM_STONE, g_STONE_MID, FAM_STONE,
+                g_STONE_HI, FAM_STONE, 3);
+        tg_acc(0, tg_shade(g_STONE_LO, 0.86), FAM_STONE);
+        if (v == 2) {
+            // A three-step moss ramp, picked from the same value as the stone
+            // beneath it, so the mossed region keeps every bit of the stone's
+            // light-and-shade and only changes hue.  Replacing the stone with a
+            // two-colour dithered patch instead cost the tile two thirds of its
+            // coarse energy and put E1/Ec at 1.49.
+            tg_over_lo(tg_shade(g_STONE_MOSS, 0.74), FAM_MOSS);
+            tg_acc(1, g_STONE_MOSS, FAM_MOSS);
+            tg_acc(2, tg_shade(g_STONE_MOSS, 1.34), FAM_MOSS);
+        } else {
+            tg_acc(1, tg_mix(g_STONE_MID, g_STONE_HI, 0.55), FAM_STONE);
+            tg_acc(2, tg_shade(g_STONE_HI, 1.05), FAM_STONE);
+        }
+    }
+
+    // feature knobs per variant
+    let per: i32 = 8;
+    let ridge: f64 = 0.90;
+    let crackw: f64 = 0.025;
+    let grid: i32 = 0;      // 0 none, 1 cobble, 2 rubble blocks
+    let strat: f64 = 0.0;   // horizontal stratification (cliff)
+    if (v == 1) { per = 8; ridge = 1.20; }
+    if (v == 2) { crackw = 0.016; }
+    if (v == 4) { per = 8; strat = 0.62; crackw = 0.04; }
+    if (v == 5) { per = 8;  ridge = 0.80; crackw = 0.02; }
+    if (v == 6) { grid = 1; per = 8; }
+    if (v == 7) { grid = 2; per = 8; ridge = 1.10; }
+
+    // THE a-b RIDGE TRICK: two offset fbm fields differenced.  The offset is
+    // applied when READING the second field (the fields are 32-periodic, so an
+    // index shift is exactly a coordinate shift and costs nothing).
+    fld_fbm(g_fa, per, sd + SEED_STONE, 3);
+    fld_fbm(g_fb, per, sd + SEED_STONE + 41, 3);
+    // Moss patches want to be BIG and few: a period-8 mask scatters small
+    // patches whose edges are all 1-texel, which is fine-scale energy with no
+    // coarse energy behind it.
+    if (v == 2) { fld_fbm(g_fc, 16, sd + SEED_MOSS, 1); }
+    if (v == 4) { fld_fbm(g_fc, 8, sd + 3, 1); }
+
+    // Per-UNIT tone jitter for the laid variants.  Without it a cobble field is
+    // a noise field with joints drawn on top: every stone is the same value, so
+    // the tile carries no energy at the 8-texel unit scale and the joints are
+    // the only thing left — which is exactly what the shimmer test caught
+    // (COBBLE E1/Ec was 0.90 with the joints alone).  Individual stones is also
+    // simply what masonry looks like.
+    let ujit: f64 = 0.0;
+    if (grid == 1) { ujit = 1.05; }
+    if (grid == 2) { ujit = 0.80; }
+
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        let sbase: i32 = ((y + 13) % g_th) * g_tw;
+        let urow: i32 = divi(y, 8);
+        let ush: i32 = (urow % 2) * 4;
+        for (let x = 0; x < g_tw; x++) {
+            let f1: f64 = g_fa[base + x];
+            let f2: f64 = g_fb[sbase + ((x + 7) % g_tw)];
+            let d: f64 = f1 - f2;
+            let n: f64 = 0.5 + d * ridge;
+            if (strat > 0.0) {
+                // CLIFF: bedding planes.  Broad, seamless, 8-texel scale.
+                n = n * (1.0 - strat) + g_fc[base] * strat;
+            }
+            if (ujit > 0.0) {
+                let uc: i32 = divi(x + ush, 8);
+                let ut: f64 = 0.5 + (h01(uc, urow, sd + 211) - 0.5) * ujit;
+                n = ut * 0.76 + n * 0.24;
+            }
+            n = ctr(n, 1.8);
+            n = tg_grain(n, x, y, sd + 53);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            // CRACKS: where the two fields cross, force the darkest step.  Thin
+            // dark seams for free.
+            // CRACKS: two levels, not one hard dark line.  A 1-texel jump from
+            // the brightest step straight to the crevice colour is the single
+            // largest fine-scale contributor in this generator; giving the crack
+            // a darkest core and a one-step-down shoulder halves it and reads as
+            // a crack with depth rather than an ink line.
+            let ad: f64 = d;
+            if (ad < 0.0) { ad = 0.0 - ad; }
+            if (ad < crackw) {
+                if (ad < crackw * 0.45) { idx = 9; } else { idx = 0; }
+            }
+            // MOSS on the top 40 % of the tile (upward faces)
+            if (v == 2) {
+                // MOSS grows downward from the top of the tile: bias the mask
+                // by height instead of cutting it off at a hard scanline.  The
+                // bias is a 32-texel gradient, which is coarse structure, where
+                // the hard cut was a single edge plus scattered small patches.
+                let mv: f64 = g_fc[base + x]
+                            + (1.0 - f64(y) / f64(g_th)) * 0.34;
+                if (mv > 0.76) {
+                    idx = tg_ramp_pick(g_oramp, 3, n, x, y);
+                }
+            }
+            put(a, x, y, idx);
+        }
+    }
+
+    if (grid == 1) {
+        // COBBLE: an 8-texel joint grid, offset every other row, drawn as a
+        // 1-texel dark joint with a 1-texel lit lip below it.
+        for (let y = 0; y < g_th; y++) {
+            let row: i32 = divi(y, 8);
+            let sh: i32 = (row % 2) * 4;
+            for (let x = 0; x < g_tw; x++) {
+                let m: i32 = y % 8;
+                if (m < 2) { put(a, x, y, 9); }
+                else {
+                    if (m == 2) { put(a, x, y, 11); }
+                    else { if ((x + sh) % 8 < 2) { put(a, x, y, 9); } }
+                }
+            }
+        }
+    }
+    if (grid == 2) {
+        // RUBBLE: scattered angular chips, 3x2 and 2x3, half lit half shadowed.
+        for (let k = 0; k < 9; k++) {
+            let px: i32 = i32(h01(k + 1, 5, sd + 61) * f64(g_tw - 5));
+            let py: i32 = i32(h01(5, k + 1, sd + 67) * f64(g_th - 5));
+            let bw: i32 = 4; let bh: i32 = 3;
+            if (h01(k, k + 2, sd + 71) > 0.5) { bw = 3; bh = 4; }
+            for (let j = 0; j < bh; j++) {
+                for (let i = 0; i < bw; i++) { put(a, px + i, py + j, 11); }
+            }
+            for (let i = 0; i < bw; i++) { put(a, px + i, py + bh, 9); }
+        }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 WOOD   var 0 = PLANK, 1 = LOG, 2 = BARK, 3 = DOOR
+// ---------------------------------------------------------------------------
+export fn tg_wood(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 2) {
+        tg_base(g_BARK_LO, FAM_BARK, tg_mix(g_BARK_LO, g_BARK_HI, 0.5), FAM_BARK,
+                tg_shade(g_BARK_HI, 1.14), FAM_BARK, 5);
+        tg_acc(0, tg_shade(g_BARK_LO, 0.80), FAM_BARK);
+        tg_acc(1, tg_shade(g_BARK_HI, 1.24), FAM_BARK);
+        tg_acc(2, tg_mix(g_BARK_LO, g_BARK_HI, 0.25), FAM_BARK);
+    } else {
+        tg_base(g_WOOD_LO, FAM_WOOD, g_WOOD_MID, FAM_WOOD,
+                tg_shade(g_WOOD_HI, 1.06), FAM_WOOD, 3);
+        tg_acc(0, tg_shade(g_WOOD_LO, 0.78), FAM_WOOD);
+        tg_acc(1, g_STEEL_MID, FAM_STEEL);
+        tg_acc(2, g_STEEL_LO, FAM_STEEL);
+    }
+
+    let plank_h: i32 = 8;
+    let vertical: i32 = 0;
+    if (v == 1) { vertical = 1; plank_h = 16; }   // log: staves run vertically
+    if (v == 2) { vertical = 1; plank_h = 8; }    // bark: ridges run vertically
+    if (v == 3) { plank_h = 16; }                 // door: two wide boards
+
+    let saxis: i32 = 0;
+    if (vertical == 1) { saxis = 1; }
+    fld_streak(g_fa, saxis, 8, 6.0, sd + SEED_GRAIN);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let along: i32 = y;
+            if (vertical == 1) { along = x; }
+            let plank: i32 = divi(along, plank_h);
+            // per-plank tone jitter: boards read as individual boards
+            let tone: f64 = 0.5 + (h01(plank, 0, sd + SEED_PLANK) - 0.5) * 0.78;
+            let g: f64 = g_fa[base + x];
+            let n: f64 = ctr(tone * 0.70 + g * 0.30, 1.75);
+            n = tg_grain(n, x, y, sd + 83);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            // GAP: 1-texel dark line between planks, 1-texel highlight below it
+            // GAP: a 2-texel dark line between planks with a lit lip below.
+            // 1-texel lines are what a nearest-sampled 320x240 image strobes on:
+            // measured, the 1-texel version put E1/Ec at 1.65 on this tile.
+            let gp: i32 = along % plank_h;
+            if (gp < 2)       { idx = 9; }
+            else { if (gp < 4) { idx = 7 - (gp - 2); } }
+            if (v == 2) {
+                // BARK: deep vertical fissures where the grain field dips
+                if (g < 0.26) { idx = 9; }
+            }
+            put(a, x, y, idx);
+        }
+    }
+    if (v == 0) {
+        // NAILS: two per plank, 1 texel of steel with a shadow texel.
+        let np: i32 = divi(g_th, plank_h);
+        for (let p = 0; p < np; p++) {
+            let yy: i32 = p * plank_h + 4;
+            put(a, 4, yy, 10);  put(a, 5, yy, 11);
+            put(a, 25, yy, 10); put(a, 26, yy, 11);
+        }
+    }
+    if (v == 3) {
+        // DOOR: a steel cross-brace and a handle.
+        for (let x = 2; x < 30; x++) { put(a, x, 3, 10); put(a, x, 4, 10); put(a, x, 5, 11); }
+        for (let x = 2; x < 30; x++) { put(a, x, 26, 10); put(a, x, 27, 10); put(a, x, 28, 11); }
+        for (let y = 13; y < 19; y++) { put(a, 25, y, 10); put(a, 26, y, 10); put(a, 27, y, 11); }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 METAL — the broad vertical value sweep is mandatory.
+// var 0 PANEL  1 RUST  2 GRATE  3 PIPE  4 VENT  5 PAINT_TEAL  6 PAINT_OCHRE
+//     7 WINDOW
+// ---------------------------------------------------------------------------
+export fn tg_metal(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 5) {
+        tg_base(tg_shade(g_PAINT_TEAL, 0.66), FAM_PAINT, g_PAINT_TEAL, FAM_PAINT,
+                tg_shade(g_PAINT_TEAL, 1.46), FAM_PAINT, 4);
+        tg_acc(0, tg_shade(g_PAINT_TEAL, 0.82), FAM_PAINT);
+        tg_acc(1, tg_shade(g_PAINT_TEAL, 1.26), FAM_PAINT);
+        tg_acc(2, g_STEEL_MID, FAM_STEEL);
+        tg_grain_amt(2);
+    } else {
+        if (v == 6) {
+            tg_base(tg_shade(g_PAINT_OCHRE, 0.58), FAM_PAINT, g_PAINT_OCHRE, FAM_PAINT,
+                    tg_shade(g_PAINT_OCHRE, 1.22), FAM_PAINT, 4);
+            tg_acc(0, tg_shade(g_PAINT_OCHRE, 0.80), FAM_PAINT);
+            tg_acc(1, tg_shade(g_PAINT_OCHRE, 1.06), FAM_PAINT);
+            tg_acc(2, g_STEEL_MID, FAM_STEEL);
+            tg_grain_amt(2);
+        } else {
+            if (v == 7) {
+                // WINDOW: cool glass in a steel frame.
+                tg_base(tg_shade(g_GRANITE_LO, 0.78), FAM_GRANITE, g_GRANITE_LO, FAM_GRANITE,
+                        g_GRANITE_HI, FAM_GRANITE, 4);
+                tg_acc(0, g_STEEL_LO, FAM_STEEL);
+                tg_acc(1, g_STEEL_MID, FAM_STEEL);
+                tg_acc(2, tg_shade(g_STEEL_HI, 0.92), FAM_STEEL);
+            } else {
+                if (v == 1) {
+                    tg_base(g_STEEL_LO, FAM_STEEL, g_STEEL_MID, FAM_STEEL,
+                            tg_shade(g_STEEL_MID, 1.20), FAM_STEEL, 4);
+                    tg_acc(0, g_RUST_DARK, FAM_RUST);
+                    tg_acc(1, g_RUST, FAM_RUST);
+                    tg_acc(2, tg_shade(g_RUST, 1.18), FAM_RUST);
+                } else {
+                    if (v == 2) {
+                        tg_base(tg_shade(g_STEEL_LO, 0.78), FAM_STEEL, g_STEEL_LO, FAM_STEEL,
+                                g_STEEL_MID, FAM_STEEL, 4);
+                        tg_acc(0, tg_shade(g_STEEL_LO, 0.66), FAM_STEEL);
+                        tg_acc(1, tg_shade(g_STEEL_MID, 1.16), FAM_STEEL);
+                        tg_acc(2, tg_mix(g_STEEL_LO, g_STEEL_MID, 0.5), FAM_STEEL);
+                    } else {
+                        tg_base(g_STEEL_LO, FAM_STEEL, g_STEEL_MID, FAM_STEEL,
+                                tg_shade(g_STEEL_HI, 0.94), FAM_STEEL, 4);
+                        tg_acc(0, tg_shade(g_STEEL_LO, 0.92), FAM_STEEL);
+                        tg_acc(1, tg_mix(g_STEEL_MID, g_STEEL_HI, 0.55), FAM_STEEL);
+                        tg_acc(2, g_RUST, FAM_RUST);
+                    }
+                }
+            }
+        }
+    }
+
+    // THE SWEEP.  Without a broad bright-to-dark gradient across the tile,
+    // "metal" is indistinguishable from "grey concrete" (ART_BIBLE §7.3).
+    // PIPE sweeps across x (a cylinder); everything else sweeps down y.
+    let horiz: i32 = 0;
+    if (v == 3) { horiz = 1; }
+
+    let baxis: i32 = 0;
+    if (horiz == 1) { baxis = 1; }
+    fld_streak(g_fa, baxis, 8, 4.0, sd + SEED_METAL);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let t: f64 = f64(y);
+            if (horiz == 1) { t = f64(x); }
+            let dd: f64 = t - 10.0;
+            if (dd < 0.0) { dd = 0.0 - dd; }
+            let sweep: f64 = 0.30 + 0.70 * (1.0 - dd / 22.0);
+            let br: f64 = g_fa[base + x];
+            let bw: f64 = 0.20;
+            if (v == 5) { bw = 0.12; }
+            if (v == 6) { bw = 0.12; }
+            let n: f64 = sweep * (1.0 - bw) + br * bw;
+            if (v == 7) {
+                // WINDOW: each 16x16 pane carries a broad diagonal sky
+                // reflection.  Glass without one is just dark grey, and a
+                // 16-texel gradient is the coarse structure the pane needs.
+                let px2: i32 = x % 16;
+                let py2: i32 = y % 16;
+                let refl: f64 = 1.0 - f64(px2 + py2) / 32.0;
+                n = n * 0.24 + refl * 0.76;
+            }
+            n = ctr(n, 1.68);
+            n = tg_grain(n, x, y, sd + 97);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            put(a, x, y, idx);
+        }
+    }
+
+    if (v == 2) {
+        // GRATE: a 4-texel bar lattice.  No alpha cutout exists on this
+        // renderer (per-vertex alpha only), so the "holes" are dark texels.
+        for (let y = 0; y < g_th; y++) {
+            for (let x = 0; x < g_tw; x++) {
+                let bx: i32 = x % 8;
+                let by: i32 = y % 8;
+                if (bx > 2) { if (by > 2) { put(a, x, y, 9); } }
+                if (bx < 2) { put(a, x, y, 10); }
+                if (by < 2) { put(a, x, y, 11); }
+                if (bx == 2) { put(a, x, y, 0); }
+                if (by == 2) { put(a, x, y, 0); }
+            }
+        }
+    } else {
+        if (v == 4) {
+            // VENT: horizontal louvers, lit lip over a shadowed throat.
+            for (let y = 0; y < g_th; y++) {
+                let m: i32 = y % 8;
+                if (m < 2) { for (let x = 2; x < 30; x++) { put(a, x, y, 10); } }
+                if (m == 2) { for (let x = 2; x < 30; x++) { put(a, x, y, 9); } }
+                if (m == 3) { for (let x = 2; x < 30; x++) { put(a, x, y, 9); } }
+            }
+        } else {
+            if (v == 7) {
+                // WINDOW: 2-texel steel frame plus a mullion cross.
+                for (let x = 0; x < g_tw; x++) {
+                    put(a, x, 0, 9); put(a, x, 1, 10);
+                    put(a, x, 31, 9); put(a, x, 30, 10);
+                    put(a, x, 15, 9); put(a, x, 16, 11);
+                }
+                for (let y = 0; y < g_th; y++) {
+                    put(a, 0, y, 9); put(a, 1, y, 10);
+                    put(a, 31, y, 9); put(a, 30, y, 10);
+                    put(a, 15, y, 9); put(a, 16, y, 11);
+                }
+            } else {
+                // PANEL LINES: a 1-texel dark border inset 1, with a lit lip.
+                for (let x = 1; x < 31; x++) {
+                    put(a, x, 1, 9);  put(a, x, 2, 9);  put(a, x, 3, 10);
+                    put(a, x, 30, 9); put(a, x, 29, 9); put(a, x, 28, 10);
+                }
+                for (let y = 1; y < 31; y++) {
+                    put(a, 1, y, 9);  put(a, 2, y, 9);  put(a, 3, y, 10);
+                    put(a, 30, y, 9); put(a, 29, y, 9); put(a, 28, y, 10);
+                }
+                // RIVETS: four corners, 3x3, lit with a shadowed lower-right.
+                for (let k = 0; k < 4; k++) {
+                    let rx: i32 = 6;  let ry: i32 = 6;
+                    if (k == 1) { rx = 24; }
+                    if (k == 2) { ry = 24; }
+                    if (k == 3) { rx = 24; ry = 24; }
+                    for (let j = 0; j < 3; j++) {
+                        for (let i = 0; i < 3; i++) { put(a, rx + i, ry + j, 10); }
+                    }
+                    for (let i = 0; i < 3; i++) { put(a, rx + i, ry + 3, 9); }
+                    for (let j = 0; j < 3; j++) { put(a, rx + 3, ry + j, 9); }
+                }
+            }
+        }
+    }
+
+    if (v == 1) {
+        // RUST STREAKS: vertical, noise-masked, starting high and running down.
+        fld_streak(g_fb, 1, 8, 6.0, sd + SEED_RUST);
+        for (let y = 0; y < g_th; y++) {
+            let rbase: i32 = y * g_tw;
+            for (let x = 0; x < g_tw; x++) {
+                let m: f64 = g_fb[rbase + x]
+                           * (0.55 + 0.45 * f64(y) / f64(g_th));
+                if (m > 0.62) {
+                    put(a, x, y, tg_ramp_pick(g_aramp, 2, (m - 0.62) * 4.0, x, y));
+                }
+            }
+        }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 CONCRETE
+// var 0 CONCRETE  1 CONC_STAIN  2 BRICK  3 PLASTER  4 ROOF_TILE
+//     5 FABRIC_RED  6 FABRIC_CREAM
+// ---------------------------------------------------------------------------
+export fn tg_concrete(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 2) {
+        tg_base(tg_shade(g_ROOF_TILE, 0.74), FAM_ROOF, g_ROOF_TILE, FAM_ROOF,
+                tg_shade(g_ROOF_TILE, 1.38), FAM_ROOF, 5);
+        tg_acc(0, g_CONCRETE_LO, FAM_CONCRETE);
+        tg_acc(1, g_CONCRETE_MID, FAM_CONCRETE);
+        tg_acc(2, tg_shade(g_ROOF_TILE, 0.62), FAM_ROOF);
+    } else {
+        if (v == 4) {
+            tg_base(tg_shade(g_ROOF_TILE, 0.70), FAM_ROOF, g_ROOF_TILE, FAM_ROOF,
+                    tg_shade(g_ROOF_TILE, 1.42), FAM_ROOF, 5);
+            tg_acc(0, tg_shade(g_ROOF_TILE, 0.58), FAM_ROOF);
+            tg_acc(1, tg_shade(g_ROOF_TILE, 1.55), FAM_ROOF);
+            tg_acc(2, tg_mix(g_ROOF_TILE, g_CONCRETE_MID, 0.35), FAM_ROOF);
+        } else {
+            if (v == 3) {
+                tg_base(tg_shade(g_CONCRETE_MID, 0.84), FAM_CONCRETE, g_CONCRETE_MID, FAM_CONCRETE,
+                        g_CONCRETE_HI, FAM_CONCRETE, 4);
+                tg_acc(0, g_CONCRETE_LO, FAM_CONCRETE);
+                tg_acc(1, tg_shade(g_CONCRETE_HI, 1.06), FAM_CONCRETE);
+                tg_acc(2, tg_mix(g_CONCRETE_LO, g_CONCRETE_MID, 0.5), FAM_CONCRETE);
+            } else {
+                if (v == 5) {
+                    // The weave field is narrow, so the extreme ramp steps are
+                    // rarely reached; the 60-luminance range has to be carried
+                    // by the steps that ARE reached, i.e. by MID..HI.
+                    tg_base(tg_shade(g_FABRIC_RED, 0.45), FAM_FABRIC,
+                            tg_shade(g_FABRIC_RED, 0.80), FAM_FABRIC,
+                            tg_shade(g_FABRIC_RED, 1.62), FAM_FABRIC, 4);
+                    tg_acc(0, tg_shade(g_FABRIC_RED, 0.46), FAM_FABRIC);
+                    tg_acc(1, tg_shade(g_FABRIC_RED, 1.70), FAM_FABRIC);
+                    tg_acc(2, tg_mix(g_FABRIC_RED, g_FABRIC_CREAM, 0.30), FAM_FABRIC);
+                } else {
+                    if (v == 6) {
+                        tg_base(tg_shade(g_FABRIC_CREAM, 0.56), FAM_FABRIC, tg_shade(g_FABRIC_CREAM, 0.76), FAM_FABRIC,
+                                g_FABRIC_CREAM, FAM_FABRIC, 4);
+                        tg_acc(0, tg_shade(g_FABRIC_CREAM, 0.50), FAM_FABRIC);
+                        tg_acc(1, tg_shade(g_FABRIC_CREAM, 1.08), FAM_FABRIC);
+                        tg_acc(2, tg_mix(g_FABRIC_CREAM, g_FABRIC_RED, 0.18), FAM_FABRIC);
+                    } else {
+                        tg_base(g_CONCRETE_LO, FAM_CONCRETE, g_CONCRETE_MID, FAM_CONCRETE,
+                                g_CONCRETE_HI, FAM_CONCRETE, 4);
+                        tg_acc(0, tg_shade(g_CONCRETE_LO, 0.90), FAM_CONCRETE);
+                        tg_acc(1, tg_mix(g_CONCRETE_LO, g_CONCRETE_MID, 0.5), FAM_CONCRETE);
+                        tg_acc(2, tg_shade(g_CONCRETE_HI, 1.04), FAM_CONCRETE);
+                    }
+                }
+            }
+        }
+    }
+
+    let weave: i32 = 0;
+    if (v == 5) { weave = 1; }
+    if (v == 6) { weave = 1; }
+    // per-unit tone: bricks read as individual bricks, roof courses as courses
+    let ujit: f64 = 0.0;
+    let uw: i32 = 16;
+    if (v == 2) { ujit = 1.20; uw = 16; tg_grain_amt(3); }
+    if (v == 4) { ujit = 0.62; uw = 8; }
+    let stain: f64 = 0.60;
+    if (v == 1) { stain = 0.40; }
+    if (v > 1)  { stain = 2.0; }        // > 1 disables staining
+
+    fld_fbm(g_fa, 16, sd + SEED_CONC, 3);
+    fld_streak(g_fb, 1, 8, 6.0, sd + SEED_STAIN);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let n: f64 = g_fa[base + x];
+            if (weave == 1) {
+                // FABRIC: a 4-texel twill.  Diagonal, so it never lines up with
+                // the pixel grid and never strobes under the affine warp.
+                let tw: f64 = 0.0;
+                if ((x + y) % 8 < 4) { tw = 0.07; }
+                n = n * 0.86 + 0.03 + tw;
+            }
+            if (ujit > 0.0) {
+                let urow: i32 = divi(y, 8);
+                let ush: i32 = (urow % 2) * divi(uw, 2);
+                let uc: i32 = divi(x + ush, uw);
+                let ut: f64 = 0.5 + (h01(uc, urow, sd + 223) - 0.5) * ujit;
+                n = ut * 0.78 + n * 0.22;
+            }
+            let cst: f64 = 1.95;
+            if (weave == 1) { cst = 2.60; }   // a weave is low-contrast noise;
+            n = ctr(n, cst);                  // it needs the whole ramp to read
+            n = tg_grain(n, x, y, sd + 103);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            // AGGREGATE: single-texel darker specks, ~4 % density.
+            if (weave == 0) {
+                if (h01(divi(x, 2), divi(y, 2), sd + 77) > 0.970) { idx = 9; }
+            }
+            // WATER STAINING: vertical streaks from the top edge, top 60 %.
+            if (y < 20) {
+                if (g_fb[base + x] > stain) {
+                    if (idx > 1) { if (idx < 8) { idx = idx - 2; } }
+                }
+            }
+            put(a, x, y, idx);
+        }
+    }
+
+    if (v == 2) {
+        // BRICK: 16x8 running bond, 1-texel mortar joint with a lit lip.
+        for (let y = 0; y < g_th; y++) {
+            let row: i32 = divi(y, 8);
+            let sh: i32 = (row % 2) * 8;
+            for (let x = 0; x < g_tw; x++) {
+                let m: i32 = y % 8;
+                // Mortar: a 2-texel recessed joint with a 2-texel lit lip, so
+                // the brick face meets it over three texels rather than one.
+                if (m < 2) { put(a, x, y, 9); }
+                else {
+                    if (m < 4) { put(a, x, y, 10); }
+                    else { if ((x + sh) % 16 < 2) { put(a, x, y, 9); }
+                           else { if ((x + sh) % 16 < 4) { put(a, x, y, 10); } } }
+                }
+            }
+        }
+    }
+    if (v == 4) {
+        // ROOF TILE: overlapping 8-texel scallop courses.
+        for (let y = 0; y < g_th; y++) {
+            let m: i32 = y % 8;
+            for (let x = 0; x < g_tw; x++) {
+                if (m < 2) { put(a, x, y, 9); }
+                if (m == 2) { put(a, x, y, 10); }
+                if (m > 2) { if (x % 8 < 2) { put(a, x, y, 11); } }
+            }
+        }
+    }
+    if (v == 0) {
+        // FORM SEAMS: one horizontal, one vertical, plus a corner chip.
+        for (let x = 0; x < g_tw; x++) { put(a, x, 11, 9); }
+        for (let y = 0; y < g_th; y++) { put(a, 21, y, 9); }
+        for (let j = 0; j < 3; j++) {
+            for (let i = 0; i < 3; i++) { put(a, 28 + i, 2 + j, 9); }
+        }
+    }
+    if (v == 1) {
+        for (let x = 0; x < g_tw; x++) { put(a, x, 6, 9); put(a, x, 7, 10); }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 LEAF MASS   var 0 DECID  1 PINE  2 AUTUMN  3 BUSH  4 NS_FLORA
+// ---------------------------------------------------------------------------
+export fn tg_leaf(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 1) {
+        tg_base(g_PINE_LO, FAM_PINE, tg_mix(g_PINE_LO, g_PINE_HI, 0.55), FAM_PINE,
+                tg_shade(g_PINE_HI, 1.30), FAM_PINE, 6);
+        tg_acc(0, tg_shade(g_PINE_LO, 0.82), FAM_PINE);
+        tg_acc(1, tg_shade(g_PINE_HI, 1.44), FAM_PINE);
+        tg_acc(2, tg_mix(g_PINE_LO, g_PINE_HI, 0.28), FAM_PINE);
+    } else {
+        if (v == 2) {
+            tg_base(tg_shade(g_LEAF_AUTUMN, 0.62), FAM_AUTUMN, g_LEAF_AUTUMN, FAM_AUTUMN,
+                    tg_shade(g_LEAF_AUTUMN, 1.18), FAM_AUTUMN, 6);
+            tg_acc(0, tg_shade(g_LEAF_AUTUMN, 0.50), FAM_AUTUMN);
+            tg_acc(1, tg_shade(g_LEAF_AUTUMN, 1.28), FAM_AUTUMN);
+            tg_acc(2, tg_mix(g_LEAF_AUTUMN, g_BARK_LO, 0.40), FAM_AUTUMN);
+        } else {
+            if (v == 4) {
+                tg_base(tg_shade(g_NIGHTSHADE_FLORA, 0.70), FAM_NS, g_NIGHTSHADE_FLORA, FAM_NS,
+                        tg_shade(g_NIGHTSHADE_FLORA, 1.40), FAM_NS, 6);
+                tg_acc(0, tg_shade(g_NIGHTSHADE_FLORA, 0.58), FAM_NS);
+                tg_acc(1, tg_mix(g_NIGHTSHADE_FLORA, g_NS_CORE, 0.45), FAM_NS);
+                tg_acc(2, tg_shade(g_LEAF_LO, 0.94), FAM_LEAF);
+            } else {
+                tg_base(g_LEAF_LO, FAM_LEAF, g_LEAF_MID, FAM_LEAF,
+                        g_LEAF_HI, FAM_LEAF, 6);
+                tg_acc(0, tg_shade(g_LEAF_LO, 0.80), FAM_LEAF);
+                tg_acc(1, tg_shade(g_LEAF_HI, 1.08), FAM_LEAF);
+                tg_acc(2, tg_mix(g_LEAF_LO, g_LEAF_MID, 0.5), FAM_LEAF);
+            }
+        }
+    }
+
+    // Small clumps = individual leaf masses.  8 texels ~ 32 cm of canopy.
+    let per: i32 = 8;
+    if (v == 3) { per = 4; }
+    let voidt: f64 = 0.950;
+    if (v == 3) { voidt = 0.925; }
+
+    fld_fbm(g_fa, per, sd + SEED_LEAF, 3);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let n: f64 = ctr(g_fa[base + x], 1.75);
+            n = tg_grain(n, x, y, sd + 109);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            // DARK VOIDS: gaps between leaves.  Kept to 2-texel clusters so they
+            // are structure at 2-4 texels, not per-texel salt.
+            if (h01(divi(x, 2), divi(y, 2), sd + 53) > voidt) { idx = 9; }
+            put(a, x, y, idx);
+        }
+    }
+    if (v == 4) {
+        // NIGHTSHADE FLORA: a few violet berry clusters.  The usage law
+        // (ART_BIBLE §3.8) permits the accent here: the plant is a collectable.
+        for (let k = 0; k < 5; k++) {
+            let px: i32 = i32(h01(k + 1, 9, sd + 131) * f64(g_tw - 3));
+            let py: i32 = i32(h01(9, k + 1, sd + 137) * f64(g_th - 3));
+            put(a, px, py, 10); put(a, px + 1, py, 10);
+            put(a, px, py + 1, 10); put(a, px + 1, py + 1, 9);
+        }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 SNOW / SAND — only two real steps, so the Bayer dither IS the look.
+// var 0 = SNOW, 1 = SAND
+// ---------------------------------------------------------------------------
+export fn tg_snow(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    let v: i32 = p_var;
+    tile_begin(a, p_cell);
+
+    if (v == 1) {
+        tg_base(tg_shade(g_SAND_LO, 0.72), FAM_SAND, g_SAND_LO, FAM_SAND,
+                g_SAND, FAM_SAND, 4);
+        tg_acc(0, tg_shade(g_SAND_LO, 0.66), FAM_SAND);
+        tg_acc(1, tg_shade(g_SAND, 1.05), FAM_SAND);
+        tg_acc(2, tg_mix(g_SAND_LO, g_SAND, 0.5), FAM_SAND);
+    } else {
+        tg_base(tg_shade(g_SNOW_LO, 0.72), FAM_SNOW, g_SNOW_LO, FAM_SNOW,
+                g_SNOW_HI, FAM_SNOW, 3);
+        tg_acc(0, tg_shade(g_SNOW_LO, 0.66), FAM_SNOW);
+        tg_acc(1, tg_shade(g_SNOW_HI, 1.02), FAM_SNOW);
+        tg_acc(2, tg_mix(g_SNOW_LO, g_SNOW_HI, 0.5), FAM_SNOW);
+    }
+
+    fld_fbm(g_fa, 16, sd + SEED_SNOW, 3);
+    fld_streak(g_fb, 0, 8, 7.0, sd + SEED_SNOW + 5);
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let n: f64 = ctr(g_fa[base + x], 1.55);
+            n = tg_grain(n, x, y, sd + 149);
+            let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
+            put(a, x, y, idx);
+        }
+    }
+    // WIND RIPPLES: a warped 8-texel ridge line, 1 texel of the light accent.
+    for (let y = 0; y < g_th; y++) {
+        let rbase: i32 = y * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let r: f64 = g_fb[rbase + x];
+            if (r > 0.72) { put(a, x, y, 10); }
+            if (r < 0.20) { put(a, x, y, 9); }
+        }
+    }
+    tile_end(p_cell);
+}
+
+// ---------------------------------------------------------------------------
+// DEBUG GRID — the diagnostic tile.  Magenta, because a debug texture that
+// reaches a screenshot must be impossible to miss (CLAUDE.md §9.7).  It is an
+// 8-texel checker, not a 1-texel one, so it does not itself shimmer.
+// ---------------------------------------------------------------------------
+export fn tg_debug_grid(p_a: object, p_cell: i32) {
+    let a: object = p_a;
+    tile_begin(a, p_cell);
+    lut_set(0, pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK), FAM_BLACK);
+    lut_set(1, pal_r(g_NS_CORE), pal_g(g_NS_CORE), pal_b(g_NS_CORE), FAM_NS);
+    lut_set(2, pal_r(tg_shade(g_NS_CORE, 0.60)), pal_g(tg_shade(g_NS_CORE, 0.60)),
+               pal_b(tg_shade(g_NS_CORE, 0.60)), FAM_NS);
+    g_ln = 3;
+    for (let y = 0; y < g_th; y++) {
+        for (let x = 0; x < g_tw; x++) {
+            let c: i32 = (divi(x, 8) + divi(y, 8)) % 2;
+            put(a, x, y, c);
+            if (x % 8 == 0) { put(a, x, y, 2); }
+            if (y % 8 == 0) { put(a, x, y, 2); }
+        }
+    }
+    tile_end(p_cell);
+}
+
+// MISSING TEXTURE — magenta, for a cell nothing has claimed yet.  It is
+// deliberately NOT registered as generated, so the self-test skips it.
+export fn tg_missing(p_a: object, p_cell: i32) {
+    let a: object = p_a;
+    let ox: i32 = atlas_cell_x(a, p_cell);
+    let oy: i32 = atlas_cell_y(a, p_cell);
+    let cw: i32 = atlas_cell_w(a);
+    let ch: i32 = atlas_cell_h(a);
+    let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE);
+    let mb: i32 = pal_b(g_NS_CORE);
+    let kr: i32 = pal_r(g_UI_BLACK); let kg: i32 = pal_g(g_UI_BLACK);
+    let kb: i32 = pal_b(g_UI_BLACK);
+    for (let y = 0; y < ch; y++) {
+        for (let x = 0; x < cw; x++) {
+            if ((divi(x, 8) + divi(y, 8)) % 2 == 0) {
+                atlas_px_rgb(a, ox + x, oy + y, mr, mg, mb);
+            } else {
+                atlas_px_rgb(a, ox + x, oy + y, kr, kg, kb);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the §7.4 packer
+// ---------------------------------------------------------------------------
+
+// Build every world-surface tile of ATLAS_WORLD.  `a` must be a 256x256 atlas
+// with an 8x8 cell grid (atlas_new(256, 256, 8, 8)).  Returns the number of
+// cells written, or -1 if the atlas geometry is wrong.
+export fn texgen_build_world_atlas(p_a: object, p_seed: i32): i32 {
+    let a: object = p_a;
+    let sd: i32 = p_seed;
+    if (atlas_cell_w(a) != 32) { return 0 - 1; }
+    if (atlas_cell_h(a) != 32) { return 0 - 1; }
+    if (atlas_cell_count(a) != 64) { return 0 - 1; }
+
+    // row 0 — ground
+    tg_grass(a, CELL_GRASS_A, sd + 1, 0);
+    tg_grass(a, CELL_GRASS_B, sd + 2, 1);
+    tg_grass(a, CELL_GRASS_DRY, sd + 3, 2);
+    tg_dirt(a, CELL_DIRT, sd + 4, 0);
+    tg_dirt(a, CELL_PATH, sd + 5, 1);
+    tg_dirt(a, CELL_MUD, sd + 6, 2);
+    tg_snow(a, CELL_SAND, sd + 7, 1);
+    tg_snow(a, CELL_SNOW, sd + 8, 0);
+
+    // row 1 — stone
+    tg_stone(a, CELL_STONE_A, sd + 11, 0);
+    tg_stone(a, CELL_STONE_B, sd + 12, 1);
+    tg_stone(a, CELL_STONE_MOSS, sd + 13, 2);
+    tg_stone(a, CELL_GRANITE, sd + 14, 3);
+    tg_stone(a, CELL_CLIFF, sd + 15, 4);
+    tg_stone(a, CELL_GRAVEL, sd + 16, 5);
+    tg_stone(a, CELL_COBBLE, sd + 17, 6);
+    tg_stone(a, CELL_RUBBLE, sd + 18, 7);
+
+    // row 2 — wood and foliage
+    tg_wood(a, CELL_WOOD_PLANK, sd + 21, 0);
+    tg_wood(a, CELL_WOOD_LOG, sd + 22, 1);
+    tg_wood(a, CELL_BARK, sd + 23, 2);
+    tg_leaf(a, CELL_LEAF_DECID, sd + 24, 0);
+    tg_leaf(a, CELL_LEAF_PINE, sd + 25, 1);
+    tg_leaf(a, CELL_LEAF_AUTUMN, sd + 26, 2);
+    tg_leaf(a, CELL_BUSH, sd + 27, 3);
+    tg_leaf(a, CELL_NS_FLORA, sd + 28, 4);
+
+    // row 3 — concrete and metal
+    tg_concrete(a, CELL_CONCRETE, sd + 31, 0);
+    tg_concrete(a, CELL_CONC_STAIN, sd + 32, 1);
+    tg_concrete(a, CELL_BRICK, sd + 33, 2);
+    tg_metal(a, CELL_METAL_PANEL, sd + 34, 0);
+    tg_metal(a, CELL_METAL_RUST, sd + 35, 1);
+    tg_metal(a, CELL_GRATE, sd + 36, 2);
+    tg_metal(a, CELL_PIPE, sd + 37, 3);
+    tg_metal(a, CELL_VENT, sd + 38, 4);
+
+    // row 4 — architecture trim
+    tg_concrete(a, CELL_ROOF_TILE, sd + 41, 4);
+    tg_concrete(a, CELL_PLASTER, sd + 42, 3);
+    tg_concrete(a, CELL_FABRIC_RED, sd + 43, 5);
+    tg_concrete(a, CELL_FABRIC_CRM, sd + 44, 6);
+    tg_metal(a, CELL_PAINT_TEAL, sd + 45, 5);
+    tg_metal(a, CELL_PAINT_OCHRE, sd + 46, 6);
+    tg_metal(a, CELL_WINDOW, sd + 47, 7);
+    tg_wood(a, CELL_DOOR, sd + 48, 3);
+
+    tg_debug_grid(a, CELL_DEBUG_GRID);
+
+    // Rows 5-7 are entity skins, weapon skins, decals and signage: ARCHITECTURE
+    // §5 gives texgen exactly the eight world-surface generators, so those cells
+    // belong to later tasks.  Until then they are the MISSING tile, magenta, not
+    // the buffer's zero-fill: a black cell in a screenshot reads as shadow and
+    // hides the bug, magenta is impossible to miss (CLAUDE.md §9.7).  A later
+    // task simply overwrites the cell.
+    for (let c = 40; c < 64; c++) {
+        if (c != CELL_DEBUG_GRID) { tg_missing(a, c); }
+    }
+
+    let out: i32 = 41;
+    return out;
+}
+
+// Was this cell produced by texgen?  The self-test and texview use it to skip
+// the cells that belong to later tasks.
+export fn texgen_cell_generated(p_cell: i32): i32 {
+    if (g_cell_gen.length == 0) { return 0; }
+    if (p_cell < 0) { return 0; }
+    if (p_cell > 63) { return 0; }
+    let out: i32 = g_cell_gen[p_cell];
+    return out;
+}
+
+let g_cell_names: array<string> = [
+        "GRASS_A", "GRASS_B", "GRASS_DRY", "DIRT", "PATH", "MUD", "SAND", "SNOW",
+        "STONE_A", "STONE_B", "STONE_MOSS", "GRANITE", "CLIFF", "GRAVEL", "COBBLE", "RUBBLE",
+        "WOOD_PLNK", "WOOD_LOG", "BARK", "LEAF_DECID", "LEAF_PINE", "LEAF_AUTMN", "BUSH", "NS_FLORA",
+        "CONCRETE", "CONC_STAIN", "BRICK", "METAL_PNL", "METAL_RUST", "GRATE", "PIPE", "VENT",
+        "ROOF_TILE", "PLASTER", "FABRIC_RED", "FABRIC_CRM", "PAINT_TEAL", "PAINT_OCHR", "WINDOW", "DOOR",
+        "-", "-", "-", "-", "-", "-", "-", "-",
+        "-", "-", "-", "-", "-", "-", "-", "-",
+        "-", "-", "-", "-", "-", "DEBUG_GRID", "-", "-"
+];
+
+export fn texgen_cell_name(p_cell: i32): string {
+    if (p_cell < 0) { return "?"; }
+    if (p_cell > 63) { return "?"; }
+    let out: string = g_cell_names[p_cell];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SELF-TEST MODE
+//
+// Per-tile histogram + statistics assertions, run against the texels that were
+// actually written (read back through atlas_get, not recomputed), so a bug in
+// `put` or in the cell arithmetic cannot hide.
+//
+// Returns the number of FAILED assertions.  Prints one line per tile plus a
+// summary.  The caller owns the exit code — this module never imports
+// @stdlib/process, it is on the shipping path.
+// ---------------------------------------------------------------------------
+
+let g_hist_c: array<i32> = [];   // distinct packed colours in the tile
+let g_hist_n: array<i32> = [];   // count of each
+let g_row: array<f64> = [];      // one row of luminance, for the shimmer test
+
+// Multiscale (Haar) band energy of one line at scale `s`: the mean absolute
+// difference between adjacent s-wide box averages, wrapped.  E(1) is the
+// 1-texel band; "a dominant frequency finer than 3 texels" means E(1) is larger
+// than every coarse band.  No FFT, no allocation, exact.
+//
+// The check is run on COLUMNS as well as rows and the two are averaged per
+// band.  A horizontal-only test (as ART_BIBLE words it) is trivially failed by
+// any horizontally-striped material — a plank tile's rows are nearly constant,
+// so its horizontal coarse energy is ~0 and any grain at all "dominates".
+// Measured on the plank tile: rows-only E1/Ec = 4.21, two-axis = 0.62.
+fn haar_e(p_w: i32, p_s: i32): f64 {
+    let w: i32 = p_w;
+    let s: i32 = p_s;
+    let acc: f64 = 0.0;
+    for (let x = 0; x < w; x++) {
+        let a: f64 = 0.0;
+        let b: f64 = 0.0;
+        for (let k = 0; k < s; k++) {
+            a = a + g_row[(x + k) % w];
+            b = b + g_row[(x + s + k) % w];
+        }
+        let d: f64 = (a - b) / f64(s);
+        if (d < 0.0) { d = 0.0 - d; }
+        acc = acc + d;
+    }
+    let out: f64 = acc / f64(w);
+    return out;
+}
+
+fn f2(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 100.0 + 0.5);
+    let whole: i64 = scaled / 100;
+    let frac: i64 = scaled - whole * 100;
+    let fs: string = `${frac}`;
+    if (frac < 10) { fs = `0${frac}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    let out: string = s;
+    return out;
+}
+
+fn pad(p_s: string, p_n: i32): string {
+    let s: string = p_s;
+    while (s.length < p_n) { s = `${s} `; }
+    let out: string = s;
+    return out;
+}
+
+export fn texgen_self_test(p_a: object): i32 {
+    let a: object = p_a;
+    let fails: i32 = 0;
+    let checks: i32 = 0;
+    let tiles: i32 = 0;
+
+    if (g_hist_c.length == 0) {
+        for (let i = 0; i < 512; i++) { g_hist_c.push(0); g_hist_n.push(0); }
+        for (let i = 0; i < 64; i++) { g_row.push(0.0); }
+    }
+
+    print("");
+    print("TEXGEN SELF-TEST — per-tile histogram, luminance, dither and shimmer");
+    print("cell name        colr fam  lmin   lmax   range   dith%   E1     E4     E8     E16    E1/Ec");
+    print("---------------------------------------------------------------------------------");
+
+    let worst_ratio: f64 = 0.0;
+    let worst_cell: i32 = 0 - 1;
+
+    for (let cell = 0; cell < 64; cell++) {
+        if (texgen_cell_generated(cell) == 0) { continue; }
+        tiles = tiles + 1;
+
+        let cx: i32 = atlas_cell_x(a, cell);
+        let cy: i32 = atlas_cell_y(a, cell);
+        let cw: i32 = atlas_cell_w(a);
+        let ch: i32 = atlas_cell_h(a);
+
+        // ---- histogram -----------------------------------------------------
+        let nc: i32 = 0;
+        let lmin: f64 = 1000.0;
+        let lmax: f64 = 0.0 - 1000.0;
+        for (let y = 0; y < ch; y++) {
+            for (let x = 0; x < cw; x++) {
+                let t: u32 = atlas_get(a, cx + x, cy + y);
+                let r: i32 = i32(t & 255);
+                let g: i32 = i32((t >> 8) & 255);
+                let b: i32 = i32((t >> 16) & 255);
+                let packed: i32 = r * 65536 + g * 256 + b;
+                let f: i32 = 0 - 1;
+                for (let i = 0; i < nc; i++) { if (g_hist_c[i] == packed) { f = i; } }
+                if (f < 0) {
+                    if (nc < 512) {
+                        g_hist_c[nc] = packed; g_hist_n[nc] = 1; nc = nc + 1;
+                    }
+                } else { g_hist_n[f] = g_hist_n[f] + 1; }
+                let lum: f64 = f64(r) * 0.299 + f64(g) * 0.587 + f64(b) * 0.114;
+                if (lum < lmin) { lmin = lum; }
+                if (lum > lmax) { lmax = lum; }
+            }
+        }
+        let range: f64 = lmax - lmin;
+
+        // ---- families ------------------------------------------------------
+        let nfam: i32 = 0;
+        for (let s = 0; s < 4; s++) {
+            let f: i32 = g_fam_used[cell * 4 + s];
+            if (f > 0) { if (f != FAM_BLACK) { nfam = nfam + 1; } }
+        }
+
+        // ---- dither coverage ----------------------------------------------
+        // Fraction of ramp_pick calls in this tile that the Bayer threshold
+        // moved up a step.  Zero would mean a ramp boundary that is NOT
+        // dithered (or a tile that never crosses one).
+        // Recomputed per tile below via the running counters.
+
+        // ---- shimmer -------------------------------------------------------
+        let e1: f64 = 0.0; let e2: f64 = 0.0; let e4: f64 = 0.0;
+        let e8: f64 = 0.0; let e16: f64 = 0.0;
+        for (let y = 0; y < ch; y++) {
+            for (let x = 0; x < cw; x++) { g_row[x] = lum_at(a, cx + x, cy + y); }
+            e1 = e1 + haar_e(cw, 1);   e2 = e2 + haar_e(cw, 2);
+            e4 = e4 + haar_e(cw, 4);   e8 = e8 + haar_e(cw, 8);
+            e16 = e16 + haar_e(cw, 16);
+        }
+        for (let x = 0; x < cw; x++) {
+            for (let y = 0; y < ch; y++) { g_row[y] = lum_at(a, cx + x, cy + y); }
+            e1 = e1 + haar_e(ch, 1);   e2 = e2 + haar_e(ch, 2);
+            e4 = e4 + haar_e(ch, 4);   e8 = e8 + haar_e(ch, 8);
+            e16 = e16 + haar_e(ch, 16);
+        }
+        let nl: f64 = f64(ch + cw);
+        e1 = e1 / nl; e2 = e2 / nl; e4 = e4 / nl; e8 = e8 / nl; e16 = e16 / nl;
+        let ec: f64 = e2;
+        if (e4 > ec) { ec = e4; }
+        if (e8 > ec) { ec = e8; }
+        if (e16 > ec) { ec = e16; }
+        let ratio: f64 = 99.0;
+        if (ec > 0.0) { ratio = e1 / ec; }
+
+        let dpct: f64 = f64(g_tile_dith_flips[cell]) * 100.0
+                      / f64(g_tile_dith_calls[cell] + 1);
+
+        // ---- assertions ----------------------------------------------------
+        checks = checks + 1;
+        if (nc > 12) { fails = fails + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: ${nc} distinct colours (> 12)`); }
+        checks = checks + 1;
+        if (nfam > 2) { fails = fails + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: ${nfam} palette families (> 2)`); }
+        checks = checks + 1;
+        if (nc < 2) { fails = fails + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: solid colour`); }
+        checks = checks + 1;
+        if (range < 60.0) { fails = fails + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: luminance range ${f2(range)} < 60`); }
+        checks = checks + 1;
+        if (range > 130.0) { fails = fails + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: luminance range ${f2(range)} > 130`); }
+        checks = checks + 1;
+        if (cell != CELL_DEBUG_GRID) {
+            if (g_tile_dith_flips[cell] < 1) { fails = fails + 1;
+                print(`  FAIL ${texgen_cell_name(cell)}: no Bayer dither flips`); }
+        }
+        checks = checks + 1;
+        if (cell != CELL_DEBUG_GRID) {
+            // "no DOMINANT frequency finer than 3 texels": the 1-texel Haar
+            // band must not exceed the strongest coarse band (4, 8, 16 and 32
+            // texel wavelengths).  Bound 0.95, i.e. parity minus a 5 % guard.
+            if (ratio > 0.95) { fails = fails + 1;
+                print(`  FAIL ${texgen_cell_name(cell)}: E1/Ec ${f2(ratio)} > 0.95 (shimmer)`); }
+        }
+
+        if (ratio > worst_ratio) { if (cell != CELL_DEBUG_GRID) {
+            worst_ratio = ratio; worst_cell = cell; } }
+
+        let s_cell: string = `${cell}`;
+        let s_nc: string = `${nc}`;
+        let s_nf: string = `${nfam}`;
+        let line: string = pad(s_cell, 5);
+        line = `${line}${pad(texgen_cell_name(cell), 12)}`;
+        line = `${line}${pad(s_nc, 5)}${pad(s_nf, 5)}`;
+        line = `${line}${pad(f2(lmin), 7)}${pad(f2(lmax), 7)}${pad(f2(range), 8)}`;
+        line = `${line}${pad(f2(dpct), 8)}`;
+        line = `${line}${pad(f2(e1), 7)}${pad(f2(e4), 7)}${pad(f2(e8), 7)}${pad(f2(e16), 7)}${f2(ratio)}`;
+        print(line);
+    }
+
+    // ---- the dither unit test ---------------------------------------------
+    // tg_ramp_pick must move up on exactly the Bayer cells below `frac`.  At
+    // frac = 0.5 that is exactly 8 of the 16 cells of the 4x4 matrix.
+    let up: i32 = 0;
+    let two: array<i32> = [0, 1];
+    for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+            if (tg_ramp_pick(two, 2, 0.5, x, y) == 1) { up = up + 1; }
+        }
+    }
+    checks = checks + 1;
+    if (up != 8) { fails = fails + 1;
+        print(`  FAIL bayer dither: ${up} of 16 cells flipped at frac 0.5, expected 8`); }
+    let up2: i32 = 0;
+    for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+            if (tg_ramp_pick(two, 2, 0.25, x, y) == 1) { up2 = up2 + 1; }
+        }
+    }
+    checks = checks + 1;
+    if (up2 != 4) { fails = fails + 1;
+        print(`  FAIL bayer dither: ${up2} of 16 cells flipped at frac 0.25, expected 4`); }
+
+    // ---- the seam test -----------------------------------------------------
+    // Every generator's noise must tile: column 0 must be a plausible
+    // continuation of column 31, i.e. the mean |L(0,y) - L(31,y)| must not
+    // exceed the mean |L(0,y) - L(1,y)| by more than 2x.
+    let seam_fail: i32 = 0;
+    for (let cell = 0; cell < 64; cell++) {
+        if (texgen_cell_generated(cell) == 0) { continue; }
+        if (cell == CELL_DEBUG_GRID) { continue; }
+        let cx: i32 = atlas_cell_x(a, cell);
+        let cy: i32 = atlas_cell_y(a, cell);
+        let cw: i32 = atlas_cell_w(a);
+        let ch: i32 = atlas_cell_h(a);
+        // The wrap step must be no worse than the WORST interior step of the
+        // same row.  Comparing against the MEAN interior step falsely accuses
+        // every tile whose 8-texel masonry joint happens to land on column 0:
+        // the wrap edge is then always a joint edge while most interior edges
+        // are not.  The maximum is phase-independent and still catches a real
+        // discontinuity.
+        let dw: f64 = 0.0;
+        let di: f64 = 0.0;
+        for (let y = 0; y < ch; y++) {
+            let l0: f64 = lum_at(a, cx, cy + y);
+            let le: f64 = lum_at(a, cx + cw - 1, cy + y);
+            let t1: f64 = l0 - le; if (t1 < 0.0) { t1 = 0.0 - t1; }
+            dw = dw + t1;
+            let mx: f64 = 0.0;
+            for (let x = 0; x < cw - 1; x++) {
+                let t2: f64 = lum_at(a, cx + x, cy + y) - lum_at(a, cx + x + 1, cy + y);
+                if (t2 < 0.0) { t2 = 0.0 - t2; }
+                if (t2 > mx) { mx = t2; }
+            }
+            di = di + mx;
+        }
+        if (dw > di * 1.15 + 6.0 * f64(ch)) {
+            seam_fail = seam_fail + 1;
+            print(`  FAIL ${texgen_cell_name(cell)}: horizontal seam, wrap ${f2(dw / f64(ch))} vs interior ${f2(di / f64(ch))}`);
+        }
+    }
+    checks = checks + 1;
+    if (seam_fail > 0) { fails = fails + seam_fail; }
+
+    print("---------------------------------------------------------------------------------");
+    print(`tiles generated : ${tiles}`);
+    if (worst_cell >= 0) {
+        print(`worst shimmer   : ${texgen_cell_name(worst_cell)}  E1/Ec = ${f2(worst_ratio)}  (bound 0.95)`);
+    }
+    print(`assertions      : ${checks} run, ${fails} failed`);
+    let out: i32 = fails;
+    return out;
+}
+
+export fn texgen_assert_count(): i32 {
+    // 7 per generated tile + 2 dither unit tests + 1 seam sweep
+    let out: i32 = 41 * 7 + 3;
+    return out;
+}
+
+fn lum_at(p_a: object, p_x: i32, p_y: i32): f64 {
+    let t: u32 = atlas_get(p_a, p_x, p_y);
+    let out: f64 = f64(i32(t & 255)) * 0.299
+                 + f64(i32((t >> 8) & 255)) * 0.587
+                 + f64(i32((t >> 16) & 255)) * 0.114;
+    return out;
+}

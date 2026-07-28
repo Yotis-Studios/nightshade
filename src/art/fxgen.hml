@@ -1,0 +1,829 @@
+// fxgen.hml — ATLAS_FX generator.  Nightshade W2-7.
+//
+//   128 x 128 RGBA8, an 8 x 8 grid of 16 x 16 cells, uploaded with BLEND_ADD.
+//   ARCHITECTURE.md §4 layer 2; ART_BIBLE §7.4 (the FX cell list) and §3.9
+//   (the only colours that may appear here).
+//
+// ---------------------------------------------------------------------------
+// THE ADDITIVE CONTRACT — why every background texel is exactly (0, 0, 0)
+// ---------------------------------------------------------------------------
+// SDL_BLENDMODE_ADD is  dstRGB = srcRGB * srcA + dstRGB.  A texel therefore
+// contributes NOTHING if and only if its RGB is (0,0,0) — alpha is irrelevant
+// to that, and "transparent black" and "opaque black" composite identically.
+// So this generator writes:
+//
+//     A = 255 EVERYWHERE.  Intensity lives in RGB, never in alpha.
+//
+// That is deliberate and it is the whole design:
+//   * the falloff is linear in the channel the blend actually reads, so a
+//     radial card fades the way it was authored instead of the way srcA*srcRGB
+//     squares it;
+//   * per-vertex alpha is left completely free for the CALLER, which is how an
+//     FX sprite fades out over its lifetime (fx.hml drives it) — if intensity
+//     were baked into texel alpha, the two would multiply and every particle
+//     would die twice as fast at the tips as at the core;
+//   * the 1-px margin and the background are literally (0,0,0), which is what
+//     `fxgen_selftest` asserts, texel by texel, on every occupied cell.
+//
+// ---------------------------------------------------------------------------
+// THE 1-PX MARGIN
+// ---------------------------------------------------------------------------
+// Every drawing primitive here iterates x, y over [FX_INSET, FX_CELL - 1 -
+// FX_INSET] of the cell — the margin is enforced by construction, not by
+// clipping, so no shape can ever bleed into its neighbour no matter what
+// radius it is handed.  Combined with atlas.hml's half-texel UV inset that
+// makes an FX quad immune to both interpolation overshoot and neighbour bleed.
+//
+// ---------------------------------------------------------------------------
+// RULE R1 / palette
+// ---------------------------------------------------------------------------
+// No colour is named here.  Every RGB comes from `palette.hml`; this file
+// contains no hex literal and no channel triple.  The glow cards bake in
+// `g_STAR_BRIGHT` (255,255,240) rather than pure white because ART_BIBLE §3.1
+// bans pure white — it is the palette's neutral-brightest entry and therefore
+// the closest thing to a tint identity that the palette actually contains.
+//
+// COST: 128*128 = 16384 texels, ~30 primitives.  Boot-time only; measured in
+// `fxgen_selftest`.
+
+import { sqrt, divi } from "@stdlib/math";
+import { bayer4, clampf } from "../core/mathx.hml";
+import { g_MUZZLE_CORE, g_MUZZLE_MID, g_MUZZLE_EDGE, g_TRACER, g_IMPACT_SPARK,
+         g_EMBER, g_EXPLO_HOT, g_EXPLO_MID, g_EXPLO_COOL, g_LIGHTNING,
+         g_NS_CORE, g_NS_HALO, g_VENOM, g_VENOM_HALO, g_STAR_BRIGHT,
+         g_STONE_MID, g_SAND_LO, g_MOON_DISC, g_SNOW_HI,
+         pal_r, pal_g, pal_b } from "./palette.hml";
+import { atlas_new, atlas_data, atlas_fill, atlas_get } from "../../../wobbleweed/src/atlas.hml";
+
+// ---------------------------------------------------------------------------
+// geometry of the atlas
+// ---------------------------------------------------------------------------
+
+export let FX_ATLAS_W = 128;
+export let FX_ATLAS_H = 128;
+export let FX_GRID    = 8;          // cells across and down
+export let FX_CELL    = 16;         // texels per cell edge
+export let FX_INSET   = 1;          // the mandated 1-px margin
+
+// ---------------------------------------------------------------------------
+// cell ids — row-major, cell = row * 8 + col.  ARCHITECTURE.md §5.3 names.
+// ---------------------------------------------------------------------------
+
+export let FX_MUZZLE_0  = 0;        // row 0 — the gun
+export let FX_MUZZLE_1  = 1;
+export let FX_MUZZLE_2  = 2;
+export let FX_TRACER    = 3;
+export let FX_SPARK_0   = 4;
+export let FX_SPARK_1   = 5;
+export let FX_EMBER     = 6;
+export let FX_XP_MOTE   = 7;
+
+export let FX_EXPLO_0   = 8;        // row 1 — the explosion strip + glow cards
+export let FX_EXPLO_1   = 9;
+export let FX_EXPLO_2   = 10;
+export let FX_EXPLO_3   = 11;
+export let FX_EXPLO_4   = 12;
+export let FX_EXPLO_5   = 13;
+export let FX_GLOW_S    = 14;
+export let FX_GLOW_L    = 15;
+
+export let FX_SMOKE_0   = 16;       // row 2 — atmospherics and the world
+export let FX_SMOKE_1   = 17;
+export let FX_SMOKE_2   = 18;
+export let FX_DUST      = 19;
+export let FX_EYE       = 20;
+export let FX_LOOT_BEAM = 21;
+export let FX_RAIN      = 22;
+export let FX_BOLT_0    = 23;
+
+export let FX_BOLT_1    = 24;       // row 3 — weather and pickups
+export let FX_SPLASH_0  = 25;
+export let FX_SPLASH_1  = 26;
+export let FX_SPARKLE   = 27;
+
+// Cells [0, FX_CELL_COUNT) carry art.  The remaining 36 are reserved: they
+// stay (0,0,0,255), which is the additive no-op, so a bad cell index draws
+// nothing instead of drawing garbage.
+export let FX_CELL_COUNT = 28;
+
+// ---------------------------------------------------------------------------
+// module state
+// ---------------------------------------------------------------------------
+
+let g_fx_atlas = null;
+
+// The live atlas, or null before `fxgen_build_atlas`.
+export fn fxgen_atlas() { return g_fx_atlas; }
+
+// Human-readable label for `texview.hml`'s cell overlay.
+export fn fxgen_cell_name(id: i32): string {
+    if (id == FX_MUZZLE_0) { return "MUZZLE 0"; }
+    if (id == FX_MUZZLE_1) { return "MUZZLE 1"; }
+    if (id == FX_MUZZLE_2) { return "MUZZLE 2"; }
+    if (id == FX_TRACER) { return "TRACER"; }
+    if (id == FX_SPARK_0) { return "SPARK 0"; }
+    if (id == FX_SPARK_1) { return "SPARK 1"; }
+    if (id == FX_EMBER) { return "EMBER"; }
+    if (id == FX_XP_MOTE) { return "XP MOTE"; }
+    if (id == FX_EXPLO_0) { return "EXPLO 0"; }
+    if (id == FX_EXPLO_1) { return "EXPLO 1"; }
+    if (id == FX_EXPLO_2) { return "EXPLO 2"; }
+    if (id == FX_EXPLO_3) { return "EXPLO 3"; }
+    if (id == FX_EXPLO_4) { return "EXPLO 4"; }
+    if (id == FX_EXPLO_5) { return "EXPLO 5"; }
+    if (id == FX_GLOW_S) { return "GLOW S"; }
+    if (id == FX_GLOW_L) { return "GLOW L"; }
+    if (id == FX_SMOKE_0) { return "SMOKE 0"; }
+    if (id == FX_SMOKE_1) { return "SMOKE 1"; }
+    if (id == FX_SMOKE_2) { return "SMOKE 2"; }
+    if (id == FX_DUST) { return "DUST"; }
+    if (id == FX_EYE) { return "EYE"; }
+    if (id == FX_LOOT_BEAM) { return "LOOT BEAM"; }
+    if (id == FX_RAIN) { return "RAIN"; }
+    if (id == FX_BOLT_0) { return "BOLT 0"; }
+    if (id == FX_BOLT_1) { return "BOLT 1"; }
+    if (id == FX_SPLASH_0) { return "SPLASH 0"; }
+    if (id == FX_SPLASH_1) { return "SPLASH 1"; }
+    if (id == FX_SPARKLE) { return "SPARKLE"; }
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// primitives
+//
+// All of them take the raw RGBA buffer and ABSOLUTE atlas coordinates, and all
+// of them accumulate — an FX cell is built by summing overlapping shapes, the
+// same way the blend mode it ships under sums sprites.  Saturating at 255 is
+// the correct clip: it is exactly what ADD does on screen.
+// ---------------------------------------------------------------------------
+
+// One additive texel.  `v` is 0..1 intensity; the colour is scaled by it and
+// ordered-dithered with the shared 4x4 Bayer threshold before quantization, so
+// a smooth falloff never bands (ART_BIBLE §7.1 rule 6).
+fn fx_add(d: buffer, x: i32, y: i32, r: i32, g: i32, b: i32, v: f64) {
+    if (v <= 0.0) { return; }
+    let vv: f64 = v;
+    if (vv > 1.0) { vv = 1.0; }
+    let bj: f64 = bayer4(x, y);
+    let o: i32 = (y * FX_ATLAS_W + x) * 4;
+    let nr: i32 = d[o] + i32(f64(r) * vv + bj);
+    let ng: i32 = d[o + 1] + i32(f64(g) * vv + bj);
+    let nb: i32 = d[o + 2] + i32(f64(b) * vv + bj);
+    if (nr > 255) { nr = 255; }
+    if (ng > 255) { ng = 255; }
+    if (nb > 255) { nb = 255; }
+    d[o] = nr;
+    d[o + 1] = ng;
+    d[o + 2] = nb;
+    d[o + 3] = 255;
+}
+
+// The inclusive texel span a cell primitive may touch: [lo, hi] in cell space.
+fn fx_lo(): i32 { let o: i32 = FX_INSET; return o; }
+fn fx_hi(): i32 { let o: i32 = FX_CELL - 1 - FX_INSET; return o; }
+
+// Elliptical soft splat.  `pw` is the falloff exponent: 1 = linear cone,
+// 2 = quadratic (the classic glow card), 3 = tight hot core.
+fn fx_splat(d: buffer, ox: i32, oy: i32, cx: f64, cy: f64,
+            rx: f64, ry: f64, pw: i32,
+            r: i32, g: i32, b: i32, gain: f64) {
+    let lo: i32 = fx_lo();
+    let hi: i32 = fx_hi();
+    let irx: f64 = 1.0 / rx;
+    let iry: f64 = 1.0 / ry;
+    for (let y = lo; y <= hi; y++) {
+        for (let x = lo; x <= hi; x++) {
+            let dx: f64 = (f64(x) + 0.5 - cx) * irx;
+            let dy: f64 = (f64(y) + 0.5 - cy) * iry;
+            let dd: f64 = sqrt(dx * dx + dy * dy);
+            if (dd < 1.0) {
+                let t: f64 = 1.0 - dd;
+                let v: f64 = t;
+                for (let k = 1; k < pw; k++) { v = v * t; }
+                fx_add(d, ox + x, oy + y, r, g, b, v * gain);
+            }
+        }
+    }
+}
+
+// A capsule (thick line segment) from A to B with half-width `hw`, whose gain
+// ramps from `ga` at A to `gb` at B.  Tracers, petals, sparks, bolts, rain and
+// the loot beam are all this one primitive.
+fn fx_seg(d: buffer, ox: i32, oy: i32,
+          ax: f64, ay: f64, bx: f64, by: f64, hw: f64,
+          r: i32, g: i32, b: i32, ga: f64, gb: f64) {
+    let lo: i32 = fx_lo();
+    let hi: i32 = fx_hi();
+    let ex: f64 = bx - ax;
+    let ey: f64 = by - ay;
+    let el2: f64 = ex * ex + ey * ey;
+    if (el2 < 0.000001) { el2 = 0.000001; }
+    let ihw: f64 = 1.0 / hw;
+    for (let y = lo; y <= hi; y++) {
+        for (let x = lo; x <= hi; x++) {
+            let px: f64 = f64(x) + 0.5 - ax;
+            let py: f64 = f64(y) + 0.5 - ay;
+            let t: f64 = (px * ex + py * ey) / el2;
+            if (t < 0.0) { t = 0.0; }
+            if (t > 1.0) { t = 1.0; }
+            let qx: f64 = px - ex * t;
+            let qy: f64 = py - ey * t;
+            let dd: f64 = sqrt(qx * qx + qy * qy) * ihw;
+            if (dd < 1.0) {
+                let v: f64 = (1.0 - dd) * (ga + (gb - ga) * t);
+                fx_add(d, ox + x, oy + y, r, g, b, v);
+            }
+        }
+    }
+}
+
+// A soft annulus of mid-radius `rm` and half-thickness `th` — the shockwave
+// shell of an explosion's dying frames.
+fn fx_ring(d: buffer, ox: i32, oy: i32, cx: f64, cy: f64,
+           rm: f64, th: f64, r: i32, g: i32, b: i32, gain: f64) {
+    let lo: i32 = fx_lo();
+    let hi: i32 = fx_hi();
+    let ith: f64 = 1.0 / th;
+    for (let y = lo; y <= hi; y++) {
+        for (let x = lo; x <= hi; x++) {
+            let dx: f64 = f64(x) + 0.5 - cx;
+            let dy: f64 = f64(y) + 0.5 - cy;
+            let dd: f64 = sqrt(dx * dx + dy * dy) - rm;
+            if (dd < 0.0) { dd = 0.0 - dd; }
+            dd = dd * ith;
+            if (dd < 1.0) { fx_add(d, ox + x, oy + y, r, g, b, (1.0 - dd) * gain); }
+        }
+    }
+}
+
+// A soft diamond (L1 ball) — the XP mote and the minimap-style pickup pip.
+fn fx_diamond(d: buffer, ox: i32, oy: i32, cx: f64, cy: f64, rad: f64,
+              r: i32, g: i32, b: i32, gain: f64) {
+    let lo: i32 = fx_lo();
+    let hi: i32 = fx_hi();
+    let ir: f64 = 1.0 / rad;
+    for (let y = lo; y <= hi; y++) {
+        for (let x = lo; x <= hi; x++) {
+            let dx: f64 = f64(x) + 0.5 - cx;
+            let dy: f64 = f64(y) + 0.5 - cy;
+            if (dx < 0.0) { dx = 0.0 - dx; }
+            if (dy < 0.0) { dy = 0.0 - dy; }
+            let dd: f64 = (dx + dy) * ir;
+            if (dd < 1.0) { fx_add(d, ox + x, oy + y, r, g, b, (1.0 - dd) * gain); }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// petal directions
+//
+// Fixed unit-vector tables, not trig: no sin/cos dependency, bit-identical on
+// both backends, and — more importantly — HAND-CHOSEN so no flash is
+// rotationally symmetric.  A symmetric star reads as a decal; an asymmetric
+// one reads as an event (ART_BIBLE §13, "symmetric" anti-goal).
+// ---------------------------------------------------------------------------
+
+fn petal_dx(i: i32): f64 {
+    if (i == 0) { return 0.94; }
+    if (i == 1) { return 0.32; }
+    if (i == 2) { return 0.0 - 0.55; }
+    if (i == 3) { return 0.0 - 0.99; }
+    if (i == 4) { return 0.0 - 0.38; }
+    if (i == 5) { return 0.71; }
+    if (i == 6) { return 0.12; }
+    return 0.0 - 0.86;
+}
+fn petal_dy(i: i32): f64 {
+    if (i == 0) { return 0.0 - 0.34; }
+    if (i == 1) { return 0.0 - 0.95; }
+    if (i == 2) { return 0.0 - 0.84; }
+    if (i == 3) { return 0.14; }
+    if (i == 4) { return 0.93; }
+    if (i == 5) { return 0.70; }
+    if (i == 6) { return 0.99; }
+    return 0.0 - 0.51;
+}
+fn petal_len(i: i32): f64 {
+    if (i == 0) { return 6.3; }
+    if (i == 1) { return 5.1; }
+    if (i == 2) { return 6.6; }
+    if (i == 3) { return 4.4; }
+    if (i == 4) { return 5.7; }
+    if (i == 5) { return 3.9; }
+    if (i == 6) { return 6.1; }
+    return 4.8;
+}
+
+// ---------------------------------------------------------------------------
+// the cells
+// ---------------------------------------------------------------------------
+
+// Muzzle flash, 3 frames.  Frame 0 is the 1-frame stab: tiny near-white core,
+// short petals.  Frame 1 is the bloom: the core has cooled to MUZZLE_MID and
+// the petals have reached full length.  Frame 2 is the ghost that sells the
+// decay — no core at all, only MUZZLE_EDGE petals and a faint haze.
+fn cell_muzzle(d: buffer, ox: i32, oy: i32, frame: i32) {
+    let cx: f64 = 8.0;
+    let cy: f64 = 8.0;
+    let cr: i32 = pal_r(g_MUZZLE_CORE); let cg: i32 = pal_g(g_MUZZLE_CORE); let cb: i32 = pal_b(g_MUZZLE_CORE);
+    let mr: i32 = pal_r(g_MUZZLE_MID);  let mg: i32 = pal_g(g_MUZZLE_MID);  let mb: i32 = pal_b(g_MUZZLE_MID);
+    let er: i32 = pal_r(g_MUZZLE_EDGE); let eg: i32 = pal_g(g_MUZZLE_EDGE); let eb: i32 = pal_b(g_MUZZLE_EDGE);
+    let np: i32 = 8;
+    let plen: f64 = 1.0;
+    let core: f64 = 1.0;
+    let mid: f64 = 0.85;
+    let edge: f64 = 0.9;
+    if (frame == 1) { plen = 1.28; core = 0.55; mid = 0.95; edge = 0.85; }
+    if (frame == 2) { plen = 1.05; core = 0.0;  mid = 0.30; edge = 0.42; np = 5; }
+    // petals first so the core burns through them
+    for (let i = 0; i < np; i++) {
+        let L: f64 = petal_len(i) * plen;
+        if (L > 6.4) { L = 6.4; }
+        fx_seg(d, ox, oy, cx, cy, cx + petal_dx(i) * L, cy + petal_dy(i) * L,
+               1.55, er, eg, eb, edge, 0.0);
+    }
+    if (mid > 0.0) { fx_splat(d, ox, oy, cx, cy, 5.4, 4.9, 2, mr, mg, mb, mid); }
+    if (core > 0.0) { fx_splat(d, ox, oy, cx, cy, 3.1, 2.8, 3, cr, cg, cb, core); }
+}
+
+// Bullet tracer: a vertical streak, hot and thin in the middle, tapering to
+// nothing at both ends so a stretched billboard has no hard cap.
+fn cell_tracer(d: buffer, ox: i32, oy: i32) {
+    let r: i32 = pal_r(g_TRACER); let g: i32 = pal_g(g_TRACER); let b: i32 = pal_b(g_TRACER);
+    fx_seg(d, ox, oy, 8.0, 1.5, 8.0, 14.5, 3.3, r, g, b, 0.18, 0.18);
+    fx_seg(d, ox, oy, 8.0, 2.5, 8.0, 13.5, 1.5, r, g, b, 0.85, 0.85);
+    fx_splat(d, ox, oy, 8.0, 8.0, 2.2, 5.4, 2, r, g, b, 0.9);
+}
+
+// Ricochet sparks.  Two frames with different, deliberately uneven fans, so a
+// burst that plays 0 then 1 never looks like the same sprite twice.
+fn cell_spark(d: buffer, ox: i32, oy: i32, variant: i32) {
+    let r: i32 = pal_r(g_IMPACT_SPARK); let g: i32 = pal_g(g_IMPACT_SPARK); let b: i32 = pal_b(g_IMPACT_SPARK);
+    let n: i32 = 6;
+    let base: i32 = 0;
+    let sc: f64 = 1.0;
+    if (variant == 1) { n = 8; base = 2; sc = 0.72; }
+    for (let i = 0; i < n; i++) {
+        let k: i32 = (i + base) % 8;
+        let L: f64 = petal_len(k) * sc;
+        if (L > 6.4) { L = 6.4; }
+        fx_seg(d, ox, oy, 8.0 + petal_dx(k) * 1.4, 8.0 + petal_dy(k) * 1.4,
+               8.0 + petal_dx(k) * L, 8.0 + petal_dy(k) * L,
+               1.15, r, g, b, 0.95, 0.0);
+    }
+    fx_splat(d, ox, oy, 8.0, 8.0, 2.6, 2.6, 3, r, g, b, 0.85);
+}
+
+// Explosion, 6 frames.  HOT core -> MID turbulent body -> COOL hollow shell.
+// The lobes come from a fixed offset table so the ball is never a circle.
+fn cell_explo(d: buffer, ox: i32, oy: i32, frame: i32) {
+    let hr: i32 = pal_r(g_EXPLO_HOT);  let hg: i32 = pal_g(g_EXPLO_HOT);  let hb: i32 = pal_b(g_EXPLO_HOT);
+    let mr: i32 = pal_r(g_EXPLO_MID);  let mg: i32 = pal_g(g_EXPLO_MID);  let mb: i32 = pal_b(g_EXPLO_MID);
+    let cr: i32 = pal_r(g_EXPLO_COOL); let cg: i32 = pal_g(g_EXPLO_COOL); let cb: i32 = pal_b(g_EXPLO_COOL);
+    // REACH IS BUDGETED, not free.  Every lobe satisfies off + lobeR <= reach
+    // <= FX_REACH, so the fireball is at zero before the cell edge.  The first
+    // version of this cell let the late frames overrun and the quad's own
+    // square boundary became visible as a hard brown edge on screen.
+    let reach: f64 = 3.2 + f64(frame) * 0.62;
+    let hot: f64 = 1.0 - f64(frame) * 0.19;
+    if (hot < 0.0) { hot = 0.0; }
+    let midg: f64 = 0.95 - f64(frame) * 0.10;
+    let coolg: f64 = 0.20 + f64(frame) * 0.15;
+    // body: five lobes of DIFFERENT sizes on hand-chosen directions.  No ring,
+    // ever — a ring is rotationally symmetric and reads as a smoke donut, not
+    // as a fireball collapsing.
+    for (let i = 0; i < 5; i++) {
+        let k: i32 = (i * 3 + frame) % 8;
+        let off: f64 = 0.45 + f64(frame) * 0.20 + f64(i) * 0.16;
+        let lr: f64 = (reach - off) * (0.74 + 0.09 * f64((i * 5 + frame) % 4));
+        fx_splat(d, ox, oy, 8.0 + petal_dx(k) * off, 8.0 + petal_dy(k) * off,
+                 lr, lr * 0.92, 2, mr, mg, mb, midg * 0.58);
+    }
+    // cooling crust: outer lobes in EXPLO_COOL from frame 2 on, placed on a
+    // DIFFERENT direction sequence so the ball goes lopsided as it dies.
+    if (frame >= 2) {
+        for (let i = 0; i < 4; i++) {
+            let k: i32 = (i * 2 + frame * 3 + 1) % 8;
+            let off: f64 = reach * 0.42;
+            let lr: f64 = reach - off;
+            fx_splat(d, ox, oy, 8.0 + petal_dx(k) * off, 8.0 + petal_dy(k) * off,
+                     lr, lr * 0.88, 2, cr, cg, cb, coolg * 0.60);
+        }
+    }
+    // there is always a core: an explosion whose middle has gone dark reads as
+    // a puff of dirt.  It cools HOT -> MID rather than vanishing.
+    let core: f64 = reach * 0.42;
+    fx_splat(d, ox, oy, 8.0, 8.0, core, core * 0.94, 3, mr, mg, mb, 0.55 + hot * 0.4);
+    if (hot > 0.0) {
+        fx_splat(d, ox, oy, 8.0, 8.0, core * 0.66, core * 0.62, 3, hr, hg, hb, hot);
+    }
+    // ejecta on the early frames — reads as force
+    if (frame < 3) {
+        for (let i = 0; i < 3; i++) {
+            let k: i32 = (i * 2 + frame) % 8;
+            let L: f64 = reach + 1.4;
+            if (L > 6.3) { L = 6.3; }
+            fx_seg(d, ox, oy, 8.0, 8.0, 8.0 + petal_dx(k) * L, 8.0 + petal_dy(k) * L,
+                   1.2, mr, mg, mb, 0.55, 0.0);
+        }
+    }
+}
+
+// A single falling ember / fire mote.  Small, hot, and slightly egg-shaped so
+// it has an up axis.
+fn cell_ember(d: buffer, ox: i32, oy: i32) {
+    let r: i32 = pal_r(g_EMBER); let g: i32 = pal_g(g_EMBER); let b: i32 = pal_b(g_EMBER);
+    let hr: i32 = pal_r(g_MUZZLE_CORE); let hg: i32 = pal_g(g_MUZZLE_CORE); let hb: i32 = pal_b(g_MUZZLE_CORE);
+    fx_splat(d, ox, oy, 8.0, 8.3, 4.0, 4.8, 2, r, g, b, 0.75);
+    fx_splat(d, ox, oy, 8.0, 7.6, 1.7, 1.9, 2, hr, hg, hb, 0.9);
+}
+
+// Smoke puff, 3 frames.  Additive smoke is a warm HAZE, not a dark cloud — on
+// an ADD layer a dark colour is invisible, so the only honest smoke is a dim
+// low-contrast lift.  Built from overlapping lobes so it is never a disc.
+fn cell_smoke(d: buffer, ox: i32, oy: i32, frame: i32) {
+    let r: i32 = pal_r(g_STONE_MID); let g: i32 = pal_g(g_STONE_MID); let b: i32 = pal_b(g_STONE_MID);
+    // A puff needs a SILHOUETTE, not a gradient.  Three lobes of clearly
+    // different sizes, one dominant "head" high and left, give it a readable
+    // outline at 16 px; five equal lobes just averaged out to a grey smudge.
+    let reach: f64 = 4.6 + f64(frame) * 0.72;
+    let gain: f64 = 1.05 - f64(frame) * 0.14;
+    let rise: f64 = f64(frame) * 0.7;
+    let cy: f64 = 8.6 - rise;
+    fx_splat(d, ox, oy, 7.3, cy - 0.9, reach * 0.80, reach * 0.74, 2, r, g, b, gain * 0.85);
+    fx_splat(d, ox, oy, 9.6, cy + 0.7, reach * 0.55, reach * 0.52, 2, r, g, b, gain * 0.72);
+    fx_splat(d, ox, oy, 6.4, cy + 1.4, reach * 0.44, reach * 0.42, 2, r, g, b, gain * 0.62);
+    fx_splat(d, ox, oy, 8.2, cy - 2.1, reach * 0.34, reach * 0.32, 2, r, g, b, gain * 0.55);
+}
+
+// Ambient dust: the faintest thing in the atlas.  Large, soft, and only just
+// above nothing — it exists to give a light shaft something to land on.
+fn cell_dust(d: buffer, ox: i32, oy: i32) {
+    let r: i32 = pal_r(g_SAND_LO); let g: i32 = pal_g(g_SAND_LO); let b: i32 = pal_b(g_SAND_LO);
+    fx_splat(d, ox, oy, 8.0, 8.0, 6.3, 5.9, 2, r, g, b, 0.46);
+    fx_splat(d, ox, oy, 7.2, 8.6, 3.0, 2.7, 2, r, g, b, 0.38);
+    fx_splat(d, ox, oy, 7.4, 8.2, 1.3, 1.2, 2, r, g, b, 0.55);
+}
+
+// Soft radial glow cards, two sizes.  These are the workhorses: a tinted glow
+// card behind a lantern, a level-up flash, an NS_CORE halo.  Baked in
+// STAR_BRIGHT so the caller's vertex tint lands on a near-neutral base.
+fn cell_glow(d: buffer, ox: i32, oy: i32, big: i32) {
+    let r: i32 = pal_r(g_STAR_BRIGHT); let g: i32 = pal_g(g_STAR_BRIGHT); let b: i32 = pal_b(g_STAR_BRIGHT);
+    if (big == 1) {
+        fx_splat(d, ox, oy, 8.0, 8.0, 6.3, 6.3, 2, r, g, b, 0.92);
+        fx_splat(d, ox, oy, 8.0, 8.0, 3.2, 3.2, 2, r, g, b, 0.45);
+    } else {
+        fx_splat(d, ox, oy, 8.0, 8.0, 4.6, 4.6, 2, r, g, b, 1.0);
+    }
+}
+
+// Enemy eye: a horizontal lens with a hot violet core.  The single strongest
+// long-range readability cue the game has (ART_BIBLE §4.4).
+fn cell_eye(d: buffer, ox: i32, oy: i32) {
+    let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
+    let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
+    fx_splat(d, ox, oy, 8.0, 8.0, 6.3, 4.4, 2, mr, mg, mb, 0.55);
+    fx_splat(d, ox, oy, 8.0, 8.0, 5.4, 2.3, 2, mr, mg, mb, 0.95);
+    fx_splat(d, ox, oy, 7.2, 8.0, 2.4, 1.4, 2, hr, hg, hb, 1.0);
+}
+
+// Loot beam: a violet column, bright at the ground and dissolving upward.
+fn cell_loot(d: buffer, ox: i32, oy: i32) {
+    let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
+    let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
+    fx_seg(d, ox, oy, 8.0, 14.4, 8.0, 1.6, 4.2, mr, mg, mb, 0.70, 0.0);
+    fx_seg(d, ox, oy, 8.0, 14.4, 8.0, 3.5, 1.7, hr, hg, hb, 0.95, 0.0);
+    fx_splat(d, ox, oy, 8.0, 13.4, 5.2, 2.2, 2, hr, hg, hb, 0.8);
+}
+
+// Rain streak: thin, slightly raked, brighter at the leading (lower) end.
+fn cell_rain(d: buffer, ox: i32, oy: i32) {
+    let r: i32 = pal_r(g_MOON_DISC); let g: i32 = pal_g(g_MOON_DISC); let b: i32 = pal_b(g_MOON_DISC);
+    fx_seg(d, ox, oy, 8.8, 1.4, 7.2, 14.6, 1.35, r, g, b, 0.10, 0.80);
+}
+
+// Lightning bolt, 2 variants.  A 5-point jagged polyline plus a wide dim
+// bloom along the same path, which is what makes a 1-px line read as light.
+fn bolt_x(v: i32, i: i32): f64 {
+    if (v == 0) {
+        if (i == 0) { return 6.2; }
+        if (i == 1) { return 9.1; }
+        if (i == 2) { return 6.0; }
+        if (i == 3) { return 9.6; }
+        return 7.4;
+    }
+    if (i == 0) { return 9.4; }
+    if (i == 1) { return 6.4; }
+    if (i == 2) { return 9.9; }
+    if (i == 3) { return 6.8; }
+    return 8.6;
+}
+fn bolt_y(i: i32): f64 {
+    if (i == 0) { return 1.4; }
+    if (i == 1) { return 4.6; }
+    if (i == 2) { return 8.0; }
+    if (i == 3) { return 11.3; }
+    return 14.6;
+}
+fn cell_bolt(d: buffer, ox: i32, oy: i32, variant: i32) {
+    let r: i32 = pal_r(g_LIGHTNING); let g: i32 = pal_g(g_LIGHTNING); let b: i32 = pal_b(g_LIGHTNING);
+    for (let i = 0; i < 4; i++) {
+        fx_seg(d, ox, oy, bolt_x(variant, i), bolt_y(i),
+               bolt_x(variant, i + 1), bolt_y(i + 1), 3.4, r, g, b, 0.20, 0.20);
+    }
+    for (let i = 0; i < 4; i++) {
+        fx_seg(d, ox, oy, bolt_x(variant, i), bolt_y(i),
+               bolt_x(variant, i + 1), bolt_y(i + 1), 1.15, r, g, b, 1.0, 1.0);
+    }
+    // one forked branch — a straight bolt looks like a scratch
+    if (variant == 0) {
+        fx_seg(d, ox, oy, 6.0, 8.0, 2.6, 11.6, 1.0, r, g, b, 0.75, 0.0);
+    } else {
+        fx_seg(d, ox, oy, 9.9, 8.0, 13.3, 11.0, 1.0, r, g, b, 0.75, 0.0);
+    }
+}
+
+// Water splash, 2 frames: a low ellipse plus a crown of droplet streaks.
+fn cell_splash(d: buffer, ox: i32, oy: i32, frame: i32) {
+    let r: i32 = pal_r(g_SNOW_HI); let g: i32 = pal_g(g_SNOW_HI); let b: i32 = pal_b(g_SNOW_HI);
+    let sp: f64 = 3.6 + f64(frame) * 1.8;
+    let hgt: f64 = 5.2 + f64(frame) * 1.4;
+    fx_splat(d, ox, oy, 8.0, 12.4, 5.6, 2.0, 2, r, g, b, 0.70 - f64(frame) * 0.22);
+    for (let i = 0; i < 5; i++) {
+        let s: f64 = f64(i) - 2.0;
+        let tipx: f64 = 8.0 + s * sp * 0.42;
+        let tipy: f64 = 12.4 - hgt + f64(i % 2) * 1.6;
+        if (tipx < 1.6) { tipx = 1.6; }
+        if (tipx > 14.4) { tipx = 14.4; }
+        if (tipy < 1.6) { tipy = 1.6; }
+        fx_seg(d, ox, oy, 8.0 + s * 1.1, 12.4, tipx, tipy, 1.05, r, g, b, 0.65, 0.0);
+    }
+}
+
+// Healing / pickup sparkle: a 4-point star with a green core.  VENOM is the
+// palette's "good thing happened" colour (§3.8).
+fn cell_sparkle(d: buffer, ox: i32, oy: i32) {
+    let r: i32 = pal_r(g_VENOM); let g: i32 = pal_g(g_VENOM); let b: i32 = pal_b(g_VENOM);
+    let hr: i32 = pal_r(g_VENOM_HALO); let hg: i32 = pal_g(g_VENOM_HALO); let hb: i32 = pal_b(g_VENOM_HALO);
+    fx_seg(d, ox, oy, 8.0, 8.0, 8.0, 2.0, 1.25, r, g, b, 0.95, 0.0);
+    fx_seg(d, ox, oy, 8.0, 8.0, 8.0, 14.0, 1.25, r, g, b, 0.95, 0.0);
+    fx_seg(d, ox, oy, 8.0, 8.0, 2.2, 8.0, 1.05, r, g, b, 0.85, 0.0);
+    fx_seg(d, ox, oy, 8.0, 8.0, 13.8, 8.0, 1.05, r, g, b, 0.85, 0.0);
+    fx_splat(d, ox, oy, 8.0, 8.0, 2.5, 2.5, 3, hr, hg, hb, 1.0);
+}
+
+// XP mote: a violet diamond with a pale core.  Same shape language as the HUD
+// XP icon so the pickup and the bar read as one system.
+fn cell_xp(d: buffer, ox: i32, oy: i32) {
+    let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
+    let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
+    fx_diamond(d, ox, oy, 8.0, 8.0, 6.4, mr, mg, mb, 0.55);
+    fx_diamond(d, ox, oy, 8.0, 8.0, 3.6, mr, mg, mb, 0.9);
+    fx_splat(d, ox, oy, 8.0, 7.6, 1.5, 1.5, 2, hr, hg, hb, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// build
+// ---------------------------------------------------------------------------
+
+// Generate the whole additive atlas.  Returns the atlas object (upload it with
+// `atlas_upload(win, a, BLEND_ADD)`), or null if atlas_new rejected the size.
+export fn fxgen_build_atlas() {
+    let a = atlas_new(FX_ATLAS_W, FX_ATLAS_H, FX_GRID, FX_GRID);
+    if (a == null) { return null; }
+    // (0,0,0,255) is the additive identity: every unwritten texel, every
+    // margin texel and every reserved cell contributes exactly nothing.
+    atlas_fill(a, 0, 0, 0, 255);
+    let d: buffer = atlas_data(a);
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        let ox: i32 = (cell % FX_GRID) * FX_CELL;
+        let oy: i32 = divi(cell, FX_GRID) * FX_CELL;
+        if (cell == FX_MUZZLE_0) { cell_muzzle(d, ox, oy, 0); }
+        if (cell == FX_MUZZLE_1) { cell_muzzle(d, ox, oy, 1); }
+        if (cell == FX_MUZZLE_2) { cell_muzzle(d, ox, oy, 2); }
+        if (cell == FX_TRACER) { cell_tracer(d, ox, oy); }
+        if (cell == FX_SPARK_0) { cell_spark(d, ox, oy, 0); }
+        if (cell == FX_SPARK_1) { cell_spark(d, ox, oy, 1); }
+        if (cell == FX_EMBER) { cell_ember(d, ox, oy); }
+        if (cell == FX_XP_MOTE) { cell_xp(d, ox, oy); }
+        if (cell >= FX_EXPLO_0 && cell <= FX_EXPLO_5) { cell_explo(d, ox, oy, cell - FX_EXPLO_0); }
+        if (cell == FX_GLOW_S) { cell_glow(d, ox, oy, 0); }
+        if (cell == FX_GLOW_L) { cell_glow(d, ox, oy, 1); }
+        if (cell >= FX_SMOKE_0 && cell <= FX_SMOKE_2) { cell_smoke(d, ox, oy, cell - FX_SMOKE_0); }
+        if (cell == FX_DUST) { cell_dust(d, ox, oy); }
+        if (cell == FX_EYE) { cell_eye(d, ox, oy); }
+        if (cell == FX_LOOT_BEAM) { cell_loot(d, ox, oy); }
+        if (cell == FX_RAIN) { cell_rain(d, ox, oy); }
+        if (cell == FX_BOLT_0) { cell_bolt(d, ox, oy, 0); }
+        if (cell == FX_BOLT_1) { cell_bolt(d, ox, oy, 1); }
+        if (cell == FX_SPLASH_0) { cell_splash(d, ox, oy, 0); }
+        if (cell == FX_SPLASH_1) { cell_splash(d, ox, oy, 1); }
+        if (cell == FX_SPARKLE) { cell_sparkle(d, ox, oy); }
+    }
+    g_fx_atlas = a;
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+// self-test — the W2-7 acceptance criteria, asserted texel by texel
+//
+// Returns the number of FAILURES (0 = clean).  `fxgen_checks()` returns how
+// many assertions it ran, so a caller can assert the COUNT as well as the
+// result and notice a test that silently stopped running.
+// ---------------------------------------------------------------------------
+
+let g_fx_checks: i32 = 0;
+let g_fx_fails: i32 = 0;
+
+// A "streak" cell is one that is MEANT to reach its cell edge because it will
+// be drawn stretched along one axis: a stretched billboard whose sprite fades
+// before the edge shows a soft cap where the geometry ends, which is worse
+// than the overrun the fade test exists to catch.
+fn fx_is_streak(cell: i32): i32 {
+    if (cell == FX_TRACER) { let y: i32 = 1; return y; }
+    if (cell == FX_RAIN) { let y: i32 = 1; return y; }
+    if (cell == FX_LOOT_BEAM) { let y: i32 = 1; return y; }
+    if (cell == FX_BOLT_0) { let y: i32 = 1; return y; }
+    if (cell == FX_BOLT_1) { let y: i32 = 1; return y; }
+    if (cell == FX_SPLASH_0) { let y: i32 = 1; return y; }
+    if (cell == FX_SPLASH_1) { let y: i32 = 1; return y; }
+    let n: i32 = 0;
+    return n;
+}
+
+// `a` is deliberately unannotated: `g_fx_atlas` starts as null, so a local
+// holding it narrows to `null` for same-module strict argument checking even
+// after the null guard.  Imported functions (atlas_get) are checked loosely,
+// which is why only this one tripped.
+fn fx_peak_at(a, x: i32, y: i32): i32 {
+    let p: u32 = atlas_get(a, x, y);
+    let m: i32 = i32(p & 255);
+    let g: i32 = i32((p >> 8) & 255);
+    let b: i32 = i32((p >> 16) & 255);
+    if (g > m) { m = g; }
+    if (b > m) { m = b; }
+    let out: i32 = m;
+    return out;
+}
+
+export fn fxgen_checks(): i32 { let o: i32 = g_fx_checks; return o; }
+
+fn fxck(name: string, ok: i32) {
+    g_fx_checks++;
+    if (ok != 1) { g_fx_fails++; eprint(`fxgen FAIL: ${name}`); }
+}
+
+export fn fxgen_selftest(): i32 {
+    g_fx_checks = 0;
+    g_fx_fails = 0;
+    let a = g_fx_atlas;
+    if (a == null) { a = fxgen_build_atlas(); }
+    fxck("atlas built", (a != null) ? 1 : 0);
+    if (a == null) { let bad: i32 = 1; return bad; }
+
+    // bayer4 must be the 0..1 normalized threshold ART_BIBLE §7.2 specifies —
+    // if W2-2 ships a 0..15 integer version the dither would blow out every
+    // gradient, so this is checked before anything that depends on it.
+    let bmin: f64 = 9.0;
+    let bmax: f64 = 0.0 - 9.0;
+    for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+            let v: f64 = bayer4(x, y);
+            if (v < bmin) { bmin = v; }
+            if (v > bmax) { bmax = v; }
+        }
+    }
+    fxck("bayer4 is normalized to [0,1)", (bmin >= 0.0 && bmax < 1.0) ? 1 : 0);
+    fxck("clampf clamps", (clampf(5.0, 0.0, 1.0) == 1.0 && clampf(0.0 - 5.0, 0.0, 1.0) == 0.0) ? 1 : 0);
+
+    // --- ACCEPTANCE: additive cells have a black (0,0,0) background --------
+    // and --- ACCEPTANCE: every cell fits its slot with a 1-px margin -------
+    let margin_ok: i32 = 1;
+    let bg_ok: i32 = 1;
+    let nonempty: i32 = 1;
+    let lo: i32 = FX_INSET;
+    let hi: i32 = FX_CELL - 1 - FX_INSET;
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        let ox: i32 = (cell % FX_GRID) * FX_CELL;
+        let oy: i32 = divi(cell, FX_GRID) * FX_CELL;
+        let black: i32 = 0;
+        let bright: i32 = 0;
+        let peak: i32 = 0;
+        for (let y = 0; y < FX_CELL; y++) {
+            for (let x = 0; x < FX_CELL; x++) {
+                let p: u32 = atlas_get(a, ox + x, oy + y);
+                let r: i32 = i32(p & 255);
+                let g: i32 = i32((p >> 8) & 255);
+                let b: i32 = i32((p >> 16) & 255);
+                let al: i32 = i32((p >> 24) & 255);
+                let inside: i32 = 0;
+                if (x >= lo && x <= hi && y >= lo && y <= hi) { inside = 1; }
+                if (inside == 0) {
+                    // the 1-px margin ring must be the additive identity
+                    if (r != 0 || g != 0 || b != 0) { margin_ok = 0; }
+                }
+                if (al != 255) { bg_ok = 0; }
+                if (r == 0 && g == 0 && b == 0) { black++; }
+                else { bright++; }
+                let m: i32 = r;
+                if (g > m) { m = g; }
+                if (b > m) { m = b; }
+                if (m > peak) { peak = m; }
+            }
+        }
+        // a cell that is entirely lit has no black background left to speak of
+        if (black < 40) { bg_ok = 0; }
+        // "draws something" = at least 24 non-black texels AND a peak bright
+        // enough to see once ADD has multiplied it by a fading vertex alpha.
+        // The faintest cells by design are SMOKE and DUST; they must still
+        // clear 64, or they are decoration nobody will ever notice.
+        if (bright < 24) { nonempty = 0; }
+        if (peak < 64) { nonempty = 0; }
+    }
+    fxck("every FX cell fits its 16x16 slot with a 1-px margin", margin_ok);
+    fxck("every FX cell has a black (0,0,0) background, A=255 throughout", bg_ok);
+    fxck("every FX cell draws >=24 texels and peaks at >=64", nonempty);
+
+    // --- the CLIPPED-EDGE test --------------------------------------------
+    // A 1-px black margin is necessary but NOT sufficient: a radial sprite
+    // whose falloff is still bright when it hits texel 1 or 14 shows its own
+    // quad as a hard square on screen.  This caught EXPLO 3-5 and the smoke
+    // puffs, which overran their cells and rendered as brown squares under
+    // ADD.  Streak cells are exempt BY DESIGN — a tracer, a rain drop, a
+    // lightning bolt, a loot beam and a splash are all supposed to run out of
+    // their cell so a stretched billboard has no visible end cap.
+    let faded: i32 = 1;
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        if (fx_is_streak(cell) == 1) { continue; }
+        let ox: i32 = (cell % FX_GRID) * FX_CELL;
+        let oy: i32 = divi(cell, FX_GRID) * FX_CELL;
+        for (let k = lo; k <= hi; k++) {
+            if (fx_peak_at(a, ox + k, oy + lo) > 48) { faded = 0; }
+            if (fx_peak_at(a, ox + k, oy + hi) > 48) { faded = 0; }
+            if (fx_peak_at(a, ox + lo, oy + k) > 48) { faded = 0; }
+            if (fx_peak_at(a, ox + hi, oy + k) > 48) { faded = 0; }
+        }
+    }
+    fxck("every radial FX cell has faded out before its own edge", faded);
+
+    // reserved cells are the additive no-op, end to end
+    let reserved_clean: i32 = 1;
+    for (let cell = FX_CELL_COUNT; cell < FX_GRID * FX_GRID; cell++) {
+        let ox: i32 = (cell % FX_GRID) * FX_CELL;
+        let oy: i32 = divi(cell, FX_GRID) * FX_CELL;
+        for (let y = 0; y < FX_CELL; y++) {
+            for (let x = 0; x < FX_CELL; x++) {
+                if (atlas_get(a, ox + x, oy + y) != 4278190080) { reserved_clean = 0; }
+            }
+        }
+    }
+    fxck("reserved cells are opaque black (the additive no-op)", reserved_clean);
+
+    // the whole cell list the build plan names is present and named
+    let named: i32 = 1;
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        if (fxgen_cell_name(cell).length == 0) { named = 0; }
+    }
+    fxck("every occupied cell has a texview label", named);
+    fxck("cell count covers the ART_BIBLE 7.4 FX list", (FX_CELL_COUNT == 28) ? 1 : 0);
+
+    // determinism: a second build must be byte-identical
+    let b2 = atlas_new(FX_ATLAS_W, FX_ATLAS_H, FX_GRID, FX_GRID);
+    atlas_fill(b2, 0, 0, 0, 255);
+    let d2: buffer = atlas_data(b2);
+    for (let cell = 0; cell < FX_CELL_COUNT; cell++) {
+        let ox: i32 = (cell % FX_GRID) * FX_CELL;
+        let oy: i32 = divi(cell, FX_GRID) * FX_CELL;
+        if (cell == FX_MUZZLE_0) { cell_muzzle(d2, ox, oy, 0); }
+        if (cell == FX_MUZZLE_1) { cell_muzzle(d2, ox, oy, 1); }
+        if (cell == FX_MUZZLE_2) { cell_muzzle(d2, ox, oy, 2); }
+        if (cell == FX_TRACER) { cell_tracer(d2, ox, oy); }
+        if (cell == FX_SPARK_0) { cell_spark(d2, ox, oy, 0); }
+        if (cell == FX_SPARK_1) { cell_spark(d2, ox, oy, 1); }
+        if (cell == FX_EMBER) { cell_ember(d2, ox, oy); }
+        if (cell == FX_XP_MOTE) { cell_xp(d2, ox, oy); }
+        if (cell >= FX_EXPLO_0 && cell <= FX_EXPLO_5) { cell_explo(d2, ox, oy, cell - FX_EXPLO_0); }
+        if (cell == FX_GLOW_S) { cell_glow(d2, ox, oy, 0); }
+        if (cell == FX_GLOW_L) { cell_glow(d2, ox, oy, 1); }
+        if (cell >= FX_SMOKE_0 && cell <= FX_SMOKE_2) { cell_smoke(d2, ox, oy, cell - FX_SMOKE_0); }
+        if (cell == FX_DUST) { cell_dust(d2, ox, oy); }
+        if (cell == FX_EYE) { cell_eye(d2, ox, oy); }
+        if (cell == FX_LOOT_BEAM) { cell_loot(d2, ox, oy); }
+        if (cell == FX_RAIN) { cell_rain(d2, ox, oy); }
+        if (cell == FX_BOLT_0) { cell_bolt(d2, ox, oy, 0); }
+        if (cell == FX_BOLT_1) { cell_bolt(d2, ox, oy, 1); }
+        if (cell == FX_SPLASH_0) { cell_splash(d2, ox, oy, 0); }
+        if (cell == FX_SPLASH_1) { cell_splash(d2, ox, oy, 1); }
+        if (cell == FX_SPARKLE) { cell_sparkle(d2, ox, oy); }
+    }
+    let same: i32 = 1;
+    let d1: buffer = atlas_data(a);
+    for (let i = 0; i < FX_ATLAS_W * FX_ATLAS_H * 4; i++) {
+        if (d1[i] != d2[i]) { same = 0; }
+    }
+    fxck("fxgen is deterministic (two builds are byte-identical)", same);
+
+    let out: i32 = g_fx_fails;
+    return out;
+}

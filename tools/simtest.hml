@@ -1,0 +1,546 @@
+// =============================================================================
+//  simtest.hml — the headless 10 000-tick sim runner.          W2-13.
+// =============================================================================
+//
+//  THE POINT OF THIS FILE IS WHAT IT DOES *NOT* LINK.
+//
+//  `src/sim/**` is the future dedicated server. It must run with no window, no
+//  renderer, no audio device and no wall clock, on a box that has never had SDL
+//  installed. The gate is one line:
+//
+//      hemlockc -O1 tools/simtest.hml -o /tmp/simtest
+//      nm /tmp/simtest | grep -c SDL_          # MUST print 0
+//
+//  Everything else here — 10 000 ticks, seven trials, the position hash — is in
+//  service of the second half of the same claim: that the sim is *reproducible*.
+//  A sim that links SDL is not a server; a sim that does not reproduce is not a
+//  sim.
+//
+//  IMPORTS (the wall, CLAUDE.md §3): `src/sim/**`, `src/core/**`, `@stdlib/math`
+//  and `@stdlib/process` for the exit code. Nothing else, ever. `ci_imports.sh`
+//  enforces this on `src/`; this file is held to the sim's own standard because
+//  it is the thing that proves the standard.
+//
+// -----------------------------------------------------------------------------
+//  THE WAVE-2 STAND-IN TICK  — read this before you change st_tick()
+// -----------------------------------------------------------------------------
+//  `src/sim/sim.hml` (`sim_step`, `sim_apply_command`, `sim_effects`) is a
+//  WAVE 4 file. It does not exist yet. Rather than leave the determinism gate
+//  unbuilt until Wave 4, `st_tick()` below is a deliberately small stand-in
+//  with the same *shape* as the real thing:
+//
+//      * it reads input ONLY through `InputCommand` accessors, dequantized;
+//      * it is pure with respect to the world — no print, no clock, no RNG that
+//        is not seeded from (world_seed, stream, tick, entity);
+//      * it hoists the SoA field arrays into locals and writes them directly,
+//        exactly as `world.hml`'s performance contract requires;
+//      * it calls `history_capture` every tick, even though nothing samples it;
+//      * it routes every cosmetic through `st_effects()`, which is skipped when
+//        `world.replaying == 1` (ARCHITECTURE §3).
+//
+//  When W4 lands `sim.hml`, delete `st_tick` and call `sim_step(w, tick)`. The
+//  golden hash below changes exactly once, in this file and in `replay.hml`.
+//
+// -----------------------------------------------------------------------------
+//  TIMING (CLAUDE.md §1.2 / RULE T)
+// -----------------------------------------------------------------------------
+//  This box permanently shares ~17 of 24 cores with a `llama-server`. Timing is
+//  `__clock()` CPU time, minimum of 7 whole-run batches. The bound is a
+//  REGRESSION GUARD at ~2x the loaded measurement, not a certification of an
+//  idle machine — see the assertion text for both numbers.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sin, cos, sqrt } from "@stdlib/math";
+
+import { g_TICK_DT, g_SPEED_WALK, g_SPEED_SPRINT, g_ACCEL_GROUND,
+         g_FRICTION_GROUND, g_AIR_CONTROL, g_GRAVITY, g_JUMP_IMPULSE,
+         g_BUDGET_SIM_MS } from "../src/core/config.hml";
+
+import { rng_new, rng_seed, rng_f11 } from "../src/sim/rng.hml";
+import { RNG_AI, RNG_WORLDGEN } from "../src/sim/rng.hml";
+
+import { cmd_new, cmd_set, cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, cmd_btn,
+         cmd_wire_ok, BTN_FIRE, BTN_JUMP, BTN_SPRINT } from "../src/sim/command.hml";
+
+import { world_new_cap, world_spawn, world_spawn_player, world_count,
+         world_set_tick, world_set_seed, world_set_replaying, world_replaying, world_id_of,
+         world_check, world_reset_session, KIND_AI } from "../src/sim/world.hml";
+
+import { history_new, history_capture, history_capture_count, history_sample,
+         HIST_PX, HIST_PY, HIST_PZ, HIST_FIELDS } from "../src/sim/history.hml";
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_ST_TICKS: i32  = 10000;   // the acceptance number, verbatim
+let g_ST_TRIALS: i32 = 7;       // RULE T: minimum-of-N, N = 7
+let g_ST_SEED: i32   = 1337;
+let g_ST_AI: i32     = 63;      // + 1 player = 64 entities
+let g_ST_CAP: i32    = 128;
+
+// The determinism anchor. `replay.hml` asserts the SAME constant, so the two
+// tools cannot drift apart silently, and a toolchain change that alters f64
+// arithmetic shows up here rather than in a screenshot three waves later.
+// Measured on this box (v2.9.1, 64 entities, 10 000 ticks, min-of-7 CPU time,
+// llama-server holding ~17/24 cores): compiled -O1 and INTERPRETED agree
+// bit-for-bit.
+let g_ST_GOLDEN: u64 = 16594734899016964914;
+
+// RULE T regression guards. `sim_per` (tick + history_capture, no test hash)
+// measured LOADED at 0.0205 ms compiled and 0.1860 ms interpreted. The guards
+// are ~2x each; an idle box can only be faster, never slower, so a guard set
+// from a loaded measurement never false-fails on machine state. The sim budget
+// itself is g_BUDGET_SIM_MS = 2.0 ms/tick, ~100x the compiled measurement.
+let g_ST_MS_GUARD: f64        = 0.042;   // compiled  (2.05x of 0.0205 loaded)
+let g_ST_MS_GUARD_INTERP: f64 = 0.380;   // interpreted (2.04x of 0.1860 loaded)
+
+// ---------------------------------------------------------------------------
+// ASSERTIONS
+// ---------------------------------------------------------------------------
+// Cold-path number -> string. Template strings are banned per-frame (N3);
+// every use in this file is in the report or an assertion message.
+fn sv(p_v): string {
+    let out: string = `${p_v}`;
+    return out;
+}
+
+let g_asserts: i32 = 0;
+let g_pass: i32 = 0;
+
+// Are we the compiled artifact? Under the interpreter argv[0] is the .hml
+// script; compiled it is the binary. The game ships compiled, so that is the
+// path the timing guard is set for (ARCHITECTURE §7 makes the same call for
+// shot.hml).
+fn st_compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn ck(p_ok: i32, p_msg: string) {
+    g_asserts = g_asserts + 1;
+    if (p_ok == 1) { g_pass = g_pass + 1; }
+    else { print("  FAIL: " + p_msg); }
+}
+
+// ---------------------------------------------------------------------------
+// THE POSITION HASH — u64 only (CLAUDE.md A13: i32/i64 * + - TRAP on overflow)
+// ---------------------------------------------------------------------------
+// FNV-1a-flavoured, fed quantized millimetres so the hash is a statement about
+// the simulation and not about the last bit of an f64.
+fn st_mix(p_h: u64, p_k: i32): u64 {
+    let h: u64 = p_h;
+    let k: i32 = p_k;
+    let u: u64 = u64(k & 2147483647);       // reinterpret i32 as its u32 bits
+    if (k < 0) { u = u + 2147483648; }
+    h = h ^ u;
+    h = h * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+// Fold the whole transform group of the world into the running hash.
+fn st_hash_world(p_h: u64, p_w: object): u64 {
+    let w: object = p_w;
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let yaw: array<f64> = w.yaw;
+    let n: i32 = w.count;
+    let h: u64 = p_h;
+    let i: i32 = 0;
+    while (i < n) {
+        h = st_mix(h, i32(px[i] * 1000.0));
+        h = st_mix(h, i32(py[i] * 1000.0));
+        h = st_mix(h, i32(pz[i] * 1000.0));
+        h = st_mix(h, i32(yaw[i] * 10000.0));
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE SCRIPTED INPUT — a function of (tick, seed) and nothing else
+// ---------------------------------------------------------------------------
+// No wall clock, no @stdlib/random, no input device. It walks forward, strafes
+// every other 2 seconds, sprints half the time, jumps on a prime cadence and
+// fires on another, so the button field is never constant and the movement
+// never settles into a fixed point.
+fn st_script(p_c: object, p_rs: array, p_tick: i32, p_seed: i32) {
+    let t: i32 = p_tick;
+    rng_seed(p_rs, p_seed, RNG_AI, t, 0);
+    let jitter: f64 = rng_f11(p_rs) * 0.02;
+
+    let yw: f64 = f64(t) * 0.004 + jitter;
+    let mx: f64 = 0.0;
+    let my: f64 = 1.0;
+    if ((t % 240) >= 120) { mx = 1.0; my = 0.0; }
+
+    let btn: i32 = 0;
+    if ((t % 97) == 0)  { btn = btn | BTN_JUMP; }
+    if ((t % 13) == 0)  { btn = btn | BTN_FIRE; }
+    if ((t % 300) < 150) { btn = btn | BTN_SPRINT; }
+
+    cmd_set(p_c, t, 17, mx, my, yw, 0.15, btn, 0, t);
+}
+
+// ---------------------------------------------------------------------------
+// COSMETICS — the thing that must NOT happen during a replay
+// ---------------------------------------------------------------------------
+// Stands in for `sim_effects()`. ARCHITECTURE §3: replaying 8 commands must
+// produce 0 sounds. `replay.hml` asserts this counter stays at 0 for the whole
+// replay pass.
+let g_effects: i32 = 0;
+
+fn st_effects(p_w: object, p_c: object) {
+    let w: object = p_w;
+    if (w.replaying == 1) { return; }
+    if (cmd_btn(p_c, BTN_FIRE) == 1) { g_effects = g_effects + 1; }
+}
+
+// ---------------------------------------------------------------------------
+// THE TICK — the Wave-2 stand-in for sim_step(world, tick)
+// ---------------------------------------------------------------------------
+// Hot: 64..512 entities x 10 000 ticks. Written to the CLAUDE.md §4 skeleton —
+// parameters copied into typed locals, SoA arrays hoisted before the loop,
+// no allocation, no object literal, no closure, no defer, no try, no throw.
+fn st_tick(p_w: object, p_c: object) {
+    let w: object = p_w;
+    let c: object = p_c;
+
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let vx: array<f64> = w.vx;
+    let vy: array<f64> = w.vy;
+    let vz: array<f64> = w.vz;
+    let yaw: array<f64> = w.yaw;
+    let pitch: array<f64> = w.pitch;
+    let n: i32 = w.count;
+
+    let dt: f64 = g_TICK_DT;
+
+    // ---- input, dequantized exactly as the server would read it -----------
+    let mx: f64 = cmd_move_x(c);
+    let my: f64 = cmd_move_y(c);
+    let yw: f64 = cmd_yaw(c);
+    let pt: f64 = cmd_pitch(c);
+    let jump: i32 = cmd_btn(c, BTN_JUMP);
+    let sprint: i32 = cmd_btn(c, BTN_SPRINT);
+
+    let sy: f64 = sin(yw);
+    let cy: f64 = cos(yw);
+    let wx: f64 = mx * cy + my * sy;
+    let wz: f64 = 0.0 - mx * sy + my * cy;
+
+    let spd: f64 = g_SPEED_WALK;
+    if (sprint == 1) { spd = g_SPEED_SPRINT; }
+
+    // ---- slot 0: the player ------------------------------------------------
+    let ax: f64 = vx[0];
+    let ay: f64 = vy[0];
+    let az: f64 = vz[0];
+    let grounded: i32 = 0;
+    if (py[0] <= 0.0) { grounded = 1; }
+
+    if (grounded == 1) {
+        let fr: f64 = 1.0 - g_FRICTION_GROUND * dt;
+        if (fr < 0.0) { fr = 0.0; }
+        ax = ax * fr;
+        az = az * fr;
+        ax = ax + wx * g_ACCEL_GROUND * dt;
+        az = az + wz * g_ACCEL_GROUND * dt;
+        if (jump == 1) { ay = g_JUMP_IMPULSE; }
+    } else {
+        ax = ax + wx * g_ACCEL_GROUND * g_AIR_CONTROL * dt;
+        az = az + wz * g_ACCEL_GROUND * g_AIR_CONTROL * dt;
+    }
+
+    let sp2: f64 = ax * ax + az * az;
+    let lim: f64 = spd * spd;
+    if (sp2 > lim) {
+        let s: f64 = sqrt(lim / sp2);
+        ax = ax * s;
+        az = az * s;
+    }
+    ay = ay - g_GRAVITY * dt;
+
+    px[0] = px[0] + ax * dt;
+    py[0] = py[0] + ay * dt;
+    pz[0] = pz[0] + az * dt;
+    if (py[0] < 0.0) {
+        py[0] = 0.0;
+        if (ay < 0.0) { ay = 0.0; }
+    }
+    vx[0] = ax;
+    vy[0] = ay;
+    vz[0] = az;
+    yaw[0] = yw;
+    pitch[0] = pt;
+
+    // ---- slots 1..n-1: a deterministic orbit-and-seek ----------------------
+    // Seek plus a tangential term, so the swarm never converges to a fixed
+    // point and the hash keeps moving for all 10 000 ticks. (A converged sim
+    // makes a determinism test pass for the wrong reason.)
+    let tx: f64 = px[0];
+    let tz: f64 = pz[0];
+    let step: f64 = 2.6 * dt;
+    let i: i32 = 1;
+    while (i < n) {
+        let ex: f64 = px[i];
+        let ez: f64 = pz[i];
+        let dx: f64 = tx - ex;
+        let dz: f64 = tz - ez;
+        let d2: f64 = dx * dx + dz * dz;
+        if (d2 > 0.0001) {
+            let inv: f64 = 1.0 / sqrt(d2);
+            let ux: f64 = dx * inv;
+            let uz: f64 = dz * inv;
+            ex = ex + (ux + (0.0 - uz) * 0.6) * step;
+            ez = ez + (uz + ux * 0.6) * step;
+        }
+        px[i] = ex;
+        pz[i] = ez;
+        yaw[i] = yaw[i] + 0.017;
+        if (yaw[i] > 6.283185307179586) { yaw[i] = yaw[i] - 6.283185307179586; }
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WORLD SETUP — identical every trial, so seven runs are seven reproductions
+// ---------------------------------------------------------------------------
+// Returns the player's SLOT. `world_spawn_player` takes a player slot 1..64 and
+// returns the dense slot it landed in — the entity's *id* is the player slot,
+// which both tools assert through `world_id_of`, because an id scheme that
+// drifts is a bug that first shows up in a packet three waves later.
+fn st_populate(p_w: object, p_rs: array, p_seed: i32): i32 {
+    let w: object = p_w;
+    world_reset_session(w, p_seed);
+
+    let pslot: i32 = world_spawn_player(w, 1);
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    px[0] = 0.0; py[0] = 0.0; pz[0] = 0.0;
+
+    let n: i32 = g_ST_AI;
+    let i: i32 = 0;
+    while (i < n) {
+        let id: i32 = world_spawn(w, KIND_AI, 0);
+        rng_seed(p_rs, p_seed, RNG_WORLDGEN, 0, id);
+        let slot: i32 = i + 1;
+        px[slot] = rng_f11(p_rs) * 20.0;
+        py[slot] = 0.0;
+        pz[slot] = rng_f11(p_rs) * 20.0;
+        i++;
+    }
+    let out: i32 = pslot;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// ONE FULL RUN — returns the folded position hash over every tick
+// ---------------------------------------------------------------------------
+fn st_run(p_w: object, p_h: object, p_c: object, p_rs: array, p_ticks: i32): u64 {
+    let w: object = p_w;
+    let hist: object = p_h;
+    let c: object = p_c;
+    let rs: array = p_rs;
+    let ticks: i32 = p_ticks;
+
+    let h: u64 = 14695981039346656037;
+    let t: i32 = 0;
+    while (t < ticks) {
+        st_script(c, rs, t, w.seed);
+        world_set_tick(w, t);
+        st_tick(w, c);
+        history_capture(hist, w);
+        st_effects(w, c);
+        h = st_hash_world(h, w);
+        t++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// The same loop with the test hash removed, so the reported sim cost is the
+// sim's cost and not the harness's.
+fn st_run_nohash(p_w: object, p_h: object, p_c: object, p_rs: array, p_ticks: i32) {
+    let w: object = p_w;
+    let hist: object = p_h;
+    let c: object = p_c;
+    let rs: array = p_rs;
+    let ticks: i32 = p_ticks;
+    let t: i32 = 0;
+    while (t < ticks) {
+        st_script(c, rs, t, w.seed);
+        world_set_tick(w, t);
+        st_tick(w, c);
+        history_capture(hist, w);
+        st_effects(w, c);
+        t++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------------------------
+fn main() {
+    print("== simtest: headless sim runner ==");
+    print("  ticks/run   " + sv(g_ST_TICKS));
+    print("  entities    " + sv(g_ST_AI + 1));
+    print("  trials      " + sv(g_ST_TRIALS) + "  (RULE T: min-of-N CPU time)");
+
+    let w: object = world_new_cap(g_ST_CAP);
+    let hist: object = history_new(g_ST_CAP);
+    let c: object = cmd_new();
+    let rs: array = rng_new();
+
+    // ---- seven whole-run trials -------------------------------------------
+    let best: f64 = 1000000.0;
+    let worst: f64 = 0.0;
+    let h0: u64 = 0;
+    let same: i32 = 1;
+    let trial: i32 = 0;
+    while (trial < g_ST_TRIALS) {
+        st_populate(w, rs, g_ST_SEED);
+        let t0: f64 = __clock();
+        let h: u64 = st_run(w, hist, c, rs, g_ST_TICKS);
+        let t1: f64 = __clock();
+        let ms: f64 = (t1 - t0) * 1000.0;
+        if (ms < best) { best = ms; }
+        if (ms > worst) { worst = ms; }
+        if (trial == 0) { h0 = h; }
+        if (h != h0) { same = 0; }
+        trial++;
+    }
+
+    // A second measurement WITHOUT the position hash: the hash is test
+    // scaffolding and the sim budget must not be charged for it.
+    let pid0: i32 = st_populate(w, rs, g_ST_SEED);
+    let s0: f64 = __clock();
+    st_run_nohash(w, hist, c, rs, g_ST_TICKS);
+    let s1: f64 = __clock();
+    let sim_ms: f64 = (s1 - s0) * 1000.0;
+    let sim_per: f64 = sim_ms / f64(g_ST_TICKS);
+
+    let per: f64 = best / f64(g_ST_TICKS);
+    print("  hash        " + sv(h0));
+    print("  cpu         min " + sv(best) + " ms / run, max " + sv(worst) + " ms");
+    print("  per tick    " + sv(per) + " ms  (incl. the test hash — harness cost, not sim cost)");
+    print("  sim only    " + sv(sim_per) + " ms/tick  (tick + history_capture; budget "
+          + sv(g_BUDGET_SIM_MS) + " ms)");
+    print("  backend     " + sv(st_compiled()) + "  (1 = compiled, 0 = interpreted)");
+    print("  effects     " + sv(g_effects) + " (cosmetics fired, replaying == 0)");
+
+    // ---- assertions --------------------------------------------------------
+    ck(same, "all 7 trials must produce the identical position hash");
+
+    let nonzero: i32 = 0;
+    if (h0 != 0) { nonzero = 1; }
+    ck(nonzero, "the position hash must be non-zero (the sim actually ran)");
+
+    if (g_ST_GOLDEN != 0) {
+        let g: i32 = 0;
+        if (h0 == g_ST_GOLDEN) { g = 1; }
+        ck(g, "hash must equal the pinned golden " + sv(g_ST_GOLDEN) + ", got " + sv(h0));
+    } else {
+        ck(1, "golden hash not pinned yet (informational)");
+    }
+
+    let want_caps: i32 = g_ST_TICKS * (g_ST_TRIALS + 1);   // 7 timed + 1 sim-only
+    let cap_ok: i32 = 0;
+    if (history_capture_count(hist) == want_caps) { cap_ok = 1; }
+    ck(cap_ok, "history_capture must have run exactly once per tick, want " + sv(want_caps)
+               + " got " + sv(history_capture_count(hist)));
+
+    let cnt_ok: i32 = 0;
+    if (world_count(w) == g_ST_AI + 1) { cnt_ok = 1; }
+    ck(cnt_ok, "entity count must be " + sv(g_ST_AI + 1) + ", got " + sv(world_count(w)));
+
+    let pid_ok: i32 = 0;
+    if (world_id_of(w, pid0) == 1) { pid_ok = 1; }
+    ck(pid_ok, "world_spawn_player returns a SLOT; the id in that slot must be the "
+               + "player slot 1, got " + sv(world_id_of(w, pid0)) + " in slot " + sv(pid0));
+
+    let chk: i32 = world_check(w);
+    let chk_ok: i32 = 0;
+    if (chk == 0) { chk_ok = 1; }
+    ck(chk_ok, "world_check must report a consistent sparse set, got " + sv(chk));
+
+    let rep_ok: i32 = 0;
+    if (world_replaying(w) == 0) { rep_ok = 1; }
+    ck(rep_ok, "simtest is a live run: world.replaying must be 0");
+
+    let fx_ok: i32 = 0;
+    if (g_effects > 0) { fx_ok = 1; }
+    ck(fx_ok, "cosmetics must fire on a live run (they are what replay must suppress)");
+
+    // positions must be finite and inside a sane world box
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let n: i32 = world_count(w);
+    let bounded: i32 = 1;
+    let i: i32 = 0;
+    while (i < n) {
+        let bx: f64 = px[i]; let by: f64 = py[i]; let bz: f64 = pz[i];
+        if (bx > 1000000.0) { bounded = 0; }
+        if (bx < -1000000.0) { bounded = 0; }
+        if (by > 1000000.0) { bounded = 0; }
+        if (bz > 1000000.0) { bounded = 0; }
+        if (bz < -1000000.0) { bounded = 0; }
+        if (bx != bx) { bounded = 0; }          // NaN
+        if (by != by) { bounded = 0; }
+        if (bz != bz) { bounded = 0; }
+        i++;
+    }
+    ck(bounded, "every position must be finite and inside +/-1e6 m after 10 000 ticks");
+
+    // the last tick must be readable back out of the history ring
+    let out: array<f64> = [];
+    out.push(0.0); out.push(0.0); out.push(0.0); out.push(0.0); out.push(0.0);
+    let hs: i32 = history_sample(hist, 0, 1, g_ST_TICKS - 1, out);
+    let hs_ok: i32 = 0;
+    if (hs == 1) {
+        if (out[HIST_PX] == px[0]) {
+            if (out[HIST_PZ] == pz[0]) { hs_ok = 1; }
+        }
+    }
+    ck(hs_ok, "history_sample(tick 9999) must return the player's final position");
+
+    let wire: i32 = cmd_wire_ok(c);
+    let wire_ok: i32 = 0;
+    if (wire == 0) { wire_ok = 1; }
+    ck(wire_ok, "the scripted command must fit the wire exactly, cmd_wire_ok = " + sv(wire));
+
+    let guard: f64 = g_ST_MS_GUARD_INTERP;
+    let backend: string = "interpreted";
+    if (st_compiled() == 1) { guard = g_ST_MS_GUARD; backend = "compiled"; }
+    let perf_ok: i32 = 0;
+    if (sim_per < guard) { perf_ok = 1; }
+    ck(perf_ok, "sim tick " + sv(sim_per) + " ms (" + backend + ") exceeds the regression guard "
+                + sv(guard) + " ms. RULE T: the guard is ~2x the LOADED min-of-7 measurement "
+                + "(0.0205 ms compiled / 0.1860 ms interpreted, this box sharing ~17/24 cores with "
+                + "llama-server); an idle box is faster, never slower. Sim budget is "
+                + sv(g_BUDGET_SIM_MS) + " ms/tick.");
+
+    // the assertion COUNT is itself an assertion (a probe that quietly stops
+    // asserting is the failure mode this catches)
+    let expect: i32 = 13;
+    let count_ok: i32 = 0;
+    if (g_asserts == expect) { count_ok = 1; }
+    g_asserts = g_asserts + 1;
+    if (count_ok == 1) { g_pass = g_pass + 1; }
+    else { print("  FAIL: assertion COUNT is " + sv(g_asserts - 1) + ", expected " + sv(expect)); }
+
+    print("PASS " + sv(g_pass) + "/" + sv(g_asserts));
+    if (g_pass != g_asserts) { exit(1); }
+}
+
+main();

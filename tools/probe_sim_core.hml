@@ -1,0 +1,1109 @@
+// probe_sim_core.hml — W2-9 acceptance probe for src/sim/rng.hml and src/sim/command.hml.
+//
+// Run it FROM THE NIGHTSHADE REPO ROOT, and BOTH ways — the golden checksums
+// below are what make running it twice meaningful:
+//     hemlockc -O1 tools/probe_sim_core.hml -o /tmp/psc && /tmp/psc
+//     hemlock  tools/probe_sim_core.hml
+//
+// It exits 1 on any failure AND on an assertion-count mismatch — a probe that
+// silently stops running half its checks is worse than no probe.
+//
+// W2-10 extends this file with the world/history assertions.
+
+import { exit } from "@stdlib/process";
+import { list_dir, read_file, is_dir } from "@stdlib/fs";
+import { cos, sin, sqrt } from "@stdlib/math";
+
+import { rng_new, rng_seed, rng_u32, rng_next, rng_f01, rng_f11, rng_pick,
+         rng_range, rng_chance, rng_copy, rng_state_hash,
+         RNG_LOOT, RNG_SPREAD, RNG_AI, RNG_WORLDGEN, RNG_DIRECTOR, RNG_STREAMS
+       } from "../src/sim/rng.hml";
+
+import { q_ang, dq_ang, q_axis, dq_axis, cmd_new, cmd_set, cmd_copy,
+         cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, cmd_btn,
+         cmd_wire_ok, cmd_hash,
+         BTN_FIRE, BTN_ADS, BTN_JUMP, BTN_CROUCH, BTN_SPRINT, BTN_RELOAD,
+         BTN_USE, BTN_MELEE, BTN_GRENADE, BTN_SWITCH, BTN_BUILD, BTN_INV,
+         BTN_ALL, CMD_FIELDS, CMD_STRIDE, ANG_SCALE, CMD_TAU, CMD_PI
+       } from "../src/sim/command.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump this deliberately, never to make red go green
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 100;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+// running u64 FNV-ish checksum so a single wrong draw anywhere is visible
+fn acc_mix(p_h: u64, p_v: u64): u64 {
+    let h: u64 = p_h;
+    let out: u64 = (h ^ p_v) * 1099511628211;
+    return out;
+}
+
+fn u64_lo31(p_h: u64): i32 {
+    let out: i32 = i32((p_h >> 33) & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// A.  RNG REPRODUCIBILITY  (the 1 M-input bit-identity criterion)
+// ===========================================================================
+fn section_rng_reproducibility() {
+    print("A. RNG reproducibility");
+
+    let st = rng_new();
+    let st2 = rng_new();
+
+    // A1 — 1 000 000 DISTINCT (seed, stream, tick, entity) tuples.
+    // The tuple walk deliberately sweeps every coordinate, including negatives.
+    let h: u64 = 14695981039346656037;
+    let seeds = [1337, -1, 0, 2147483647, -2147483648];
+    let i = 0;
+    while (i < 1000000) {
+        let ws: i32 = seeds[i % 5];
+        let sm: i32 = i % 5;
+        let tk: i32 = i / 5;
+        let en: i32 = (i * 7) % 4096;
+        rng_seed(st, ws, sm, tk, en);
+        h = acc_mix(h, rng_u32(st));
+        i = i + 1;
+    }
+    let ck_tuples: i32 = u64_lo31(h);
+    print(`   A1  1 000 000 distinct tuples, checksum = ${ck_tuples}`);
+    ck(ck_tuples == 777611223, "A1 tuple-walk checksum",
+       `got ${ck_tuples}, golden 777611223`);
+
+    // A2 — 1 000 000 SEQUENTIAL draws from one seed.
+    rng_seed(st, 20260728, RNG_WORLDGEN, 0, 0);
+    let h2: u64 = 14695981039346656037;
+    let j = 0;
+    while (j < 1000000) {
+        h2 = acc_mix(h2, rng_u32(st));
+        j = j + 1;
+    }
+    let ck_seq: i32 = u64_lo31(h2);
+    print(`   A2  1 000 000 sequential draws, checksum = ${ck_seq}`);
+    ck(ck_seq == 484318002, "A2 sequence checksum",
+       `got ${ck_seq}, golden 484318002`);
+
+    // A2b — the generator never absorbed into the all-zero state
+    let alive: i32 = 0;
+    if (st[0] != 0) { alive = 1; }
+    if (st[1] != 0) { alive = 1; }
+    if (st[2] != 0) { alive = 1; }
+    if (st[3] != 0) { alive = 1; }
+    ck(alive == 1, "A2b state non-zero after 1 M draws", "xorshift absorbed at 0");
+
+    // A3 — the SAME tuple reseeded twice yields the same 8 draws. 100 000 tuples.
+    let mism: i32 = 0;
+    let k = 0;
+    while (k < 100000) {
+        let ws: i32 = (k * 20011) % 1000003;
+        rng_seed(st,  ws, k % 5, k, k % 257);
+        rng_seed(st2, ws, k % 5, k, k % 257);
+        let d = 0;
+        while (d < 8) {
+            if (rng_u32(st) != rng_u32(st2)) { mism = mism + 1; }
+            d = d + 1;
+        }
+        k = k + 1;
+    }
+    print(`   A3  100 000 tuples x 8 draws reseeded twice, mismatches = ${mism}`);
+    ck(mism == 0, "A3 same tuple -> same sequence", `${mism} mismatched draws`);
+
+    // A4 — rng_state_hash is a pure function of the lanes
+    rng_seed(st,  99, RNG_LOOT, 4242, 17);
+    rng_seed(st2, 99, RNG_LOOT, 4242, 17);
+    ck(rng_state_hash(st) == rng_state_hash(st2), "A4 state hash reproducible",
+       `${rng_state_hash(st)} vs ${rng_state_hash(st2)}`);
+    rng_u32(st);
+    ck(rng_state_hash(st) != rng_state_hash(st2), "A4b state hash advances",
+       "hash unchanged after a draw");
+
+    // A5 — rng_copy resumes the exact sequence, not the seed
+    rng_seed(st, 5, RNG_AI, 1, 1);
+    let n0 = 0;
+    while (n0 < 37) { rng_u32(st); n0 = n0 + 1; }
+    rng_copy(st2, st);
+    let same: i32 = 1;
+    let c0 = 0;
+    while (c0 < 64) {
+        if (rng_u32(st) != rng_u32(st2)) { same = 0; }
+        c0 = c0 + 1;
+    }
+    ck(same == 1, "A5 rng_copy resumes mid-sequence", "copies diverged");
+
+    // A6 — ranges of every derived draw, 200 000 samples each
+    rng_seed(st, 7, RNG_SPREAD, 0, 0);
+    let bad01: i32 = 0;
+    let bad11: i32 = 0;
+    let badnext: i32 = 0;
+    let s0: f64 = 0.0;
+    let s1: f64 = 0.0;
+    let m = 0;
+    while (m < 200000) {
+        let f: f64 = rng_f01(st);
+        if (f < 0.0 || f >= 1.0) { bad01 = bad01 + 1; }
+        s0 = s0 + f;
+        let g: f64 = rng_f11(st);
+        if (g <= -1.0 || g >= 1.0) { bad11 = bad11 + 1; }
+        s1 = s1 + g;
+        let v: i32 = rng_next(st);
+        if (v < 0) { badnext = badnext + 1; }
+        m = m + 1;
+    }
+    let mean01: f64 = s0 / 200000.0;
+    let mean11: f64 = s1 / 200000.0;
+    print(`   A6  mean rng_f01 = ${mean01} (want 0.5), mean rng_f11 = ${mean11} (want 0.0)`);
+    ck(bad01 == 0, "A6 rng_f01 in [0,1)", `${bad01} out of range`);
+    ck(bad11 == 0, "A6b rng_f11 in (-1,1)", `${bad11} out of range`);
+    ck(badnext == 0, "A6c rng_next non-negative", `${badnext} negative`);
+    ck(mean01 > 0.495 && mean01 < 0.505, "A6d rng_f01 mean ~0.5", `${mean01}`);
+    ck(mean11 > -0.005 && mean11 < 0.005, "A6e rng_f11 mean ~0", `${mean11}`);
+
+    // A7 — rng_pick(n) stays in [0,n) and covers every value
+    let hits = [];
+    let z = 0;
+    while (z < 7) { hits.push(0); z = z + 1; }
+    let badpick: i32 = 0;
+    let p = 0;
+    while (p < 200000) {
+        let v: i32 = rng_pick(st, 7);
+        if (v < 0 || v > 6) { badpick = badpick + 1; }
+        else { hits[v] = hits[v] + 1; }
+        p = p + 1;
+    }
+    let minhit: i32 = 200000;
+    let maxhit: i32 = 0;
+    let q = 0;
+    while (q < 7) {
+        if (hits[q] < minhit) { minhit = hits[q]; }
+        if (hits[q] > maxhit) { maxhit = hits[q]; }
+        q = q + 1;
+    }
+    let spread: f64 = f64(maxhit - minhit) / 28571.4;
+    print(`   A7  rng_pick(7) x200k: min bin ${minhit}, max bin ${maxhit}, spread ${spread * 100.0}%`);
+    ck(badpick == 0, "A7 rng_pick in [0,n)", `${badpick} out of range`);
+    ck(spread < 0.05, "A7b rng_pick unbiased (<5% bin spread)", `${spread * 100.0}%`);
+    ck(rng_pick(st, 1) == 0, "A7c rng_pick(1) == 0", "non-zero");
+    ck(rng_pick(st, 0) == 0, "A7d rng_pick(0) == 0", "non-zero");
+
+    // A8 — rng_range is inclusive at both ends
+    let sawlo: i32 = 0;
+    let sawhi: i32 = 0;
+    let badr: i32 = 0;
+    let r = 0;
+    while (r < 200000) {
+        let v: i32 = rng_range(st, -3, 4);
+        if (v < -3 || v > 4) { badr = badr + 1; }
+        if (v == -3) { sawlo = 1; }
+        if (v == 4) { sawhi = 1; }
+        r = r + 1;
+    }
+    ck(badr == 0, "A8 rng_range within [lo,hi]", `${badr} out of range`);
+    ck(sawlo == 1 && sawhi == 1, "A8b rng_range inclusive endpoints", "endpoint never drawn");
+    ck(rng_range(st, 9, 9) == 9, "A8c rng_range degenerate", "lo==hi wrong");
+
+    // A9 — rng_chance frequency
+    let hitc: i32 = 0;
+    let c1 = 0;
+    while (c1 < 200000) {
+        hitc = hitc + rng_chance(st, 1, 4);
+        c1 = c1 + 1;
+    }
+    let frac: f64 = f64(hitc) / 200000.0;
+    print(`   A9  rng_chance(1,4) fired ${frac * 100.0}% (want 25%)`);
+    ck(frac > 0.245 && frac < 0.255, "A9 rng_chance(1,4) ~25%", `${frac}`);
+    ck(rng_chance(st, 0, 4) == 0, "A9b rng_chance(0,n) never", "fired");
+    ck(rng_chance(st, 4, 4) == 1, "A9c rng_chance(n,n) always", "did not fire");
+}
+
+// ===========================================================================
+// B.  STREAM INDEPENDENCE  (chi-square over 100 000 draws)
+// ===========================================================================
+fn chisq_uniform256(p_bins: array, p_n: i32): f64 {
+    let bins: array = p_bins;
+    let expct: f64 = f64(p_n) / 256.0;
+    let acc: f64 = 0.0;
+    let i = 0;
+    while (i < 256) {
+        let d: f64 = f64(bins[i]) - expct;
+        acc = acc + (d * d) / expct;
+        i = i + 1;
+    }
+    let out: f64 = acc;
+    return out;
+}
+
+fn section_streams() {
+    print("B. Stream independence");
+
+    let N = 100000;
+    let CRIT_UNI: f64 = 330.6;   // chi-square, df = 255, p = 0.001
+    let CRIT_IND: f64 = 296.4;   // chi-square, df = 225, p = 0.001
+
+    let st = rng_new();
+
+    // first-draws of every stream at every tick, plus 100 k sequential draws
+    let first = [];
+    let seqs = [];
+    let s = 0;
+    while (s < RNG_STREAMS) {
+        let a = [];
+        let b = [];
+        rng_seed(st, 20260728, s, 0, 0);
+        let t = 0;
+        while (t < N) {
+            rng_seed(st, 20260728, s, t, 0);
+            a.push(i32(rng_u32(st) >> 16));      // top 16 bits
+            t = t + 1;
+        }
+        rng_seed(st, 20260728, s, 0, 0);
+        let u = 0;
+        while (u < N) {
+            b.push(i32(rng_u32(st) >> 16));
+            u = u + 1;
+        }
+        first.push(a);
+        seqs.push(b);
+        s = s + 1;
+    }
+
+    // B1 — per-stream uniformity of the SEEDED first draw (tests the seeding)
+    let s1 = 0;
+    while (s1 < RNG_STREAMS) {
+        let bins = [];
+        let z = 0;
+        while (z < 256) { bins.push(0); z = z + 1; }
+        let a = first[s1];
+        let t = 0;
+        while (t < N) {
+            let bi: i32 = a[t] >> 8;
+            bins[bi] = bins[bi] + 1;
+            t = t + 1;
+        }
+        let x2: f64 = chisq_uniform256(bins, N);
+        print(`   B1  stream ${s1} seed-uniformity chi2 = ${x2}  (df 255, crit ${CRIT_UNI})`);
+        ck(x2 < CRIT_UNI, `B1 stream ${s1} seeded draws uniform`, `chi2 ${x2}`);
+        s1 = s1 + 1;
+    }
+
+    // B2 — per-stream uniformity of the SEQUENCE (tests the generator)
+    let s2 = 0;
+    while (s2 < RNG_STREAMS) {
+        let bins = [];
+        let z = 0;
+        while (z < 256) { bins.push(0); z = z + 1; }
+        let b = seqs[s2];
+        let t = 0;
+        while (t < N) {
+            let bi: i32 = b[t] >> 8;
+            bins[bi] = bins[bi] + 1;
+            t = t + 1;
+        }
+        let x2: f64 = chisq_uniform256(bins, N);
+        print(`   B2  stream ${s2} sequence-uniformity chi2 = ${x2}  (df 255, crit ${CRIT_UNI})`);
+        ck(x2 < CRIT_UNI, `B2 stream ${s2} sequence uniform`, `chi2 ${x2}`);
+        s2 = s2 + 1;
+    }
+
+    // B3 — pairwise independence: 16x16 contingency of the two streams' first
+    // draw at the SAME tick. This is the case that actually bites: loot and
+    // spread both rolling on tick T must not move together.
+    let pa = 0;
+    while (pa < RNG_STREAMS) {
+        let pb = pa + 1;
+        while (pb < RNG_STREAMS) {
+            let grid = [];
+            let z = 0;
+            while (z < 256) { grid.push(0); z = z + 1; }
+            let a = first[pa];
+            let b = first[pb];
+            let t = 0;
+            while (t < N) {
+                let ia: i32 = a[t] >> 12;
+                let ib: i32 = b[t] >> 12;
+                let gi: i32 = ia * 16 + ib;
+                grid[gi] = grid[gi] + 1;
+                t = t + 1;
+            }
+            // row/col marginals -> contingency chi-square, df = 15*15 = 225
+            let rows = [];
+            let cols = [];
+            let z2 = 0;
+            while (z2 < 16) { rows.push(0); cols.push(0); z2 = z2 + 1; }
+            let g1 = 0;
+            while (g1 < 256) {
+                let ra: i32 = g1 / 16;
+                let cb: i32 = g1 % 16;
+                rows[ra] = rows[ra] + grid[g1];
+                cols[cb] = cols[cb] + grid[g1];
+                g1 = g1 + 1;
+            }
+            let acc: f64 = 0.0;
+            let g2 = 0;
+            while (g2 < 256) {
+                let ra: i32 = g2 / 16;
+                let cb: i32 = g2 % 16;
+                let e: f64 = (f64(rows[ra]) * f64(cols[cb])) / f64(N);
+                let d: f64 = f64(grid[g2]) - e;
+                acc = acc + (d * d) / e;
+                g2 = g2 + 1;
+            }
+            print(`   B3  streams ${pa}x${pb} independence chi2 = ${acc}  (df 225, crit ${CRIT_IND})`);
+            ck(acc < CRIT_IND, `B3 streams ${pa}x${pb} independent`, `chi2 ${acc}`);
+            pb = pb + 1;
+        }
+        pa = pa + 1;
+    }
+
+    // B4 — adjacent ticks of ONE stream are decorrelated (the seeding walk)
+    let grid2 = [];
+    let z3 = 0;
+    while (z3 < 256) { grid2.push(0); z3 = z3 + 1; }
+    let a0 = first[RNG_SPREAD];
+    let t4 = 0;
+    while (t4 < N - 1) {
+        let gi: i32 = (a0[t4] >> 12) * 16 + (a0[t4 + 1] >> 12);
+        grid2[gi] = grid2[gi] + 1;
+        t4 = t4 + 1;
+    }
+    let x4: f64 = chisq_uniform256(grid2, N - 1);
+    print(`   B4  adjacent-tick lag-1 chi2 = ${x4}  (df 255, crit ${CRIT_UNI})`);
+    ck(x4 < CRIT_UNI, "B4 adjacent ticks decorrelated", `chi2 ${x4}`);
+}
+
+// ===========================================================================
+// C.  QUANTIZATION
+// ===========================================================================
+fn section_quantize() {
+    print("C. Quantization");
+
+    // C1 — q_ang(dq_ang(q)) == q for ALL 65536 grid points. This is the
+    // criterion that forced rounding rather than the doc's truncation.
+    let bad: i32 = 0;
+    let firstbad: i32 = -1;
+    let q = 0;
+    while (q < 65536) {
+        let r: i32 = q_ang(dq_ang(q));
+        if (r != q) {
+            bad = bad + 1;
+            if (firstbad < 0) { firstbad = q; }
+        }
+        q = q + 1;
+    }
+    print(`   C1  q_ang(dq_ang(q)) over all 65536 grid points: ${bad} mismatches`);
+    ck(bad == 0, "C1 q_ang/dq_ang round-trip idempotent",
+       `${bad} mismatches, first at q=${firstbad}`);
+
+    // C1b — a second round-trip is also stable (idempotence, not just inverse)
+    let bad2: i32 = 0;
+    let q2 = 0;
+    while (q2 < 65536) {
+        if (q_ang(dq_ang(q_ang(dq_ang(q2)))) != q2) { bad2 = bad2 + 1; }
+        q2 = q2 + 1;
+    }
+    ck(bad2 == 0, "C1b double round-trip stable", `${bad2} mismatches`);
+
+    // C2 — dq_ang stays inside [0, TAU) and the grid step is right
+    let badr: i32 = 0;
+    let q3 = 0;
+    while (q3 < 65536) {
+        let a: f64 = dq_ang(q3);
+        if (a < 0.0 || a >= CMD_TAU) { badr = badr + 1; }
+        q3 = q3 + 1;
+    }
+    ck(badr == 0, "C2 dq_ang in [0,TAU)", `${badr} out of range`);
+
+    // C3 — worst-case quantization error <= half a step
+    let step: f64 = CMD_TAU / 65536.0;
+    let worst: f64 = 0.0;
+    let st = rng_new();
+    rng_seed(st, 4242, RNG_SPREAD, 0, 0);
+    let i = 0;
+    while (i < 200000) {
+        let a: f64 = rng_f01(st) * CMD_TAU;
+        let b: f64 = dq_ang(q_ang(a));
+        let d: f64 = a - b;
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > CMD_PI) { d = CMD_TAU - d; }
+        if (d > worst) { worst = d; }
+        i = i + 1;
+    }
+    print(`   C3  worst angular error = ${worst} rad, half-step = ${step * 0.5}`);
+    ck(worst <= step * 0.5 + 0.0000000001, "C3 error <= half step",
+       `${worst} > ${step * 0.5}`);
+
+    // C4 — q_ang wraps: any number of full turns is the same grid point
+    let badw: i32 = 0;
+    let w = 0;
+    while (w < 20000) {
+        let a: f64 = rng_f01(st) * CMD_TAU;
+        let turns: f64 = f64(rng_range(st, -50, 50));
+        if (q_ang(a) != q_ang(a + turns * CMD_TAU)) { badw = badw + 1; }
+        w = w + 1;
+    }
+    ck(badw == 0, "C4 q_ang wraps whole turns", `${badw} mismatches`);
+    ck(q_ang(-0.0000001) == 0, "C4b q_ang of tiny negative == 0", `${q_ang(-0.0000001)}`);
+    ck(q_ang(1e12) == 0, "C4c q_ang of an absurd angle is defended", `${q_ang(1e12)}`);
+
+    // C5 — q_axis(dq_axis(q)) == q for every wire value
+    let bada: i32 = 0;
+    let ax = -127;
+    while (ax <= 127) {
+        if (q_axis(dq_axis(ax)) != ax) { bada = bada + 1; }
+        ax = ax + 1;
+    }
+    print(`   C5  q_axis(dq_axis(q)) over all 255 grid points: ${bada} mismatches`);
+    ck(bada == 0, "C5 q_axis/dq_axis round-trip idempotent", `${bada} mismatches`);
+
+    // C6 — q_axis clamps, never widens the i8 field
+    ck(q_axis(9.0) == 127, "C6 q_axis clamps high", `${q_axis(9.0)}`);
+    ck(q_axis(-9.0) == -127, "C6b q_axis clamps low", `${q_axis(-9.0)}`);
+    ck(q_axis(0.0) == 0, "C6c q_axis(0) == 0", `${q_axis(0.0)}`);
+    ck(q_axis(1.0) == 127, "C6d q_axis(1) == 127", `${q_axis(1.0)}`);
+    ck(q_axis(-1.0) == -127, "C6e q_axis(-1) == -127", `${q_axis(-1.0)}`);
+}
+
+// ===========================================================================
+// D.  THE INPUT COMMAND
+// ===========================================================================
+
+// The NETWORKING.md §11.2 20-byte stride, written here rather than in
+// command.hml because src/net/packing.hml (W2-12) owns the real packer. This
+// proves the struct is serializable UNCHANGED: nine integers in, nine out.
+fn wr_u8(p_p: ptr, p_off: i32, p_v: i32) {
+    ptr_write_u8(ptr_offset(p_p, p_off, 1), p_v & 255);
+}
+fn rd_u8(p_p: ptr, p_off: i32): i32 {
+    let out: i32 = ptr_deref_u8(ptr_offset(p_p, p_off, 1));
+    return out;
+}
+fn wr_u16(p_p: ptr, p_off: i32, p_v: i32) {
+    wr_u8(p_p, p_off, p_v & 255);
+    wr_u8(p_p, p_off + 1, (p_v >> 8) & 255);
+}
+fn rd_u16(p_p: ptr, p_off: i32): i32 {
+    let out: i32 = rd_u8(p_p, p_off) | (rd_u8(p_p, p_off + 1) << 8);
+    return out;
+}
+fn wr_u32(p_p: ptr, p_off: i32, p_v: i32) {
+    wr_u16(p_p, p_off, p_v & 65535);
+    wr_u16(p_p, p_off + 2, (p_v >> 16) & 65535);
+}
+fn rd_u32(p_p: ptr, p_off: i32): i32 {
+    let out: i32 = rd_u16(p_p, p_off) | (rd_u16(p_p, p_off + 2) << 16);
+    return out;
+}
+
+fn cmd_pack20(p_c: object, p_p: ptr) {
+    let c: object = p_c;
+    wr_u32(p_p, 0, c.tick);
+    wr_u32(p_p, 4, c.seq);
+    wr_u8(p_p, 8, c.move_x + 256);
+    wr_u8(p_p, 9, c.move_y + 256);
+    wr_u16(p_p, 10, c.yaw_q);
+    wr_u16(p_p, 12, c.pitch_q);
+    wr_u32(p_p, 14, c.buttons);
+    wr_u8(p_p, 18, c.weapon_sel);
+    wr_u8(p_p, 19, c.dt_ms);
+}
+
+fn cmd_unpack20(p_c: object, p_p: ptr) {
+    let c: object = p_c;
+    c.tick = rd_u32(p_p, 0);
+    c.seq = rd_u32(p_p, 4);
+    let mx: i32 = rd_u8(p_p, 8);
+    if (mx > 127) { mx = mx - 256; }
+    let my: i32 = rd_u8(p_p, 9);
+    if (my > 127) { my = my - 256; }
+    c.move_x = mx;
+    c.move_y = my;
+    c.yaw_q = rd_u16(p_p, 10);
+    c.pitch_q = rd_u16(p_p, 12);
+    c.buttons = rd_u32(p_p, 14);
+    c.weapon_sel = rd_u8(p_p, 18);
+    c.dt_ms = rd_u8(p_p, 19);
+}
+
+fn section_command() {
+    print("D. InputCommand");
+
+    let c = cmd_new();
+
+    // D1 — exactly nine fields, every one an i32. No bool, no f64, no null.
+    let keys = c.keys();
+    print(`   D1  cmd_new() field count = ${keys.length} (want ${CMD_FIELDS})`);
+    ck(keys.length == CMD_FIELDS, "D1 nine fields", `${keys.length}`);
+    ck(CMD_FIELDS == 9, "D1b CMD_FIELDS == 9", `${CMD_FIELDS}`);
+
+    let nonint: i32 = 0;
+    let names = "";
+    let ki = 0;
+    while (ki < keys.length) {
+        let t = typeof(c[keys[ki]]);
+        if (t != "i32") { nonint = nonint + 1; names = `${names} ${keys[ki]}:${t}`; }
+        ki = ki + 1;
+    }
+    ck(nonint == 0, "D1c every field is i32 (no bool/f64/null/string)", `${names}`);
+
+    // the nine names are the wire contract; a rename breaks v2 silently
+    let want = ["tick", "dt_ms", "move_x", "move_y", "yaw_q", "pitch_q",
+                "buttons", "weapon_sel", "seq"];
+    let missing = "";
+    let wi = 0;
+    while (wi < 9) {
+        let found: i32 = 0;
+        let kj = 0;
+        while (kj < keys.length) {
+            if (keys[kj] == want[wi]) { found = 1; }
+            kj = kj + 1;
+        }
+        if (found == 0) { missing = `${missing} ${want[wi]}`; }
+        wi = wi + 1;
+    }
+    ck(missing == "", "D1d field names match NETWORKING.md 8.1", `missing:${missing}`);
+
+    // D2 — QUANTIZED AT CONSTRUCTION: what the sim reads back is on the grid
+    cmd_set(c, 1234, 17, 0.37, -0.81, 2.71828, -0.4, BTN_FIRE | BTN_SPRINT, 3, 1234);
+    ck(c.yaw_q == q_ang(2.71828), "D2 yaw quantized at construction", `${c.yaw_q}`);
+    ck(c.pitch_q == q_ang(-0.4), "D2b pitch quantized at construction", `${c.pitch_q}`);
+    ck(c.move_x == q_axis(0.37), "D2c move_x quantized at construction", `${c.move_x}`);
+    ck(c.move_y == q_axis(-0.81), "D2d move_y quantized at construction", `${c.move_y}`);
+    ck(cmd_yaw(c) == dq_ang(q_ang(2.71828)), "D2e cmd_yaw reads the grid value", "off grid");
+    ck(q_ang(cmd_yaw(c)) == c.yaw_q, "D2f yaw re-quantizes to itself", "drift");
+    ck(q_ang(cmd_pitch(c)) == c.pitch_q, "D2g pitch re-quantizes to itself", "drift");
+    ck(cmd_move_x(c) == dq_axis(q_axis(0.37)), "D2h cmd_move_x reads the grid value", "off grid");
+
+    // D2i — the whole point: prediction and the server see the SAME f64.
+    // Feeding the dequantized angle back through construction must not move it.
+    let c2 = cmd_new();
+    cmd_set(c2, 1234, 17, cmd_move_x(c), cmd_move_y(c), cmd_yaw(c), cmd_pitch(c),
+            c.buttons, c.weapon_sel, c.seq);
+    ck(cmd_hash(c2) == cmd_hash(c), "D2i re-constructing from read-back is a fixpoint",
+       `${cmd_hash(c)} vs ${cmd_hash(c2)}`);
+
+    // D3 — clamping and cmd_wire_ok over 100 000 hostile constructions
+    let st = rng_new();
+    rng_seed(st, 31337, RNG_LOOT, 0, 0);
+    let badwire: i32 = 0;
+    let i = 0;
+    while (i < 100000) {
+        cmd_set(c,
+                rng_next(st),
+                rng_range(st, -50, 400),
+                rng_f11(st) * 3.0,
+                rng_f11(st) * 3.0,
+                rng_f11(st) * 200.0,
+                rng_f11(st) * 200.0,
+                rng_next(st),
+                rng_range(st, -8, 40),
+                rng_next(st));
+        if (cmd_wire_ok(c) != 0) { badwire = badwire + 1; }
+        i = i + 1;
+    }
+    print(`   D3  100 000 hostile cmd_set calls, wire violations = ${badwire}`);
+    ck(badwire == 0, "D3 cmd_set always produces a wire-legal command", `${badwire}`);
+
+    // D3b — cmd_wire_ok actually detects a violation (a check that never fails
+    // is not a check)
+    cmd_set(c, 10, 17, 0.0, 0.0, 0.0, 0.0, 0, 0, 10);
+    c.yaw_q = 70000;
+    ck(cmd_wire_ok(c) == 16, "D3b cmd_wire_ok flags a bad yaw_q", `${cmd_wire_ok(c)}`);
+    c.yaw_q = 0;
+    c.move_x = -200;
+    ck(cmd_wire_ok(c) == 4, "D3c cmd_wire_ok flags a bad move_x", `${cmd_wire_ok(c)}`);
+    c.move_x = 0;
+    ck(cmd_wire_ok(c) == 0, "D3d cmd_wire_ok clean when legal", `${cmd_wire_ok(c)}`);
+
+    // D4 — SERIALIZABLE UNCHANGED: 100 000 commands through the real 20-byte
+    // stride from NETWORKING.md §11.2, field for field.
+    let blob = buffer(CMD_STRIDE);
+    let bp = buffer_ptr(blob);
+    let back = cmd_new();
+    let lost: i32 = 0;
+    let j = 0;
+    while (j < 100000) {
+        cmd_set(c,
+                rng_pick(st, 100000000),
+                17,
+                rng_f11(st), rng_f11(st),
+                rng_f01(st) * CMD_TAU, rng_f11(st) * CMD_PI,
+                rng_pick(st, 4096),
+                rng_pick(st, 16),
+                rng_pick(st, 100000000));
+        cmd_pack20(c, bp);
+        cmd_unpack20(back, bp);
+        if (cmd_hash(back) != cmd_hash(c)) { lost = lost + 1; }
+        if (back.tick != c.tick) { lost = lost + 1; }
+        if (back.dt_ms != c.dt_ms) { lost = lost + 1; }
+        if (back.move_x != c.move_x) { lost = lost + 1; }
+        if (back.move_y != c.move_y) { lost = lost + 1; }
+        if (back.yaw_q != c.yaw_q) { lost = lost + 1; }
+        if (back.pitch_q != c.pitch_q) { lost = lost + 1; }
+        if (back.buttons != c.buttons) { lost = lost + 1; }
+        if (back.weapon_sel != c.weapon_sel) { lost = lost + 1; }
+        if (back.seq != c.seq) { lost = lost + 1; }
+        j = j + 1;
+    }
+    print(`   D4  100 000 commands through the 20-byte wire stride: ${lost} field losses`);
+    ck(lost == 0, "D4 command round-trips the wire unchanged", `${lost} losses`);
+    ck(CMD_STRIDE == 20, "D4b stride is 20 bytes", `${CMD_STRIDE}`);
+
+    // D5 — cmd_copy is field-for-field, and does not alias
+    cmd_set(c, 77, 17, 0.5, -0.5, 1.0, 0.2, BTN_JUMP, 2, 77);
+    cmd_copy(back, c);
+    ck(cmd_hash(back) == cmd_hash(c), "D5 cmd_copy exact", "hash differs");
+    back.tick = 99;
+    ck(c.tick == 77, "D5b cmd_copy does not alias", `${c.tick}`);
+
+    // D6 — cmd_hash is sensitive to every single field
+    cmd_set(c, 77, 17, 0.5, -0.5, 1.0, 0.2, BTN_JUMP, 2, 77);
+    let base: i32 = cmd_hash(c);
+    let collisions: i32 = 0;
+    cmd_copy(back, c); back.tick = 78;       if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.dt_ms = 16;      if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.move_x = 60;     if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.move_y = -60;    if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.yaw_q = 1;       if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.pitch_q = 1;     if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.buttons = 0;     if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.weapon_sel = 3;  if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    cmd_copy(back, c); back.seq = 78;        if (cmd_hash(back) == base) { collisions = collisions + 1; }
+    ck(collisions == 0, "D6 cmd_hash covers all nine fields", `${collisions} blind fields`);
+
+    // D7 — buttons are integers and every bit is distinct and inside the mask
+    let bits = [BTN_FIRE, BTN_ADS, BTN_JUMP, BTN_CROUCH, BTN_SPRINT, BTN_RELOAD,
+                BTN_USE, BTN_MELEE, BTN_GRENADE, BTN_SWITCH, BTN_BUILD, BTN_INV];
+    let orall: i32 = 0;
+    let dup: i32 = 0;
+    let bi = 0;
+    while (bi < 12) {
+        if ((orall & bits[bi]) != 0) { dup = dup + 1; }
+        orall = orall | bits[bi];
+        bi = bi + 1;
+    }
+    ck(dup == 0, "D7 button bits are disjoint", `${dup} overlaps`);
+    ck(orall == BTN_ALL, "D7b BTN_ALL == OR of every bit", `${orall} vs ${BTN_ALL}`);
+    ck(orall == 4095, "D7c twelve bits, 1..2048", `${orall}`);
+
+    cmd_set(c, 1, 17, 0.0, 0.0, 0.0, 0.0, BTN_FIRE | BTN_ADS, 0, 1);
+    ck(typeof(cmd_btn(c, BTN_FIRE)) == "i32", "D7d cmd_btn returns an integer",
+       typeof(cmd_btn(c, BTN_FIRE)));
+    ck(cmd_btn(c, BTN_FIRE) == 1, "D7e cmd_btn set", "0");
+    ck(cmd_btn(c, BTN_JUMP) == 0, "D7f cmd_btn clear", "1");
+    ck(c.buttons == (BTN_FIRE | BTN_ADS), "D7g buttons stored as a bitfield", `${c.buttons}`);
+}
+
+// ===========================================================================
+// E.  APPLY DETERMINISM
+// ===========================================================================
+//
+// `sim_apply_command` lives in src/sim/sim.hml, which no Wave 2 task owns and
+// which therefore does not exist yet. What is testable NOW is the property the
+// criterion is really about: a command applied to identical state produces
+// identical state, using only the dequantized command and the seeded RNG. The
+// miniature applier below has exactly the shape sim_apply_command must have —
+// pure w.r.t. the world, no clock, no globals, RNG reseeded from
+// (world_seed, stream, tick, entity). W2-13's replay gate re-runs this against
+// the real one.
+
+fn mini_world(p_seed: i32): object {
+    let w = { seed: p_seed, px: 0.0, py: 0.0, pz: 0.0, yaw: 0.0, pitch: 0.0,
+              vx: 0.0, vz: 0.0, hp: 100, ammo: 30, shots: 0, hits: 0 };
+    return w;
+}
+
+fn mini_apply(p_w: object, p_slot: i32, p_c: object, p_st: array) {
+    let w: object = p_w;
+    let c: object = p_c;
+    let st: array = p_st;
+
+    let yaw: f64 = cmd_yaw(c);
+    let pitch: f64 = cmd_pitch(c);
+    let mx: f64 = cmd_move_x(c);
+    let my: f64 = cmd_move_y(c);
+
+    let cs: f64 = cos(yaw);
+    let sn: f64 = sin(yaw);
+    let sprint: f64 = 1.0;
+    if (cmd_btn(c, BTN_SPRINT) == 1) { sprint = 1.6; }
+
+    w.vx = (mx * cs + my * sn) * 4.4 * sprint;
+    w.vz = (my * cs - mx * sn) * 4.4 * sprint;
+    w.px = w.px + w.vx * 0.016666666666666666;
+    w.pz = w.pz + w.vz * 0.016666666666666666;
+    w.yaw = yaw;
+    w.pitch = pitch;
+
+    if (cmd_btn(c, BTN_FIRE) == 1) {
+        if (w.ammo > 0) {
+            w.ammo = w.ammo - 1;
+            w.shots = w.shots + 1;
+            rng_seed(st, w.seed, RNG_SPREAD, c.tick, p_slot);
+            let sx: f64 = rng_f11(st) * 0.02;
+            let sy: f64 = rng_f11(st) * 0.02;
+            let aim: f64 = sqrt(sx * sx + sy * sy);
+            if (aim < 0.015) {
+                w.hits = w.hits + 1;
+                w.hp = w.hp - rng_pick(st, 4);
+            }
+        }
+    }
+    if (cmd_btn(c, BTN_RELOAD) == 1) { w.ammo = 30; }
+    return;
+}
+
+fn mini_hash(p_w: object): i32 {
+    let w: object = p_w;
+    let h: u64 = 14695981039346656037;
+    h = (h ^ u64(q_ang(w.yaw))) * 1099511628211;
+    h = (h ^ u64(q_ang(w.pitch))) * 1099511628211;
+    h = (h ^ u64(i32(w.px * 256.0) + 1073741824)) * 1099511628211;
+    h = (h ^ u64(i32(w.pz * 256.0) + 1073741824)) * 1099511628211;
+    h = (h ^ u64(i32(w.vx * 128.0) + 1073741824)) * 1099511628211;
+    h = (h ^ u64(i32(w.vz * 128.0) + 1073741824)) * 1099511628211;
+    h = (h ^ u64(w.hp + 1000)) * 1099511628211;
+    h = (h ^ u64(w.ammo)) * 1099511628211;
+    h = (h ^ u64(w.shots)) * 1099511628211;
+    h = (h ^ u64(w.hits)) * 1099511628211;
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+fn section_apply() {
+    print("E. Apply determinism (surrogate for sim_apply_command)");
+
+    let st = rng_new();
+
+    // E1 — the SAME (world, slot, cmd) applied to two identical worlds
+    let c = cmd_new();
+    cmd_set(c, 900, 17, 0.6, -0.3, 2.0, 0.15, BTN_FIRE | BTN_SPRINT, 1, 900);
+    let wa = mini_world(20260728);
+    let wb = mini_world(20260728);
+    mini_apply(wa, 0, c, st);
+    mini_apply(wb, 0, c, st);
+    ck(mini_hash(wa) == mini_hash(wb), "E1 same (world, slot, cmd) -> same state",
+       `${mini_hash(wa)} vs ${mini_hash(wb)}`);
+
+    // E2 — a 4096-tick scripted stream, replayed. Compare the per-tick hash
+    // chain, not just the final state: a mid-run divergence that cancels out is
+    // the bug this is for.
+    let rs = rng_new();
+    let run1 = [];
+    let run2 = [];
+    let pass = 0;
+    while (pass < 2) {
+        let w = mini_world(20260728);
+        rng_seed(rs, 20260728, RNG_DIRECTOR, 0, 0);
+        let cc = cmd_new();
+        let t = 0;
+        while (t < 4096) {
+            let btn: i32 = 0;
+            if (rng_chance(rs, 1, 3) == 1) { btn = btn | BTN_FIRE; }
+            if (rng_chance(rs, 1, 9) == 1) { btn = btn | BTN_SPRINT; }
+            if (rng_chance(rs, 1, 40) == 1) { btn = btn | BTN_RELOAD; }
+            cmd_set(cc, t, 17,
+                    rng_f11(rs), rng_f11(rs),
+                    rng_f01(rs) * CMD_TAU, rng_f11(rs) * 1.5,
+                    btn, rng_pick(rs, 16), t);
+            mini_apply(w, 0, cc, st);
+            if (pass == 0) { run1.push(mini_hash(w)); } else { run2.push(mini_hash(w)); }
+            t = t + 1;
+        }
+        pass = pass + 1;
+    }
+    let diverge: i32 = -1;
+    let d = 0;
+    while (d < 4096) {
+        if (run1[d] != run2[d]) {
+            if (diverge < 0) { diverge = d; }
+        }
+        d = d + 1;
+    }
+    print(`   E2  4096-tick scripted replay: first divergence at tick ${diverge} (-1 = none)`);
+    ck(diverge == -1, "E2 4096-tick replay is bit-identical", `diverged at ${diverge}`);
+    ck(run1.length == 4096, "E2b replay produced 4096 hashes", `${run1.length}`);
+
+    // E3 — applying to one world does not touch another
+    let w1 = mini_world(1);
+    let w2 = mini_world(1);
+    let h2before: i32 = mini_hash(w2);
+    cmd_set(c, 5, 17, 1.0, 1.0, 3.0, 0.0, BTN_FIRE, 0, 5);
+    mini_apply(w1, 0, c, st);
+    ck(mini_hash(w2) == h2before, "E3 apply touches only its own world", "cross-contamination");
+    ck(mini_hash(w1) != h2before, "E3b apply actually did something", "no-op");
+
+    // E4 — slot participates in the RNG seed, so two players firing on the same
+    // tick get different spread
+    let ws0 = mini_world(20260728);
+    let ws1 = mini_world(20260728);
+    cmd_set(c, 1000, 17, 0.0, 0.0, 0.0, 0.0, BTN_FIRE, 0, 1000);
+    mini_apply(ws0, 0, c, st);
+    mini_apply(ws1, 1, c, st);
+    ck(mini_hash(ws0) != mini_hash(ws1), "E4 slot is part of the RNG seed",
+       "two slots drew the same spread");
+}
+
+// ===========================================================================
+// F.  THE IMPORT WALL — no @stdlib/random anywhere under src/sim/
+// ===========================================================================
+fn section_wall() {
+    print("F. Import wall under src/sim/");
+
+    let dir = "src/sim";
+    let files = list_dir(dir);
+    let hml = [];
+    let i = 0;
+    while (i < files.length) {
+        let f = files[i];
+        if (f.contains(".hml")) { hml.push(f); }
+        i = i + 1;
+    }
+    print(`   F   scanned ${hml.length} .hml files under ${dir}/`);
+    ck(hml.length >= 2, "F0 found the sim modules to scan", `${hml.length} files`);
+
+    // Only CODE lines are scanned. `@stdlib/random is banned here` in a comment
+    // is documentation, not a violation, and a scanner that cannot tell the
+    // difference gets switched off within a week.
+    let banned = ["@stdlib/random", "@stdlib/time", "@stdlib/process", "@stdlib/fs",
+                  "@stdlib/net", "@stdlib/http", "@stdlib/websocket", "@stdlib/os",
+                  "wobbleweed", "gn.hml", "sdl.hml", "SDL_", "__clock", "ticks("];
+    let hits = "";
+    let j = 0;
+    while (j < hml.length) {
+        let txt = read_file(`${dir}/${hml[j]}`);
+        let ls = txt.split("\n");
+        let l = 0;
+        while (l < ls.length) {
+            let code = ls[l].split("//")[0];
+            let b = 0;
+            while (b < banned.length) {
+                if (code.contains(banned[b])) { hits = `${hits} ${hml[j]}:${l}:${banned[b]}`; }
+                b = b + 1;
+            }
+            l = l + 1;
+        }
+        j = j + 1;
+    }
+    ck(hits == "", "F1 no banned import or symbol in sim CODE", `${hits}`);
+
+    // F2 — the ban list itself works (a check that cannot fail is not a check)
+    let selftext = read_file("tools/probe_sim_core.hml");
+    let selfhit: i32 = 0;
+    let sl = selftext.split("\n");
+    let si = 0;
+    while (si < sl.length) {
+        if (sl[si].split("//")[0].contains("@stdlib/fs")) { selfhit = 1; }
+        si = si + 1;
+    }
+    ck(selfhit == 1, "F2 scanner detects a real import line", "scanner blind");
+
+    // F3 — every import in every sim file resolves to an allowed prefix
+    let badimp = "";
+    let k = 0;
+    while (k < hml.length) {
+        let txt = read_file(`${dir}/${hml[k]}`);
+        let ls = txt.split("\n");
+        let l = 0;
+        while (l < ls.length) {
+            let line = ls[l];
+            if (line.contains("from \"")) {
+                let ok: i32 = 0;
+                if (line.contains("\"@stdlib/math\"")) { ok = 1; }
+                if (line.contains("src/sim/")) { ok = 1; }
+                if (line.contains("src/core/")) { ok = 1; }
+                if (line.contains("./")) { ok = 1; }
+                if (line.contains("../core/")) { ok = 1; }
+                if (ok == 0) { badimp = `${badimp} ${hml[k]}:${line}`; }
+            }
+            l = l + 1;
+        }
+        k = k + 1;
+    }
+    ck(badimp == "", "F3 every sim import is math/sim/core", `${badimp}`);
+}
+
+// ===========================================================================
+// G.  PERFORMANCE  (RULE T: __clock CPU time, min of 7, bound at ~2x loaded)
+// ===========================================================================
+fn section_perf() {
+    print("G. Performance (RULE T: __clock CPU time, min of 7 trials)");
+
+    let TRIALS = 7;
+    let st = rng_new();
+
+    // BACKEND + LOAD CALIBRATION. This empty loop measures 12.35 ns/iteration
+    // compiled -O1 on this box; the interpreter is an order of magnitude
+    // slower and this machine's load swings the compiled figure by ~40 %.
+    // Every bound below is scaled by this measurement, which turns four
+    // absolute bounds into four RATIO bounds (CLAUDE.md 1.2: ratios survive
+    // contention because both terms inflate together) and lets the identical
+    // assertions run compiled AND interpreted.
+    let NC = 2000000;
+    let bestc: f64 = 1000000.0;
+    let calsink: i32 = 0;
+    let tc = 0;
+    while (tc < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < NC) { calsink = calsink ^ i; i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < bestc) { bestc = dt; }
+        tc = tc + 1;
+    }
+    let cal: f64 = bestc * 1000000000.0 / f64(NC);
+    let scale: f64 = cal / 12.5;
+    if (scale < 1.0) { scale = 1.0; }
+    print(`   G0  empty-loop calibration ${cal} ns/iter -> bound scale x${scale}   sink=${calsink}`);
+
+    // G1 — rng_u32
+    let N1 = 2000000;
+    let best1: f64 = 1000000.0;
+    let sink: u64 = 0;
+    let t = 0;
+    while (t < TRIALS) {
+        rng_seed(st, 1, RNG_AI, 0, 0);
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N1) { sink = sink ^ rng_u32(st); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best1) { best1 = dt; }
+        t = t + 1;
+    }
+    let ns1: f64 = best1 * 1000000000.0 / f64(N1);
+    print(`   G1  rng_u32          ${ns1} ns/draw   (min of ${TRIALS}, ${N1} draws)   sink=${sink}`);
+    // MEASURED on this box, min-of-7, compiled -O1, with llama-server holding
+    // ~17 of 24 cores: 245-254 ns/draw across four runs, 352 ns under a heavier
+    // load spike. No idle number exists — this machine is never idle (CLAUDE.md
+    // 1.2). Bound = 2x the worst loaded observation. The cost is NOT the state
+    // array (u64-in-array, u64-in-object and u64 globals all measured within
+    // 1 % of each other); it is that `u64` has no fast path in the compiler's
+    // binary-op dispatch and every operation goes through hml_binary_op. The
+    // same generator in i64 measures 200 ns. See the task report.
+    ck(ns1 < 700.0 * scale, "G1 rng_u32 <= 700 ns/draw x scale (loaded 245-352, no idle box)", `${ns1} ns`);
+
+    // G2 — rng_seed (includes the 8-draw warm-up)
+    let N2 = 300000;
+    let best2: f64 = 1000000.0;
+    let t2 = 0;
+    while (t2 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N2) { rng_seed(st, 1, RNG_LOOT, i, 3); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best2) { best2 = dt; }
+        t2 = t2 + 1;
+    }
+    let ns2: f64 = best2 * 1000000000.0 / f64(N2);
+    print(`   G2  rng_seed         ${ns2} ns/seed   (min of ${TRIALS}, ${N2} seeds)`);
+    // Loaded 1581-1610 ns across four runs (splitmix64 x2 + 4 warm-up draws).
+    ck(ns2 < 3400.0 * scale, "G2 rng_seed <= 3400 ns x scale (loaded 1581-1610, no idle box)", `${ns2} ns`);
+
+    // G3 — q_ang, called twice per tick per player
+    let N3 = 2000000;
+    let best3: f64 = 1000000.0;
+    let acc3: i32 = 0;
+    let t3 = 0;
+    while (t3 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N3) { acc3 = acc3 ^ q_ang(f64(i) * 0.0001); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best3) { best3 = dt; }
+        t3 = t3 + 1;
+    }
+    let ns3: f64 = best3 * 1000000000.0 / f64(N3);
+    print(`   G3  q_ang            ${ns3} ns/call   (min of ${TRIALS}, ${N3} calls)   sink=${acc3}`);
+    // Loaded 92-95 ns across four runs, 133 ns under a load spike. Called twice
+    // per tick per player: 0.19 us/tick, 0.001 % of the frame.
+    ck(ns3 < 260.0 * scale, "G3 q_ang <= 260 ns/call x scale (loaded 92-133, no idle box)", `${ns3} ns`);
+
+    // G4 — a whole command: construct + hash. Twice per tick at 60 Hz is
+    // nothing, but this is the number the net layer will budget against.
+    let N4 = 300000;
+    let c = cmd_new();
+    let best4: f64 = 1000000.0;
+    let acc4: i32 = 0;
+    let t4 = 0;
+    while (t4 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N4) {
+            cmd_set(c, i, 17, 0.5, -0.5, 1.0, 0.2, 5, 1, i);
+            acc4 = acc4 ^ cmd_hash(c);
+            i = i + 1;
+        }
+        let dt: f64 = __clock() - t0;
+        if (dt < best4) { best4 = dt; }
+        t4 = t4 + 1;
+    }
+    let ns4: f64 = best4 * 1000000000.0 / f64(N4);
+    print(`   G4  cmd_set+cmd_hash ${ns4} ns/command (min of ${TRIALS}, ${N4})   sink=${acc4}`);
+    // Loaded 997-1017 ns across four runs, 1476 under a load spike. Once per
+    // tick: 0.006 % of the frame.
+    ck(ns4 < 2600.0 * scale, "G4 cmd_set+cmd_hash <= 2600 ns x scale (loaded 997-1476, no idle box)", `${ns4} ns`);
+
+    // G5 — the ratio assertion that survives contention (CLAUDE.md 1.2):
+    // seeding must not cost more than ~30 draws, or per-entity reseeding is a
+    // trap for AI and loot.
+    let ratio: f64 = ns2 / ns1;
+    print(`   G5  rng_seed / rng_u32 = ${ratio} draws-equivalent`);
+    // The RATIO is the assertion that survives contention (CLAUDE.md 1.2):
+    // both terms inflate together. Measured 6.32-6.54 across four runs.
+    ck(ratio < 12.0, "G5 a reseed costs < 12 draws (measured 6.3-6.5)", `${ratio}`);
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_sim_core  —  W2-9  (src/sim/rng.hml, src/sim/command.hml)");
+    print("");
+
+    // Section F scans src/sim/ from the CURRENT DIRECTORY. Say so loudly rather
+    // than dying 40 seconds in with "Failed to open directory".
+    if (is_dir("src/sim") != true) {
+        print("FAIL  run this from the nightshade repo root: src/sim/ not found from here");
+        exit(1);
+    }
+
+    section_rng_reproducibility();
+    print("");
+    section_streams();
+    print("");
+    section_quantize();
+    print("");
+    section_command();
+    print("");
+    section_apply();
+    print("");
+    section_wall();
+    print("");
+    section_perf();
+    print("");
+
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

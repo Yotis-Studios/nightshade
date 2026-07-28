@@ -1,0 +1,1635 @@
+// ---------------------------------------------------------------------------
+// skygen.hml — TEX_SKY, the 512x160 sky panorama.        (Nightshade W2-6)
+//
+// ART_BIBLE §11 in full: a gamma-1.35 gradient with per-row Bayer dither, two
+// horizontally-tileable cloud layers with the lit-top / shadowed-bottom split,
+// a hard-edged sun disc with a halo, a phased moon with mare, three tiers of
+// stars with the 1-px cross, a Milky Way band, and a fixed constellation seed.
+//
+// U spans a full 360 deg of yaw; V spans zenith (row 0) to horizon (row 159).
+// The panorama is authored once and re-baked INCREMENTALLY: 20 rows per frame,
+// 8 frames for a full refresh, each slice pushed with one dirty-rect
+// SDL_UpdateTexture.  Budget: 0.6 ms/frame (BUDGET_ACTUAL).
+//
+// ---------------------------------------------------------------------------
+// R1 — THIS FILE NAMES NO COLOUR
+// ---------------------------------------------------------------------------
+// Every colour is either a palette.hml constant or arrives in the KEY BLOCK
+// (below), which tod.hml fills from the ART_BIBLE §5.1 keyframe table.  There
+// is not one hex literal in this file and there must never be one.
+//
+// ---------------------------------------------------------------------------
+// THE KEY BLOCK — the skygen <-> tod interface
+// ---------------------------------------------------------------------------
+// A flat `array<f64>` of SKYK_COUNT slots.  Flat, not an object: it is copied
+// once per re-bake and read from the row loop, and A7/N8 both say a struct
+// buys nothing.  tod.hml owns the values; skygen owns the layout.  Channel
+// values are 0..255; fog multipliers and alphas are 0..1.
+//
+//   0..2    SKY_ZENITH   r,g,b
+//   3..5    SKY_MID      r,g,b
+//   6..8    SKY_HORIZON  r,g,b   (the authored horizon tint)
+//   9..11   CLOUD_LIT    r,g,b
+//   12..14  CLOUD_SHADOW r,g,b
+//   15..17  FOG_TINT_MUL r,g,b   0..1 — drives the horizon seam, see below
+//   18      STAR_ALPHA           0..1
+//   19..21  SUN_DIR      x,y,z   y > 0 is above the horizon
+//   22      SUN halo radius, px  (34 normally, 56 at DAWN and GOLDEN)
+//   23      SUN halo falloff exp (1.8 normally, 1.2 at DAWN and GOLDEN)
+//   24      MOON_PHASE           0 = new, 0.5 = full; advances one step per day
+//   25      CLOUD_COVER_BIAS     -1..+1, subtracted from the coverage threshold
+//                                 (weather: OVERCAST/RAIN/STORM push it up)
+//
+// ---------------------------------------------------------------------------
+// THE HORIZON SEAM — §11.5, and why it is not the authored SKY_HORIZON
+// ---------------------------------------------------------------------------
+// "The horizon band of the sky must equal FOG_TINT_MUL applied to a mid-grey,
+//  or a visible seam appears where the world meets the sky.  Derive one from
+//  the other; never author them separately."
+//
+// The §5.1 table authors both, and they do NOT agree: at NOON, SKY_HORIZON /
+// FOG_TINT_MUL implies a mid-grey of (221, 250, 247) — three different greys,
+// which is not a grey.  At GOLDEN it implies (266, 219, 155).  So the table
+// cannot be taken literally on both rows at once and one has to give.
+//
+// skygen derives the seam from the fog, per §11.5, but calibrates the grey
+// instead of hardcoding one:
+//
+//     g    = luma(SKY_HORIZON) / luma(FOG_TINT_MUL)
+//     seam = clamp(FOG_TINT_MUL * g, 0, 255)
+//
+// so the seam keeps the authored horizon's LUMINANCE (the value structure the
+// art director composed) and takes the fog's HUE (the thing that actually
+// shows as a seam — a hue mismatch at the skyline is visible at 320x240, a
+// two-percent value mismatch is not).  It is self-calibrating at every
+// keyframe and in every weather state, and needs no magic constant.
+//
+// V = 0.82 still reaches the authored lerp(SKY_MID, SKY_HORIZON, 0.55); the
+// last 18 % of the panorama transitions to the seam, and V = 1.00 darkens it
+// by the §11.1 factor so sky and fog are near-identical but not identical.
+//
+// ---------------------------------------------------------------------------
+// HOW IT HITS THE BUDGET — measured Hemlock costs, not guesses
+// ---------------------------------------------------------------------------
+// Every structural decision below came out of a microbenchmark on this box
+// (compiled, -O1, min-of-7 CPU time).  The numbers are per operation:
+//
+//     for (i = 0; i < n; i++) {}          2.1 ns   <- 5x FASTER than `while`
+//     while (i < n) { i++; }             10.4 ns      (and `while (i < CONST)`
+//                                                      on a top-level const is
+//                                                      16 ns — never do that)
+//     ptr_write_u64  (2 texels)           9.6 ns/texel
+//     ptr_write_u32  (1 texel)           16.4 ns
+//     d[o]=..x3      (3 u8 stores)       70   ns
+//     3 u8 loads + blend + 3 stores     162   ns
+//     u32 pack from parts               120   ns   <- u32 shifts are NOT free
+//     f64 flop                            2.7 ns
+//     array<f64> read                     6   ns
+//
+// So the whole design is: pay 9.6 ns for the 80 % of texels that are only
+// gradient, never read a texel back, and never pack a u32 in a loop.
+//
+// 1. The gradient is evaluated ONCE PER ROW and quantised against all four
+//    Bayer thresholds into four packed texels, then two u64 constants.  The
+//    row fill is 256 u64 stores and nothing else — no float work at all.
+// 2. Cloud noise is evaluated on a SUBSAMPLED profile (one sample per 8
+//    texels, far below the ART_BIBLE §7.1 3-texel structure floor) and walked
+//    INCREMENTALLY across each cell, so the inner loop holds no array reads
+//    and no divides — two adds per layer per texel.
+// 3. A cloud texel is chosen from a 4-entry ramp [sky, SHADOW, MID, LIT] by
+//    ramp_pick with Bayer dither (§7.2/§11.2) and written as ONE precomputed
+//    u32.  No read-modify-write, no per-texel packing.  Index 0 means "sky",
+//    which is already there, so the store is skipped entirely.
+// 4. Stars, sun, moon and the Milky Way haze do read-modify-write, because
+//    they must composite — but they touch a few hundred texels a frame, not
+//    ten thousand, and their x-ranges are computed per row.
+// 5. atlas_px takes seven arguments and Hemlock calls cost ~10 ns PER
+//    ARGUMENT (A9b), so one call per texel would be 0.7 ms on its own.  Every
+//    store here goes straight through the hoisted base pointer (N4).
+//
+// ---------------------------------------------------------------------------
+// SEAMLESSNESS
+// ---------------------------------------------------------------------------
+// The panorama wraps in U.  mathx's vnoise/fbm2 cannot know the wrap width, so
+// the lattice wrap lives here: sky_octave folds the lattice index by
+// SKY_W / period.  Every period used divides 512.  V does not wrap.
+// ---------------------------------------------------------------------------
+
+import { floor, sqrt, pow, atan2, asin, divi } from "@stdlib/math";
+
+// W2-2.  h01 is the shared lattice hash (ART_BIBLE §7.2); bayer4 is the shared
+// 4x4 ordered-dither matrix.  Both are hoisted OUT of the inner loops here
+// (A9/A9b): h01 is called only on lattice rows, bayer4 only four times a row.
+import { h01, bayer4 } from "../core/mathx.hml";
+
+// W2-3.  The only place a colour is named.
+import { pal_r, pal_g, pal_b,
+         g_SKY_ZENITH, g_SKY_MID, g_SKY_HORIZON,
+         g_CLOUD_LIT, g_CLOUD_MID, g_CLOUD_SHADOW,
+         g_SUN_DISC, g_SUN_HALO, g_MOON_DISC, g_MOON_MARE,
+         g_STAR_BRIGHT, g_STAR_DIM } from "./palette.hml";
+
+// W1-8.
+import { atlas_new, atlas_upload, atlas_update_rows, atlas_mark_rows,
+         atlas_tex, atlas_free } from "../../../wobbleweed/src/atlas.hml";
+import { BLEND_NONE } from "../../../wobbleweed/src/sdl.hml";
+
+// ---------------------------------------------------------------------------
+// dimensions and schedule
+// ---------------------------------------------------------------------------
+
+export const SKY_W = 512;               // 360 deg of yaw
+export const SKY_H = 160;               // zenith -> horizon
+export const SKY_ROWS_PER_SLICE = 20;   // 160 / 20 = 8 frames for a full re-bake
+
+// key block
+export const SKYK_ZEN = 0;
+export const SKYK_MID = 3;
+export const SKYK_HOR = 6;
+export const SKYK_CLOUD_LIT = 9;
+export const SKYK_CLOUD_SHADOW = 12;
+export const SKYK_FOG = 15;
+export const SKYK_STAR_ALPHA = 18;
+export const SKYK_SUN = 19;
+export const SKYK_HALO_R = 22;
+export const SKYK_HALO_EXP = 23;
+export const SKYK_MOON_PHASE = 24;
+export const SKYK_CLOUD_COVER = 25;
+export const SKYK_COUNT = 26;
+
+// feature mask — the harness bakes single layers to check them in isolation.
+export const SKYF_CLOUDS = 1;
+export const SKYF_STARS = 2;
+export const SKYF_SUN = 4;
+export const SKYF_MOON = 8;
+export const SKYF_MILKYWAY = 16;
+export const SKYF_ALL = 31;
+
+// ---------------------------------------------------------------------------
+// tuning — ART_BIBLE §11.  Lives here because §11 is game art direction, not
+// engine policy (R1).  Nothing in this block is a colour.
+// ---------------------------------------------------------------------------
+
+// Both layers share one profile stride so the cloud loop can walk one cell
+// grid with four incremental accumulators instead of two nested ones.
+const CLOUD_STEP = 8;                   // profile subsample stride, texels
+const CLOUD_STEP_SHIFT = 3;             // log2(CLOUD_STEP) — the inner loop
+                                        // shifts, it never calls divi()
+const CLOUD_CELLS = 64;                 // SKY_W / CLOUD_STEP
+const CLOUD_FAR_PERIOD = 128;           // divides 512
+const CLOUD_FAR_THRESH = 0.62;
+const CLOUD_FAR_OPACITY = 0.55;
+const CLOUD_FAR_DRIFT = 0.6;            // px/s
+const CLOUD_NEAR_PERIOD = 64;           // divides 512
+const CLOUD_NEAR_THRESH = 0.68;
+const CLOUD_NEAR_OPACITY = 1.0;
+const CLOUD_NEAR_DRIFT = 1.4;           // px/s
+
+const CLOUD_VSQUASH = 2.6;              // §11.2 v*2.6 — horizontally stretched
+const CLOUD_TOP_LOOK = 3;               // rows to look up for the lit-top test
+const CLOUD_BAND_LO0 = 0.18;            // fade in  ...
+const CLOUD_BAND_LO1 = 0.30;            // ... to full
+const CLOUD_BAND_HI0 = 0.70;            // fade out ...
+const CLOUD_BAND_HI1 = 0.84;            // ... to nothing.  Clouds never reach 1.
+const CLOUD_EDGE_SOFT = 9.0;            // wispy-edge ramp into the 4-step pick
+const CLOUD_SHADOW_DEPTH = 0.34;        // §11.2: below this is the wispy underside
+// How far past the top edge CLOUD_LIT still applies.  §11.2's bare
+// `above < threshold` gives a lit band exactly as thick as the field's own
+// crossing, which at a 128-texel lattice squashed 2.6x is one or two rows —
+// invisible at 320x240.  Biasing the comparison thickens it to about five
+// rows, which is what makes the lit-top / shadowed-bottom split read as form
+// rather than as a dotted outline.
+const CLOUD_TOP_BIAS = 0.045;
+// CLOUD_MID is a palette constant authored against the NOON keyframe.  Its
+// position between CLOUD_SHADOW and CLOUD_LIT at NOON is 0.66/0.69/0.86 per
+// channel, mean 0.74; 0.70 reproduces it to within 8/255 and, unlike the
+// constant, tracks every other keyframe automatically.
+const CLOUD_MID_T = 0.70;
+const CLOUD_SUN_NEAR = 20.0;            // §11.2 sun-side lit edge, full tint
+const CLOUD_SUN_FAR = 60.0;             // ... to nothing
+const CLOUD_SUN_TINT = 0.45;
+
+const SUN_DISC_R = 9.0;                 // §11.3 hard edge
+const SUN_HALO_R_DEF = 34.0;
+const SUN_HALO_EXP_DEF = 1.8;
+const MOON_DISC_R = 11.0;
+const MOON_HALO_R = 20.0;
+const MOON_HALO_MAX = 0.22;             // "very faint"
+const MOON_DARK_T = 0.18;               // unlit limb blend toward MOON_MARE
+
+const STAR_SEED = 20260728;             // FIXED.  The constellations never change.
+const STAR_CROSS = 0.40;                // §11.4 the 1-px cross, 40 % brightness
+const STAR_T2_MIX = 0.45;               // lerp(STAR_BRIGHT, STAR_DIM, 0.45)
+const STAR_FADE_V0 = 0.80;              // stars fade out into the fog band ...
+const STAR_FADE_V1 = 0.92;              // ... and are gone well above the horizon
+const MW_HALFW = 76.6;                  // 55 px perpendicular at slope 2.6
+const MW_SLOPE = 2.6;
+const MW_X0 = 96.0;
+const MW_HAZE = 0.35;                   // §11.4 STAR_DIM * 0.35
+const MW_PERIOD = 128;
+
+const OCT_W0 = 0.68;                    // 2 octaves, renormalised from §7.2's 3
+const OCT_W1 = 0.32;                    // (§7.2: "2-3 octaves ONLY")
+
+const MAX_STARS = 4096;
+const ALPHA_BITS = 4278190080;          // 255 << 24, RGBA32 memory order R,G,B,A
+
+// The sun halo and the Milky Way haze are smooth alpha ramps over thousands of
+// texels.  Blending each one costs 162 ns (read + blend + three stores); a
+// quantised ramp with Bayer dither costs 40 ns (index + one 32-bit store) and
+// is what §7.2's ramp_pick asks for anyway.  The levels are packed once per
+// row, against that row's own gradient colour.
+const HALO_LEVELS = 8;
+const HALO_LUT = 128;                   // alpha(r^2) samples, per snapshot
+const MW_LEVELS = 6;
+
+// ---------------------------------------------------------------------------
+// module state
+// ---------------------------------------------------------------------------
+
+let g_sky_ready = 0;
+let g_sky_atlas = null;                 // atlas.hml object, from skygen_init
+let g_sky_data = buffer(1);             // g_sky_atlas.data
+let g_sky_p = ptr_null();               // its base pointer, hoisted (N4)
+
+let g_sky_keys: array<f64> = [];        // pending — what the caller last set
+let g_sky_keys_hot: array<f64> = [];    // active  — snapshot for THIS re-bake
+let g_sky_features = SKYF_ALL;
+let g_sky_clock = 0.0;                  // seconds, drives cloud drift
+let g_sky_clock_hot = 0.0;
+
+let g_sky_cursor = 0;                   // next row of the rolling re-bake
+let g_sky_slice_rows = SKY_ROWS_PER_SLICE;   // the dial, see skygen_set_slice_rows
+let g_sky_remaining = 0;                // rows still to bake
+
+// derived per re-bake (cold, once per snapshot)
+let g_sky_sun_u = 0.0;
+let g_sky_sun_v = 0.0;
+let g_sky_sun_up = 0;                   // 1 = draw the sun, 0 = draw the moon
+let g_sky_moon_u = 0.0;
+let g_sky_moon_v = 0.0;
+let g_sky_seam: array<f64> = [];        // the fog-derived horizon colour, rgb
+let g_sky_rgb: array<f64> = [];         // per-row gradient scratch, rgb
+
+// cloud profiles, one sample per CLOUD_STEP texels.  _up is the (v-3) sample
+// that decides the lit top edge.
+let g_sky_ring_far: array<f64> = [];    // RING * (CELLS+2), see the ring notes
+let g_sky_ring_near: array<f64> = [];
+let g_sky_ring_tag: array<i32> = [];    // which row each ring slot holds
+let g_sky_pf_up_far: array<f64> = [];   // fallback when the ring misses
+let g_sky_pf_up_near: array<f64> = [];
+let g_sky_pf_mw: array<f64> = [];
+let g_sky_lat: array<f64> = [];         // every lattice row, hashed at init
+let g_sky_lat_off: array<i32> = [];
+let g_sky_latb: array<f64> = [];        // one lattice row pre-blended by ty
+let g_sky_foff = 0;                     // cloud drift offsets, per snapshot
+let g_sky_noff = 0;
+let g_sky_halo_a: array<f64> = [];      // sun halo alpha vs r^2, per snapshot
+let g_sky_halo_px: array = [];          // its 9 packed colours, per row
+let g_sky_mw_px: array = [];            // Milky Way haze levels, per row
+let g_sky_mw_tag = -1000;               // which row group g_sky_pf_mw holds
+
+// smoothstep(tx) tables, one per period actually used
+let g_sky_ss128: array<f64> = [];
+let g_sky_ss64: array<f64> = [];
+let g_sky_ss32: array<f64> = [];
+
+// star table, row-major so a slice can find its stars in O(1)
+let g_sky_star_x: array<i32> = [];
+let g_sky_star_t: array<i32> = [];      // 1, 2 or 3
+let g_sky_star_row: array<i32> = [];    // SKY_H + 1 offsets
+let g_sky_star_n = 0;
+
+// per-row bake statistics — a by-product of the bake, used by the harness to
+// prove clouds never touch the horizon without re-deriving the noise.
+let g_sky_row_cloud: array<i32> = [];
+
+// per-row Bayer thresholds (only x & 3 varies once y is fixed)
+let g_sky_bay: array<f64> = [];
+
+// ---------------------------------------------------------------------------
+// small cold helpers
+// ---------------------------------------------------------------------------
+
+fn sky_fill_f64(n: i32): array<f64> {
+    let a: array<f64> = [];
+    for (let i = 0; i < n; i++) { a.push(0.0); }
+    return a;
+}
+
+fn sky_fill_i32(n: i32): array<i32> {
+    let a: array<i32> = [];
+    for (let i = 0; i < n; i++) { a.push(0); }
+    return a;
+}
+
+// smoothstep table for one lattice period: s = t*t*(3-2t) at t = i/period.
+fn sky_ss_table(period: i32): array<f64> {
+    let a: array<f64> = [];
+    let p: f64 = f64(period);
+    for (let i = 0; i < period; i++) {
+        let t: f64 = f64(i) / p;
+        a.push(t * t * (3.0 - 2.0 * t));
+    }
+    return a;
+}
+
+fn sky_ss_for(period: i32): array<f64> {
+    if (period == 128) { return g_sky_ss128; }
+    if (period == 64) { return g_sky_ss64; }
+    return g_sky_ss32;
+}
+
+// One RGBA32 texel as the u32 SDL holds.  Cold only — 120 ns a call (see the
+// header table); never on a per-texel path.
+fn sky_pack(p_r: f64, p_g: f64, p_b: f64): u32 {
+    let r: f64 = p_r;
+    let g: f64 = p_g;
+    let b: f64 = p_b;
+    if (r < 0.0) { r = 0.0; }
+    if (g < 0.0) { g = 0.0; }
+    if (b < 0.0) { b = 0.0; }
+    if (r > 255.0) { r = 255.0; }
+    if (g > 255.0) { g = 255.0; }
+    if (b > 255.0) { b = 255.0; }
+    let v: u32 = u32(i32(r + 0.5)) | (u32(i32(g + 0.5)) << 8)
+               | (u32(i32(b + 0.5)) << 16) | ALPHA_BITS;
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// wrapped value noise, accumulated onto a subsampled x profile
+//
+// Two octaves across a whole row, into `prof` (CLOUD_CELLS + 2 samples).  The
+// lattice is folded by SKY_W / period so the row wraps seamlessly in U — the
+// part a generic vnoise() cannot do, because it does not know the panorama
+// width.  Called four times a row; everything inside is per-sample, not
+// per-texel.
+// ---------------------------------------------------------------------------
+
+// Every lattice row every octave will ever need is hashed ONCE, at init, into
+// one flat table.  The bake then makes zero h01 calls.
+//
+// This is worth spelling out: the naive version called h01 (cells+1)*2 times
+// per octave per row — 160 calls a row, 26 000 a bake, at ~90 ns a call, which
+// is 2.3 ms of pure hashing.  The lattice only depends on (period, seed, iy),
+// and iy = floor(i32(y*2.6) / period) takes at most 16 distinct values across
+// the whole panorama for every period in use.  The whole table is 864 doubles.
+//
+// Config layout, one per (period, seed) an octave uses:
+//   0  far  oct0   period 128  seed 1301        cells 4
+//   1  far  oct1   period  64  seed 1332        cells 8
+//   2  near oct0   period  64  seed 2711        cells 8
+//   3  near oct1   period  32  seed 2742        cells 16
+//   4  mw   oct0   period 128  seed STAR+401    cells 4
+//   5  mw   oct1   period  64  seed STAR+432    cells 8
+const NCFG = 6;
+const LAT_IY0 = -1;                 // ny spans [-7, 413]; iy spans [-1, 13]
+const LAT_NIY = 16;
+
+fn sky_cfg_period(i: i32): i32 {
+    if (i == 0) { return 128; }
+    if (i == 1) { return 64; }
+    if (i == 2) { return 64; }
+    if (i == 3) { return 32; }
+    if (i == 4) { return 128; }
+    return 64;
+}
+fn sky_cfg_shift(i: i32): i32 {
+    if (i == 0) { return 7; }
+    if (i == 1) { return 6; }
+    if (i == 2) { return 6; }
+    if (i == 3) { return 5; }
+    if (i == 4) { return 7; }
+    return 6;
+}
+fn sky_cfg_seed(i: i32): i32 {
+    if (i == 0) { return 1301; }
+    if (i == 1) { return 1332; }
+    if (i == 2) { return 2711; }
+    if (i == 3) { return 2742; }
+    if (i == 4) { return STAR_SEED + 401; }
+    return STAR_SEED + 432;
+}
+
+fn sky_build_lattice() {
+    g_sky_lat_off = sky_fill_i32(NCFG);
+    let total: i32 = 0;
+    for (let i = 0; i < NCFG; i++) {
+        g_sky_lat_off[i] = total;
+        total = total + (divi(SKY_W, sky_cfg_period(i)) + 1) * LAT_NIY;
+    }
+    g_sky_lat = sky_fill_f64(total);
+    for (let i = 0; i < NCFG; i++) {
+        let cells: i32 = divi(SKY_W, sky_cfg_period(i));
+        let seed: i32 = sky_cfg_seed(i);
+        let off: i32 = g_sky_lat_off[i];
+        for (let r = 0; r < LAT_NIY; r++) {
+            let iy: i32 = LAT_IY0 + r;
+            let base: i32 = off + r * (cells + 1);
+            for (let c = 0; c <= cells; c++) {
+                // fold the lattice by SKY_W / period so the row wraps in U —
+                // the part a generic vnoise() cannot do, because it does not
+                // know the panorama width
+                g_sky_lat[base + c] = h01(c % cells, iy, seed);
+            }
+        }
+    }
+    g_sky_latb = sky_fill_f64(SKY_W + 2);
+}
+
+// One octave across a row, into prof[poff .. poff+nprof).  `first` overwrites,
+// otherwise it accumulates.  No divides, no modulo, no calls: every period and
+// every stride here is a power of two, and the lattice rows are pre-blended by
+// ty before the sample loop so the inner body is two array reads and four
+// flops.
+fn sky_octave(p_prof: array<f64>, p_poff: i32, p_nprof: i32, p_ny: i32,
+              p_cfg: i32, p_w: f64, p_xoff: i32, p_first: i32) {
+    let prof: array<f64> = p_prof;
+    let poff: i32 = p_poff;
+    let nprof: i32 = p_nprof;
+    let cfg: i32 = p_cfg;
+    let w: f64 = p_w;
+    let first: i32 = p_first;
+    let period: i32 = sky_cfg_period(cfg);
+    let pshift: i32 = sky_cfg_shift(cfg);
+    let pmask: i32 = period - 1;
+    let cells: i32 = divi(SKY_W, period);
+    let ny: i32 = p_ny;
+
+    // floor, not divi: divi truncates toward zero and the (v-3) look-up row is
+    // negative near the zenith, which would fold the lattice the wrong way.
+    let fy: f64 = f64(ny) / f64(period);
+    let iy: i32 = i32(floor(fy));
+    let ty: f64 = fy - f64(iy);
+    ty = ty * ty * (3.0 - 2.0 * ty);
+
+    let lat: array<f64> = g_sky_lat;
+    let latb: array<f64> = g_sky_latb;
+    let stride: i32 = cells + 1;
+    let r0: i32 = g_sky_lat_off[cfg] + (iy - LAT_IY0) * stride;
+    let r1: i32 = r0 + stride;
+    for (let c = 0; c <= cells; c++) {
+        let a: f64 = lat[r0 + c];
+        latb[c] = a + (lat[r1 + c] - a) * ty;
+    }
+
+    let ss: array<f64> = sky_ss_for(period);
+    let xoff: i32 = p_xoff;
+    // Split on `first` rather than branching inside: the accumulate form costs
+    // an extra array read per sample and the overwrite form must not pay it.
+    if (first == 1) {
+        for (let k = 0; k < nprof; k++) {
+            let sx: i32 = ((k << CLOUD_STEP_SHIFT) + xoff) & 511;
+            let ci: i32 = sx >> pshift;
+            let n0: f64 = latb[ci];
+            prof[poff + k] = w * (n0 + (latb[ci + 1] - n0) * ss[sx & pmask]);
+        }
+    } else {
+        for (let k = 0; k < nprof; k++) {
+            let sx: i32 = ((k << CLOUD_STEP_SHIFT) + xoff) & 511;
+            let ci: i32 = sx >> pshift;
+            let n0: f64 = latb[ci];
+            let o: i32 = poff + k;
+            prof[o] = prof[o] + w * (n0 + (latb[ci + 1] - n0) * ss[sx & pmask]);
+        }
+    }
+}
+
+// Two octaves (§7.2: "2-3 octaves ONLY"), renormalised to sum to 1.
+fn sky_profile(p_prof: array<f64>, p_poff: i32, p_nprof: i32, p_ny: i32,
+               p_cfg0: i32, p_xoff: i32) {
+    sky_octave(p_prof, p_poff, p_nprof, p_ny, p_cfg0, OCT_W0, p_xoff, 1);
+    sky_octave(p_prof, p_poff, p_nprof, p_ny, p_cfg0 + 1, OCT_W1, p_xoff, 0);
+}
+
+// ---------------------------------------------------------------------------
+// the profile ring
+//
+// The lit-top test samples the same noise field CLOUD_TOP_LOOK rows higher, and
+// because the noise row index is i32(y * 2.6), the "above" profile of row y is
+// EXACTLY the profile of row y - 3.  Rows are always baked in increasing order
+// with no gaps (both skygen_bake_all and the slice cursor guarantee it), so a
+// four-deep ring turns four profile evaluations per row into two.
+// ---------------------------------------------------------------------------
+
+const RING = 4;
+
+fn sky_ring_fill(p_y: i32, p_foff: i32, p_noff: i32) {
+    let y: i32 = p_y;
+    let ny: i32 = i32(f64(y) * CLOUD_VSQUASH);
+    sky_profile(g_sky_ring_far, p_foff, CLOUD_CELLS + 1, ny, 0, g_sky_foff);
+    sky_profile(g_sky_ring_near, p_noff, CLOUD_CELLS + 1, ny, 2, g_sky_noff);
+}
+
+// ---------------------------------------------------------------------------
+// the star field — built once from a FIXED seed, so the constellations are the
+// same every night, in every process, forever.
+//
+// h01 has 256 levels, which is far too coarse for a 1/2200 density (the finest
+// probability it can express alone is 1/256).  Two independent draws give a
+// 1/65536 grid, and the gate draw early-outs 97.7 % of texels before the
+// second hash is taken.  The resulting densities are 1/2185, 1/697 and 1/221
+// against the §11.4 targets of 1/2200, 1/700 and 1/220.
+// ---------------------------------------------------------------------------
+
+// One recognisable asterism, in fixed texel coordinates.  Seven tier-1 stars.
+// Nobody is ever told it is there.
+const AST_N = 7;
+fn sky_ast_x(i: i32): i32 {
+    if (i == 0) { return 186; }
+    if (i == 1) { return 199; }
+    if (i == 2) { return 213; }
+    if (i == 3) { return 226; }
+    if (i == 4) { return 236; }
+    if (i == 5) { return 249; }
+    return 258;
+}
+fn sky_ast_y(i: i32): i32 {
+    if (i == 0) { return 44; }
+    if (i == 1) { return 39; }
+    if (i == 2) { return 37; }
+    if (i == 3) { return 41; }
+    if (i == 4) { return 52; }
+    if (i == 5) { return 57; }
+    return 49;
+}
+
+// Horizontal distance from the Milky Way centre line at row y, wrapped.
+fn sky_mw_dx(p_x: i32, p_y: i32): f64 {
+    let cx: f64 = MW_X0 + MW_SLOPE * f64(p_y);
+    let d: f64 = f64(p_x) - cx;
+    let w: f64 = f64(SKY_W);
+    d = d - floor(d / w + 0.5) * w;
+    if (d < 0.0) { d = 0.0 - d; }
+    let out: f64 = d;
+    return out;
+}
+
+fn sky_build_stars() {
+    g_sky_star_x = [];
+    g_sky_star_t = [];
+    g_sky_star_row = sky_fill_i32(SKY_H + 1);
+    let n: i32 = 0;
+    // stars stop where the fade reaches zero — below that they would sit in
+    // the fog band and read as noise.
+    let ylast: i32 = i32(STAR_FADE_V1 * f64(SKY_H - 1));
+
+    for (let y = 0; y < SKY_H; y++) {
+        g_sky_star_row[y] = n;
+        if (y <= ylast) {
+            // the fixed asterism first, so it survives any table truncation
+            for (let ai = 0; ai < AST_N; ai++) {
+                if (sky_ast_y(ai) == y) {
+                    if (n < MAX_STARS) {
+                        g_sky_star_x.push(sky_ast_x(ai));
+                        g_sky_star_t.push(1);
+                        n = n + 1;
+                    }
+                }
+            }
+            for (let x = 0; x < SKY_W; x++) {
+                // gate draw: 6/256 of texels get past this
+                let hb: i32 = i32(h01(x, y, STAR_SEED + 7) * 255.0 + 0.5);
+                if (hb < 6) {
+                    let ha: i32 = i32(h01(x, y, STAR_SEED + 61) * 255.0 + 0.5);
+                    let tier: i32 = 0;
+                    if (ha < 5) {
+                        tier = 1;                       // 30/65536 = 1/2185
+                    } else {
+                        if (hb < 1) {
+                            if (ha < 94) { tier = 2; }  // 94/65536 = 1/697
+                        }
+                        if (tier == 0) {
+                            let lim: i32 = 2;           // 1/221 outside the band
+                            if (sky_mw_dx(x, y) < MW_HALFW) { lim = 5; }  // 3x inside
+                            if (hb < lim) {
+                                if (ha < 200) { tier = 3; }
+                            }
+                        }
+                    }
+                    if (tier > 0) {
+                        if (n < MAX_STARS) {
+                            g_sky_star_x.push(x);
+                            g_sky_star_t.push(tier);
+                            n = n + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    g_sky_star_row[SKY_H] = n;
+    g_sky_star_n = n;
+}
+
+// ---------------------------------------------------------------------------
+// lifecycle
+// ---------------------------------------------------------------------------
+
+// Allocate everything, once (A8).  Idempotent.  No SDL: the panorama can be
+// baked and inspected with no window open.
+export fn skygen_init() {
+    if (g_sky_ready == 1) { return; }
+    g_sky_atlas = atlas_new(SKY_W, SKY_H, 1, 1);
+    g_sky_data = g_sky_atlas.data;
+    g_sky_p = buffer_ptr(g_sky_data);
+
+    g_sky_keys = sky_fill_f64(SKYK_COUNT);
+    g_sky_keys_hot = sky_fill_f64(SKYK_COUNT);
+    g_sky_seam = sky_fill_f64(3);
+    g_sky_rgb = sky_fill_f64(3);
+
+    g_sky_ring_far = sky_fill_f64(RING * (CLOUD_CELLS + 2));
+    g_sky_ring_near = sky_fill_f64(RING * (CLOUD_CELLS + 2));
+    g_sky_ring_tag = sky_fill_i32(RING);
+    for (let i = 0; i < RING; i++) { g_sky_ring_tag[i] = -1000; }
+    g_sky_pf_up_far = sky_fill_f64(CLOUD_CELLS + 2);
+    g_sky_pf_up_near = sky_fill_f64(CLOUD_CELLS + 2);
+    g_sky_pf_mw = sky_fill_f64(CLOUD_CELLS + 2);
+
+    g_sky_ss128 = sky_ss_table(128);
+    g_sky_ss64 = sky_ss_table(64);
+    g_sky_ss32 = sky_ss_table(32);
+
+    g_sky_bay = sky_fill_f64(4);
+    g_sky_row_cloud = sky_fill_i32(SKY_H);
+    g_sky_halo_a = sky_fill_f64(HALO_LUT + 1);
+    g_sky_halo_px = [];
+    for (let i = 0; i <= HALO_LEVELS; i++) { g_sky_halo_px.push(0); }
+    g_sky_mw_px = [];
+    for (let i = 0; i <= MW_LEVELS; i++) { g_sky_mw_px.push(0); }
+
+    sky_build_lattice();
+    sky_build_stars();
+    skygen_keys_default(g_sky_keys);
+    g_sky_ready = 1;
+}
+
+// A zeroed key block of the right length, for a caller that wants to fill one.
+export fn skygen_keys_new(): array<f64> {
+    return sky_fill_f64(SKYK_COUNT);
+}
+
+// The NOON keyframe, reconstructed from palette.hml.
+//
+// ART_BIBLE §3.2's sky entries ARE the NOON column of the §5.1 table, so this
+// is not a second authoring of the same data — it is the same data, read from
+// the one file allowed to name a colour.  FOG_TINT_MUL is derived from
+// SKY_HORIZON rather than authored, because §11.5 requires the two to be
+// derived from each other and tod.hml is the module that owns the real curve.
+//
+// It exists so that skygen is testable standalone and so boot has a valid sky
+// before the first tod_eval().  tod.hml overwrites all of it at runtime.
+export fn skygen_keys_default(p_k: array<f64>) {
+    let k: array<f64> = p_k;
+    k[SKYK_ZEN] = f64(pal_r(g_SKY_ZENITH));
+    k[SKYK_ZEN + 1] = f64(pal_g(g_SKY_ZENITH));
+    k[SKYK_ZEN + 2] = f64(pal_b(g_SKY_ZENITH));
+    k[SKYK_MID] = f64(pal_r(g_SKY_MID));
+    k[SKYK_MID + 1] = f64(pal_g(g_SKY_MID));
+    k[SKYK_MID + 2] = f64(pal_b(g_SKY_MID));
+    k[SKYK_HOR] = f64(pal_r(g_SKY_HORIZON));
+    k[SKYK_HOR + 1] = f64(pal_g(g_SKY_HORIZON));
+    k[SKYK_HOR + 2] = f64(pal_b(g_SKY_HORIZON));
+    k[SKYK_CLOUD_LIT] = f64(pal_r(g_CLOUD_LIT));
+    k[SKYK_CLOUD_LIT + 1] = f64(pal_g(g_CLOUD_LIT));
+    k[SKYK_CLOUD_LIT + 2] = f64(pal_b(g_CLOUD_LIT));
+    k[SKYK_CLOUD_SHADOW] = f64(pal_r(g_CLOUD_SHADOW));
+    k[SKYK_CLOUD_SHADOW + 1] = f64(pal_g(g_CLOUD_SHADOW));
+    k[SKYK_CLOUD_SHADOW + 2] = f64(pal_b(g_CLOUD_SHADOW));
+    k[SKYK_FOG] = f64(pal_r(g_SKY_HORIZON)) / 255.0;
+    k[SKYK_FOG + 1] = f64(pal_g(g_SKY_HORIZON)) / 255.0;
+    k[SKYK_FOG + 2] = f64(pal_b(g_SKY_HORIZON)) / 255.0;
+    k[SKYK_STAR_ALPHA] = 0.0;
+    k[SKYK_SUN] = 0.18;                     // ART_BIBLE §5.1 NOON SUN_DIR
+    k[SKYK_SUN + 1] = 0.96;
+    k[SKYK_SUN + 2] = 0.22;
+    k[SKYK_HALO_R] = SUN_HALO_R_DEF;
+    k[SKYK_HALO_EXP] = SUN_HALO_EXP_DEF;
+    k[SKYK_MOON_PHASE] = 0.5;
+    k[SKYK_CLOUD_COVER] = 0.0;
+}
+
+// Hand skygen the current keyframe.  Takes effect at the next mark_dirty/build,
+// never mid-slice: a re-bake that changed keys halfway through would leave a
+// horizontal tear across the panorama for eight frames.
+export fn skygen_set_keys(p_k: array<f64>) {
+    if (g_sky_ready == 0) { skygen_init(); }
+    let src: array<f64> = p_k;
+    let dst: array<f64> = g_sky_keys;
+    for (let i = 0; i < SKYK_COUNT; i++) { dst[i] = src[i]; }
+}
+
+export fn skygen_keys(): array<f64> {
+    if (g_sky_ready == 0) { skygen_init(); }
+    return g_sky_keys;
+}
+
+// Seconds since world start; drives cloud drift (§11.2, 0.6 and 1.4 px/s).
+export fn skygen_set_clock(t: f64) {
+    if (g_sky_ready == 0) { skygen_init(); }
+    g_sky_clock = t;
+}
+
+// Bake only some layers.  SKYF_ALL in the game; the harness uses it to check
+// the gradient for banding without clouds and stars in the way.
+export fn skygen_set_features(m: i32) {
+    if (g_sky_ready == 0) { skygen_init(); }
+    g_sky_features = m;
+}
+
+// ---------------------------------------------------------------------------
+// per-snapshot derivation (cold — once per re-bake, not once per row)
+// ---------------------------------------------------------------------------
+
+fn sky_snapshot() {
+    let src: array<f64> = g_sky_keys;
+    let k: array<f64> = g_sky_keys_hot;
+    for (let i = 0; i < SKYK_COUNT; i++) { k[i] = src[i]; }
+    g_sky_clock_hot = g_sky_clock;
+
+    // --- the horizon seam: fog hue at the authored horizon's luminance ------
+    let fr: f64 = k[SKYK_FOG];
+    let fg: f64 = k[SKYK_FOG + 1];
+    let fb: f64 = k[SKYK_FOG + 2];
+    let lw: f64 = 0.299 * fr + 0.587 * fg + 0.114 * fb;
+    let lh: f64 = 0.299 * k[SKYK_HOR] + 0.587 * k[SKYK_HOR + 1]
+                + 0.114 * k[SKYK_HOR + 2];
+    let gq: f64 = 0.0;
+    if (lw > 0.02) { gq = lh / lw; }
+    let sr: f64 = fr * gq;
+    let sg: f64 = fg * gq;
+    let sb: f64 = fb * gq;
+    if (sr > 255.0) { sr = 255.0; }
+    if (sg > 255.0) { sg = 255.0; }
+    if (sb > 255.0) { sb = 255.0; }
+    if (sr < 0.0) { sr = 0.0; }
+    if (sg < 0.0) { sg = 0.0; }
+    if (sb < 0.0) { sb = 0.0; }
+    g_sky_seam[0] = sr;
+    g_sky_seam[1] = sg;
+    g_sky_seam[2] = sb;
+
+    // --- sun / moon placement: azimuth -> U, elevation -> V ------------------
+    let sx: f64 = k[SKYK_SUN];
+    let sy: f64 = k[SKYK_SUN + 1];
+    let sz: f64 = k[SKYK_SUN + 2];
+    let len: f64 = sqrt(sx * sx + sy * sy + sz * sz);
+    if (len < 0.0001) { len = 1.0; sy = 1.0; }
+    let ny: f64 = sy / len;
+    if (ny > 1.0) { ny = 1.0; }
+    if (ny < -1.0) { ny = -1.0; }
+
+    let az: f64 = atan2(sx, sz);                    // -PI .. PI
+    let el: f64 = asin(ny);                         // -PI/2 .. PI/2
+    g_sky_sun_u = (az / 6.283185307179586 + 0.5) * f64(SKY_W);
+    g_sky_sun_v = (1.0 - el / 1.5707963267948966) * f64(SKY_H - 1);
+
+    // The moon opposes the sun (§5.1 note 1): -SUN_DIR.
+    let maz: f64 = atan2(0.0 - sx, 0.0 - sz);
+    let mel: f64 = asin(0.0 - ny);
+    g_sky_moon_u = (maz / 6.283185307179586 + 0.5) * f64(SKY_W);
+    g_sky_moon_v = (1.0 - mel / 1.5707963267948966) * f64(SKY_H - 1);
+
+    g_sky_sun_up = 0;
+    if (ny > -0.02) { g_sky_sun_up = 1; }
+
+    // --- per-snapshot precomputation ---------------------------------------
+    // Cloud drift (§11.2, 0.6 and 1.4 px/s) shifts the sample point, not the
+    // lattice, so it is a plain integer offset held for the whole re-bake.
+    g_sky_foff = i32(g_sky_clock_hot * CLOUD_FAR_DRIFT);
+    g_sky_noff = i32(g_sky_clock_hot * CLOUD_NEAR_DRIFT);
+    sky_build_halo_lut();
+    // The profile ring holds rows baked under the PREVIOUS keyframe; keeping
+    // them would blend two keyframes' cloud tops together for three rows.
+    for (let i = 0; i < RING; i++) { g_sky_ring_tag[i] = -1000; }
+    g_sky_mw_tag = -1000;
+}
+
+// The sun's baked panorama position, for the harness and for anything that
+// wants to point a lens flare at it.  Writes u, v into out[off], out[off+1].
+export fn skygen_sun_uv(p_out: array<f64>, p_off: i32) {
+    let o: array<f64> = p_out;
+    let i: i32 = p_off;
+    o[i] = g_sky_sun_u;
+    o[i + 1] = g_sky_sun_v;
+}
+export fn skygen_moon_uv(p_out: array<f64>, p_off: i32) {
+    let o: array<f64> = p_out;
+    let i: i32 = p_off;
+    o[i] = g_sky_moon_u;
+    o[i + 1] = g_sky_moon_v;
+}
+export fn skygen_sun_is_up(): i32 { let o: i32 = g_sky_sun_up; return o; }
+
+// ---------------------------------------------------------------------------
+// the gradient — ART_BIBLE §11.1
+//
+// Evaluated once per row into out[0..2] as unclamped f64 channels.  The gamma
+// on the zenith->mid leg is 1.35: real skies change fast near the horizon and
+// slowly overhead, and a linear ramp there is the most obvious tell of a
+// procedural sky there is.
+// ---------------------------------------------------------------------------
+
+fn sky_gradient(p_v: f64, p_out: array<f64>) {
+    let v: f64 = p_v;
+    let k: array<f64> = g_sky_keys_hot;
+    let out: array<f64> = p_out;
+    let a0: f64 = 0.0;
+    let a1: f64 = 0.0;
+    let a2: f64 = 0.0;
+    let b0: f64 = 0.0;
+    let b1: f64 = 0.0;
+    let b2: f64 = 0.0;
+    let t: f64 = 0.0;
+
+    // V = 0.82 stop: lerp(SKY_MID, SKY_HORIZON, 0.55)
+    let m0: f64 = k[SKYK_MID] + (k[SKYK_HOR] - k[SKYK_MID]) * 0.55;
+    let m1: f64 = k[SKYK_MID + 1] + (k[SKYK_HOR + 1] - k[SKYK_MID + 1]) * 0.55;
+    let m2: f64 = k[SKYK_MID + 2] + (k[SKYK_HOR + 2] - k[SKYK_MID + 2]) * 0.55;
+
+    if (v <= 0.42) {
+        a0 = k[SKYK_ZEN]; a1 = k[SKYK_ZEN + 1]; a2 = k[SKYK_ZEN + 2];
+        b0 = k[SKYK_MID]; b1 = k[SKYK_MID + 1]; b2 = k[SKYK_MID + 2];
+        t = pow(v / 0.42, 1.35);
+    } else {
+        if (v <= 0.82) {
+            a0 = k[SKYK_MID]; a1 = k[SKYK_MID + 1]; a2 = k[SKYK_MID + 2];
+            b0 = m0; b1 = m1; b2 = m2;
+            t = (v - 0.42) / 0.40;
+        } else {
+            if (v <= 0.96) {
+                a0 = m0; a1 = m1; a2 = m2;
+                b0 = g_sky_seam[0]; b1 = g_sky_seam[1]; b2 = g_sky_seam[2];
+                t = (v - 0.82) / 0.14;
+            } else {
+                a0 = g_sky_seam[0]; a1 = g_sky_seam[1]; a2 = g_sky_seam[2];
+                b0 = a0 * 0.96; b1 = a1 * 0.96; b2 = a2 * 0.96;
+                t = (v - 0.96) / 0.04;
+            }
+        }
+    }
+    out[0] = a0 + (b0 - a0) * t;
+    out[1] = a1 + (b1 - a1) * t;
+    out[2] = a2 + (b2 - a2) * t;
+}
+
+// ---------------------------------------------------------------------------
+// the cloud band — 0 at the zenith, 1 through the middle, 0 well above the
+// horizon.  §11.2 and §11.5: "never let a cloud touch the horizon line".
+// ---------------------------------------------------------------------------
+
+fn sky_cloud_band(p_v: f64): f64 {
+    let v: f64 = p_v;
+    if (v <= CLOUD_BAND_LO0) { return 0.0; }
+    if (v >= CLOUD_BAND_HI1) { return 0.0; }
+    let a: f64 = 1.0;
+    if (v < CLOUD_BAND_LO1) {
+        let t: f64 = (v - CLOUD_BAND_LO0) / (CLOUD_BAND_LO1 - CLOUD_BAND_LO0);
+        a = t * t * (3.0 - 2.0 * t);
+    }
+    let b: f64 = 1.0;
+    if (v > CLOUD_BAND_HI0) {
+        let t2: f64 = 1.0 - (v - CLOUD_BAND_HI0) / (CLOUD_BAND_HI1 - CLOUD_BAND_HI0);
+        b = t2 * t2 * (3.0 - 2.0 * t2);
+    }
+    let out: f64 = a * b;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// composite one texel — read, blend, write.  Used ONLY by the star, sun, moon
+// and Milky Way passes, which together touch a few hundred texels a frame.
+// 162 ns a call; never put it on the cloud path.
+// ---------------------------------------------------------------------------
+
+fn sky_blend_px(p_o: i32, p_r: f64, p_g: f64, p_b: f64, p_a: f64, p_dith: f64) {
+    let a: f64 = p_a;
+    if (a <= 0.0) { return; }
+    if (a > 1.0) { a = 1.0; }
+    let d: buffer = g_sky_data;
+    let o: i32 = p_o;
+    let bv: f64 = p_dith;
+    let vr: f64 = f64(d[o]);
+    let vg: f64 = f64(d[o + 1]);
+    let vb: f64 = f64(d[o + 2]);
+    vr = vr + (p_r - vr) * a + bv;
+    vg = vg + (p_g - vg) * a + bv;
+    vb = vb + (p_b - vb) * a + bv;
+    if (vr < 0.0) { vr = 0.0; }
+    if (vg < 0.0) { vg = 0.0; }
+    if (vb < 0.0) { vb = 0.0; }
+    if (vr > 255.0) { vr = 255.0; }
+    if (vg > 255.0) { vg = 255.0; }
+    if (vb > 255.0) { vb = 255.0; }
+    d[o] = i32(vr + 0.5);
+    d[o + 1] = i32(vg + 0.5);
+    d[o + 2] = i32(vb + 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// pass 2 — the Milky Way haze.  Only the band's own x-span is walked; at slope
+// 2.6 that is 153 of 512 texels, and the wrap is handled by two spans.
+// ---------------------------------------------------------------------------
+
+fn sky_pass_milkyway(p_y: i32, p_sa: f64) {
+    let y: i32 = p_y;
+    let sa: f64 = p_sa;
+    // The haze is the lowest-frequency thing in the panorama: a 128-texel
+    // lattice squashed 2.6x has vertical features about 49 rows tall, so
+    // re-deriving its profile every row is 4x wasted work.  Once every four
+    // rows is still 12 samples per feature.
+    let grp: i32 = y >> 2;
+    if (g_sky_mw_tag != grp) {
+        g_sky_mw_tag = grp;
+        sky_profile(g_sky_pf_mw, 0, CLOUD_CELLS + 1,
+                    i32(f64(grp << 2) * CLOUD_VSQUASH), 4, 0);
+    }
+
+    // the haze levels, packed once against this row's gradient
+    let rgb: array<f64> = g_sky_rgb;
+    let sr: f64 = rgb[0];
+    let sg: f64 = rgb[1];
+    let sb: f64 = rgb[2];
+    let hr: f64 = f64(pal_r(g_STAR_DIM));
+    let hg: f64 = f64(pal_g(g_STAR_DIM));
+    let hb: f64 = f64(pal_b(g_STAR_DIM));
+    let px: array = g_sky_mw_px;
+    let amax: f64 = MW_HAZE * sa;
+    for (let l = 0; l <= MW_LEVELS; l++) {
+        let a: f64 = amax * f64(l) / f64(MW_LEVELS);
+        px[l] = sky_pack(sr + (hr - sr) * a, sg + (hg - sg) * a, sb + (hb - sb) * a);
+    }
+
+    let prof: array<f64> = g_sky_pf_mw;
+    let bay: array<f64> = g_sky_bay;
+    let cx: f64 = MW_X0 + MW_SLOPE * f64(y);
+    let base: i32 = y * SKY_W;
+    let invw: f64 = 1.0 / MW_HALFW;
+    let invs: f64 = 1.0 / f64(CLOUD_STEP);
+    let p: ptr = g_sky_p;
+    let nl: f64 = f64(MW_LEVELS);
+    // The span is walked in unwrapped x so no per-texel wrap arithmetic is
+    // needed; only the buffer index is folded.
+    let x0: i32 = i32(floor(cx - MW_HALFW));
+    let x1: i32 = i32(floor(cx + MW_HALFW)) + 1;
+
+    // Walked incrementally: |dx| falls then rises linearly across the band and
+    // the profile is linear inside a cell, so the body holds one multiply-add
+    // per quantity instead of a divide, a shift and two array reads.
+    let dx: f64 = f64(x0) - cx;
+    let fk: i32 = -1;
+    let n: f64 = 0.0;
+    let dn: f64 = 0.0;
+    for (let x = x0; x <= x1; x++) {
+        let adx: f64 = dx;
+        if (adx < 0.0) { adx = 0.0 - adx; }
+        if (adx < MW_HALFW) {
+            let xx: i32 = x & 511;
+            let k: i32 = xx >> CLOUD_STEP_SHIFT;
+            if (k != fk) {
+                fk = k;
+                n = prof[k];
+                dn = (prof[k + 1] - n) * invs;
+                n = n + dn * f64(xx & 7);
+            }
+            let t: f64 = 1.0 - adx * invw;
+            let li: i32 = i32(t * t * n * nl + bay[xx & 3]);
+            if (li > MW_LEVELS) { li = MW_LEVELS; }
+            if (li > 0) { ptr_write_u32(ptr_offset(p, base + xx, 4), px[li]); }
+            n = n + dn;
+        }
+        dx = dx + 1.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pass 3 — the stars.  Only the row's own table entries are touched.
+// ---------------------------------------------------------------------------
+
+fn sky_put_star(p_x: i32, p_y: i32, p_r: f64, p_g: f64, p_b: f64, p_a: f64) {
+    let y: i32 = p_y;
+    if (y < 0) { return; }
+    if (y >= SKY_H) { return; }
+    let xx: i32 = p_x % SKY_W;
+    if (xx < 0) { xx = xx + SKY_W; }
+    sky_blend_px((y * SKY_W + xx) * 4, p_r, p_g, p_b, p_a, 0.0);
+}
+
+fn sky_pass_stars(p_y: i32, p_sa: f64) {
+    let y: i32 = p_y;
+    let sa: f64 = p_sa;
+    let s0: i32 = g_sky_star_row[y];
+    let s1: i32 = g_sky_star_row[y + 1];
+    if (s0 >= s1) { return; }
+
+    let br: f64 = f64(pal_r(g_STAR_BRIGHT));
+    let bg: f64 = f64(pal_g(g_STAR_BRIGHT));
+    let bb: f64 = f64(pal_b(g_STAR_BRIGHT));
+    let dr: f64 = f64(pal_r(g_STAR_DIM));
+    let dg: f64 = f64(pal_g(g_STAR_DIM));
+    let db: f64 = f64(pal_b(g_STAR_DIM));
+    // tier 2 is lerp(STAR_BRIGHT, STAR_DIM, 0.45)
+    let t2r: f64 = br + (dr - br) * STAR_T2_MIX;
+    let t2g: f64 = bg + (dg - bg) * STAR_T2_MIX;
+    let t2b: f64 = bb + (db - bb) * STAR_T2_MIX;
+    let bay: array<f64> = g_sky_bay;
+    let xs: array<i32> = g_sky_star_x;
+    let ts: array<i32> = g_sky_star_t;
+
+    for (let i = s0; i < s1; i++) {
+        let x: i32 = xs[i];
+        let tier: i32 = ts[i];
+        if (tier == 1) {
+            sky_put_star(x, y, br, bg, bb, sa);
+            // the 1-px cross at 40 %: this is what makes one texel read as a
+            // star instead of a dead pixel (§11.4)
+            let ca: f64 = sa * STAR_CROSS;
+            sky_put_star(x - 1, y, br, bg, bb, ca);
+            sky_put_star(x + 1, y, br, bg, bb, ca);
+            sky_put_star(x, y - 1, br, bg, bb, ca);
+            sky_put_star(x, y + 1, br, bg, bb, ca);
+        } else {
+            if (tier == 2) {
+                sky_put_star(x, y, t2r, t2g, t2b, sa);
+            } else {
+                // tier 3 is dithered at 50 % against the Bayer cell, so half of
+                // them flicker out — free twinkle on every re-bake
+                if (bay[x & 3] >= 0.5) {
+                    sky_put_star(x, y, dr, dg, db, sa);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pass 4 — sun and moon, baked into the panorama (§11.3).
+// ---------------------------------------------------------------------------
+
+// The halo's alpha profile, 1 - (r/R)^exp, tabulated against r^2 so the texel
+// loop needs neither sqrt nor pow.  Rebuilt whenever the snapshot's halo radius
+// or exponent changes — i.e. once per re-bake, not once per row.
+fn sky_build_halo_lut() {
+    let k: array<f64> = g_sky_keys_hot;
+    let hr: f64 = k[SKYK_HALO_R];
+    if (hr < 10.0) { hr = SUN_HALO_R_DEF; }
+    let hx: f64 = k[SKYK_HALO_EXP];
+    if (hx < 0.5) { hx = SUN_HALO_EXP_DEF; }
+    let lut: array<f64> = g_sky_halo_a;
+    let n: f64 = f64(HALO_LUT);
+    for (let i = 0; i <= HALO_LUT; i++) {
+        // i indexes r^2 / hr^2 linearly, so r/hr = sqrt(i/n)
+        let a: f64 = 1.0 - pow(sqrt(f64(i) / n), hx);
+        if (a < 0.0) { a = 0.0; }
+        lut[i] = a;
+    }
+}
+
+fn sky_pass_sun(p_y: i32) {
+    let y: i32 = p_y;
+    let k: array<f64> = g_sky_keys_hot;
+    let hr: f64 = k[SKYK_HALO_R];
+    if (hr < 10.0) { hr = SUN_HALO_R_DEF; }
+
+    let dy: f64 = f64(y) - g_sky_sun_v;
+    if (dy < 0.0) { dy = 0.0 - dy; }
+    if (dy > hr) { return; }
+    let span: f64 = sqrt(hr * hr - dy * dy);
+    let x0: i32 = i32(floor(g_sky_sun_u - span)) - 1;
+    let x1: i32 = i32(floor(g_sky_sun_u + span)) + 1;
+
+    // the disc, and the halo levels packed against this row's gradient
+    let rgb: array<f64> = g_sky_rgb;
+    let sr: f64 = rgb[0];
+    let sg: f64 = rgb[1];
+    let sb: f64 = rgb[2];
+    let lr: f64 = f64(pal_r(g_SUN_HALO));
+    let lg: f64 = f64(pal_g(g_SUN_HALO));
+    let lb: f64 = f64(pal_b(g_SUN_HALO));
+    let px: array = g_sky_halo_px;
+    for (let l = 0; l <= HALO_LEVELS; l++) {
+        let a: f64 = f64(l) / f64(HALO_LEVELS);
+        px[l] = sky_pack(sr + (lr - sr) * a, sg + (lg - sg) * a, sb + (lb - sb) * a);
+    }
+    let disc: u32 = sky_pack(f64(pal_r(g_SUN_DISC)), f64(pal_g(g_SUN_DISC)),
+                             f64(pal_b(g_SUN_DISC)));
+
+    let bay: array<f64> = g_sky_bay;
+    let lut: array<f64> = g_sky_halo_a;
+    let dy2: f64 = dy * dy;
+    let base: i32 = y * SKY_W;
+    let p: ptr = g_sky_p;
+    let disc2: f64 = SUN_DISC_R * SUN_DISC_R;
+    let hr2: f64 = hr * hr;
+    let lscale: f64 = f64(HALO_LUT) / hr2;
+    let nl: f64 = f64(HALO_LEVELS);
+
+    for (let x = x0; x <= x1; x++) {
+        let dx: f64 = f64(x) - g_sky_sun_u;
+        let r2: f64 = dx * dx + dy2;
+        if (r2 < hr2) {
+            let xx: i32 = x & 511;
+            if (r2 <= disc2) {
+                // HARD edge — no gradient on the disc.  A hard disc reads as a
+                // light source; a soft blob reads as a smudge (§11.3).
+                ptr_write_u32(ptr_offset(p, base + xx, 4), disc);
+            } else {
+                let li: i32 = i32(lut[i32(r2 * lscale)] * nl + bay[xx & 3]);
+                if (li > HALO_LEVELS) { li = HALO_LEVELS; }
+                if (li > 0) { ptr_write_u32(ptr_offset(p, base + xx, 4), px[li]); }
+            }
+        }
+    }
+}
+
+// Four MOON_MARE blobs in a fixed pattern (§11.3), in disc-local texels.
+fn sky_mare_x(i: i32): f64 {
+    if (i == 0) { return -3.5; }
+    if (i == 1) { return 1.5; }
+    if (i == 2) { return 4.0; }
+    return -1.0;
+}
+fn sky_mare_y(i: i32): f64 {
+    if (i == 0) { return -2.0; }
+    if (i == 1) { return -4.0; }
+    if (i == 2) { return 2.5; }
+    return 4.5;
+}
+fn sky_mare_r2(i: i32): f64 {
+    if (i == 0) { return 9.0; }
+    if (i == 1) { return 4.0; }
+    if (i == 2) { return 6.25; }
+    return 4.0;
+}
+
+fn sky_pass_moon(p_y: i32) {
+    let y: i32 = p_y;
+    let dy: f64 = f64(y) - g_sky_moon_v;
+    let ady: f64 = dy;
+    if (ady < 0.0) { ady = 0.0 - ady; }
+    if (ady > MOON_HALO_R) { return; }
+
+    let k: array<f64> = g_sky_keys_hot;
+    let phase: f64 = k[SKYK_MOON_PHASE];
+    // A triangle wave in phase gives a linear terminator sweep; a cosine bunches
+    // the crescents at both ends and the moon then looks stuck.
+    //   phase 0 -> k=+1 new, 0.25 -> 0 right half, 0.5 -> -1 full, 0.75 -> 0.
+    let kk: f64 = 1.0 - 4.0 * phase;
+    if (phase > 0.5) { kk = 4.0 * phase - 3.0; }
+    if (kk < -1.0) { kk = -1.0; }
+    if (kk > 1.0) { kk = 1.0; }
+
+    let span: f64 = sqrt(MOON_HALO_R * MOON_HALO_R - ady * ady);
+    let x0: i32 = i32(floor(g_sky_moon_u - span)) - 1;
+    let x1: i32 = i32(floor(g_sky_moon_u + span)) + 1;
+
+    let cr: f64 = f64(pal_r(g_MOON_DISC));
+    let cg: f64 = f64(pal_g(g_MOON_DISC));
+    let cb: f64 = f64(pal_b(g_MOON_DISC));
+    let mr: f64 = f64(pal_r(g_MOON_MARE));
+    let mg: f64 = f64(pal_g(g_MOON_MARE));
+    let mb: f64 = f64(pal_b(g_MOON_MARE));
+    let bay: array<f64> = g_sky_bay;
+    let base: i32 = y * SKY_W;
+
+    // the terminator's x at this row
+    let inner: f64 = MOON_DISC_R * MOON_DISC_R - dy * dy;
+    let xt: f64 = 0.0;
+    if (inner > 0.0) { xt = kk * sqrt(inner); }
+
+    for (let x = x0; x <= x1; x++) {
+        let dx: f64 = f64(x) - g_sky_moon_u;
+        let r: f64 = sqrt(dx * dx + dy * dy);
+        let xx: i32 = x % SKY_W;
+        if (xx < 0) { xx = xx + SKY_W; }
+        let o: i32 = (base + xx) * 4;
+        let bv: f64 = bay[xx & 3] - 0.5;
+        if (r <= MOON_DISC_R) {
+            let rr: f64 = cr;
+            let gg: f64 = cg;
+            let bb2: f64 = cb;
+            let hitm: i32 = 0;
+            for (let mi = 0; mi < 4; mi++) {
+                if (hitm == 0) {
+                    let mdx: f64 = dx - sky_mare_x(mi);
+                    let mdy: f64 = dy - sky_mare_y(mi);
+                    if (mdx * mdx + mdy * mdy <= sky_mare_r2(mi)) {
+                        rr = mr; gg = mg; bb2 = mb;
+                        hitm = 1;
+                    }
+                }
+            }
+            if (dx >= xt) {
+                sky_blend_px(o, rr, gg, bb2, 1.0, bv);
+            } else {
+                // the unlit limb: a MOON_MARE-tinted ghost, not a black hole
+                sky_blend_px(o, mr, mg, mb, MOON_DARK_T, bv);
+            }
+        } else {
+            if (r < MOON_HALO_R) {
+                let t: f64 = 1.0 - r / MOON_HALO_R;
+                sky_blend_px(o, cr, cg, cb, t * t * MOON_HALO_MAX, bv);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pass 5 — the clouds.  §11.2, including the lit-top / shadowed-bottom split
+// that is the whole difference between clouds and noise.
+//
+// Structure: walk the CLOUD_CELLS profile cells; inside a cell the four noise
+// values advance by a constant delta, so the per-texel work is four adds, two
+// compares and — on a hit — a ramp_pick and one 32-bit store.  No divides, no
+// array reads, no read-modify-write.
+//
+// The 4-entry ramp is [sky, CLOUD_SHADOW, CLOUD_MID, CLOUD_LIT] and the pick is
+// the §7.2 ramp_pick: quantise, then push up one step when the fraction beats
+// the Bayer cell.  Index 0 is the sky, which is already in the buffer, so the
+// store is skipped — that is also what makes a wispy edge dissolve into the
+// gradient instead of ending on a hard line.
+// ---------------------------------------------------------------------------
+
+fn sky_pass_clouds(p_y: i32, p_band: f64) {
+    let y: i32 = p_y;
+    let band: f64 = p_band;
+    let k: array<f64> = g_sky_keys_hot;
+    let bias: f64 = k[SKYK_CLOUD_COVER];
+
+    // This row's profiles, into the ring.  The "above" profiles come out of the
+    // ring for free whenever row y-3 is still in it, which is every row except
+    // the first three of a fresh re-bake.
+    let np: i32 = CLOUD_CELLS + 1;
+    let slot: i32 = y & 3;
+    let foff: i32 = slot * (CLOUD_CELLS + 2);
+    sky_ring_fill(y, foff, foff);
+    g_sky_ring_tag[slot] = y;
+
+    let pf: array<f64> = g_sky_ring_far;
+    let pn: array<f64> = g_sky_ring_near;
+    let pfu: array<f64> = g_sky_ring_far;
+    let pnu: array<f64> = g_sky_ring_near;
+    let uslot: i32 = (y - CLOUD_TOP_LOOK) & 3;
+    let uoff: i32 = uslot * (CLOUD_CELLS + 2);
+    if (g_sky_ring_tag[uslot] != y - CLOUD_TOP_LOOK) {
+        let nyu: i32 = i32(f64(y - CLOUD_TOP_LOOK) * CLOUD_VSQUASH);
+        sky_profile(g_sky_pf_up_far, 0, np, nyu, 0, g_sky_foff);
+        sky_profile(g_sky_pf_up_near, 0, np, nyu, 2, g_sky_noff);
+        pfu = g_sky_pf_up_far;
+        pnu = g_sky_pf_up_near;
+        uoff = 0;
+    }
+
+    // --- the per-row composited ramp ---------------------------------------
+    // A layer's opacity is folded into the COLOUR, not into a dither density.
+    // The far layer is a 55 %-opaque veil; writing lerp(sky, cloud, 0.55) as a
+    // solid texel is exactly what an alpha blend would produce, and it reads as
+    // a thin high cloud.  Dithering that same 55 % as a checkerboard of sky and
+    // full cloud instead — which is what the first cut did — reads as a
+    // halftone screen printed on the sky, and it was the single worst thing in
+    // the first render.  Only the FRINGE is dithered, between the composited
+    // colour and its half step.
+    let lr: f64 = k[SKYK_CLOUD_LIT];
+    let lg: f64 = k[SKYK_CLOUD_LIT + 1];
+    let lb: f64 = k[SKYK_CLOUD_LIT + 2];
+    let sr: f64 = k[SKYK_CLOUD_SHADOW];
+    let sg: f64 = k[SKYK_CLOUD_SHADOW + 1];
+    let sb: f64 = k[SKYK_CLOUD_SHADOW + 2];
+    let mr: f64 = sr + (lr - sr) * CLOUD_MID_T;
+    let mg: f64 = sg + (lg - sg) * CLOUD_MID_T;
+    let mb: f64 = sb + (lb - sb) * CLOUD_MID_T;
+    // §11.2: sun-side clouds get a SUN_HALO-tinted edge within 60 px of the
+    // sun's azimuth.
+    let hr: f64 = f64(pal_r(g_SUN_HALO));
+    let hg: f64 = f64(pal_g(g_SUN_HALO));
+    let hb: f64 = f64(pal_b(g_SUN_HALO));
+    let tr: f64 = lr + (hr - lr) * CLOUD_SUN_TINT;
+    let tg: f64 = lg + (hg - lg) * CLOUD_SUN_TINT;
+    let tb: f64 = lb + (hb - lb) * CLOUD_SUN_TINT;
+    let gr: f64 = g_sky_rgb[0];
+    let gg2: f64 = g_sky_rgb[1];
+    let gb: f64 = g_sky_rgb[2];
+
+    let an1: f64 = CLOUD_NEAR_OPACITY;
+    let an2: f64 = an1 * 0.5;
+    let af1: f64 = CLOUD_FAR_OPACITY;
+    let af2: f64 = af1 * 0.5;
+    let n_lit: u32 = sky_pack(gr + (lr - gr) * an1, gg2 + (lg - gg2) * an1, gb + (lb - gb) * an1);
+    let n_mid: u32 = sky_pack(gr + (mr - gr) * an1, gg2 + (mg - gg2) * an1, gb + (mb - gb) * an1);
+    let n_sha: u32 = sky_pack(gr + (sr - gr) * an1, gg2 + (sg - gg2) * an1, gb + (sb - gb) * an1);
+    let n_sun: u32 = sky_pack(gr + (tr - gr) * an1, gg2 + (tg - gg2) * an1, gb + (tb - gb) * an1);
+    let h_lit: u32 = sky_pack(gr + (lr - gr) * an2, gg2 + (lg - gg2) * an2, gb + (lb - gb) * an2);
+    let h_mid: u32 = sky_pack(gr + (mr - gr) * an2, gg2 + (mg - gg2) * an2, gb + (mb - gb) * an2);
+    let h_sha: u32 = sky_pack(gr + (sr - gr) * an2, gg2 + (sg - gg2) * an2, gb + (sb - gb) * an2);
+    let h_sun: u32 = sky_pack(gr + (tr - gr) * an2, gg2 + (tg - gg2) * an2, gb + (tb - gb) * an2);
+    let F_lit: u32 = sky_pack(gr + (lr - gr) * af1, gg2 + (lg - gg2) * af1, gb + (lb - gb) * af1);
+    let F_mid: u32 = sky_pack(gr + (mr - gr) * af1, gg2 + (mg - gg2) * af1, gb + (mb - gb) * af1);
+    let F_sha: u32 = sky_pack(gr + (sr - gr) * af1, gg2 + (sg - gg2) * af1, gb + (sb - gb) * af1);
+    let F_sun: u32 = sky_pack(gr + (tr - gr) * af1, gg2 + (tg - gg2) * af1, gb + (tb - gb) * af1);
+    let G_lit: u32 = sky_pack(gr + (lr - gr) * af2, gg2 + (lg - gg2) * af2, gb + (lb - gb) * af2);
+    let G_mid: u32 = sky_pack(gr + (mr - gr) * af2, gg2 + (mg - gg2) * af2, gb + (mb - gb) * af2);
+    let G_sha: u32 = sky_pack(gr + (sr - gr) * af2, gg2 + (sg - gg2) * af2, gb + (sb - gb) * af2);
+    let G_sun: u32 = sky_pack(gr + (tr - gr) * af2, gg2 + (tg - gg2) * af2, gb + (tb - gb) * af2);
+
+    let thf: f64 = CLOUD_FAR_THRESH - bias;
+    let thn: f64 = CLOUD_NEAR_THRESH - bias;
+    if (thf < 0.05) { thf = 0.05; }
+    if (thn < 0.05) { thn = 0.05; }
+    // Opacity CAPS the layer, it does not scale the ramp: the far layer must
+    // saturate at 0.55 (a permanently half-dithered veil) while the near layer
+    // reaches a solid core.  Folding opacity into the ramp instead, as the
+    // first cut did, let the far layer go fully opaque given enough depth.
+    let invf: f64 = CLOUD_EDGE_SOFT / (1.0 - thf);
+    let invn: f64 = CLOUD_EDGE_SOFT / (1.0 - thn);
+
+    let bay: array<f64> = g_sky_bay;
+    let b0: f64 = bay[0];
+    let b1: f64 = bay[1];
+    let b2: f64 = bay[2];
+    let b3: f64 = bay[3];
+    let p: ptr = g_sky_p;
+    let base: i32 = y * SKY_W;
+    let sunu: f64 = g_sky_sun_u;
+    let sun_on: i32 = g_sky_sun_up;
+    let w: f64 = f64(SKY_W);
+    let istep: f64 = 1.0 / f64(CLOUD_STEP);
+    let count: i32 = 0;
+
+    // The threshold is divided by `band` once instead of multiplying every
+    // profile sample by it, so the skip test below is four reads and four
+    // compares with no arithmetic at all.
+    let thfb: f64 = thf / band;
+    let thnb: f64 = thn / band;
+
+    for (let c = 0; c < CLOUD_CELLS; c++) {
+        let raw_f0: f64 = pf[foff + c];
+        let raw_f1: f64 = pf[foff + c + 1];
+        let raw_n0: f64 = pn[foff + c];
+        let raw_n1: f64 = pn[foff + c + 1];
+        // CELL SKIP.  The value is linear across the cell, so if neither
+        // endpoint of either layer clears its threshold, no texel in these
+        // eight can be cloud.  Coverage is 15-20 %, so this drops three cells
+        // in four before any per-texel work happens — the single reason the
+        // cloud pass fits the frame at all.
+        let skip: i32 = 1;
+        if (raw_f0 > thfb) { skip = 0; }
+        if (raw_f1 > thfb) { skip = 0; }
+        if (raw_n0 > thnb) { skip = 0; }
+        if (raw_n1 > thnb) { skip = 0; }
+        if (skip == 1) { continue; }
+
+        let cf: f64 = raw_f0 * band;
+        let cf1: f64 = raw_f1 * band;
+        let cn: f64 = raw_n0 * band;
+        let cn1: f64 = raw_n1 * band;
+        let dcf: f64 = (cf1 - cf) * istep;
+        let af: f64 = pfu[uoff + c] * band;
+        let daf: f64 = (pfu[uoff + c + 1] * band - af) * istep;
+        let dcn: f64 = (cn1 - cn) * istep;
+        let an: f64 = pnu[uoff + c] * band;
+        let dan: f64 = (pnu[uoff + c + 1] * band - an) * istep;
+        let x: i32 = c << CLOUD_STEP_SHIFT;
+
+        for (let j = 0; j < CLOUD_STEP; j++) {
+            // depth: 0 at the wispy edge, 1 in the core (§11.2)
+            let core: f64 = -1.0;
+            let above: f64 = 0.0;
+            let th: f64 = 0.0;
+            let near: i32 = 0;
+            if (cn > thn) {
+                core = (cn - thn) * invn; above = an; th = thn; near = 1;
+            } else {
+                if (cf > thf) { core = (cf - thf) * invf; above = af; th = thf; }
+            }
+            if (core > 0.0) {
+                if (core > 1.0) { core = 1.0; }
+                let m: i32 = x & 3;
+                let bt: f64 = b0;
+                if (m == 1) { bt = b1; }
+                if (m == 2) { bt = b2; }
+                if (m == 3) { bt = b3; }
+                let lev: i32 = i32(core + core + bt);
+                if (lev > 0) {
+                    // THE lit-top / shadowed-bottom split: sample the same
+                    // field three rows up.  If the cloud is not there, this
+                    // texel is the cloud's top edge and catches the light.
+                    let tier: i32 = 1;                      // 0 shadow 1 mid 2 lit
+                    if (above < th + CLOUD_TOP_BIAS) {
+                        tier = 2;
+                        if (sun_on == 1) {
+                            let dxs: f64 = f64(x) - sunu;
+                            if (dxs > 256.0) { dxs = dxs - 512.0; }
+                            if (dxs < -256.0) { dxs = dxs + 512.0; }
+                            if (dxs < 0.0) { dxs = 0.0 - dxs; }
+                            if (dxs < CLOUD_SUN_FAR) { tier = 3; }
+                        }
+                    } else {
+                        if (core < CLOUD_SHADOW_DEPTH) { tier = 0; }
+                    }
+                    let px: u32 = 0;
+                    if (near == 1) {
+                        if (lev == 1) {
+                            px = h_mid;
+                            if (tier == 0) { px = h_sha; }
+                            if (tier == 2) { px = h_lit; }
+                            if (tier == 3) { px = h_sun; }
+                        } else {
+                            px = n_mid;
+                            if (tier == 0) { px = n_sha; }
+                            if (tier == 2) { px = n_lit; }
+                            if (tier == 3) { px = n_sun; }
+                        }
+                    } else {
+                        if (lev == 1) {
+                            px = G_mid;
+                            if (tier == 0) { px = G_sha; }
+                            if (tier == 2) { px = G_lit; }
+                            if (tier == 3) { px = G_sun; }
+                        } else {
+                            px = F_mid;
+                            if (tier == 0) { px = F_sha; }
+                            if (tier == 2) { px = F_lit; }
+                            if (tier == 3) { px = F_sun; }
+                        }
+                    }
+                    ptr_write_u32(ptr_offset(p, base + x, 4), px);
+                    count = count + 1;
+                }
+            }
+            cf = cf + dcf; af = af + daf; cn = cn + dcn; an = an + dan;
+            x = x + 1;
+        }
+    }
+    g_sky_row_cloud[y] = count;
+}
+
+// ---------------------------------------------------------------------------
+// one row
+// ---------------------------------------------------------------------------
+
+fn sky_bake_row(p_y: i32) {
+    let y: i32 = p_y;
+    let v: f64 = f64(y) / f64(SKY_H - 1);
+    let bay: array<f64> = g_sky_bay;
+    bay[0] = bayer4(0, y);
+    bay[1] = bayer4(1, y);
+    bay[2] = bayer4(2, y);
+    bay[3] = bayer4(3, y);
+
+    // --- pass 1: the gradient, as 256 u64 stores ---------------------------
+    // The row colour is one value; the only per-texel variation is the ordered
+    // dither, which has four states.  Quantise once, pair the four texels into
+    // two u64s, and the whole row is a memset with a period of eight bytes.
+    let rgb: array<f64> = g_sky_rgb;
+    sky_gradient(v, rgb);
+    let cr: f64 = rgb[0];
+    let cg: f64 = rgb[1];
+    let cb: f64 = rgb[2];
+    let q0: u32 = sky_pack(cr + bay[0] - 0.5, cg + bay[0] - 0.5, cb + bay[0] - 0.5);
+    let q1: u32 = sky_pack(cr + bay[1] - 0.5, cg + bay[1] - 0.5, cb + bay[1] - 0.5);
+    let q2: u32 = sky_pack(cr + bay[2] - 0.5, cg + bay[2] - 0.5, cb + bay[2] - 0.5);
+    let q3: u32 = sky_pack(cr + bay[3] - 0.5, cg + bay[3] - 0.5, cb + bay[3] - 0.5);
+    let pa: u64 = u64(q0) | (u64(q1) << 32);
+    let pb: u64 = u64(q2) | (u64(q3) << 32);
+    let p: ptr = g_sky_p;
+    let b8: i32 = y * 256;                  // row base in u64 units
+    for (let i = 0; i < 256; i = i + 2) {
+        ptr_write_u64(ptr_offset(p, b8 + i, 8), pa);
+        ptr_write_u64(ptr_offset(p, b8 + i + 1, 8), pb);
+    }
+
+    g_sky_row_cloud[y] = 0;
+
+    let feat: i32 = g_sky_features;
+    let sa: f64 = g_sky_keys_hot[SKYK_STAR_ALPHA];
+    if (sa > 0.0) {
+        // stars fade out well above the horizon so they never sit in the fog
+        let fade: f64 = 1.0;
+        if (v > STAR_FADE_V0) {
+            fade = 1.0 - (v - STAR_FADE_V0) / (STAR_FADE_V1 - STAR_FADE_V0);
+        }
+        if (fade < 0.0) { fade = 0.0; }
+        let sae: f64 = sa * fade;
+        if (sae > 0.0) {
+            if ((feat & SKYF_MILKYWAY) != 0) { sky_pass_milkyway(y, sae); }
+            if ((feat & SKYF_STARS) != 0) { sky_pass_stars(y, sae); }
+        }
+    }
+
+    if (g_sky_sun_up == 1) {
+        if ((feat & SKYF_SUN) != 0) { sky_pass_sun(y); }
+    } else {
+        if ((feat & SKYF_MOON) != 0) { sky_pass_moon(y); }
+    }
+
+    if ((feat & SKYF_CLOUDS) != 0) {
+        let band: f64 = sky_cloud_band(v);
+        if (band > 0.004) { sky_pass_clouds(y, band); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// public bake API
+// ---------------------------------------------------------------------------
+
+// CPU-only full bake.  No SDL, no window.  Returns rows baked.
+export fn skygen_bake_all(): i32 {
+    if (g_sky_ready == 0) { skygen_init(); }
+    sky_snapshot();
+    for (let y = 0; y < SKY_H; y++) { sky_bake_row(y); }
+    g_sky_cursor = 0;
+    g_sky_remaining = 0;
+    atlas_mark_rows(g_sky_atlas, 0, SKY_H);
+    let out: i32 = SKY_H;
+    return out;
+}
+
+// Full bake + upload.  This is the boot path (ARCHITECTURE §6).  TEX_SKY is
+// BLEND_NONE: the sky is opaque and is never fogged, lit or tinted at runtime.
+export fn skygen_build(win: object) {
+    skygen_bake_all();
+    return atlas_upload(win, g_sky_atlas, BLEND_NONE);
+}
+
+// The ToD moved: schedule a rolling re-bake from row 0.  The current key block
+// is snapshotted here, so all 160 rows of the next refresh share one keyframe.
+export fn skygen_mark_dirty() {
+    if (g_sky_ready == 0) { skygen_init(); }
+    sky_snapshot();
+    g_sky_cursor = 0;
+    g_sky_remaining = SKY_H;
+}
+
+export fn skygen_dirty_rows(): i32 { let o: i32 = g_sky_remaining; return o; }
+
+// Rows per re-bake slice.  SKY_ROWS_PER_SLICE (20, an 8-frame refresh) is the
+// ARCHITECTURE §6 default and what boot uses.  It is a DIAL, not a constant,
+// because the cost is linear in rows and the sky is the one asset that can pay
+// for itself over more frames without anyone noticing: the ToD keyframe blend
+// moves across a 16-minute day, so a refresh spread over 20 frames (0.33 s)
+// looks identical to one spread over 8 (0.13 s).  If a platform cannot afford
+// 20 rows in its sky slot, turn this down before turning anything else off.
+export fn skygen_set_slice_rows(n: i32) {
+    if (g_sky_ready == 0) { skygen_init(); }
+    let v: i32 = n;
+    if (v < 1) { v = 1; }
+    if (v > SKY_H) { v = SKY_H; }
+    g_sky_slice_rows = v;
+}
+export fn skygen_slice_rows(): i32 { let o: i32 = g_sky_slice_rows; return o; }
+
+// Bake the next SKY_ROWS_PER_SLICE rows and push exactly those rows with one
+// dirty-rect SDL_UpdateTexture.  Returns the number of rows baked, 0 when the
+// panorama is clean.  Eight calls complete a refresh.
+export fn skygen_rebake_slice(): i32 {
+    if (g_sky_remaining <= 0) { return 0; }
+    let y0: i32 = g_sky_cursor;
+    let n: i32 = g_sky_slice_rows;
+    if (n > g_sky_remaining) { n = g_sky_remaining; }
+    let end: i32 = y0 + n;
+    for (let y = y0; y < end; y++) { sky_bake_row(y); }
+    g_sky_cursor = end;
+    g_sky_remaining = g_sky_remaining - n;
+    if (atlas_tex(g_sky_atlas) != ptr_null()) {
+        atlas_update_rows(g_sky_atlas, y0, n);
+    } else {
+        atlas_mark_rows(g_sky_atlas, y0, end);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// introspection — for texview.hml, shot.hml and the acceptance probe
+// ---------------------------------------------------------------------------
+
+export fn skygen_tex() {
+    if (g_sky_ready == 0) { return ptr_null(); }
+    return atlas_tex(g_sky_atlas);
+}
+export fn skygen_atlas() { return g_sky_atlas; }
+export fn skygen_w(): i32 { let o: i32 = SKY_W; return o; }
+export fn skygen_h(): i32 { let o: i32 = SKY_H; return o; }
+export fn skygen_star_count(): i32 { let o: i32 = g_sky_star_n; return o; }
+// How many texels of row y the cloud pass painted.  A by-product of the bake.
+export fn skygen_row_cloud(y: i32): i32 {
+    if (y < 0) { return 0; }
+    if (y >= SKY_H) { return 0; }
+    let o: i32 = g_sky_row_cloud[y];
+    return o;
+}
+// The fog-derived horizon seam colour, rgb 0..255, into out[off..off+2].
+export fn skygen_seam(p_out: array<f64>, p_off: i32) {
+    let o: array<f64> = p_out;
+    let i: i32 = p_off;
+    o[i] = g_sky_seam[0];
+    o[i + 1] = g_sky_seam[1];
+    o[i + 2] = g_sky_seam[2];
+}
+
+export fn skygen_free() {
+    if (g_sky_ready == 0) { return; }
+    atlas_free(g_sky_atlas);
+}

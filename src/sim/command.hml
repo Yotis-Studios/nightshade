@@ -1,0 +1,283 @@
+// command.hml — `InputCommand`: the ONLY way input reaches the simulation.
+//
+// W2-9. Owner: the sim. This module imports NOTHING. It is the contract between
+// the player and the world, and in v2 it is the contract between the client and
+// the server — the same nine integers, unchanged, going into a socket instead of
+// a function call (NETWORKING.md §8).
+//
+// ---------------------------------------------------------------------------
+// THE STRUCT — nine integers. No bools, no floats, no nulls, no strings.
+// ---------------------------------------------------------------------------
+//   tick        i32   client tick this command belongs to   (u32 on the wire)
+//   dt_ms       i32   always TICK_MS; a variable-rate client is visible here
+//   move_x      i32   -127..127   strafe, quantized
+//   move_y      i32   -127..127   forward, quantized
+//   yaw_q       i32   0..65535    ABSOLUTE view yaw   (radians * 65536 / TAU)
+//   pitch_q     i32   0..65535    ABSOLUTE view pitch
+//   buttons     i32   bitfield, BTN_*  — INTEGER, NEVER BOOLS
+//   weapon_sel  i32   0..15       requested weapon slot
+//   seq         i32   per-client sequence number  (== tick in v1)
+//
+// WHY EVERY FIELD IS AN INTEGER (NETWORKING.md §3):
+//   - gn.hml THROWS on a bool.
+//   - a float is silently truncated to f32 on the wire, so the server would
+//     simulate a different number than the client predicted.
+//   - a null SILENTLY TRUNCATES THE REST OF THE PACKET.
+// Add a tenth field only by editing NETWORKING.md §11.2's 20-byte stride first.
+//
+// ---------------------------------------------------------------------------
+// QUANTIZED AT CONSTRUCTION, NOT AT SEND
+// ---------------------------------------------------------------------------
+// `yaw_q` is a u16 *in the struct*. `cmd_set` takes radians and stores the grid
+// value; the simulation reads `cmd_yaw()`, which dequantizes. Therefore local
+// prediction uses EXACTLY the angle the server will use, bit for bit. Keeping a
+// full-precision yaw locally and quantizing only on send makes prediction
+// disagree with the server on every single tick.
+//
+// ---------------------------------------------------------------------------
+// DEVIATION FROM NETWORKING.md §11.1, DELIBERATE — reported to the orchestrator
+// ---------------------------------------------------------------------------
+// The doc's illustrative pseudo-code is `i32(a * ANG_SCALE) & 65535`, i.e.
+// truncation. Truncation is NOT idempotent: `dq_ang(q) * ANG_SCALE` lands a few
+// 1e-11 below `q` for many q, and truncating gives back `q - 1`. The W2-9
+// acceptance criterion requires `q_ang(dq_ang(q)) == q`, so this module rounds
+// (`+ 0.5` on a value that is always non-negative). Rounding is also strictly
+// better quantization. `src/net/quantize.hml` (W2-12) MUST match this, or the
+// two copies of q_ang disagree by one step. Verified over all 65536 grid points.
+
+// ---------------------------------------------------------------------------
+// BUTTON BITS — NETWORKING.md §8.1. Never renumber; these go on the wire.
+// ---------------------------------------------------------------------------
+export let BTN_FIRE    = 1;
+export let BTN_ADS     = 2;
+export let BTN_JUMP    = 4;
+export let BTN_CROUCH  = 8;
+export let BTN_SPRINT  = 16;
+export let BTN_RELOAD  = 32;
+export let BTN_USE     = 64;
+export let BTN_MELEE   = 128;
+export let BTN_GRENADE = 256;
+export let BTN_SWITCH  = 512;
+export let BTN_BUILD   = 1024;
+export let BTN_INV     = 2048;
+export let BTN_ALL     = 4095;   // mask of every defined bit
+
+// ---------------------------------------------------------------------------
+// THE WIRE GRID — NETWORKING.md §11.1. These are protocol constants.
+// ---------------------------------------------------------------------------
+export let CMD_FIELDS  = 9;                     // exactly nine, forever
+export let CMD_STRIDE  = 20;                    // packed bytes, NETWORKING §11.2
+export let ANG_STEPS   = 65536;
+export let ANG_SCALE   = 10430.378350470453;    // 65536 / TAU
+export let AXIS_STEPS  = 127;
+export let CMD_TAU     = 6.283185307179586;
+export let CMD_PI      = 3.141592653589793;
+
+// Field bounds, used by cmd_set to clamp at construction and by cmd_wire_ok.
+export let CMD_MAX_TICK   = 2147483647;   // u32 on the wire; i32 in the struct
+export let CMD_MAX_DT_MS  = 255;          // u8 on the wire
+export let CMD_MAX_WEAPON = 15;
+
+// ---------------------------------------------------------------------------
+// QUANTIZERS
+// ---------------------------------------------------------------------------
+
+// Radians -> 0..65535. Wraps any angle into [0, TAU) first, so a negative pitch
+// and a runaway accumulated yaw both land on the grid rather than clamping.
+export fn q_ang(p_a: f64): i32 {
+    let a: f64 = p_a;
+    let n: f64 = a * 0.15915494309189535;        // a / TAU
+    // Defensive: an angle this large is a bug upstream, and i32() would trap.
+    if (n > 1000000000.0) { let z: i32 = 0; return z; }
+    if (n < -1000000000.0) { let z: i32 = 0; return z; }
+    let w: f64 = a - 6.283185307179586 * f64(i32(n));   // (-TAU, TAU)
+    if (w < 0.0) { w = w + 6.283185307179586; }
+    let q: i32 = i32(w * 10430.378350470453 + 0.5);
+    return q & 65535;
+}
+
+// 0..65535 -> radians in [0, TAU). The inverse the simulation actually uses.
+export fn dq_ang(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q & 65535) * 0.00009587379924285257;   // / ANG_SCALE
+    return out;
+}
+
+// A movement axis in [-1, 1] -> -127..127. Rounds away from zero so that
+// dq_axis -> q_axis is idempotent, and clamps so a bad input cannot widen the
+// field beyond the i8 the packer will write.
+export fn q_axis(p_v: f64): i32 {
+    let v: f64 = p_v;
+    if (v > 1.0) { v = 1.0; }
+    if (v < -1.0) { v = -1.0; }
+    let q: i32 = 0;
+    if (v >= 0.0) { q = i32(v * 127.0 + 0.5); }
+    if (v < 0.0)  { q = i32(v * 127.0 - 0.5); }
+    if (q > 127) { q = 127; }
+    if (q < -127) { q = -127; }
+    return q;
+}
+
+// -127..127 -> [-1, 1].
+export fn dq_axis(p_q: i32): f64 {
+    let q: i32 = p_q;
+    let out: f64 = f64(q) * 0.007874015748031496;   // / 127
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// CONSTRUCTION
+// ---------------------------------------------------------------------------
+
+// A zeroed command. Allocate these once into the pending-command ring
+// (NETWORKING §9.2) and refill with cmd_set; never allocate one per tick.
+export fn cmd_new(): object {
+    let c = {
+        tick: 0,
+        dt_ms: 0,
+        move_x: 0,
+        move_y: 0,
+        yaw_q: 0,
+        pitch_q: 0,
+        buttons: 0,
+        weapon_sel: 0,
+        seq: 0
+    };
+    return c;
+}
+
+// Fill a command IN PLACE. `p_yaw` / `p_pitch` are RADIANS and `p_mx` / `p_my`
+// are in [-1, 1]; every one of them is quantized here, at construction, so that
+// what the sim reads back is exactly what the server would have received.
+// Everything else is clamped to its wire range.
+export fn cmd_set(p_c: object, p_tick: i32, p_dt_ms: i32, p_mx: f64, p_my: f64,
+                  p_yaw: f64, p_pitch: f64, p_buttons: i32, p_weapon: i32, p_seq: i32) {
+    let c: object = p_c;
+
+    let tk: i32 = p_tick;
+    if (tk < 0) { tk = 0; }
+
+    let dt: i32 = p_dt_ms;
+    if (dt < 0) { dt = 0; }
+    if (dt > 255) { dt = 255; }
+
+    let wp: i32 = p_weapon;
+    if (wp < 0) { wp = 0; }
+    if (wp > 15) { wp = 15; }
+
+    let sq: i32 = p_seq;
+    if (sq < 0) { sq = 0; }
+
+    c.tick = tk;
+    c.dt_ms = dt;
+    c.move_x = q_axis(p_mx);
+    c.move_y = q_axis(p_my);
+    c.yaw_q = q_ang(p_yaw);
+    c.pitch_q = q_ang(p_pitch);
+    c.buttons = p_buttons & 4095;
+    c.weapon_sel = wp;
+    c.seq = sq;
+}
+
+// Field-for-field copy. The pending-command ring stores the command AS SENT;
+// aliasing the live command instead is how reconciliation starts lying.
+export fn cmd_copy(p_dst: object, p_src: object) {
+    let d: object = p_dst;
+    let s: object = p_src;
+    d.tick = s.tick;
+    d.dt_ms = s.dt_ms;
+    d.move_x = s.move_x;
+    d.move_y = s.move_y;
+    d.yaw_q = s.yaw_q;
+    d.pitch_q = s.pitch_q;
+    d.buttons = s.buttons;
+    d.weapon_sel = s.weapon_sel;
+    d.seq = s.seq;
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// READERS — the simulation reads through these, never the raw fields
+// ---------------------------------------------------------------------------
+
+// Yaw in [0, TAU).
+export fn cmd_yaw(p_c: object): f64 {
+    let c: object = p_c;
+    let out: f64 = dq_ang(c.yaw_q);
+    return out;
+}
+
+// Pitch in (-PI, PI]. Stored wrapped like yaw; returned signed because that is
+// what a look transform wants. q_ang(cmd_pitch(c)) == c.pitch_q still holds.
+export fn cmd_pitch(p_c: object): f64 {
+    let c: object = p_c;
+    let a: f64 = dq_ang(c.pitch_q);
+    if (a > 3.141592653589793) { a = a - 6.283185307179586; }
+    let out: f64 = a;
+    return out;
+}
+
+// Strafe axis in [-1, 1].
+export fn cmd_move_x(p_c: object): f64 {
+    let c: object = p_c;
+    let out: f64 = dq_axis(c.move_x);
+    return out;
+}
+
+// Forward axis in [-1, 1].
+export fn cmd_move_y(p_c: object): f64 {
+    let c: object = p_c;
+    let out: f64 = dq_axis(c.move_y);
+    return out;
+}
+
+// 1 if the button bit is held this tick, else 0. Returns an INTEGER: a bool
+// here is a bool on the wire, and gn.hml throws on those.
+export fn cmd_btn(p_c: object, p_bit: i32): i32 {
+    let c: object = p_c;
+    let out: i32 = 0;
+    if ((c.buttons & p_bit) != 0) { out = 1; }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// VALIDATION AND HASHING
+// ---------------------------------------------------------------------------
+
+// 0 when the command fits the NETWORKING §11.2 wire stride exactly; otherwise a
+// bit per out-of-range field (bit 0 = tick .. bit 8 = seq). The server calls
+// this on every received command before it touches the world; the loopback
+// serializer (W2-12) asserts it too.
+export fn cmd_wire_ok(p_c: object): i32 {
+    let c: object = p_c;
+    let bad: i32 = 0;
+    if (c.tick < 0) { bad = bad | 1; }
+    if (c.dt_ms < 0 || c.dt_ms > 255) { bad = bad | 2; }
+    if (c.move_x < -127 || c.move_x > 127) { bad = bad | 4; }
+    if (c.move_y < -127 || c.move_y > 127) { bad = bad | 8; }
+    if (c.yaw_q < 0 || c.yaw_q > 65535) { bad = bad | 16; }
+    if (c.pitch_q < 0 || c.pitch_q > 65535) { bad = bad | 32; }
+    if (c.buttons < 0 || c.buttons > 4095) { bad = bad | 64; }
+    if (c.weapon_sel < 0 || c.weapon_sel > 15) { bad = bad | 128; }
+    if (c.seq < 0) { bad = bad | 256; }
+    let out: i32 = bad;
+    return out;
+}
+
+// A 31-bit fingerprint of all nine fields, for the replay determinism gate.
+// Mixing is in u64 — i32 `*` traps on overflow (CLAUDE.md A13).
+export fn cmd_hash(p_c: object): i32 {
+    let c: object = p_c;
+    let h: u64 = 14695981039346656037;
+    h = (h ^ u64(c.tick)) * 1099511628211;
+    h = (h ^ u64(c.dt_ms)) * 1099511628211;
+    h = (h ^ u64(c.move_x + 127)) * 1099511628211;
+    h = (h ^ u64(c.move_y + 127)) * 1099511628211;
+    h = (h ^ u64(c.yaw_q)) * 1099511628211;
+    h = (h ^ u64(c.pitch_q)) * 1099511628211;
+    h = (h ^ u64(c.buttons)) * 1099511628211;
+    h = (h ^ u64(c.weapon_sel)) * 1099511628211;
+    h = (h ^ u64(c.seq)) * 1099511628211;
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}

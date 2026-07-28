@@ -1,0 +1,803 @@
+// protocol.hml — net_ids, wire strides, and the gn.hml-compatible codec. W2-12.
+//
+// v1 is single-player. NOTHING here opens a socket. This file exists so that
+// when multiplayer starts, the packet code is boring: the message catalogue,
+// the byte strides and the encoder are already written, already exercised on
+// every frame of single-player through NS_LOOPBACK_SERIALIZE, and already
+// proven to survive a round trip with zero field loss.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS FILE CONTAINS A COPY OF gn.hml's ELEMENT CODEC
+// ---------------------------------------------------------------------------
+// It does not import gn.hml, and neither does anything else in v1. Instead it
+// re-implements gn.hml's `gm_convert` element framing byte for byte:
+//
+//     packet := [u16 payload_size LE][u16 net_id LE][element...]
+//     element := [u8 type][payload]        payload_size counts the net_id
+//
+// Three reasons that is the right call rather than taking the dependency:
+//
+//  1. v1 must not depend on a WebSocket library to run single-player. The ship
+//     build links no networking at all.
+//  2. `parse_packets` is module-private in gn.hml and is not exported
+//     (NETWORKING §3.9). We were always going to own a copy of those 12 lines.
+//  3. Writing the bytes ourselves is what makes NS_LOOPBACK_SERIALIZE a real
+//     test. A round trip through a shim that hands objects back unchanged
+//     proves nothing.
+//
+// When v2 arrives, `transport.hml` — and ONLY transport.hml — imports gn.hml
+// and either feeds these elements to a `Packet` or ships `proto_build`'s bytes
+// straight down the socket. Both work; the bytes are identical.
+//
+// ---------------------------------------------------------------------------
+// ⚠ THE ELEMENT TYPE IS CHOSEN BY VALUE, NOT BY DECLARATION
+// ---------------------------------------------------------------------------
+// gn.hml's `determine_type` picks the SMALLEST type that fits the value. So
+// "element 0: u32 server_tick" in NETWORKING §11.3 is a u32 only once the tick
+// passes 65535 — at tick 5 it is one byte on the wire. This is inherent to the
+// gn.hml codec and it is faithfully reproduced here.
+//
+// Consequence for anyone writing a packet dumper: **element offsets inside a
+// packet are not fixed and must not be asserted**. What IS fixed is the
+// element ORDER, and the byte layout INSIDE each blob. Assert those.
+// The blob strides below are the real contract.
+//
+// ---------------------------------------------------------------------------
+// NO THROWS
+// ---------------------------------------------------------------------------
+// gn.hml's build() throws on an oversized payload and on a >255-byte buffer.
+// This file returns `null` / -1 and counts instead (CLAUDE.md rule 7).
+
+import { from_bytes } from "@stdlib/strings";
+import {
+    pack_reset, pack_flush, pack_is_wire_safe,
+    pack_u8, pack_u16, pack_i16, pack_i32,
+    unpack_new, unpack_u8, unpack_u16, unpack_i16, unpack_i32,
+    pack_ent_blob, unpack_ent_blob, pack_ev_blob, unpack_ev_blob,
+    pack_cmd_blob, unpack_cmd_blob,
+    ENTS_PER_BLOB, EVS_PER_BLOB, LOCAL_STRIDE, PACK_MAX_BLOB
+} from "./packing.hml";
+
+// Re-exported so a packet dumper or a tool needs one import, not two: the
+// message catalogue and the byte strides it describes arrive together.
+export { ENT_STRIDE, CMD_STRIDE, EV_STRIDE } from "./packing.hml";
+import {
+    q_pos, dq_pos, q_pos16, dq_pos16, q_ang, dq_ang, q_ang8, dq_ang8,
+    q_vel, dq_vel, q_evpos, dq_evpos
+} from "./quantize.hml";
+
+// ---------------------------------------------------------------------------
+// MESSAGE CATALOGUE — NETWORKING §10.1.
+// Reserved now, unused in v1. Blocks are chosen so a hexdump identifies a
+// packet at a glance: 1xx is input, 11xx is state, 12xx is events.
+//     1-99      C->S control/handshake      1000-1099  S->C control/handshake
+//     100-199   C->S gameplay input         1100-1199  S->C snapshots
+//     200-299   C->S reliable actions       1200-1299  S->C events
+//                                           1300-1399  S->C world streaming
+// ---------------------------------------------------------------------------
+export let NET_C_HELLO: i32 = 1;
+export let NET_C_PING: i32 = 2;
+export let NET_C_READY: i32 = 3;
+export let NET_C_ACK_SNAPSHOT: i32 = 4;      // v2 only; the delta baseline ack
+export let NET_C_INPUT: i32 = 100;
+export let NET_C_CHAT: i32 = 200;
+export let NET_C_ACTION: i32 = 201;
+export let NET_S_WELCOME: i32 = 1000;
+export let NET_S_PONG: i32 = 1001;
+export let NET_S_DISCONNECT: i32 = 1002;
+export let NET_S_SNAPSHOT: i32 = 1100;
+export let NET_S_SNAPSHOT_DELTA: i32 = 1101; // v2 only; do not build in v1
+export let NET_S_EVENT: i32 = 1200;
+export let NET_S_PLAYER_JOIN: i32 = 1201;
+export let NET_S_PLAYER_LEAVE: i32 = 1202;
+export let NET_S_CHUNK: i32 = 1300;
+
+// ---------------------------------------------------------------------------
+// EVENT TYPES — NETWORKING §11.5. The server saying "this definitely
+// happened"; the client turns each one into juice. Reserved now.
+// ---------------------------------------------------------------------------
+export let EV_HIT: i32 = 1;
+export let EV_KILL: i32 = 2;
+export let EV_DAMAGE_TAKEN: i32 = 3;
+export let EV_SPAWN: i32 = 4;
+export let EV_DESPAWN: i32 = 5;
+export let EV_PICKUP: i32 = 6;
+export let EV_RELOAD_DONE: i32 = 7;
+export let EV_WEAPON_SWITCH: i32 = 8;
+export let EV_DOOR: i32 = 9;
+export let EV_BLOCK_PLACED: i32 = 10;
+export let EV_BLOCK_BROKEN: i32 = 11;
+export let EV_XP: i32 = 12;
+export let EV_LEVELUP: i32 = 13;
+export let EV_SOUND: i32 = 14;
+
+// Entity flags byte (+19 of the entity stride). Integers, never bools.
+export let EF_TEAM_MASK: i32 = 3;
+export let EF_CROUCH: i32 = 4;
+export let EF_ADS: i32 = 8;
+export let EF_FIRING: i32 = 16;
+export let EF_DEAD: i32 = 32;
+export let EF_HITFLASH: i32 = 64;
+export let EF_DISSOLVE: i32 = 128;
+
+// Wire caps.
+export let MAX_CMDS_PER_PACKET: i32 = 8;     // NETWORKING §11.2: n is 1..8
+export let MAX_PAYLOAD: i32 = 65535;         // gn.hml u16 size field
+
+// ---------------------------------------------------------------------------
+// gm_convert element type ids. These integers are gn.hml's wire format; do not
+// renumber them. Type 6 (f16) is decoded (2-byte advance, f32 read) to match
+// gn.hml's parser, but it is NEVER emitted — gn.hml's own writer and parser
+// disagree about its size and it is a corrupting mismatch (NETWORKING §3.9).
+// ---------------------------------------------------------------------------
+export let WT_U8: i32 = 0;
+export let WT_U16: i32 = 1;
+export let WT_U32: i32 = 2;
+export let WT_S8: i32 = 3;
+export let WT_S16: i32 = 4;
+export let WT_S32: i32 = 5;
+export let WT_F16: i32 = 6;
+export let WT_F32: i32 = 7;
+export let WT_F64: i32 = 8;
+export let WT_STRING: i32 = 9;
+export let WT_BUFFER: i32 = 10;
+export let WT_UNDEF: i32 = 11;
+export let WT_COUNT: i32 = 12;
+
+// Diagnostics. A non-zero refusal count is a protocol bug and packetdump
+// prints it; nothing here ever changes behaviour on it.
+let g_proto_refused: i32 = 0;      // elements refused for being bool/null
+let g_proto_oversize: i32 = 0;     // messages refused for exceeding 65535 B
+let g_proto_malformed: i32 = 0;    // frames that failed to parse
+
+export fn proto_refused(): i32 { let out: i32 = g_proto_refused; return out; }
+export fn proto_oversize(): i32 { let out: i32 = g_proto_oversize; return out; }
+export fn proto_malformed(): i32 { let out: i32 = g_proto_malformed; return out; }
+export fn proto_diag_reset() { g_proto_refused = 0; g_proto_oversize = 0; g_proto_malformed = 0; }
+
+// ---------------------------------------------------------------------------
+// Msg := { net_id, data: array }   — the same shape as a gn.hml Packet, minus
+// the closures. Elements are integers and buffers only.
+// ---------------------------------------------------------------------------
+export fn proto_msg(p_net_id: i32): object {
+    return { net_id: p_net_id, data: [] };
+}
+
+export fn proto_msg_reset(p_m: object, p_net_id: i32) {
+    let m: object = p_m;
+    m.net_id = p_net_id;
+    m.data.clear();
+}
+
+export fn proto_net_id(p_m: object): i32 { let out: i32 = p_m.net_id; return out; }
+export fn proto_count(p_m: object): i32 { let out: i32 = p_m.data.length; return out; }
+export fn proto_get(p_m: object, p_i: i32) { return p_m.data[p_i]; }
+
+// The gate every element passes through. A bool throws in gn.hml's build(); a
+// null silently truncates the packet. Both are refused here, loudly counted,
+// and never appended — so a bad field cannot shift every later field.
+export fn proto_add(p_m: object, p_v): i32 {
+    if (pack_is_wire_safe(p_v) == 0) {
+        g_proto_refused = g_proto_refused + 1;
+        return -1;
+    }
+    p_m.data.push(p_v);
+    return 1;
+}
+
+// Walk a built message and count elements that must never be on the wire.
+// This is the runtime half of the "no bool, no null" acceptance criterion;
+// the CI grep is the static half.
+export fn proto_audit(p_m: object): i32 {
+    let m: object = p_m;
+    let n: i32 = m.data.length;
+    let bad: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (pack_is_wire_safe(m.data[i]) == 0) { bad = bad + 1; }
+        i++;
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Stricter audit for gameplay traffic: also rejects floats and strings, which
+// gn.hml *can* carry but which we never use for state (f32 truncation,
+// NETWORKING §3.7; strings lose a trailing 0x00 byte, §3.9).
+export fn proto_audit_gameplay(p_m: object): i32 {
+    let m: object = p_m;
+    let n: i32 = m.data.length;
+    let bad: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let t: i32 = typeid(m.data[i]);
+        if (t == TYPEID_F32 || t == TYPEID_F64 || t == TYPEID_STRING) { bad = bad + 1; }
+        if (pack_is_wire_safe(m.data[i]) == 0) { bad = bad + 1; }
+        i++;
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE CODEC
+// ---------------------------------------------------------------------------
+
+// gn.hml determine_type, verbatim in behaviour. Integer typeids first so a
+// buffer never reaches the `>= 0` comparison (which would throw on it).
+export fn proto_wtype(p_v): i32 {
+    let t: i32 = typeid(p_v);
+    if (t == TYPEID_BUFFER) { return WT_BUFFER; }
+    if (t == TYPEID_STRING) { return WT_STRING; }
+    if (t == TYPEID_F32 || t == TYPEID_F64) {
+        let a: f64 = f64(p_v);
+        if (a < 0.0) { a = 0.0 - a; }
+        if (a <= 16777216.0) { return WT_F32; }
+        return WT_F64;
+    }
+    if (t == TYPEID_I8 || t == TYPEID_I16 || t == TYPEID_I32 || t == TYPEID_I64
+        || t == TYPEID_U8 || t == TYPEID_U16 || t == TYPEID_U32 || t == TYPEID_U64) {
+        if (p_v >= 0) {
+            if (p_v < 256) { return WT_U8; }
+            if (p_v < 65536) { return WT_U16; }
+            return WT_U32;
+        }
+        if (p_v > -129) { return WT_S8; }
+        if (p_v > -32769) { return WT_S16; }
+        return WT_S32;
+    }
+    return WT_UNDEF;
+}
+
+// Bytes an element occupies, type byte included.
+fn proto_wsize(p_t: i32, p_v): i32 {
+    let t: i32 = p_t;
+    if (t == WT_U8 || t == WT_S8) { return 2; }
+    if (t == WT_U16 || t == WT_S16) { return 3; }
+    if (t == WT_U32 || t == WT_S32 || t == WT_F32) { return 5; }
+    if (t == WT_F64) { return 9; }
+    if (t == WT_BUFFER) { return 2 + p_v.length; }
+    if (t == WT_STRING) { return 4 + p_v.byte_length; }   // type + len(2) + bytes + NUL
+    return 1;
+}
+
+fn proto_wwrite(p_buf, p_off: i32, p_t: i32, p_v): i32 {
+    let buf = p_buf;
+    let off: i32 = p_off;
+    let t: i32 = p_t;
+    buf.write_u8(off, t);
+    if (t == WT_U8) { buf.write_u8(off + 1, p_v); return 2; }
+    if (t == WT_S8) { buf.write_i8(off + 1, p_v); return 2; }
+    if (t == WT_U16) { buf.write_u16_le(off + 1, p_v); return 3; }
+    if (t == WT_S16) { buf.write_i16_le(off + 1, p_v); return 3; }
+    if (t == WT_U32) { buf.write_u32_le(off + 1, p_v); return 5; }
+    if (t == WT_S32) { buf.write_i32_le(off + 1, p_v); return 5; }
+    if (t == WT_F32) { buf.write_f32_le(off + 1, p_v); return 5; }
+    if (t == WT_F64) { buf.write_f64_le(off + 1, p_v); return 9; }
+    if (t == WT_BUFFER) {
+        let n: i32 = p_v.length;
+        buf.write_u8(off + 1, n);
+        buf.write_bytes(off + 2, p_v, n);
+        return 2 + n;
+    }
+    if (t == WT_STRING) {
+        let bn: i32 = p_v.byte_length;
+        buf.write_u16_le(off + 1, bn + 1);
+        memcpy(buffer_ptr(buf) + off + 3, p_v.byte_ptr(), bn);
+        buf.write_u8(off + 3 + bn, 0);
+        return 4 + bn;
+    }
+    return 1;
+}
+
+// Serialize to the full framed packet: [u16 size][u16 net_id][elements].
+// Returns null (never a throw) if the message is unbuildable, and counts why.
+export fn proto_build(p_m: object) {
+    let m: object = p_m;
+    let n: i32 = m.data.length;
+    let total: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let t: i32 = proto_wtype(m.data[i]);
+        if (t == WT_UNDEF) { g_proto_refused = g_proto_refused + 1; return null; }
+        if (t == WT_BUFFER) {
+            if (m.data[i].length > PACK_MAX_BLOB) { g_proto_oversize = g_proto_oversize + 1; return null; }
+        }
+        total = total + proto_wsize(t, m.data[i]);
+        i++;
+    }
+    let payload: i32 = 2 + total;
+    if (payload > MAX_PAYLOAD) { g_proto_oversize = g_proto_oversize + 1; return null; }
+
+    let out = buffer(2 + payload);
+    out.write_u16_le(0, payload);
+    out.write_u16_le(2, m.net_id);
+    let off: i32 = 4;
+    i = 0;
+    while (i < n) {
+        let t2: i32 = proto_wtype(m.data[i]);
+        off = off + proto_wwrite(out, off, t2, m.data[i]);
+        i++;
+    }
+    return out;
+}
+
+// Parse one packet body into p_m. The region [p_off, p_off + p_len) starts at
+// the net_id, exactly like gn.hml's Packet.load(). Returns 1 on success.
+export fn proto_load(p_frame, p_off: i32, p_len: i32, p_m: object): i32 {
+    let frame = p_frame;
+    let base: i32 = p_off;
+    let len: i32 = p_len;
+    let m: object = p_m;
+    m.data.clear();
+    if (len < 2) { g_proto_malformed = g_proto_malformed + 1; return 0; }
+    m.net_id = i32(frame.read_u16_le(base));
+
+    let i: i32 = 2;
+    while (i < len) {
+        let t: i32 = i32(frame.read_u8(base + i));
+        if (t >= WT_COUNT) { g_proto_malformed = g_proto_malformed + 1; return 0; }
+        let at: i32 = base + i + 1;
+        let adv: i32 = 0;
+        if (t == WT_U8) { if (i + 2 > len) { break; } m.data.push(i32(frame.read_u8(at))); adv = 1; }
+        else if (t == WT_S8) { if (i + 2 > len) { break; } m.data.push(i32(frame.read_i8(at))); adv = 1; }
+        else if (t == WT_U16) { if (i + 3 > len) { break; } m.data.push(i32(frame.read_u16_le(at))); adv = 2; }
+        else if (t == WT_S16) { if (i + 3 > len) { break; } m.data.push(i32(frame.read_i16_le(at))); adv = 2; }
+        else if (t == WT_U32) { if (i + 5 > len) { break; } m.data.push(i64(frame.read_u32_le(at))); adv = 4; }
+        else if (t == WT_S32) { if (i + 5 > len) { break; } m.data.push(i32(frame.read_i32_le(at))); adv = 4; }
+        else if (t == WT_F16) { if (i + 3 > len) { break; } m.data.push(f64(frame.read_f32_le(at))); adv = 2; }
+        else if (t == WT_F32) { if (i + 5 > len) { break; } m.data.push(f64(frame.read_f32_le(at))); adv = 4; }
+        else if (t == WT_F64) { if (i + 9 > len) { break; } m.data.push(frame.read_f64_le(at)); adv = 8; }
+        else if (t == WT_STRING) {
+            if (i + 3 > len) { break; }
+            let sl: i32 = i32(frame.read_u16_le(at));
+            if (i + 3 + sl > len) { break; }
+            let se: i32 = sl;
+            if (sl > 0) { if (i32(frame.read_u8(at + 2 + sl - 1)) == 0) { se = sl - 1; } }
+            let sv: string = "";
+            if (se > 0) { sv = from_bytes(frame.slice(at + 2, at + 2 + se)); }
+            m.data.push(sv);
+            adv = sl + 2;
+        }
+        else if (t == WT_BUFFER) {
+            if (i + 2 > len) { break; }
+            let bl: i32 = i32(frame.read_u8(at));
+            if (i + 2 + bl > len) { break; }
+            m.data.push(frame.read_bytes(at + 1, bl));
+            adv = bl + 1;
+        }
+        else {
+            // WT_UNDEF. gn.hml's own parser treats this as end-of-packet, which
+            // is exactly the silent truncation of NETWORKING §3.2. We match the
+            // behaviour and count it so it cannot pass unnoticed.
+            g_proto_malformed = g_proto_malformed + 1;
+            break;
+        }
+        i = i + adv + 1;
+    }
+    return 1;
+}
+
+// gn.hml's private parse_packets, reimplemented (NETWORKING §3.9): one
+// WebSocket frame may carry several concatenated packets. `recv_packet()` is
+// BANNED because it returns the first and discards the rest (§3.3).
+// Fills p_out with parsed Msg objects; returns how many.
+export fn proto_parse_frame(p_frame, p_out: array): i32 {
+    let frame = p_frame;
+    let out: array = p_out;
+    out.clear();
+    if (frame == null) { return 0; }
+    let len: i32 = frame.length;
+    let off: i32 = 0;
+    let got: i32 = 0;
+    while (off + 2 <= len) {
+        let sz: i32 = i32(frame.read_u16_le(off));
+        if (sz < 2) { g_proto_malformed = g_proto_malformed + 1; return got; }
+        if (off + 2 + sz > len) { g_proto_malformed = g_proto_malformed + 1; return got; }
+        let m: object = proto_msg(0);
+        if (proto_load(frame, off + 2, sz, m) == 1) { out.push(m); got++; }
+        off = off + 2 + sz;
+    }
+    let n: i32 = got;
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// C_INPUT (net_id 100) — NETWORKING §11.2
+//
+//   element 0 : u8      n, 1..8
+//   element 1 : buffer  n * 20 bytes, oldest first (max 160 B, under the cap)
+//
+//   command stride, 20 bytes LE:
+//     +0  u32 tick   +4  u32 seq   +8  i8 move_x  +9  i8 move_y
+//     +10 u16 yaw_q  +12 u16 pitch_q  +14 u32 buttons
+//     +18 u8 weapon_sel  +19 u8 dt_ms
+//
+// Nine integers. No bools (gn.hml throws), no floats (f32 truncation on the
+// wire), no nulls (silent truncation), no strings.
+// ---------------------------------------------------------------------------
+
+// CmdQ — SoA ring of commands. Preallocated; never an array of objects.
+export fn cmdq_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let q: object = {
+        cap: cap, count: 0,
+        tick: [], seq: [], move_x: [], move_y: [],
+        yaw_q: [], pitch_q: [], buttons: [], weapon_sel: [], dt_ms: []
+    };
+    let i: i32 = 0;
+    while (i < cap) {
+        q.tick.push(0); q.seq.push(0); q.move_x.push(0); q.move_y.push(0);
+        q.yaw_q.push(0); q.pitch_q.push(0); q.buttons.push(0);
+        q.weapon_sel.push(0); q.dt_ms.push(0);
+        i++;
+    }
+    return q;
+}
+
+export fn cmdq_reset(p_q: object) { p_q.count = 0; }
+export fn cmdq_count(p_q: object): i32 { let out: i32 = p_q.count; return out; }
+
+// Returns the slot written, or -1 if the queue is full.
+export fn cmdq_push(p_q: object, p_tick: i32, p_seq: i32, p_mx: i32, p_my: i32,
+                    p_yaw: i32, p_pitch: i32, p_btn: i32, p_wsel: i32, p_dt: i32): i32 {
+    let q: object = p_q;
+    let k: i32 = q.count;
+    if (k >= q.cap) { return -1; }
+    q.tick[k] = p_tick; q.seq[k] = p_seq;
+    q.move_x[k] = p_mx; q.move_y[k] = p_my;
+    q.yaw_q[k] = p_yaw; q.pitch_q[k] = p_pitch;
+    q.buttons[k] = p_btn; q.weapon_sel[k] = p_wsel; q.dt_ms[k] = p_dt;
+    q.count = k + 1;
+    let out: i32 = k;
+    return out;
+}
+
+// Bridge from the sim's InputCommand object (src/sim/command.hml, W2-9).
+// Field names are the contract of NETWORKING §8.1; this is the only place the
+// net layer touches an object it did not build.
+export fn cmdq_push_cmd(p_q: object, p_cmd: object): i32 {
+    let c: object = p_cmd;
+    let out: i32 = cmdq_push(p_q, c.tick, c.seq, c.move_x, c.move_y,
+                             c.yaw_q, c.pitch_q, c.buttons, c.weapon_sel, c.dt_ms);
+    return out;
+}
+
+// Build a C_INPUT message from the first min(count, 8) commands of p_q.
+// Writes into p_m (reset first) and reuses p_pk. Returns element count, or -1.
+export fn proto_write_input(p_m: object, p_pk: object, p_q: object): i32 {
+    let m: object = p_m;
+    let pk: object = p_pk;
+    let q: object = p_q;
+    let n: i32 = q.count;
+    if (n > MAX_CMDS_PER_PACKET) { n = MAX_CMDS_PER_PACKET; }
+    proto_msg_reset(m, NET_C_INPUT);
+    if (n < 1) { return 0; }
+    pack_reset(pk);
+    pack_cmd_blob(pk, q, 0, n);
+    proto_add(m, n);
+    proto_add(m, pack_flush(pk));
+    let out: i32 = m.data.length;
+    return out;
+}
+
+// Decode a C_INPUT message into p_q. Returns the command count, or -1.
+export fn proto_read_input(p_m: object, p_q: object): i32 {
+    let m: object = p_m;
+    let q: object = p_q;
+    cmdq_reset(q);
+    if (m.net_id != NET_C_INPUT) { return -1; }
+    if (m.data.length < 2) { return -1; }
+    let n: i32 = i32(m.data[0]);
+    if (n < 1) { return 0; }
+    if (n > MAX_CMDS_PER_PACKET) { return -1; }
+    if (unpack_cmd_blob(m.data[1], q, n) < 0) { return -1; }
+    let out: i32 = q.count;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// S_SNAPSHOT (net_id 1100) — NETWORKING §11.3
+//
+//   element 0 : u32 server_tick
+//   element 1 : u32 last_acked_seq
+//   element 2 : u16 server_time_ms & 65535
+//   element 3 : u16 entity_count
+//   element 4.. : buffer <= 240 B, 12 entities each, ceil(count/12) of them
+//   last      : buffer 24 B, the local player's authoritative block
+//
+//   entity stride, 20 bytes LE:
+//     +0  u32 entity_id   +4  i32 px_q   +8  i32 pz_q   +12 i16 py_q
+//     +14 u16 yaw_q  +16 u8 pitch_q  +17 u8 anim  +18 u8 hp_pct  +19 u8 flags
+//
+//   local block, 24 bytes LE:
+//     +0  i32 px_q  +4  i32 py_q  +8  i32 pz_q
+//     +12 i16 vx_q  +14 i16 vy_q  +16 i16 vz_q
+//     +18 u8 hp  +19 u8 armor  +20 u8 move_state  +21 u8 weapon  +22 u16 ammo_mag
+//
+// 12 players + 20 nearby entities = 32 entities -> 3 blobs, ~690 B, 13.8 KB/s
+// down per client at 20 Hz.
+//
+// `hp_pct` is 0..100, not exact hp: exact hp is owner-only and rides in the
+// local block. Leaking exact hp of every entity to every client is a wallhack.
+// ---------------------------------------------------------------------------
+
+// NetEnts — SoA staging area for the entity section, both directions.
+// Preallocated once; snapshot_write/read never allocate.
+export fn netents_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let e: object = {
+        cap: cap, count: 0,
+        tick: 0, acked_seq: 0, time_ms: 0,
+        id: [], px_q: [], py_q: [], pz_q: [],
+        yaw_q: [], pitch_q: [], anim: [], hp_pct: [], flags: []
+    };
+    let i: i32 = 0;
+    while (i < cap) {
+        e.id.push(0); e.px_q.push(0); e.py_q.push(0); e.pz_q.push(0);
+        e.yaw_q.push(0); e.pitch_q.push(0); e.anim.push(0);
+        e.hp_pct.push(0); e.flags.push(0);
+        i++;
+    }
+    return e;
+}
+
+export fn netents_reset(p_e: object) { p_e.count = 0; }
+export fn netents_count(p_e: object): i32 { let out: i32 = p_e.count; return out; }
+
+// Append an entity already in wire units. Use this from the authority after it
+// has snapped its own state to the grid with quantize.hml's wire_* helpers.
+export fn netents_push_q(p_e: object, p_id: i32, p_px: i32, p_py: i32, p_pz: i32,
+                         p_yaw: i32, p_pitch: i32, p_anim: i32, p_hp: i32, p_flags: i32): i32 {
+    let e: object = p_e;
+    let k: i32 = e.count;
+    if (k >= e.cap) { return -1; }
+    e.id[k] = p_id; e.px_q[k] = p_px; e.py_q[k] = p_py; e.pz_q[k] = p_pz;
+    e.yaw_q[k] = p_yaw; e.pitch_q[k] = p_pitch;
+    e.anim[k] = p_anim; e.hp_pct[k] = p_hp; e.flags[k] = p_flags;
+    e.count = k + 1;
+    let out: i32 = k;
+    return out;
+}
+
+// Append from world units, quantizing on the way in. The dequantized values
+// are what the authority must then store back into the world (wire_pos etc.),
+// so both ends compare identical numbers.
+export fn netents_push(p_e: object, p_id: i32, p_x: f64, p_y: f64, p_z: f64,
+                       p_yaw: f64, p_pitch: f64, p_anim: i32, p_hp: i32, p_flags: i32): i32 {
+    let out: i32 = netents_push_q(p_e, p_id, q_pos(p_x), q_pos16(p_y), q_pos(p_z),
+                                  q_ang(p_yaw), q_ang8(p_pitch), p_anim, p_hp, p_flags);
+    return out;
+}
+
+// Dequantized accessors for the client side.
+export fn netents_x(p_e: object, p_i: i32): f64 { let out: f64 = dq_pos(p_e.px_q[p_i]); return out; }
+export fn netents_y(p_e: object, p_i: i32): f64 { let out: f64 = dq_pos16(p_e.py_q[p_i]); return out; }
+export fn netents_z(p_e: object, p_i: i32): f64 { let out: f64 = dq_pos(p_e.pz_q[p_i]); return out; }
+export fn netents_yaw(p_e: object, p_i: i32): f64 { let out: f64 = dq_ang(p_e.yaw_q[p_i]); return out; }
+export fn netents_pitch(p_e: object, p_i: i32): f64 { let out: f64 = dq_ang8(p_e.pitch_q[p_i]); return out; }
+
+// NetLocal — the owner-only authoritative block. All integers, wire units.
+export fn netlocal_new(): object {
+    return { px_q: 0, py_q: 0, pz_q: 0, vx_q: 0, vy_q: 0, vz_q: 0,
+             hp: 0, armor: 0, move_state: 0, weapon: 0, ammo_mag: 0 };
+}
+
+export fn netlocal_set(p_l: object, p_x: f64, p_y: f64, p_z: f64,
+                       p_vx: f64, p_vy: f64, p_vz: f64,
+                       p_hp: i32, p_armor: i32, p_ms: i32, p_wpn: i32, p_ammo: i32) {
+    let l: object = p_l;
+    l.px_q = q_pos(p_x); l.py_q = q_pos(p_y); l.pz_q = q_pos(p_z);
+    l.vx_q = q_vel(p_vx); l.vy_q = q_vel(p_vy); l.vz_q = q_vel(p_vz);
+    l.hp = p_hp; l.armor = p_armor; l.move_state = p_ms;
+    l.weapon = p_wpn; l.ammo_mag = p_ammo;
+}
+
+export fn netlocal_x(p_l: object): f64 { let out: f64 = dq_pos(p_l.px_q); return out; }
+export fn netlocal_y(p_l: object): f64 { let out: f64 = dq_pos(p_l.py_q); return out; }
+export fn netlocal_z(p_l: object): f64 { let out: f64 = dq_pos(p_l.pz_q); return out; }
+export fn netlocal_vx(p_l: object): f64 { let out: f64 = dq_vel(p_l.vx_q); return out; }
+export fn netlocal_vy(p_l: object): f64 { let out: f64 = dq_vel(p_l.vy_q); return out; }
+export fn netlocal_vz(p_l: object): f64 { let out: f64 = dq_vel(p_l.vz_q); return out; }
+
+// Number of 240-byte entity blobs a count needs.
+export fn proto_blob_count(p_count: i32): i32 {
+    let c: i32 = p_count;
+    if (c < 1) { return 0; }
+    let out: i32 = (c + ENTS_PER_BLOB - 1) / ENTS_PER_BLOB;
+    return out;
+}
+
+// Build S_SNAPSHOT. p_pk must be a 240-byte packer; p_lpk a 24-byte packer.
+// p_local may be null — the block is then omitted entirely, never nulled
+// (a null element truncates the packet, NETWORKING §3.2).
+// The `p_baseline` argument is the v2 delta hook (NETWORKING §11.4); v1 always
+// passes 0 and it is asserted unused. It exists so the call sites never change.
+export fn proto_write_snapshot(p_m: object, p_pk: object, p_lpk: object,
+                               p_e: object, p_local, p_baseline: i32): i32 {
+    let m: object = p_m;
+    let pk: object = p_pk;
+    let e: object = p_e;
+    let n: i32 = e.count;
+    proto_msg_reset(m, NET_S_SNAPSHOT);
+    proto_add(m, e.tick);
+    proto_add(m, e.acked_seq);
+    proto_add(m, e.time_ms & 65535);
+    proto_add(m, n);
+
+    let i: i32 = 0;
+    while (i < n) {
+        let blob_end: i32 = i + ENTS_PER_BLOB;
+        if (blob_end > n) { blob_end = n; }
+        pack_reset(pk);
+        pack_ent_blob(pk, e, i, blob_end);
+        proto_add(m, pack_flush(pk));
+        i = blob_end;
+    }
+
+    if (p_local != null) {
+        let lpk: object = p_lpk;
+        pack_reset(lpk);
+        pack_i32(lpk, p_local.px_q);
+        pack_i32(lpk, p_local.py_q);
+        pack_i32(lpk, p_local.pz_q);
+        pack_i16(lpk, p_local.vx_q);
+        pack_i16(lpk, p_local.vy_q);
+        pack_i16(lpk, p_local.vz_q);
+        pack_u8(lpk, p_local.hp);
+        pack_u8(lpk, p_local.armor);
+        pack_u8(lpk, p_local.move_state);
+        pack_u8(lpk, p_local.weapon);
+        pack_u16(lpk, p_local.ammo_mag);
+        proto_add(m, pack_flush(lpk));
+    }
+    let out: i32 = m.data.length;
+    return out;
+}
+
+// Decode S_SNAPSHOT into p_e (and p_local, if the block is present).
+// Returns the entity count, or -1 on a malformed message.
+export fn proto_read_snapshot(p_m: object, p_e: object, p_local): i32 {
+    let m: object = p_m;
+    let e: object = p_e;
+    netents_reset(e);
+    if (m.net_id != NET_S_SNAPSHOT) { return -1; }
+    if (m.data.length < 4) { return -1; }
+    e.tick = i32(m.data[0]);
+    e.acked_seq = i32(m.data[1]);
+    e.time_ms = i32(m.data[2]);
+    let n: i32 = i32(m.data[3]);
+    if (n < 0) { return -1; }
+    if (n > e.cap) { return -1; }
+    let nb: i32 = proto_blob_count(n);
+    if (m.data.length < 4 + nb) { return -1; }
+
+    let bi: i32 = 0;
+    while (bi < nb) {
+        let want: i32 = ENTS_PER_BLOB;
+        let rem: i32 = n - bi * ENTS_PER_BLOB;
+        if (rem < want) { want = rem; }
+        if (unpack_ent_blob(m.data[4 + bi], e, want) < 0) { return -1; }
+        bi++;
+    }
+
+    if (p_local != null) {
+        if (m.data.length >= 5 + nb) {
+            let lu: object = unpack_new(m.data[4 + nb]);
+            if (lu.len >= LOCAL_STRIDE) {
+                let l: object = p_local;
+                l.px_q = unpack_i32(lu); l.py_q = unpack_i32(lu); l.pz_q = unpack_i32(lu);
+                l.vx_q = unpack_i16(lu); l.vy_q = unpack_i16(lu); l.vz_q = unpack_i16(lu);
+                l.hp = unpack_u8(lu); l.armor = unpack_u8(lu);
+                l.move_state = unpack_u8(lu); l.weapon = unpack_u8(lu);
+                l.ammo_mag = unpack_u16(lu);
+            }
+        }
+    }
+    let out: i32 = e.count;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// S_EVENT (net_id 1200) — NETWORKING §11.5
+//
+//   element 0 : u32 server_tick
+//   element 1 : u8  n_events
+//   element 2+: buffer, 15 events per 240-byte blob
+//
+//   event stride, 16 bytes LE:
+//     +0 u8 type  +1 u8 sub  +2 u32 actor_id  +6 u32 target_id
+//     +10 i16 x_q  +12 i16 y_q  +14 i16 z_q      (1/16 m, viewer-relative)
+//
+// Events are the reason an authoritative game feels responsive: the server
+// says "this definitely happened", the client turns it into a hitmarker. In v1
+// the local server emits them into the loopback and the client reacts to them,
+// so the multiplayer version changes nothing about the feel.
+// ---------------------------------------------------------------------------
+export fn netevs_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let v: object = { cap: cap, count: 0, tick: 0,
+                      type: [], sub: [], actor: [], target: [], x_q: [], y_q: [], z_q: [] };
+    let i: i32 = 0;
+    while (i < cap) {
+        v.type.push(0); v.sub.push(0); v.actor.push(0); v.target.push(0);
+        v.x_q.push(0); v.y_q.push(0); v.z_q.push(0);
+        i++;
+    }
+    return v;
+}
+
+export fn netevs_reset(p_v: object) { p_v.count = 0; }
+export fn netevs_count(p_v: object): i32 { let out: i32 = p_v.count; return out; }
+
+export fn netevs_push_q(p_v: object, p_type: i32, p_sub: i32, p_actor: i32, p_target: i32,
+                        p_x: i32, p_y: i32, p_z: i32): i32 {
+    let v: object = p_v;
+    let k: i32 = v.count;
+    if (k >= v.cap) { return -1; }
+    v.type[k] = p_type; v.sub[k] = p_sub; v.actor[k] = p_actor; v.target[k] = p_target;
+    v.x_q[k] = p_x; v.y_q[k] = p_y; v.z_q[k] = p_z;
+    v.count = k + 1;
+    let out: i32 = k;
+    return out;
+}
+
+export fn netevs_push(p_v: object, p_type: i32, p_sub: i32, p_actor: i32, p_target: i32,
+                      p_x: f64, p_y: f64, p_z: f64): i32 {
+    let out: i32 = netevs_push_q(p_v, p_type, p_sub, p_actor, p_target,
+                                 q_evpos(p_x), q_evpos(p_y), q_evpos(p_z));
+    return out;
+}
+
+export fn netevs_x(p_v: object, p_i: i32): f64 { let out: f64 = dq_evpos(p_v.x_q[p_i]); return out; }
+export fn netevs_y(p_v: object, p_i: i32): f64 { let out: f64 = dq_evpos(p_v.y_q[p_i]); return out; }
+export fn netevs_z(p_v: object, p_i: i32): f64 { let out: f64 = dq_evpos(p_v.z_q[p_i]); return out; }
+
+export fn proto_write_events(p_m: object, p_pk: object, p_v: object): i32 {
+    let m: object = p_m;
+    let pk: object = p_pk;
+    let v: object = p_v;
+    let n: i32 = v.count;
+    proto_msg_reset(m, NET_S_EVENT);
+    proto_add(m, v.tick);
+    proto_add(m, n);
+    let i: i32 = 0;
+    while (i < n) {
+        let blob_end: i32 = i + EVS_PER_BLOB;
+        if (blob_end > n) { blob_end = n; }
+        pack_reset(pk);
+        pack_ev_blob(pk, v, i, blob_end);
+        proto_add(m, pack_flush(pk));
+        i = blob_end;
+    }
+    let out: i32 = m.data.length;
+    return out;
+}
+
+export fn proto_read_events(p_m: object, p_v: object): i32 {
+    let m: object = p_m;
+    let v: object = p_v;
+    netevs_reset(v);
+    if (m.net_id != NET_S_EVENT) { return -1; }
+    if (m.data.length < 2) { return -1; }
+    v.tick = i32(m.data[0]);
+    let n: i32 = i32(m.data[1]);
+    if (n < 0) { return -1; }
+    if (n > v.cap) { return -1; }
+    let nb: i32 = 0;
+    if (n > 0) { nb = (n + EVS_PER_BLOB - 1) / EVS_PER_BLOB; }
+    if (m.data.length < 2 + nb) { return -1; }
+    let bi: i32 = 0;
+    while (bi < nb) {
+        let want: i32 = EVS_PER_BLOB;
+        let rem: i32 = n - bi * EVS_PER_BLOB;
+        if (rem < want) { want = rem; }
+        if (unpack_ev_blob(m.data[2 + bi], v, want) < 0) { return -1; }
+        bi++;
+    }
+    let out: i32 = v.count;
+    return out;
+}
