@@ -1,63 +1,67 @@
 // ===========================================================================
-// nightshade/tools/shot.hml — THE VISUAL VERIFICATION HARNESS   (task W2-11)
+// nightshade/tools/shot.hml — THE VISUAL VERIFICATION HARNESS   (task W3-7)
 // ===========================================================================
 //
 // This is not a debug utility. It is the primary quality instrument: the harsh
-// visual critic runs it every iteration from Wave 3 on, and every art decision
-// in the project is argued from its output.
+// visual critic runs it every iteration, and every art decision in the project
+// is argued from its output.
 //
 //   hemlockc -O1 tools/shot.hml -o /tmp/shot
 //   SDL_VIDEODRIVER=dummy /tmp/shot --scene list
 //   SDL_VIDEODRIVER=dummy /tmp/shot --scene ridge_golden --out docs/shots/ridge_golden.png
+//   SDL_VIDEODRIVER=dummy /tmp/shot --scene atlas_sheet  --out docs/shots/atlas_sheet.png
 //   SDL_VIDEODRIVER=dummy /tmp/shot --scene muzzle_fog --cam 3,2.1,-8 --look 220,-4 \
 //                                   --tod 22.0 --weather storm --seed 1337 --out /tmp/a.png
 //   SDL_VIDEODRIVER=dummy /tmp/shot --selftest
 //
-// THE FIVE CONTRACTS (ARCHITECTURE.md §7, BUILD_PLAN W2-11)
+// THE FIVE CONTRACTS (ARCHITECTURE.md §7, BUILD_PLAN W2-11 / W3-7)
 //
 //  1. It renders through the REAL frame path. `frame_render()` below executes
 //     stages 6..28 of ARCHITECTURE.md §4 in that exact order, on the real
 //     engine modules (batch / emit / shade / mesh / billboard / quad / font /
 //     atlas / target / stats). There is no second renderer in this file.
-//  2. Deterministic. No wall clock and no @stdlib/random reach any geometry
+//  2. It renders the REAL ART. Every colour, tile, sprite, glyph, mesh, sky
+//     row and lighting value in this file comes from `src/art/*` — palette,
+//     tod, texgen, skygen, fxgen, hudgen, meshgen. There is no second art
+//     pipeline in this file either, and there is no local copy of one.
+//  3. Deterministic. No wall clock and no @stdlib/random reach any geometry
 //     decision; every placement comes from `--seed` through the local xorshift
-//     below. The same command produces byte-identical PNG bytes.
-//  3. Compiled only. Run interpreted it refuses with a clear error and exit 2.
-//  4. It never dies on a headless SDL failure — in particular
+//     below, and `tod_reset()` clears the ToD crossfade/lightning state before
+//     every evaluation. The same command produces byte-identical PNG bytes.
+//  4. Compiled only. Run interpreted it refuses with a clear error and exit 2.
+//  5. It never dies on a headless SDL failure — in particular
 //     SDL_SetRelativeMouseMode always fails under SDL_VIDEODRIVER=dummy; that
 //     is reported and rendering continues.
-//  5. A screenshot without its stats report is impossible. The PNG and
+//  6. A screenshot without its stats report is impossible. The PNG and
 //     `<out>.stats.txt` are written as a pair: if either write fails, neither
 //     file survives, and the report is printed to stdout as well.
 //
 // ---------------------------------------------------------------------------
-// WHAT IS A WAVE-2 STAND-IN AND WHAT IS PERMANENT
+// WHAT THIS FILE OWNS AND WHAT IT ONLY DRIVES
 // ---------------------------------------------------------------------------
-// PERMANENT (the harness): the CLI, the scene registry, determinism, the
+// OWNED (the harness): the CLI, the scene registry, the seeded test world
+// (terrain height field, prop placement, particle placement), determinism, the
 // PNG+stats pairing, the compiled-only guard, the stage order of frame_render,
-// the stats plumbing, `--selftest`.
+// the stats plumbing, `--selftest`, and the `atlas_sheet` contact sheet.
 //
-// STAND-IN (the *content*), all of it between the two fences marked
-// `WAVE-2 STAND-IN CONTENT`. In Wave 2 the game's art pipeline does not exist
-// yet: src/art/palette.hml (W2-3), tod.hml (W2-4), texgen.hml (W2-5),
-// skygen.hml (W2-6), fxgen/hudgen (W2-7) and meshgen.hml (W2-8) are being
-// written in parallel with this file and could not be imported when it was
-// built. The fence therefore holds a minimal local palette, ToD keyframe
-// table, texture generator, font and mesh set, transcribed from ART_BIBLE, so
-// that the five money shots are actually evaluable TODAY. W3-7 re-owns this
-// file: it deletes the fence, imports the real modules, and calls
-// `frame_render` from src/render/world_render.hml. The call shapes inside the
-// fence deliberately match the signatures in ARCHITECTURE.md §5.3 so the swap
-// is mechanical.
+// DRIVEN, NEVER REIMPLEMENTED (the art): palette.hml, tod.hml, texgen.hml,
+// skygen.hml, fxgen.hml, hudgen.hml, meshgen.hml. If a picture out of this
+// tool is ugly, the fix belongs in one of those seven files. That is the whole
+// point: the harness must not be able to flatter or slander the art.
 //
-// Nothing outside the fence names a colour or a game noun.
+// The Wave-2 stand-in fence that used to sit here — a local palette, ToD
+// table, texture generator, font and mesh set — is DELETED. It existed only
+// because the art modules were being written in parallel with this file.
 // ===========================================================================
 
 import { exit } from "@stdlib/process";
 import { write_file, exists, remove_file, make_dirs } from "@stdlib/fs";
 import { getenv } from "@stdlib/env";
-import { sin, cos, sqrt, floor, divi, PI } from "@stdlib/math";
+import { sin, cos, sqrt, floor, divi, atan2, asin } from "@stdlib/math";
 
+// ---------------------------------------------------------------------------
+// the engine
+// ---------------------------------------------------------------------------
 import { window_open_ex, window_close, sdl_clear, sdl_present, read_pixels_rect,
          set_draw_blend, set_relative_mouse, sdl_error,
          FMT_ARGB8888, BLEND_BLEND, BLEND_ADD }
@@ -68,34 +72,37 @@ import { target_new, target_free, target_begin, target_end, target_present,
 import { write_png } from "../../wobbleweed/src/png.hml";
 import { batch_new, batch_reset, batch_reserve, batch_commit, batch_vbuf,
          batch_flush, batch_sort, batch_sort_flush, batch_count,
-         batch_write_vertex, batch_draw_calls,
+         batch_write_vertex,
          LAYER_SKY, LAYER_WORLD, LAYER_FX, LAYER_HUD }
        from "../../wobbleweed/src/batch.hml";
 import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
          emit_set_backface, emit_set_lighting, emit_mesh_buf, emit_quad_world,
          emit_stats_reset, emit_count_backface, emit_count_near,
          emit_count_guard, emit_count_straddle, emit_count_submitted,
-         EMIT_BF_CW, EMIT_BF_CCW, EMIT_RGB_WHITE }
+         EMIT_BF_CCW }
        from "../../wobbleweed/src/emit.hml";
-import { env_new, env_set_sun, env_set_ambient, env_set_bounce, env_set_camera,
-         env_set_fog, env_set_mist, env_clear_lights, env_add_light, env_field,
+import { env_new, env_set_camera, env_set_fog, env_set_mist,
+         env_clear_lights, env_add_light, env_field,
          env_far_plane, env_fog_factor, env_fog_alpha, env_light_count,
-         ENV_FOG_R, ENV_FOG_G, ENV_FOG_B, ENV_LIGHT0_X, ENV_LIGHT_STRIDE }
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_FOG_ALPHA_MAX, ENV_LIGHT0_X, ENV_LIGHT_STRIDE }
        from "../../wobbleweed/src/shade.hml";
-import { mesh_new, mesh_begin, mesh_vert, mesh_vert_n, mesh_vert_ao, mesh_tri,
-         mesh_quad, mesh_end, mesh_bake_light, mesh_buf, mesh_tri_count,
-         mesh_radius, mesh_set_mvp, mesh_set_viewport, mesh_set_near,
-         mesh_set_cull, mesh_emit_yaw, mesh_reset_counters, mesh_rej_near,
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_quad, mesh_end,
+         mesh_bake_light, mesh_buf, mesh_tri_count, mesh_radius,
+         mesh_set_mvp, mesh_set_viewport, mesh_set_near, mesh_set_cull,
+         mesh_emit_yaw, mesh_reset_counters, mesh_rej_near,
          mesh_rej_guard, mesh_rej_backface, MESH_CULL_NEG }
        from "../../wobbleweed/src/mesh.hml";
 import { billboard_set_mvp, billboard_set_viewport, billboard_set_near,
          billboard_set_proj_persp, billboard_set_uv, billboard_world,
-         billboard_stretched, billboard_reset_counters, billboard_tris_emitted }
+         billboard_stretched, billboard_reset_counters }
        from "../../wobbleweed/src/billboard.hml";
-import { atlas_new, atlas_px, atlas_fill, atlas_cell_uv, atlas_rect_uv,
-         atlas_upload, atlas_base }
+import { atlas_new, atlas_cell_uv, atlas_upload }
        from "../../wobbleweed/src/atlas.hml";
-import { font_new, font_add_glyph, font_bake, font_text_shadowed, font_width }
+import { font_text_shadowed }
        from "../../wobbleweed/src/font.hml";
 import { quad_screen_uv, quad_ring }
        from "../../wobbleweed/src/quad.hml";
@@ -120,30 +127,86 @@ import { stat_add, stat_set, stat_begin, stat_end, stat_get, stat_ms,
          STAT_T_FLUSH_HUD, STAT_T_PRESENT, STAT_T_FRAME }
        from "../../wobbleweed/src/stats.hml";
 
+// ---------------------------------------------------------------------------
+// the game — core
+// ---------------------------------------------------------------------------
+import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_TRIS_CLAMP,
+         g_FOG_FAR_CAP, g_MIST_HEIGHT, g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS,
+         g_TEXEL_CM_GROUND }
+       from "../src/core/config.hml";
+import { clamp01, lerpf, clampi, clampf } from "../src/core/mathx.hml";
+
+// ---------------------------------------------------------------------------
+// the game — art. THE POINT OF THIS FILE.
+// ---------------------------------------------------------------------------
+import { pal_r, pal_g, pal_b, pal_pack,
+         g_UI_WHITE, g_UI_DIM, g_UI_BLACK, g_UI_AMBER, g_UI_DANGER,
+         g_UI_GOOD, g_UI_XP, g_NS_CORE, g_NS_HALO, g_MUZZLE_MID,
+         g_EMBER, g_LIGHTNING, g_WINDOW_LIGHT,
+         g_GRASS_MID, g_GRASS_DRY, g_DIRT_MID, g_SNOW_HI, g_SNOW_LO }
+       from "../src/art/palette.hml";
+import { tod_eval, tod_reset, tod_set_weather, tod_set_mist_band,
+         tod_sky_keys, tod_lightning_fire, tod_clock_hours, tod_mist_density,
+         WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM, WX_BLOOM,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R, TODSKY_STAR_ALPHA,
+         TODSKY_HALO, TODSKY_BODY_X, TODSKY_CLOUD_COVER, TODSKY_COUNT }
+       from "../src/art/tod.hml";
+import { texgen_build_world_atlas, texgen_cell_name,
+         CELL_GRASS_A, CELL_GRASS_B, CELL_DIRT, CELL_SNOW, CELL_CLIFF }
+       from "../src/art/texgen.hml";
+import { skygen_init, skygen_build, skygen_keys_new, skygen_set_keys,
+         skygen_set_clock, skygen_mark_dirty, skygen_rebake_slice,
+         skygen_dirty_rows, skygen_atlas, skygen_w, skygen_h,
+         skygen_star_count,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER }
+       from "../src/art/skygen.hml";
+import { fxgen_build_atlas, fxgen_cell_name,
+         FX_MUZZLE_0, FX_MUZZLE_1, FX_MUZZLE_2, FX_TRACER, FX_SPARK_0,
+         FX_EMBER, FX_XP_MOTE, FX_GLOW_S, FX_GLOW_L, FX_DUST, FX_EYE,
+         FX_RAIN, FX_SMOKE_1, FX_CELL_COUNT }
+       from "../src/art/fxgen.hml";
+import { hudgen_build_atlas, hudgen_uv, hudgen_rect, hud_font_micro,
+         hud_font_big,
+         HUD_ICON_HEART, HUD_ICON_AMMO, HUD_ICON_XP, HUD_ICON_ENEMY,
+         HUD_ICON_PLAYER, HUD_XH_TICK_V, HUD_XH_TICK_H, HUD_XH_DOT,
+         HUD_HITMARK, HUD_CHEVRON, HUD_TICK_MINOR, HUD_TICK_MAJOR,
+         HUD_MM_CORNER, HUD_SOLID, HUD_RECT_COUNT }
+       from "../src/art/hudgen.hml";
+import { meshgen_build_all, meshgen_bake_all, meshgen_mesh, meshgen_name,
+         meshgen_tris, meshgen_radius, meshgen_enemy_mesh,
+         meshgen_set_material_uv, meshgen_set_sun_azimuth, meshgen_count,
+         MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT,
+         MG_MAT_GLASS,
+         MESH_TREE0, MESH_TREE1, MESH_TREE2, MESH_BUSH, MESH_ROCK,
+         MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_NPC,
+         MESH_SPARROW_VM, ENEMY_COUNT }
+       from "../src/art/meshgen.hml";
+
 // ===========================================================================
 // 0. FIXED SHAPE
 // ===========================================================================
 
-let g_RES_W: i32 = 320;             // ARCHITECTURE §8: the resolution
-let g_RES_H: i32 = 240;
 let g_NEAR: f64 = 0.15;
 let g_GUARD: f64 = 640.0;           // guard-band margin in pixels
-let g_CAP_SKY: i32 = 96;
+let g_CAP_SKY: i32 = 256;
 let g_CAP_WORLD: i32 = 3500;        // the hard clamp of ARCHITECTURE §8
 let g_CAP_FX: i32 = 640;
-let g_CAP_HUD: i32 = 320;
-let g_HUD_TRI_CAP: i32 = 250;       // ART_BIBLE §9
+let g_CAP_HUD: i32 = 512;
 let g_CHUNK_Q: i32 = 8;             // quads per chunk edge
 let g_QUAD_M: f64 = 4.0;            // metres per terrain quad (<= 4 m, §6 rule)
 let g_CHUNK_M: f64 = 32.0;          // g_CHUNK_Q * g_QUAD_M
-let g_VERSION: string = "shot.hml W2-11 rev1";
+let g_VERSION: string = "shot.hml W3-7 rev1 (real art)";
 
 // ===========================================================================
 // 1. DETERMINISM — the harness RNG and the positional hash
 // ---------------------------------------------------------------------------
 // xorshift64. All mixing in u64: CLAUDE.md A13 — i32/i64 * + - TRAP on
-// overflow. This is the tool's own stream; src/sim/rng.hml (W2-9) is the
-// simulation's, and they are deliberately separate.
+// overflow. This is the tool's own stream, used ONLY to place the test world;
+// src/sim/rng.hml is the simulation's, and they are deliberately separate.
 // ===========================================================================
 
 let g_rng: u64 = 88172645463325252;
@@ -180,7 +243,8 @@ fn rnd_range(p_lo: f64, p_hi: f64): f64 {
 }
 
 // Position-keyed hash: same coordinate, same value, whatever the order of
-// evaluation. Masked into u64 before every multiply.
+// evaluation. Masked into u64 before every multiply. This is the TERRAIN's
+// hash — mathx owns the atlas/lattice hashes and this is neither.
 fn h2(p_x: i32, p_y: i32, p_s: i32): f64 {
     let hx: u64 = u64(p_x & 1048575);
     let hy: u64 = u64(p_y & 1048575);
@@ -210,167 +274,200 @@ fn vnoise2(p_x: f64, p_y: f64, p_s: i32): f64 {
     return out;
 }
 
-fn clamp01(p_v: f64): f64 {
-    let v: f64 = p_v;
-    if (v < 0.0) { v = 0.0; }
-    if (v > 1.0) { v = 1.0; }
-    let out: f64 = v;
-    return out;
+// ===========================================================================
+// 2. THE ART — built once, from src/art, at boot
+// ---------------------------------------------------------------------------
+// Four SDL textures and not five (CLAUDE.md §6): ATLAS_WORLD (BLEND),
+// ATLAS_FX (ADD), ATLAS_HUD (BLEND), TEX_SKY (NONE, owned by skygen).
+// ===========================================================================
+
+let g_atlas_world = null;
+let g_atlas_fx = null;
+let g_atlas_hud = null;
+let g_tex_world = null;
+let g_tex_fx = null;
+let g_tex_hud = null;
+let g_tex_sky = null;
+
+let g_world_cells: i32 = 0;         // cells texgen actually wrote
+let g_mesh_tris: i32 = 0;           // total triangles in the mesh library
+
+// scratch, allocated once (A8)
+let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];   // HUD_SOLID uv
+let g_uvs: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_rect: array<i32> = [0, 0, 0, 0];
+let g_skyk: array<f64> = [];
+let g_todsky: array<f64> = [];
+
+// The ten meshgen materials, bound to the cells of the REAL world atlas.
+// meshgen bakes UVs into its vertex arena, so this must happen before
+// meshgen_build_all() and can never be patched afterwards.
+fn art_bind_materials() {
+    meshgen_set_material_uv(MG_MAT_BARK, 0.0, 0.0, 0.0, 0.0);
+    let pairs: array<i32> = [
+        MG_MAT_BARK, 18,        // CELL_BARK
+        MG_MAT_LEAF, 20,        // CELL_LEAF_PINE
+        MG_MAT_STONE, 8,        // CELL_STONE_A
+        MG_MAT_WOOD, 16,        // CELL_WOOD_PLANK
+        MG_MAT_METAL, 27,       // CELL_METAL_PANEL
+        MG_MAT_CONCRETE, 24,    // CELL_CONCRETE
+        MG_MAT_CLOTH, 35,       // CELL_FABRIC_CRM
+        MG_MAT_HIDE, 17,        // CELL_WOOD_LOG
+        MG_MAT_DIRT, 3,         // CELL_DIRT
+        MG_MAT_GLASS, 38        // CELL_WINDOW
+    ];
+    let n: i32 = pairs.length;
+    for (let i = 0; i < n; i = i + 2) {
+        atlas_cell_uv(g_atlas_world, pairs[i + 1], g_uvq, 0);
+        meshgen_set_material_uv(pairs[i], g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3]);
+    }
 }
 
-fn lerpf(p_a: f64, p_b: f64, p_t: f64): f64 {
-    let out: f64 = p_a + (p_b - p_a) * p_t;
-    return out;
-}
+fn art_build(p_win) {
+    // --- ATLAS_WORLD: 41 procedural tiles, texgen.hml ----------------------
+    g_atlas_world = atlas_new(g_ATLAS_WORLD_PX, g_ATLAS_WORLD_PX,
+                              g_ATLAS_WORLD_CELLS, g_ATLAS_WORLD_CELLS);
+    g_world_cells = texgen_build_world_atlas(g_atlas_world, 1337);
 
-fn clampi(p_v: i32, p_lo: i32, p_hi: i32): i32 {
-    let v: i32 = p_v;
-    if (v < p_lo) { v = p_lo; }
-    if (v > p_hi) { v = p_hi; }
-    let out: i32 = v;
-    return out;
+    // --- ATLAS_FX: 28 additive sprites, fxgen.hml --------------------------
+    g_atlas_fx = fxgen_build_atlas();
+
+    // --- ATLAS_HUD: two fonts + 26 sprites, hudgen.hml ---------------------
+    g_atlas_hud = hudgen_build_atlas();
+    hudgen_uv(HUD_SOLID, g_uvw, 0);
+
+    // --- the mesh library, meshgen.hml -------------------------------------
+    art_bind_materials();
+    g_mesh_tris = meshgen_build_all();
+
+    // --- TEX_SKY: the 512x160 panorama, skygen.hml -------------------------
+    skygen_init();
+    skygen_set_clock(0.0);          // no wall clock ever reaches the bake
+    g_skyk = skygen_keys_new();
+    g_todsky = [];
+    for (let i = 0; i < TODSKY_COUNT; i++) { g_todsky.push(0.0); }
+
+    g_tex_world = atlas_upload(p_win, g_atlas_world, BLEND_BLEND);
+    g_tex_fx = atlas_upload(p_win, g_atlas_fx, BLEND_ADD);
+    g_tex_hud = atlas_upload(p_win, g_atlas_hud, BLEND_BLEND);
+    g_tex_sky = skygen_build(p_win);
 }
 
 // ===========================================================================
-// ##################  WAVE-2 STAND-IN CONTENT — START  ######################
-// Deleted by W3-7. See the header. Everything between the fences is content,
-// not harness.
+// 3. THE SCENE REGISTRY
+// ---------------------------------------------------------------------------
+// Every scene is a reproducible camera + world + ToD setup. The five ART_BIBLE
+// §12 money shots, plus hud_worst_case, budget_worst, flat_debug, and the
+// atlas_sheet contact sheet GATE 2 asks for.
+// Parallel arrays, stride SC_N. `--scene list` prints this table.
 // ===========================================================================
 
-// --- palette (ART_BIBLE §3 -> src/art/palette.hml, W2-3) -------------------
-// Packed as 0xRRGGBB but built from decimal channels so no hex colour literal
-// exists in the repo outside the eventual palette.hml.
-fn pal(p_r: i32, p_g: i32, p_b: i32): i32 {
-    let out: i32 = (p_r & 255) * 65536 + (p_g & 255) * 256 + (p_b & 255);
-    return out;
-}
-fn pal_r(p_c: i32): i32 { let out: i32 = divi(p_c, 65536) & 255; return out; }
-fn pal_g(p_c: i32): i32 { let out: i32 = divi(p_c, 256) & 255; return out; }
-fn pal_b(p_c: i32): i32 { let out: i32 = p_c & 255; return out; }
+let SC_CAMX: i32 = 0;  let SC_CAMY: i32 = 1;  let SC_CAMZ: i32 = 2;
+let SC_YAW: i32 = 3;   let SC_PITCH: i32 = 4;
+let SC_TOD: i32 = 5;   let SC_WX: i32 = 6;    let SC_SEED: i32 = 7;
+let SC_FOGFAR: i32 = 8; let SC_MIST: i32 = 9; let SC_FOV: i32 = 10;
+let SC_NTREE: i32 = 11; let SC_NROCK: i32 = 12; let SC_NPROP: i32 = 13;
+let SC_NENEMY: i32 = 14; let SC_NFLORA: i32 = 15; let SC_NPART: i32 = 16;
+let SC_FLAGS: i32 = 17; let SC_RIDGE: i32 = 18; let SC_GROUND: i32 = 19;
+let SC_N: i32 = 20;
 
-let g_GRASS_HI: i32   = pal(159, 184, 74);
-let g_GRASS_MID: i32  = pal(122, 150, 54);
-let g_GRASS_LO: i32   = pal(81, 99, 39);
-let g_GRASS_DRY: i32  = pal(184, 168, 85);
-let g_DIRT_HI: i32    = pal(176, 138, 84);
-let g_DIRT_MID: i32   = pal(138, 104, 64);
-let g_DIRT_LO: i32    = pal(92, 69, 42);
-let g_SNOW_HI: i32    = pal(234, 240, 246);
-let g_SNOW_LO: i32    = pal(182, 196, 212);
-let g_PINE_HI: i32    = pal(78, 132, 104);
-let g_PINE_LO: i32    = pal(46, 90, 74);
-let g_LEAF_MID: i32   = pal(90, 154, 60);
-let g_BARK_HI: i32    = pal(150, 114, 74);
-let g_BARK_LO: i32    = pal(90, 66, 44);
-let g_STONE_HI: i32   = pal(176, 168, 150);
-let g_STONE_MID: i32  = pal(134, 126, 108);
-let g_STONE_LO: i32   = pal(86, 80, 68);
-let g_GRANITE_HI: i32 = pal(142, 150, 164);
-let g_GRANITE_LO: i32 = pal(86, 94, 110);
-let g_CONCRETE_HI: i32  = pal(198, 192, 174);
-let g_CONCRETE_MID: i32 = pal(154, 148, 132);
-let g_CONCRETE_LO: i32  = pal(96, 90, 78);
-let g_RUST: i32       = pal(160, 82, 48);
-let g_WOOD_HI: i32    = pal(166, 124, 76);
-let g_WOOD_MID: i32   = pal(126, 92, 54);
-let g_WOOD_LO: i32    = pal(88, 64, 34);
-let g_ROOF_TILE: i32  = pal(142, 74, 60);
-let g_PAINT_TEAL: i32 = pal(62, 140, 138);
-let g_PAINT_OCHRE: i32 = pal(200, 154, 68);
-let g_FABRIC_CREAM: i32 = pal(216, 204, 168);
-let g_STEEL_MID: i32  = pal(138, 144, 154);
-let g_STEEL_LO: i32   = pal(86, 92, 104);
-let g_GUNMETAL_HI: i32 = pal(122, 128, 136);
-let g_GUNMETAL_LO: i32 = pal(74, 80, 88);
-let g_BRASS: i32      = pal(200, 154, 60);
-let g_POLYMER: i32    = pal(94, 96, 88);
-let g_NS_CORE: i32    = pal(199, 79, 255);
-let g_NS_MID: i32     = pal(138, 43, 212);
-let g_NS_HALO: i32    = pal(232, 166, 255);
-let g_NS_FLORA: i32   = pal(122, 74, 158);
-let g_MUZZLE_CORE: i32 = pal(255, 248, 220);
-let g_MUZZLE_MID: i32 = pal(255, 196, 74);
-let g_EMBER: i32      = pal(255, 138, 42);
-let g_LIGHTNING: i32  = pal(232, 240, 255);
-let g_UI_WHITE: i32   = pal(244, 244, 236);
-let g_UI_DIM: i32     = pal(154, 160, 166);
-let g_UI_BLACK: i32   = pal(10, 12, 16);
-let g_UI_AMBER: i32   = pal(255, 196, 68);
-let g_UI_DANGER: i32  = pal(255, 59, 48);
-let g_UI_GOOD: i32    = pal(107, 224, 122);
-let g_WINDOW_WARM: i32 = pal(255, 216, 160);
+let F_MUZZLE: i32 = 1;
+let F_LIGHTNING: i32 = 2;
+let F_HUD: i32 = 4;
+let F_SHRINE: i32 = 8;
+let F_SNOW: i32 = 16;
+let F_LANDMARK: i32 = 32;
+let F_RAIN: i32 = 64;
+let F_VIEWMODEL: i32 = 128;
+let F_NPC: i32 = 256;
+let F_ATLAS: i32 = 512;         // the contact sheet, not a 3D scene
 
-// --- the day/night cycle (ART_BIBLE §5 -> src/art/tod.hml, W2-4) ----------
-// Seven keyframes. Fields per key, in one flat array<f64> of stride TOD_N.
-let TOD_HOUR: i32 = 0;
-let TOD_SUNX: i32 = 1;   let TOD_SUNY: i32 = 2;   let TOD_SUNZ: i32 = 3;
-let TOD_SUNR: i32 = 4;   let TOD_SUNG: i32 = 5;   let TOD_SUNB: i32 = 6;
-let TOD_AMBR: i32 = 7;   let TOD_AMBG: i32 = 8;   let TOD_AMBB: i32 = 9;
-let TOD_BNCR: i32 = 10;  let TOD_BNCG: i32 = 11;  let TOD_BNCB: i32 = 12;
-let TOD_FTR: i32 = 13;   let TOD_FTG: i32 = 14;   let TOD_FTB: i32 = 15;
-let TOD_FNEAR: i32 = 16; let TOD_FFAR: i32 = 17;  let TOD_FAMAX: i32 = 18;
-let TOD_ZENR: i32 = 19;  let TOD_ZENG: i32 = 20;  let TOD_ZENB: i32 = 21;
-let TOD_MIDR: i32 = 22;  let TOD_MIDG: i32 = 23;  let TOD_MIDB: i32 = 24;
-let TOD_HORR: i32 = 25;  let TOD_HORG: i32 = 26;  let TOD_HORB: i32 = 27;
-let TOD_MIST: i32 = 28;  let TOD_STAR: i32 = 29;
-let TOD_CLR: i32 = 30;   let TOD_CLG: i32 = 31;   let TOD_CLB: i32 = 32;
-let TOD_CSR: i32 = 33;   let TOD_CSG: i32 = 34;   let TOD_CSB: i32 = 35;
-let TOD_N: i32 = 36;
+let g_sc_id: array = [];
+let g_sc_label: array = [];     // FONT_MICRO is uppercase-only (hudgen §9.4)
+let g_sc_desc: array = [];
+let g_sc: array<f64> = [];
 
-let g_tod: array<f64> = [];
-let g_TOD_KEYS: i32 = 8;
-
-fn tod_key(p_hour: f64,
-           p_sx: f64, p_sy: f64, p_sz: f64,
-           p_sr: f64, p_sg: f64, p_sb: f64,
-           p_ar: f64, p_ag: f64, p_ab: f64,
-           p_br: f64, p_bg: f64, p_bb: f64,
-           p_tr: f64, p_tg: f64, p_tb: f64,
-           p_fn: f64, p_ff: f64, p_fa: f64,
-           p_zen: i32, p_mid: i32, p_hor: i32,
-           p_mist: f64, p_star: f64,
-           p_clit: i32, p_cshadow: i32) {
-    g_tod.push(p_hour);
-    g_tod.push(p_sx); g_tod.push(p_sy); g_tod.push(p_sz);
-    g_tod.push(p_sr); g_tod.push(p_sg); g_tod.push(p_sb);
-    g_tod.push(p_ar); g_tod.push(p_ag); g_tod.push(p_ab);
-    g_tod.push(p_br); g_tod.push(p_bg); g_tod.push(p_bb);
-    g_tod.push(p_tr); g_tod.push(p_tg); g_tod.push(p_tb);
-    g_tod.push(p_fn); g_tod.push(p_ff); g_tod.push(p_fa);
-    g_tod.push(f64(pal_r(p_zen))); g_tod.push(f64(pal_g(p_zen))); g_tod.push(f64(pal_b(p_zen)));
-    g_tod.push(f64(pal_r(p_mid))); g_tod.push(f64(pal_g(p_mid))); g_tod.push(f64(pal_b(p_mid)));
-    g_tod.push(f64(pal_r(p_hor))); g_tod.push(f64(pal_g(p_hor))); g_tod.push(f64(pal_b(p_hor)));
-    g_tod.push(p_mist); g_tod.push(p_star);
-    g_tod.push(f64(pal_r(p_clit))); g_tod.push(f64(pal_g(p_clit))); g_tod.push(f64(pal_b(p_clit)));
-    g_tod.push(f64(pal_r(p_cshadow))); g_tod.push(f64(pal_g(p_cshadow))); g_tod.push(f64(pal_b(p_cshadow)));
+fn scene_add(p_id: string, p_label: string, p_desc: string,
+             p_x: f64, p_y: f64, p_z: f64, p_yaw: f64, p_pitch: f64,
+             p_tod: f64, p_wx: i32, p_seed: i32,
+             p_fogfar: f64, p_mist: f64, p_fov: f64,
+             p_ntree: i32, p_nrock: i32, p_nprop: i32,
+             p_nenemy: i32, p_nflora: i32, p_npart: i32,
+             p_flags: i32, p_ridge: f64) {
+    g_sc_id.push(p_id);
+    g_sc_label.push(p_label);
+    g_sc_desc.push(p_desc);
+    g_sc.push(p_x); g_sc.push(p_y); g_sc.push(p_z);
+    g_sc.push(p_yaw); g_sc.push(p_pitch);
+    g_sc.push(p_tod); g_sc.push(f64(p_wx)); g_sc.push(f64(p_seed));
+    g_sc.push(p_fogfar); g_sc.push(p_mist); g_sc.push(p_fov);
+    g_sc.push(f64(p_ntree)); g_sc.push(f64(p_nrock)); g_sc.push(f64(p_nprop));
+    g_sc.push(f64(p_nenemy)); g_sc.push(f64(p_nflora)); g_sc.push(f64(p_npart));
+    g_sc.push(f64(p_flags)); g_sc.push(p_ridge); g_sc.push(0.0);
 }
 
-fn tod_build() {
-    // hour  sun dir          sun rgb            ambient rgb        bounce rgb         fog tint mul       near  far  amax   zenith           mid              horizon           mist star
-    tod_key( 2.0,  0.20,-0.90, 0.39, 0.14,0.16,0.26, 0.14,0.15,0.26, 0.02,0.03,0.05, 0.13,0.16,0.30,  3.0, 22.0, 0.45,
-             pal(8,10,30),    pal(14,18,48),   pal(22,28,52),   0.70, 1.00, pal(42,48,80), pal(18,24,44));
-    tod_key( 5.5,  0.94, 0.10, 0.32, 0.80,0.50,0.28, 0.20,0.18,0.28, 0.09,0.08,0.04, 0.86,0.62,0.52,  8.0, 52.0, 1.00,
-             pal(42,58,114),  pal(122,90,150), pal(232,164,104), 0.55, 0.15, pal(255,208,160), pal(142,110,136));
-    tod_key( 8.0,  0.66, 0.60, 0.45, 0.72,0.64,0.48, 0.28,0.30,0.38, 0.11,0.13,0.06, 0.82,0.86,0.94, 14.0, 66.0, 1.00,
-             pal(50,104,194), pal(90,150,218), pal(168,204,228), 0.18, 0.00, pal(242,240,228), pal(168,180,198));
-    tod_key(12.0,  0.18, 0.96, 0.22, 0.58,0.56,0.50, 0.42,0.44,0.50, 0.13,0.16,0.07, 0.76,0.84,0.94, 20.0, 72.0, 1.00,
-             pal(44,95,184),  pal(78,143,214), pal(168,210,232), 0.00, 0.00, pal(242,240,228), pal(150,163,184));
-    tod_key(18.25,-0.72, 0.42,-0.55, 0.76,0.54,0.24, 0.24,0.22,0.32, 0.12,0.09,0.04, 0.96,0.72,0.44, 12.0, 64.0, 1.00,
-             pal(46,74,142),  pal(138,90,130), pal(255,158,68),  0.55, 0.00, pal(255,192,112), pal(142,90,114));
-    tod_key(19.5, -0.95, 0.08,-0.30, 0.44,0.24,0.30, 0.22,0.20,0.34, 0.06,0.05,0.05, 0.52,0.42,0.62,  6.0, 40.0, 0.90,
-             pal(35,28,70),   pal(74,44,86),   pal(158,78,82),   0.60, 0.35, pal(180,112,122), pal(78,52,80));
-    tod_key(22.0, -0.30,-0.55,-0.78, 0.22,0.24,0.34, 0.16,0.18,0.30, 0.03,0.04,0.06, 0.18,0.22,0.36,  4.0, 26.0, 0.55,
-             pal(12,16,40),   pal(20,26,56),   pal(38,48,78),    0.70, 1.00, pal(58,66,96), pal(26,32,56));
-    tod_key(26.0,  0.20,-0.90, 0.39, 0.14,0.16,0.26, 0.14,0.15,0.26, 0.02,0.03,0.05, 0.13,0.16,0.30,  3.0, 22.0, 0.45,
-             pal(8,10,30),    pal(14,18,48),   pal(22,28,52),    0.70, 1.00, pal(42,48,80), pal(18,24,44));
+fn scenes_build() {
+    scene_add("ridge_golden", "RIDGE GOLDEN",
+              "ART_BIBLE 12.1 — the ridge at golden hour",
+              0.0, 0.0, 6.0, 307.0, 0.0, 18.25, WX_CLEAR, 1337,
+              64.0, 0.55, 70.0, 26, 7, 2, 0, 0, 20,
+              F_HUD + F_LANDMARK + F_VIEWMODEL, 1.0);
+    scene_add("muzzle_fog", "MUZZLE FOG",
+              "ART_BIBLE 12.2 — muzzle flash in the fog",
+              0.0, 0.0, 0.0, 18.0, -3.0, 22.0, WX_CLEAR, 4242,
+              26.0, 0.70, 70.0, 22, 5, 1, 3, 0, 26,
+              F_HUD + F_MUZZLE + F_VIEWMODEL, 0.0);
+    scene_add("hub_dawn", "HUB DAWN",
+              "ART_BIBLE 12.3 — the hub at dawn",
+              2.0, 0.0, 14.0, 186.0, -4.0, 5.5, WX_CLEAR, 77,
+              52.0, 0.55, 70.0, 6, 4, 11, 0, 0, 14,
+              F_HUD + F_VIEWMODEL + F_NPC, 0.0);
+    scene_add("ns_bloom", "NS BLOOM",
+              "ART_BIBLE 12.4 — nightshade bloom",
+              0.0, 0.0, 17.0, 180.0, -5.0, 22.0, WX_BLOOM, 909,
+              30.0, 0.45, 70.0, 5, 6, 0, 2, 46, 40,
+              F_HUD + F_SHRINE + F_VIEWMODEL, 0.0);
+    scene_add("storm_assault", "STORM ASSAULT",
+              "ART_BIBLE 12.5 — storm assault, lightning frame",
+              0.0, 0.0, 4.0, 200.0, -2.0, 15.0, WX_STORM, 555,
+              20.0, 0.30, 70.0, 8, 6, 9, 5, 0, 40,
+              F_HUD + F_LIGHTNING + F_RAIN + F_VIEWMODEL, 0.0);
+    scene_add("hud_worst_case", "HUD WORST CASE",
+              "the HUD over noon sky, snow, a muzzle flash and CONCRETE_HI",
+              0.0, 0.0, 3.0, 200.0, 2.0, 12.0, WX_CLEAR, 2024,
+              72.0, 0.0, 70.0, 4, 3, 12, 2, 0, 18,
+              F_HUD + F_MUZZLE + F_SNOW + F_VIEWMODEL, 0.0);
+    scene_add("budget_worst", "BUDGET WORST",
+              "the densest legal frame: FOG_FAR 72, every prop class",
+              0.0, 0.0, 0.0, 214.0, -4.0, 12.0, WX_CLEAR, 31337,
+              72.0, 0.10, 78.0, 46, 22, 16, 6, 30, 60,
+              F_HUD + F_MUZZLE + F_LANDMARK + F_VIEWMODEL + F_NPC, 0.4);
+    scene_add("flat_debug", "FLAT DEBUG",
+              "a flat lit grid — the reference frame for regression diffs",
+              0.0, 0.0, 0.0, 180.0, -8.0, 12.0, WX_CLEAR, 1,
+              48.0, 0.0, 70.0, 3, 2, 2, 1, 0, 0,
+              F_HUD, 0.0);
+    scene_add("atlas_sheet", "ATLAS SHEET",
+              "GATE 2 — the four atlases, straight out of src/art, one sheet",
+              0.0, 0.0, 0.0, 0.0, 0.0, 12.0, WX_CLEAR, 1,
+              72.0, 0.0, 70.0, 0, 0, 0, 0, 0, 0,
+              F_ATLAS, 0.0);
 }
-tod_build();
+scenes_build();
 
-let WX_CLEAR: i32 = 0;
-let WX_OVERCAST: i32 = 1;
-let WX_RAIN: i32 = 2;
-let WX_STORM: i32 = 3;
-let WX_BLOOM: i32 = 4;
+fn scene_index(p_id: string): i32 {
+    let n: i32 = g_sc_id.length;
+    for (let i = 0; i < n; i++) {
+        if (g_sc_id[i] == p_id) { let out: i32 = i; return out; }
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+fn scene_count(): i32 { let out: i32 = g_sc_id.length; return out; }
+fn scene_f(p_i: i32, p_field: i32): f64 { let out: f64 = g_sc[p_i * SC_N + p_field]; return out; }
+fn scene_set(p_i: i32, p_field: i32, p_v: f64) { g_sc[p_i * SC_N + p_field] = p_v; }
 
 fn wx_name(p_w: i32): string {
     if (p_w == WX_OVERCAST) { return "overcast"; }
@@ -388,617 +485,130 @@ fn wx_parse(p_s: string): i32 {
     return -1;
 }
 
-// The evaluated frame environment, one f64 per TOD_* field, after keyframe
-// interpolation and the weather override. Read by the sky, the fog, the
-// lighting and the bake.
-let g_ev: array<f64> = [];
-for (let i = 0; i < TOD_N; i++) { g_ev.push(0.0); }
-
-// tod_eval: hours (0..24) + weather -> g_ev + the engine RenderEnv.
-// Same shape as src/art/tod.hml's `tod_eval(env, day_t, weather)` (§5.3).
-fn tod_eval(p_env: array<f64>, p_hours: f64, p_wx: i32, p_lightning: i32,
-            p_fog_far_override: f64, p_mist_override: f64,
-            p_camx: f64, p_camy: f64, p_camz: f64, p_ground: f64) {
-    let h: f64 = p_hours;
-    if (h < 2.0) { h = h + 24.0; }
-    if (h > 26.0) { h = 26.0; }
-    let k: i32 = 0;
-    while (k < g_TOD_KEYS - 2 && g_tod[(k + 1) * TOD_N + TOD_HOUR] < h) { k++; }
-    let h0: f64 = g_tod[k * TOD_N + TOD_HOUR];
-    let h1: f64 = g_tod[(k + 1) * TOD_N + TOD_HOUR];
-    let t: f64 = 0.0;
-    if (h1 > h0) { t = clamp01((h - h0) / (h1 - h0)); }
-    let a: i32 = k * TOD_N;
-    let b: i32 = (k + 1) * TOD_N;
-    for (let f = 0; f < TOD_N; f++) {
-        g_ev[f] = lerpf(g_tod[a + f], g_tod[b + f], t);
-    }
-
-    // --- weather override (ART_BIBLE §5.2) --------------------------------
-    let wx: i32 = p_wx;
-    let sunmul: f64 = 1.0;
-    let ambt: f64 = 0.0;
-    let ambr: f64 = 0.0; let ambg: f64 = 0.0; let ambb: f64 = 0.0;
-    let ftr: f64 = 1.0; let ftg: f64 = 1.0; let ftb: f64 = 1.0;
-    let fnear: f64 = g_ev[TOD_FNEAR];
-    let ffar: f64 = g_ev[TOD_FFAR];
-    if (wx == WX_OVERCAST) {
-        sunmul = 0.42; ambt = 0.65; ambr = 0.58; ambg = 0.59; ambb = 0.62;
-        ftr = 0.94; ftg = 0.95; ftb = 0.97; fnear = 10.0; ffar = 48.0;
-    } else if (wx == WX_RAIN) {
-        sunmul = 0.30; ambt = 0.70; ambr = 0.44; ambg = 0.46; ambb = 0.52;
-        ftr = 0.80; ftg = 0.84; ftb = 0.90; fnear = 6.0; ffar = 34.0;
-    } else if (wx == WX_STORM) {
-        sunmul = 0.20; ambt = 0.80; ambr = 0.30; ambg = 0.31; ambb = 0.38;
-        ftr = 0.60; ftg = 0.62; ftb = 0.72; fnear = 3.0; ffar = 20.0;
-    } else if (wx == WX_BLOOM) {
-        sunmul = 0.55; ambt = 0.60; ambr = 0.22; ambg = 0.14; ambb = 0.32;
-        ftr = 0.66; ftg = 0.40; ftb = 0.92; fnear = 5.0; ffar = 30.0;
-    }
-    g_ev[TOD_SUNR] = g_ev[TOD_SUNR] * sunmul;
-    g_ev[TOD_SUNG] = g_ev[TOD_SUNG] * sunmul;
-    g_ev[TOD_SUNB] = g_ev[TOD_SUNB] * sunmul;
-    g_ev[TOD_AMBR] = lerpf(g_ev[TOD_AMBR], ambr, ambt);
-    g_ev[TOD_AMBG] = lerpf(g_ev[TOD_AMBG], ambg, ambt);
-    g_ev[TOD_AMBB] = lerpf(g_ev[TOD_AMBB], ambb, ambt);
-    g_ev[TOD_FTR] = g_ev[TOD_FTR] * ftr;
-    g_ev[TOD_FTG] = g_ev[TOD_FTG] * ftg;
-    g_ev[TOD_FTB] = g_ev[TOD_FTB] * ftb;
-    if (wx != WX_CLEAR) { g_ev[TOD_FNEAR] = fnear; g_ev[TOD_FFAR] = ffar; }
-
-    // Lightning: two frames of flat blue-white ambient (§5.2). Two triangles
-    // and one variable, for the most dramatic image in the game.
-    if (p_lightning != 0) {
-        g_ev[TOD_AMBR] = 0.90; g_ev[TOD_AMBG] = 0.92; g_ev[TOD_AMBB] = 1.00;
-        g_ev[TOD_SUNR] = 0.10; g_ev[TOD_SUNG] = 0.08; g_ev[TOD_SUNB] = 0.00;
-    }
-
-    if (p_fog_far_override > 0.0) { g_ev[TOD_FFAR] = p_fog_far_override; }
-    if (p_mist_override >= 0.0) { g_ev[TOD_MIST] = p_mist_override; }
-    // CLAUDE.md §6: FOG_FAR never exceeds 72 m.
-    if (g_ev[TOD_FFAR] > 72.0) { g_ev[TOD_FFAR] = 72.0; }
-    if (g_ev[TOD_FNEAR] < 3.0) { g_ev[TOD_FNEAR] = 3.0; }
-    if (g_ev[TOD_FNEAR] > g_ev[TOD_FFAR] - 4.0) { g_ev[TOD_FNEAR] = g_ev[TOD_FFAR] - 4.0; }
-
-    // --- into the engine RenderEnv ----------------------------------------
-    // At night SUN_DIR drives the moon term, negated (ART_BIBLE §5.1 note 1).
-    let sx: f64 = g_ev[TOD_SUNX];
-    let sy: f64 = g_ev[TOD_SUNY];
-    let sz: f64 = g_ev[TOD_SUNZ];
-    if (sy < 0.0) { sx = 0.0 - sx; sy = 0.0 - sy; sz = 0.0 - sz; }
-    env_set_sun(p_env, sx, sy, sz, g_ev[TOD_SUNR], g_ev[TOD_SUNG], g_ev[TOD_SUNB]);
-    env_set_ambient(p_env, g_ev[TOD_AMBR], g_ev[TOD_AMBG], g_ev[TOD_AMBB]);
-    env_set_bounce(p_env, g_ev[TOD_BNCR], g_ev[TOD_BNCG], g_ev[TOD_BNCB]);
-    env_set_camera(p_env, p_camx, p_camy, p_camz);
-    env_set_fog(p_env, g_ev[TOD_FNEAR], g_ev[TOD_FFAR],
-                g_ev[TOD_FTR], g_ev[TOD_FTG], g_ev[TOD_FTB], g_ev[TOD_FAMAX]);
-    // §6.4 height fog. The literal reading of "MIST_BOTTOM = terrain height"
-    // puts every ground vertex at h = 1 and drowns the whole world in mist —
-    // the point is that VALLEYS fill and hilltops stand clear, so the band is
-    // an absolute world-Y band pinned just BELOW the camera's own ground.
-    // Walking downhill then visibly submerges you, which is the effect §6.4
-    // is actually describing.
-    env_set_mist(p_env, p_ground - 1.1, p_ground - 4.6, g_ev[TOD_MIST]);
-}
-
-// --- texture generation (ART_BIBLE §7 -> src/art/texgen.hml, W2-5) --------
-// 4x4 ordered Bayer, the single most PS1-authentic technique available. One
-// array lookup at every ramp boundary, always (§7.1 rule 2).
-let g_bayer: array<i32> = [ 0, 8, 2,10, 12, 4,14, 6, 3,11, 1, 9, 15, 7,13, 5];
-
-let g_ATLAS_W: i32 = 128;       // 4x4 cells of 32x32 => 12.5 cm/texel on ground
-let g_CELL: i32 = 32;
-let g_atlas_world = null;
-let g_atlas_fx = null;
-let g_atlas_hud = null;
-let g_font = null;
-let g_tex_world = null;
-let g_tex_fx = null;
-let g_tex_hud = null;
-
-// Cell indices into ATLAS_WORLD.
-let CELL_GRASS: i32 = 0;
-let CELL_DIRT: i32 = 1;
-let CELL_STONE: i32 = 2;
-let CELL_SNOW: i32 = 3;
-let CELL_BARK: i32 = 4;
-let CELL_PINE: i32 = 5;
-let CELL_WOOD: i32 = 6;
-let CELL_CONCRETE: i32 = 7;
-let CELL_METAL: i32 = 8;
-let CELL_PLASTER: i32 = 9;
-let CELL_ROOF: i32 = 10;
-let CELL_WINDOW: i32 = 11;
-let CELL_NSFLORA: i32 = 12;
-let CELL_GRANITE: i32 = 13;
-let CELL_GUNMETAL: i32 = 14;
-let CELL_MISSING: i32 = 15;      // magenta, impossible to miss in a screenshot
-
-// FX atlas cells (64x64, 4x4 of 16x16).
-let FX_GLOW: i32 = 0;
-let FX_SPARK: i32 = 1;
-let FX_STREAK: i32 = 2;
-let FX_MOTE: i32 = 3;
-
-// One tile: a 3-step value ramp of one family, structure at 4-10 texels,
-// Bayer at the ramp boundary, grain +/- 6 luminance. Never per-texel noise.
-fn tg_tile(p_cell: i32, p_lo: i32, p_mid: i32, p_hi: i32,
-           p_scale: f64, p_seed: i32, p_grain: i32) {
-    let a = g_atlas_world;
-    let cx: i32 = (p_cell % 4) * g_CELL;
-    let cy: i32 = divi(p_cell, 4) * g_CELL;
-    let lr: i32 = pal_r(p_lo);  let lg: i32 = pal_g(p_lo);  let lb: i32 = pal_b(p_lo);
-    let mr: i32 = pal_r(p_mid); let mg: i32 = pal_g(p_mid); let mb: i32 = pal_b(p_mid);
-    let hr: i32 = pal_r(p_hi);  let hg: i32 = pal_g(p_hi);  let hb: i32 = pal_b(p_hi);
-    for (let y = 0; y < g_CELL; y++) {
-        for (let x = 0; x < g_CELL; x++) {
-            // structure: two octaves, coarsest at ~8 texels
-            let n0: f64 = vnoise2(f64(x) * p_scale, f64(y) * p_scale, p_seed);
-            let n1: f64 = vnoise2(f64(x) * p_scale * 2.0, f64(y) * p_scale * 2.0, p_seed + 7);
-            let v: f64 = clamp01(n0 * 0.68 + n1 * 0.32);
-            let d: f64 = f64(g_bayer[(y % 4) * 4 + (x % 4)]) * 0.0625 - 0.5;
-            let vv: f64 = clamp01(v + d * 0.16);
-            let r: i32 = 0; let g: i32 = 0; let b: i32 = 0;
-            if (vv < 0.42) {
-                let t: f64 = vv * 2.380952;
-                r = i32(lerpf(f64(lr), f64(mr), t));
-                g = i32(lerpf(f64(lg), f64(mg), t));
-                b = i32(lerpf(f64(lb), f64(mb), t));
-            } else {
-                let t2: f64 = (vv - 0.42) * 1.724137;
-                if (t2 > 1.0) { t2 = 1.0; }
-                r = i32(lerpf(f64(mr), f64(hr), t2));
-                g = i32(lerpf(f64(mg), f64(hg), t2));
-                b = i32(lerpf(f64(mb), f64(hb), t2));
-            }
-            // grain: +/- p_grain luminance, never structure
-            let gq: i32 = i32(h2(x, y, p_seed + 991) * f64(p_grain * 2 + 1)) - p_grain;
-            r = clampi(r + gq, 0, 255);
-            g = clampi(g + gq, 0, 255);
-            b = clampi(b + gq, 0, 255);
-            atlas_px(a, cx + x, cy + y, r, g, b, 255);
-        }
-    }
-}
-
-// Horizontal plank / brick banding on top of a tile: 4-texel structure.
-fn tg_bands(p_cell: i32, p_period: i32, p_dark: i32) {
-    let a = g_atlas_world;
-    let cx: i32 = (p_cell % 4) * g_CELL;
-    let cy: i32 = divi(p_cell, 4) * g_CELL;
-    for (let y = 0; y < g_CELL; y++) {
-        if (y % p_period == 0) {
-            for (let x = 0; x < g_CELL; x++) {
-                let base: u32 = 0;
-                // read-modify-write through atlas_px only: darken the seam row
-                let px: i32 = cx + x;
-                let py: i32 = cy + y;
-                let p: ptr = atlas_base(a);
-                let o: i32 = (py * g_ATLAS_W + px) * 4;
-                let r: i32 = ptr_deref_u8(ptr_offset(p, o, 1));
-                let g: i32 = ptr_deref_u8(ptr_offset(p, o + 1, 1));
-                let b: i32 = ptr_deref_u8(ptr_offset(p, o + 2, 1));
-                atlas_px(a, px, py, clampi(r - p_dark, 0, 255),
-                         clampi(g - p_dark, 0, 255), clampi(b - p_dark, 0, 255), 255);
-            }
-        }
-    }
-}
-
-fn texgen_build_world_atlas() {
-    g_atlas_world = atlas_new(g_ATLAS_W, g_ATLAS_W, 4, 4);
-    atlas_fill(g_atlas_world, 0, 0, 0, 255);
-    tg_tile(CELL_GRASS,    g_GRASS_LO, g_GRASS_MID, g_GRASS_HI,   0.17, 11, 5);
-    tg_tile(CELL_DIRT,     g_DIRT_LO, g_DIRT_MID, g_DIRT_HI,      0.15, 23, 6);
-    tg_tile(CELL_STONE,    g_STONE_LO, g_STONE_MID, g_STONE_HI,   0.13, 31, 4);
-    tg_tile(CELL_SNOW,     g_SNOW_LO, g_SNOW_LO, g_SNOW_HI,       0.11, 41, 3);
-    tg_tile(CELL_BARK,     g_BARK_LO, g_BARK_LO, g_BARK_HI,       0.09, 53, 5);
-    tg_tile(CELL_PINE,     g_PINE_LO, g_PINE_LO, g_PINE_HI,       0.21, 61, 6);
-    tg_tile(CELL_WOOD,     g_WOOD_LO, g_WOOD_MID, g_WOOD_HI,      0.10, 71, 4);
-    tg_tile(CELL_CONCRETE, g_CONCRETE_LO, g_CONCRETE_MID, g_CONCRETE_HI, 0.12, 83, 4);
-    tg_tile(CELL_METAL,    g_STEEL_LO, g_STEEL_MID, g_RUST,       0.14, 97, 4);
-    tg_tile(CELL_PLASTER,  g_FABRIC_CREAM, g_FABRIC_CREAM, g_PAINT_OCHRE, 0.10, 103, 3);
-    tg_tile(CELL_ROOF,     g_ROOF_TILE, g_ROOF_TILE, g_PAINT_OCHRE, 0.16, 109, 5);
-    tg_tile(CELL_WINDOW,   g_WINDOW_WARM, g_WINDOW_WARM, g_MUZZLE_CORE, 0.08, 113, 2);
-    tg_tile(CELL_NSFLORA,  g_NS_FLORA, g_NS_MID, g_NS_CORE,       0.19, 127, 5);
-    tg_tile(CELL_GRANITE,  g_GRANITE_LO, g_GRANITE_LO, g_GRANITE_HI, 0.13, 131, 4);
-    tg_tile(CELL_GUNMETAL, g_GUNMETAL_LO, g_GUNMETAL_LO, g_GUNMETAL_HI, 0.10, 137, 3);
-    // The missing-texture tile ships MAGENTA on purpose (CLAUDE.md §9 rule 7).
-    tg_tile(CELL_MISSING,  pal(255, 0, 255), pal(255, 0, 255), pal(190, 0, 190), 0.25, 149, 0);
-    tg_bands(CELL_WOOD, 8, 26);
-    tg_bands(CELL_ROOF, 6, 22);
-    tg_bands(CELL_CONCRETE, 16, 14);
-    tg_bands(CELL_PLASTER, 32, 0);
-}
-
-// One additive sprite: radial falloff to alpha 0, colour constant. Additive
-// content is authored bright and small; the alpha ramp is the shape.
-fn fx_sprite(p_cell: i32, p_c: i32, p_pow: f64, p_streak: i32) {
-    let a = g_atlas_fx;
-    let n: i32 = 16;
-    let cx: i32 = (p_cell % 4) * n;
-    let cy: i32 = divi(p_cell, 4) * n;
-    let r: i32 = pal_r(p_c); let g: i32 = pal_g(p_c); let b: i32 = pal_b(p_c);
-    for (let y = 0; y < n; y++) {
-        for (let x = 0; x < n; x++) {
-            let dx: f64 = (f64(x) + 0.5) / f64(n) * 2.0 - 1.0;
-            let dy: f64 = (f64(y) + 0.5) / f64(n) * 2.0 - 1.0;
-            if (p_streak != 0) { dx = dx * 3.2; }
-            let d: f64 = sqrt(dx * dx + dy * dy);
-            let f: f64 = clamp01(1.0 - d);
-            let al: f64 = f;
-            let k: f64 = p_pow;
-            while (k > 1.0) { al = al * f; k = k - 1.0; }
-            // Bayer the alpha ramp too: no banding in a 16 px sprite.
-            let dd: f64 = f64(g_bayer[(y % 4) * 4 + (x % 4)]) * 0.0625 - 0.5;
-            let av: i32 = clampi(i32(al * 255.0 + dd * 10.0), 0, 255);
-            atlas_px(a, cx + x, cy + y, r, g, b, av);
-        }
-    }
-}
-
-fn fxgen_build_atlas() {
-    g_atlas_fx = atlas_new(64, 64, 4, 4);
-    atlas_fill(g_atlas_fx, 0, 0, 0, 0);
-    fx_sprite(FX_GLOW, g_MUZZLE_CORE, 2.0, 0);
-    fx_sprite(FX_SPARK, g_MUZZLE_MID, 4.0, 0);
-    fx_sprite(FX_STREAK, g_UI_WHITE, 2.0, 1);
-    fx_sprite(FX_MOTE, g_NS_HALO, 3.0, 0);
-}
-
-// --- FONT_MICRO 4x6 (-> src/art/hudgen.hml, W2-7) -------------------------
-// 3x5 pixel glyphs inside a 4x6 cell, hand-built bitfields. Never scaled,
-// never filtered (CLAUDE.md §9 rule 8).
-fn g5(p_cp: i32, p_a: i32, p_b: i32, p_c: i32, p_d: i32, p_e: i32) {
-    font_add_glyph(g_font, p_cp, [p_a * 2, p_b * 2, p_c * 2, p_d * 2, p_e * 2, 0]);
-}
-
-fn hudgen_build_font() {
-    g_font = font_new(4, 6, 4, 7, 64);
-    g5(32, 0,0,0,0,0);          // space
-    g5(48, 7,5,5,5,7);          // 0
-    g5(49, 2,6,2,2,7);
-    g5(50, 7,1,7,4,7);
-    g5(51, 7,1,7,1,7);
-    g5(52, 5,5,7,1,1);
-    g5(53, 7,4,7,1,7);
-    g5(54, 7,4,7,5,7);
-    g5(55, 7,1,1,1,1);
-    g5(56, 7,5,7,5,7);
-    g5(57, 7,5,7,1,7);          // 9
-    g5(65, 7,5,7,5,5);          // A
-    g5(66, 6,5,6,5,6);
-    g5(67, 7,4,4,4,7);
-    g5(68, 6,5,5,5,6);
-    g5(69, 7,4,7,4,7);
-    g5(70, 7,4,7,4,4);
-    g5(71, 7,4,5,5,7);
-    g5(72, 5,5,7,5,5);
-    g5(73, 7,2,2,2,7);
-    g5(74, 1,1,1,5,7);
-    g5(75, 5,5,6,5,5);
-    g5(76, 4,4,4,4,7);
-    g5(77, 5,7,7,5,5);
-    g5(78, 5,7,7,7,5);
-    g5(79, 7,5,5,5,7);
-    g5(80, 7,5,7,4,4);
-    g5(81, 7,5,5,7,3);
-    g5(82, 7,5,7,6,5);
-    g5(83, 7,4,7,1,7);
-    g5(84, 7,2,2,2,2);
-    g5(85, 5,5,5,5,7);
-    g5(86, 5,5,5,5,2);
-    g5(87, 5,5,7,7,5);
-    g5(88, 5,5,2,5,5);
-    g5(89, 5,5,2,2,2);
-    g5(90, 7,1,2,4,7);          // Z
-    g5(46, 0,0,0,0,2);          // .
-    g5(58, 0,2,0,2,0);          // :
-    g5(47, 1,1,2,4,4);          // /
-    g5(45, 0,0,7,0,0);          // -
-    g5(37, 5,1,2,4,5);          // %
-    g5(43, 0,2,7,2,0);          // +
-}
-
-let g_uv_white: array<f64> = [0.0, 0.0, 0.0, 0.0];
-
-fn hudgen_build_atlas() {
-    g_atlas_hud = atlas_new(128, 128, 8, 8);
-    atlas_fill(g_atlas_hud, 0, 0, 0, 0);
-    // a 4x4 opaque white block at (0,0): the one texel every flat HUD rect and
-    // the vignette ring samples, so the whole layer is one texture run.
-    for (let y = 0; y < 4; y++) {
-        for (let x = 0; x < 4; x++) { atlas_px(g_atlas_hud, x, y, 255, 255, 255, 255); }
-    }
-    atlas_rect_uv(g_atlas_hud, 1, 1, 2, 2, g_uv_white, 0);
-    hudgen_build_font();
-    font_bake(g_font, atlas_base(g_atlas_hud), 128, 128, 0, 8, 16, 255, 255, 255, 255);
-}
-
-// --- meshgen (-> src/art/meshgen.hml, W2-8) -------------------------------
-// Every mesh is authored at full-sun-noon ALBEDO. mesh_bake_light folds the
-// lighting model into vertex colour once per scene, so at emit time a static
-// prop costs zero normal transforms (G19).
-let KIND_TREE: i32 = 0;
-let KIND_ROCK: i32 = 1;
-let KIND_CRATE: i32 = 2;
-let KIND_BUILDING: i32 = 3;
-let KIND_ENEMY: i32 = 4;
-let KIND_FLORA: i32 = 5;
-let KIND_MONOLITH: i32 = 6;
-let KIND_MAST: i32 = 7;
-let KIND_COUNT: i32 = 8;
-
-let g_meshes: array = [];
-
-// UV rect of a cell, reused by every builder.
-let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
-
-fn cell_uv(p_cell: i32) {
-    atlas_cell_uv(g_atlas_world, p_cell, g_uvq, 0);
-}
-
-// Axis-aligned box, 12 triangles, one cell. `p_ao_bottom` darkens the base so
-// the prop is grounded even before its contact blob lands.
-fn mg_box(p_m, p_cell: i32,
-          p_x0: f64, p_y0: f64, p_z0: f64,
-          p_x1: f64, p_y1: f64, p_z1: f64,
-          p_c_top: i32, p_c_side: i32, p_ao_bottom: f64) {
-    cell_uv(p_cell);
-    let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
-    let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
-    let tr: i32 = pal_r(p_c_top);  let tg: i32 = pal_g(p_c_top);  let tb: i32 = pal_b(p_c_top);
-    let sr: i32 = pal_r(p_c_side); let sg: i32 = pal_g(p_c_side); let sb: i32 = pal_b(p_c_side);
-    let x0: f64 = p_x0; let y0: f64 = p_y0; let z0: f64 = p_z0;
-    let x1: f64 = p_x1; let y1: f64 = p_y1; let z1: f64 = p_z1;
-    // top
-    let a = mesh_vert_n(p_m, x0, y1, z0, u0, v0, tr, tg, tb, 0.0, 1.0, 0.0);
-    let b = mesh_vert_n(p_m, x1, y1, z0, u1, v0, tr, tg, tb, 0.0, 1.0, 0.0);
-    let c = mesh_vert_n(p_m, x1, y1, z1, u1, v1, tr, tg, tb, 0.0, 1.0, 0.0);
-    let d = mesh_vert_n(p_m, x0, y1, z1, u0, v1, tr, tg, tb, 0.0, 1.0, 0.0);
-    mesh_quad(p_m, a, b, c, d);
-    // four sides, each with its own outward normal and AO gradient
-    let f0 = mesh_vert_n(p_m, x0, y1, z1, u0, v0, sr, sg, sb, 0.0, 0.0, 1.0);
-    let f1 = mesh_vert_n(p_m, x1, y1, z1, u1, v0, sr, sg, sb, 0.0, 0.0, 1.0);
-    let f2 = mesh_vert_n(p_m, x1, y0, z1, u1, v1, sr, sg, sb, 0.0, 0.0, 1.0);
-    let f3 = mesh_vert_n(p_m, x0, y0, z1, u0, v1, sr, sg, sb, 0.0, 0.0, 1.0);
-    mesh_vert_ao(p_m, f2, p_ao_bottom); mesh_vert_ao(p_m, f3, p_ao_bottom);
-    mesh_quad(p_m, f0, f1, f2, f3);
-    let k0 = mesh_vert_n(p_m, x1, y1, z0, u0, v0, sr, sg, sb, 0.0, 0.0, -1.0);
-    let k1 = mesh_vert_n(p_m, x0, y1, z0, u1, v0, sr, sg, sb, 0.0, 0.0, -1.0);
-    let k2 = mesh_vert_n(p_m, x0, y0, z0, u1, v1, sr, sg, sb, 0.0, 0.0, -1.0);
-    let k3 = mesh_vert_n(p_m, x1, y0, z0, u0, v1, sr, sg, sb, 0.0, 0.0, -1.0);
-    mesh_vert_ao(p_m, k2, p_ao_bottom); mesh_vert_ao(p_m, k3, p_ao_bottom);
-    mesh_quad(p_m, k0, k1, k2, k3);
-    let l0 = mesh_vert_n(p_m, x0, y1, z0, u0, v0, sr, sg, sb, -1.0, 0.0, 0.0);
-    let l1 = mesh_vert_n(p_m, x0, y1, z1, u1, v0, sr, sg, sb, -1.0, 0.0, 0.0);
-    let l2 = mesh_vert_n(p_m, x0, y0, z1, u1, v1, sr, sg, sb, -1.0, 0.0, 0.0);
-    let l3 = mesh_vert_n(p_m, x0, y0, z0, u0, v1, sr, sg, sb, -1.0, 0.0, 0.0);
-    mesh_vert_ao(p_m, l2, p_ao_bottom); mesh_vert_ao(p_m, l3, p_ao_bottom);
-    mesh_quad(p_m, l0, l1, l2, l3);
-    let r0 = mesh_vert_n(p_m, x1, y1, z1, u0, v0, sr, sg, sb, 1.0, 0.0, 0.0);
-    let r1 = mesh_vert_n(p_m, x1, y1, z0, u1, v0, sr, sg, sb, 1.0, 0.0, 0.0);
-    let r2 = mesh_vert_n(p_m, x1, y0, z0, u1, v1, sr, sg, sb, 1.0, 0.0, 0.0);
-    let r3 = mesh_vert_n(p_m, x1, y0, z1, u0, v1, sr, sg, sb, 1.0, 0.0, 0.0);
-    mesh_vert_ao(p_m, r2, p_ao_bottom); mesh_vert_ao(p_m, r3, p_ao_bottom);
-    mesh_quad(p_m, r0, r1, r2, r3);
-}
-
-// A tapered n-gon skirt: the conifer tier, the rock, the roof.
-fn mg_taper(p_m, p_cell: i32, p_segs: i32,
-            p_y0: f64, p_y1: f64, p_r0: f64, p_r1: f64,
-            p_c_lo: i32, p_c_hi: i32, p_yaw: f64) {
-    cell_uv(p_cell);
-    let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
-    let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
-    let lr: i32 = pal_r(p_c_lo); let lg: i32 = pal_g(p_c_lo); let lb: i32 = pal_b(p_c_lo);
-    let hr: i32 = pal_r(p_c_hi); let hg: i32 = pal_g(p_c_hi); let hb: i32 = pal_b(p_c_hi);
-    let segs: i32 = p_segs;
-    let step: f64 = 6.283185307179586 / f64(segs);
-    for (let i = 0; i < segs; i++) {
-        let a0: f64 = p_yaw + f64(i) * step;
-        let a1: f64 = p_yaw + f64(i + 1) * step;
-        let c0: f64 = cos(a0); let s0: f64 = sin(a0);
-        let c1: f64 = cos(a1); let s1: f64 = sin(a1);
-        let nx: f64 = cos(a0 + step * 0.5);
-        let nz: f64 = sin(a0 + step * 0.5);
-        let ny: f64 = (p_r0 - p_r1) * 0.7;
-        let t0 = mesh_vert_n(p_m, c0 * p_r1, p_y1, s0 * p_r1, u0, v0, hr, hg, hb, nx, ny, nz);
-        let t1 = mesh_vert_n(p_m, c1 * p_r1, p_y1, s1 * p_r1, u1, v0, hr, hg, hb, nx, ny, nz);
-        let b1 = mesh_vert_n(p_m, c1 * p_r0, p_y0, s1 * p_r0, u1, v1, lr, lg, lb, nx, ny, nz);
-        let b0 = mesh_vert_n(p_m, c0 * p_r0, p_y0, s0 * p_r0, u0, v1, lr, lg, lb, nx, ny, nz);
-        mesh_vert_ao(p_m, b0, 0.72); mesh_vert_ao(p_m, b1, 0.72);
-        mesh_quad(p_m, t0, t1, b1, b0);
-    }
-}
-
-fn meshgen_build_all() {
-    // 0 — conifer, three tiers over a trunk. LOD0.
-    let tree = mesh_new(200);
-    mesh_begin(tree);
-    mg_box(tree, CELL_BARK, -0.14, 0.0, -0.14, 0.14, 2.1, 0.14, g_BARK_HI, g_BARK_LO, 0.45);
-    mg_taper(tree, CELL_PINE, 6, 1.7, 3.1, 1.55, 0.55, g_PINE_LO, g_PINE_HI, 0.0);
-    mg_taper(tree, CELL_PINE, 6, 3.0, 4.3, 1.15, 0.35, g_PINE_LO, g_PINE_HI, 0.5);
-    mg_taper(tree, CELL_PINE, 6, 4.2, 5.4, 0.75, 0.05, g_PINE_LO, g_PINE_HI, 1.0);
-    mesh_end(tree);
-    g_meshes.push(tree);
-
-    // 1 — rock, one squashed 7-gon. Asymmetric on purpose.
-    let rock = mesh_new(60);
-    mesh_begin(rock);
-    mg_taper(rock, CELL_STONE, 7, 0.0, 0.62, 0.85, 0.42, g_STONE_LO, g_STONE_HI, 0.3);
-    mg_taper(rock, CELL_STONE, 7, 0.60, 0.80, 0.44, 0.10, g_STONE_LO, g_STONE_HI, 0.3);
-    mesh_end(rock);
-    g_meshes.push(rock);
-
-    // 2 — crate
-    let crate = mesh_new(30);
-    mesh_begin(crate);
-    mg_box(crate, CELL_WOOD, -0.42, 0.0, -0.42, 0.42, 0.84, 0.42, g_WOOD_HI, g_WOOD_MID, 0.55);
-    mesh_end(crate);
-    g_meshes.push(crate);
-
-    // 3 — hub building: plaster block, tile roof, two warm windows
-    let bld = mesh_new(120);
-    mesh_begin(bld);
-    mg_box(bld, CELL_PLASTER, -2.2, 0.0, -1.8, 2.2, 2.6, 1.8, g_FABRIC_CREAM, g_FABRIC_CREAM, 0.62);
-    mg_taper(bld, CELL_ROOF, 4, 2.5, 3.7, 3.1, 0.5, g_ROOF_TILE, g_PAINT_OCHRE, 0.785398);
-    mg_box(bld, CELL_WINDOW, -1.3, 1.0, -1.86, -0.5, 1.8, -1.82, g_WINDOW_WARM, g_WINDOW_WARM, 1.0);
-    mg_box(bld, CELL_WINDOW, 0.5, 1.0, -1.86, 1.3, 1.8, -1.82, g_WINDOW_WARM, g_WINDOW_WARM, 1.0);
-    mg_box(bld, CELL_PLASTER, -2.24, 0.0, -1.84, -1.9, 2.6, -1.8, g_PAINT_TEAL, g_PAINT_TEAL, 0.7);
-    mesh_end(bld);
-    g_meshes.push(bld);
-
-    // 4 — enemy husk: torso, asymmetric shoulder, small head, two eye plates.
-    // CLAUDE.md §9 rule 10: one asymmetric feature, a distinct head ratio.
-    let en = mesh_new(120);
-    mesh_begin(en);
-    mg_box(en, CELL_GRANITE, -0.28, 0.0, -0.18, 0.28, 1.32, 0.18, g_GRANITE_HI, g_GRANITE_LO, 0.5);
-    mg_box(en, CELL_GRANITE, 0.24, 0.92, -0.22, 0.52, 1.44, 0.22, g_GRANITE_HI, g_GRANITE_LO, 0.8);
-    mg_box(en, CELL_GRANITE, -0.15, 1.30, -0.14, 0.15, 1.62, 0.14, g_GRANITE_HI, g_GRANITE_LO, 0.9);
-    mg_box(en, CELL_NSFLORA, -0.12, 1.44, -0.16, -0.03, 1.52, -0.14, g_NS_CORE, g_NS_CORE, 1.0);
-    mg_box(en, CELL_NSFLORA, 0.03, 1.44, -0.16, 0.12, 1.52, -0.14, g_NS_CORE, g_NS_CORE, 1.0);
-    mesh_end(en);
-    g_meshes.push(en);
-
-    // 5 — nightshade flora: 6 triangles of blade geometry
-    let fl = mesh_new(24);
-    mesh_begin(fl);
-    mg_taper(fl, CELL_NSFLORA, 3, 0.0, 0.55, 0.16, 0.03, g_NS_FLORA, g_NS_MID, 0.0);
-    mesh_end(fl);
-    g_meshes.push(fl);
-
-    // 6 — monolith: the only vertical element in ns_bloom
-    let mono = mesh_new(40);
-    mesh_begin(mono);
-    mg_box(mono, CELL_GRANITE, -0.9, 0.0, -0.9, 0.9, 12.0, 0.9, g_GRANITE_LO, g_GRANITE_LO, 0.35);
-    mg_box(mono, CELL_NSFLORA, -0.92, 2.0, -0.06, 0.92, 2.12, 0.06, g_NS_CORE, g_NS_CORE, 1.0);
-    mesh_end(mono);
-    g_meshes.push(mono);
-
-    // 7 — radio mast: a thin dark line against the sun at 55 m
-    let mast = mesh_new(60);
-    mesh_begin(mast);
-    mg_box(mast, CELL_GUNMETAL, -0.16, 0.0, -0.16, 0.16, 14.0, 0.16, g_GUNMETAL_HI, g_GUNMETAL_LO, 0.4);
-    mg_box(mast, CELL_GUNMETAL, -1.1, 9.4, -0.08, 1.1, 9.6, 0.08, g_GUNMETAL_HI, g_GUNMETAL_LO, 0.6);
-    mesh_end(mast);
-    g_meshes.push(mast);
-}
-
 // ===========================================================================
-// ###################  WAVE-2 STAND-IN CONTENT — END  #######################
-// ===========================================================================
-
-// ===========================================================================
-// 3. THE SCENE REGISTRY
+// 4. TIME OF DAY — driven, never reimplemented
 // ---------------------------------------------------------------------------
-// Every scene is a reproducible camera + world + ToD setup. The five ART_BIBLE
-// §12 money shots, plus hud_worst_case and budget_worst (ARCHITECTURE §7).
-// Parallel arrays, stride SC_N. `--scene list` prints this table.
+// tod.hml is authored on the D6 16-minute day: its clock is a DAY FRACTION in
+// [0,1), not an hour. The scene table stays in hours because an hour is what
+// ART_BIBLE §12 and a human argue in, so the harness inverts tod_clock_hours()
+// by bisection. tod_clock_hours is piecewise-linear and strictly increasing
+// from 5.5 h at t = 0 to 29.5 h at t = 1, so 44 halvings are exact to ~1e-13
+// of a day — well under one tick.
 // ===========================================================================
 
-let SC_CAMX: i32 = 0;  let SC_CAMY: i32 = 1;  let SC_CAMZ: i32 = 2;
-let SC_YAW: i32 = 3;   let SC_PITCH: i32 = 4;
-let SC_TOD: i32 = 5;   let SC_WX: i32 = 6;    let SC_SEED: i32 = 7;
-let SC_FOGFAR: i32 = 8; let SC_MIST: i32 = 9; let SC_FOV: i32 = 10;
-let SC_NTREE: i32 = 11; let SC_NROCK: i32 = 12; let SC_NPROP: i32 = 13;
-let SC_NENEMY: i32 = 14; let SC_NFLORA: i32 = 15; let SC_NPART: i32 = 16;
-let SC_FLAGS: i32 = 17; let SC_RIDGE: i32 = 18; let SC_GROUND: i32 = 19;
-let SC_N: i32 = 20;
-
-let F_MUZZLE: i32 = 1;
-let F_LIGHTNING: i32 = 2;
-let F_HUD: i32 = 4;
-let F_MONOLITH: i32 = 8;
-let F_SNOW: i32 = 16;
-let F_MAST: i32 = 32;
-let F_RAIN: i32 = 64;
-let F_VIEWMODEL: i32 = 128;
-
-let g_sc_id: array = [];
-let g_sc_desc: array = [];
-let g_sc: array<f64> = [];
-
-fn scene_add(p_id: string, p_desc: string,
-             p_x: f64, p_y: f64, p_z: f64, p_yaw: f64, p_pitch: f64,
-             p_tod: f64, p_wx: i32, p_seed: i32,
-             p_fogfar: f64, p_mist: f64, p_fov: f64,
-             p_ntree: i32, p_nrock: i32, p_nprop: i32,
-             p_nenemy: i32, p_nflora: i32, p_npart: i32,
-             p_flags: i32, p_ridge: f64) {
-    g_sc_id.push(p_id);
-    g_sc_desc.push(p_desc);
-    g_sc.push(p_x); g_sc.push(p_y); g_sc.push(p_z);
-    g_sc.push(p_yaw); g_sc.push(p_pitch);
-    g_sc.push(p_tod); g_sc.push(f64(p_wx)); g_sc.push(f64(p_seed));
-    g_sc.push(p_fogfar); g_sc.push(p_mist); g_sc.push(p_fov);
-    g_sc.push(f64(p_ntree)); g_sc.push(f64(p_nrock)); g_sc.push(f64(p_nprop));
-    g_sc.push(f64(p_nenemy)); g_sc.push(f64(p_nflora)); g_sc.push(f64(p_npart));
-    g_sc.push(f64(p_flags)); g_sc.push(p_ridge); g_sc.push(0.0);
+fn hours_unwrapped(p_t: f64): f64 {
+    let h: f64 = tod_clock_hours(p_t);
+    if (h < 5.5) { h = h + 24.0; }
+    let out: f64 = h;
+    return out;
 }
 
-fn scenes_build() {
-    //          id              description
-    //          cam x     y     z      yaw    pitch  tod   wx          seed
-    //          fogfar mist  fov    tree rock prop enemy flora part  flags                     ridge
-    scene_add("ridge_golden", "ART_BIBLE 12.1 — the ridge at golden hour",
-              0.0, 0.0, 6.0, 307.0, -6.0, 18.25, WX_CLEAR, 1337,
-              64.0, 0.55, 70.0, 26, 7, 2, 0, 0, 20,
-              F_HUD + F_MAST + F_VIEWMODEL, 1.0);
-    scene_add("muzzle_fog", "ART_BIBLE 12.2 — muzzle flash in the fog",
-              0.0, 0.0, 0.0, 18.0, -3.0, 22.0, WX_CLEAR, 4242,
-              26.0, 0.70, 70.0, 22, 5, 1, 3, 0, 26,
-              F_HUD + F_MUZZLE + F_VIEWMODEL, 0.0);
-    scene_add("hub_dawn", "ART_BIBLE 12.3 — the hub at dawn",
-              2.0, 0.0, 14.0, 186.0, -4.0, 5.5, WX_CLEAR, 77,
-              52.0, 0.55, 70.0, 6, 4, 11, 0, 0, 14,
-              F_HUD + F_VIEWMODEL, 0.0);
-    scene_add("ns_bloom", "ART_BIBLE 12.4 — nightshade bloom",
-              0.0, 0.0, 17.0, 180.0, -5.0, 22.0, WX_BLOOM, 909,
-              30.0, 0.45, 70.0, 5, 6, 0, 2, 46, 40,
-              F_HUD + F_MONOLITH + F_VIEWMODEL, 0.0);
-    scene_add("storm_assault", "ART_BIBLE 12.5 — storm assault, lightning frame",
-              0.0, 0.0, 4.0, 200.0, -2.0, 15.0, WX_STORM, 555,
-              20.0, 0.30, 70.0, 8, 6, 9, 5, 0, 40,
-              F_HUD + F_LIGHTNING + F_RAIN + F_VIEWMODEL, 0.0);
-    scene_add("hud_worst_case", "the HUD over noon sky, snow, a muzzle flash and CONCRETE_HI",
-              0.0, 0.0, 3.0, 200.0, 2.0, 12.0, WX_CLEAR, 2024,
-              72.0, 0.0, 70.0, 4, 3, 12, 2, 0, 18,
-              F_HUD + F_MUZZLE + F_SNOW + F_VIEWMODEL, 0.0);
-    scene_add("budget_worst", "the densest legal frame: FOG_FAR 72, every prop class",
-              0.0, 0.0, 0.0, 214.0, -4.0, 12.0, WX_CLEAR, 31337,
-              72.0, 0.10, 78.0, 46, 22, 16, 6, 30, 60,
-              F_HUD + F_MUZZLE + F_MAST + F_VIEWMODEL, 0.4);
-    scene_add("flat_debug", "a flat lit grid — the reference frame for regression diffs",
-              0.0, 0.0, 0.0, 180.0, -8.0, 12.0, WX_CLEAR, 1,
-              48.0, 0.0, 70.0, 3, 2, 2, 1, 0, 0,
-              F_HUD, 0.0);
-}
-scenes_build();
-
-fn scene_index(p_id: string): i32 {
-    let n: i32 = g_sc_id.length;
-    for (let i = 0; i < n; i++) {
-        if (g_sc_id[i] == p_id) { let out: i32 = i; return out; }
+fn tod_t_from_hours(p_hours: f64): f64 {
+    let want: f64 = p_hours;
+    while (want < 0.0) { want = want + 24.0; }
+    while (want >= 24.0) { want = want - 24.0; }
+    if (want < 5.5) { want = want + 24.0; }
+    let lo: f64 = 0.0;
+    let hi: f64 = 1.0;
+    for (let i = 0; i < 44; i++) {
+        let mid: f64 = (lo + hi) * 0.5;
+        if (hours_unwrapped(mid) < want) { lo = mid; } else { hi = mid; }
     }
-    let miss: i32 = -1;
-    return miss;
+    let out: f64 = (lo + hi) * 0.5;
+    return out;
 }
 
-fn scene_count(): i32 { let out: i32 = g_sc_id.length; return out; }
-fn scene_f(p_i: i32, p_field: i32): f64 { let out: f64 = g_sc[p_i * SC_N + p_field]; return out; }
-fn scene_set(p_i: i32, p_field: i32, p_v: f64) { g_sc[p_i * SC_N + p_field] = p_v; }
+// Evaluate the scene's atmosphere into the engine RenderEnv. Idempotent by
+// construction: tod_reset() clears the weather crossfade and the lightning
+// cursor first, so calling this twice with the same scene produces exactly the
+// same env — which is what makes two renders byte-identical.
+fn tod_apply(p_si: i32) {
+    let si: i32 = p_si;
+    let wx: i32 = i32(scene_f(si, SC_WX));
+    tod_reset();
+    tod_set_weather(wx);
+    // §6.4: the mist band is an absolute world-Y band pinned just below the
+    // camera's own ground, so valleys fill and hilltops stand clear. Handing
+    // tod.hml the terrain height per vertex would put every ground vertex at
+    // the top of the band and drown the world.
+    tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
+    if ((i32(scene_f(si, SC_FLAGS)) & F_LIGHTNING) != 0) { tod_lightning_fire(); }
+    tod_eval(g_env, tod_t_from_hours(scene_f(si, SC_TOD)), wx);
+    env_set_camera(g_env, g_camx, g_camy, g_camz);
+
+    // Scene overrides, applied through the engine's own env setters. The cap
+    // is core/config.hml's, never a second copy of the number.
+    let fnear: f64 = env_field(g_env, ENV_FOG_NEAR);
+    let ffar: f64 = env_field(g_env, ENV_FOG_FAR);
+    let ovr: f64 = scene_f(si, SC_FOGFAR);
+    if (ovr > 0.0) { ffar = ovr; }
+    if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
+    env_set_fog(g_env, fnear, ffar,
+                env_field(g_env, ENV_FOG_R), env_field(g_env, ENV_FOG_G),
+                env_field(g_env, ENV_FOG_B), env_field(g_env, ENV_FOG_ALPHA_MAX));
+    let mist: f64 = scene_f(si, SC_MIST);
+    if (mist >= 0.0) {
+        env_set_mist(g_env, g_ground_y - 1.1 + g_MIST_HEIGHT + 2.0,
+                     g_ground_y - 1.1, mist);
+    }
+    g_fog_far = ffar;
+    g_fog_near = fnear;
+
+    // Hand skygen this frame's keyframe. tod owns the values, skygen owns the
+    // layout; this is the whole tod <-> skygen interface.
+    //
+    // ⚠ UNIT MISMATCH, REPORTED, BRIDGED HERE (see the task report):
+    // skygen.hml's key block is documented and written in 0..255 channels
+    // (`skygen_keys_default` stores `f64(pal_r(c))` raw), but tod.hml's
+    // `tod_kf_sky` divides its five sky/cloud rows by 255 at module load, so
+    // `tod_sky_keys` hands out 0..1. Passing them straight through bakes a
+    // BLACK panorama — which is exactly what the first render of this file
+    // produced. The harness does not own either module, so it scales here and
+    // says so. `src/render/world_render.hml` will hit the identical bug.
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    // The panorama is sampled with a negated azimuth (see sky_uv_at: SDL's
+    // software renderer will not draw a right-to-left uv span). Negating the
+    // x of the direction skygen bakes the sun and moon at applies the same
+    // mirror to the bodies, so both still land at their true azimuth.
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(g_env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(g_env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(g_env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    // §11: the corona is 34 px normally and 56 px at DAWN and GOLDEN, with a
+    // softer falloff. TODSKY_HALO is exactly that 0..1 dial.
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    // CLOUD_COVER arrives as 0.25 (clear) .. 1.0 (storm); skygen wants a bias
+    // subtracted from its 0.62/0.68 coverage thresholds.
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+}
 
 // ===========================================================================
-// 4. THE WORLD — deterministic, seeded, rebuilt once per shot
+// 5. THE WORLD — deterministic, seeded, rebuilt once per shot
 // ===========================================================================
 
 let g_ground_seed: i32 = 1;
 let g_ridge: f64 = 0.0;
 let g_snow: i32 = 0;
+let g_fog_far: f64 = 72.0;
+let g_fog_near: f64 = 8.0;
 
 // Terrain height. ±1.5 m of undulation over 32 m destroys the ruler horizon
-// (CLAUDE.md §9 rule 5); the ridge term adds the 14 m spine ridge_golden needs.
+// (CLAUDE.md §9 rule 5); the ridge term adds the spine ridge_golden needs.
 fn terrain_h(p_x: f64, p_z: f64): f64 {
     let x: f64 = p_x; let z: f64 = p_z;
     let n0: f64 = vnoise2(x * 0.031, z * 0.031, g_ground_seed);
@@ -1006,8 +616,6 @@ fn terrain_h(p_x: f64, p_z: f64): f64 {
     let n2: f64 = vnoise2(x * 0.215, z * 0.215, g_ground_seed + 9);
     let h: f64 = (n0 - 0.5) * 5.2 + (n1 - 0.5) * 1.9 + (n2 - 0.5) * 0.55;
     if (g_ridge > 0.0) {
-        // A spine running north-south, west of the camera: the ridge to stand
-        // on and the valley beyond it to fill with mist.
         let d: f64 = (z + 26.0) * 0.09;
         let ridge: f64 = 13.0 / (1.0 + d * d);
         h = h + ridge * g_ridge;
@@ -1026,8 +634,19 @@ let g_ch_cy: array<f64> = [];
 let g_ch_cz: array<f64> = [];
 let g_ch_r: array<f64> = [];
 
-// Prop instances, SoA.
+// Prop instances, SoA. `kind` is a harness composition class; it resolves to a
+// REAL meshgen asset (with a real LOD) at emit time.
+let K_TREE: i32 = 0;
+let K_ROCK: i32 = 1;
+let K_CRATE: i32 = 2;
+let K_BARREL: i32 = 3;
+let K_LANTERN: i32 = 4;
+let K_BUSH: i32 = 5;
+let K_NPC: i32 = 6;
+let K_ENEMY: i32 = 7;
+
 let g_pr_kind: array<i32> = [];
+let g_pr_cls: array<i32> = [];
 let g_pr_x: array<f64> = [];
 let g_pr_y: array<f64> = [];
 let g_pr_z: array<f64> = [];
@@ -1038,7 +657,7 @@ let g_pr_tg: array<i32> = [];
 let g_pr_tb: array<i32> = [];
 let g_pr_shadow: array<f64> = [];
 
-// Particles (client-only FX), SoA: pos + size + cell + colour.
+// Particles (client-only FX), SoA: pos + size + fxgen cell + colour.
 let g_fx_x: array<f64> = [];
 let g_fx_y: array<f64> = [];
 let g_fx_z: array<f64> = [];
@@ -1052,22 +671,66 @@ let g_dep: array<f64> = [];      // depth scratch for the emit calls
 fn world_clear() {
     g_ch_mesh = []; g_ch_ox = []; g_ch_oz = [];
     g_ch_cx = []; g_ch_cy = []; g_ch_cz = []; g_ch_r = [];
-    g_pr_kind = []; g_pr_x = []; g_pr_y = []; g_pr_z = [];
+    g_pr_kind = []; g_pr_cls = []; g_pr_x = []; g_pr_y = []; g_pr_z = [];
     g_pr_yaw = []; g_pr_s = []; g_pr_tr = []; g_pr_tg = []; g_pr_tb = [];
     g_pr_shadow = [];
     g_fx_x = []; g_fx_y = []; g_fx_z = []; g_fx_s = [];
     g_fx_cell = []; g_fx_c = []; g_fx_a = [];
 }
 
-fn prop_add(p_kind: i32, p_x: f64, p_z: f64, p_yaw: f64, p_scale: f64, p_shadow: f64) {
+// LOD0 mesh of a composition class — the one used for culling radius.
+fn kind_mesh0(p_kind: i32, p_cls: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == K_TREE) { let o: i32 = MESH_TREE0; return o; }
+    if (k == K_ROCK) { let o: i32 = MESH_ROCK; return o; }
+    if (k == K_CRATE) { let o: i32 = MESH_CRATE; return o; }
+    if (k == K_BARREL) { let o: i32 = MESH_BARREL; return o; }
+    if (k == K_LANTERN) { let o: i32 = MESH_LANTERN; return o; }
+    if (k == K_BUSH) { let o: i32 = MESH_BUSH; return o; }
+    if (k == K_NPC) { let o: i32 = MESH_NPC; return o; }
+    let o2: i32 = meshgen_enemy_mesh(p_cls, 0);
+    return o2;
+}
+
+// The same class at the distance-appropriate LOD. Trees and enemies are the
+// only assets meshgen ships three of, and they are the only ones that matter:
+// 46 trees at LOD0 is 4416 triangles and 46 trees LODed is under 900.
+fn kind_mesh_lod(p_kind: i32, p_cls: i32, p_dist: f64): i32 {
+    let k: i32 = p_kind;
+    let d: f64 = p_dist;
+    if (k == K_TREE) {
+        // meshgen's own note on MESH_TREE2: "two crossed quads ... no texture
+        // detail survives at 45 m". It is an OPAQUE leaf card — the world atlas
+        // has no alpha — so it reads as a flat green rectangle anywhere the fog
+        // has not eaten it. LOD1 therefore holds until 46 m, which is where
+        // that comment says LOD2 belongs.
+        if (d < 18.0) { let o: i32 = MESH_TREE0; return o; }
+        if (d < 46.0) { let o: i32 = MESH_TREE1; return o; }
+        let o2: i32 = MESH_TREE2;
+        return o2;
+    }
+    if (k == K_ENEMY) {
+        let lod: i32 = 0;
+        if (d >= 18.0) { lod = 1; }
+        if (d >= 36.0) { lod = 2; }
+        let o: i32 = meshgen_enemy_mesh(p_cls, lod);
+        return o;
+    }
+    let o3: i32 = kind_mesh0(k, p_cls);
+    return o3;
+}
+
+fn prop_add(p_kind: i32, p_cls: i32, p_x: f64, p_z: f64,
+            p_yaw: f64, p_scale: f64, p_shadow: f64) {
     g_pr_kind.push(p_kind);
+    g_pr_cls.push(p_cls);
     g_pr_x.push(p_x);
     g_pr_y.push(terrain_h(p_x, p_z));
     g_pr_z.push(p_z);
     g_pr_yaw.push(p_yaw);
     g_pr_s.push(p_scale);
-    // Per-instance vertex-colour jitter, +/- 8 % (ARCHITECTURE §6). Twenty
-    // trees from one mesh and nobody notices.
+    // Per-instance vertex-colour jitter, +/- 8 % (config g_INST_TINT_JITTER).
+    // Twenty trees from one mesh and nobody notices.
     let j: f64 = rnd_range(0.92, 1.08);
     g_pr_tr.push(clampi(i32(255.0 * j), 0, 255));
     g_pr_tg.push(clampi(i32(255.0 * j), 0, 255));
@@ -1085,17 +748,71 @@ fn fx_add(p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_cell: i32, p_c: i32, p_a: i3
 // ---------------------------------------------------------------------------
 // A terrain quad that CONTAINS the camera straddles the near plane, and
 // nothing in this repo clips yet (`clip.hml`'s slow path takes a single scalar
-// light term per vertex and cannot carry the terrain's baked RGB — see the
-// task report). A dropped straddler leaves a hole at the bottom of the frame,
-// which is exactly where a first-person camera looks.
+// light term per vertex and cannot carry the terrain's baked RGB). A dropped
+// straddler leaves a hole at the bottom of the frame, which is exactly where a
+// first-person camera looks.
 //
 // The apron is a radial fan centred on the camera: every triangle lies wholly
-// inside one 15-degree sector, so no triangle in the view cone can span the
+// inside one 11-degree sector, so no triangle in the view cone can span the
 // w = 0 line and none of them straddle. It covers the coarse grid out to 8 m
 // and sorts in front of it. This is near-field LOD0, which a real renderer
 // wants anyway — it is not a workaround bolted on the side.
 let g_APRON_SEGS: i32 = 32;
 let g_apron_index: i32 = -1;
+
+fn ground_cell(p_x: f64, p_z: f64, p_slope: f64): i32 {
+    if (g_snow != 0) { let o: i32 = CELL_SNOW; return o; }
+    if (p_slope > 1.15) { let o: i32 = CELL_CLIFF; return o; }
+    if (p_slope > 0.72) { let o: i32 = CELL_DIRT; return o; }
+    // Only the two grass tiles alternate, and deliberately NOT CELL_GRASS_DRY.
+    // A per-quad tile swap is a per-quad VALUE swap when the two tiles differ
+    // in luminance, and 4 m value swaps are the cardboard patchwork of
+    // CLAUDE.md §9 rule 4 — `storm_assault` came back covered in them. GRASS_A
+    // and GRASS_B are the same value with different structure, so switching
+    // between them is invisible; the dry/lush variation is carried entirely by
+    // the continuous vertex colour in ground_vcol.
+    let v: f64 = vnoise2(p_x * 0.083, p_z * 0.083, g_ground_seed + 33);
+    if (v > 0.50) { let o: i32 = CELL_GRASS_B; return o; }
+    let o2: i32 = CELL_GRASS_A;
+    return o2;
+}
+
+// Ground vertex colour, CONTINUOUS in (x, z).
+//
+// ART_BIBLE / CLAUDE.md §9 rule 4: a hard material swap per 4 m quad reads as
+// cardboard patches. The first render of this file proved it — `storm_assault`
+// came back with 4 m yellow-green triangles all over the near ground, because
+// the vertex colour was taken from the QUAD's chosen tile. So the tile choice
+// stays per-quad (it is what gives the ground texture variety) and the colour
+// is a smooth field sampled per VERTEX: crossing a tile boundary changes the
+// pattern, never the value. Slope comes from the height-field gradient at the
+// vertex, not from the quad, for the same reason.
+fn ground_vcol(p_x: f64, p_z: f64): i32 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let gx: f64 = terrain_h(x - 1.0, z) - terrain_h(x + 1.0, z);
+    let gz: f64 = terrain_h(x, z - 1.0) - terrain_h(x, z + 1.0);
+    let slope: f64 = clamp01(sqrt(gx * gx + gz * gz) * 0.55);
+    let dry: f64 = clamp01((vnoise2(x * 0.083, z * 0.083, g_ground_seed + 33) - 0.40) * 2.2);
+    let lo: i32 = g_GRASS_MID;
+    let hi: i32 = g_GRASS_DRY;
+    if (g_snow != 0) { lo = g_SNOW_LO; hi = g_SNOW_HI; }
+    let r: f64 = lerpf(f64(pal_r(lo)), f64(pal_r(hi)), dry);
+    let g: f64 = lerpf(f64(pal_g(lo)), f64(pal_g(hi)), dry);
+    let b: f64 = lerpf(f64(pal_b(lo)), f64(pal_b(hi)), dry);
+    // Steep ground goes to bare earth continuously; snow stays snow.
+    if (g_snow == 0) {
+        r = lerpf(r, f64(pal_r(g_DIRT_MID)), slope);
+        g = lerpf(g, f64(pal_g(g_DIRT_MID)), slope);
+        b = lerpf(b, f64(pal_b(g_DIRT_MID)), slope);
+    }
+    // Low-frequency patchiness so the ground is never one flat value.
+    let p: f64 = 0.86 + 0.28 * vnoise2(x * 0.06, z * 0.06, g_ground_seed + 21);
+    let out: i32 = pal_pack(clampi(i32(r * p), 0, 255),
+                            clampi(i32(g * p), 0, 255),
+                            clampi(i32(b * p), 0, 255));
+    return out;
+}
 
 fn apron_build() {
     let rings: array<f64> = [0.30, 0.90, 1.80, 3.20, 5.20, 8.00];
@@ -1104,14 +821,6 @@ fn apron_build() {
     let m = mesh_new(segs * (nr - 1) * 2 + 8);
     mesh_begin(m);
     let step: f64 = 6.283185307179586 / f64(segs);
-    let cell: i32 = CELL_GRASS;
-    if (g_snow != 0) { cell = CELL_SNOW; }
-    cell_uv(cell);
-    let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
-    let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
-    let base: i32 = g_GRASS_MID;
-    if (g_snow != 0) { base = g_SNOW_HI; }
-    let br: i32 = pal_r(base); let bg: i32 = pal_g(base); let bb: i32 = pal_b(base);
     for (let r = 0; r < nr - 1; r++) {
         let r0: f64 = rings[r];
         let r1: f64 = rings[r + 1];
@@ -1122,29 +831,27 @@ fn apron_build() {
             let x10: f64 = g_camx + cos(a1) * r0; let z10: f64 = g_camz + sin(a1) * r0;
             let x11: f64 = g_camx + cos(a1) * r1; let z11: f64 = g_camz + sin(a1) * r1;
             let x01: f64 = g_camx + cos(a0) * r1; let z01: f64 = g_camz + sin(a0) * r1;
+            let cell: i32 = ground_cell(x00, z00, 0.0);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
             let lift: f64 = 0.012;
-            let p0: f64 = 0.86 + 0.28 * vnoise2(x00 * 0.06, z00 * 0.06, g_ground_seed + 21);
-            let p1: f64 = 0.86 + 0.28 * vnoise2(x11 * 0.06, z11 * 0.06, g_ground_seed + 21);
+            let c00: i32 = ground_vcol(x00, z00);
+            let c10: i32 = ground_vcol(x10, z10);
+            let c11: i32 = ground_vcol(x11, z11);
+            let c01: i32 = ground_vcol(x01, z01);
             let n0x: f64 = terrain_h(x00 - 1.0, z00) - terrain_h(x00 + 1.0, z00);
             let n0z: f64 = terrain_h(x00, z00 - 1.0) - terrain_h(x00, z00 + 1.0);
             let n1x: f64 = terrain_h(x11 - 1.0, z11) - terrain_h(x11 + 1.0, z11);
             let n1z: f64 = terrain_h(x11, z11 - 1.0) - terrain_h(x11, z11 + 1.0);
             let a = mesh_vert_n(m, x00, terrain_h(x00, z00) + lift, z00, u0, v0,
-                                clampi(i32(f64(br) * p0), 0, 255),
-                                clampi(i32(f64(bg) * p0), 0, 255),
-                                clampi(i32(f64(bb) * p0), 0, 255), n0x, 2.0, n0z);
+                                pal_r(c00), pal_g(c00), pal_b(c00), n0x, 2.0, n0z);
             let b = mesh_vert_n(m, x10, terrain_h(x10, z10) + lift, z10, u1, v0,
-                                clampi(i32(f64(br) * p0), 0, 255),
-                                clampi(i32(f64(bg) * p0), 0, 255),
-                                clampi(i32(f64(bb) * p0), 0, 255), n0x, 2.0, n0z);
+                                pal_r(c10), pal_g(c10), pal_b(c10), n0x, 2.0, n0z);
             let c = mesh_vert_n(m, x11, terrain_h(x11, z11) + lift, z11, u1, v1,
-                                clampi(i32(f64(br) * p1), 0, 255),
-                                clampi(i32(f64(bg) * p1), 0, 255),
-                                clampi(i32(f64(bb) * p1), 0, 255), n1x, 2.0, n1z);
+                                pal_r(c11), pal_g(c11), pal_b(c11), n1x, 2.0, n1z);
             let d = mesh_vert_n(m, x01, terrain_h(x01, z01) + lift, z01, u0, v1,
-                                clampi(i32(f64(br) * p1), 0, 255),
-                                clampi(i32(f64(bg) * p1), 0, 255),
-                                clampi(i32(f64(bb) * p1), 0, 255), n1x, 2.0, n1z);
+                                pal_r(c01), pal_g(c01), pal_b(c01), n1x, 2.0, n1z);
             // reversed relative to the grid quad: a radial cycle has the
             // opposite handedness in XZ to a rectangular one
             mesh_quad(m, a, d, c, b);
@@ -1168,8 +875,6 @@ fn chunk_build(p_cx: i32, p_cz: i32) {
     mesh_begin(m);
     let ox: f64 = f64(p_cx) * g_CHUNK_M;
     let oz: f64 = f64(p_cz) * g_CHUNK_M;
-    let cell_grass: i32 = CELL_GRASS;
-    if (g_snow != 0) { cell_grass = CELL_SNOW; }
     for (let j = 0; j < q; j++) {
         for (let i = 0; i < q; i++) {
             let x0: f64 = ox + f64(i) * g_QUAD_M;
@@ -1180,53 +885,33 @@ fn chunk_build(p_cx: i32, p_cz: i32) {
             let y10: f64 = terrain_h(x1, z0);
             let y11: f64 = terrain_h(x1, z1);
             let y01: f64 = terrain_h(x0, z1);
-            // Slope picks the material: steep faces are dirt/stone, not grass.
+            // Slope picks the material: steep faces are dirt/cliff, not grass.
             let dy: f64 = y10 - y00; if (dy < 0.0) { dy = 0.0 - dy; }
             let dz: f64 = y01 - y00; if (dz < 0.0) { dz = 0.0 - dz; }
             let slope: f64 = (dy + dz) / g_QUAD_M;
-            // A hard material swap per 4 m quad reads as a cardboard patch, so
-            // the swap threshold is high and most of the slope response is a
-            // vertex-colour shift instead.
-            let cell: i32 = cell_grass;
-            if (slope > 0.72) { cell = CELL_DIRT; }
-            if (slope > 1.15) { cell = CELL_STONE; }
-            cell_uv(cell);
+            let cell: i32 = ground_cell(x0, z0, slope);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
             let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
             let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
-            // Low-frequency patchiness, per vertex, so the ground is never
-            // cardboard (CLAUDE.md §9 rule 4).
-            let base: i32 = g_GRASS_MID;
-            if (cell == CELL_DIRT) { base = g_DIRT_MID; }
-            else if (cell == CELL_STONE) { base = g_STONE_MID; }
-            else if (g_snow != 0) { base = g_SNOW_HI; }
-            // slope shifts the vertex colour toward dirt continuously
-            let mix: f64 = clamp01(slope * 1.15);
-            let br: i32 = clampi(i32(lerpf(f64(pal_r(base)), f64(pal_r(g_DIRT_MID)), mix)), 0, 255);
-            let bg: i32 = clampi(i32(lerpf(f64(pal_g(base)), f64(pal_g(g_DIRT_MID)), mix)), 0, 255);
-            let bb: i32 = clampi(i32(lerpf(f64(pal_b(base)), f64(pal_b(g_DIRT_MID)), mix)), 0, 255);
+            // Vertex colour is a continuous field (see ground_vcol): the tile
+            // changes at quad borders, the value never does.
+            let k00: i32 = ground_vcol(x0, z0);
+            let k10: i32 = ground_vcol(x1, z0);
+            let k11: i32 = ground_vcol(x1, z1);
+            let k01: i32 = ground_vcol(x0, z1);
             // normals from the height field, per vertex
             let nx0: f64 = terrain_h(x0 - 1.0, z0) - terrain_h(x0 + 1.0, z0);
             let nz0: f64 = terrain_h(x0, z0 - 1.0) - terrain_h(x0, z0 + 1.0);
             let nx1: f64 = terrain_h(x1 - 1.0, z1) - terrain_h(x1 + 1.0, z1);
             let nz1: f64 = terrain_h(x1, z1 - 1.0) - terrain_h(x1, z1 + 1.0);
-            let p00: f64 = 0.86 + 0.28 * vnoise2(x0 * 0.06, z0 * 0.06, g_ground_seed + 21);
-            let p11: f64 = 0.86 + 0.28 * vnoise2(x1 * 0.06, z1 * 0.06, g_ground_seed + 21);
             let a = mesh_vert_n(m, x0 - ox, y00, z0 - oz, u0, v0,
-                                clampi(i32(f64(br) * p00), 0, 255),
-                                clampi(i32(f64(bg) * p00), 0, 255),
-                                clampi(i32(f64(bb) * p00), 0, 255), nx0, 2.0, nz0);
+                                pal_r(k00), pal_g(k00), pal_b(k00), nx0, 2.0, nz0);
             let b = mesh_vert_n(m, x1 - ox, y10, z0 - oz, u1, v0,
-                                clampi(i32(f64(br) * p11), 0, 255),
-                                clampi(i32(f64(bg) * p11), 0, 255),
-                                clampi(i32(f64(bb) * p11), 0, 255), nx1, 2.0, nz0);
+                                pal_r(k10), pal_g(k10), pal_b(k10), nx1, 2.0, nz0);
             let c = mesh_vert_n(m, x1 - ox, y11, z1 - oz, u1, v1,
-                                clampi(i32(f64(br) * p11), 0, 255),
-                                clampi(i32(f64(bg) * p11), 0, 255),
-                                clampi(i32(f64(bb) * p11), 0, 255), nx1, 2.0, nz1);
+                                pal_r(k11), pal_g(k11), pal_b(k11), nx1, 2.0, nz1);
             let d = mesh_vert_n(m, x0 - ox, y01, z1 - oz, u0, v1,
-                                clampi(i32(f64(br) * p00), 0, 255),
-                                clampi(i32(f64(bg) * p00), 0, 255),
-                                clampi(i32(f64(bb) * p00), 0, 255), nx0, 2.0, nz1);
+                                pal_r(k01), pal_g(k01), pal_b(k01), nx0, 2.0, nz1);
             mesh_quad(m, a, b, c, d);
         }
     }
@@ -1241,106 +926,24 @@ fn chunk_build(p_cx: i32, p_cz: i32) {
     g_ch_r.push(g_CHUNK_M * 0.78 + 9.0);
 }
 
-// Bake the lighting model into every mesh's vertex colour. Runs once per shot,
-// after tod_eval, so every prop answers to the scene's time of day. This is
-// G19: after this, a static prop performs zero normal transforms per frame.
+// Fold the lighting model into every vertex colour. Runs once per shot, after
+// tod_apply, so every prop answers to the scene's time of day. This is G19:
+// after this, a static prop performs zero normal transforms per frame.
+// meshgen owns the library's bake (and its ART_BIBLE 8.2.6 luminance floor);
+// the harness only bakes the terrain it built itself.
 fn bake_all(p_lx: f64, p_ly: f64, p_lz: f64) {
-    let sr: f64 = g_ev[TOD_SUNR]; let sg: f64 = g_ev[TOD_SUNG]; let sb: f64 = g_ev[TOD_SUNB];
-    let ar: f64 = g_ev[TOD_AMBR]; let ag: f64 = g_ev[TOD_AMBG]; let ab: f64 = g_ev[TOD_AMBB];
-    let br: f64 = g_ev[TOD_BNCR]; let bg: f64 = g_ev[TOD_BNCG]; let bb: f64 = g_ev[TOD_BNCB];
+    let sr: f64 = env_field(g_env, ENV_SUN_R); let sg: f64 = env_field(g_env, ENV_SUN_G);
+    let sb: f64 = env_field(g_env, ENV_SUN_B);
+    let ar: f64 = env_field(g_env, ENV_AMB_R); let ag: f64 = env_field(g_env, ENV_AMB_G);
+    let ab: f64 = env_field(g_env, ENV_AMB_B);
+    let br: f64 = env_field(g_env, ENV_BOUNCE_R); let bg: f64 = env_field(g_env, ENV_BOUNCE_G);
+    let bb: f64 = env_field(g_env, ENV_BOUNCE_B);
     let nc: i32 = g_ch_mesh.length;
     for (let i = 0; i < nc; i++) {
         mesh_bake_light(g_ch_mesh[i], p_lx, p_ly, p_lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
     }
-    let nm: i32 = g_meshes.length;
-    for (let k = 0; k < nm; k++) {
-        mesh_bake_light(g_meshes[k], p_lx, p_ly, p_lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
-    }
-}
-
-// ===========================================================================
-// 5. THE SKY PANORAMA  (TEX_SKY — the fourth and last SDL texture)
-// ---------------------------------------------------------------------------
-// STAND-IN for src/art/skygen.hml (W2-6): a dithered vertical gradient, two
-// cloud layers with a lit top and a shadowed bottom, and a fixed-seed star
-// field. Bayer on every gradient row — the sky is 40 % of every outdoor frame
-// and a banded sky is the loudest possible amateur tell (CLAUDE.md §9 rule 12).
-// Rebuilt once per shot because the ToD keyframe blend moved.
-// ===========================================================================
-
-let g_SKY_W: i32 = 128;
-let g_SKY_H: i32 = 128;
-let g_SKY_HORIZON_V: f64 = 0.78;
-let g_atlas_sky = null;
-let g_tex_sky = null;
-
-fn skygen_build() {
-    if (g_atlas_sky == null) { g_atlas_sky = atlas_new(g_SKY_W, g_SKY_H, 1, 1); }
-    let zr: f64 = g_ev[TOD_ZENR]; let zg: f64 = g_ev[TOD_ZENG]; let zb: f64 = g_ev[TOD_ZENB];
-    let mr: f64 = g_ev[TOD_MIDR]; let mg: f64 = g_ev[TOD_MIDG]; let mb: f64 = g_ev[TOD_MIDB];
-    let hr: f64 = g_ev[TOD_HORR]; let hg: f64 = g_ev[TOD_HORG]; let hb: f64 = g_ev[TOD_HORB];
-    let star: f64 = g_ev[TOD_STAR];
-    let hy: i32 = i32(f64(g_SKY_H) * g_SKY_HORIZON_V);
-    for (let y = 0; y < g_SKY_H; y++) {
-        let t: f64 = f64(y) / f64(hy);
-        let r: f64 = 0.0; let g: f64 = 0.0; let b: f64 = 0.0;
-        if (y <= hy) {
-            if (t < 0.55) {
-                let k: f64 = t / 0.55;
-                r = lerpf(zr, mr, k); g = lerpf(zg, mg, k); b = lerpf(zb, mb, k);
-            } else {
-                let k2: f64 = (t - 0.55) / 0.45;
-                r = lerpf(mr, hr, k2); g = lerpf(mg, hg, k2); b = lerpf(mb, hb, k2);
-            }
-        } else {
-            // Below the horizon: the fog target, darkening CONTINUOUSLY from
-            // the horizon band. It must start at exactly the horizon colour —
-            // a step here is the visible seam at the skyline that ART_BIBLE
-            // §6.6 calls the classic amateur tell.
-            let k3: f64 = f64(y - hy) / f64(g_SKY_H - hy);
-            let m3: f64 = 1.0 - 0.42 * k3;
-            r = hr * m3; g = hg * m3; b = hb * m3;
-        }
-        for (let x = 0; x < g_SKY_W; x++) {
-            let rr: f64 = r; let gg: f64 = g; let bb2: f64 = b;
-            if (y < hy) {
-                // two cloud layers, lit top / shadow bottom
-                let ch: f64 = f64(y) / f64(hy);
-                let c0: f64 = vnoise2(f64(x) * 0.075, f64(y) * 0.16, 5001);
-                let c1: f64 = vnoise2(f64(x) * 0.031, f64(y) * 0.075, 5003);
-                let cov: f64 = clamp01((c0 * 0.55 + c1 * 0.45 - 0.44) * 3.4)
-                             * clamp01((ch - 0.06) * 2.4) * clamp01((0.94 - ch) * 4.0);
-                if (cov > 0.02) {
-                    // lit top / shadowed bottom: the vertical gradient of the
-                    // noise field IS the light direction (ART_BIBLE §11).
-                    let lit: f64 = clamp01((vnoise2(f64(x) * 0.075, f64(y) * 0.16 - 0.55, 5001)
-                                            - c0) * 2.2 + 0.5);
-                    let cr: f64 = lerpf(g_ev[TOD_CSR], g_ev[TOD_CLR], lit);
-                    let cg: f64 = lerpf(g_ev[TOD_CSG], g_ev[TOD_CLG], lit);
-                    let cb: f64 = lerpf(g_ev[TOD_CSB], g_ev[TOD_CLB], lit);
-                    rr = lerpf(rr, cr, cov);
-                    gg = lerpf(gg, cg, cov);
-                    bb2 = lerpf(bb2, cb, cov);
-                }
-                if (star > 0.01) {
-                    let sv: f64 = h2(x, y, 7717);
-                    if (sv > 0.99905) {
-                        // STAR_BRIGHT / STAR_DIM, faded out toward the horizon
-                        let tier: f64 = h2(x, y, 7719);
-                        let fade: f64 = clamp01((0.80 - ch) * 1.6);
-                        let br2: f64 = star * fade * lerpf(52.0, 150.0, tier);
-                        rr = rr + br2; gg = gg + br2; bb2 = bb2 + br2 * 0.92;
-                    }
-                }
-            }
-            // Bayer at every ramp boundary, always.
-            let d: f64 = f64(g_bayer[(y % 4) * 4 + (x % 4)]) * 0.0625 - 0.46875;
-            atlas_px(g_atlas_sky, x, y,
-                     clampi(i32(rr + d * 5.0), 0, 255),
-                     clampi(i32(gg + d * 5.0), 0, 255),
-                     clampi(i32(bb2 + d * 5.0), 0, 255), 255);
-        }
-    }
+    meshgen_set_sun_azimuth(p_lx, p_lz);
+    meshgen_bake_all(p_lx, p_ly, p_lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
 }
 
 // ===========================================================================
@@ -1369,7 +972,7 @@ let g_relative_mouse_rc: i32 = 0;
 
 let g_D2R: f64 = 0.017453292519943295;
 
-fn world_build(p_si: i32, p_seed: i32, p_wx: i32) {
+fn world_build(p_si: i32, p_seed: i32) {
     let si: i32 = p_si;
     g_ground_seed = (p_seed & 1048575) + 1;
     g_ridge = scene_f(si, SC_RIDGE);
@@ -1379,7 +982,7 @@ fn world_build(p_si: i32, p_seed: i32, p_wx: i32) {
     rnd_reseed(p_seed);
     world_clear();
 
-    let far: f64 = g_ev[TOD_FFAR];
+    let far: f64 = g_fog_far;
     // chunk ring: everything the fog can still show
     let rad: i32 = i32(far / g_CHUNK_M) + 1;
     let ccx: i32 = i32(floor(g_camx / g_CHUNK_M));
@@ -1402,52 +1005,68 @@ fn world_build(p_si: i32, p_seed: i32, p_wx: i32) {
     let fwd_x: f64 = sin(g_yaw * g_D2R);
     let fwd_z: f64 = 0.0 - cos(g_yaw * g_D2R);
 
+    // 8 m, not 5: meshgen's canopies are horizontal fan discs at 3.4 m, and a
+    // camera standing under one at 5 m sees a flat green plate fill the top of
+    // the frame. 8 m keeps the whole tree in silhouette, which is the read the
+    // asset was built for.
     for (let t = 0; t < ntree; t++) {
         let a: f64 = rnd_range(0.0, 6.283185307179586);
-        let d: f64 = 5.0 + (far - 8.0) * sqrt(rnd01());
-        prop_add(KIND_TREE, g_camx + cos(a) * d, g_camz + sin(a) * d,
+        let d: f64 = 8.0 + (far - 11.0) * sqrt(rnd01());
+        prop_add(K_TREE, 0, g_camx + cos(a) * d, g_camz + sin(a) * d,
                  rnd_range(0.0, 6.283185307179586), rnd_range(0.85, 1.25), 1.9);
     }
     for (let r = 0; r < nrock; r++) {
         let a2: f64 = rnd_range(0.0, 6.283185307179586);
         let d2: f64 = 3.2 + (far * 0.55) * sqrt(rnd01());
-        prop_add(KIND_ROCK, g_camx + cos(a2) * d2, g_camz + sin(a2) * d2,
+        prop_add(K_ROCK, 0, g_camx + cos(a2) * d2, g_camz + sin(a2) * d2,
                  rnd_range(0.0, 6.283185307179586), rnd_range(0.7, 1.7), 1.2);
     }
     for (let p = 0; p < nprop; p++) {
         let a3: f64 = rnd_range(0.0, 6.283185307179586);
         let d3: f64 = 6.0 + (far * 0.6) * sqrt(rnd01());
-        let kind: i32 = KIND_CRATE;
+        let kind: i32 = K_CRATE;
         let sc: f64 = rnd_range(0.85, 1.2);
         let sh: f64 = 1.0;
-        if (p % 3 == 0) { kind = KIND_BUILDING; sc = rnd_range(0.9, 1.15); sh = 5.0; }
-        prop_add(kind, g_camx + cos(a3) * d3, g_camz + sin(a3) * d3,
+        if (p % 3 == 0) { kind = K_LANTERN; sc = rnd_range(0.9, 1.15); sh = 1.4; }
+        else if (p % 3 == 1) { kind = K_BARREL; sh = 1.1; }
+        prop_add(kind, 0, g_camx + cos(a3) * d3, g_camz + sin(a3) * d3,
                  rnd_range(0.0, 6.283185307179586), sc, sh);
     }
-    // Enemies advance from 12..19 m inside the view cone: at that distance the
+    // Enemies advance from 11..19 m inside the view cone: at that distance the
     // fog has already reduced them to violet-rimmed shapes (ART_BIBLE 12.5).
+    // The class cycles so every shot exercises more than one silhouette.
     for (let e = 0; e < nen; e++) {
         let spread: f64 = rnd_range(-0.7, 0.7);
         let d4: f64 = rnd_range(11.0, 19.0);
         let ex: f64 = g_camx + (fwd_x * cos(spread) - fwd_z * sin(spread)) * d4;
         let ez: f64 = g_camz + (fwd_z * cos(spread) + fwd_x * sin(spread)) * d4;
-        prop_add(KIND_ENEMY, ex, ez, rnd_range(0.0, 6.283185307179586), 1.0, 1.1);
+        prop_add(K_ENEMY, e % ENEMY_COUNT, ex, ez,
+                 rnd_range(0.0, 6.283185307179586), 1.0, 1.1);
     }
     for (let f = 0; f < nfl; f++) {
         let a5: f64 = rnd_range(0.0, 6.283185307179586);
         let d5: f64 = 2.5 + 18.0 * sqrt(rnd01());
-        prop_add(KIND_FLORA, g_camx + cos(a5) * d5, g_camz + sin(a5) * d5,
-                 rnd_range(0.0, 6.283185307179586), rnd_range(0.8, 1.5), 0.5);
+        prop_add(K_BUSH, 0, g_camx + cos(a5) * d5, g_camz + sin(a5) * d5,
+                 rnd_range(0.0, 6.283185307179586), rnd_range(0.8, 1.5), 0.9);
     }
-    if ((g_flags & F_MONOLITH) != 0) {
-        prop_add(KIND_MONOLITH, g_camx + fwd_x * 22.0, g_camz + fwd_z * 22.0, 0.4, 1.0, 3.0);
+    if ((g_flags & F_SHRINE) != 0) {
+        // meshgen has no monolith/obelisk; the game's landmark asset is the
+        // LANTERN (core/config g_LANTERN_*), so the bloom's centrepiece is a
+        // lantern at 1.6x. Scaling it further just makes a floating lamp.
+        prop_add(K_LANTERN, 0, g_camx + fwd_x * 20.0, g_camz + fwd_z * 20.0,
+                 0.4, 1.6, 2.2);
     }
-    if ((g_flags & F_MAST) != 0) {
-        prop_add(KIND_MAST, g_camx + fwd_x * 55.0 + 9.0, g_camz + fwd_z * 55.0, 0.0, 1.0, 2.0);
+    if ((g_flags & F_LANDMARK) != 0) {
+        prop_add(K_TREE, 0, g_camx + fwd_x * 46.0 + 9.0, g_camz + fwd_z * 46.0,
+                 0.0, 2.3, 3.0);
+    }
+    if ((g_flags & F_NPC) != 0) {
+        prop_add(K_NPC, 0, g_camx + fwd_x * 7.5 + 1.6, g_camz + fwd_z * 7.5,
+                 3.4, 1.0, 1.0);
     }
 
     // Client-only FX. Negative ids in the real sim (CLAUDE.md §7); here they
-    // are simply not entities.
+    // are simply not entities. Every cell is a real fxgen sprite.
     for (let q = 0; q < npart; q++) {
         let a6: f64 = rnd_range(0.0, 6.283185307179586);
         let d6: f64 = 2.0 + 16.0 * sqrt(rnd01());
@@ -1455,26 +1074,28 @@ fn world_build(p_si: i32, p_seed: i32, p_wx: i32) {
         let pz: f64 = g_camz + sin(a6) * d6;
         let py: f64 = terrain_h(px, pz) + rnd_range(0.2, 3.4);
         if ((g_flags & F_RAIN) != 0) {
-            fx_add(px, terrain_h(px, pz) + rnd_range(1.0, 7.0), pz, 0.5, FX_STREAK, g_UI_WHITE, 120);
-        } else if ((g_flags & F_MONOLITH) != 0) {
-            fx_add(px, py, pz, rnd_range(0.10, 0.22), FX_MOTE, g_NS_HALO, 190);
+            fx_add(px, terrain_h(px, pz) + rnd_range(1.0, 7.0), pz,
+                   0.5, FX_RAIN, g_UI_WHITE, 120);
+        } else if ((g_flags & F_SHRINE) != 0) {
+            fx_add(px, py, pz, rnd_range(0.14, 0.28), FX_XP_MOTE, g_NS_HALO, 190);
         } else {
-            fx_add(px, py, pz, rnd_range(0.09, 0.18), FX_MOTE, g_EMBER, 150);
+            fx_add(px, py, pz, rnd_range(0.12, 0.22), FX_EMBER, g_EMBER, 150);
         }
     }
-    // One glow card per nightshade plant — the plant's albedo is in the world
-    // atlas; the GLOW is additive and lives in ATLAS_FX (ART_BIBLE §3.4).
+    // One glow card per emissive thing — the albedo is in ATLAS_WORLD, the
+    // GLOW is additive and lives in ATLAS_FX (ART_BIBLE §3.4).
     let np: i32 = g_pr_kind.length;
     for (let k = 0; k < np; k++) {
-        if (g_pr_kind[k] == KIND_FLORA) {
+        if (g_pr_kind[k] == K_BUSH) {
             fx_add(g_pr_x[k], g_pr_y[k] + 0.45 * g_pr_s[k], g_pr_z[k],
-                   0.9 * g_pr_s[k], FX_GLOW, g_NS_HALO, 165);
+                   0.8 * g_pr_s[k], FX_GLOW_S, g_NS_HALO, 150);
         }
-        if (g_pr_kind[k] == KIND_ENEMY) {
-            fx_add(g_pr_x[k], g_pr_y[k] + 1.48, g_pr_z[k], 0.42, FX_GLOW, g_NS_CORE, 205);
+        if (g_pr_kind[k] == K_ENEMY) {
+            fx_add(g_pr_x[k], g_pr_y[k] + 1.42, g_pr_z[k], 0.30, FX_EYE, g_NS_CORE, 215);
         }
-        if (g_pr_kind[k] == KIND_BUILDING) {
-            fx_add(g_pr_x[k], g_pr_y[k] + 1.4, g_pr_z[k], 2.6, FX_GLOW, g_WINDOW_WARM, 95);
+        if (g_pr_kind[k] == K_LANTERN) {
+            fx_add(g_pr_x[k], g_pr_y[k] + 1.15 * g_pr_s[k], g_pr_z[k],
+                   1.9 * g_pr_s[k], FX_GLOW_L, g_WINDOW_LIGHT, 120);
         }
     }
     // Dynamic lights: the 2-light cap of BUDGET_ACTUAL.md is a hard ceiling.
@@ -1486,18 +1107,23 @@ fn world_build(p_si: i32, p_seed: i32, p_wx: i32) {
                       f64(pal_r(g_MUZZLE_MID)) / 255.0 * 2.6,
                       f64(pal_g(g_MUZZLE_MID)) / 255.0 * 2.6,
                       f64(pal_b(g_MUZZLE_MID)) / 255.0 * 2.6, 9.0);
-        fx_add(g_camx + fwd_x * 1.15, g_camy - 0.12, g_camz + fwd_z * 1.15,
-               0.11, FX_GLOW, g_MUZZLE_CORE, 255);
-        fx_add(g_camx + fwd_x * 1.15, g_camy - 0.12, g_camz + fwd_z * 1.15,
-               0.26, FX_GLOW, g_MUZZLE_MID, 170);
-        fx_add(g_camx + fwd_x * 1.15, g_camy - 0.12, g_camz + fwd_z * 1.15,
-               0.52, FX_GLOW, g_EMBER, 90);
+        // The flash itself: fxgen's three-frame muzzle strip, frame 0 hot.
+        fx_add(g_camx + fwd_x * 1.05, g_camy - 0.13, g_camz + fwd_z * 1.05,
+               0.42, FX_MUZZLE_0, g_UI_WHITE, 255);
+        fx_add(g_camx + fwd_x * 1.35, g_camy - 0.13, g_camz + fwd_z * 1.35,
+               0.30, FX_MUZZLE_1, g_UI_WHITE, 170);
+        fx_add(g_camx + fwd_x * 1.70, g_camy - 0.13, g_camz + fwd_z * 1.70,
+               0.55, FX_SMOKE_1, g_UI_DIM, 70);
+        fx_add(g_camx + fwd_x * 3.20, g_camy - 0.10, g_camz + fwd_z * 3.20,
+               0.60, FX_TRACER, g_UI_WHITE, 200);
+        fx_add(g_camx + fwd_x * 9.00, g_camy + 0.10, g_camz + fwd_z * 9.00,
+               0.34, FX_SPARK_0, g_UI_WHITE, 210);
     }
-    if ((g_flags & F_MONOLITH) != 0) {
-        env_add_light(g_env, g_camx + fwd_x * 22.0, g_ground_y + 1.2, g_camz + fwd_z * 22.0,
-                      f64(pal_r(g_NS_MID)) / 255.0 * 2.2,
-                      f64(pal_g(g_NS_MID)) / 255.0 * 2.2,
-                      f64(pal_b(g_NS_MID)) / 255.0 * 2.2, 14.0);
+    if ((g_flags & F_SHRINE) != 0) {
+        env_add_light(g_env, g_camx + fwd_x * 20.0, g_ground_y + 1.4, g_camz + fwd_z * 20.0,
+                      f64(pal_r(g_NS_CORE)) / 255.0 * 2.2,
+                      f64(pal_g(g_NS_CORE)) / 255.0 * 2.2,
+                      f64(pal_b(g_NS_CORE)) / 255.0 * 2.2, 14.0);
     }
 }
 
@@ -1510,7 +1136,7 @@ fn world_build(p_si: i32, p_seed: i32, p_wx: i32) {
 // FEWER triangles than reserved (culled, near-clipped, guard-rejected). The
 // unwritten tail must be handed back or the flush draws uninitialised memory.
 // The only way to do that today is to write `b.n` directly, which is what
-// mesh.hml itself does internally. See the task report.
+// mesh.hml itself does internally.
 // ===========================================================================
 
 fn emit_chunk(p_b, p_tex, p_mesh, p_ox: f64, p_oy: f64, p_oz: f64): i32 {
@@ -1551,55 +1177,207 @@ fn emit_world_quad(p_b, p_tex,
     return out;
 }
 
-// One screen-space gradient band of the sky quad. Written straight through
-// batch_write_vertex — the reference encoder for the 20-byte SDL_Vertex.
-fn sky_quad(p_b, p_tex, p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64,
-            p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
-            p_r: i32, p_g: i32, p_bl: i32, p_a: i32, p_depth: f64): i32 {
+// One screen-space quad with four independent UVs. Written straight through
+// batch_write_vertex — the reference encoder for the 20-byte SDL_Vertex. The
+// sky panorama needs per-corner UVs, so the rect form is not enough.
+fn sky_quad_uv(p_b, p_tex,
+               p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64,
+               p_ua: f64, p_va: f64, p_ub: f64, p_vb: f64,
+               p_uc: f64, p_vc: f64, p_ud: f64, p_vd: f64,
+               p_r: i32, p_g: i32, p_bl: i32, p_a: i32, p_depth: f64): i32 {
     let cur: i32 = batch_reserve(p_b, 2);
     if (cur < 0) { let z: i32 = 0; return z; }
     let buf: ptr = batch_vbuf(p_b);
-    batch_write_vertex(buf, cur, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_u0, p_v0);
-    batch_write_vertex(buf, cur + 20, p_x1, p_y0, p_r, p_g, p_bl, p_a, p_u1, p_v0);
-    batch_write_vertex(buf, cur + 40, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_u1, p_v1);
-    batch_write_vertex(buf, cur + 60, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_u0, p_v0);
-    batch_write_vertex(buf, cur + 80, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_u1, p_v1);
-    batch_write_vertex(buf, cur + 100, p_x0, p_y1, p_r, p_g, p_bl, p_a, p_u0, p_v1);
+    batch_write_vertex(buf, cur, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
+    batch_write_vertex(buf, cur + 20, p_x1, p_y0, p_r, p_g, p_bl, p_a, p_ub, p_vb);
+    batch_write_vertex(buf, cur + 40, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
+    batch_write_vertex(buf, cur + 60, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
+    batch_write_vertex(buf, cur + 80, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
+    batch_write_vertex(buf, cur + 100, p_x0, p_y1, p_r, p_g, p_bl, p_a, p_ud, p_vd);
     batch_commit(p_b, cur, p_tex, p_depth);
     batch_commit(p_b, cur + 60, p_tex, p_depth);
     let out: i32 = 2;
     return out;
 }
 
-// Project a world point to target pixels. Returns 1 and writes g_proj[0..2]
-// (x, y, w) when the point is in front of the near plane.
-let g_proj: array<f64> = [0.0, 0.0, 0.0];
+// ===========================================================================
+// 8. THE SKY QUAD — mapping a 360-degree panorama onto a 70-degree frustum
+// ---------------------------------------------------------------------------
+// skygen bakes U across a full turn of yaw and V from zenith (row 0) to
+// horizon (row H-1). Two triangles with corner UVs would squeeze all 360
+// degrees into the 70 the camera can see, so the sky is a small grid: each
+// vertex takes the exact panorama UV of its own view ray, and the affine error
+// inside an 8.75-degree column is under a texel. 48 triangles, at depth = FAR,
+// in the SKY layer, flushed in insertion order before anything else.
+//
+// Below the horizon V clamps to 1.0, which is the row skygen derives from
+// FOG_TINT_MUL — so the band under the horizon is the fog colour by
+// construction and there is no seam at the skyline (ART_BIBLE §11.5, §6.6).
+//
+// ---------------------------------------------------------------------------
+// ⚠ MIRRORED UVs DRAW NOTHING. Measured, not guessed.
+// ---------------------------------------------------------------------------
+// SDL 2.0.18's SOFTWARE renderer — the one every headless shot and the CI
+// fallback use — silently draws NOTHING for a textured triangle whose u runs
+// right-to-left. It is not a blend-mode issue and it is not a clipping issue.
+// Minimal repro (a 64x64 target, a 16x16 half-red/half-green texture, one
+// full-target quad, SDL_RenderGeometry, read back):
+//
+//     u 0.00 -> 1.00, BLEND_NONE   left 220,40   right 40,220     drawn
+//     u 1.00 -> 0.00, BLEND_NONE   left 0,0      right 0,0        NOTHING
+//     u 1.00 -> 0.00, BLEND_BLEND  left 0,0      right 0,0        NOTHING
+//     u 0.36 -> 0.60, BLEND_NONE   left 220,40   right 40,220     drawn
+//     u 0.60 -> 0.36, BLEND_NONE   left 0,0      right 0,0        NOTHING
+//
+// This cost two renders to find, because a dropped triangle leaves the CLEAR
+// colour behind and a sky cleared to its own zenith looks like a plausible sky.
+// It has already bitten twice in this file:
+//   * the panorama. This engine's right vector is (cos yaw, 0, sin yaw), so
+//     `atan2(x, z)` — skygen's own azimuth convention — DECREASES across the
+//     screen from left to right. Sampled literally, every sky quad is mirrored
+//     and the whole layer vanishes. sky_uv_at negates the azimuth and
+//     tod_apply negates the sun's x to match.
+//   * the minimap. hudgen ships one corner bracket and expects the other three
+//     to be uv flips (HUD_MM_CORNER). Three of the four corners were invisible.
+// Anything else in this project that plans to mirror a sprite with a uv flip —
+// a left-facing icon, a mirrored decal, a flipped viewmodel — has to bake a
+// second sprite instead, or draw on hardware only.
+// ===========================================================================
 
-fn project_point(p_x: f64, p_y: f64, p_z: f64): i32 {
-    let m = g_mvp;
-    let cw: f64 = m[12] * p_x + m[13] * p_y + m[14] * p_z + m[15];
-    if (cw < g_NEAR) { let no: i32 = 0; return no; }
-    let cx: f64 = m[0] * p_x + m[1] * p_y + m[2] * p_z + m[3];
-    let cy: f64 = m[4] * p_x + m[5] * p_y + m[6] * p_z + m[7];
-    let inv: f64 = 1.0 / cw;
-    g_proj[0] = (cx * inv * 0.5 + 0.5) * f64(g_RES_W);
-    g_proj[1] = (0.5 - cy * inv * 0.5) * f64(g_RES_H);
-    g_proj[2] = cw;
-    let ok: i32 = 1;
-    return ok;
+let SKY_COLS: i32 = 10;
+let SKY_ROWS: i32 = 4;
+
+// The camera basis, hoisted once per sky pass, and the one output pair.
+let g_sk_thh: f64 = 0.0;   let g_sk_thv: f64 = 0.0;
+let g_sk_fx: f64 = 0.0;    let g_sk_fy: f64 = 0.0;   let g_sk_fz: f64 = -1.0;
+let g_sk_rx: f64 = 1.0;    let g_sk_rz: f64 = 0.0;
+let g_sk_ux: f64 = 0.0;    let g_sk_uy: f64 = 1.0;   let g_sk_uz: f64 = 0.0;
+let g_sk_u: f64 = 0.0;     let g_sk_v: f64 = 0.0;
+
+fn sky_basis() {
+    let fovr: f64 = g_fov * g_D2R;
+    let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
+    let hh: f64 = fovr * 0.5;
+    g_sk_thv = sin(hh) / cos(hh);
+    g_sk_thh = g_sk_thv * aspect;
+    let cyw: f64 = cos(g_yaw * g_D2R);
+    let syw: f64 = sin(g_yaw * g_D2R);
+    let cpw: f64 = cos(g_pitch * g_D2R);
+    let spw: f64 = sin(g_pitch * g_D2R);
+    g_sk_fx = syw * cpw;  g_sk_fy = spw;  g_sk_fz = 0.0 - (cyw * cpw);
+    g_sk_rx = cyw;        g_sk_rz = syw;
+    g_sk_ux = 0.0 - (syw * spw);  g_sk_uy = cpw;  g_sk_uz = cyw * spw;
+}
+
+// Panorama UV of the view ray through NDC (x, y), into g_sk_u / g_sk_v.
+// u is NOT wrapped into [0,1) here: the caller wants the continuous turn count
+// so it can split the one quad that crosses the seam.
+//
+// ⚠ THE AZIMUTH IS NEGATED. This is not a taste decision — see MIRRORED UVs in
+// the block comment above sky_emit. `atan2(-wx, wz)` makes u ASCEND with screen
+// x for this engine's camera basis (right = (cos yaw, 0, sin yaw)), which is
+// the only thing SDL 2.0.18's software renderer will draw. `tod_apply` negates
+// the x of the sun direction it hands skygen by exactly the same token, so the
+// sun and moon still land at their true azimuths; only the procedural cloud and
+// star field is mirrored, which is unobservable.
+fn sky_uv_at(p_ndcx: f64, p_ndcy: f64) {
+    let dx: f64 = p_ndcx * g_sk_thh;
+    let dy: f64 = p_ndcy * g_sk_thv;
+    let wx: f64 = g_sk_rx * dx + g_sk_ux * dy + g_sk_fx;
+    let wy: f64 = g_sk_uy * dy + g_sk_fy;
+    let wz: f64 = g_sk_rz * dx + g_sk_uz * dy + g_sk_fz;
+    let l: f64 = sqrt(wx * wx + wy * wy + wz * wz);
+    if (l > 0.0) { wx = wx / l; wy = wy / l; wz = wz / l; }
+    let az: f64 = atan2(0.0 - wx, wz);
+    let el: f64 = asin(clampf(wy, -1.0, 1.0));
+    g_sk_u = az / 6.283185307179586 + 0.5;
+    g_sk_v = clampf(1.0 - el / 1.5707963267948966, 0.0, 1.0);
+}
+
+fn sky_emit(p_depth: f64): i32 {
+    let cols: i32 = SKY_COLS;
+    let rows: i32 = SKY_ROWS;
+    sky_basis();
+    let w: f64 = f64(g_RES_W) / f64(cols);
+    let h: f64 = f64(g_RES_H) / f64(rows);
+    let tris: i32 = 0;
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            let nx0: f64 = f64(i) / f64(cols) * 2.0 - 1.0;
+            let nx1: f64 = f64(i + 1) / f64(cols) * 2.0 - 1.0;
+            let ny0: f64 = 1.0 - f64(j) / f64(rows) * 2.0;
+            let ny1: f64 = 1.0 - f64(j + 1) / f64(rows) * 2.0;
+            sky_uv_at(nx0, ny0); let ua: f64 = g_sk_u; let va: f64 = g_sk_v;
+            sky_uv_at(nx1, ny0); let ub: f64 = g_sk_u; let vb: f64 = g_sk_v;
+            sky_uv_at(nx1, ny1); let uc: f64 = g_sk_u; let vc: f64 = g_sk_v;
+            sky_uv_at(nx0, ny1); let ud: f64 = g_sk_u; let vd: f64 = g_sk_v;
+            // One quad spans 1/cols of the fov — under 10 degrees of azimuth —
+            // so the other three corners are within 0.03 turns of the first.
+            // Anything further apart is the +-180 seam, and wraps.
+            if (ub - ua > 0.5) { ub = ub - 1.0; }
+            if (ua - ub > 0.5) { ub = ub + 1.0; }
+            if (uc - ua > 0.5) { uc = uc - 1.0; }
+            if (ua - uc > 0.5) { uc = uc + 1.0; }
+            if (ud - ua > 0.5) { ud = ud - 1.0; }
+            if (ua - ud > 0.5) { ud = ud + 1.0; }
+            // The grid cells OVERLAP by 0.6 px on their right and bottom
+            // edges. SDL's software rasterizer has no shared-edge fill rule,
+            // so two triangles that meet exactly on x = 128.0 leave a one-pixel
+            // unwritten column — a thin dark line straight down the sky, which
+            // is what `muzzle_fog` showed at the column boundary. The overlap
+            // is sub-pixel in uv terms and both quads carry the same depth in
+            // an insertion-ordered layer, so it is invisible.
+            let x0: f64 = f64(i) * w;
+            let x1: f64 = f64(i + 1) * w + 0.6;
+            let y0: f64 = f64(j) * h;
+            let y1: f64 = f64(j + 1) * h + 0.6;
+            // A source rect with zero width or height is empty, and an empty
+            // rect draws nothing at all. Every row below the horizon has v
+            // clamped to exactly 1.0 at both ends, so without this the bottom
+            // of the frame silently loses its sky. One texel of span is enough
+            // and is invisible.
+            let epu: f64 = 0.001953125;      // 1/512
+            let epv: f64 = 0.00625;          // 1/160
+            if (ub - ua < epu) { ub = ua + epu; }
+            if (uc - ud < epu) { uc = ud + epu; }
+            if (vd - va < epv) { va = vd - epv; }
+            if (vc - vb < epv) { vb = vc - epv; }
+            if (va < 0.0) { va = 0.0; }
+            if (vb < 0.0) { vb = 0.0; }
+            // Shift into [0,1): the software renderer builds a source rect from
+            // the uv bounding box, so a negative u is not a wrap, it is a
+            // dropped triangle.
+            let lo: f64 = ua;
+            if (ud < lo) { lo = ud; }
+            let sh: f64 = floor(lo);
+            ua = ua - sh; ub = ub - sh; uc = uc - sh; ud = ud - sh;
+            let hi: f64 = ub;
+            if (uc > hi) { hi = uc; }
+            if (hi > 1.0) {
+                // This is the one column that straddles the panorama seam.
+                // Split it there rather than letting it run off the texture.
+                let t: f64 = (1.0 - ua) / (ub - ua);
+                let xc: f64 = x0 + (x1 - x0) * t;
+                tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, xc, y1,
+                                          ua, va, 1.0, vb, 1.0, vc, ud, vd,
+                                          255, 255, 255, 255, p_depth);
+                tris = tris + sky_quad_uv(g_bsky, g_tex_sky, xc, y0, x1, y1,
+                                          0.0, va, ub - 1.0, vb,
+                                          uc - 1.0, vc, 0.0, vd,
+                                          255, 255, 255, 255, p_depth);
+                continue;
+            }
+            tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, x1, y1,
+                                      ua, va, ub, vb, uc, vc, ud, vd,
+                                      255, 255, 255, 255, p_depth);
+        }
+    }
+    let out: i32 = tris;
+    return out;
 }
 
 // ===========================================================================
-// 8. frame_render — ARCHITECTURE.md §4, STAGES 6..28, IN ORDER
-// ---------------------------------------------------------------------------
-// This is the real frame path for Wave 2. W3-7 replaces the body with a call
-// to `frame_render(g_rsnap, g_view)` in src/render/world_render.hml; the stage
-// list, the stat timers and the layer order below are exactly what that file
-// has to reproduce, which is the point of writing them here first.
-//
-// Stages 1..5 (input, sim, snapshot, fx_update) have no Wave-2 implementation
-// and are timed at zero; the timer slots exist so the report shape never
-// changes when they arrive.
+// 9. frame_render — ARCHITECTURE.md §4, STAGES 6..28, IN ORDER
 // ===========================================================================
 
 fn frame_render(p_si: i32): i32 {
@@ -1611,25 +1389,24 @@ fn frame_render(p_si: i32): i32 {
 
     let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
     let fovr: f64 = g_fov * g_D2R;
+    let sheet: i32 = 0;
+    if ((g_flags & F_ATLAS) != 0) { sheet = 1; }
 
     // -- 6  tod_eval: fills the engine RenderEnv -----------------------------
     stat_begin(STAT_T_TOD);
-    let lightning: i32 = 0;
-    if ((i32(scene_f(si, SC_FLAGS)) & F_LIGHTNING) != 0) { lightning = 1; }
-    tod_eval(g_env, scene_f(si, SC_TOD), i32(scene_f(si, SC_WX)), lightning,
-             scene_f(si, SC_FOGFAR), scene_f(si, SC_MIST),
-             g_camx, g_camy, g_camz, g_ground_y);
+    tod_apply(si);
     emit_set_env(g_env);
     stat_set(STAT_LIGHTS, env_light_count(g_env));
     stat_end(STAT_T_TOD);
 
-    // -- 7  skygen_rebake: the whole panorama, once, because this is one frame
-    // (the game re-bakes 20 rows/frame on a rolling cursor instead).
+    // -- 7  skygen: the rolling re-bake, run to completion because this is one
+    // frame (the game bakes 20 rows/frame on the same cursor and pays 0.6 ms).
     stat_begin(STAT_T_SKYBAKE);
-    skygen_build();
-    g_tex_sky = atlas_upload(g_win, g_atlas_sky, BLEND_BLEND);
+    let rows: i32 = 0;
+    skygen_mark_dirty();
+    while (skygen_dirty_rows() > 0) { rows = rows + skygen_rebake_slice(); }
     stat_end(STAT_T_SKYBAKE);
-    stat_set(STAT_SKY_ROWS, g_SKY_H);
+    stat_set(STAT_SKY_ROWS, rows);
 
     // -- 8..10  view basis, MVP hoist, frustum extraction --------------------
     stat_begin(STAT_T_VIEW);
@@ -1663,229 +1440,190 @@ fn frame_render(p_si: i32): i32 {
 
     stat_begin(STAT_T_EMIT);
 
-    // -- 12  sky: 2 tris at depth = FAR, v by pitch --------------------------
+    // -- 12  sky: the panorama, at depth = FAR -------------------------------
     stat_begin(STAT_T_EMIT_SKY);
-    let skydepth: f64 = far;
-    // horizon screen y for this pitch, then the texture v that lands on it
-    let yh: f64 = f64(g_RES_H) * 0.5 * (1.0 + (g_pitch * g_D2R) / (fovr * 0.5));
-    let vspan: f64 = (g_fov / 100.0);
-    let v0: f64 = g_SKY_HORIZON_V - (yh / f64(g_RES_H)) * vspan;
-    let v1: f64 = g_SKY_HORIZON_V + ((f64(g_RES_H) - yh) / f64(g_RES_H)) * vspan;
-    let u0s: f64 = 0.0; let u1s: f64 = 1.0;
-    sky_quad(g_bsky, g_tex_sky, 0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
-             u0s, clamp01(v0), u1s, clamp01(v1), 255, 255, 255, 255, skydepth);
-    // sun / moon disc + halo, projected from the light direction
-    let sdx: f64 = g_ev[TOD_SUNX]; let sdy: f64 = g_ev[TOD_SUNY]; let sdz: f64 = g_ev[TOD_SUNZ];
-    let discc: i32 = pal(255, 244, 200);
-    let haloc: i32 = pal(255, 217, 138);
-    if (sdy < 0.0) {
-        sdx = 0.0 - sdx; sdy = 0.0 - sdy; sdz = 0.0 - sdz;
-        discc = pal(220, 228, 240);
-        haloc = pal(168, 180, 200);
-    }
-    let sd: f64 = far * 0.86;
-    if (project_point(g_camx + sdx * sd, g_camy + sdy * sd, g_camz + sdz * sd) == 1) {
-        let px: f64 = g_proj[0]; let py: f64 = g_proj[1];
-        atlas_cell_uv(g_atlas_fx, FX_GLOW, g_uvq, 0);
-        sky_quad(g_bsky, g_tex_fx, px - 28.0, py - 28.0, px + 28.0, py + 28.0,
-                 g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3],
-                 pal_r(haloc), pal_g(haloc), pal_b(haloc), 210, skydepth);
-        sky_quad(g_bsky, g_tex_fx, px - 8.0, py - 8.0, px + 8.0, py + 8.0,
-                 g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3],
-                 pal_r(discc), pal_g(discc), pal_b(discc), 255, skydepth);
-    }
+    if (sheet == 0) { sky_emit(far); }
     stat_end(STAT_T_EMIT_SKY);
 
     // -- 13  terrain: ring walk -> frustum_sphere per chunk -> emit ----------
     stat_begin(STAT_T_EMIT_TERRAIN);
-    let nc: i32 = g_ch_mesh.length;
     let tested: i32 = 0; let culled: i32 = 0; let drawn: i32 = 0;
-    for (let i = 0; i < nc; i++) {
-        tested++;
-        let cx: f64 = g_ch_cx[i]; let cy: f64 = g_ch_cy[i]; let cz: f64 = g_ch_cz[i];
-        // distance cull first: never draw past the fog far plane
-        let ddx: f64 = cx - g_camx; let ddz: f64 = cz - g_camz;
-        let dist: f64 = sqrt(ddx * ddx + ddz * ddz) - g_ch_r[i];
-        if (dist > g_ev[TOD_FFAR]) { culled++; stat_add(STAT_REJ_DISTANCE, 1); continue; }
-        if (frustum_sphere(g_frustum, cx, cy, cz, g_ch_r[i]) == 0) {
-            culled++;
-            stat_add(STAT_REJ_FRUSTUM, 1);
-            continue;
+    if (sheet == 0) {
+        let nc: i32 = g_ch_mesh.length;
+        for (let i = 0; i < nc; i++) {
+            tested++;
+            let cx: f64 = g_ch_cx[i]; let cy: f64 = g_ch_cy[i]; let cz: f64 = g_ch_cz[i];
+            // distance cull first: never draw past the fog far plane
+            let ddx: f64 = cx - g_camx; let ddz: f64 = cz - g_camz;
+            let dist: f64 = sqrt(ddx * ddx + ddz * ddz) - g_ch_r[i];
+            if (dist > g_fog_far) { culled++; stat_add(STAT_REJ_DISTANCE, 1); continue; }
+            if (frustum_sphere(g_frustum, cx, cy, cz, g_ch_r[i]) == 0) {
+                culled++;
+                stat_add(STAT_REJ_FRUSTUM, 1);
+                continue;
+            }
+            emit_chunk(g_bworld, g_tex_world, g_ch_mesh[i],
+                       g_ch_ox[i], 0.0, g_ch_oz[i]);
+            drawn++;
         }
-        emit_chunk(g_bworld, g_tex_world, g_ch_mesh[i],
-                   g_ch_ox[i], 0.0, g_ch_oz[i]);
-        drawn++;
     }
     stat_set(STAT_CHUNKS_TESTED, tested);
     stat_set(STAT_CHUNKS_CULLED, culled);
     stat_set(STAT_CHUNKS_DRAWN, drawn);
     stat_end(STAT_T_EMIT_TERRAIN);
 
-    // -- 14  entities/props: LOD by distance + ONE contact shadow quad each --
+    // -- 14  entities/props: real LOD + ONE contact blob each ----------------
     stat_begin(STAT_T_EMIT_ENTITY);
-    let np: i32 = g_pr_kind.length;
     let etested: i32 = 0; let eculled: i32 = 0; let edrawn: i32 = 0;
-    let ftr: f64 = env_field(g_env, ENV_FOG_R);
-    let ftg2: f64 = env_field(g_env, ENV_FOG_G);
-    let ftb: f64 = env_field(g_env, ENV_FOG_B);
-    atlas_cell_uv(g_atlas_world, CELL_STONE, g_uvq, 0);
-    let shu0: f64 = g_uvq[0]; let shv0: f64 = g_uvq[1];
-    let shu1: f64 = g_uvq[2]; let shv1: f64 = g_uvq[3];
-    for (let k = 0; k < np; k++) {
-        etested++;
-        let kind: i32 = g_pr_kind[k];
-        let px2: f64 = g_pr_x[k]; let py2: f64 = g_pr_y[k]; let pz2: f64 = g_pr_z[k];
-        let m = g_meshes[kind];
-        let rad2: f64 = mesh_radius(m) * g_pr_s[k];
-        let dx2: f64 = px2 - g_camx; let dz2: f64 = pz2 - g_camz;
-        let dd: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
-        if (dd - rad2 > g_ev[TOD_FFAR]) {
-            eculled++;
-            stat_add(STAT_REJ_DISTANCE, 1);
-            continue;
-        }
-        if (frustum_sphere(g_frustum, px2, py2 + rad2 * 0.5, pz2, rad2 + 1.0) == 0) {
-            eculled++;
-            stat_add(STAT_REJ_FRUSTUM, 1);
-            continue;
-        }
-        // Per-instance point lighting. mesh_bake_light folds ambient + sun +
-        // bounce only, so a dynamic light reaches a static prop through its
-        // instance tint — the same approximation the fog uses, and exact
-        // enough for a prop small next to the light's radius.
-        let plr: f64 = 1.0; let plg: f64 = 1.0; let plb: f64 = 1.0;
-        let nl: i32 = env_light_count(g_env);
-        for (let li = 0; li < nl; li++) {
-            let lb2: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
-            let ldx: f64 = env_field(g_env, lb2) - px2;
-            let ldy: f64 = env_field(g_env, lb2 + 1) - (py2 + rad2 * 0.4);
-            let ldz: f64 = env_field(g_env, lb2 + 2) - pz2;
-            let lrad: f64 = env_field(g_env, lb2 + 6);
-            let ld: f64 = sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
-            if (ld < lrad) {
-                let att: f64 = (1.0 - ld / lrad) * (1.0 - ld / lrad);
-                plr = plr + env_field(g_env, lb2 + 3) * att;
-                plg = plg + env_field(g_env, lb2 + 4) * att;
-                plb = plb + env_field(g_env, lb2 + 5) * att;
+    if (sheet == 0) {
+        let np: i32 = g_pr_kind.length;
+        let ftr: f64 = env_field(g_env, ENV_FOG_R);
+        let ftg2: f64 = env_field(g_env, ENV_FOG_G);
+        let ftb: f64 = env_field(g_env, ENV_FOG_B);
+        let blob = meshgen_mesh(MESH_BLOB);
+        for (let k = 0; k < np; k++) {
+            etested++;
+            let px2: f64 = g_pr_x[k]; let py2: f64 = g_pr_y[k]; let pz2: f64 = g_pr_z[k];
+            let dx2: f64 = px2 - g_camx; let dz2: f64 = pz2 - g_camz;
+            let dd: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
+            let rad2: f64 = meshgen_radius(kind_mesh0(g_pr_kind[k], g_pr_cls[k])) * g_pr_s[k];
+            if (dd - rad2 > g_fog_far) {
+                eculled++;
+                stat_add(STAT_REJ_DISTANCE, 1);
+                continue;
             }
+            if (frustum_sphere(g_frustum, px2, py2 + rad2 * 0.5, pz2, rad2 + 1.0) == 0) {
+                eculled++;
+                stat_add(STAT_REJ_FRUSTUM, 1);
+                continue;
+            }
+            let m = meshgen_mesh(kind_mesh_lod(g_pr_kind[k], g_pr_cls[k], dd));
+            // Per-instance point lighting. mesh_bake_light folds ambient + sun
+            // + bounce only, so a dynamic light reaches a static prop through
+            // its instance tint — the same approximation the fog uses, and
+            // exact enough for a prop small next to the light's radius.
+            let plr: f64 = 1.0; let plg: f64 = 1.0; let plb: f64 = 1.0;
+            let nl: i32 = env_light_count(g_env);
+            for (let li = 0; li < nl; li++) {
+                let lb2: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
+                let ldx: f64 = env_field(g_env, lb2) - px2;
+                let ldy: f64 = env_field(g_env, lb2 + 1) - (py2 + rad2 * 0.4);
+                let ldz: f64 = env_field(g_env, lb2 + 2) - pz2;
+                let lrad: f64 = env_field(g_env, lb2 + 6);
+                let ld: f64 = sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
+                if (ld < lrad) {
+                    let att: f64 = (1.0 - ld / lrad) * (1.0 - ld / lrad);
+                    plr = plr + env_field(g_env, lb2 + 3) * att;
+                    plg = plg + env_field(g_env, lb2 + 4) * att;
+                    plb = plb + env_field(g_env, lb2 + 5) * att;
+                }
+            }
+            // Per-instance fog: exact for props small next to the fog gradient.
+            let f: f64 = env_fog_factor(px2, py2 + rad2 * 0.4, pz2);
+            let a: i32 = i32(env_fog_alpha(f));
+            let tr2: i32 = clampi(i32(f64(g_pr_tr[k]) * plr * (1.0 - f * (1.0 - ftr))), 0, 255);
+            let tg3: i32 = clampi(i32(f64(g_pr_tg[k]) * plg * (1.0 - f * (1.0 - ftg2))), 0, 255);
+            let tb2: i32 = clampi(i32(f64(g_pr_tb[k]) * plb * (1.0 - f * (1.0 - ftb))), 0, 255);
+            mesh_emit_yaw(m, g_bworld, g_tex_world, px2, py2, pz2,
+                          g_pr_yaw[k], g_pr_s[k], tr2, tg3, tb2, a);
+            // The contact blob — meshgen's own MESH_BLOB, 2 triangles.
+            // MANDATORY, no exceptions, not even in a test scene (CLAUDE.md §9
+            // rule 6): the highest value-per-triangle spend we have.
+            let sh: f64 = g_pr_shadow[k] * g_pr_s[k] * 0.5;
+            mesh_emit_yaw(blob, g_bworld, g_tex_world,
+                          px2, terrain_h(px2, pz2) + 0.035, pz2,
+                          0.0, sh, 255, 255, 255, a);
+            edrawn++;
         }
-        // Per-instance fog: exact for props small next to the fog gradient.
-        let f: f64 = env_fog_factor(px2, py2 + rad2 * 0.4, pz2);
-        let a: i32 = i32(env_fog_alpha(f));
-        let tr2: i32 = clampi(i32(f64(g_pr_tr[k]) * plr * (1.0 - f * (1.0 - ftr))), 0, 255);
-        let tg3: i32 = clampi(i32(f64(g_pr_tg[k]) * plg * (1.0 - f * (1.0 - ftg2))), 0, 255);
-        let tb2: i32 = clampi(i32(f64(g_pr_tb[k]) * plb * (1.0 - f * (1.0 - ftb))), 0, 255);
-        mesh_emit_yaw(m, g_bworld, g_tex_world, px2, py2, pz2,
-                      g_pr_yaw[k], g_pr_s[k], tr2, tg3, tb2, a);
-        // The contact blob. MANDATORY, no exceptions, not even in a test scene
-        // (CLAUDE.md §9 rule 6): the highest value-per-triangle spend we have.
-        let sh: f64 = g_pr_shadow[k] * g_pr_s[k] * 0.5;
-        // The four corners follow the ground, so the blob never floats and
-        // never buries itself on a slope.
-        let s00: f64 = terrain_h(px2 - sh, pz2 - sh) + 0.04;
-        let s10: f64 = terrain_h(px2 + sh, pz2 - sh) + 0.04;
-        let s11: f64 = terrain_h(px2 + sh, pz2 + sh) + 0.04;
-        let s01: f64 = terrain_h(px2 - sh, pz2 + sh) + 0.04;
-        emit_world_quad(g_bworld, g_tex_world,
-                        px2 - sh, s00, pz2 - sh, px2 + sh, s10, pz2 - sh,
-                        px2 + sh, s11, pz2 + sh, px2 - sh, s01, pz2 + sh,
-                        shu0, shv0, shu1, shv1,
-                        pal(clampi(38 + i32(f * 120.0), 0, 255),
-                            clampi(36 + i32(f * 120.0), 0, 255),
-                            clampi(40 + i32(f * 120.0), 0, 255)));
-        edrawn++;
     }
     stat_set(STAT_ENTS_TESTED, etested);
     stat_set(STAT_ENTS_CULLED, eculled);
     stat_set(STAT_ENTS_DRAWN, edrawn);
     stat_end(STAT_T_EMIT_ENTITY);
 
-    // -- 15  viewmodel: depth 0.05, fog f = 0, never culled -----------------
+    // -- 15  viewmodel: meshgen's SPARROW, never culled, never fogged -------
     stat_begin(STAT_T_EMIT_VIEWMODEL);
-    if ((g_flags & F_VIEWMODEL) != 0) {
-        atlas_cell_uv(g_atlas_world, CELL_GUNMETAL, g_uvq, 0);
-        let vu0: f64 = g_uvq[0]; let vv0: f64 = g_uvq[1];
-        let vu1: f64 = g_uvq[2]; let vv1: f64 = g_uvq[3];
+    if (sheet == 0 && (g_flags & F_VIEWMODEL) != 0) {
+        let cy2: f64 = cos(g_yaw * g_D2R); let sy2: f64 = sin(g_yaw * g_D2R);
+        let cp2: f64 = cos(g_pitch * g_D2R); let sp2: f64 = sin(g_pitch * g_D2R);
+        let ffx: f64 = sy2 * cp2; let ffy: f64 = sp2; let ffz: f64 = 0.0 - (cy2 * cp2);
+        let rrx: f64 = cy2; let rrz: f64 = sy2;
+        let uux: f64 = 0.0 - (sy2 * sp2); let uuy: f64 = cp2; let uuz: f64 = cy2 * sp2;
+        // mesh_emit_yaw rotates local +z to (sin yaw, cos yaw); the camera
+        // looks down (sin yaw_c, -cos yaw_c), so the model yaw is PI - yaw_c.
+        let vyaw: f64 = 3.141592653589793 - g_yaw * g_D2R;
+        let vx: f64 = g_camx + ffx * 1.05 + rrx * 0.26 + uux * (0.0 - 0.34);
+        let vy: f64 = g_camy + ffy * 1.05 + uuy * (0.0 - 0.34);
+        let vz: f64 = g_camz + ffz * 1.05 + rrz * 0.26 + uuz * (0.0 - 0.34);
         // The viewmodel is never fogged (§6.6) but it IS lit: a full-albedo gun
-        // at night is the single most common first-person lighting bug.
-        let vlr: f64 = clamp01(g_ev[TOD_AMBR] + g_ev[TOD_SUNR] * 0.85);
-        let vlg: f64 = clamp01(g_ev[TOD_AMBG] + g_ev[TOD_SUNG] * 0.85);
-        let vlb: f64 = clamp01(g_ev[TOD_AMBB] + g_ev[TOD_SUNB] * 0.85);
-        let br: i32 = clampi(i32(f64(pal_r(g_GUNMETAL_HI)) * vlr), 0, 255);
-        let bg: i32 = clampi(i32(f64(pal_g(g_GUNMETAL_HI)) * vlg), 0, 255);
-        let bb3: i32 = clampi(i32(f64(pal_b(g_GUNMETAL_HI)) * vlb), 0, 255);
-        // receiver, barrel, handguard, magazine — a readable first-person
-        // silhouette in the lower right, at 0.05 depth with no fog.
-        // receiver / barrel / handguard / magazine: a readable silhouette in
-        // the lower right, small enough to leave the frame to the world.
-        quad_screen_uv(g_bworld, g_tex_world, 226.0, 196.0, 58.0, 13.0,
-                       vu0, vv0, vu1, vv1, br, bg, bb3, 255, 0.05);
-        quad_screen_uv(g_bworld, g_tex_world, 196.0, 200.0, 34.0, 5.0,
-                       vu0, vv0, vu1, vv1,
-                       clampi(i32(f64(pal_r(g_GUNMETAL_LO)) * vlr), 0, 255),
-                       clampi(i32(f64(pal_g(g_GUNMETAL_LO)) * vlg), 0, 255),
-                       clampi(i32(f64(pal_b(g_GUNMETAL_LO)) * vlb), 0, 255),
-                       255, 0.05);
-        quad_screen_uv(g_bworld, g_tex_world, 238.0, 208.0, 12.0, 21.0,
-                       vu0, vv0, vu1, vv1,
-                       clampi(i32(f64(pal_r(g_POLYMER)) * vlr), 0, 255),
-                       clampi(i32(f64(pal_g(g_POLYMER)) * vlg), 0, 255),
-                       clampi(i32(f64(pal_b(g_POLYMER)) * vlb), 0, 255), 255, 0.05);
-        quad_screen_uv(g_bworld, g_tex_world, 256.0, 208.0, 26.0, 17.0,
-                       vu0, vv0, vu1, vv1,
-                       clampi(i32(f64(pal_r(g_GUNMETAL_LO)) * vlr * 0.86), 0, 255),
-                       clampi(i32(f64(pal_g(g_GUNMETAL_LO)) * vlg * 0.86), 0, 255),
-                       clampi(i32(f64(pal_b(g_GUNMETAL_LO)) * vlb * 0.86), 0, 255),
-                       255, 0.05);
-        quad_screen_uv(g_bworld, g_tex_world, 274.0, 190.0, 8.0, 7.0,
-                       vu0, vv0, vu1, vv1,
-                       clampi(i32(f64(pal_r(g_BRASS)) * vlr), 0, 255),
-                       clampi(i32(f64(pal_g(g_BRASS)) * vlg), 0, 255),
-                       clampi(i32(f64(pal_b(g_BRASS)) * vlb), 0, 255), 255, 0.05);
+        // at night is the single most common first-person lighting bug. It is
+        // baked with the world, so the tint is neutral and alpha is opaque.
+        mesh_emit_yaw(meshgen_mesh(MESH_SPARROW_VM), g_bworld, g_tex_world,
+                      vx, vy, vz, vyaw, 1.0, 255, 255, 255, 255);
     }
     stat_end(STAT_T_EMIT_VIEWMODEL);
 
     // -- 16  fx: particles, glow cards, tracers, rain ------------------------
     stat_begin(STAT_T_EMIT_FX);
-    let nfx: i32 = g_fx_x.length;
-    let uvt: array<f64> = g_uvq;
-    for (let q = 0; q < nfx; q++) {
-        atlas_cell_uv(g_atlas_fx, g_fx_cell[q], uvt, 0);
-        billboard_set_uv(uvt[0], uvt[1], uvt[2], uvt[3]);
-        let c: i32 = g_fx_c[q];
-        let fa: f64 = env_fog_factor(g_fx_x[q], g_fx_y[q], g_fx_z[q]);
-        let al: i32 = clampi(i32(f64(g_fx_a[q]) * (1.0 - fa * 0.85)), 0, 255);
-        if (g_fx_cell[q] == FX_STREAK) {
-            billboard_stretched(g_bfx, g_tex_fx,
-                                g_fx_x[q], g_fx_y[q], g_fx_z[q],
-                                g_fx_x[q] + 0.12, g_fx_y[q] - 1.5, g_fx_z[q],
-                                0.05, pal_r(c), pal_g(c), pal_b(c), al);
-        } else {
-            billboard_world(g_bfx, g_tex_fx, g_fx_x[q], g_fx_y[q], g_fx_z[q],
-                            g_fx_s[q], pal_r(c), pal_g(c), pal_b(c), al);
+    let nfx: i32 = 0;
+    if (sheet == 0) {
+        nfx = g_fx_x.length;
+        for (let q = 0; q < nfx; q++) {
+            atlas_cell_uv(g_atlas_fx, g_fx_cell[q], g_uvs, 0);
+            billboard_set_uv(g_uvs[0], g_uvs[1], g_uvs[2], g_uvs[3]);
+            let c: i32 = g_fx_c[q];
+            let fa: f64 = env_fog_factor(g_fx_x[q], g_fx_y[q], g_fx_z[q]);
+            let al: i32 = clampi(i32(f64(g_fx_a[q]) * (1.0 - fa * 0.85)), 0, 255);
+            if (g_fx_cell[q] == FX_RAIN) {
+                billboard_stretched(g_bfx, g_tex_fx,
+                                    g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                    g_fx_x[q] + 0.12, g_fx_y[q] - 1.5, g_fx_z[q],
+                                    0.05, pal_r(c), pal_g(c), pal_b(c), al);
+            } else if (g_fx_cell[q] == FX_TRACER) {
+                let tdx: f64 = g_fx_x[q] - g_camx;
+                let tdz: f64 = g_fx_z[q] - g_camz;
+                let tl: f64 = sqrt(tdx * tdx + tdz * tdz);
+                if (tl < 0.001) { tl = 1.0; }
+                billboard_stretched(g_bfx, g_tex_fx,
+                                    g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                    g_fx_x[q] + tdx / tl * 2.6, g_fx_y[q],
+                                    g_fx_z[q] + tdz / tl * 2.6,
+                                    0.06, pal_r(c), pal_g(c), pal_b(c), al);
+            } else {
+                billboard_world(g_bfx, g_tex_fx, g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                g_fx_s[q], pal_r(c), pal_g(c), pal_b(c), al);
+            }
         }
-    }
-    // One flat ground glow card per dynamic light. mesh_bake_light folds only
-    // ambient + sun + bounce, so this 2-triangle additive card is how a point
-    // light reaches the GROUND — which is exactly what ART_BIBLE 12.2 asks for
-    // and exactly what a PS1-era renderer would have done.
-    let nl2: i32 = env_light_count(g_env);
-    atlas_cell_uv(g_atlas_fx, FX_GLOW, uvt, 0);
-    for (let li = 0; li < nl2; li++) {
-        let lb3: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
-        let lx2: f64 = env_field(g_env, lb3);
-        let lz2: f64 = env_field(g_env, lb3 + 2);
-        let lrad2: f64 = env_field(g_env, lb3 + 6) * 0.62;
-        let lr2: i32 = clampi(i32(env_field(g_env, lb3 + 3) * 96.0), 0, 255);
-        let lg2: i32 = clampi(i32(env_field(g_env, lb3 + 4) * 96.0), 0, 255);
-        let lb4: i32 = clampi(i32(env_field(g_env, lb3 + 5) * 96.0), 0, 255);
-        emit_world_quad(g_bfx, g_tex_fx,
-                        lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
-                        lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
-                        lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
-                        lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
-                        uvt[0], uvt[1], uvt[2], uvt[3],
-                        pal(lr2, lg2, lb4));
+        // One flat ground glow card per dynamic light. mesh_bake_light folds
+        // only ambient + sun + bounce, so this 2-triangle additive card is how
+        // a point light reaches the GROUND — which is what ART_BIBLE 12.2 asks
+        // for and what a PS1-era renderer would have done.
+        let nl2: i32 = env_light_count(g_env);
+        atlas_cell_uv(g_atlas_fx, FX_GLOW_L, g_uvs, 0);
+        for (let li = 0; li < nl2; li++) {
+            let lb3: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
+            let lx2: f64 = env_field(g_env, lb3);
+            let lz2: f64 = env_field(g_env, lb3 + 2);
+            // The card is a 2-triangle quad with only four corners following
+            // the ground, so beyond ~14 m it is seen edge-on and reads as a
+            // bright LINE across the terrain instead of a pool of light. Near
+            // lights (the muzzle flash, a lantern you are standing by) are
+            // exactly where a ground pool earns its two triangles.
+            let ldc: f64 = sqrt((lx2 - g_camx) * (lx2 - g_camx)
+                                + (lz2 - g_camz) * (lz2 - g_camz));
+            if (ldc > 14.0) { continue; }
+            let lrad2: f64 = env_field(g_env, lb3 + 6) * 0.62;
+            let lr2: i32 = clampi(i32(env_field(g_env, lb3 + 3) * 96.0), 0, 255);
+            let lg2: i32 = clampi(i32(env_field(g_env, lb3 + 4) * 96.0), 0, 255);
+            let lb4: i32 = clampi(i32(env_field(g_env, lb3 + 5) * 96.0), 0, 255);
+            emit_world_quad(g_bfx, g_tex_fx,
+                            lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
+                            lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
+                            lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
+                            lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
+                            g_uvs[0], g_uvs[1], g_uvs[2], g_uvs[3],
+                            pal_pack(lr2, lg2, lb4));
+        }
     }
     stat_set(STAT_PARTICLES, nfx);
     stat_end(STAT_T_EMIT_FX);
@@ -1907,7 +1645,11 @@ fn frame_render(p_si: i32): i32 {
 
     // -- 19  clear to the sky zenith so a dropped sky frame is never black ---
     stat_begin(STAT_T_CLEAR);
-    sdl_clear(g_win, i32(g_ev[TOD_ZENR]), i32(g_ev[TOD_ZENG]), i32(g_ev[TOD_ZENB]), 255);
+    sdl_clear(g_win, clampi(i32(g_skyk[SKYK_ZEN]), 0, 255),
+              clampi(i32(g_skyk[SKYK_ZEN + 1]), 0, 255),
+              clampi(i32(g_skyk[SKYK_ZEN + 2]), 0, 255), 255);
+    if (sheet == 1) { sdl_clear(g_win, pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
+                                pal_b(g_UI_BLACK), 255); }
     stat_end(STAT_T_CLEAR);
 
     // -- 20  SKY, insertion order, 1-3 draw calls ---------------------------
@@ -1934,22 +1676,25 @@ fn frame_render(p_si: i32): i32 {
     batch_sort_flush(g_win, g_bfx);
     stat_end(STAT_T_FLUSH_FX);
 
-    // -- 23  postfx: the vignette ring (16 tris) + the damage/flash ring -----
+    // -- 23  postfx: the vignette ring + the lightning flash -----------------
     stat_begin(STAT_T_POSTFX);
-    quad_ring(g_bhud, g_tex_hud, f64(g_RES_W) * 0.5, f64(g_RES_H) * 0.5,
-              128.0, 96.0, 260.0, 210.0, 8,
-              (g_uv_white[0] + g_uv_white[2]) * 0.5, (g_uv_white[1] + g_uv_white[3]) * 0.5,
-              pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK), 0, 150, 0.9);
-    if ((g_flags & F_LIGHTNING) != 0) {
-        quad_screen_uv(g_bhud, g_tex_hud, 0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
-                       g_uv_white[0], g_uv_white[1], g_uv_white[2], g_uv_white[3],
-                       pal_r(g_LIGHTNING), pal_g(g_LIGHTNING), pal_b(g_LIGHTNING), 54, 0.95);
+    if (sheet == 0) {
+        quad_ring(g_bhud, g_tex_hud, f64(g_RES_W) * 0.5, f64(g_RES_H) * 0.5,
+                  128.0, 96.0, 260.0, 210.0, 8,
+                  (g_uvw[0] + g_uvw[2]) * 0.5, (g_uvw[1] + g_uvw[3]) * 0.5,
+                  pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK), 0, 150, 0.9);
+        if ((g_flags & F_LIGHTNING) != 0) {
+            quad_screen_uv(g_bhud, g_tex_hud, 0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
+                           g_uvw[0], g_uvw[1], g_uvw[2], g_uvw[3],
+                           pal_r(g_LIGHTNING), pal_g(g_LIGHTNING), pal_b(g_LIGHTNING),
+                           54, 0.95);
+        }
     }
     stat_end(STAT_T_POSTFX);
 
     // -- 24  HUD, <= 250 tris, hard-capped -----------------------------------
     stat_begin(STAT_T_HUD);
-    hud_build(si);
+    if (sheet == 1) { atlas_sheet_build(si); } else { hud_build(si); }
     stat_end(STAT_T_HUD);
 
     // -- 25  HUD flush, insertion order --------------------------------------
@@ -1976,33 +1721,53 @@ fn frame_render(p_si: i32): i32 {
     return out;
 }
 
-
 // ===========================================================================
-// 9. THE HUD  (ART_BIBLE §9 — <= 250 triangles, hard-capped)
+// 10. THE HUD  (ART_BIBLE §9 — <= 250 triangles, hard-capped)
 // ---------------------------------------------------------------------------
-// Everything gets a UI_BLACK contrast plate or a 1-px (+1,+1) shadow, because
-// it has to survive noon sky, snow, a muzzle flash and CONCRETE_HI. That is
-// what `--scene hud_worst_case` exists to prove.
+// Every glyph, icon, tick and plate below is a real hudgen sprite or a real
+// hudgen font. Nothing here draws a shape it invented. FONT_MICRO is
+// uppercase-only by design (§9.4), which is why the scene labels are.
 // ===========================================================================
 
-let g_hud_u: f64 = 0.0;
-let g_hud_v: f64 = 0.0;
+fn hud_sprite(p_id: i32, p_x: f64, p_y: f64, p_sx: f64, p_sy: f64,
+              p_c: i32, p_a: i32): i32 {
+    hudgen_uv(p_id, g_uvq, 0);
+    hudgen_rect(p_id, g_rect, 0);
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y,
+                                  f64(g_rect[2]) * p_sx, f64(g_rect[3]) * p_sy,
+                                  g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3],
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
 
+// A flat rect of any size, sampled from HUD_SOLID — bars, plates, lines.
 fn hud_rect(p_x: f64, p_y: f64, p_w: f64, p_h: f64, p_c: i32, p_a: i32): i32 {
+    let u: f64 = (g_uvw[0] + g_uvw[2]) * 0.5;
+    let v: f64 = (g_uvw[1] + g_uvw[3]) * 0.5;
     let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y, p_w, p_h,
-                                  g_hud_u, g_hud_v, g_hud_u, g_hud_v,
+                                  u, v, u, v,
                                   pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
     return out;
 }
 
 fn hud_plate(p_x: f64, p_y: f64, p_w: f64, p_h: f64): i32 {
-    let out: i32 = hud_rect(p_x - 1.0, p_y - 1.0, p_w + 2.0, p_h + 2.0, g_UI_BLACK, 168);
+    let out: i32 = hud_rect(p_x - 1.0, p_y - 1.0, p_w + 2.0, p_h + 2.0, g_UI_BLACK, 180);
     return out;
 }
 
 fn hud_text(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
     // 1-px UI_BLACK shadow at (+1,+1), always (CLAUDE.md §9 rule 8).
-    let out: i32 = font_text_shadowed(g_font, g_bhud, g_tex_hud, p_x, p_y, p_s,
+    let out: i32 = font_text_shadowed(hud_font_micro(), g_bhud, g_tex_hud,
+                                      p_x, p_y, p_s,
+                                      pal_r(p_c), pal_g(p_c), pal_b(p_c), 255,
+                                      pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
+                                      pal_b(g_UI_BLACK), 255, 1.0, 1.0, p_budget);
+    return out;
+}
+
+fn hud_text_big(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    let out: i32 = font_text_shadowed(hud_font_big(), g_bhud, g_tex_hud,
+                                      p_x, p_y, p_s,
                                       pal_r(p_c), pal_g(p_c), pal_b(p_c), 255,
                                       pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
                                       pal_b(g_UI_BLACK), 255, 1.0, 1.0, p_budget);
@@ -2010,45 +1775,42 @@ fn hud_text(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
 }
 
 fn hud_build(p_si: i32) {
-    g_hud_u = (g_uv_white[0] + g_uv_white[2]) * 0.5;
-    g_hud_v = (g_uv_white[1] + g_uv_white[3]) * 0.5;
     let used: i32 = 0;
     let cx: f64 = f64(g_RES_W) * 0.5;
     let cy: f64 = f64(g_RES_H) * 0.5;
 
-    // crosshair with real spread bloom: 4 ticks, a 1-px centre dot, black
-    // outline so it survives a white background.
+    // crosshair: hudgen's own outlined ticks and dot, with real spread bloom
     let gap: f64 = 4.0;
     if ((g_flags & F_MUZZLE) != 0) { gap = 7.0; }
-    used = used + hud_rect(cx - gap - 5.0, cy - 1.0, 5.0, 2.0, g_UI_BLACK, 200);
-    used = used + hud_rect(cx + gap, cy - 1.0, 5.0, 2.0, g_UI_BLACK, 200);
-    used = used + hud_rect(cx - 1.0, cy - gap - 5.0, 2.0, 5.0, g_UI_BLACK, 200);
-    used = used + hud_rect(cx - 1.0, cy + gap, 2.0, 5.0, g_UI_BLACK, 200);
-    used = used + hud_rect(cx - gap - 5.0, cy - 0.5, 5.0, 1.0, g_UI_WHITE, 255);
-    used = used + hud_rect(cx + gap, cy - 0.5, 5.0, 1.0, g_UI_WHITE, 255);
-    used = used + hud_rect(cx - 0.5, cy - gap - 5.0, 1.0, 5.0, g_UI_WHITE, 255);
-    used = used + hud_rect(cx - 0.5, cy + gap, 1.0, 5.0, g_UI_WHITE, 255);
-    used = used + hud_rect(cx - 0.5, cy - 0.5, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_H, cx - gap - 6.0, cy - 3.0, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_H, cx + gap, cy - 3.0, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, cx - 3.0, cy - gap - 6.0, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, cx - 3.0, cy + gap, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_DOT, cx - 2.0, cy - 2.0, 1.0, 1.0, g_UI_WHITE, 255);
 
-    // health, bottom left: plate, track, fill
-    used = used + hud_plate(8.0, 218.0, 74.0, 6.0);
-    used = used + hud_rect(8.0, 218.0, 74.0, 6.0, g_UI_BLACK, 190);
-    used = used + hud_rect(9.0, 219.0, 52.0, 4.0, g_UI_GOOD, 255);
-    used = used + hud_text(8.0, 208.0, "HP 72", g_UI_WHITE, 40);
+    // health, bottom left: plate, track, fill, heart icon
+    used = used + hud_plate(18.0, 218.0, 64.0, 6.0);
+    used = used + hud_rect(18.0, 218.0, 64.0, 6.0, g_UI_BLACK, 200);
+    used = used + hud_rect(19.0, 219.0, 45.0, 4.0, g_UI_GOOD, 255);
+    used = used + hud_sprite(HUD_ICON_HEART, 8.0, 216.0, 1.0, 1.0, g_UI_DANGER, 255);
+    used = used + hud_text(19.0, 208.0, "72", g_UI_WHITE, 16);
 
-    // XP bar, bottom left under health — NS_CORE, the progression colour
-    used = used + hud_plate(8.0, 228.0, 74.0, 3.0);
-    used = used + hud_rect(8.0, 228.0, 74.0, 3.0, g_UI_BLACK, 190);
-    used = used + hud_rect(9.0, 229.0, 31.0, 1.0, g_NS_CORE, 255);
+    // XP bar under it — NS_CORE, the progression colour, and nothing else
+    used = used + hud_plate(18.0, 228.0, 64.0, 3.0);
+    used = used + hud_rect(18.0, 228.0, 64.0, 3.0, g_UI_BLACK, 200);
+    used = used + hud_rect(19.0, 229.0, 27.0, 1.0, g_UI_XP, 255);
+    used = used + hud_sprite(HUD_ICON_XP, 8.0, 226.0, 1.0, 1.0, g_UI_XP, 255);
 
-    // ammo, bottom right, amber numerals on a plate
-    used = used + hud_plate(250.0, 216.0, 62.0, 10.0);
-    used = used + hud_rect(250.0, 216.0, 62.0, 10.0, g_UI_BLACK, 190);
-    used = used + hud_text(253.0, 218.0, "24/120", g_UI_AMBER, 40);
+    // ammo, bottom right: FONT_BIG numerals on a plate, magazine in micro
+    used = used + hud_plate(248.0, 212.0, 64.0, 14.0);
+    used = used + hud_rect(248.0, 212.0, 64.0, 14.0, g_UI_BLACK, 200);
+    used = used + hud_sprite(HUD_ICON_AMMO, 250.0, 214.0, 1.0, 1.0, g_UI_AMBER, 255);
+    used = used + hud_text_big(262.0, 213.0, "24", g_UI_AMBER, 16);
+    used = used + hud_text(281.0, 219.0, "/120", g_UI_DIM, 20);
 
     // compass strip, top centre
     used = used + hud_plate(cx - 46.0, 6.0, 92.0, 9.0);
-    used = used + hud_rect(cx - 46.0, 6.0, 92.0, 9.0, g_UI_BLACK, 160);
+    used = used + hud_rect(cx - 46.0, 6.0, 92.0, 9.0, g_UI_BLACK, 170);
     let yawn: f64 = g_yaw;
     while (yawn < 0.0) { yawn = yawn + 360.0; }
     while (yawn >= 360.0) { yawn = yawn - 360.0; }
@@ -2056,28 +1818,37 @@ fn hud_build(p_si: i32) {
         let ang: f64 = f64(t) * 45.0 - yawn;
         while (ang < -180.0) { ang = ang + 360.0; }
         while (ang > 180.0) { ang = ang - 360.0; }
-        if (ang > -46.0 && ang < 46.0) {
+        if (ang > -44.0 && ang < 44.0) {
             let tx: f64 = cx + ang * 1.0;
-            let h: f64 = 3.0;
+            let id: i32 = HUD_TICK_MINOR;
             let c: i32 = g_UI_DIM;
-            if (t % 2 == 0) { h = 6.0; c = g_UI_WHITE; }
-            used = used + hud_rect(tx, 7.0, 1.0, h, c, 255);
+            if (t % 2 == 0) { id = HUD_TICK_MAJOR; c = g_UI_WHITE; }
+            used = used + hud_sprite(id, tx, 7.0, 1.0, 1.0, c, 255);
         }
     }
-    used = used + hud_rect(cx, 6.0, 1.0, 9.0, g_UI_AMBER, 255);
+    used = used + hud_sprite(HUD_CHEVRON, cx - 2.0, 4.0, 1.0, 1.0, g_UI_AMBER, 255);
 
-    // minimap chrome, top right
-    used = used + hud_plate(268.0, 22.0, 44.0, 44.0);
-    used = used + hud_rect(268.0, 22.0, 44.0, 44.0, g_UI_BLACK, 96);
-    used = used + hud_rect(289.0, 43.0, 2.0, 2.0, g_UI_WHITE, 255);
+    // minimap, top right: hudgen's corner brackets (flipped via the uv rect)
+    used = used + hud_rect(268.0, 22.0, 44.0, 44.0, g_UI_BLACK, 110);
+    // hudgen ships ONE corner bracket and expects the other three to be uv
+    // flips. Mirrored uvs (u1 < u0) drew nothing under the software renderer,
+    // so all four are drawn unflipped and the finding is in the task report.
+    hudgen_rect(HUD_MM_CORNER, g_rect, 0);
+    let mw: f64 = f64(g_rect[2]);
+    let mh: f64 = f64(g_rect[3]);
+    used = used + hud_sprite(HUD_MM_CORNER, 268.0, 22.0, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_MM_CORNER, 312.0 - mw, 22.0, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_MM_CORNER, 268.0, 66.0 - mh, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_MM_CORNER, 312.0 - mw, 66.0 - mh, 1.0, 1.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_ICON_PLAYER, 288.0, 42.0, 1.0, 1.0, g_UI_WHITE, 255);
     let nb: i32 = g_pr_kind.length;
     let blips: i32 = 0;
     for (let k = 0; k < nb; k++) {
-        if (g_pr_kind[k] == KIND_ENEMY && blips < 6) {
+        if (g_pr_kind[k] == K_ENEMY && blips < 6) {
             let bx: f64 = 290.0 + (g_pr_x[k] - g_camx) * 0.55;
             let by: f64 = 44.0 + (g_pr_z[k] - g_camz) * 0.55;
-            if (bx > 269.0 && bx < 310.0 && by > 23.0 && by < 64.0) {
-                used = used + hud_rect(bx, by, 2.0, 2.0, g_UI_DANGER, 255);
+            if (bx > 269.0 && bx < 308.0 && by > 23.0 && by < 62.0) {
+                used = used + hud_sprite(HUD_ICON_ENEMY, bx, by, 1.0, 1.0, g_UI_DANGER, 255);
                 blips++;
             }
         }
@@ -2086,19 +1857,16 @@ fn hud_build(p_si: i32) {
     // scene label + budget readout — this is a verification harness, the frame
     // says which frame it is. It gets a plate: `hud_worst_case` caught this
     // text disappearing into a noon sky, which is the whole point of it.
-    used = used + hud_rect(4.0, 4.0, 118.0, 20.0, g_UI_BLACK, 150);
-    used = used + hud_text(6.0, 6.0, g_sc_id[p_si], g_UI_WHITE, 60);
-    used = used + hud_text(6.0, 15.0, `TOD ${i32(scene_f(p_si, SC_TOD))} FOG ${i32(g_ev[TOD_FFAR])}M`,
+    used = used + hud_rect(4.0, 4.0, 108.0, 19.0, g_UI_BLACK, 165);
+    used = used + hud_text(6.0, 6.0, g_sc_label[p_si], g_UI_WHITE, 60);
+    used = used + hud_text(6.0, 15.0,
+                           `${i32(tod_clock_hours(g_day_t) + 0.5)}H FOG ${i32(g_fog_far)}M`,
                            g_UI_DIM, 60);
 
-    // hit-direction arc + hitmarker on the muzzle scenes: the hit-feedback
-    // contract is five things in one frame, and this is two of them.
+    // the hit-feedback contract: hitmarker + damage number in the same frame
     if ((g_flags & F_MUZZLE) != 0) {
-        used = used + hud_rect(cx - 6.0, cy - 6.0, 4.0, 1.0, g_UI_DANGER, 255);
-        used = used + hud_rect(cx + 2.0, cy - 6.0, 4.0, 1.0, g_UI_DANGER, 255);
-        used = used + hud_rect(cx - 6.0, cy + 5.0, 4.0, 1.0, g_UI_DANGER, 255);
-        used = used + hud_rect(cx + 2.0, cy + 5.0, 4.0, 1.0, g_UI_DANGER, 255);
-        used = used + hud_text(cx + 14.0, cy - 18.0, "84", g_UI_AMBER, 20);
+        used = used + hud_sprite(HUD_HITMARK, cx - 8.0, cy - 8.0, 1.0, 1.0, g_UI_DANGER, 255);
+        used = used + hud_text(cx + 14.0, cy - 18.0, "84", g_UI_AMBER, 12);
     }
     if (used > g_HUD_TRI_CAP) {
         eprint(`shot: HUD emitted ${used} triangles, over the ${g_HUD_TRI_CAP} cap`);
@@ -2106,11 +1874,51 @@ fn hud_build(p_si: i32) {
 }
 
 // ===========================================================================
-// 10. OUTPUT — the PNG and its stats report, written as an inseparable pair
+// 11. THE ATLAS CONTACT SHEET  (--scene atlas_sheet, GATE 2)
+// ---------------------------------------------------------------------------
+// All four textures, straight out of src/art, in one frame, through the same
+// batch/flush path as everything else. ATLAS_FX and ATLAS_HUD are drawn 1:1 —
+// every texel of the sprite sheet and both fonts is really there. ATLAS_WORLD
+// is 256x256 and the target is 240 tall, so it is drawn at 1:2; `texview.hml`
+// is the magnified per-cell view. TEX_SKY is 512x160, drawn at 1:2.
+//
+// Note what the sheet is FOR: it is the only image in docs/shots that shows
+// what has NOT been built. Cells 40..63 of ATLAS_WORLD are the magenta
+// missing-texture tile on purpose (CLAUDE.md §9 rule 7) — those are entity
+// skins, weapon skins, decals and signage, and they belong to later tasks.
+// ===========================================================================
+
+fn sheet_quad(p_tex, p_x: f64, p_y: f64, p_w: f64, p_h: f64): i32 {
+    let out: i32 = quad_screen_uv(g_bhud, p_tex, p_x, p_y, p_w, p_h,
+                                  0.0, 0.0, 1.0, 1.0, 255, 255, 255, 255, 0.5);
+    return out;
+}
+
+fn atlas_sheet_build(p_si: i32) {
+    // Every label is FONT_MICRO out of hudgen, so the sheet is also a legibility
+    // test of the font it is labelled with. Kept short: this frame's HUD layer
+    // is still measured against the 250-triangle cap.
+    // ATLAS_WORLD — 8x8 cells of 32, 41 of them generated
+    hud_text(4.0, 4.0, "WORLD 256 1:2", g_UI_WHITE, 56);
+    sheet_quad(g_tex_world, 4.0, 12.0, 128.0, 128.0);
+    // ATLAS_FX — 8x8 cells of 16, 28 of them generated, additive
+    hud_text(140.0, 4.0, "FX 128 1:1", g_UI_WHITE, 44);
+    sheet_quad(g_tex_fx, 140.0, 12.0, 128.0, 128.0);
+    // ATLAS_HUD — both fonts and 26 sprites
+    hud_text(140.0, 76.0, "HUD 128 1:1", g_UI_WHITE, 48);
+    sheet_quad(g_tex_hud, 140.0, 84.0, 128.0, 60.0);
+    // TEX_SKY — the panorama for this scene's ToD
+    hud_text(4.0, 148.0, "SKY 512X160 1:2", g_UI_WHITE, 64);
+    sheet_quad(g_tex_sky, 4.0, 156.0, 256.0, 80.0);
+}
+
+// ===========================================================================
+// 12. OUTPUT — the PNG and its stats report, written as an inseparable pair
 // ===========================================================================
 
 let g_fb: ptr = alloc(320 * 240 * 4);
 let g_upscale: i32 = 3;
+let g_day_t: f64 = 0.5;
 
 fn fnv1a_rgb(p_buf: buffer, p_n: i32): u64 {
     let h: u64 = 14695981039346656037;
@@ -2172,8 +1980,9 @@ fn dirname_of(p_path: string): string {
 }
 
 // The report. Scene provenance first (so the PNG is reproducible from the text
-// alone), then the full §4 counter and stage-timer table from stats.hml, then
-// the budget verdict. A picture without this is not evidence.
+// alone), then the ART provenance (so nobody can ever again wonder whether a
+// screenshot depicts the game's art), then the full §4 counter and stage-timer
+// table from stats.hml, then the budget verdict.
 fn build_report(p_si: i32, p_out: string, p_checksum: u64, p_headless: i32): string {
     let s: string = "";
     s = s + "== NIGHTSHADE SHOT ==\n";
@@ -2184,14 +1993,35 @@ fn build_report(p_si: i32, p_out: string, p_checksum: u64, p_headless: i32): str
     s = s + `resolution    ${g_RES_W}x${g_RES_H} upscaled x${g_upscale}\n`;
     s = s + `camera        ${g_camx}, ${g_camy}, ${g_camz}\n`;
     s = s + `look          yaw ${g_yaw} pitch ${g_pitch} fov ${g_fov}\n`;
-    s = s + `tod           ${scene_f(p_si, SC_TOD)} h   weather ${wx_name(i32(scene_f(p_si, SC_WX)))}\n`;
+    s = s + `tod           ${scene_f(p_si, SC_TOD)} h  (day_t ${g_day_t})  weather ${wx_name(i32(scene_f(p_si, SC_WX)))}\n`;
     s = s + `seed          ${i32(scene_f(p_si, SC_SEED))}\n`;
-    s = s + `fog           near ${g_ev[TOD_FNEAR]} far ${g_ev[TOD_FFAR]} mist ${g_ev[TOD_MIST]}\n`;
+    s = s + `fog           near ${g_fog_near} far ${g_fog_far} mist ${tod_mist_density()}\n`;
     s = s + `far plane     ${env_far_plane(g_env)}\n`;
     s = s + `image fnv1a   ${p_checksum}\n`;
     s = s + `relative mouse rc ${g_relative_mouse_rc} (non-fatal; always -1 headless)\n`;
+    s = s + "\n-- art provenance (src/art, imported, not reimplemented) --\n";
+    s = s + `  palette.hml   pal_r/g/b/pack + every colour named in this frame\n`;
+    s = s + `  tod.hml       tod_eval -> RenderEnv; tod_sky_keys -> skygen\n`;
+    s = s + `  texgen.hml    ATLAS_WORLD ${g_ATLAS_WORLD_PX}px, ${g_world_cells} generated cells, ${g_TEXEL_CM_GROUND} cm/texel ground\n`;
+    s = s + `  skygen.hml    TEX_SKY ${skygen_w()}x${skygen_h()}, ${skygen_star_count()} stars\n`;
+    s = s + `                zenith  ${i32(g_skyk[SKYK_ZEN])},${i32(g_skyk[SKYK_ZEN + 1])},${i32(g_skyk[SKYK_ZEN + 2])}`;
+    s = s + `  mid ${i32(g_skyk[SKYK_MID])},${i32(g_skyk[SKYK_MID + 1])},${i32(g_skyk[SKYK_MID + 2])}`;
+    s = s + `  horizon ${i32(g_skyk[SKYK_HOR])},${i32(g_skyk[SKYK_HOR + 1])},${i32(g_skyk[SKYK_HOR + 2])}\n`;
+    s = s + `                cloud lit ${i32(g_skyk[SKYK_CLOUD_LIT])},${i32(g_skyk[SKYK_CLOUD_LIT + 1])},${i32(g_skyk[SKYK_CLOUD_LIT + 2])}`;
+    s = s + `  cover bias ${g_skyk[SKYK_CLOUD_COVER]}  star ${g_skyk[SKYK_STAR_ALPHA]}\n`;
+    s = s + `                sun dir ${g_skyk[SKYK_SUN]},${g_skyk[SKYK_SUN + 1]},${g_skyk[SKYK_SUN + 2]}  visible elevation band 0..${i32(g_fov * 0.5 + g_pitch)} deg\n`;
+    sky_basis();
+    sky_uv_at(-1.0, 1.0);
+    let sku0: f64 = g_sk_u; let skv0: f64 = g_sk_v;
+    sky_uv_at(0.0, 0.0);
+    let skuc: f64 = g_sk_u; let skvc: f64 = g_sk_v;
+    sky_uv_at(1.0, -1.0);
+    s = s + `                panorama uv  top-left ${sku0},${skv0}  centre ${skuc},${skvc}  bottom-right ${g_sk_u},${g_sk_v}\n`;
+    s = s + `  fxgen.hml     ATLAS_FX ${FX_CELL_COUNT} additive sprites\n`;
+    s = s + `  hudgen.hml    ATLAS_HUD ${HUD_RECT_COUNT} sprites + FONT_MICRO + FONT_BIG\n`;
+    s = s + `  meshgen.hml   ${meshgen_count()} meshes, ${g_mesh_tris} triangles in the library\n`;
     if (p_headless == 1) {
-        s = s + "WARNING: SDL_VIDEODRIVER=dummy selects the SOFTWARE renderer, which\n";
+        s = s + "\nWARNING: SDL_VIDEODRIVER=dummy selects the SOFTWARE renderer, which\n";
         s = s + "         collapses BLEND_ADD to BLEND inside SDL_RenderGeometry. The FX\n";
         s = s + "         layer's additivity in this PNG is NOT representative of a real\n";
         s = s + "         display. Judge glow/muzzle brightness on DISPLAY=:0.\n";
@@ -2201,14 +2031,14 @@ fn build_report(p_si: i32, p_out: string, p_checksum: u64, p_headless: i32): str
     s = s + "\n-- budget (ARCHITECTURE.md §8) --\n";
     let tris: i32 = stat_get(STAT_TRIS_SKY) + stat_get(STAT_TRIS_WORLD)
                   + stat_get(STAT_TRIS_FX) + stat_get(STAT_TRIS_HUD);
-    s = s + `  triangles drawn = ${tris}  (2500 steady / 3500 hard clamp)\n`;
+    s = s + `  triangles drawn = ${tris}  (${g_TRIS_STEADY} steady / ${g_TRIS_CLAMP} hard clamp)\n`;
     s = s + `  draw calls      = ${stat_get(STAT_DRAW_CALLS)}  (unbudgeted)\n`;
     s = s + `  batch overflow  = ${stat_get(STAT_BATCH_OVERFLOW)}  (must be 0)\n`;
     s = s + `  hud triangles   = ${stat_get(STAT_TRIS_HUD)}  (cap ${g_HUD_TRI_CAP})\n`;
     s = s + `  dynamic lights  = ${stat_get(STAT_LIGHTS)}  (cap 2, BUDGET_ACTUAL.md)\n`;
     let over: string = "OK";
-    if (tris > 3500) { over = "OVER HARD CLAMP"; }
-    else if (tris > 2500) { over = "over steady budget"; }
+    if (tris > g_TRIS_CLAMP) { over = "OVER HARD CLAMP"; }
+    else if (tris > g_TRIS_STEADY) { over = "over steady budget"; }
     s = s + `  verdict         = ${over}\n`;
     let fr: f64 = stat_ms(STAT_T_FRAME);
     let sk: f64 = stat_ms(STAT_T_SKYBAKE);
@@ -2227,8 +2057,6 @@ fn build_report(p_si: i32, p_out: string, p_checksum: u64, p_headless: i32): str
 fn write_pair(p_png: string, p_report: string): i32 {
     let dir: string = dirname_of(p_png);
     if (dir.length > 0 && exists(dir) == false) {
-        // Cold path, once per run: a try here is the difference between a
-        // clear error and an uncaught exception in a CI log.
         try { make_dirs(dir); }
         catch (e) {
             eprint(`shot: cannot create ${dir}: ${e}`);
@@ -2259,12 +2087,7 @@ fn write_pair(p_png: string, p_report: string): i32 {
 }
 
 // ===========================================================================
-// 11. THE COMPILED-ONLY GUARD
-// ---------------------------------------------------------------------------
-// ARCHITECTURE.md §7: compiled is the shipping target, compiled is 5-18x the
-// interpreter, and the shipped artifact is a self-contained binary. Verify
-// what you ship. The interpreter passes the SCRIPT PATH as args[0]; a compiled
-// binary passes its own executable path, which never ends in `.hml`.
+// 13. THE COMPILED-ONLY GUARD
 // ===========================================================================
 
 fn running_interpreted(): bool {
@@ -2275,7 +2098,7 @@ fn running_interpreted(): bool {
 }
 
 // ===========================================================================
-// 12. CLI
+// 14. CLI
 // ===========================================================================
 
 fn is_number(p_s: string): bool {
@@ -2338,7 +2161,7 @@ fn scene_list() {
 }
 
 // ===========================================================================
-// 13. ENGINE LIFECYCLE + ONE SHOT
+// 15. ENGINE LIFECYCLE + ONE SHOT
 // ===========================================================================
 
 let g_inited: i32 = 0;
@@ -2374,13 +2197,10 @@ fn shot_init(): i32 {
     g_bfx = batch_new(g_CAP_FX, 80.0, LAYER_FX);
     g_bhud = batch_new(g_CAP_HUD, 4.0, LAYER_HUD);
 
-    texgen_build_world_atlas();
-    fxgen_build_atlas();
-    hudgen_build_atlas();
-    meshgen_build_all();
-    g_tex_world = atlas_upload(g_win, g_atlas_world, BLEND_BLEND);
-    g_tex_fx = atlas_upload(g_win, g_atlas_fx, BLEND_ADD);
-    g_tex_hud = atlas_upload(g_win, g_atlas_hud, BLEND_BLEND);
+    art_build(g_win);
+    if (g_world_cells < 41) {
+        eprint(`shot: texgen wrote ${g_world_cells} cells, expected 41`);
+    }
     g_inited = 1;
     let ok: i32 = 0;
     return ok;
@@ -2391,6 +2211,13 @@ fn shot_shutdown() {
     if (g_win != null) { window_close(g_win); g_win = null; }
     g_inited = 0;
 }
+
+let g_cam_override: i32 = 0;
+let g_look_override: i32 = 0;
+let g_fov_override: i32 = 0;
+let g_yaw_ovr: f64 = 0.0;
+let g_pitch_ovr: f64 = 0.0;
+let g_fov_ovr: f64 = 70.0;
 
 // Render one scene end to end. Deterministic: every step below is a pure
 // function of (scene index, seed, overrides).
@@ -2409,6 +2236,7 @@ fn shot_render(p_si: i32): u64 {
 
     g_ground_seed = (seed & 1048575) + 1;
     g_ridge = scene_f(si, SC_RIDGE);
+    g_flags = i32(scene_f(si, SC_FLAGS));
     g_ground_y = terrain_h(g_camx, g_camz);
     if (g_cam_override == 0) {
         // eye height: 1.7 m standing, 2.4 m on the hub's raised path
@@ -2417,19 +2245,17 @@ fn shot_render(p_si: i32): u64 {
         g_camy = g_ground_y + eye;
     }
     scene_set(si, SC_GROUND, g_ground_y);
+    g_day_t = tod_t_from_hours(scene_f(si, SC_TOD));
 
     // ToD must be evaluated BEFORE the world is built and baked: the bake
     // folds this frame's sun and ambient into every vertex colour.
-    let lightning: i32 = 0;
-    if ((i32(scene_f(si, SC_FLAGS)) & F_LIGHTNING) != 0) { lightning = 1; }
-    tod_eval(g_env, scene_f(si, SC_TOD), i32(scene_f(si, SC_WX)), lightning,
-             scene_f(si, SC_FOGFAR), scene_f(si, SC_MIST),
-             g_camx, g_camy, g_camz, g_ground_y);
+    tod_apply(si);
     emit_set_env(g_env);
-    world_build(si, seed, i32(scene_f(si, SC_WX)));
+    world_build(si, seed);
 
-    let lx: f64 = g_ev[TOD_SUNX]; let ly: f64 = g_ev[TOD_SUNY]; let lz: f64 = g_ev[TOD_SUNZ];
-    if (ly < 0.0) { lx = 0.0 - lx; ly = 0.0 - ly; lz = 0.0 - lz; }
+    let lx: f64 = env_field(g_env, ENV_SUN_X);
+    let ly: f64 = env_field(g_env, ENV_SUN_Y);
+    let lz: f64 = env_field(g_env, ENV_SUN_Z);
     bake_all(lx, ly, lz);
 
     frame_render(si);
@@ -2438,22 +2264,15 @@ fn shot_render(p_si: i32): u64 {
     return out;
 }
 
-let g_cam_override: i32 = 0;
-let g_look_override: i32 = 0;
-let g_fov_override: i32 = 0;
-let g_yaw_ovr: f64 = 0.0;
-let g_pitch_ovr: f64 = 0.0;
-let g_fov_ovr: f64 = 70.0;
-
 // ===========================================================================
-// 14. SELFTEST — the harness verifies itself
+// 16. SELFTEST — the harness verifies itself
 // ---------------------------------------------------------------------------
 // Exit status is the contract: 0 iff every assertion passed AND the expected
 // NUMBER of assertions ran. A probe whose denominator can move cannot be
 // trusted by a gate script.
 // ===========================================================================
 
-let g_EXPECTED_ASSERTIONS: i32 = 29;
+let g_EXPECTED_ASSERTIONS: i32 = 38;
 let g_n: i32 = 0;
 let g_pass: i32 = 0;
 
@@ -2473,8 +2292,8 @@ fn selftest(): i32 {
     print("shot.hml selftest");
 
     // --- 1. the scene registry ------------------------------------------
-    eqi("every ART_BIBLE money shot plus hud_worst_case, budget_worst and a"
-        + " flat reference are registered", scene_count(), 8);
+    eqi("every ART_BIBLE money shot plus hud_worst_case, budget_worst, a flat"
+        + " reference and the atlas sheet are registered", scene_count(), 9);
     ok("ridge_golden registered", scene_index("ridge_golden") >= 0);
     ok("muzzle_fog registered", scene_index("muzzle_fog") >= 0);
     ok("hub_dawn registered", scene_index("hub_dawn") >= 0);
@@ -2482,6 +2301,7 @@ fn selftest(): i32 {
     ok("storm_assault registered", scene_index("storm_assault") >= 0);
     ok("hud_worst_case registered", scene_index("hud_worst_case") >= 0);
     ok("budget_worst registered", scene_index("budget_worst") >= 0);
+    ok("atlas_sheet registered (GATE 2)", scene_index("atlas_sheet") >= 0);
     eqi("an unknown scene id resolves to -1", scene_index("no_such_scene"), -1);
 
     // --- 2. the compiled-only guard --------------------------------------
@@ -2492,20 +2312,31 @@ fn selftest(): i32 {
     eqi("weather names round-trip", wx_parse(wx_name(WX_STORM)), WX_STORM);
     eqi("an unknown weather name is rejected", wx_parse("fog_of_war"), -1);
 
-    // --- 4. ToD is deterministic and clamps FOG_FAR ----------------------
-    tod_eval(g_env, 12.0, WX_CLEAR, 0, -1.0, -1.0, 0.0, 1.7, 0.0, 0.0);
-    let noon_far: f64 = g_ev[TOD_FFAR];
-    tod_eval(g_env, 22.0, WX_CLEAR, 0, -1.0, -1.0, 0.0, 1.7, 0.0, 0.0);
-    let night_far: f64 = g_ev[TOD_FFAR];
-    tod_eval(g_env, 12.0, WX_CLEAR, 0, -1.0, -1.0, 0.0, 1.7, 0.0, 0.0);
-    ok("tod_eval is a pure function of its arguments", g_ev[TOD_FFAR] == noon_far);
-    ok("night has a much shorter draw distance than noon (the pacing lever)",
-       night_far < noon_far * 0.5);
-    ok("FOG_FAR never exceeds 72 m", noon_far <= 72.0);
-    tod_eval(g_env, 12.0, WX_CLEAR, 0, 500.0, -1.0, 0.0, 1.7, 0.0, 0.0);
-    ok("a FOG_FAR override is still clamped to 72 m", g_ev[TOD_FFAR] <= 72.0);
+    // --- 4. the real art is loaded, not a stand-in ------------------------
+    eqi("texgen generated all 41 world tiles", g_world_cells, 41);
+    ok("meshgen built the whole library",
+       meshgen_count() > 30 && g_mesh_tris > 1000);
+    ok("meshgen named a real asset", meshgen_name(MESH_TREE0) == "tree_lod0");
+    ok("tree LOD really steps down",
+       meshgen_tris(MESH_TREE0) > meshgen_tris(MESH_TREE1)
+       && meshgen_tris(MESH_TREE1) > meshgen_tris(MESH_TREE2));
+    ok("texgen cell names are the real table",
+       texgen_cell_name(14) == "COBBLE" && fxgen_cell_name(FX_EMBER) == "EMBER");
+    ok("skygen baked the real panorama",
+       skygen_w() == 512 && skygen_h() == 160 && skygen_star_count() > 100);
 
-    // --- 5. the RNG is seeded, reproducible and never throws -------------
+    // --- 5. ToD: the hour<->day_t inversion and the fog cap ---------------
+    ok("the hour inversion round-trips at noon",
+       tod_clock_hours(tod_t_from_hours(12.0)) - 12.0 < 0.001
+       && 12.0 - tod_clock_hours(tod_t_from_hours(12.0)) < 0.001);
+    ok("the hour inversion round-trips at golden hour",
+       tod_clock_hours(tod_t_from_hours(18.25)) - 18.25 < 0.001
+       && 18.25 - tod_clock_hours(tod_t_from_hours(18.25)) < 0.001);
+    ok("the hour inversion round-trips after midnight",
+       tod_clock_hours(tod_t_from_hours(2.0)) - 2.0 < 0.001
+       && 2.0 - tod_clock_hours(tod_t_from_hours(2.0)) < 0.001);
+
+    // --- 6. the RNG is seeded, reproducible and never throws -------------
     rnd_reseed(1337);
     let a1: f64 = rnd01(); let a2: f64 = rnd01();
     rnd_reseed(1337);
@@ -2521,7 +2352,7 @@ fn selftest(): i32 {
     }
     ok("20 000 draws stay in [0,1) and none of the u64 mixing traps", inrange);
 
-    // --- 6. a real render, twice, byte-for-byte --------------------------
+    // --- 7. a real render, twice, byte-for-byte --------------------------
     let si: i32 = scene_index("ridge_golden");
     let c1: u64 = shot_render(si);
     let t1: i32 = stat_get(STAT_TRIS_WORLD);
@@ -2531,21 +2362,27 @@ fn selftest(): i32 {
     let c2: u64 = shot_render(si);
     ok("the same command renders byte-identical pixels twice", c1 == c2);
     ok("the world layer actually drew geometry", t1 > 200);
-    ok("the sky layer drew", stat_get(STAT_TRIS_SKY) > 0);
+    ok("the sky layer drew the panorama", stat_get(STAT_TRIS_SKY) > 0);
     ok("the HUD drew and stayed under its 250-triangle cap",
        hud1 > 0 && hud1 <= g_HUD_TRI_CAP);
     eqi("no batch overflowed on the reference scene", ov1, 0);
+    ok("FOG_FAR never exceeds the config cap", g_fog_far <= g_FOG_FAR_CAP);
     ok("the frustum rejected part of the chunk ring",
        stat_get(STAT_CHUNKS_CULLED) > 0);
     ok("at least one draw call was issued per populated layer", dc1 >= 3);
     ok("the report carries the whole §4 table",
        stat_report_string_now().length > 900);
 
-    // --- 7. a different scene is a different picture ---------------------
+    // --- 8. a different scene is a different picture ---------------------
     let c3: u64 = shot_render(scene_index("muzzle_fog"));
     ok("a different scene id produces a different image", c3 != c1);
 
-    // --- 8. the PNG and its stats report are inseparable -----------------
+    // --- 9. the atlas sheet renders and is not the 3D path ---------------
+    let c4: u64 = shot_render(scene_index("atlas_sheet"));
+    ok("the atlas sheet renders", c4 != c1 && c4 != c3);
+    eqi("the atlas sheet draws no world geometry", stat_get(STAT_TRIS_WORLD), 0);
+
+    // --- 10. the PNG and its stats report are inseparable ----------------
     let png: string = "/tmp/shot_selftest.png";
     let sp: string = stats_path_for(png);
     if (exists(png)) { remove_file(png); }
@@ -2568,7 +2405,7 @@ fn selftest(): i32 {
 }
 
 // ===========================================================================
-// 15. MAIN
+// 17. MAIN
 // ===========================================================================
 
 fn main() {
