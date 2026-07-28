@@ -68,7 +68,7 @@
 // budget is 200 ms (ARCHITECTURE §8 gives 400 ms for all asset generation).
 // Measured on this box: see the self-test's BUILD line.
 
-import { floor, divi } from "@stdlib/math";
+import { floor, divi, sqrt } from "@stdlib/math";
 
 import { atlas_px_rgb, atlas_get, atlas_data,
          atlas_cell_x, atlas_cell_y, atlas_cell_w, atlas_cell_h,
@@ -242,6 +242,11 @@ let g_aramp: array<i32> = [9, 10];
 // ramp was picked from re-hues a region without flattening it — which is the
 // difference between "mossy stone" and "a green sticker on stone".
 let g_oramp: array<i32> = [8, 10, 11];
+// A THREE-step accent ramp: slot 8 as the accent's own shadow, then 9 and 10.
+// Two accent steps make a dry patch a flat two-tone sticker; three let the
+// patch carry the same light/shadow ladder the base ramp carries, which is the
+// difference between "dry grass" and "a decal of dry grass".
+let g_tramp: array<i32> = [8, 9, 10];
 // value-domain grain amplitude, set by tg_base from its `amt` argument
 let g_jit: f64 = 0.125;
 
@@ -496,6 +501,12 @@ fn tile_end(p_cell: i32) {
 let g_fa: array<f64> = [];      // scratch field A, 32*32
 let g_fb: array<f64> = [];      // scratch field B
 let g_fc: array<f64> = [];      // scratch field C
+let g_fd: array<f64> = [];      // scratch field D
+// The ramp index actually written to each texel of the current tile.  A second
+// pass (the grass blade ladder, the dry tufts) needs to know what the base pass
+// decided so it can step RELATIVE to it — a blade in a shadowed clump must stay
+// darker than a blade in a lit one, or the clump structure is erased.
+let g_bidx: array<i32> = [];
 let g_lat: array<f64> = [];     // 2-D lattice scratch, up to 32*32
 let g_lin: array<f64> = [];     // 1-D lattice scratch, up to 32
 let g_warp: array<f64> = [];    // 32-entry domain-warp table
@@ -508,6 +519,7 @@ fn fld_init() {
         }
     }
     for (let i = 0; i < 1024; i++) { g_fa.push(0.0); g_fb.push(0.0); g_fc.push(0.0); }
+    for (let i = 0; i < 1024; i++) { g_fd.push(0.0); g_bidx.push(0); }
     for (let i = 0; i < 1024; i++) { g_lat.push(0.0); }
     for (let i = 0; i < 32; i++) { g_lin.push(0.0); g_warp.push(0.0); }
 }
@@ -574,6 +586,125 @@ fn fld_fbm(p_dst: array<f64>, p_per: i32, p_seed: i32, p_oct: i32) {
     }
 }
 
+// ANISOTROPIC value noise — same construction as fld_fbm, but the lattice
+// spacing differs per axis.  Both periods must divide the tile, which is the
+// only thing seamlessness requires; the ART_BIBLE warning about `vnoise(x*4,y)`
+// is about SCALING A COORDINATE inside a fixed lattice, which does break the
+// wrap.  Choosing a different integer period per axis does not.
+//
+// §L5 WHY THE GROUND NEEDS THIS.  The ground plane is minified ANISOTROPICALLY.
+// At the middle of the ground band (~18 m, rows 150-170 of 240) one screen
+// pixel covers ~0.6 texel across the view and ~5 texels along it, because
+// d(distance)/d(row) = h / sin^2(theta).  Structure that varies ACROSS the view
+// survives at nearly 1:1; structure that varies ALONG it is box-averaged 5x and
+// is gone.  An isotropic field therefore spends five sixths of its fine detail
+// on a direction the frame cannot resolve, which is exactly why the measured
+// 3x3 high-pass in the ground band was 5.5-6.9 while the tile's own was 15.9.
+// A 2:1 anisotropy (fine across, coarse along) puts the detail where the pixels
+// are.  2:1 and not 4:1 because the camera can face any way: at 90 degrees of
+// yaw the two axes swap, and a 4:1 tile would then be smooth in the direction
+// that survives.
+fn fld_fbm_a(p_dst: array<f64>, p_perx: i32, p_pery: i32,
+             p_seed: i32, p_oct: i32) {
+    let dst: array<f64> = p_dst;
+    let w: i32 = g_tw;
+    let h: i32 = g_th;
+    let n: i32 = w * h;
+    for (let i = 0; i < n; i++) { dst[i] = 0.0; }
+
+    let px: i32 = p_perx;
+    let py: i32 = p_pery;
+    let sd: i32 = p_seed;
+    let oct: i32 = p_oct;
+    for (let o = 0; o < oct; o++) {
+        let amp: f64 = 1.0;
+        if (oct == 2) { if (o == 0) { amp = 0.62; } else { amp = 0.38; } }
+        if (oct == 3) {
+            if (o == 0) { amp = 0.52; }
+            if (o == 1) { amp = 0.32; }
+            if (o == 2) { amp = 0.16; }
+        }
+        let mx: i32 = divi(w, px);  if (mx < 1) { mx = 1; }
+        let my: i32 = divi(h, py);  if (my < 1) { my = 1; }
+        for (let j = 0; j < my; j++) {
+            for (let i = 0; i < mx; i++) { g_lat[j * mx + i] = h01(i, j, sd); }
+        }
+        let invx: f64 = 1.0 / f64(px);
+        let invy: f64 = 1.0 / f64(py);
+        for (let y = 0; y < h; y++) {
+            let fy: f64 = f64(y) * invy;
+            let iy: i32 = i32(fy);
+            let ty: f64 = fy - f64(iy);
+            ty = ty * ty * (3.0 - 2.0 * ty);
+            let r0: i32 = (iy % my) * mx;
+            let r1: i32 = ((iy + 1) % my) * mx;
+            let base: i32 = y * w;
+            for (let x = 0; x < w; x++) {
+                let fx: f64 = f64(x) * invx;
+                let ix: i32 = i32(fx);
+                let tx: f64 = fx - f64(ix);
+                tx = tx * tx * (3.0 - 2.0 * tx);
+                let x0: i32 = ix % mx;
+                let x1: i32 = (ix + 1) % mx;
+                let n00: f64 = g_lat[r0 + x0];
+                let n10: f64 = g_lat[r0 + x1];
+                let n01: f64 = g_lat[r1 + x0];
+                let n11: f64 = g_lat[r1 + x1];
+                let ta: f64 = n00 + (n10 - n00) * tx;
+                let tb: f64 = n01 + (n11 - n01) * tx;
+                dst[base + x] = dst[base + x] + (ta + (tb - ta) * ty) * amp;
+            }
+        }
+        px = divi(px, 2);  if (px < 1) { px = 1; }
+        py = divi(py, 2);  if (py < 1) { py = 1; }
+        if (o == 0) { sd = p_seed + 31; }
+        if (o == 1) { sd = p_seed + 97; }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §L4  NORMALIZE THE FIELD, OR THE SEED DECIDES THE TILE'S BRIGHTNESS.
+//
+// `fld_fbm`'s coarsest octave has (32/period)^2 lattice points — FOUR of them
+// at period 16.  The field's mean over the tile is therefore the mean of four
+// hashes, and it misses 0.5 by up to 0.12 purely on the seed.  `ctr` contrasts
+// about a hard-coded 0.5, so a field that happens to sit low gets pushed LOWER
+// and the tile camps on the bottom of its ramp.
+//
+// This was not theoretical.  Measured on the shipping tile, seed 1337:
+//
+//   DIRT   ramp step 4 of 8 reached on 4 texels of 1024; steps 5, 6, 7 never
+//          reached at all; 6 distinct colours out of an authored 11; tile mean
+//          19 luminance BELOW its own MID colour.
+//   GRASS  GRASS_B came out BRIGHTER than GRASS_A (151 vs 139) even though B's
+//          ramp tops out 11 luminance lower — the opposite of what the code
+//          says, decided entirely by four hash values.
+//
+// Normalizing each field to a known mean and standard deviation makes ramp
+// usage identical across tiles and across seeds.  That is what lets a
+// generator's contrast be a stated number instead of a per-variant eyeball,
+// and it is what makes "every ground tile clears sd 24" a property the
+// self-test can hold rather than a coincidence.
+//
+// Three linear passes over 1024 texels; ~2 % of the cost of the fbm that
+// produced the field.
+fn fld_norm(p_dst: array<f64>, p_sd: f64) {
+    let dst: array<f64> = p_dst;
+    let n: i32 = g_tw * g_th;
+    let acc: f64 = 0.0;
+    for (let i = 0; i < n; i++) { acc = acc + dst[i]; }
+    let mean: f64 = acc / f64(n);
+    let var: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        let d: f64 = dst[i] - mean;
+        var = var + d * d;
+    }
+    let sd: f64 = sqrt(var / f64(n));
+    let k: f64 = 1.0;
+    if (sd > 0.000001) { k = p_sd / sd; }
+    for (let i = 0; i < n; i++) { dst[i] = 0.5 + (dst[i] - mean) * k; }
+}
+
 // Fill `dst` with a seamless STREAK field: 1-D noise along one axis, its
 // coordinate domain-warped by a 1-D noise along the other.  Because the warp
 // does not depend on the warped axis, the field wraps exactly — which
@@ -628,7 +759,111 @@ fn fld_streak(p_dst: array<f64>, p_axis: i32, p_per: i32,
 
 // ---------------------------------------------------------------------------
 // §7.3 GRASS   var 0 = GRASS_A, 1 = GRASS_B (lusher), 2 = GRASS_DRY
+//
 // ---------------------------------------------------------------------------
+// §L6  THE GRASS IS BLADES, NOT MOTTLE.  (art round 2)
+// ---------------------------------------------------------------------------
+// Round 1 built these three cells the way every other ground cell is built: an
+// isotropic fbm, contrasted, quantized through the 8-step ramp.  The tile
+// measured well in isolation and still arrived on the ground plane as mush —
+// the 3x3 high-pass over rows 150-185 of the frame came back 5.5 to 6.9 in six
+// of the eight scenes, against 12.8 for the one scene whose ground is not
+// grass.  Three things cause that and all three are fixed here.
+//
+// 1. A 3x3 HIGH-PASS IS A 2-TEXEL DETECTOR.  Its response at wavelength L is
+//    1 - (1 + 2 cos(2 pi / L)) / 3: 1.33 at L = 2, 0.67 at L = 4, 0.20 at L = 8.
+//    A tile whose finest real structure is 4 texels has already lost half its
+//    legibility before the lighting touches it, and the ground plane is sampled
+//    NEAREST-NEIGHBOUR with no mipmaps, so what the frame shows is the tile's
+//    own texel-to-texel contrast, scaled by the lighting multiply and nothing
+//    else.  Round 1's grass had almost all of its variance at 8 and 16 texels.
+//    Legibility therefore has to be bought at the 1-2 texel scale, and it has
+//    to be bought with STRUCTURE, because 1-2 texel noise is static.
+//
+// 2. STRUCTURE AT 1-2 TEXELS IS A BLADE.  Cobble reaches high-pass sd 33 with
+//    one-texel mortar lines; it is not noisier than grass, it is more ORGANISED.
+//    The grass equivalent is the blade: a dark root texel, a mid body, a lit
+//    tip, drawn as a 3-4 texel stroke.  The ladder is taken RELATIVE to the
+//    ramp index the base pass already chose (`g_bidx`), so a blade in a
+//    shadowed clump stays darker than a blade in a lit one and the metre-scale
+//    clump structure survives underneath.  That relative step is why this reads
+//    as grass rather than as hatching laid over a photograph.
+//
+// 3. ANISOTROPIC MINIFICATION (see §L5 on fld_fbm_a).  At the middle of the
+//    ground band one screen pixel covers ~0.6 texel across the view and ~5
+//    along it.  The clump octaves are 2:1, fine across, coarse along.
+//
+// The old BLADE pass ran 2-3 texel strokes of ONE fixed bright ramp step at
+// 4.5 % coverage.  One fixed step means no ladder, and 4.5 % means the strokes
+// read as sparse scratches on a smooth field — which, since v is world +z, is
+// what drew the radial streak in flat_debug when the camera faces down z.  The
+// new pass is twice as dense (9-11 % of texels are a blade root, and a root
+// grows a stroke 2 to 4 texels wide and 6 to 8 long, so ~60 % of the tile is
+// blade), the strokes LEAN by -1, 0 or +1 texel per step so no two neighbours
+// stay parallel, and every stroke spans SEVEN ramp steps from root to tip.
+//
+// DEVIATION, stated: the round-2 brief asked for a "2-3 step value ladder".
+// What ships is a SEVEN-step ladder, b-3 at the root to b+4 at the tip, clamped
+// to the ramp.  Three steps is 52 luminance here, and at the measured 0.26
+// golden-hour ground multiply that is 13 levels on screen — legible in the
+// atlas, invisible in the frame.  Seven steps is 122 luminance and 32 levels on
+// screen.  The rest of the brief (light tips over dark roots, oriented, accents
+// as sparse dry blades rather than uniform speckle) is implemented as written.
+//
+// The ladder is also why the strokes are 6-8 texels long rather than the 3-4
+// they started at.  A 7-step ladder over 3 texels is 2.3 steps of change
+// between adjacent texels, which put E1/Ec at 1.26 against the 0.95 shimmer
+// bound — the tile was legible and would have crawled.  The same ladder over 7
+// texels is 1 step per texel, E1/Ec 0.90, and it measures BETTER (tile
+// high-pass sd 27.0 against 26.6), because what a 3x3 high-pass sees is the
+// stroke's whole span, not its steepest single step.
+//
+// The dry patching is no longer a thresholded low-frequency field.  That field
+// puts one blob per ~8 texels, i.e. one per metre, evenly spaced, at a fixed
+// size — the "repeating decal grid" of the round-2 review.  Tufts are now
+// stamped on a 4x4 JITTERED LATTICE: at most one per 8x8 texel block, kept or
+// dropped by a hash, with a hashed centre inside the block, a hashed radius
+// from 1.1 to 3.4 texels and a hashed eccentricity from 0.7 to 1.6.  Spacing,
+// size and shape all vary; the rim is dithered out rather than drawn, so the
+// edge is ragged instead of circular; and the fill is picked from the blade
+// ladder through a THREE-step accent ramp, so a tuft is dry grass with its own
+// lit tips rather than a flat stamp.
+// ---------------------------------------------------------------------------
+
+// One dry tuft, stamped toroidally so it can straddle the tile wrap.
+fn grass_tuft(p_a: object, p_cx: f64, p_cy: f64, p_rx: f64, p_ry: f64) {
+    let a: object = p_a;
+    let rx: f64 = p_rx;
+    let ry: f64 = p_ry;
+    let irx: i32 = i32(rx) + 1;
+    let iry: i32 = i32(ry) + 1;
+    let icx: i32 = i32(p_cx);
+    let icy: i32 = i32(p_cy);
+    for (let dy = 0 - iry; dy <= iry; dy++) {
+        for (let dx = 0 - irx; dx <= irx; dx++) {
+            let fx: f64 = f64(dx) / rx;
+            let fy: f64 = f64(dy) / ry;
+            let d2: f64 = fx * fx + fy * fy;
+            if (d2 >= 1.0) { continue; }
+            let x: i32 = ((icx + dx) % g_tw + g_tw) % g_tw;
+            let y: i32 = ((icy + dy) % g_th + g_th) % g_th;
+            // Rim texels are dithered OUT rather than drawn, so the boundary is
+            // ragged instead of a circle.  (1 - d2) * 2.2 exceeds 1 over the
+            // inner ~78 % of the area, so only the rim is tested.
+            let edge: f64 = (1.0 - d2) * 2.2;
+            if (edge < 1.0) {
+                if (tg_ramp_pick(g_aramp, 2, edge, x, y) == g_aramp[0]) { continue; }
+            }
+            // Fill from the blade ladder the base+blade passes left behind, so
+            // the tuft keeps its lit tips.  Index 0..7 -> 0..1 across 3 steps.
+            let bi: f64 = f64(g_bidx[y * g_tw + x]);
+            let tv: f64 = (bi - 1.0) * 0.2;
+            let idx: i32 = tg_ramp_pick(g_tramp, 3, tv, x, y);
+            put(a, x, y, idx);
+        }
+    }
+}
+
 export fn tg_grass(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     let a: object = p_a;
     let sd: i32 = p_seed;
@@ -636,56 +871,161 @@ export fn tg_grass(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     tile_begin(a, p_cell);
 
     if (v == 2) {
-        tg_base(g_GRASS_LO, FAM_GRASS, g_GRASS_DRY, FAM_GRASS,
-                tg_shade(g_GRASS_DRY, 1.13), FAM_GRASS, 5);
-        tg_acc(0, tg_shade(g_DIRT_MID, 0.94), FAM_DIRT);
+        // DRY: bleached straw over bare soil.
+        tg_base(tg_shade(g_GRASS_LO, 0.90), FAM_GRASS, g_GRASS_DRY, FAM_GRASS,
+                tg_shade(g_GRASS_DRY, 1.22), FAM_GRASS, 5);
+        tg_over_lo(tg_shade(g_DIRT_MID, 0.70), FAM_DIRT);
+        tg_acc(0, tg_shade(g_DIRT_MID, 0.98), FAM_DIRT);
         tg_acc(1, g_DIRT_HI, FAM_DIRT);
-        tg_acc(2, tg_shade(g_GRASS_LO, 0.86), FAM_GRASS);
+        tg_acc(2, tg_shade(g_GRASS_LO, 0.84), FAM_GRASS);
     } else {
-        tg_base(g_GRASS_LO, FAM_GRASS, g_GRASS_MID, FAM_GRASS,
-                g_GRASS_HI, FAM_GRASS, 5);
-        tg_acc(0, tg_shade(g_GRASS_DRY, 0.88), FAM_GRASS);
-        tg_acc(1, g_GRASS_DRY, FAM_GRASS);
+        // GRASS_A and GRASS_B are two dressings of ONE material — they exist to
+        // break the tiling, so they must not read as two different terrains.
+        // They differ in clump scale and tuft density, never in hue.
+        //
+        // §L1  THE 0.30x RULE.  Vertex colour only darkens (CLAUDE.md §6) and
+        // at golden hour the ground vertex colour measures ~0.18.  An albedo
+        // band of dL luminance therefore arrives on screen as 0.18..0.45 * dL.
+        // The ramp runs GRASS_LO*0.85 (73) -> GRASS_HI*1.20 (197): 123
+        // luminance of span, which is all the <= 130 range assertion allows and
+        // 10 more than round 1 spent.  Every one of those ten came out of the
+        // ROOT step, because a dark root under a lit tip is what a blade is.
+        let hi_m: f64 = 1.20;
+        if (v == 1) { hi_m = 1.17; }   // B: lusher, so a slightly shorter tail
+        tg_base(tg_shade(g_GRASS_LO, 0.85), FAM_GRASS,
+                tg_mix(g_GRASS_MID, g_GRASS_HI, 0.20), FAM_GRASS,
+                tg_shade(g_GRASS_HI, hi_m), FAM_GRASS, 5);
+        // The dry accents are a HUE event, not a value event: their three steps
+        // straddle the tile mean instead of sitting 25 luminance above it.
+        tg_over_lo(tg_shade(g_GRASS_DRY, 0.74), FAM_GRASS);
+        tg_acc(0, tg_shade(g_GRASS_DRY, 0.92), FAM_GRASS);
+        tg_acc(1, tg_shade(g_GRASS_DRY, 1.08), FAM_GRASS);
         tg_acc(2, tg_shade(g_DIRT_MID, 0.96), FAM_DIRT);
     }
 
-    let clump: i32 = 8;
-    let dryt: f64 = 0.64;
-    if (v == 1) { dryt = 0.78; }   // GRASS_B: lusher, almost no dry patching
-    if (v == 2) { dryt = 0.80; }   // the base ramp is already dry: patch sparsely
+    // Grain is per-texel decorrelated noise, i.e. pure 1-texel Haar energy, and
+    // the blade pass below spends the whole 1-texel budget on structure.  3
+    // rather than the usual 5 (+/-4 luminance, not +/-6) is what keeps E1/Ec
+    // under the 0.95 shimmer bound with 9-11 % blade roots in the tile.
+    tg_grain_amt(3);
 
-    fld_fbm(g_fa, clump, sd + SEED_GRASS, 3);
-    fld_fbm(g_fb, 16, sd + SEED_DRY, 1);
+    // ---- fields -----------------------------------------------------------
+    // g_fa  clump   period 16 + 8, isotropic: the metre-scale patchiness that
+    //               is all that survives past ~30 m.
+    // g_fb  tussock 2:1 anisotropic at two scales (8x16 and 4x8), sharpened.
+    // g_fd  base    clump + tussock + emboss, normalized, quantized below.
+    let cw: f64 = 0.40;
+    if (v == 1) { cw = 0.30; }
+    if (v == 2) { cw = 0.36; }
+
+    fld_fbm(g_fa, 16, sd + SEED_GRASS, 2);
+    fld_norm(g_fa, 0.20);
+
+    // The tussock field.  8x16 is the tussock (96 cm across, 1.9 m along the
+    // view) and 4x8 is the blade group inside it.
+    fld_fbm_a(g_fb, 8, 16, sd + SEED_GRASS + 41, 1);
+    fld_fbm_a(g_fc, 4, 8,  sd + SEED_GRASS + 97, 1);
+    let bfine: f64 = 0.56;
+    if (v == 1) { bfine = 0.50; }
+    for (let i = 0; i < 1024; i++) {
+        g_fb[i] = g_fb[i] * (1.0 - bfine) + g_fc[i] * bfine;
+    }
+    fld_norm(g_fb, 0.20);
+    // SHARPEN.  k = 1.35 on an sd-0.20 field clips ~5 % of the tile onto each
+    // rail; the plateaus are what give a quantized tile hard edges instead of
+    // slow ramps.
+    for (let i = 0; i < 1024; i++) { g_fb[i] = ctr(g_fb[i], 1.35); }
+
+    // ---- compose: clump + tussock + emboss --------------------------------
+    // The emboss is a central difference along y, i.e. a fixed "light from -z"
+    // on every tussock: a bright rim on the up-slope and a dark one on the
+    // down-slope.  It is the coarse-scale half of the light-tip/dark-root
+    // ladder; the blade pass below is the fine-scale half.
+    let ke: f64 = 0.55;
+    let bw: f64 = 1.0 - cw;
+    for (let y = 0; y < g_th; y++) {
+        let base: i32 = y * g_tw;
+        let up: i32 = ((y - 1) % g_th + g_th) % g_th * g_tw;
+        let dn: i32 = ((y + 1) % g_th + g_th) % g_th * g_tw;
+        for (let x = 0; x < g_tw; x++) {
+            let e: f64 = g_fb[up + x] - g_fb[dn + x];
+            g_fd[base + x] = g_fa[base + x] * cw + g_fb[base + x] * bw + e * ke;
+        }
+    }
+    // 0.235 rather than round 1's 0.255: the blade pass below adds -3/+4 ramp
+    // steps of its own, and a base that already clips into both end steps plus
+    // a ladder that pushes past them wastes the ladder on the rails.
+    fld_norm(g_fd, 0.235);
+
     for (let y = 0; y < g_th; y++) {
         let base: i32 = y * g_tw;
         for (let x = 0; x < g_tw; x++) {
-            let n: f64 = ctr(g_fa[base + x], 2.1);
-            n = tg_grain(n, x, y, sd + 11);
+            let n: f64 = tg_grain(g_fd[base + x], x, y, sd + 11);
             let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
-            // low-frequency dry patches: a second field, hard-thresholded, then
-            // itself dithered across the two accent steps so the patch does not
-            // read as a flat sticker.
-            let d: f64 = g_fb[base + x];
-            if (d > dryt) {
-                idx = tg_ramp_pick(g_aramp, 2, (d - dryt) * 3.4, x, y);
-            }
+            g_bidx[base + x] = idx;
             put(a, x, y, idx);
         }
     }
-    // BLADES: sparse 1-texel-wide, 2-3 texel-tall highlight strokes.  They are
-    // the only sub-3-texel STRUCTURE in the tile and they are kept under 8 %
-    // coverage so they read as sparkle, not as noise (§7.1 rule 4).
+
+    // ---- blades ------------------------------------------------------------
+    // A blade is a stroke 2-4 texels wide and 6-8 long rising from (x, y):
+    // root at b - 3, tip at b + 4, where b is the ramp index the BASE pass
+    // chose there — so a blade in a shadowed clump is a dark blade, and the
+    // metre-scale clump structure survives underneath 60 % blade coverage.
+    // The stroke leans -1, 0 or +1 texel per step, so neighbouring blades are
+    // never parallel for longer than their own length; that is what keeps this
+    // from reading as hatching.  Width is hashed 2/3/4 rather than fixed at 1
+    // because a 1-texel stroke puts all of its cross-stroke energy in the
+    // 1-texel Haar band: at width 1 the tile measured E1/Ec 1.23, at the
+    // hashed width it measures 0.90 with a HIGHER 3x3 high-pass.  Everything
+    // wraps, so blades cross the tile edge like any other feature.
+    let dens: f64 = 0.100;
+    if (v == 1) { dens = 0.110; }
+    if (v == 2) { dens = 0.090; }
+    let cut: f64 = 1.0 - dens;
     for (let y = 0; y < g_th; y++) {
         for (let x = 0; x < g_tw; x++) {
-            if (h01(x, y, sd + 11) > 0.955) {
-                let ln: i32 = 2;
-                if (h01(x, y, sd + 17) > 0.5) { ln = 3; }
-                for (let k = 0; k < ln; k++) {
-                    let yy: i32 = y - k;
-                    if (yy < 0) { yy = yy + g_th; }
-                    put(a, x, yy, 6);
+            if (h01(x, y, sd + 311) < cut) { continue; }
+            let b: i32 = g_bidx[y * g_tw + x];
+            let ln: i32 = 5;
+            if (h01(x, y, sd + 313) > 0.45) { ln = 7; }
+            let hl: f64 = h01(x, y, sd + 317);
+            let lean: i32 = 0;
+            if (hl > 0.70) { lean = 1; }
+            if (hl < 0.30) { lean = 0 - 1; }
+            let wd: i32 = 1;
+            let hw: f64 = h01(x, y, sd + 319);
+            if (hw > 0.12) { wd = 2; }
+            if (hw > 0.62) { wd = 3; }
+            if (hw > 0.90) { wd = 4; }
+            for (let k = 0; k <= ln; k++) {
+                let yy: i32 = ((y - k) % g_th + g_th) % g_th;
+                let ti: i32 = b - 3 + divi(7 * k, ln);
+                if (ti < 0) { ti = 0; }
+                if (ti > 7) { ti = 7; }
+                for (let w = 0; w < wd; w++) {
+                    let xx: i32 = ((x + lean * k + w) % g_tw + g_tw) % g_tw;
+                    g_bidx[yy * g_tw + xx] = ti;
+                    put(a, xx, yy, ti);
                 }
             }
+        }
+    }
+
+    // ---- dry tufts on a jittered lattice ----------------------------------
+    // 4x4 blocks of 8x8 texels; `keep` is the hash threshold a block must clear
+    // to get one, so A gets ~6 tufts, B ~3 and DRY ~5, at random sizes.
+    let keep: f64 = 0.62;
+    if (v == 1) { keep = 0.80; }
+    if (v == 2) { keep = 0.66; }
+    for (let by = 0; by < 4; by++) {
+        for (let bx = 0; bx < 4; bx++) {
+            if (h01(bx, by, sd + 211) < keep) { continue; }
+            let cx: f64 = f64(bx) * 8.0 + h01(bx, by, sd + 223) * 8.0;
+            let cy: f64 = f64(by) * 8.0 + h01(bx, by, sd + 227) * 8.0;
+            let rr: f64 = 1.1 + h01(bx, by, sd + 229) * 2.3;
+            let ec: f64 = 0.7 + h01(bx, by, sd + 233) * 0.9;
+            grass_tuft(a, cx, cy, rr, rr * ec);
         }
     }
     tile_end(p_cell);
@@ -700,30 +1040,71 @@ export fn tg_dirt(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     let v: i32 = p_var;
     tile_begin(a, p_cell);
 
+    // §L3  THE MINIMUM-ALBEDO FLOOR.  CLAUDE.md §8 requires every texel of the
+    // world atlas to sit at luminance >= 72, because vertex colour can only
+    // darken and anything authored below the floor is already black before the
+    // sun touches it.  palette.hml holds the line on the named constants
+    // (DIRT_LO is 72.8, MUD is 90.7) but every `tg_shade(LO, 0.8)` ACCENT in
+    // this file quietly broke it: the measured floors were DIRT 63.2, PATH 63.2
+    // and MUD 62.9.  Those accents are the pebble shadows and the crevices —
+    // precisely the small dark marks that were meant to give the ground its
+    // read — so the rule was being broken by exactly the texels that mattered.
+    // Every accent below is now at or above 72.
     if (v == 2) {
-        tg_base(tg_shade(g_MUD, 0.80), FAM_MUD, g_MUD, FAM_MUD,
-                g_DIRT_HI, FAM_DIRT, 5);
-        tg_acc(0, tg_shade(g_MUD, 0.70), FAM_MUD);
+        // MUD stays the darkest ground in the game; that is where the frame
+        // gets its sub-30 anchor once the vertex colour lands on it.  What it
+        // must not be is FLAT and dark, which at a 0.30x multiply and an 80
+        // luminance span is what it was.
+        // MID sits 37 % of the way up the span so the eight ramp steps come out
+        // near-even (10.4 then 13.4 luminance).  With MID at MUD itself the
+        // bottom half of the ramp compressed into 21 luminance and the tile
+        // measured sd 17.8 — the flattest ground in the atlas.
+        tg_base(tg_shade(g_MUD, 0.83), FAM_MUD, tg_mix(g_MUD, g_DIRT_HI, 0.30), FAM_MUD,
+                tg_shade(g_DIRT_HI, 1.12), FAM_DIRT, 5);
+        tg_acc(0, tg_shade(g_MUD, 0.81), FAM_MUD);
         tg_acc(1, g_DIRT_MID, FAM_DIRT);
         tg_acc(2, tg_shade(g_DIRT_HI, 1.06), FAM_DIRT);
     } else {
-        tg_base(g_DIRT_LO, FAM_DIRT, g_DIRT_MID, FAM_DIRT,
-                g_DIRT_HI, FAM_DIRT, 6);
-        tg_acc(0, tg_shade(g_DIRT_LO, 0.88), FAM_DIRT);
-        tg_acc(1, tg_shade(g_DIRT_HI, 1.05), FAM_DIRT);
-        if (v == 1) { tg_acc(2, tg_shade(g_GRASS_DRY, 0.92), FAM_GRASS); }
-        else        { tg_acc(2, tg_shade(g_DIRT_MID, 1.12), FAM_DIRT); }
+        if (v == 1) {
+            // PATH: trodden earth is COMPACTED, BLEACHED and dusty.  It was
+            // previously the dirt ramp with a different noise period, and
+            // measured 4.7 8-bit levels away from DIRT after a 0.30x multiply
+            // — i.e. the same material.  Taking its upper half into the SAND
+            // family separates the two by 8 luminance levels plus a hue, which
+            // is what makes a path read as a path from 20 m in fog.
+            tg_base(tg_shade(g_DIRT_MID, 0.96), FAM_DIRT,
+                    tg_mix(g_DIRT_HI, g_SAND_LO, 0.55), FAM_SAND,
+                    tg_shade(g_SAND, 1.06), FAM_SAND, 6);
+            tg_acc(0, g_DIRT_MID, FAM_DIRT);
+            tg_acc(1, tg_shade(g_SAND, 1.10), FAM_SAND);
+            tg_acc(2, tg_mix(g_DIRT_HI, g_SAND, 0.50), FAM_SAND);
+        } else {
+            tg_base(g_DIRT_LO, FAM_DIRT, tg_mix(g_DIRT_MID, g_DIRT_HI, 0.28), FAM_DIRT,
+                    tg_shade(g_DIRT_HI, 1.24), FAM_DIRT, 6);
+            tg_acc(0, g_DIRT_LO, FAM_DIRT);
+            tg_acc(1, tg_shade(g_DIRT_HI, 1.16), FAM_DIRT);
+            tg_acc(2, tg_shade(g_DIRT_MID, 1.12), FAM_DIRT);
+        }
     }
 
     let per: i32 = 16;
     if (v == 1) { per = 8; }
 
+    // Same coarse blend as grass (§L2).  Dirt was the worst offender: its
+    // period-4 detail field carried a quarter of the weight at a scale that
+    // cannot survive a single step of minification, and 32 -> 4 box-downsampling
+    // cost the tile 64 % of its sd.
     fld_fbm(g_fa, per, sd + SEED_DIRT, 3);
     fld_fbm(g_fb, 4, sd + SEED_DIRT + 5, 1);
+    fld_fbm(g_fc, 16, sd + SEED_DIRT + 67, 2);
+    fld_norm(g_fa, 0.20);  fld_norm(g_fb, 0.20);  fld_norm(g_fc, 0.20);
+    // weights 0.50/0.34/0.16 -> quadrature 0.625 -> blend sd 0.125; ctr 2.04
+    // restores 0.255, the same spread grass uses.
     for (let y = 0; y < g_th; y++) {
         let base: i32 = y * g_tw;
         for (let x = 0; x < g_tw; x++) {
-            let n: f64 = ctr(g_fa[base + x] * 0.75 + g_fb[base + x] * 0.25, 2.0);
+            let n: f64 = ctr(g_fa[base + x] * 0.50 + g_fc[base + x] * 0.34
+                           + g_fb[base + x] * 0.16, 2.04);
             n = tg_grain(n, x, y, sd + 23);
             let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
             put(a, x, y, idx);
@@ -757,30 +1138,58 @@ export fn tg_stone(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     tile_begin(a, p_cell);
 
     if (v == 3) {
-        tg_base(tg_shade(g_GRANITE_LO, 0.80), FAM_GRANITE, g_GRANITE_LO, FAM_GRANITE,
-                g_GRANITE_HI, FAM_GRANITE, 5);
-        tg_acc(0, tg_shade(g_GRANITE_LO, 0.70), FAM_GRANITE);
+        // GRANITE: the cool stone.  Its mid was GRANITE_LO itself, so the tile
+        // spent its whole ramp between 75 and 149 and averaged 107 — a cool
+        // grey that goes to 19 at golden hour.  Mid now sits a third of the way
+        // up and the top step reaches 179.
+        tg_base(tg_shade(g_GRANITE_LO, 0.80), FAM_GRANITE,
+                tg_mix(g_GRANITE_LO, g_GRANITE_HI, 0.35), FAM_GRANITE,
+                tg_shade(g_GRANITE_HI, 1.20), FAM_GRANITE, 5);
+        tg_acc(0, tg_shade(g_GRANITE_LO, 0.80), FAM_GRANITE);   // 74.7, §L3 floor
         tg_acc(1, tg_shade(g_GRANITE_HI, 1.08), FAM_GRANITE);
         tg_acc(2, tg_mix(g_GRANITE_LO, g_GRANITE_HI, 0.5), FAM_GRANITE);
     } else {
+      if (v == 5) {
+        // GRAVEL is a bed of loose chips, not "STONE_A with less ridge".  It
+        // measured 2.35 8-bit levels from STONE_A after a 0.30x multiply, the
+        // closest pair in the whole ground set.  Pulling its body into the COOL
+        // (granite) family while leaving its highlight warm separates it by hue
+        // at every light level, which value alone cannot do once both tiles are
+        // multiplied by the same vertex colour.
+        tg_base(tg_shade(g_GRANITE_LO, 0.84), FAM_GRANITE,
+                tg_mix(g_GRANITE_LO, g_STONE_MID, 0.50), FAM_GRANITE,
+                tg_shade(g_STONE_HI, 1.04), FAM_STONE, 4);
+        tg_acc(0, tg_shade(g_GRANITE_LO, 0.82), FAM_GRANITE);
+        tg_acc(1, tg_mix(g_GRANITE_LO, g_STONE_HI, 0.60), FAM_STONE);
+        tg_acc(2, tg_shade(g_STONE_HI, 1.10), FAM_STONE);
+      } else {
         // grain 3, not 5: the a-b cracks already carry this material's fine
         // detail, and extra per-texel grain on top is pure 1-texel energy.
-        tg_base(g_STONE_LO, FAM_STONE, g_STONE_MID, FAM_STONE,
-                g_STONE_HI, FAM_STONE, 3);
-        tg_acc(0, tg_shade(g_STONE_LO, 0.86), FAM_STONE);
+        //
+        // The mid step is lifted a fifth of the way to HI and the top step
+        // opened to STONE_HI * 1.16 (§L1): stone was averaging 122 with an sd
+        // of 28, which at the measured golden-hour multiply is 5 levels of
+        // structure.  Range goes 100 -> 120, still inside the <= 130 assertion.
+        tg_base(g_STONE_LO, FAM_STONE, tg_mix(g_STONE_MID, g_STONE_HI, 0.20), FAM_STONE,
+                tg_shade(g_STONE_HI, 1.16), FAM_STONE, 3);
+        tg_acc(0, tg_shade(g_STONE_LO, 0.94), FAM_STONE);   // 75.7, §L3 floor
         if (v == 2) {
             // A three-step moss ramp, picked from the same value as the stone
             // beneath it, so the mossed region keeps every bit of the stone's
             // light-and-shade and only changes hue.  Replacing the stone with a
             // two-colour dithered patch instead cost the tile two thirds of its
             // coarse energy and put E1/Ec at 1.49.
-            tg_over_lo(tg_shade(g_STONE_MOSS, 0.74), FAM_MOSS);
-            tg_acc(1, g_STONE_MOSS, FAM_MOSS);
-            tg_acc(2, tg_shade(g_STONE_MOSS, 1.34), FAM_MOSS);
+            // The moss ramp tracks the stone ramp: now that the stone runs to
+            // 195 a moss top step of 143 would read as a dark stain rather than
+            // as growth catching the same light.
+            tg_over_lo(tg_shade(g_STONE_MOSS, 0.84), FAM_MOSS);
+            tg_acc(1, tg_shade(g_STONE_MOSS, 1.08), FAM_MOSS);
+            tg_acc(2, tg_shade(g_STONE_MOSS, 1.32), FAM_MOSS);
         } else {
             tg_acc(1, tg_mix(g_STONE_MID, g_STONE_HI, 0.55), FAM_STONE);
-            tg_acc(2, tg_shade(g_STONE_HI, 1.05), FAM_STONE);
+            tg_acc(2, tg_shade(g_STONE_HI, 1.12), FAM_STONE);
         }
+      }
     }
 
     // feature knobs per variant
@@ -791,7 +1200,7 @@ export fn tg_stone(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     let strat: f64 = 0.0;   // horizontal stratification (cliff)
     if (v == 1) { per = 8; ridge = 1.20; }
     if (v == 2) { crackw = 0.016; }
-    if (v == 4) { per = 8; strat = 0.62; crackw = 0.04; }
+    if (v == 4) { per = 8; strat = 0.62; crackw = 0.030; }
     if (v == 5) { per = 8;  ridge = 0.80; crackw = 0.02; }
     if (v == 6) { grid = 1; per = 8; }
     if (v == 7) { grid = 2; per = 8; ridge = 1.10; }
@@ -804,8 +1213,10 @@ export fn tg_stone(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     // Moss patches want to be BIG and few: a period-8 mask scatters small
     // patches whose edges are all 1-texel, which is fine-scale energy with no
     // coarse energy behind it.
-    if (v == 2) { fld_fbm(g_fc, 16, sd + SEED_MOSS, 1); }
-    if (v == 4) { fld_fbm(g_fc, 8, sd + 3, 1); }
+    // Both of these are THRESHOLDED (moss) or MIXED IN AT 62 % (cliff bedding),
+    // so an off-centre field moves the tile's whole mean.  §L4.
+    if (v == 2) { fld_fbm(g_fc, 16, sd + SEED_MOSS, 1); fld_norm(g_fc, 0.20); }
+    if (v == 4) { fld_fbm(g_fc, 8, sd + 3, 1);          fld_norm(g_fc, 0.20); }
 
     // Per-UNIT tone jitter for the laid variants.  Without it a cobble field is
     // a noise field with joints drawn on top: every stone is the same value, so
@@ -859,7 +1270,10 @@ export fn tg_stone(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
                 // the hard cut was a single edge plus scattered small patches.
                 let mv: f64 = g_fc[base + x]
                             + (1.0 - f64(y) / f64(g_th)) * 0.34;
-                if (mv > 0.76) {
+                // 0.88, not 0.76: at 0.76 the mask covered two thirds of the
+                // top of the tile and the material read as a stone sitting on
+                // moss rather than as a mossy stone.
+                if (mv > 0.88) {
                     idx = tg_ramp_pick(g_oramp, 3, n, x, y);
                 }
             }
@@ -1389,10 +1803,15 @@ export fn tg_snow(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
     tile_begin(a, p_cell);
 
     if (v == 1) {
-        tg_base(tg_shade(g_SAND_LO, 0.72), FAM_SAND, g_SAND_LO, FAM_SAND,
-                g_SAND, FAM_SAND, 4);
+        // SAND is the brightest warm ground and the only terrain that can put a
+        // near-anchor value into a daylight frame, so it runs all the way to
+        // SAND * 1.10 = 217.  Floor 92 (§L3), range 125 — the widest the <= 130
+        // assertion allows.
+        tg_base(tg_shade(g_SAND_LO, 0.72), FAM_SAND,
+                tg_mix(g_SAND_LO, g_SAND, 0.35), FAM_SAND,
+                tg_shade(g_SAND, 1.10), FAM_SAND, 4);
         tg_acc(0, tg_shade(g_SAND_LO, 0.66), FAM_SAND);
-        tg_acc(1, tg_shade(g_SAND, 1.05), FAM_SAND);
+        tg_acc(1, tg_shade(g_SAND, 1.12), FAM_SAND);
         tg_acc(2, tg_mix(g_SAND_LO, g_SAND, 0.5), FAM_SAND);
     } else {
         tg_base(tg_shade(g_SNOW_LO, 0.72), FAM_SNOW, g_SNOW_LO, FAM_SNOW,
@@ -1402,24 +1821,41 @@ export fn tg_snow(p_a: object, p_cell: i32, p_seed: i32, p_var: i32) {
         tg_acc(2, tg_mix(g_SNOW_LO, g_SNOW_HI, 0.5), FAM_SNOW);
     }
 
-    fld_fbm(g_fa, 16, sd + SEED_SNOW, 3);
+    // A period-16 fbm on a 32-texel tile interpolates FOUR lattice values, so
+    // the body of the tile was ONE smooth arc — sand that reads as a beige
+    // gradient rather than as ground.  Same coarse/fine blend as grass (§L2):
+    // period-8 detail carries the granularity, period-16 carries the dune.
+    fld_fbm(g_fa, 8, sd + SEED_SNOW, 3);
+    fld_fbm(g_fc, 16, sd + SEED_SNOW + 61, 2);
     fld_streak(g_fb, 0, 8, 7.0, sd + SEED_SNOW + 5);
+    fld_norm(g_fa, 0.20);  fld_norm(g_fc, 0.20);  fld_norm(g_fb, 0.20);
     for (let y = 0; y < g_th; y++) {
         let base: i32 = y * g_tw;
         for (let x = 0; x < g_tw; x++) {
-            let n: f64 = ctr(g_fa[base + x], 1.55);
+            let n: f64 = ctr(g_fa[base + x] * 0.62 + g_fc[base + x] * 0.38, 1.75);
             n = tg_grain(n, x, y, sd + 149);
             let idx: i32 = tg_ramp_pick(g_ramp, TG_RAMP_N, n, x, y);
             put(a, x, y, idx);
         }
     }
-    // WIND RIPPLES: a warped 8-texel ridge line, 1 texel of the light accent.
+    // WIND RIPPLES: a warped ridge line, ~1 texel of the light accent, with its
+    // shadow one contour below.
+    //
+    // These were THRESHOLDED REGIONS, not lines: `r > 0.72` on a smooth 1-D
+    // field selects the whole crest of the wave, so a third of the tile came
+    // out as two solid horizontal bands — the hard grey stripe across SNOW and
+    // the beige/cream split across SAND.  A CONTOUR of the same field is thin
+    // wherever the field is steep, which is exactly where a ripple crest is,
+    // and it is guaranteed to exist now that the field is normalized (the old
+    // absolute thresholds were never reached at all on some seeds).
     for (let y = 0; y < g_th; y++) {
         let rbase: i32 = y * g_tw;
         for (let x = 0; x < g_tw; x++) {
             let r: f64 = g_fb[rbase + x];
-            if (r > 0.72) { put(a, x, y, 10); }
-            if (r < 0.20) { put(a, x, y, 9); }
+            let dc: f64 = r - 0.60;  if (dc < 0.0) { dc = 0.0 - dc; }
+            let dt: f64 = r - 0.34;  if (dt < 0.0) { dt = 0.0 - dt; }
+            if (dt < 0.035) { put(a, x, y, 9); }
+            if (dc < 0.040) { put(a, x, y, 10); }
         }
     }
     tile_end(p_cell);

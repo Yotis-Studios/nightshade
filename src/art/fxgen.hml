@@ -26,6 +26,195 @@
 //     `fxgen_selftest` asserts, texel by texel, on every occupied cell.
 //
 // ---------------------------------------------------------------------------
+// THE SATURATION CEILING — why no violet cell may reach 255 in RED
+// ---------------------------------------------------------------------------
+// `fx_add` saturates at 255, which is correct: it is exactly what ADD does on
+// screen.  But the cells here are built by SUMMING overlapping shapes, and a
+// violet built out of NS_MID + NS_CORE + NS_HALO reaches 255 in RED and BLUE
+// long before it reaches it in GREEN.  R == B == 255 is not violet.  It is
+// MAGENTA, and one more layer on top of it is WHITE.
+//
+// That is not a hypothesis.  Measured on the 2026-07-28 atlas, brightest texel
+// of each cell, before this pass:
+//
+//     XP MOTE    (255, 162, 255)   hue 300 deg  sat 0.36   <- magenta
+//     EYE        (255, 140, 255)   hue 300 deg  sat 0.45   <- magenta
+//     LOOT BEAM  (255, 254, 255)   hue 300 deg  sat 0.00   <- WHITE
+//     SPARKLE    (242, 255, 255)   hue 180 deg  sat 0.05   <- WHITE, not green
+//     GLOW S     (183, 183, 172)   hue  60 deg  sat 0.06   <- neutral by design
+//
+// and the resulting `ns_bloom` frame measured 305.7 deg / sat 0.39 across every
+// pixel the FX layer touched.  ART_BIBLE 12.4 asks for a violet money shot and
+// the money shot was pink-grey.
+//
+// THE RULE, as it stood after the first pass.  NS_CORE #C74FFF is hue 281 deg.
+// Hue 281 with BLUE pinned at 255 requires  R = G + 0.68 * (255 - G).  So a cell
+// whose green sits near 100 may not exceed ~215 in red.  Every violet cell was
+// gain-budgeted so that its BRIGHTEST texel landed near (215, 100, 255) — blue
+// clipped, red short of the clip, green low.  The same arithmetic in green
+// governs SPARKLE (VENOM, hue 128 deg).
+//
+// That fixed the hue.  It also capped every violet cell's LUMINANCE at 148, and
+// see the next section for why that turned out to be half the picture.
+//
+// ---------------------------------------------------------------------------
+// THE ANCHOR LAW — why a violet cell must still have a WHITE HEART
+// ---------------------------------------------------------------------------
+// CLAUDE.md §8: every frame needs something below luminance 30 AND something
+// above 220.  Four of eight harness scenes had nothing above 220 anywhere in
+// the world, and `tod.hml` structurally cannot supply one — `cr = ambient +
+// sun*N.L` is clamped to 1, so no lit surface can out-run its own albedo.  The
+// only layer that can put a pixel ABOVE the albedo ceiling is this one.
+//
+// Under BLEND_ADD what actually lands on screen is
+//
+//     screen += texel_rgb * tint_rgb * vertex_alpha / 255^2
+//
+// so a cell's whole budget is `tint * alpha / 255`, and it is spent by the
+// CALLER.  Measured against shot.hml's call sites, the maximum luminance any
+// single FX sprite can add, with a texel clipped to (255,255,255):
+//
+//     FX_GLOW_L   lantern   WINDOW_LIGHT a120   ->  104     <- the free anchor
+//     FX_XP_MOTE  mote      NS_HALO      a190   ->  146
+//     FX_GLOW_S   bloom     NS_HALO      a150   ->  115
+//     FX_EYE      enemy     NS_CORE      a215   ->  113
+//     FX_RAIN     rain      UI_WHITE     a120   ->  111
+//     FX_MUZZLE_0 flash     UI_WHITE     a255   ->  237
+//
+// and against those numbers the previous atlas was leaving 25-40 % on the
+// table, because a cell budgeted to peak at (215, 100, 255) has luminance 148,
+// i.e. 58 % of what the call site would have carried.  hub_dawn's brightest
+// world pixel measured 215 — five short of the bar — and it was ONE pixel,
+// because the old glow card's peak was one texel.
+//
+// So every emissive cell now has a WHITE HEART: a small region deliberately
+// driven past 1.0 so it CLIPS to the neutral-brightest palette entry, wrapped
+// in the saturated mantle the section above argues for.  That is not a
+// compromise with the hue rule, it is what a light source looks like — a
+// candle flame, a muzzle flash and a nightshade bloom all have a white middle
+// and a coloured skirt, and the "uniform violet disc" the first pass produced
+// is exactly the sticker ART_BIBLE §13 lists as an anti-goal.  The hue budget
+// still governs the MANTLE, which is where 90 % of the lit texels are and
+// therefore what the frame's measured hue is made of.
+//
+// ---------------------------------------------------------------------------
+// THE TINT IS PART OF THE COLOUR — budget the SCREEN, not the texel
+// ---------------------------------------------------------------------------
+// The saturation-ceiling section above budgets the hue of the ATLAS TEXEL.
+// That is the wrong place to measure, and it cost the violet cells a third of
+// their luminance.  What the player sees is `texel * tint`, and every violet
+// call site in shot.hml tints with a violet:
+//
+//     FX_GLOW_S, FX_XP_MOTE   tinted NS_HALO  (232,166,255)  g/r = 0.72
+//     FX_EYE                  tinted NS_CORE  (199, 79,255)  g/r = 0.31
+//
+// A green channel multiplied by 0.31 does not survive.  So an NS_CORE lens in
+// the atlas arrives as NS_CORE SQUARED — hue 277 deg, saturation 0.88,
+// luminance 97 — which is not "more violet", it is the same violet, darker,
+// and it is invisible against fog.  Measured, same cell, same call site:
+//
+//                       atlas texel        -> screen        hue    sat    lum
+//     EYE, old          (208,  88, 255)       (162, 27,255)  277    0.88    93
+//     EYE, this pass    (255, 181, 255)       (199, 56,255)  283    0.78   121
+//     BLOOM, old        (218,  92, 255)       (198, 60,255)  286    0.80   121
+//     BLOOM, this pass  (227, 157, 255)       (207,102,255)  281    0.60   151
+//
+// Both of the new ones are CLOSER to NS_CORE's own 281 deg than the old ones
+// were, and 25-30 % brighter.  The rule that replaces the old one:
+//
+//     **Build the cell in the colour you want AFTER the tint, not the colour
+//     you want in the atlas.  Spend the deep, dark violets on the OUTER
+//     falloff, where the channels have already pulled apart and the darkness
+//     reads as depth; keep the bright middle pale and let the caller's tint
+//     put the hue in.**
+//
+// A HEART MUST SURVIVE MINIFICATION.  These sprites are 3-80 screen pixels wide
+// against a 14-texel cell, sampled NEAREST with no mip chain, so a 1-texel core
+// is invisible more often than not: a 4 px eye sprite samples every third texel
+// and will simply miss a single hot texel.  Every heart below is therefore
+// sized so that it CLIPS over at least ~3 texels across, not one.
+//
+// A NOTE ON GAINS.  `fx_splat` samples at TEXEL CENTRES (`f64(x) + 0.5`), and
+// every shape here is centred on 8.0, which is a texel CORNER.  So the peak
+// texel of a splat centred at (8.0, 8.0) sits sqrt(0.5) away from the centre
+// and never sees the full gain — for a tight pw-2 core of radius 1.9 it sees
+// 48 % of it.  Budget against the measured peak, not against the gain you
+// typed; the first version of this pass was 30 % dark for exactly this reason.
+// The hearts use pw 1 (a linear cone) and a gain above 1 for the same reason:
+// a cone of radius R and gain G is CLIPPED out to r = R*(1 - 1/G), which is an
+// arithmetic plateau you can size on paper, and it is the only falloff here
+// whose clipped radius does not depend on the exponent.
+//
+// ---------------------------------------------------------------------------
+// ADDITIVE SMOKE — what it can and cannot be
+// ---------------------------------------------------------------------------
+// It cannot be a cloud.  `dstRGB = srcRGB * srcA + dstRGB` has no term that can
+// take light away, so a dark smoke texel is not "faint", it is *identically
+// nothing*.  Every attempt to author occluding smoke on this layer is dead on
+// arrival and no amount of tuning rescues it.
+//
+// What it CAN be — and what `cell_smoke` now is — is the light a muzzle flash
+// SCATTERS off a puff.  That is a real, separate, and much better-looking
+// thing: bright lobes crowded on the lit shoulder, a body that is barely there,
+// and a HOLE in the middle where a backlit puff is genuinely see-through.  The
+// previous version was a uniform grey blob peaking at luminance 97, which after
+// the caller's tint and alpha contributed a 16/255 lift — invisible, as the
+// gate found.  This one peaks at luminance 226 / 208 / 187 across the three
+// frames, has a silhouette, and lights 57 / 66 / 79 texels against 45 / 54 / 70.
+//
+// An occluding dark smoke would need an ALPHA-BLENDED texture.  ATLAS_FX is
+// ADD and blend mode is per-texture (CLAUDE.md §6, "Four SDL textures. Not
+// five"), so that is a renderer decision, not an fxgen one.  Flagged, not
+// attempted.
+//
+// ---------------------------------------------------------------------------
+// ROUND 3 — WHAT THE ANCHOR LAW ABOVE COST, AND THE TWO CEILINGS IT HIT
+// ---------------------------------------------------------------------------
+// The ANCHOR LAW section is still right about what a light source looks like
+// and wrong about how to build one, and both halves were measured this round
+// on DISPLAY=:0.  READ THAT FIRST: `SDL_VIDEODRIVER=dummy` picks the SOFTWARE
+// renderer, which collapses BLEND_ADD to BLEND inside SDL_RenderGeometry, and
+// every number in this file is meaningless under it.  Render with DISPLAY=:0.
+//
+// 1. A CLIPPED CORE IS NOT FREE — IT COSTS SILHOUETTE, AND NOBODY MEASURED
+//    THAT.  Every heart above was built as a LINEAR cone driven past 1.0, and
+//    a linear cone of radius R and gain G clips out to R*(1 - 1/G) and reaches
+//    zero at R: its whole visible gradient is R/G texels wide.  At gain 2.8
+//    that is 1.2 texels, and FX_MUZZLE_0 is drawn 72 SCREEN PIXELS across —
+//    4.5 px per texel — so the "anchor" shipped as a hard-edged disc with a
+//    4.5-pixel cliff around it, in an otherwise EMPTY cell.  That is the
+//    "hard-edged rectangular sprite card" of the round-3 critique.  It was not
+//    the quad, the UVs or the falloff being clipped by the border: the border
+//    was clean and the self-test proving it was passing.  See `cell_muzzle`.
+//    The new `fxgen_selftest` OUTER-SKIRT check is the guard that was missing.
+//
+// 2. THE ANCHOR LAW CANNOT REACH 220 IN `ns_bloom` OR `flat_debug`, AND NO
+//    AUTHORING IN THIS FILE WILL CHANGE THAT.  Under BLEND_ADD a sprite puts
+//    `texel * tint * alpha / 255^2` on screen.  Every heart here is already
+//    255 in every channel, so each call site's ceiling is fixed by ITS tint
+//    and ITS alpha, not by this file:
+//
+//      FX_XP_MOTE  NS_HALO      a190 -> lum 145   (ns_bloom)
+//      FX_GLOW_S   NS_HALO      a150 -> lum 114   (ns_bloom)
+//      FX_EYE      NS_CORE      a215 -> lum 112
+//      FX_GLOW_L   WINDOW_LIGHT a120 -> lum 104   (flat_debug's only FX)
+//      FX_GLOW_L   WINDOW_LIGHT a205 -> lum 177   (hub_dawn's lit windows)
+//      FX_MUZZLE_0 UI_WHITE     a255 -> lum 237
+//
+//    `ns_bloom`'s night ground is luminance 20-45 and its brightest FX pixel
+//    is one mote at 189, so §8 there needs TWO sprites on one pixel — and the
+//    frame draws ~14 blooms and ~10 motes, none of which overlap.  Widening
+//    and whitening both cards to make the target bigger was built, rendered
+//    and measured: +2 luminance, and it bleached the money shot.  Reverted;
+//    the negative result is written up in `cell_bloom`.  `flat_debug` is
+//    worse — one lantern glow with a 104 ceiling and nothing else in frame.
+//    Those two anchors have to come from `shot.hml` (tint/alpha), `skygen.hml`
+//    (the moon peaks at 161) or `meshgen.hml`, and an fxgen pass that claims
+//    them is lying.  `storm_assault` fails the OTHER end of §8 — nothing below
+//    luminance 30 — and an ADDITIVE layer has no term that can take light
+//    away, so that one is not addressable here at any price.
+//
+// ---------------------------------------------------------------------------
 // THE 1-PX MARGIN
 // ---------------------------------------------------------------------------
 // Every drawing primitive here iterates x, y over [FX_INSET, FX_CELL - 1 -
@@ -38,10 +227,11 @@
 // RULE R1 / palette
 // ---------------------------------------------------------------------------
 // No colour is named here.  Every RGB comes from `palette.hml`; this file
-// contains no hex literal and no channel triple.  The glow cards bake in
-// `g_STAR_BRIGHT` (255,255,240) rather than pure white because ART_BIBLE §3.1
-// bans pure white — it is the palette's neutral-brightest entry and therefore
-// the closest thing to a tint identity that the palette actually contains.
+// contains no hex literal and no channel triple.  The NEUTRAL glow card
+// (FX_GLOW_L) bakes in `g_STAR_BRIGHT` (255,255,240) rather than pure white
+// because ART_BIBLE §3.1 bans pure white — it is the palette's neutral-brightest
+// entry and therefore the closest thing to a tint identity that the palette
+// actually contains.  FX_GLOW_S is NOT neutral; see its declaration.
 //
 // COST: 128*128 = 16384 texels, ~30 primitives.  Boot-time only; measured in
 // `fxgen_selftest`.
@@ -50,8 +240,8 @@ import { sqrt, divi } from "@stdlib/math";
 import { bayer4, clampf } from "../core/mathx.hml";
 import { g_MUZZLE_CORE, g_MUZZLE_MID, g_MUZZLE_EDGE, g_TRACER, g_IMPACT_SPARK,
          g_EMBER, g_EXPLO_HOT, g_EXPLO_MID, g_EXPLO_COOL, g_LIGHTNING,
-         g_NS_CORE, g_NS_HALO, g_VENOM, g_VENOM_HALO, g_STAR_BRIGHT,
-         g_STONE_MID, g_SAND_LO, g_MOON_DISC, g_SNOW_HI,
+         g_NS_CORE, g_NS_MID, g_NS_HALO, g_VENOM, g_VENOM_HALO, g_STAR_BRIGHT,
+         g_SAND, g_GRANITE_HI, g_SAND_LO, g_MOON_DISC, g_SNOW_HI,
          pal_r, pal_g, pal_b } from "./palette.hml";
 import { atlas_new, atlas_data, atlas_fill, atlas_get } from "../../../wobbleweed/src/atlas.hml";
 
@@ -84,8 +274,16 @@ export let FX_EXPLO_2   = 10;
 export let FX_EXPLO_3   = 11;
 export let FX_EXPLO_4   = 12;
 export let FX_EXPLO_5   = 13;
-export let FX_GLOW_S    = 14;
-export let FX_GLOW_L    = 15;
+// FX_GLOW_S is the NIGHTSHADE BLOOM card.  Its one and only consumer, in this
+// repo and in ART_BIBLE 12.4 ("each 6 tris of geometry plus a 2-tri NS_HALO
+// additive glow card"), is the NS_FLORA plant.  It used to be a neutral
+// STAR_BRIGHT disc that relied on the caller's NS_HALO tint for all of its
+// hue — and a neutral card times a pale tint is arithmetically incapable of
+// producing a saturated colour, which is why the money shot measured pink-grey.
+// It now carries its own violet.  FX_GLOW_L is the neutral workhorse: lantern
+// halos and the per-light ground pool tint it warm, so it must stay hueless.
+export let FX_GLOW_S    = 14;       // NS BLOOM — violet, NOT tint-neutral
+export let FX_GLOW_L    = 15;       // the neutral glow card
 
 export let FX_SMOKE_0   = 16;       // row 2 — atmospherics and the world
 export let FX_SMOKE_1   = 17;
@@ -131,7 +329,7 @@ export fn fxgen_cell_name(id: i32): string {
     if (id == FX_EXPLO_3) { return "EXPLO 3"; }
     if (id == FX_EXPLO_4) { return "EXPLO 4"; }
     if (id == FX_EXPLO_5) { return "EXPLO 5"; }
-    if (id == FX_GLOW_S) { return "GLOW S"; }
+    if (id == FX_GLOW_S) { return "NS BLOOM"; }
     if (id == FX_GLOW_L) { return "GLOW L"; }
     if (id == FX_SMOKE_0) { return "SMOKE 0"; }
     if (id == FX_SMOKE_1) { return "SMOKE 1"; }
@@ -318,32 +516,156 @@ fn petal_len(i: i32): f64 {
 // the cells
 // ---------------------------------------------------------------------------
 
-// Muzzle flash, 3 frames.  Frame 0 is the 1-frame stab: tiny near-white core,
-// short petals.  Frame 1 is the bloom: the core has cooled to MUZZLE_MID and
-// the petals have reached full length.  Frame 2 is the ghost that sells the
-// decay — no core at all, only MUZZLE_EDGE petals and a faint haze.
+// ---------------------------------------------------------------------------
+// Muzzle flash, 3 frames.
+//
+// WHY THIS CELL WAS REBUILT — THE MEASURED CAUSE OF THE "RECTANGULAR SPRITE"
+// ---------------------------------------------------------------------------
+// The round-2 critique read: "hard-edged rectangular sprite card — straight
+// left, right and bottom quad edges visible against the night sky", and the
+// suggested cause was "the falloff is clipped by the quad".  IT IS NOT.  Both
+// halves of that are worth writing down, because the real cause has a
+// different fix and the wrong fix would have been free of any effect.
+//
+// Measured, `muzzle_fog`, DISPLAY=:0 (the software renderer collapses
+// BLEND_ADD to BLEND and must never be used to judge this layer):
+//
+//   * FX_MUZZLE_0 is drawn 0.42 m across at 1.05 m, which is a 72 x 72 SCREEN
+//     PIXEL quad — 4.5 screen pixels per atlas texel.  Verified by rendering a
+//     2-texel checkerboard through this cell and counting: 9 px per check.
+//   * the quad's own border was already clean.  The `faded` self-test was
+//     passing and the ring at texel 1 / 14 measured peak 0, not 48.
+//   * the visible cliffs sat at screen x 146 and x 173, which at 4.5 px/texel
+//     are TEXEL 5 and TEXEL 11 — inside the cell, nowhere near its border.
+//
+// And here is the old cell's own row 8, in luminance:
+//
+//     x     3    4    5    6    7    8    9   10   11   12   13
+//     L     4   44  236  255  255  255  255  218   20    3    0
+//
+// One ramp texel per side.  That is not a glow, it is a DISC with a 4.5-pixel
+// hard edge, and the reason is arithmetic: a LINEAR cone of radius R and gain
+// G clips out to R*(1 - 1/G) and reaches zero at R, so its entire visible
+// gradient is R/G texels wide.  The old core was R 3.3 at gain 2.8 — 1.18
+// texels of ramp.  Every soft-looking parameter in the file (`pw 2` mid splat,
+// eight petals) contributed less than 50 luminance and was invisible beside
+// it.  The old cell did not even reach its own margin: texels 0-2 and 14-15
+// were empty, so the flash was a small hard disc floating in a large empty
+// square.  A high-gain linear cone IS a hard-edged disc; that is what the
+// anchor-law section of this header bought its 237-luminance anchor with, and
+// nobody measured the silhouette it paid with.
+//
+// WHAT REPLACES IT
+//
+//   1. A STACK OF FIVE CONES OF DECREASING RADIUS instead of one steep one.
+//      The sum of linear cones is a piecewise-linear, monotone, roughly
+//      exponential profile, so the ramp is spread over SIX texels (27 screen
+//      pixels) instead of one.  The heart still clips — a muzzle flash whose
+//      middle is not blown out is a decal — but it clips over ~3 texels, not
+//      over half the sprite.
+//   2. THE CELL IS FILLED.  The outer haze reaches texel 2 and fades to zero
+//      before texel 1 / 14 on its own, so the silhouette ends in air rather
+//      than at a border.
+//   3. SIX PETALS THAT ACTUALLY EXIST.  The old petals ramped `edge -> 0` over
+//      the whole segment, so at r = 4 they were down to 0.2 * MUZZLE_EDGE —
+//      luminance 20, under the mid splat, invisible.  These start at r = 1.0,
+//      hold most of their gain to two thirds of their length and only then let
+//      go, so the 3-6 texel band reads roughly 2x brighter along a petal than
+//      between two.  THAT is what makes the silhouette a star instead of a
+//      circle, and a star is the only thing that cannot be mistaken for a
+//      quad.  They still land on gb = 0, so no petal puts a value on the cell
+//      border: "reaching the edge at low alpha" and "showing the quad" are the
+//      same event under BLEND_ADD and the star has to win without it.
+//   4. THE CENTRE IS OFF A TEXEL CORNER (8.15, 7.85) AND EVERY LAYER IS
+//      SLIGHTLY ELLIPTICAL.  A shape centred on 8.0 rasterises axis-aligned
+//      and its clipped plateau comes out a SQUARE — which is a large part of
+//      why the old one read as a rectangle rather than as a hard circle.
+//
+// AND THE HALF THIS FILE CANNOT DO.  "A night muzzle flash that leaves the
+// world unlit" is the other half of the finding and most of it is not here.
+// The flash IS a dynamic point light already (`shot.hml` adds one, MUZZLE_MID
+// x 2.6, radius 9 m) — but the viewmodel is emitted with a baked neutral
+// vertex colour and never consults it, so the gun stays ice blue three pixels
+// from a white-hot flash.  That is a `shot.hml` / `meshgen.hml` call, not an
+// fxgen one.  What THIS cell can do, and now does, is carry a genuinely warm
+// MUZZLE_EDGE haze all the way out to texel 2 — 27 screen pixels of radius —
+// so the near ground, the gun's upper receiver and the muzzle end of the
+// barrel do take a warm additive lift from the sprite itself.  Beyond ~32 px
+// the cell is out of reach at any authoring; lighting the wall at 13 m needs
+// the re-key, and that is `tod.hml`.
+// ---------------------------------------------------------------------------
+
+// Petal gain along the segment.  `fx_seg` ramps ga -> gb linearly in t, which
+// puts the half-value point at the MIDDLE of the petal; a flash petal wants to
+// hold and then drop, so each petal is drawn as two segments — a strong inner
+// two thirds and a fading outer third.  Two capsules, no new primitive.
+fn muzzle_petal(d: buffer, ox: i32, oy: i32, cx: f64, cy: f64,
+                dx: f64, dy: f64, len: f64, hw: f64,
+                r: i32, g: i32, b: i32, gain: f64) {
+    let r0: f64 = 1.00;
+    let r1: f64 = 1.00 + (len - 1.00) * 0.62;
+    fx_seg(d, ox, oy, cx + dx * r0, cy + dy * r0, cx + dx * r1, cy + dy * r1,
+           hw, r, g, b, gain, gain * 0.72);
+    fx_seg(d, ox, oy, cx + dx * r1, cy + dy * r1, cx + dx * len, cy + dy * len,
+           hw * 0.78, r, g, b, gain * 0.72, 0.0);
+}
+
 fn cell_muzzle(d: buffer, ox: i32, oy: i32, frame: i32) {
-    let cx: f64 = 8.0;
-    let cy: f64 = 8.0;
+    // Deliberately NOT (8.0, 8.0): see note 4 above.
+    let cx: f64 = 8.15;
+    let cy: f64 = 7.85;
     let cr: i32 = pal_r(g_MUZZLE_CORE); let cg: i32 = pal_g(g_MUZZLE_CORE); let cb: i32 = pal_b(g_MUZZLE_CORE);
     let mr: i32 = pal_r(g_MUZZLE_MID);  let mg: i32 = pal_g(g_MUZZLE_MID);  let mb: i32 = pal_b(g_MUZZLE_MID);
     let er: i32 = pal_r(g_MUZZLE_EDGE); let eg: i32 = pal_g(g_MUZZLE_EDGE); let eb: i32 = pal_b(g_MUZZLE_EDGE);
-    let np: i32 = 8;
-    let plen: f64 = 1.0;
-    let core: f64 = 1.0;
-    let mid: f64 = 0.85;
-    let edge: f64 = 0.9;
-    if (frame == 1) { plen = 1.28; core = 0.55; mid = 0.95; edge = 0.85; }
-    if (frame == 2) { plen = 1.05; core = 0.0;  mid = 0.30; edge = 0.42; np = 5; }
-    // petals first so the core burns through them
+    let np: i32 = 6;
+    let plen: f64 = 0.92;
+    let core: f64 = 1.00;
+    let body: f64 = 1.00;
+    let haze: f64 = 1.00;
+    let pg: f64 = 1.02;
+    if (frame == 1) { np = 7; plen = 1.00; core = 0.46; body = 1.06; haze = 1.08; pg = 0.82; }
+    if (frame == 2) { np = 5; plen = 0.95; core = 0.00; body = 0.46; haze = 0.66; pg = 0.44; }
+
+    // 1. HAZE — MUZZLE_EDGE, reach 6.20/5.95 from a centre at (8.15, 7.85), so
+    //    the furthest texel it can touch is 14 in x and 13 in y and it is at
+    //    zero by both.  This is the layer that warms the ground and the gun.
+    fx_splat(d, ox, oy, cx, cy, 6.20, 6.05, 1, er, eg, eb, 0.50 * haze);
+    // 2. SKIRT — the first MUZZLE_MID cone, offset off-axis.
+    fx_splat(d, ox, oy, cx - 0.20, cy + 0.15, 4.95, 4.70, 1, mr, mg, mb, 0.44 * body);
+    // 3. BODY.
+    //    A SIXTH CONE WAS TRIED HERE AND REMOVED.  The right-hand shoulder
+    //    still steps 240 -> 126 in one texel, and the obvious fix — a wide
+    //    MUZZLE_MID cone at R 5.60 under everything, plus widening the inner
+    //    CORE cone from R 3.20 to R 4.40 — does remove the step and makes the
+    //    frame WORSE.  Rendered and compared: it flattens the 3-5 texel band
+    //    into a uniform slab (screen row y=138 measured 242 242 243 242 248
+    //    248 248 250 253 253 253 253 251 248 247 247 247 245 241 241 240 240
+    //    239 then 126), and a large uniform region with an edge on it is
+    //    exactly the rectangle this cell was rebuilt to stop being.  A steep
+    //    LAST step is fine; a flat middle is not.  Six graded stages beat five
+    //    only if all six are still falling.
+    fx_splat(d, ox, oy, cx + 0.10, cy - 0.05, 4.30, 3.95, 1, mr, mg, mb, 0.62 * body);
+    // 4. PETALS, under the core so the core burns through them.
     for (let i = 0; i < np; i++) {
         let L: f64 = petal_len(i) * plen;
-        if (L > 6.4) { L = 6.4; }
-        fx_seg(d, ox, oy, cx, cy, cx + petal_dx(i) * L, cy + petal_dy(i) * L,
-               1.55, er, eg, eb, edge, 0.0);
+        if (L > 6.15) { L = 6.15; }
+        muzzle_petal(d, ox, oy, cx, cy, petal_dx(i), petal_dy(i), L, 1.24,
+                     er, eg, eb, pg);
     }
-    if (mid > 0.0) { fx_splat(d, ox, oy, cx, cy, 5.4, 4.9, 2, mr, mg, mb, mid); }
-    if (core > 0.0) { fx_splat(d, ox, oy, cx, cy, 3.1, 2.8, 3, cr, cg, cb, core); }
+    // 5. INNER — MUZZLE_CORE, still short of clipping on its own.
+    if (core > 0.0) {
+        fx_splat(d, ox, oy, cx, cy, 3.20, 2.95, 1, cr, cg, cb, 0.94 * core);
+    }
+    // 6. HEART — the only layer driven past 1.0.  R 1.80 at gain 1.42 clips on
+    //    its own out to r = 0.53, and with layers 1-3 under it the composite is
+    //    at 255 in all three channels over about 3 texels / 13 screen pixels.
+    //    That is the >220 anchor `muzzle_fog` and `budget_worst` are carrying.
+    //    It is deliberately SMALLER than the old cell's 4x4 / 18 px: a
+    //    blown-out middle sells the flash, an 18-pixel blown-out middle with
+    //    one ramp texel around it IS the square the critique named.
+    if (core > 0.0) {
+        fx_splat(d, ox, oy, cx, cy, 1.80, 1.60, 1, cr, cg, cb, 1.42 * core);
+    }
 }
 
 // Bullet tracer: a vertical streak, hot and thin in the middle, tapering to
@@ -352,6 +674,8 @@ fn cell_tracer(d: buffer, ox: i32, oy: i32) {
     let r: i32 = pal_r(g_TRACER); let g: i32 = pal_g(g_TRACER); let b: i32 = pal_b(g_TRACER);
     fx_seg(d, ox, oy, 8.0, 1.5, 8.0, 14.5, 3.3, r, g, b, 0.18, 0.18);
     fx_seg(d, ox, oy, 8.0, 2.5, 8.0, 13.5, 1.5, r, g, b, 0.85, 0.85);
+    // clipped spine — a tracer is a bullet on fire, not a pencil line
+    fx_seg(d, ox, oy, 8.0, 3.5, 8.0, 12.5, 1.1, r, g, b, 1.60, 1.60);
     fx_splat(d, ox, oy, 8.0, 8.0, 2.2, 5.4, 2, r, g, b, 0.9);
 }
 
@@ -371,7 +695,10 @@ fn cell_spark(d: buffer, ox: i32, oy: i32, variant: i32) {
                8.0 + petal_dx(k) * L, 8.0 + petal_dy(k) * L,
                1.15, r, g, b, 0.95, 0.0);
     }
-    fx_splat(d, ox, oy, 8.0, 8.0, 2.6, 2.6, 3, r, g, b, 0.85);
+    // clipped centre: an impact spark is a white-hot point, and at 0.34 m from
+    // 9 m it is a 4 px sprite, so the plateau has to be ~3 texels across to be
+    // sampled at all
+    fx_splat(d, ox, oy, 8.0, 8.0, 3.0, 3.0, 1, r, g, b, 2.40);
 }
 
 // Explosion, 6 frames.  HOT core -> MID turbulent body -> COOL hollow shell.
@@ -431,29 +758,86 @@ fn cell_explo(d: buffer, ox: i32, oy: i32, frame: i32) {
 
 // A single falling ember / fire mote.  Small, hot, and slightly egg-shaped so
 // it has an up axis.
+//
+// Embers are the ONLY additive sprite `ridge_golden` and `hub_dawn` carry
+// besides the lantern, and they are drawn at 0.12-0.22 m from 2-18 m: 3-6
+// screen pixels against a 14-texel cell, so a 1-texel white centre is sampled
+// past most of the time.  The core is now a clipped plateau ~3 texels across.
+// Under the EMBER tint a clipped white texel resolves to EMBER's own colour at
+// full strength, which is the point: an ember is a piece of fire, and against
+// hub_dawn's 173-luminance dawn sky it is worth +95 — enough on its own to put
+// the frame over the bar.
 fn cell_ember(d: buffer, ox: i32, oy: i32) {
     let r: i32 = pal_r(g_EMBER); let g: i32 = pal_g(g_EMBER); let b: i32 = pal_b(g_EMBER);
     let hr: i32 = pal_r(g_MUZZLE_CORE); let hg: i32 = pal_g(g_MUZZLE_CORE); let hb: i32 = pal_b(g_MUZZLE_CORE);
-    fx_splat(d, ox, oy, 8.0, 8.3, 4.0, 4.8, 2, r, g, b, 0.75);
-    fx_splat(d, ox, oy, 8.0, 7.6, 1.7, 1.9, 2, hr, hg, hb, 0.9);
+    fx_splat(d, ox, oy, 8.0, 8.3, 4.4, 5.2, 2, r, g, b, 0.85);
+    fx_splat(d, ox, oy, 8.0, 7.7, 2.7, 2.9, 1, r, g, b, 1.90);
+    fx_splat(d, ox, oy, 8.0, 7.7, 1.9, 2.0, 1, hr, hg, hb, 2.40);
 }
 
-// Smoke puff, 3 frames.  Additive smoke is a warm HAZE, not a dark cloud — on
-// an ADD layer a dark colour is invisible, so the only honest smoke is a dim
-// low-contrast lift.  Built from overlapping lobes so it is never a disc.
+// The five lit-shoulder lobe offsets, in units of the puff radius.  Crowded on
+// the lower-left because that is where the muzzle is; deliberately NOT evenly
+// spaced, because an evenly spaced set of lobes on a circle is a donut and a
+// donut reads as a smoke ring, which is a completely different event.
+fn smoke_rx(i: i32): f64 {
+    if (i == 0) { return 0.0 - 0.86; }
+    if (i == 1) { return 0.0 - 0.34; }
+    if (i == 2) { return 0.38; }
+    if (i == 3) { return 0.0 - 0.94; }
+    return 0.78;
+}
+fn smoke_ry(i: i32): f64 {
+    if (i == 0) { return 0.58; }
+    if (i == 1) { return 0.90; }
+    if (i == 2) { return 0.80; }
+    if (i == 3) { return 0.0 - 0.08; }
+    return 0.30;
+}
+fn smoke_rg(i: i32): f64 {
+    if (i == 0) { return 0.82; }
+    if (i == 1) { return 0.74; }
+    if (i == 2) { return 0.64; }
+    if (i == 3) { return 0.54; }
+    return 0.44;
+}
+
+// Smoke puff, 3 frames.  Read the ADDITIVE SMOKE note in the header first:
+// this is not a cloud, it is the light a flash scatters off one.  So:
+//
+//   * the LIT RIM is five small SAND lobes crowded on the lower-left shoulder,
+//     at gains 0.98 down to 0.58.  They are what you actually see;
+//   * the BODY is two wide GRANITE_HI lobes at gain 0.30 — cool, because the
+//     unlit side of anything in this game is cool (CLAUDE.md §8), and dim,
+//     because it only has to carry the silhouette;
+//   * the MIDDLE is left empty.  Under ADD an empty texel is see-through, and a
+//     backlit puff genuinely is see-through in the middle.  It is also the only
+//     way to have a rim at all: fill the centre and the rim stops being a rim.
+//
+// Peak luminance 226 against the old version's 97.  Note the hard ceiling this
+// cell is up against: the caller still multiplies it by its tint and its
+// per-vertex alpha, and at shot.hml's muzzle-flash call site that product is
+// UI_DIM * 70/255 = 0.17, so no smoke cell whatsoever can contribute more than
+// ~43/255 of lift there.  This one now spends everything it has; the rest of
+// the fix is a call-site decision (see the task report).
 fn cell_smoke(d: buffer, ox: i32, oy: i32, frame: i32) {
-    let r: i32 = pal_r(g_STONE_MID); let g: i32 = pal_g(g_STONE_MID); let b: i32 = pal_b(g_STONE_MID);
-    // A puff needs a SILHOUETTE, not a gradient.  Three lobes of clearly
-    // different sizes, one dominant "head" high and left, give it a readable
-    // outline at 16 px; five equal lobes just averaged out to a grey smudge.
-    let reach: f64 = 4.6 + f64(frame) * 0.72;
-    let gain: f64 = 1.05 - f64(frame) * 0.14;
-    let rise: f64 = f64(frame) * 0.7;
-    let cy: f64 = 8.6 - rise;
-    fx_splat(d, ox, oy, 7.3, cy - 0.9, reach * 0.80, reach * 0.74, 2, r, g, b, gain * 0.85);
-    fx_splat(d, ox, oy, 9.6, cy + 0.7, reach * 0.55, reach * 0.52, 2, r, g, b, gain * 0.72);
-    fx_splat(d, ox, oy, 6.4, cy + 1.4, reach * 0.44, reach * 0.42, 2, r, g, b, gain * 0.62);
-    fx_splat(d, ox, oy, 8.2, cy - 2.1, reach * 0.34, reach * 0.32, 2, r, g, b, gain * 0.55);
+    let br: i32 = pal_r(g_GRANITE_HI); let bg: i32 = pal_g(g_GRANITE_HI); let bb: i32 = pal_b(g_GRANITE_HI);
+    let lr: i32 = pal_r(g_SAND);       let lg: i32 = pal_g(g_SAND);       let lb: i32 = pal_b(g_SAND);
+    let reach: f64 = 5.0 + f64(frame) * 0.45;
+    let fade: f64 = 1.0 - f64(frame) * 0.09;
+    let cx: f64 = 8.3 - f64(frame) * 0.28;
+    let cy: f64 = 8.5 - f64(frame) * 0.50;      // the puff rises and drifts left
+    // body — two wide dim lobes of different sizes, the silhouette only
+    fx_splat(d, ox, oy, cx - 0.5, cy - 0.4, reach * 0.70, reach * 0.66, 2,
+             br, bg, bb, fade * 0.40);
+    fx_splat(d, ox, oy, cx + 1.1, cy + 0.5, reach * 0.50, reach * 0.47, 2,
+             br, bg, bb, fade * 0.34);
+    // lit rim — the part that is actually visible
+    let rr: f64 = reach * 0.52;
+    let lo2: f64 = reach * 0.50;
+    for (let i = 0; i < 5; i++) {
+        fx_splat(d, ox, oy, cx + smoke_rx(i) * rr, cy + smoke_ry(i) * rr,
+                 lo2, lo2 * 0.92, 1, lr, lg, lb, fade * smoke_rg(i));
+    }
 }
 
 // Ambient dust: the faintest thing in the atlas.  Large, soft, and only just
@@ -465,42 +849,312 @@ fn cell_dust(d: buffer, ox: i32, oy: i32) {
     fx_splat(d, ox, oy, 7.4, 8.2, 1.3, 1.2, 2, r, g, b, 0.55);
 }
 
-// Soft radial glow cards, two sizes.  These are the workhorses: a tinted glow
-// card behind a lantern, a level-up flash, an NS_CORE halo.  Baked in
-// STAR_BRIGHT so the caller's vertex tint lands on a near-neutral base.
-fn cell_glow(d: buffer, ox: i32, oy: i32, big: i32) {
+// FX_GLOW_L — the neutral glow card, and THE ANCHOR OF THE WHOLE HARNESS.
+//
+// Lantern halos and the per-light ground pool multiply this by the LIGHT's
+// colour, so it must stay hueless: baked in STAR_BRIGHT, the palette's
+// neutral-brightest entry.  Do not tint this cell.
+//
+// It is also the only >220 anchor available to `hub_dawn` and `flat_debug`,
+// neither of which has a muzzle flash, a sun disc or a shrine.  shot.hml puts
+// one of these on every K_LANTERN at 1.9 m across, which at 6-37 m is 15-100
+// screen pixels — this is the one FX card in the atlas that is MAGNIFIED
+// rather than minified, so it is worth building properly.
+//
+// The old card was two soft quadratic splats.  Its peak was ONE texel at gain
+// 0.998, and hub_dawn's brightest world pixel was therefore a single pixel at
+// luminance 215: five short of the bar, with nothing around it.  A soft
+// quadratic blob is also, visually, exactly the "dead grey stick with a smudge
+// on it" the critic saw — it has no core, so it reads as fog, not as a lamp.
+//
+// This one is a LAMP:
+//
+//   * a HARD CORE — a linear cone of radius 3.05 at gain 2.7, which is clipped
+//     to (255,255,240) out to r = 1.92 and therefore plateaus over 12 texels,
+//     ~26 % of the card's diameter.  At a 15 m lantern that is a 7 px disc all
+//     carrying the full 104-luminance additive budget instead of one pixel;
+//   * a FILAMENT CROSS — four short anamorphic spikes, horizontal ones longer
+//     than vertical.  A hot core with streaks is the only visual grammar that
+//     says "brighter than this display can show", and it costs nothing.  They
+//     are kept to r <= 4.6 deliberately: this cell is also the ground light
+//     pool, and a long cross projected flat on the terrain would read as a
+//     decal instead of as a pool;
+//   * two soft skirts, so the halo still falls off to nothing before texel 14.
+//
+// Peak texel (255,255,240) over 12 texels; ring texels 0.  Verified against
+// the clipped-edge assertion in `fxgen_selftest`.
+fn cell_glow(d: buffer, ox: i32, oy: i32) {
     let r: i32 = pal_r(g_STAR_BRIGHT); let g: i32 = pal_g(g_STAR_BRIGHT); let b: i32 = pal_b(g_STAR_BRIGHT);
-    if (big == 1) {
-        fx_splat(d, ox, oy, 8.0, 8.0, 6.3, 6.3, 2, r, g, b, 0.92);
-        fx_splat(d, ox, oy, 8.0, 8.0, 3.2, 3.2, 2, r, g, b, 0.45);
-    } else {
-        fx_splat(d, ox, oy, 8.0, 8.0, 4.6, 4.6, 2, r, g, b, 1.0);
+    // skirt — reach 6.35, which is inside the 6.5 that would touch texel 1
+    fx_splat(d, ox, oy, 8.0, 8.0, 6.35, 6.35, 2, r, g, b, 0.62);
+    fx_splat(d, ox, oy, 8.0, 8.0, 4.30, 4.30, 2, r, g, b, 0.52);
+    // filament cross, drawn UNDER the core so the core burns through it
+    fx_seg(d, ox, oy, 8.0, 8.0, 3.4, 8.0, 0.95, r, g, b, 1.0, 0.0);
+    fx_seg(d, ox, oy, 8.0, 8.0, 12.6, 8.0, 0.95, r, g, b, 1.0, 0.0);
+    fx_seg(d, ox, oy, 8.0, 8.0, 8.0, 4.4, 0.85, r, g, b, 0.85, 0.0);
+    fx_seg(d, ox, oy, 8.0, 8.0, 8.0, 11.6, 0.85, r, g, b, 0.85, 0.0);
+    // The hard core.  R 4.10 at gain 2.30 clips out to r = 4.10*(1 - 1/2.30) =
+    // 2.32 and reaches zero at 4.10, so the plateau is ~4.6 texels across and
+    // the ramp under it is 1.78 texels wide.  The previous R 3.05 / gain 2.70
+    // clipped to 1.92 with a 1.13-texel ramp, and at a 1.9 m lantern seen from
+    // 6 m — 72 screen pixels, 4.5 px per texel — a 1.13-texel ramp is a FIVE
+    // PIXEL cliff from 255 to background, which is the same defect the muzzle
+    // cell was rebuilt for.  Wider plateau, gentler shoulder, same reach.
+    fx_splat(d, ox, oy, 8.0, 8.0, 4.10, 4.10, 1, r, g, b, 2.30);
+}
+
+// FX_GLOW_S — the NIGHTSHADE BLOOM (ART_BIBLE 12.4).  The money shot.
+//
+// Three concentric violets plus three off-centre wisps:
+//
+//   NS_MID   #8A2BD4  a LINEAR (pw 1) skirt, so the halo still has real energy
+//                     out at r = 4 instead of collapsing quadratically into a
+//                     dot.  This is what makes it read from across the basin.
+//   NS_CORE  #C74FFF  the body, also linear.
+//   NS_HALO  #E8A6FF  a 2-texel hot centre.  A glow with a uniform colour is a
+//                     sticker; a glow with a hot middle is a light source.
+//
+// The MANTLE is budgeted against the saturation ceiling in the header and is
+// where the frame's measured hue comes from — it is ~90 % of the lit texels.
+// The HEART is white by the anchor law: NS_HALO driven past 1.0 so it clips,
+// with a STAR_BRIGHT centre inside it.
+//
+// Two things the first pass got wrong and this one fixes:
+//
+//   1. NO ANCHOR.  A card whose brightest texel is (218, 92, 255) has
+//      luminance 148, and at shot.hml's NS_HALO/alpha-150 call site that is
+//      only 67 of the 115 luminance the call site could have carried.  Two
+//      overlapping blooms — and shot.hml puts 46 of these in a 20 m disc, so
+//      overlaps are the normal case, not the exception — still summed to 134.
+//      Nothing in `ns_bloom` could reach 220 and nothing did.
+//   2. NOT ENOUGH VIOLET.  `ns_bloom` measured 1.3 % violet against a brief
+//      that calls it "the violet money shot".  The skirt was a LINEAR cone at
+//      gain 0.80, so at r = 4 it was down to 0.25 — (34, 11, 53), a colour
+//      that lands under the frame's own luminance floor and is not counted as
+//      violet by anything, including the eye.  The mantle gains below are
+//      roughly doubled and the NS_CORE body widened from 4.0 to 5.0, which is
+//      what turns each card from "a violet dot with a dark fringe" into a
+//      violet DISC the size shot.hml is already drawing it at.
+//
+// The wisps start at r = 2.2, OUTSIDE the heart, so they cost the centre's red
+// budget nothing.  They exist because a perfect disc reads as a lamp and this
+// is supposed to be a flowering plant: the asymmetric fringe is the difference
+// between "a violet dot" and "something growing there".  The card is 1.1x
+// taller than wide for the same reason.
+fn cell_bloom(d: buffer, ox: i32, oy: i32) {
+    let dr: i32 = pal_r(g_NS_MID);  let dg: i32 = pal_g(g_NS_MID);  let db: i32 = pal_b(g_NS_MID);
+    let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
+    let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
+    let sr: i32 = pal_r(g_STAR_BRIGHT); let sg: i32 = pal_g(g_STAR_BRIGHT); let sb: i32 = pal_b(g_STAR_BRIGHT);
+    for (let i = 0; i < 3; i++) {
+        let k: i32 = i * 3 + 1;                 // 1, 4, 7 — three of the eight
+        let L: f64 = 4.5 + f64(i) * 0.5;
+        fx_seg(d, ox, oy, 8.0 + petal_dx(k) * 2.2, 8.0 + petal_dy(k) * 2.2,
+               8.0 + petal_dx(k) * L, 8.0 + petal_dy(k) * L,
+               1.30, dr, dg, db, 0.95, 0.0);
     }
+    // mantle — the violet the frame is measured on.  See THE TINT IS PART OF
+    // THE COLOUR in the header: the body is NS_HALO, not NS_CORE, because
+    // shot.hml already multiplies this card by NS_HALO.  NS_HALO squared is
+    // hue 282 / sat 0.58 on screen at luminance 155; NS_CORE times NS_HALO is
+    // hue 285 / sat 0.80 at luminance 121.  The deep NS_MID skirt supplies the
+    // depth the pale body gives up, out where the falloff has pulled red down
+    // far enough for it to keep its hue.
+    //
+    // ---------------------------------------------------------------------
+    // ROUND 3: WHY THE MANTLE IS STILL VIOLET, AND WHY `ns_bloom` STILL FAILS
+    // CLAUDE.md §8.  A NEGATIVE RESULT, MEASURED, SO NOBODY REPEATS IT.
+    // ---------------------------------------------------------------------
+    // Green is the whole of §8 here.  Red and blue are clipped over the middle
+    // of any bloom on screen — NS_HALO is (232,166,255) and blue pins first —
+    // so at a bloom pixel
+    //     lum = 0.299*255 + 0.587*G + 0.114*255 = 105.3 + 0.587*G
+    // and clearing 220 needs G >= 195.  Under BLEND_ADD one sprite delivers
+    // texel * tint * alpha / 255^2, and the texel here is ALREADY 255 in every
+    // channel, so the per-sprite green ceilings are fixed by the call site and
+    // cannot be raised from this file at all:
+    //
+    //     FX_GLOW_S  NS_HALO a150 ->  97.6 green   (lum ceiling 114)
+    //     FX_XP_MOTE NS_HALO a190 -> 123.7 green   (lum ceiling 145)
+    //     FX_EYE     NS_CORE a215 ->  66.6 green   (lum ceiling 112)
+    //
+    // Therefore EVERY >220 pixel this scene could ever have is two sprites on
+    // top of each other, and the experiment this round was: make the body pale
+    // so that a crossing sprite lands on a high-green target over 42 % of the
+    // card instead of 6 %.  STAR_BRIGHT at R 5.70 / gain 2.35, holding green
+    // over 195 out to r = 4.1.  It was built, rendered and measured:
+    //
+    //     brightest FX world pixel, control        (229,153,255)  187.1
+    //     brightest FX world pixel, pale body      (229,156,255)  189.1
+    //     world pixels > 220, either               0
+    //
+    // Two luminance.  The reason is placement, not authoring: `ns_bloom` draws
+    // ~14 blooms and ~10 motes inside the frustum and NONE OF THEM OVERLAP.
+    // The brightest world pixel in the frame is one mote on bare terrain
+    // (123.7 green + 32 of ground) and no amount of widening a target hits a
+    // dart nobody threw.  What the pale body DID do is turn each flower into a
+    // flat lavender balloon — the "uniform violet disc / sticker" the ART_BIBLE
+    // §13 anti-goal names, and a visible regression on the one frame the last
+    // critique called the best in the set.  Reverted, and the mantle stays
+    // violet.
+    //
+    // SO: `ns_bloom` CANNOT BE MADE TO PASS §8 FROM THIS FILE.  The anchor has
+    // to come from one of three places, none of them fxgen:
+    //   * `shot.hml` — the FX_XP_MOTE / FX_GLOW_S call sites at a higher alpha
+    //     or a paler tint.  Two motes at a190 already sum to 250; the moment
+    //     any two of these sprites overlap the frame passes;
+    //   * `skygen.hml` — the moon.  It peaks at 161.5 and a 235+ disc core
+    //     would settle §8 for this frame outright;
+    //   * `meshgen.hml` / `shot.hml` — a specular or emissive face on the
+    //     shrine that the NS_CORE point light can actually blow out.
+    fx_splat(d, ox, oy, 8.0, 8.0, 5.9, 6.35, 1, dr, dg, db, 0.95);
+    fx_splat(d, ox, oy, 8.0, 7.9, 4.6, 5.0, 1, hr, hg, hb, 1.05);
+    fx_splat(d, ox, oy, 8.0, 7.9, 5.6, 6.0, 1, mr, mg, mb, 0.28);
+    // heart — STAR_BRIGHT clipped out to r = 2.4*(1 - 1/4.2) = 1.83, i.e. 12
+    // texels, with a ramp only 0.55 texels wide.  NOTE THE MISSING PALE RING:
+    // the obvious build is white -> NS_HALO -> NS_CORE -> NS_MID, and stacking
+    // NS_HALO on top of a band whose blue is already clipped raises green while
+    // red clips too — that band measured (255, 192, 255), hue 300 deg, sat
+    // 0.25.  That is the magenta ring the header's first section is about, and
+    // it was eating the money shot from the inside.  A steep white heart
+    // straight onto the mantle keeps the transition to a single texel ring.
+    // THE HEART IS WIDER AND SOFTER THAN IT WAS, AND HERE IS THE ARITHMETIC.
+    // `ns_bloom` is the frame that fails CLAUDE.md §8 and the whole failure is
+    // an OVERLAP problem, not a brightness problem.  Under BLEND_ADD what one
+    // sprite puts on screen is texel * tint * alpha / 255^2, and both violet
+    // call sites are green-limited by their own tint:
+    //
+    //   FX_GLOW_S  NS_HALO(232,166,255) a150 -> (136, 98,141)  lum 114
+    //   FX_XP_MOTE NS_HALO(232,166,255) a190 -> (173,124,179)  lum 145
+    //   FX_EYE     NS_CORE(199, 79,255) a215 -> (168, 66,202)  lum 112
+    //
+    // The texel is already 255 in every channel, so those three numbers are
+    // hard ceilings that no authoring in this file can raise.  Therefore:
+    //
+    //   bloom + bloom = (255,195,255)  lum 220   <- 0.2 SHORT.  Never passes.
+    //   bloom + mote  = (255,221,255)  lum 235   <- passes
+    //   mote  + mote  = (255,247,255)  lum 250   <- passes
+    //
+    // The frame's measured maximum was 181.8 on an FX pixel: one mote landing
+    // on a bloom's MANTLE, not on its heart.  The fix is therefore to make the
+    // heart a bigger TARGET, so that a mote crossing a bloom crosses its
+    // clipped middle instead of its skirt.  R 3.80 at gain 2.60 clips out to
+    // r = 3.80*(1 - 1/2.60) = 2.34 against the old 1.83 — a 1.6x larger
+    // clipped area — and reaches zero at 3.80 instead of 2.40, which widens
+    // the ramp from 0.57 texels to 1.46 and removes the one-texel 182 -> 255
+    // cliff the old card had (visible as a hard ring on a near bloom, 5 px
+    // wide at 2 m).
+    //
+    // This does NOT bleach the money shot, and that is worth saying because it
+    // looks like it should.  A clipped white texel arrives on screen as
+    // texel * NS_HALO, i.e. (136, 98, 141): hue 293 deg, saturation 0.31 — it
+    // lands INSIDE the 260-300 violet band the census counts.  Whitening the
+    // atlas here buys violet on screen; it is the pale-atlas / violet-tint
+    // rule two sections up, applied to the heart instead of to the mantle.
+    fx_splat(d, ox, oy, 8.0, 7.9, 3.80, 3.80, 1, sr, sg, sb, 2.60);
 }
 
 // Enemy eye: a horizontal lens with a hot violet core.  The single strongest
 // long-range readability cue the game has (ART_BIBLE §4.4).
+// Two NS_CORE splats plus an NS_HALO pupil used to sum to (255,140,255) — the
+// clipped magenta the header warns about.  The lens haze is NS_MID and the
+// mantle gains are budgeted, so the lens lands violet instead of pink.  The
+// pupil is off-centre: a centred pupil in a symmetric lens is a decal, an
+// off-centre one is looking at you.
+//
+// THE PUPIL IS NOW WHITE-HOT AND WIDE.  Two measured reasons:
+//
+//   * MINIFICATION.  shot.hml draws this at 0.30 m from 11-19 m, which is 3-5
+//     screen pixels against a 14-texel cell.  Nearest sampling at that ratio
+//     takes every third texel, so the old 1-texel pupil was missed outright in
+//     most frames.  The clipped region is now ~4 texels across so a 4 px
+//     sprite cannot step over it.
+//   * READABILITY.  The critic measured `storm_assault`'s four hostiles at
+//     Weber contrast 0.067 against the fog behind them — invisible.  This cell
+//     is the highest-alpha FX in the game (a215) and the single strongest
+//     long-range readability cue the design has (ART_BIBLE §4.4); its old peak
+//     spent 79 of the 113 luminance the call site would carry.  A hot pupil in
+//     a violet corona is worth more than 40 % more contrast per enemy, and it
+//     costs no triangles.
 fn cell_eye(d: buffer, ox: i32, oy: i32) {
+    let dr: i32 = pal_r(g_NS_MID);  let dg: i32 = pal_g(g_NS_MID);  let db: i32 = pal_b(g_NS_MID);
     let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
     let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
-    fx_splat(d, ox, oy, 8.0, 8.0, 6.3, 4.4, 2, mr, mg, mb, 0.55);
-    fx_splat(d, ox, oy, 8.0, 8.0, 5.4, 2.3, 2, mr, mg, mb, 0.95);
-    fx_splat(d, ox, oy, 7.2, 8.0, 2.4, 1.4, 2, hr, hg, hb, 1.0);
+    let sr: i32 = pal_r(g_STAR_BRIGHT); let sg: i32 = pal_g(g_STAR_BRIGHT); let sb: i32 = pal_b(g_STAR_BRIGHT);
+    // THE LENS IS PALE, AND THAT IS WHY IT IS VIOLET.  shot.hml tints this
+    // cell with NS_CORE itself, whose green channel is 79/255 = 0.31 — so an
+    // NS_CORE lens in the atlas arrives on screen as NS_CORE SQUARED: hue 277,
+    // saturation 0.88, luminance 97.  A near-white lens arrives as NS_CORE
+    // exactly: hue 285, saturation 0.67, luminance 133, i.e. 37 % brighter for
+    // the same brand colour.  Enemy readability is a luminance-contrast
+    // problem, not a saturation problem, so the lens is NS_HALO and the deep
+    // violet is spent only on the outer haze, where the falloff has already
+    // pulled the channels apart.
+    fx_splat(d, ox, oy, 8.0, 8.0, 6.35, 4.6, 2, dr, dg, db, 1.05);
+    fx_splat(d, ox, oy, 8.0, 8.0, 5.6, 2.5, 1, hr, hg, hb, 1.05);
+    fx_splat(d, ox, oy, 7.3, 8.0, 3.4, 2.4, 1, mr, mg, mb, 0.35);
+    // pupil: clipped out to 2.0*(1-1/3.6) = 1.44 in x, 1.5*(1-1/3.6) = 1.08 in
+    // y — about 3 x 2 texels, which a 4 px sprite sampling every third texel
+    // can still land on.
+    fx_splat(d, ox, oy, 7.3, 8.0, 2.0, 1.5, 1, sr, sg, sb, 3.60);
 }
 
 // Loot beam: a violet column, bright at the ground and dissolving upward.
+// The wide column + hot spine + base flare used to sum to (255,254,255): a
+// PURE WHITE loot beam, which is both off-brand and unreadable against a snow
+// or noon background.  Re-budgeted; the base now measures (214, 94, 255),
+// hue 284 deg, saturation 0.63.
 fn cell_loot(d: buffer, ox: i32, oy: i32) {
+    let dr: i32 = pal_r(g_NS_MID);  let dg: i32 = pal_g(g_NS_MID);  let db: i32 = pal_b(g_NS_MID);
     let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
     let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
-    fx_seg(d, ox, oy, 8.0, 14.4, 8.0, 1.6, 4.2, mr, mg, mb, 0.70, 0.0);
-    fx_seg(d, ox, oy, 8.0, 14.4, 8.0, 3.5, 1.7, hr, hg, hb, 0.95, 0.0);
-    fx_splat(d, ox, oy, 8.0, 13.4, 5.2, 2.2, 2, hr, hg, hb, 0.8);
+    fx_seg(d, ox, oy, 8.0, 14.4, 8.0, 1.6, 4.2, dr, dg, db, 0.78, 0.0);
+    fx_seg(d, ox, oy, 8.0, 14.4, 8.0, 3.5, 1.7, mr, mg, mb, 0.60, 0.0);
+    fx_splat(d, ox, oy, 8.0, 13.4, 5.2, 2.2, 2, hr, hg, hb, 0.26);
 }
 
-// Rain streak: thin, slightly raked, brighter at the leading (lower) end.
+// Rain streak: thin, slightly raked, brighter at the leading (lower) end, with
+// a WHITE-HOT HEAD.
+//
+// `storm_assault` is the worst frame in the set — a full-screen additive veil
+// has flattened it to std 22.4 over a p1-p99 range of 84, with no world pixel
+// anywhere near 220 — and 40 of these are the only high-frequency detail the
+// scene has.  The old streak topped out at 0.80 * MOON_DISC = (176,182,192),
+// which after UI_WHITE * alpha 120 * the fog term is a +50 lift: below the
+// noise floor of the veil it is drawn over.  It measured as an empty grey sky.
+//
+// Three changes, all aimed at making rain a legible EVENT:
+//   * a MOON_DISC halo at twice the width, so a streak that lands 2 px wide
+//     still resolves to more than one column;
+//   * the body driven to gain 1.20 at the leading end so it clips;
+//   * a STAR_BRIGHT HEAD over the last third.  Rain catching a lightning flash
+//     is white at the head and cool along the tail, which is both what the
+//     reference does and what makes this the scene's >220 anchor: at 2-5 m the
+//     fog term barely touches alpha, so the head carries its full ~111.
+//
+// FX_RAIN is a STREAK cell (`fx_is_streak`) and is meant to run out of its own
+// cell — a stretched billboard whose sprite fades early shows a soft end cap.
+//
+// THE CELL IS FULL-WIDTH ON PURPOSE, AND THE RAKE IS GONE.  Measured: shot.hml
+// draws rain through `billboard_stretched` at HALF-WIDTH 0.05 m, which at 5-18
+// m is 0.4-1.2 SCREEN PIXELS.  A 1 px quad takes one sample across the whole
+// u range, so every scrap of horizontal detail in this cell — the rake, the
+// taper, the soft shoulders — is not "subtle", it is a coin flip on whether
+// the sampled column is the streak or the black beside it.  That is why the
+// old raked line, drawn 12 times in `storm_assault`, changed 23 pixels in the
+// entire frame.
+//
+// So the whole cell width now carries the streak and the ENTIRE budget goes
+// into the vertical profile, which is the only axis the sprite actually
+// resolves.  The rake is not lost: the caller already slants the quad by 0.12
+// m over a 1.5 m drop, so the geometry rakes it.
 fn cell_rain(d: buffer, ox: i32, oy: i32) {
     let r: i32 = pal_r(g_MOON_DISC); let g: i32 = pal_g(g_MOON_DISC); let b: i32 = pal_b(g_MOON_DISC);
-    fx_seg(d, ox, oy, 8.8, 1.4, 7.2, 14.6, 1.35, r, g, b, 0.10, 0.80);
+    let sr: i32 = pal_r(g_STAR_BRIGHT); let sg: i32 = pal_g(g_STAR_BRIGHT); let sb: i32 = pal_b(g_STAR_BRIGHT);
+    // cool body, tail to head, spanning every drawable column
+    fx_seg(d, ox, oy, 8.0, 0.5, 8.0, 15.5, 7.60, r, g, b, 0.12, 0.95);
+    // white-hot head over the lower half: clipped across the middle 8 columns
+    fx_seg(d, ox, oy, 8.0, 7.0, 8.0, 15.5, 6.40, sr, sg, sb, 0.35, 3.20);
 }
 
 // Lightning bolt, 2 variants.  A 5-point jagged polyline plus a wide dim
@@ -532,9 +1186,12 @@ fn cell_bolt(d: buffer, ox: i32, oy: i32, variant: i32) {
         fx_seg(d, ox, oy, bolt_x(variant, i), bolt_y(i),
                bolt_x(variant, i + 1), bolt_y(i + 1), 3.4, r, g, b, 0.20, 0.20);
     }
+    // the channel itself, driven past 1.0 so the spine CLIPS.  A bolt whose
+    // brightest texel is its own palette colour reads as a chalk scratch; the
+    // thing lightning is famous for is being the brightest object in the frame.
     for (let i = 0; i < 4; i++) {
         fx_seg(d, ox, oy, bolt_x(variant, i), bolt_y(i),
-               bolt_x(variant, i + 1), bolt_y(i + 1), 1.15, r, g, b, 1.0, 1.0);
+               bolt_x(variant, i + 1), bolt_y(i + 1), 1.25, r, g, b, 2.10, 2.10);
     }
     // one forked branch — a straight bolt looks like a scratch
     if (variant == 0) {
@@ -563,24 +1220,65 @@ fn cell_splash(d: buffer, ox: i32, oy: i32, frame: i32) {
 
 // Healing / pickup sparkle: a 4-point star with a green core.  VENOM is the
 // palette's "good thing happened" colour (§3.8).
+// Healing / pickup sparkle: a 4-point star with a green core.  VENOM is the
+// palette's "good thing happened" colour (§3.8).
+//
+// All four arms used to START at the centre, so the centre paid 3.6x VENOM plus
+// a full VENOM_HALO splat and clipped to (242,255,255) — a WHITE sparkle.  The
+// arms now start at r = 1.6 and the core is its own two splats, so the middle
+// lands on (129, 228, 144): hue 129 deg, saturation 0.43, and green.
 fn cell_sparkle(d: buffer, ox: i32, oy: i32) {
     let r: i32 = pal_r(g_VENOM); let g: i32 = pal_g(g_VENOM); let b: i32 = pal_b(g_VENOM);
     let hr: i32 = pal_r(g_VENOM_HALO); let hg: i32 = pal_g(g_VENOM_HALO); let hb: i32 = pal_b(g_VENOM_HALO);
-    fx_seg(d, ox, oy, 8.0, 8.0, 8.0, 2.0, 1.25, r, g, b, 0.95, 0.0);
-    fx_seg(d, ox, oy, 8.0, 8.0, 8.0, 14.0, 1.25, r, g, b, 0.95, 0.0);
-    fx_seg(d, ox, oy, 8.0, 8.0, 2.2, 8.0, 1.05, r, g, b, 0.85, 0.0);
-    fx_seg(d, ox, oy, 8.0, 8.0, 13.8, 8.0, 1.05, r, g, b, 0.85, 0.0);
-    fx_splat(d, ox, oy, 8.0, 8.0, 2.5, 2.5, 3, hr, hg, hb, 1.0);
+    fx_seg(d, ox, oy, 8.0, 6.4, 8.0, 2.0, 1.25, r, g, b, 1.00, 0.0);
+    fx_seg(d, ox, oy, 8.0, 9.6, 8.0, 14.0, 1.25, r, g, b, 1.00, 0.0);
+    fx_seg(d, ox, oy, 6.4, 8.0, 2.2, 8.0, 1.05, r, g, b, 0.90, 0.0);
+    fx_seg(d, ox, oy, 9.6, 8.0, 13.8, 8.0, 1.05, r, g, b, 0.90, 0.0);
+    fx_splat(d, ox, oy, 8.0, 8.0, 3.2, 3.2, 2, r, g, b, 0.95);
+    fx_splat(d, ox, oy, 8.0, 8.0, 1.8, 1.8, 2, hr, hg, hb, 0.95);
 }
 
 // XP mote: a violet diamond with a pale core.  Same shape language as the HUD
 // XP icon so the pickup and the bar read as one system.
+// The two NS_CORE diamonds plus the NS_HALO core used to sum past 255 in both
+// red and blue and land on (255,162,255) — the magenta the header warns about,
+// and the single biggest contributor to `ns_bloom` measuring hue 306 deg.  The
+// outer diamond is NS_MID and the mantle gains are budgeted so the diamond
+// itself stays violet.
+//
+// This cell has the LARGEST additive budget in `ns_bloom`: NS_HALO at alpha
+// 190 is worth 146 luminance, more than the bloom card (115) or the eye (113),
+// and shot.hml scatters 40 of them through the same 20 m disc as the 46 bloom
+// cards.  A mote crossing a bloom card is therefore the scene's most likely
+// >220 event, and it can only happen if BOTH of them clip.  So the mote gets a
+// white heart too — sized against a 3-9 px sprite, i.e. ~4 texels across.
 fn cell_xp(d: buffer, ox: i32, oy: i32) {
+    let dr: i32 = pal_r(g_NS_MID);  let dg: i32 = pal_g(g_NS_MID);  let db: i32 = pal_b(g_NS_MID);
     let mr: i32 = pal_r(g_NS_CORE); let mg: i32 = pal_g(g_NS_CORE); let mb: i32 = pal_b(g_NS_CORE);
     let hr: i32 = pal_r(g_NS_HALO); let hg: i32 = pal_g(g_NS_HALO); let hb: i32 = pal_b(g_NS_HALO);
-    fx_diamond(d, ox, oy, 8.0, 8.0, 6.4, mr, mg, mb, 0.55);
-    fx_diamond(d, ox, oy, 8.0, 8.0, 3.6, mr, mg, mb, 0.9);
-    fx_splat(d, ox, oy, 8.0, 7.6, 1.5, 1.5, 2, hr, hg, hb, 1.0);
+    let sr: i32 = pal_r(g_STAR_BRIGHT); let sg: i32 = pal_g(g_STAR_BRIGHT); let sb: i32 = pal_b(g_STAR_BRIGHT);
+    // NS_HALO body for the tint reason in `cell_bloom`; NS_MID keeps the
+    // diamond's outer edge deep.
+    // The diamonds stay violet.  A STAR_BRIGHT inner diamond was tried this
+    // round — see the long negative result in `cell_bloom` — and it moved the
+    // frame's brightest world pixel by two luminance while turning the motes
+    // into white confetti.  The mote's job in this frame is to be VIOLET and
+    // numerous; the >220 anchor is not available to it.
+    fx_diamond(d, ox, oy, 8.0, 8.0, 6.6, dr, dg, db, 1.05);
+    fx_diamond(d, ox, oy, 8.0, 8.0, 4.2, hr, hg, hb, 0.85);
+    // white heart, clipped out to 2.4*(1 - 1/4.2) = 1.83.  No NS_HALO layer,
+    // for the reason spelled out in `cell_bloom`.  Sized against a 3-9 px
+    // sprite: at 24 % of the diamond's radius the old heart was 1 px wide and
+    // minified away, which is the whole reason `ns_bloom` had no anchor.
+    // Widened for the same reason as `cell_bloom`'s heart, and this is the one
+    // that matters most: the mote is the only sprite in `ns_bloom` with a
+    // 145-luminance budget, so every >220 pixel the frame can ever have has a
+    // MOTE in it.  R 3.80 at gain 2.75 clips out to r = 2.42 (was 1.83) and
+    // reaches zero at 3.80 (was 2.40).  At the 3-9 px this sprite is drawn at,
+    // NEAREST sampling steps 1.8-5 texels between screen columns, so the old
+    // 3.7-texel-wide plateau was landed on by two columns out of six and the
+    // new 4.8-texel one by three — half the sprite instead of a third.
+    fx_splat(d, ox, oy, 8.0, 7.8, 3.80, 3.80, 1, sr, sg, sb, 2.75);
 }
 
 // ---------------------------------------------------------------------------
@@ -608,8 +1306,8 @@ export fn fxgen_build_atlas() {
         if (cell == FX_EMBER) { cell_ember(d, ox, oy); }
         if (cell == FX_XP_MOTE) { cell_xp(d, ox, oy); }
         if (cell >= FX_EXPLO_0 && cell <= FX_EXPLO_5) { cell_explo(d, ox, oy, cell - FX_EXPLO_0); }
-        if (cell == FX_GLOW_S) { cell_glow(d, ox, oy, 0); }
-        if (cell == FX_GLOW_L) { cell_glow(d, ox, oy, 1); }
+        if (cell == FX_GLOW_S) { cell_bloom(d, ox, oy); }
+        if (cell == FX_GLOW_L) { cell_glow(d, ox, oy); }
         if (cell >= FX_SMOKE_0 && cell <= FX_SMOKE_2) { cell_smoke(d, ox, oy, cell - FX_SMOKE_0); }
         if (cell == FX_DUST) { cell_dust(d, ox, oy); }
         if (cell == FX_EYE) { cell_eye(d, ox, oy); }
@@ -767,6 +1465,60 @@ export fn fxgen_selftest(): i32 {
     }
     fxck("every radial FX cell has faded out before its own edge", faded);
 
+    // --- the OUTER-SKIRT test ---------------------------------------------
+    // Fading to zero before the border is necessary and STILL not sufficient,
+    // and the round-2 muzzle cell is the proof: it passed every test above
+    // with a ring peak of 0 and shipped as the "hard-edged rectangular sprite
+    // card, straight left, right and bottom quad edges" the round-3 critique
+    // named.  Its own centre row, in luminance, was
+    //
+    //     0   0   0   4   44  236  255  255  255  255  218   20   3   0
+    //
+    // — a clipped disc with ONE ramp texel per side sitting in an EMPTY cell.
+    // FX_MUZZLE_0 is drawn 0.42 m at 1.05 m in `muzzle_fog`, which is 72
+    // screen pixels, 4.5 px per atlas texel: 236 -> 44 is a four-and-a-half
+    // pixel cliff from white to night, and what the eye reads at that point is
+    // the bounding box of the clipped plateau.  The cause is arithmetic and it
+    // will bite anyone who reaches for the same tool: a LINEAR cone of radius
+    // R and gain G clips out to R*(1 - 1/G) and hits zero at R, so its entire
+    // visible gradient is R/G texels wide.  R 3.3 at gain 2.8 buys a
+    // 237-luminance §8 anchor and pays for it with a 1.2-texel shoulder, and
+    // nothing in this file was measuring the shoulder.
+    //
+    // The guard is the simplest thing that separates the two: a flash card has
+    // to have an OUTER SKIRT.  Mean peak channel over the annulus 4 <= r <= 6
+    // must be at least 20 on the two frames that are drawn large.  Measured:
+    //
+    //                      round 2   this pass
+    //     FX_MUZZLE_0        10         29
+    //     FX_MUZZLE_1        17         38
+    //
+    // Bound 20, i.e. a regression guard set between the two, not a certificate
+    // (CLAUDE.md §1.2).  It is scoped to the muzzle frames on purpose: EMBER,
+    // SPARK and EYE measure 0-6 there and are RIGHT to, because they are drawn
+    // at 3-6 screen pixels where an outer skirt is sub-pixel and simply throws
+    // the sprite's whole budget away.  A cell only owes a skirt if it is drawn
+    // big enough to show one.
+    let skirt_ok: i32 = 1;
+    for (let f = 0; f < 2; f++) {
+        let cell: i32 = FX_MUZZLE_0 + f;
+        let ox: i32 = (cell % FX_GRID) * FX_CELL;
+        let oy: i32 = divi(cell, FX_GRID) * FX_CELL;
+        let acc: i32 = 0;
+        let cnt: i32 = 0;
+        for (let y = lo; y <= hi; y++) {
+            for (let x = lo; x <= hi; x++) {
+                let dx: f64 = f64(x) + 0.5 - 8.0;
+                let dy: f64 = f64(y) + 0.5 - 8.0;
+                let rr: f64 = sqrt(dx * dx + dy * dy);
+                if (rr >= 4.0 && rr <= 6.0) { acc = acc + fx_peak_at(a, ox + x, oy + y); cnt++; }
+            }
+        }
+        if (cnt < 1) { cnt = 1; }
+        if (divi(acc, cnt) < 20) { skirt_ok = 0; }
+    }
+    fxck("the muzzle frames carry an outer skirt (annulus 4-6 mean peak >= 20)", skirt_ok);
+
     // reserved cells are the additive no-op, end to end
     let reserved_clean: i32 = 1;
     for (let cell = FX_CELL_COUNT; cell < FX_GRID * FX_GRID; cell++) {
@@ -804,8 +1556,8 @@ export fn fxgen_selftest(): i32 {
         if (cell == FX_EMBER) { cell_ember(d2, ox, oy); }
         if (cell == FX_XP_MOTE) { cell_xp(d2, ox, oy); }
         if (cell >= FX_EXPLO_0 && cell <= FX_EXPLO_5) { cell_explo(d2, ox, oy, cell - FX_EXPLO_0); }
-        if (cell == FX_GLOW_S) { cell_glow(d2, ox, oy, 0); }
-        if (cell == FX_GLOW_L) { cell_glow(d2, ox, oy, 1); }
+        if (cell == FX_GLOW_S) { cell_bloom(d2, ox, oy); }
+        if (cell == FX_GLOW_L) { cell_glow(d2, ox, oy); }
         if (cell >= FX_SMOKE_0 && cell <= FX_SMOKE_2) { cell_smoke(d2, ox, oy, cell - FX_SMOKE_0); }
         if (cell == FX_DUST) { cell_dust(d2, ox, oy); }
         if (cell == FX_EYE) { cell_eye(d2, ox, oy); }
