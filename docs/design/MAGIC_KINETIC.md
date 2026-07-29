@@ -10,13 +10,33 @@ exploration gating, and the progression rows that carry them.
 **Does not own:** any `.hml` file. This task wrote no code. Section 12 is the implementation ledger —
 the exact files, tables and literals a later wave must touch, with the traps named.
 
-**Reads:** `CLAUDE.md`, `docs/recon/GAME_DESIGN.md` (the GDD), `docs/recon/ART_BIBLE.md`,
+**Reads:** `docs/design/DIRECTION.md` **first — it is a directive and it outranks the GDD**;
+`CLAUDE.md`, `docs/recon/GAME_DESIGN.md` (the GDD), `docs/recon/ART_BIBLE.md`,
 `docs/ARCHITECTURE.md`, `docs/BUDGET_ACTUAL.md`, and the shipping sim: `src/sim/combat.hml`,
 `ai.hml`, `director.hml`, `progression.hml`, `command.hml`, `src/art/meshgen.hml`.
 
 **Companion:** `docs/design/LORE.md`. Every mechanic here has a fictional reason there, and the two
 files are meant to be edited together. A rule with no reason in `LORE.md` is a rule the player will
 experience as an arbitrary damage drop.
+
+---
+
+## ⚠ RECONCILED WITH `DIRECTION.md`
+
+`docs/design/DIRECTION.md` landed while this document was being written and it is the project owner
+speaking. Four things in here changed because of it, and one thing in here is now **the owner's
+decision to make, not mine**.
+
+| `DIRECTION.md` | What changed here |
+|---|---|
+| §2 — *"Magic is a SPELL SCHOOL, not just a damage type"* (healing, fire blasts, cloaking) | §1.3 and **§1.9** reframe the lantern as a **focus** and the three radiant verbs as the first three spells of a school with non-damage spells in it. The damage-type split survives intact underneath. |
+| §2 — *"the Emberlance … should probably move to the spell side"* | **Done, and it reverses what I originally wrote.** §1.1 and §11 now move the Emberlance out of the gun slots and into the spell slots. Its damage type does **not** change — see §1.9.2, which is the whole reason this reconciliation is cheap. |
+| §2 — the **OPEN QUESTION**: spells and guns held *simultaneously* or *swapped*? | **§1.4 no longer decides this.** It presents three options, states what each costs, recommends one, and marks the choice as the owner's. Everything downstream that depends on the answer is tagged **[HANDS]**. |
+| §3 — kinetic leans **primitive**; manufactured weapons need a **lit city**; *"ammunition is the real currency"* | §1.2 now gives ammunition scarcity as a first-class answer to "why choose the weaker option" instead of resting it on range and precision alone. §6.1 makes the **Pall a power outage**, so shrinking one raises the city's output — the light-grid *is* the weapon tech tree. §7.4 pays XP for it. |
+
+**Unchanged by `DIRECTION.md`, and re-checked against it:** the whole affinity system (§3), both new
+enemy classes, the exploration gates (§6), the budget (§8), and the party/solo law (§5.3).
+`DIRECTION.md` §4 and §5 restate the constraints this document was already written against.
 
 ---
 
@@ -50,17 +70,25 @@ DTYPE_COUNT   = 2
 
 DMG_RADIANT_BURST = 6      // the flare
 DMG_RADIANT_BEAM  = 7      // the shutter
-DMG_RADIANT_LANCE = 8      // the lance (Lv 15)
+DMG_RADIANT_LANCE = 8      // the lance (Lv 17)
 DMG_KIND_COUNT    = 9      // was 6
 
 // indexed by DMG_*, yields DTYPE_*
 g_dtype: array<i32> = [0, 0, 0, 0, 0, 0, 1, 1, 1];
 ```
 
-Everything that exists today is KINETIC, including `DMG_BURN`. **The Emberlance is a gun.** It looks
-like fire and it is thematically warm, but mechanically it is lead that keeps burning; it has a
-magazine, a reserve, a reload and a range table. Making it radiant would give the player a radiant
-*primary* at Lv 12 and collapse the whole hand-switching tension. See §11 for the v2 note.
+Everything that exists today is KINETIC, **including `DMG_BURN` and including the Emberlance.**
+
+> **This is the load-bearing consequence of keeping the two axes orthogonal, and it is what makes
+> `DIRECTION.md` §2's Emberlance consolidation nearly free.** The Emberlance moves out of the gun slots
+> and into the spell slots (§1.9), because it is a fire blast and `DIRECTION.md` says so. Its **damage
+> type does not move with it.** Fire burns *matter*; it is not light calling anything back. So the
+> Emberlance stays `DTYPE_KINETIC`, its 60 impact + 12/s burn over 5 s and its 3.5 m AoE are unchanged,
+> and `g_dtype` needs no edit. Moving it costs a slot reassignment, not a rebalance.
+
+**A spell is a delivery mechanism, not a damage type.** The school holds spells of both types. That is
+not a compromise — it is the reason a caster is interesting, and it is why a solo player is never stuck
+(§5.3): the fire blast is a *kinetic answer in the lamp hand*.
 
 `sub_hit = DMG_SUB_BASE + p_dmg_kind` already exists in `combat_apply_damage`. With
 `DMG_SUB_BASE = 64` the three new kinds ride at 70, 71, 72 — clear of weapon ids 0..15, clear of
@@ -73,8 +101,8 @@ Fiction: metal, thrown fast. It does not care what a thing is made of; it cares 
 
 | Property | Value |
 |---|---|
-| Sources | every weapon in GDD §2.4, melee, the Lantern Drone streak, fall damage, enemy contact |
-| Resource | ammunition — **does not drop from enemies**, comes from caches and the town bench (GDD §2.4) |
+| Sources | every weapon in GDD §2.4, melee, the Lantern Drone streak, fall damage, enemy contact, **and the fire blast spell** (§1.9) |
+| Resource | ammunition — **does not drop from enemies**, comes from caches, the village bench, and **the city, only while the city has power** (`DIRECTION.md` §3) |
 | Range | **up to 72 m** (`g_FOG_FAR_CAP`) with the per-weapon falloff table |
 | Precision | headshot multipliers 1.25–2.10; the head volume is the top 0.22 of the body |
 | Delivery | hitscan, instant, per-shot |
@@ -88,7 +116,42 @@ six weapons would need retuning, and the Wisp would stop being free dopamine. **
 system lives in the RADIANT column.** The GDD's TTK table *is* the kinetic table, unamended.
 
 The pressure toward light therefore cannot come from making bullets worse against existing enemies. It
-comes from **two new classes** (§3) that resist lead, and from what light buys that lead cannot (§1.3).
+comes from three places, and only the first is a resistance table:
+
+1. **Two new classes** (§3) that resist lead.
+2. **What light buys that lead cannot** (§1.3) — including spells that do no damage at all (§1.9).
+3. **Ammunition scarcity** (`DIRECTION.md` §3): *"Ammunition is the real currency, not the gun."*
+
+### 1.2a The two kinetic tiers, and why the third answer is the strongest one
+
+`DIRECTION.md` §3 splits the arsenal by where it was *made*, and the split is gated on the light grid
+the player is already building:
+
+| Tier | Source | Weapons | Character |
+|---|---|---|---|
+| **Village** | crafted, or traded with villagers | bolt-action rifle, revolver, pump shotgun, crude pipe-SMG | hand-made, forgiving on ammo, primitive |
+| **City** | manufactured — **only while the city has power** | Sparrow AR, Tinker SMG, the LMG | precision-made, ammo-hungry, a privilege |
+
+This is the best answer in the whole design to *"why would a player ever choose the weaker option"*,
+and it is the owner's, not mine: **sometimes you carry the bolt-action because city ammo is precious.
+That is a choice, not a punishment.** It also means the affinity table does not have to carry the whole
+load, which is exactly the right amount of weight to put on a resistance system — resistances make
+*this fight* different; ammunition makes *this expedition* different.
+
+Two consequences that belong to this document rather than to the weapon designer:
+
+- **Affinity is orthogonal to tier.** A bolt-action and a Sparrow both do ×1.00 against everything. A
+  village weapon is never *worse against a class* — it is worse at range, at rate, or at handling.
+  Stacking "primitive" on top of "resisted" would produce the double-punishment this document exists to
+  avoid.
+- **Light is the ammunition-free hand.** Oil regenerates at the lantern you are standing at (§1.6);
+  city ammunition does not regenerate anywhere. So the scarcer lead gets, the more the lamp matters —
+  which means `DIRECTION.md` §3's economy and this document's §1.3 point 3 are the *same* pressure
+  arriving from two directions, and they compound without either being tuned against the other.
+
+The bolt-action and the machine gun `DIRECTION.md` §3 asks for are weapon-design work, not
+damage-type work, and this document does not specify them. It only guarantees they need no affinity
+column: **kinetic is 1.00, whoever made the gun.**
 
 ### 1.3 RADIANT — light
 
@@ -97,15 +160,15 @@ it can hurt the dark itself. See `LORE.md` §4.
 
 | Property | Value |
 |---|---|
-| Source | **the lantern in your left hand.** The only radiant source in v1. |
+| Source | **the lantern in your left hand** — the spell focus (§1.9). The only radiant source in v1. |
 | Resource | **OIL**, 0–100 (tank grows to 150 / 200 — §7) |
-| Range | **≤ 14 m** for the two baseline verbs; 24 m for the Lv-15 lance. Nothing radiant reaches past 24 m, ever. |
+| Range | **≤ 14 m** for the two baseline verbs; 24 m for the Lv-17 lance. Nothing radiant reaches past 24 m, ever. |
 | Precision | **none, and that is the point.** Cones and radii. No headshots, no crits. |
 | Delivery | instantaneous volume test (hitscan-shaped — no projectile, GDD §9.12 holds) |
 | Affinity | 0.25 → 2.50 by class, ×2.0 on a bodied enemy's tell, ×5.0 on the Spitter's sac |
 | Scales on | **charms** (slots at Lv 4 / 11 / 18, currently carrying nothing), tank tier, day phase |
 
-**What light buys besides damage — the four things that make a player choose the weaker hand:**
+**What light buys besides damage — the five things that make a player choose the weaker hand:**
 
 1. **You do not have to hit.** At 320×240 a 1.8 m enemy is 12 px at 30 m and 6 px at 60 m
    (ART_BIBLE §8.1). Inside 6 m, three Wisps moving 6.4 m/s erratically are a genuinely hard target
@@ -124,12 +187,56 @@ it can hurt the dark itself. See `LORE.md` §4.
    the *reactive* hand: you spend it the instant a thing commits. That asymmetry is why an expert uses
    both in the same fight instead of picking a favourite.
 
-**And the cost, stated plainly:** light is 14 m, imprecise, cannot kill anything with a body, and
-using it means your gun is down.
+5. **Some of it is not damage at all.** `DIRECTION.md` §2 asks for **healing and cloaking** in the same
+   school as the blasts. A hand that can close 40 HP or make you unseeable for 4 s is a hand you raise
+   for reasons that have nothing to do with a resistance table (§1.9). This is the strongest of the
+   five, and it is the owner's addition, not mine.
 
-### 1.4 The stance rule — the mechanical root of everything below
+**And the cost, stated plainly:** light is 14 m, imprecise, cannot kill anything with a body, and —
+depending on the answer to §1.4 — using it may mean your gun is down.
 
-> **You may only work one hand at a time.** Raising the lamp lowers the gun and vice versa.
+### 1.4 THE HANDS QUESTION — **[HANDS]** the owner's decision, not mine
+
+`DIRECTION.md` §2 raises this explicitly and flags that it *changes the viewmodel build*:
+
+> *"are spells and guns held **simultaneously** (lantern-hand / gun-hand, no swap, very readable at
+> 320×240, more distinctive) or **swapped** like weapon slots (cheaper in viewmodel triangles, one hand
+> on screen)?"*
+
+**I am not deciding this.** It is the single highest-leverage open question in the design, because the
+party-composition argument in §5.2 is built on the answer. Here are the three options, honestly costed.
+Everything downstream that depends on the choice is tagged **[HANDS]**.
+
+| | **A — SWAPPED** | **B — SIMULTANEOUS** | **C — BOTH HELD, ONE WORKED** ← recommended |
+|---|---|---|---|
+| On screen | one object | two objects | **two objects, always** |
+| Viewmodel tris | 260 | ~420 (two viewmodels) | ~330 (gun stows to a low-detail 70-tri pose) |
+| Can you beam and shoot at once? | no | **yes** | **no** |
+| 320×240 readability | weakest — the screen forgets you have a lamp | strongest | strong |
+| Preserves the verified 156-px lantern anchor | **no — the lantern leaves the screen** | yes | **yes** |
+| Party composition (§5.2) | works | **collapses — see below** | works |
+| Stance cost | full weapon swap, 0.55 / 0.40 s | none | 0.30 / 0.22 s |
+
+**Why B collapses §5.2.** If one player can hold the beam and fire the gun at the same time, then a
+solo player is already parallel, a second player adds only raw DPS, and every "solo is sequential,
+a party is parallel" number in §5.2 goes to 1.0×. The owner asked for *"good party composition helps
+you fight them"*; option B is the one option that cannot deliver it. It is still a legitimate choice —
+it is the most generous to the player and the most readable — but then party composition has to be
+rebuilt on something else, and the only other candidate is the N=3 sconce door (§6.2), which is 10 % of
+one POI type. **That is not enough to carry the owner's request, and I would rather say so than paper
+over it.**
+
+**Why C is recommended.** It is not a compromise between A and B; it takes the best of each. The lamp
+is *visually* simultaneous — the constant 156-px bright core at every pitch is already built,
+playtested and verified, and option C is the only option that keeps it. But it is *mechanically*
+exclusive, which is what makes two players categorically better than one. The cost over A is ~70
+viewmodel triangles.
+
+**Option C, specified.** If the owner picks A or B, §5.2 and §7.3's stance charm must be revisited;
+nothing else in this document changes.
+
+> **You may only work one hand at a time.** Raising the lamp lowers the gun and vice versa. Both stay
+> on screen.
 
 | Property | Value |
 |---|---|
@@ -138,10 +245,10 @@ using it means your gun is down.
 | Transition out | 0.22 s, lamp cannot discharge during it |
 | Movement while in lamp stance | 2.9 m/s (`g_SPEED_ADS`) — you may not sprint |
 | Lantern light while in lamp stance | radius ×2.2, intensity ×1.6 — **still one light slot** |
-| Viewmodel | the existing lantern rises from `g_VM_DOWN` 0.34 → 0.14 m and centres; the gun tucks |
+| Viewmodel | the existing lantern rises from `g_VM_DOWN` 0.34 → 0.14 m and centres; the gun **stows, it does not vanish** |
 | ADS | mutually exclusive with lamp stance; whichever button was pressed last wins |
 
-This single rule does four jobs at once:
+Option C does four jobs at once:
 
 - It makes the two types feel like two objects rather than two buttons on one object.
 - It puts a real cost on the imprecise-but-unmissable option: 0.52 s of round trip and no sprint.
@@ -149,14 +256,17 @@ This single rule does four jobs at once:
 - **It is the entire party-composition answer.** One player is sequential. Two players are parallel.
   Nothing else in the design needs to exist for co-op to feel different (§5).
 
-### 1.5 The three lamp verbs
+### 1.5 The three radiant verbs
+
+*(These are three of the seven spells in §1.9. They are specified here because they are the ones that
+carry the damage type; the other four are stat changes and are specified in §1.9.2.)*
 
 All three are instantaneous volume tests against live entities — no projectile, no travel time. Falloff
 is **linear**, not smoothstepped: `mult = 1 - clamp((r - r0) / (r1 - r0), 0, 1)`. Linear because the
 player must be able to feel the edge of the cone; the smoothstep the fog uses would make the boundary
 mushy and unlearnable.
 
-| | **FLARE** (baseline) | **SHUTTER / beam** (Lv 3) | **LANCE** (Lv 15) |
+| | **FLARE** (baseline) | **SHUTTER / beam** (Lv 3) | **LANCE** (Lv 17) |
 |---|---|---|---|
 | Input | tap `BTN_FIRE` in lamp stance | hold `BTN_FIRE` in lamp stance | tap `BTN_ADS` in lamp stance |
 | Shape | sphere, 360°, centred on the player | cone, 22° half-angle | cone, 5° half-angle |
@@ -171,7 +281,7 @@ mushy and unlearnable.
 
 The **flare** is the get-off-me verb and it is baseline because §8's first minute demands it (§7.1).
 The **shutter** is the sustained verb: the shell-stripper, the plate-scourer, the Pall-pusher, the
-sconce-lighter. The **lance** arrives at Lv 15, long after the player has internalised "light is a
+sconce-lighter. The **lance** arrives at Lv 17, long after the player has internalised "light is a
 14 m weapon", and its 1.2 s locked wind-up is priced exactly so it never becomes a sniper.
 
 ### 1.6 Oil — the economy
@@ -244,6 +354,78 @@ see §13.*
 
 ---
 
+## 1.9 THE SPELL SCHOOL
+
+`DIRECTION.md` §2: *"The owner wants the character to **learn** abilities: **healing, fire blasts,
+cloaking**, and more. This is broader than the resistance system originally briefed."*
+
+It is broader, and it fits without straining, because of one structural fact established in §1.1: **a
+spell is a delivery mechanism and a damage type is a separate axis.** The school is the delivery
+system. Some spells are radiant, one is kinetic, and two do no damage at all.
+
+### 1.9.1 The lantern is the focus
+
+There is no wand, no staff, no spellbook and no second hand to find. **The lantern is the focus**, it
+has been in the player's hand since the first frame, and `DIRECTION.md` §2 says so: *"it is the anchor
+of the magic side — and note it is already a genuine light source in every frame."*
+
+Consequences worth stating because they each delete a subsystem:
+
+- **No spell has a projectile except the one that already had one.** The Emberlance keeps its slow
+  arcing 6.0 m/s bolt (GDD §9.12 keeps its single exception). Every other spell is an instantaneous
+  volume test.
+- **No spell adds a dynamic light.** All of them modulate the lantern's existing slot (§8.2).
+- **No spell needs a new input field.** The school is `BTN_LAMP` plus which spell is *equipped*, and
+  weapon-select is already a field on `InputCommand` (`CMD_MAX_WEAPON = 15`). Spells occupy ids in that
+  same space. **Zero wire change.**
+- **No mana.** Oil is the only cost. One bar, one number, one HUD element (§8.1).
+
+### 1.9.2 The seven spells
+
+Three slots, equipped at a lantern or in town, freely swappable there and never mid-fight. The player
+learns more than they can carry, which is the whole point of a school.
+
+| Spell | Type | Oil | Effect | Unlock |
+|---|---|---|---|---|
+| **Flare** | RADIANT | 18 | 360° burst, 6 m, 28→14 (§1.5) | lighting the first lantern (§7.1) |
+| **Shutter** | RADIANT | 22/s | 22° cone, 14 m, 30→15 DPS (§1.5) | Lv 3 |
+| **Emberlance** | **KINETIC** | 30 | **the fire blast.** 60 impact + 12/s burn for 5 s, 3.5 m AoE, arcing 6.0 m/s bolt | Lv 12 (was a weapon; now a spell) |
+| **Mend** | — (no damage) | 45 | **healing.** +40 HP over 1.2 s, channelled, cancelled by damage | Lv 7 |
+| **Guttering** | — (no damage) | 35 | **cloaking.** 4.0 s. AI aggro range ×0.15; breaks on firing, on any spell, and on taking damage | Lv 15 |
+| **Lance** | RADIANT | 40 | 5° cone, 24 m, 55→27, 1.2 s locked wind-up (§1.5) | Lv 17 |
+| **Kindling** | — (no damage) | 25 | drops a 3 m light pool for 8 s: tier 0 inside it, +1.5 oil/s to anyone standing in it | Lv 19 |
+
+**Why this list and not a bigger one.** Seven spells, three slots, and every single one is either a
+volume test or a stat change. There is no summon, no shield, no buff-with-an-icon, no damage-over-time
+bookkeeping beyond the burn that `DMG_BURN` already implements. **The school adds seven table rows and
+one equip screen. It does not add a system.**
+
+Three of the seven do **no damage at all**, and those three are the real answer to *"why would a player
+ever choose the weaker hand"* — better than any resistance number in §3. A hand that heals is a hand
+you raise whatever you are fighting.
+
+### 1.9.3 The four consequences of moving the Emberlance
+
+`DIRECTION.md` §2 calls this a consolidation opportunity and it is, but it is not free. Itemised:
+
+1. **The kinetic arsenal drops from 6 weapons to 5** — Sparrow, Tinker, Bellows, Longshadow, Kestrel —
+   which is exactly what `DIRECTION.md` §3 wants, because it *"frees the kinetic arsenal to be purely
+   primitive"* and leaves room for the bolt-action and the machine gun without growing the slot count.
+2. **`UNLOCK_EMBERLANCE` (id 14, Lv 12) changes meaning, not level or id.** It becomes a spell unlock.
+   Ids are API and are not renumbered; only `g_unlock_name[14]` and what the unlock card grants change.
+3. **`weapons.hml` loses a row** — the Emberlance's entry in the damage, falloff, handling, recoil and
+   TTK tables. That is a *real* edit to a measured, playtested table set and it must be done by
+   deletion, not by leaving a dead row that the probes still assert against.
+4. **GDD §3.3's Relic unique *Vesper*** (*"the burn spreads between enemies within 4 m"*) was an
+   Emberlance relic. It has to become a **charm** (§7.3) instead, since relics roll on weapons and the
+   Emberlance is no longer one. One relic slot frees up for a bolt-action unique — which the
+   bolt-action wants anyway, because a 5-round stripper-clip rifle with a relic that refunds a clip on a
+   headshot is a better fantasy than *Vesper* ever was.
+
+Flagged in §14 #10, because #3 and #4 touch shipped, measured content.
+
+---
+
 ## 2. WHAT THE PLAYER SEES — the one-second test
 
 > **ART_BIBLE RULE S1**: every enemy identifiable by class at 12 px (30 m), detectable as a threat at
@@ -311,7 +493,8 @@ still a hit; it is a hit that says "wrong hand".
 
 At `FOG_FAR = 72 m` (the shipping cap) the ART_BIBLE §2.6 formula `(π/4)·d²/16·2` gives **509 ground
 triangles**. Pulled to 25.2 m it gives **62**. A Gloam therefore *returns* ~447 triangles to the
-budget while it is alive. The scariest enemy in the design is the cheapest one to render. Do not
+budget while it is alive. The scariest enemy in the design is the cheapest one to render. (Ground triangles only — props and enemies inside
+the shrunken radius still draw.) Do not
 "optimise" this away by faking the fog with a screen overlay — the real fog parameter is both free and
 correct.
 
@@ -354,7 +537,23 @@ cost are unchanged for all six. **One column is added.**
 | **Husk** | 90 | bodied | 1.00 | **0.35** | ×2.0 on the 0.45 s arm-raise | Matter with a tenant. The bread-and-butter enemy stays a bread-and-butter *gun* fight. |
 | **Spitter** | 70 | bodied + sac | 1.00 | **0.60** | **×5.0** on the 1.4 s glow charge | Its existing tell *is* a light-filled sac. Hit it while it charges and it pops. |
 | **Warden** | 220 + 80 plate | bodied + plate | 1.00, plate arc + 75 % DR unchanged | **0.25** body | radiant into the **plate pool at ×2.50, facing-independent** | Light goes round a shield. Scour the plate with the lamp, then kill with lead — a fast option, never the only one. |
-| **Bulwark** | 900 | bodied | 1.00 | **0.30** | ×2.0 on the 1.1 s slam crouch | The wave-3 punctuation stays a lead fight. 900 HP at 11.7 radiant DPS is 77 s: the lamp is *irrelevant* here and should be. |
+| **Bulwark** | 900 | bodied | 1.00 | **0.30** | ×2.0 on the 1.1 s slam crouch | The wave-3 punctuation stays a lead fight. 900 HP at 11.7 radiant DPS is 76.9 s: the lamp is *irrelevant* here and should be. |
+
+**The proof that the night bonus does not make light a strict upgrade.** §1.7 gives radiant ×1.30 at
+night, which is when the game is hardest — so it has to be shown that light still cannot simply win.
+At the most favourable possible conditions (night, point blank, full tank of 100 oil):
+
+| Target | Radiant DPS or per-hit | Oil to kill | Verdict |
+|---|---|---|---|
+| Wisp, 15 HP | flare 28 × 2.50 × 1.30 = **91** | 18 | one flare kills ~3 of them |
+| Mote, 30 HP | flare 28 × 2.00 × 1.30 = **72.8** | 18 | one flare |
+| Husk, 90 HP | flare **12.74** → 8 flares, or shutter 30 × 0.35 × 1.30 = **13.65 DPS** → 6.59 s | **144–145** | **more than a full tank. The lamp cannot kill one Husk.** |
+| Bulwark, 900 HP | shutter **11.7 DPS** → 76.9 s | **1 692** | 17 tanks. Absurd, and correctly so. |
+
+A full tank cannot kill a single Husk, and the Husk is the enemy the whole weapon table was tuned
+around (GDD §2.2: *"Its 90 HP defines the whole weapon table"*). Night makes the lamp *good at what it
+is already good at*; it never makes the gun optional. And the tier tables push exactly the wrong
+targets at night, so the two curves cross rather than one dominating.
 
 ### 3.2 The two new classes
 
@@ -419,12 +618,12 @@ Mechanics, using machinery that already exists:
 | Approach | Maths | Time | Cost |
 |---|---|---|---|
 | **Light then lead** (intended) | shutter 30 × 2.20 × 1.30 = 85.8 DPS → 60 shell = 0.70 s; then Sparrow near 26 → 110 HP = 5 rounds | **0.70 s + 0.35 s ≈ 1.05 s** | 15 oil + 5 rounds |
-| **Lead only** | 26 × 0.20 = 5.2 per round → 110 HP = 22 rounds | **1.91 s** | 22 rounds (73 % of a Sparrow mag) |
+| **Lead only** | 26 × 0.20 = 5.2 per round → 110 HP = 22 rounds at 690 RPM | **1.83 s** | 22 rounds (73 % of a Sparrow mag) |
 | **In a party** (one lamp, one gun, simultaneous) | strip and shoot in parallel | **0.70 s** | same total |
 
-Solo 1.05 s, party 0.70 s, lead-only 1.91 s. **Solo is 1.5× slower than a party and lead-only is 2.7×
-slower than the intended play — and neither is blocked.** That is the shape every affinity in this
-document must have.
+Solo 1.05 s, party 0.70 s, lead-only 1.83 s. **Solo is 1.5× slower than a party; lead-only is 1.7×
+slower and costs 4.4× the ammunition — and neither is blocked.** That is the shape every affinity in
+this document must have.
 
 ### 3.3 The affinity table, as a programmer types it
 
@@ -505,7 +704,7 @@ Nothing here is a tutorial. Every step is a fight the player will have anyway.
 |---|---|---|
 | 0:10, GDD §8 | there are things that die to one bullet | three Wisps, one Kestrel round each. **Unchanged.** |
 | 0:30, GDD §8 | **the lantern is a weapon** | the lantern lights → `+350 XP`, `LEVEL 2`, and *the flare is granted by the act of lighting it*, not by a card (§7.1). One line under the unlock card: *"Some of it came back with you."* |
-| 0:33–0:55 | **the lamp will not save you from a body** | four Husks. Flare them: 12 damage each, grey numbers, a dull thock. The revolver is the answer. This is the first time the game is frightening and now it is also the first time the system speaks. |
+| 0:33–0:55 | **the lamp will not save you from a body** | four Husks. Flare them: **13** damage each (`28 × 0.35 × 1.30 = 12.74`, rounded by the existing `i32(applied + 0.5)`), grey numbers, a dull thock. The revolver is the answer. This is the first time the game is frightening and now it is also the first time the system speaks. |
 | first frontier trip (tier 1) | **lead is not always the answer** | a Gloam. The fog closes in before you see it. You shoot it, get grey half-size numbers, then raise the lamp and it dies in half a second. |
 | tier 2 | **light opens, lead kills** | a Snuffer. An unreadable black lozenge that ignores bullets. The beam peels it and a normal humanoid steps out. |
 | any Spitter | **windows** | you happen to flare a Spitter mid-charge and it pops for 5×. Nobody told you. You will tell a friend. |
@@ -634,6 +833,39 @@ dots. Lighting a T3+ lantern within 85 m of a Pall shrinks it by that lantern's 
 visibly, on the map. **The map becomes a record of dark you personally deleted.** That is the retention
 hook the GDD already identified, given a second thing to draw.
 
+### 6.1a A PALL IS A POWER OUTAGE — the gate that feeds the gun
+
+`DIRECTION.md` §3 is the keystone: manufactured weapons *"need a well lit city manufacturing them and
+the ammunition"*, and *"the Wick Lines and Lantern Posts already in the GDD are the grid. Light more of
+it and the city's output rises."*
+
+**So a Pall is not just a dark place. It is a fault on the grid.** That single sentence connects the
+scariest content in this document straight to the gun the player wants:
+
+```
+shrink a Pall  ->  the grid reconnects  ->  the city's output rises  ->  city ammunition
+                                                                        appears in the shop
+```
+
+| Property | Value |
+|---|---|
+| Grid contribution of a lit lantern | 1 point; 2 if it is on a Wick Line (two lanterns within 90 m) |
+| Grid contribution lost to a Pall | **−4 points** while it stands, −2 once shrunk below half radius, 0 when extinguished |
+| City output tiers | 5, thresholded on total grid points; each tier adds stock and lowers the price of city ammunition |
+| Visible where | **the shop inventory**, and the city skyline |
+
+This is the fusion `DIRECTION.md` §3 describes — *"world state the player permanently changes — the
+Minecraft pillar — and it is now visible in the shop inventory, which is the Animal Crossing pillar"* —
+and it means the **exploration gate and the weapon tech tree are the same object.** The player who goes
+into a Pall with a lamp because they had to comes out able to buy the assault rifle they wanted. Nothing
+about that had to be invented; it is the light grid the GDD already had, read as a utility network,
+which is what `LORE.md` §1 says it literally is.
+
+**The consequence for this document:** the lamp is not merely a *second* weapon, it is the tool that
+unlocks the *first* one's ammunition supply. A player who ignores the light hand does not just struggle
+against Gloams — their shop runs dry. That is the strongest possible answer to "why would a player ever
+choose the weaker one", and it is structural rather than numeric.
+
 ### 6.2 THE SCONCE DOOR — a lock that displays its own arity
 
 Ruins (1 per 6 chunks) and Burrows (1 per 20 chunks) may carry a sealed **sconce door**: stone, with
@@ -693,28 +925,40 @@ a menu row (*"Some of it came back with you."*); (c) it makes lighting the first
 game hands you your second hand, which is the thesis of this document delivered as a beat rather than
 as a stat.
 
-### 7.2 Five new rows on the unlock ladder
+### 7.2 Eight new rows on the unlock ladder
 
-`progression.hml` says **"Ids are API — append at the end, never renumber."** So these are ids 25–29,
-appended, and `UNLOCK_COUNT` goes 25 → 30. Note that this **breaks the file's stated
-`g_unlock_level`-is-sorted invariant** — flagged and resolved in §14.
+`progression.hml` says **"Ids are API — append at the end, never renumber."** So these are ids 25–32,
+appended, and `UNLOCK_COUNT` goes 25 → **33**. Note that this **breaks the file's stated
+`g_unlock_level`-is-sorted invariant** — flagged and resolved in §14 #5.
 
 | Id | Name | Level | Effect |
 |---|---|---|---|
 | 25 | `UNLOCK_LAMP_SHUTTER` | **3** | the sustained beam (§1.5) |
 | 26 | `UNLOCK_OIL_STILL` | **6** | town building: 1 Sap + 2 Ash → 1 oil flask |
-| 27 | `UNLOCK_LAMP_TANK_2` | **10** | oil tank 100 → **150** |
-| 28 | `UNLOCK_LAMP_LANCE` | **15** | the 24 m lance (§1.5) |
-| 29 | `UNLOCK_LAMP_TANK_3` | **21** | oil tank 150 → **200** |
+| 27 | `UNLOCK_SPELL_MEND` | **7** | **healing** (`DIRECTION.md` §2) |
+| 28 | `UNLOCK_LAMP_TANK_2` | **10** | oil tank 100 → **150** |
+| 29 | `UNLOCK_SPELL_GUTTERING` | **15** | **cloaking** (`DIRECTION.md` §2) |
+| 30 | `UNLOCK_LAMP_LANCE` | **17** | the 24 m lance (§1.5) |
+| 31 | `UNLOCK_SPELL_KINDLING` | **19** | the placed light pool (§1.9.2) |
+| 32 | `UNLOCK_LAMP_TANK_3` | **21** | oil tank 150 → **200** |
 
-**These rows fill holes rather than crowding the ladder.** `g_unlock_level` is
+`UNLOCK_EMBERLANCE` (id 14, Lv 12) is **not** in this list. It already exists; it changes from a weapon
+grant to a spell grant, at the same id and the same level (§1.9.3).
+
+**These rows fill holes rather than crowding the ladder — and the arithmetic was checked, not asserted.**
+`g_unlock_level` today is
 `[2,2,3,4,4,5,5,6,7,8,9,9,11,11,12,13,14,16,18,18,20,22,25,28,30]`. Levels 2..30 that currently grant
-**nothing**: 10, 15, 17, 19, 21, 23, 24, 26, 27, 29. Three of the five new rows land on empty levels
-(**10, 15, 21**); the other two join levels that currently have a single row each (3, 6). No level goes
-above 2 unlocks. Checkable claim, checked.
+**nothing**: **10, 15, 17, 19, 21, 23, 24, 26, 27, 29.**
+
+- **Five of the eight new rows land on empty levels** (10, 15, 17, 19, 21) — they *fill* pacing holes.
+- The other three join levels that currently have exactly one row each (3, 6, 7).
+- **No level ends up with more than 2 unlocks.** Levels 4, 5, 9, 11, 18 keep their existing 2 and gain
+  nothing.
 
 Deliberate pairing at Lv 6: the **Ammo bench** (lead) and the **Oil Still** (light) arrive together.
-The game says "you now maintain both hands" in one level-up.
+The game says "you now maintain both hands" in one level-up. And the run from 15 to 21 — cloaking,
+lance, light pool, bigger tank — is currently the emptiest stretch of the ladder and becomes the stretch
+where the school comes into its own.
 
 ### 7.3 Charms carry the lamp
 
@@ -730,10 +974,17 @@ affix system**, keeping the 10-row weapon affix pool (GDD §3.3) purely kinetic 
 | +% radiant vs unbodied | 8–24 % |
 | −% stance transition | 10–30 % (0.30 s → 0.21 s) |
 | +oil regen inside a lantern | +0.5–1.5 / s |
+| −% stance transition **[HANDS]** | 10–30 % (0.30 s → 0.21 s). **Delete this charm if the owner picks option B in §1.4** — with no stance there is nothing to shorten. |
 | Flare leaves a 2 s light pool (3 m, 6 radiant/s) | — |
+| **Vesper** (relic-grade): the Emberlance burn spreads between enemies within 4 m | — |
 
 Rarity and affix count follow the existing GDD §3.3 tiers exactly. Charms drop from the same table as
 everything else; no new loot system.
+
+**Vesper moves here.** GDD §3.3 lists *Vesper* as the Emberlance's Relic unique, and relics roll on
+weapons. The Emberlance is no longer a weapon (§1.9.3), so Vesper becomes a relic-grade **charm** with
+its effect unchanged. That leaves one relic slot open in the weapon family table — which the
+bolt-action `DIRECTION.md` §3 asks for wants anyway.
 
 ### 7.4 New XP sources
 
@@ -821,7 +1072,7 @@ See §13.
 | Line | Cost |
 |---|---|
 | New meshes | 2 classes × 3 LODs = **6**; `MESH_COUNT` 34 → 40 |
-| New FX atlas cells | **5** (`FX_LAMP_CONE`, `FX_LAMP_RING`, `FX_SCALD`, `FX_SHELL_SEAM`, `FX_LIGHT_POOL`) of **36 free** — `FX_CELL_COUNT` is 28 in an 8×8 = 64-cell atlas. 33 free after. |
+| New FX atlas cells | **5** (`FX_LAMP_CONE`, `FX_LAMP_RING`, `FX_SCALD`, `FX_SHELL_SEAM`, `FX_LIGHT_POOL`) of **36 free** — `FX_CELL_COUNT` is 28 in an 8×8 = 64-cell atlas. 31 free after. |
 | New audio samples | 2 (`SFX_KILL_RESOLVE`, the resisted *thock*) |
 | Boot time | +6 meshes against a 400 ms boot budget building 34. **Must be measured, not assumed.** |
 | Save | one new block for `lamp` state (oil, stance, tank tier, cooldowns) → **`SAVE_VERSION` 1 → 2**. `save.hml` is a wire contract; this is a version bump, not a free change. |
@@ -876,16 +1127,24 @@ noted.
 
 **Out — mechanics**
 
-1. **A third damage type.** Two. Forever, in v1. `DMG_BURN` stays kinetic and the Emberlance stays a gun.
+1. **A third damage type.** Two. Forever, in v1. `DMG_BURN` stays **kinetic**, and so does the
+   Emberlance even though it is now a spell (§1.1, §1.9.2) — *a spell is a delivery mechanism, not a
+   damage type.*
 2. **Player resistances.** The player has HP. There is no "you take 30 % less radiant". Enemy attacks
    are all kinetic for damage purposes and the player's damage-direction indicator does not change.
 3. **An enemy immune to both types.** Forbidden by the §5.3 law.
-4. **A radiant primary weapon.** The lamp is the only radiant source in v1. *(v2 note below.)*
+4. **A radiant *weapon-slot* item.** The lantern is the only radiant source in v1; radiant lives in the
+   spell school, never in a gun slot. *(v2 note below.)*
 5. **Radiant headshots, radiant crits, radiant overpenetration.** No precision on the light hand, ever.
 6. **A radiant affix pool on weapons.** GDD §3.3's 10 affixes stay kinetic. Charms carry the lamp.
-7. **Radiant projectiles.** All three verbs are instantaneous volume tests. GDD §9.12 ("hitscan only")
-   holds; the Emberlance stays the one projectile in the game.
+7. **Radiant projectiles.** All radiant verbs are instantaneous volume tests. GDD §9.12 ("hitscan
+   only") holds, and the Emberlance — now a spell — remains the game's single designed exception.
 8. **A third dynamic light.** §8.2.
+8a. **More than seven spells, or more than three equipped slots** (§1.9.2). The school is seven table
+   rows and an equip screen. The moment it needs a resource other than oil, a cooldown UI, or a
+   status-effect stack, it has become a system and it is out of v1.
+8b. **Spells that summon, shield, or buff a stat with an icon.** Every v1 spell is a volume test or a
+   stat change with a timer. No exceptions.
 9. **Oil as a tradeable/bankable resource.** It is a tank, not an inventory item. Flasks are items;
    oil is not.
 10. **Affinity on props, terrain, or structures.** Lighting a sconce is a *verb*, not damage.
@@ -906,8 +1165,8 @@ noted.
     teammate, reviving with a Wick charge, running the Wick Line ahead of the group.
 18. **N=3 sconce doors designed for parties** rather than merely openable by them — sconces at 60 m+,
     with the Lantern Kit route removed. Only correct once a party is guaranteed.
-19. **The Sconce** — a radiant *primary* weapon. Only interesting when a party can build around one
-    player giving up their gun slot. In v1 it would just delete the stance rule.
+19. **The Sconce** — a radiant *primary weapon* occupying a gun slot. Only interesting when a party can
+    build around one player giving up their gun slot. In v1 it would just delete the stance rule.
 20. **The Pall as a co-op space** — 4 players, overlapping cones, a real light-corridor discipline.
 21. **Shared oil / a party lantern** whose radius covers the group.
 
@@ -925,14 +1184,16 @@ What a later wave must touch. Ownership per `BUILD_PLAN.md` rules; **this task o
 | `src/sim/combat.hml` | `DTYPE_*`, 3 new `DMG_*`, `DMG_KIND_COUNT` 6→9, `g_dtype`, `g_affinity`, `HM_RADIANT`/`HM_RESISTED`, the multiply in `combat_apply_damage`; widen `HB_R`/`HB_H` to 8; `combat_plate_hp` returns `SNUFFER_SHELL_HP` for the Snuffer | `combat_hb_ok()` asserts both hitbox arrays are exactly `g_ENEMY_KIND_COUNT` wide. `class_of` clamps unknown classes to Husk — **do not let a Gloam fall through to Husk affinity**, that would silently make it bullet-vulnerable. |
 | `src/sim/ai.hml` | 2 class rows in `ai_kind_params`; `AI_GLOAM = 6`, `AI_SNUFFER = 7`, `AI_CLASS_COUNT` → 8; the Gloam's 12 m fog aura as an AI-owned scalar the snapshot exposes | The Gloam's aura is **not** a light and **not** a render decision. The sim owns the number; the renderer reads it from the snapshot. |
 | `src/sim/director.hml` | `g_dir_w` re-normalised to 8 columns (§3.4), `g_dir_cost` → 8 entries | **Every tier row must still sum to exactly 100** — `director_table_ok` asserts it. Use §3.4's table verbatim; it is checked. |
-| `src/sim/progression.hml` | 5 new `UNLOCK_*` ids 25–29, `UNLOCK_COUNT` 25→30, 5 new `g_unlock_level` / `g_unlock_name` entries, `g_xp_kill` → 8 entries, 3 new XP sources | The header's *"keep `g_unlock_level` sorted"* invariant breaks. See §14 #5 — both enumerators already do a full linear scan, so nothing functional depends on it; **the comment must be corrected, not the code bent.** Unlocks are derived from level and never stored, so this costs **zero save bytes.** |
+| `src/sim/progression.hml` | 8 new `UNLOCK_*` ids 25–32, `UNLOCK_COUNT` 25→**33**, 8 new `g_unlock_level` / `g_unlock_name` entries, `g_unlock_name[14]` reworded (Emberlance is a spell), `g_xp_kill` → 8 entries, 4 new XP sources | The header's *"keep `g_unlock_level` sorted"* invariant breaks. See §14 #5 — both enumerators already do a full linear scan, so nothing functional depends on it; **the comment must be corrected, not the code bent.** Unlocks are derived from level and never stored, so this costs **zero save bytes.** |
 | `src/sim/command.hml` | `BTN_LAMP = 4096`, `BTN_ALL` 4095 → **8191** | **Two more literals hide here:** `c.buttons = p_buttons & 4095` (line ~177) and `if (c.buttons < 0 \|\| c.buttons > 4095)` (line ~260). Miss either and the lamp button is silently dropped on every command — a bug that only shows up as "the lamp doesn't work sometimes". |
-| `src/sim/lamp.hml` | **NEW.** Oil, stance, cooldowns, tank tier, the three verbs, `lamp_step`, `lamp_serialize` / `lamp_deserialize` / `lamp_hash` | Shape it like `progression.hml`: a flat state array, no closures, no per-entity objects (CLAUDE.md §7). Add its signatures to `ARCHITECTURE.md` §5.4. |
+| `src/sim/lamp.hml` | **NEW.** Oil, stance, cooldowns, tank tier, the **seven spells** and the three equipped slots, `lamp_step`, `lamp_serialize` / `lamp_deserialize` / `lamp_hash` | Shape it like `progression.hml`: a flat state array, no closures, no per-entity objects (CLAUDE.md §7). Add its signatures to `ARCHITECTURE.md` §5.4. **Mend and Guttering are sim state with timers — they must be in the hash and in the save, or a replay diverges.** |
+| `src/sim/weapons.hml` | **delete the Emberlance row** from the damage, falloff, handling, recoil and TTK tables; weapon count 6 → 5 | These are *measured, playtested* tables. Delete the row — do not leave a dead one that `probe_weapons` still asserts against. Check whether any table width is asserted against a weapon count constant, and whether `CMD_MAX_WEAPON = 15` is now shared with spell ids (§1.9.1). |
+| `src/sim/projectiles.hml` | the Emberlance bolt is now cast by a spell, not fired by a weapon | The projectile itself does not change — 6.0 m/s arcing, 3.5 m AoE, `DMG_EXPLOSION` + `DMG_BURN`. Only its *caller* changes. Do not take the opportunity to "improve" it. |
 | `src/sim/sim.hml` | call `lamp_step` in the tick order; radiant verbs resolve in the existing damage stage | **The tick order is API** (CLAUDE.md §7). Adding a stage means amending `ARCHITECTURE.md` §4, in that file, deliberately. |
 | `src/art/meshgen.hml` | 6 new meshes; widen the 6 per-class arrays to 8; `MESH_COUNT` 34 → 40; the shell lozenge as a separate mesh | Every class needs a **distinct protrusion axis** and there are only 6 axes in `g_hu_axis` (0..5) for 8 classes. The unbodied are exempt from the humanoid rule — a lozenge has no shoulders — so measure them against a different criterion and **say so in the probe**, rather than forcing a fake head:shoulder ratio. |
-| `src/art/fxgen.hml` | 5 new atlas cells | 28 of 64 used; 33 free after. No atlas resize. |
+| `src/art/fxgen.hml` | 5 new atlas cells | 28 of 64 used; 31 free after. No atlas resize. |
 | `src/art/palette.hml` | none | **No new colour is needed.** Every cue in §2 uses an existing entry. |
-| `src/render/viewmodel.hml` | the lamp-stance pose: `g_VM_DOWN` 0.34 → 0.14 m and centre | The 156-px bright anchor at every pitch is a *verified, playtested* property. Do not break it to make room for a raised pose — add a pose, keep the anchor. |
+| `src/render/viewmodel.hml` | the lamp-stance pose: `g_VM_DOWN` 0.34 → 0.14 m and centre; **and whatever §1.4's answer requires** | **[HANDS] — BLOCKED ON THE OWNER.** `DIRECTION.md` §2 says this question *"changes the viewmodel build"* and it is right. Do not start this file until §1.4 is answered. Whatever the answer: the 156-px bright anchor at every pitch is a *verified, playtested* property — add a pose, keep the anchor. |
 | `src/game/save.hml` | one `lamp` block; `SAVE_VERSION` 1 → 2, `SAVE_MIN_VERSION` stays 1 | The save is a wire contract. Old saves must load with oil = full and tank tier derived from level. |
 | HUD | oil bar + stance crosshair (§8.1) | Must pass `--scene hud_worst_case` against noon sky, snow, a muzzle flash and `CONCRETE_HI`. 1-px `UI_BLACK` shadow at (+1,+1), always. |
 
@@ -964,7 +1225,19 @@ What a later wave must touch. Ownership per `BUILD_PLAN.md` rules; **this task o
 8. **I did not amend any existing doc.** Every contradiction in §14 is *reported*, per CLAUDE.md §10.5
    and the brief's explicit instruction to flag rather than silently override. Three of them
    (#1, #3, #5) require a deliberate ratification in `ARCHITECTURE.md` §0 before implementation
-   starts. **I did not make those decisions.**
+   starts. **I did not make those decisions.** In particular **I did not amend the GDD**, which
+   `DIRECTION.md` says should be amended — §14 #11.
+9. **I did not answer the `DIRECTION.md` §2 hands question.** It is the owner's, it is posed as an open
+   question, and it changes the viewmodel build. §1.4 costs three options and recommends one. Until it
+   is answered, §5.2's party numbers are conditional and `src/render/viewmodel.hml` should not be
+   started. **This is the one place where I stopped rather than guessed, and it is deliberate.**
+10. **I did not specify the bolt-action rifle or the machine gun** that `DIRECTION.md` §3 asks for, or
+    the city's geometry, tiers, or shop. Those are weapon-design and hub-design work. §1.2a and §6.1a
+    specify only the *interface* between them and the damage-type system, and guarantee that interface
+    needs no affinity column.
+11. **The spell school's seven spells are unbalanced against each other.** Mend at 45 oil for 40 HP and
+    Guttering at 35 oil for 4 s are first-pass numbers chosen to be *specific*, not tuned. They have
+    not been playtested and they are the numbers in this document I have least confidence in.
 
 ---
 
@@ -1037,6 +1310,28 @@ ratifies 2.** `config.hml` correctly implements 2. This design needs **0 new lig
 depend on the resolution — but the stale "4" in ART_BIBLE §2.7 is exactly the kind of number that will
 tempt a future implementer to add a light for the beam. Worth striking.
 
+**#10 — moving the Emberlance touches shipped, measured content.** `DIRECTION.md` §2 directs it and I
+have followed the directive, but two of the four consequences in §1.9.3 are real edits to tables that
+were measured and playtested: **`weapons.hml` loses a row** from the damage / falloff / handling /
+recoil / TTK set, and **GDD §3.3's Relic unique *Vesper* has to become a charm** because relics roll on
+weapons. Neither is hard; both are the kind of change that leaves a dead table row behind if done in a
+hurry, and a dead row that a probe still asserts against is a false green. Also note that GDD §2.4's
+TTK table has an Emberlance column — it must be deleted, not zeroed.
+
+**#11 — `DIRECTION.md` outranks the GDD, and the GDD has not been amended yet.** `DIRECTION.md`'s own
+header says: *"Where they contradict `docs/recon/GAME_DESIGN.md`, these win and the GDD should be
+amended."* As of this writing the GDD still describes the Emberlance as a weapon (§2.4, §3.2 Lv 12,
+§3.3), still frames the fiction as modern-military CoD (§1), and has no city in it (§5 is Ember Hollow
+alone). **I did not amend the GDD** — that is not this task's file to own. Someone must, and until they
+do, an implementer reading only the GDD will build the wrong Emberlance. This is the highest-priority
+documentation debt created by this design.
+
+**#12 — the §1.4 hands question is unanswered and it blocks work.** `DIRECTION.md` §2 poses it as an
+open question for the owner. I have costed three options and recommended one, and I have **not decided
+it.** Two things are blocked on the answer: `src/render/viewmodel.hml` (which `DIRECTION.md` itself
+notes) and the entire party-composition argument in §5.2, which goes to 1.0× under option B. Everything
+so blocked is tagged **[HANDS]**.
+
 ---
 
 ## 15. VERIFICATION
@@ -1054,5 +1349,13 @@ tempt a future implementer to add a light for the beam. Worth striking.
 | Procedural art only | **PASS** | 6 meshes and 5 FX cells, all generated; no PNG, no OBJ |
 | 16-minute day respected | **PASS** | §1.7 indexes `daycycle.hml`'s existing 4 phases; ARCHITECTURE D6 stands |
 | Measured TTK / weapon tables respected | **PASS** | kinetic is ×1.00 on all six existing classes; GDD §2.4 is unamended (§1.2) |
-| Design anchors pinned with literals | **PASS** | 8×2 affinity table, 6×8 director table summed by hand, 5 unlock rows with levels, oil economy derived from `director.hml`'s own header |
-| Contradictions flagged, not overridden | **PASS** | 9 in §14; 3 need ratification and I did not grant it |
+| Design anchors pinned with literals | **PASS** | 8×2 affinity table, 6×8 director table (all 5 rows summed to 100 by hand), 8 unlock rows with levels, 7 spells with oil costs, oil economy derived from `director.hml`'s own header |
+| Contradictions flagged, not overridden | **PASS** | **12** in §14; 3 need ratification and I did not grant it |
+| `DIRECTION.md` §1 — FPS feel kept, CoD *fiction* free to change | **PASS** | weapon tables, recoil and the §2.5 feedback contract untouched; §2.1 RULE C keeps all five feedback channels |
+| `DIRECTION.md` §2 — magic is a spell school | **PASS** | §1.9: 7 spells, 3 slots, healing + fire + cloaking, lantern as focus |
+| `DIRECTION.md` §2 — Emberlance moves to the spell side | **PASS**, and it reverses my first draft | §1.9.2, §1.9.3; damage type unchanged, 4 ripples itemised, §14 #10 |
+| `DIRECTION.md` §2 — the hands open question | **DEFERRED TO THE OWNER — not answered** | §1.4 costs 3 options, recommends C, tags every dependent item **[HANDS]** |
+| `DIRECTION.md` §3 — primitive kinetic + lit city + ammo-as-currency | **PASS** | §1.2a (two tiers, affinity orthogonal to tier), §6.1a (a Pall is a power outage; grid → city output → shop) |
+| `DIRECTION.md` §4 — solo-satisfying, party-better, never solo-hostile | **PASS** | §5.3's law: no multiplier below 0.15, worst case 6.7× TTK, five ordered outs |
+| `DIRECTION.md` §5 — constraints do not move | **PASS** | §8: +18 permanent tris, 0 new lights, `FOG_FAR` only ever pulled down, procedural only, 16-min day |
+| GDD amended where `DIRECTION.md` overrides it | **FAIL — NOT DONE** | §14 #11. Not this task's file to own; flagged as the top documentation debt. |

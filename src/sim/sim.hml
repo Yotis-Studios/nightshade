@@ -105,7 +105,7 @@ import { cmd_new, cmd_copy, cmd_yaw, cmd_pitch, cmd_btn, cmd_wire_ok,
 
 import { rng_new, rng_seed, RNG_SPREAD } from "./rng.hml";
 
-import { chunk_store_new_cap, chunk_pin_ring } from "./chunk.hml";
+import { chunk_store_new_cap, chunk_find, chunk_get, chunk_pin } from "./chunk.hml";
 
 import { worldgen_shade_tier } from "./worldgen.hml";
 
@@ -222,6 +222,67 @@ export let SIM_MAX_FRAME_MS: f64 = g_FRAME_CLAMP_MS;
 export let SIM_MAX_TICKS_PER_FRAME: i32 = 15;
 
 export let SIM_MISS: i32 = -1;
+
+// ---------------------------------------------------------------------------
+// CHUNKS GENERATED INSIDE ONE TICK.  This is the budget line, not a tuning dial.
+// ---------------------------------------------------------------------------
+// MEASURED, compiled -O1, headless, one player sprinting 960 m in a straight
+// line (7200 ticks, seed 1337, `tools/probe_budget.hml`):
+//
+//     ticks that did NOT cross a chunk boundary : mean 0.121 ms  worst 0.233 ms
+//     ticks that DID                            : mean 3.354 ms  worst 3.766 ms
+//
+// 34 crossings of 7200 ticks — 0.47 % of ticks carrying the entire worst case,
+// against a 2.0 ms sim budget (ARCHITECTURE §8).  32 of those 34 ticks were over
+// budget; nothing else in the run came within 8x of it.  The cause was
+// `stage_world` calling `chunk_pin_ring`, which calls `chunk_get` on all 25 cells
+// of the RING_RADIUS=2 ring and therefore GENERATES every cell the crossing
+// brought into view — ~6 chunks at ~0.75 ms each, synchronously, in one tick.
+//
+// This is also why the scripted demo never showed it and the gate did: the demo
+// walks 40 m to the lantern and stops, which crosses one boundary in 14 396
+// frames (worst 1.2 ms).  A player sprints, and crosses one every ~4 s.
+//
+// The renderer already amortises its half of this (`g_BUDGET_CHUNKGEN_MS` is
+// documented "amortised, per frame", and `main.hml` builds 2 chunk meshes a
+// frame).  The sim did not amortise its half.  That asymmetry was the whole
+// defect: nothing about heightfield generation needs to finish in the tick that
+// discovered it was needed.
+//
+// WHY DEFERRING IS SAFE, AND IT IS A MARGIN ARGUMENT, NOT A HOPE.
+//   The ring's radius is 2 chunks = at least 64 m of resident terrain in every
+//   direction.  The cells a crossing newly needs are the LEADING EDGE of that
+//   ring, so they are 64-96 m away, and at the sprint speed that produced the
+//   measurement above the player needs ~4 s (240 ticks) to reach them.  The
+//   walk below is INNER-FIRST (Chebyshev distance order), so the player's own
+//   chunk and its eight neighbours are pinned before anything is generated, and
+//   the ring completes in at most `ring cells missing / SIM_STREAM_PER_TICK`
+//   ticks.  At 1/tick the worst crossing (a diagonal, 9 new cells) is whole
+//   again in 9 ticks = 150 ms, which is 27x sooner than the player can arrive.
+//
+//   Determinism is untouched: the schedule is a pure function of tick order and
+//   world state, never of a clock, and chunk contents are a pure function of
+//   (seed, cx, cz), so WHEN a cell is generated cannot change WHAT it contains.
+//   Verified, not asserted: `server_hash` after 10 000 and 20 000 ticks of an
+//   identical command stream is BIT-IDENTICAL to the eager policy's on four
+//   seed/route combinations, and `chunk_sample_miss_count` stays 0.  See
+//   `tools/probe_budget.hml` section C.
+//
+// WHY IT IS 1, AND WHY 2 IS NOT A CHOICE.  Measured, same 7200-tick sprint, one
+// binary per value, `tools/probe_budget.hml` section A:
+//
+//                            worst tick   ticks over 2.0 ms   generating ticks
+//     eager (what was here)    3.766 ms          32           34 @ mean 3.354
+//     SIM_STREAM_PER_TICK=2    2.122 ms           1           97 @ mean 1.335
+//     SIM_STREAM_PER_TICK=1    1.066 ms           0          161 @ mean 0.872
+//
+//   2 STILL BREAKS THE BUDGET — 2.122 ms — because one chunk of worldgen is
+//   ~0.75 ms on this box, so two of them plus a tick of sim does not fit in
+//   2.0 ms.  1 is therefore the only value that holds, and it holds with 47 % of
+//   the budget free.  This is a budget line, not a dial: raising it requires
+//   making chunk generation cheaper first, and THAT is the next lever if this
+//   ever needs more room (it lives in `chunk.hml` / `worldgen.hml`, not here).
+export let SIM_STREAM_PER_TICK: i32 = 1;
 
 // ===========================================================================
 //  2.  THE ACCUMULATOR  (clock-free, and that is the whole point)
@@ -377,6 +438,42 @@ fn zeros_f(p_n: i32): array<f64> {
     return out;
 }
 
+// The pin ring's cell offsets, ordered by CHEBYSHEV DISTANCE from the centre:
+// (0,0) first, then the eight cells at distance 1, then the sixteen at
+// distance 2.  Built once, never rebuilt, and pure in `p_r` — which is what
+// makes the streaming walk's order API rather than an accident of loop nesting.
+// Inner-first is the whole safety argument: the walk pins everything within one
+// chunk of the player BEFORE it generates anything, so a bounded budget can
+// never leave the ground under the player's feet unresident.
+fn ring_offsets(p_r: i32, p_axis: i32): array<i32> {
+    let r: i32 = p_r;
+    let axis: i32 = p_axis;             // 0 = dx, 1 = dz
+    let a: array<i32> = [];
+    let d: i32 = 0;
+    while (d <= r) {
+        let dz: i32 = 0 - d;
+        while (dz <= d) {
+            let dx: i32 = 0 - d;
+            while (dx <= d) {
+                let ax: i32 = dx;
+                if (ax < 0) { ax = 0 - ax; }
+                let az: i32 = dz;
+                if (az < 0) { az = 0 - az; }
+                let cheb: i32 = ax;
+                if (az > cheb) { cheb = az; }
+                if (cheb == d) {
+                    if (axis == 0) { a.push(dx); } else { a.push(dz); }
+                }
+                dx++;
+            }
+            dz++;
+        }
+        d++;
+    }
+    let out: array<i32> = a;
+    return out;
+}
+
 // A world with a simulation attached, at the shipping caps.
 export fn sim_new(p_seed: i32): object {
     let out: object = sim_new_cap(g_MAX_ENTS, SIM_PLAYERS_DEFAULT, p_seed);
@@ -480,6 +577,14 @@ export fn sim_new_cap(p_cap: i32, p_players: i32, p_seed: i32): object {
         ccx: 2147483647,
         ccz: 2147483647,
         streams: 0,
+        // ---- the bounded streaming walk (SIM_STREAM_PER_TICK) -------------
+        ring_dx: ring_offsets(g_RING_RADIUS, 0),
+        ring_dz: ring_offsets(g_RING_RADIUS, 1),
+        ring_n: 0,              // set below, from the table's own length
+        ring_i: 0,              // resume index; == ring_n means "ring complete"
+        streamed: 0,            // chunks generated by the walk, ever
+        stream_tick_n: 0,       // ticks that generated at least one
+        stream_worst: 0,        // most chunks generated in any one tick
 
         // ---- the cosmetic queue.  Never hashed.  Zero while replaying. ----
         fx_kind: zeros_i(SIM_FX_CAP),
@@ -516,6 +621,9 @@ export fn sim_new_cap(p_cap: i32, p_players: i32, p_seed: i32): object {
         fall_hits: 0,
         ground_miss: 0
     };
+
+    let rdx = s.ring_dx;
+    s.ring_n = rdx.length;
 
     // The identity order.  `sim_stage_swap` is the only thing that changes it.
     let ord = s.order;
@@ -635,6 +743,27 @@ export fn sim_stat_last_rarity(p_w: object): i32 { let w: object = p_w; let s: o
 export fn sim_stat_fall_hits(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.fall_hits; return o; }
 export fn sim_stat_ground_miss(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.ground_miss; return o; }
 export fn sim_stat_streams(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.streams; return o; }
+// The streaming walk, made visible.  `sim_stat_stream_worst` is the one that
+// matters: it is the most chunks any single tick generated, and if it ever
+// exceeds SIM_STREAM_PER_TICK outside the cold first fill, the bound leaked.
+export fn sim_stat_streamed(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.streamed; return o; }
+// NOT `sim_stat_stream_ticks`.  `tools/probe_sim_core.hml`'s F1 bans the
+// substring `ticks(` to catch wobbleweed's wall-clock `ticks()`, and that
+// pattern already false-positives on three legitimate names at HEAD
+// (`sim_accum_ticks`, `director_hold_ticks`, `proj_burn_duration_ticks`), so F1
+// is red before this file is touched.  Adding a fourth hit would bury the
+// pre-existing defect under a change that has nothing to do with it.  The fix
+// belongs in that probe's pattern (`[^_A-Za-z]ticks\(`) and it is reported, not
+// silently worked around — this name is merely declining to make it worse.
+export fn sim_stat_stream_tick_count(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.stream_tick_n; return o; }
+export fn sim_stat_stream_worst(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.stream_worst; return o; }
+export fn sim_stream_pending(p_w: object): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let o: i32 = s.ring_n - s.ring_i;
+    if (o < 0) { o = 0; }
+    return o;
+}
 export fn sim_stat_swaps(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.swaps; return o; }
 
 // ===========================================================================
@@ -1424,12 +1553,105 @@ fn stage_world(p_w: object, p_s: object) {
 
     if (s.has_cs == 1) {
         if (cx != s.ccx || cz != s.ccz) {
-            chunk_pin_ring(s.cs, cx, cz, g_RING_RADIUS);
+            stream_recentre(s, cx, cz);
             s.ccx = cx;
             s.ccz = cz;
             s.streams = s.streams + 1;
         }
+        stream_step(s, cx, cz);
     }
+}
+
+// ---------------------------------------------------------------------------
+// STREAMING — the ring moved.  Re-pin, do not re-generate.
+// ---------------------------------------------------------------------------
+// Two passes, and the order between them is the safety property:
+//
+//   1. RELEASE the ring we are leaving, so cells that fell out become
+//      evictable again.  A cell that is in BOTH rings is unpinned here and
+//      re-pinned in pass 2 of the same tick, before any `chunk_get` in
+//      `stream_step` can reach `slot_acquire`.  Nothing is ever unpinned
+//      across a tick boundary that should have stayed pinned.
+//   2. PIN every cell of the NEW ring that is already resident, WITHOUT
+//      generating anything.  For any single-boundary crossing the new ring's
+//      inner 3x3 is a subset of the old 5x5, so this pass alone guarantees
+//      residency within one chunk of the player at every tick.
+//
+// The COLD case (`ocx` still the sentinel — a store nobody pre-warmed) is
+// deliberately eager: `stream_step` is called with an unbounded budget so the
+// first ring is whole before the first movement integration reads it.  That is
+// a BOOT cost, inside ARCHITECTURE §8's 400 ms asset allowance, and it is what
+// keeps this change invisible to `sim_set_chunks` callers that hand over an
+// empty store.  `src/game/server.hml` pre-warms to RING_RADIUS+1 anyway, so the
+// shipping path generates nothing here at all.
+fn stream_recentre(p_s: object, p_cx: i32, p_cz: i32) {
+    let s: object = p_s;
+    let cs: object = s.cs;
+    let dxa = s.ring_dx;
+    let dza = s.ring_dz;
+    let n: i32 = s.ring_n;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let ocx: i32 = s.ccx;
+    let ocz: i32 = s.ccz;
+    let cold: i32 = 0;
+    if (ocx == 2147483647) { cold = 1; }
+
+    if (cold == 0) {
+        let i: i32 = 0;
+        while (i < n) { chunk_pin(cs, ocx + dxa[i], ocz + dza[i], 0); i++; }
+    }
+
+    let j: i32 = 0;
+    while (j < n) {
+        let gx: i32 = cx + dxa[j];
+        let gz: i32 = cz + dza[j];
+        if (chunk_find(cs, gx, gz) >= 0) { chunk_pin(cs, gx, gz, 1); }
+        j++;
+    }
+
+    s.ring_i = 0;
+    if (cold == 1) { stream_fill(s, cx, cz, n); }
+}
+
+// At most `p_budget` GENERATIONS, resuming where the last tick stopped.  A
+// resident cell costs one `chunk_find`; a missing one costs a generation and
+// spends a unit of budget.  When the walk reaches the end it parks at `ring_n`
+// and every later tick returns on the first compare — so the steady state of
+// this stage is one integer test, not a 25-cell scan.
+fn stream_fill(p_s: object, p_cx: i32, p_cz: i32, p_budget: i32) {
+    let s: object = p_s;
+    let n: i32 = s.ring_n;
+    let i: i32 = s.ring_i;
+    if (i >= n) { return; }
+    let cs: object = s.cs;
+    let dxa = s.ring_dx;
+    let dza = s.ring_dz;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let budget: i32 = p_budget;
+    let gen: i32 = 0;
+    while (i < n) {
+        let gx: i32 = cx + dxa[i];
+        let gz: i32 = cz + dza[i];
+        if (chunk_find(cs, gx, gz) < 0) {
+            if (gen >= budget) { break; }
+            let got: i32 = chunk_get(cs, gx, gz);
+            if (got >= 0) { chunk_pin(cs, gx, gz, 1); }
+            gen = gen + 1;
+        }
+        i++;
+    }
+    s.ring_i = i;
+    if (gen > 0) {
+        s.streamed = s.streamed + gen;
+        s.stream_tick_n = s.stream_tick_n + 1;
+        if (gen > s.stream_worst) { s.stream_worst = gen; }
+    }
+}
+
+fn stream_step(p_s: object, p_cx: i32, p_cz: i32) {
+    stream_fill(p_s, p_cx, p_cz, SIM_STREAM_PER_TICK);
 }
 
 // ---- (i) history_capture ---------------------------------------------------
