@@ -83,3 +83,34 @@ authoritative-server shape, gn.hml behind an import wall) but v1 ships solo.
 design.** Flag contradictions with the GDD rather than silently overriding it — two internal
 inconsistencies (the XP cumulative column, the night-hold duration) were caught precisely because
 implementers checked instead of assuming.
+
+---
+
+## 6. Villagers / NPCs — approved direction
+
+The owner endorsed this shape. `GAME_DESIGN §5` already names five villagers with a personality line
+each; this is how they should FUNCTION.
+
+**They are where the Animal Crossing pillar actually lives.** Four principles:
+
+1. **NPCs are the crafting and trading interface, not menus.** You get the bolt-action *from someone*,
+   and that person remembers you. This matters doubly given `DIRECTION.md` §3 — village-tier weapons
+   are crafted or traded, so the arsenal is literally delivered through relationships.
+2. **They arrive as the settlement grows.** A new villager appearing is the most legible possible
+   signal that your lantern work mattered — far better than a number going up. Ties settlement tier
+   (see `SETTLEMENT.md`) directly to something you can greet.
+3. **They react to the grid.** A villager who mentions the east road has gone dark again is doing
+   tutorial, quest-giving and world-state readout in a single line of dialogue. With ENTROPY
+   accepted, this is how a player learns their maintenance is slipping without a UI nag.
+4. **Named, few and persistent** beats many and generic — especially under entropy, where the
+   emotional hook is *"the town survived because you came back."*
+
+### THE BUDGET PROBLEM, and it is the real constraint on settlements
+Measured by `benchframe.hml`: **an NPC mesh is 220 triangles.** Ten villagers is 2200 — the entire
+current budget, for people standing still. This, not building geometry, is what stands between us
+and a town that feels inhabited.
+
+**NPC LOD is the unlock** (approved): full mesh up close, a simplified silhouette mid-range, a
+billboard beyond that. Target roughly **40 triangles at conversational distance**, at which point a
+town of 30 becomes affordable. Silhouette must still read instantly at 320x240 per `ART_BIBLE` §6 —
+a villager the player cannot tell from a Husk at 20 m is a bug, not a saving.
