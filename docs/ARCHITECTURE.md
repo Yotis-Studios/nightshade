@@ -453,9 +453,43 @@ fn fbm2(p_x: f64, p_y: f64, p_cell: f64, p_wrap: i32, p_seed: i32): f64
 | `tod.hml` | The ART_BIBLE §5 keyframe table remapped onto the 16-minute day (D6), interpolation, weather overrides, lightning. Writes the engine `RenderEnv`. | `tod_eval, tod_phase, tod_sky_keys, tod_set_weather, tod_lightning_fire, TOD_DAWN..TOD_DEEP, WX_CLEAR/OVERCAST/RAIN/STORM/BLOOM` |
 | `texgen.hml` | ART_BIBLE §7.2 primitives + §7.3 generators + the §7.4 8×8 packer → `ATLAS_WORLD` (256×256). | `texgen_build_world_atlas, tg_grass, tg_dirt, tg_stone, tg_wood, tg_metal, tg_concrete, tg_leaf, tg_snow, tg_ramp_pick, tg_grain, CELL_*` (cell index constants) |
 | `skygen.hml` | ART_BIBLE §11 panorama: dithered gradient, two cloud layers with lit-top/shadow-bottom, sun/moon/halo, star field with a fixed seed. Incremental re-bake, 20 rows/frame. | `skygen_build, skygen_mark_dirty, skygen_rebake_slice, skygen_tex`, plus the key-block interface in §5.3.1 |
+
+#### 5.3.2 `meshgen_vm_bob` — the held-object bob (added by the lantern-viewmodel task)
+
+The viewmodel is a **lantern**, not a gun (playtest 2026-07-27: *"the gun is just like floating in
+front of the pov camera ... maybe do something easier for fps pov? like a torch?"*). A held lamp has
+to move or it reads as pasted on. The motion curve belongs with the model, but the transform is
+applied by the renderer, so `meshgen.hml` publishes the curve and `world_render.hml` consumes it:
+
+```hemlock
+// meshgen.hml — pure, allocation-free, writes 3 metres-offsets into p_out.
+//   p_phase   walk-cycle phase in radians (2 per stride); free-running when idle
+//   p_speed   0..1, horizontal speed / run speed
+//   p_out     caller-owned array<f64> of length >= 3: [right, up, forward]
+export fn meshgen_vm_bob(p_phase: f64, p_speed: f64, p_out: array<f64>);
+```
+
+**Call site — `world_render.hml` stage 15, six lines.** The viewmodel offset is currently the
+constants `1.05 / 0.26 / -0.34`; the bob adds to them in the same camera basis that is already
+computed there:
+
+```hemlock
+meshgen_vm_bob(g_vm_phase, g_vm_speed, g_vm_bob);   // g_vm_bob: array<f64> len 3, allocated once
+let bo_r: f64 = 0.26 + g_vm_bob[0];
+let bo_u: f64 = 0.0 - 0.34 + g_vm_bob[1];
+let bo_f: f64 = 1.05 + g_vm_bob[2];
+let vx: f64 = g_camx + ffx * bo_f + rrx * bo_r + uux * bo_u;
+// (same for vy, vz)
+```
+
+`g_vm_phase` / `g_vm_speed` come from the movement state the renderer already receives in the
+snapshot. Amplitudes are 1.4 cm vertical / 0.9 cm lateral at a full sprint — 3 px and 2 px at
+320×240 — plus a 0.35 cm idle sway that never stops. **Until this call site exists the lantern is
+static**; nothing else about it depends on the wiring.
+
 | `fxgen.hml` | `ATLAS_FX` (128×128, 16×16 cells): muzzle ×3, tracer, sparks, explosion ×6, ember, smoke ×3, glow cards ×2, enemy eye, loot beam, rain streak, lightning, dust, splash, XP mote. | `fxgen_build_atlas, FX_MUZZLE_0, FX_TRACER, FX_GLOW_S, FX_GLOW_L, …` |
-| `hudgen.hml` | `ATLAS_HUD` (128×128): `FONT_MICRO` 4×6 and `FONT_BIG` 8×12 as packed bitfields, icons, crosshair parts, minimap chrome, vignette gradient strip. | `hudgen_build_atlas, hud_font_micro, hud_font_big, HUD_ICON_*` |
-| `meshgen.hml` | The procedural mesh DSL and every world mesh: tree LOD0/1/2, bush, rock, crate, barrel, lantern post, contact blob, enemy ×6 × 3 LODs (rigid parts), NPC, weapon viewmodels ×6 — **34 meshes, 3270 triangles, built in ~45 ms**. Bakes vertex colour + creased AO at build time, then applies a soft luminance floor of 72 (`MG_LUM_FLOOR`) so no vertex in the game is darker than the atlas minimum. UVs are bound per MATERIAL, not per atlas cell: `assets.hml` calls `meshgen_set_material_uv(MG_MAT_*, u0,v0,u1,v1)` with texgen's `CELL_*` rects **before** `meshgen_build_all()`. | `mg_box, mg_box_ex, mg_prism, mg_taper, mg_fan_disc, mg_lathe, mg_spike, mg_panel, mg_ground_quad, mg_set_jitter, meshgen_build_all, meshgen_bake_all, meshgen_set_material_uv, meshgen_set_sun_azimuth, meshgen_mesh, meshgen_name, meshgen_tris, meshgen_budget, meshgen_kind, meshgen_radius, meshgen_view_yaw, meshgen_count, meshgen_enemy_mesh, mg_head_shoulder, mg_head_width, mg_shoulder_width, mg_protrusion, mg_protrusion_axis, MESH_TREE0/1/2, MESH_BUSH, MESH_ROCK, MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_WISP0..MESH_BULWARK2 (class ×3 LODs), MESH_NPC, MESH_SPARROW_VM..MESH_EMBERLANCE_VM, MESH_COUNT, ENEMY_WISP..ENEMY_BULWARK, MG_MAT_*, MG_KIND_*, MG_LUM_FLOOR` |
+| `hudgen.hml` | `ATLAS_HUD` (128×128): `FONT_MICRO` 4×6 and `FONT_BIG` 8×12 as packed bitfields, icons, crosshair parts, minimap chrome, vignette gradient strip. **`hudgen_uv` returns WHOLE-TEXEL uv edges, not `atlas_rect_uv`'s half-texel inset** — ATLAS_HUD is blitted 1:1, and at 1:1 the inset drops a texel of the mandatory §9.1 outline off every sprite (measured; `hudgen_selftest` asserts the whole-texel form). | `hudgen_build_atlas, hud_font_micro, hud_font_big, hudgen_rect, hudgen_uv, hudgen_xh_place, HUD_XH_GAP, HUD_XH_LEN, HUD_ICON_*` |
+| `meshgen.hml` | The procedural mesh DSL and every world mesh: tree LOD0/1/2, bush, rock, crate, barrel, lantern post, contact blob, enemy ×6 × 3 LODs (rigid parts), NPC, the LANTERN viewmodel (slot 28, the only one the renderer is bound to) and five retained gun viewmodels — **34 meshes, 2494 triangles, built in ~29 ms**. Bakes vertex colour + creased AO at build time, then applies a soft luminance floor of 72 (`MG_LUM_FLOOR`) so no vertex in the game is darker than the atlas minimum. UVs are bound per MATERIAL, not per atlas cell: `assets.hml` calls `meshgen_set_material_uv(MG_MAT_*, u0,v0,u1,v1)` with texgen's `CELL_*` rects **before** `meshgen_build_all()`. | `mg_box, mg_box_ex, mg_prism, mg_taper, mg_fan_disc, mg_lathe, mg_spike, mg_panel, mg_ground_quad, mg_set_jitter, meshgen_build_all, meshgen_bake_all, meshgen_set_material_uv, meshgen_set_sun_azimuth, meshgen_mesh, meshgen_name, meshgen_tris, meshgen_budget, meshgen_kind, meshgen_radius, meshgen_view_yaw, meshgen_count, meshgen_enemy_mesh, mg_head_shoulder, mg_head_width, mg_shoulder_width, mg_protrusion, mg_protrusion_axis, MESH_TREE0/1/2, MESH_BUSH, MESH_ROCK, MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_WISP0..MESH_BULWARK2 (class ×3 LODs), MESH_NPC, MESH_LANTERN_VM (= MESH_SPARROW_VM, the alias), MESH_TINKER_VM..MESH_EMBERLANCE_VM, MESH_COUNT, ENEMY_WISP..ENEMY_BULWARK, MG_MAT_*, MG_KIND_*, MG_LUM_FLOOR, MG_VM_LUM_FLOOR, meshgen_vm_bob` |
 | `biome.hml` | Per-biome palettes, texture cell selection, prop density, `FOG_FAR` override, triangle-budget policy. (Wave 4.) | `biome_of, biome_params, BIOME_HOLLOWFIELD..BIOME_DEEPSHADE` |
 | `weather.hml` | Weather state machine + rain/snow/fog-bank emitters. (Wave 4.) | `weather_step, weather_emit` |
 | `hubgen.hml` | Ember Hollow's modular building meshes and layout. (Wave 4.) | `hubgen_build, hub_layout` |

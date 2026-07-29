@@ -29,6 +29,44 @@
 // can quietly replace it with a scaled micro font.
 //
 // ---------------------------------------------------------------------------
+// WHY hudgen_uv DOES NOT USE atlas_rect_uv'S HALF-TEXEL INSET
+// ---------------------------------------------------------------------------
+// `atlas_rect_uv` insets the rect by half a texel on every side.  That is the
+// right convention for a quad that is SCALED, where the inset stops a filtered
+// or near-boundary sample reaching a neighbouring cell.  ATLAS_HUD is not that
+// atlas: every sprite here is blitted 1:1 at an integer pixel position, and at
+// 1:1 the inset is actively wrong — it squeezes N texels into (N-1) texel
+// widths across N pixels, so the sampled column drifts by up to a texel.
+//
+// Measured, compiled, SDL readback of a real 320x240 render (uvprobe):
+//
+//     atlas  XH TICK V      inset uv renders     whole-texel uv renders
+//       ooo        ooo                  ooo                       ooo
+//       o#o        oo#   <- ink 1 px    o#o   <- exact
+//       o#o        oo#      right, and  o#o
+//       o#o        oo#      the right/  o#o
+//       o#o        oo#      bottom      o#o
+//       ooo        oo#      OUTLINE     ooo
+//                           IS GONE
+//
+// Losing the trailing outline is not cosmetic: the 1-px UI_BLACK outline is
+// what ART_BIBLE §9.1 makes mandatory so a white glyph survives snow and a
+// noon sky, and half of it was being dropped on every icon, every compass
+// tick and every crosshair arm.  The crosshair took it worst — the four arms
+// landed on two different axes and the centre dot on a third, which is the
+// "totally wonky" the first human playtest reported.
+//
+// wobbleweed's own `font.hml` already uses the whole-texel convention
+// (`f.u0[i] = f64(cx) / faw`, font.hml:199), which is exactly why the fonts
+// are texel-exact on readback and the sprites were not.  This is the sprite
+// path being brought into line with the font path, not a new invention.
+//
+// Verified safe for the STRETCHED users of this atlas too (HUD_SOLID as a
+// bar, HUD_VIGNETTE as a screen-inset ramp): rendering HUD_SOLID at 4, 40,
+// 91, 120 and 300 px wide gives a fully opaque run of exactly the requested
+// width under both conventions — no edge seam, no bleed (uvprobe2).
+//
+// ---------------------------------------------------------------------------
 // TEXEL MAP (all coordinates in atlas texels)
 // ---------------------------------------------------------------------------
 //   y  0 .. 11   FONT_MICRO, 32 glyph cells per row x 4 px = 128, 2 rows of 6
@@ -42,7 +80,7 @@
 import { divi } from "@stdlib/math";
 import { bayer4 } from "../core/mathx.hml";
 import { g_UI_BLACK, pal_r, pal_g, pal_b } from "./palette.hml";
-import { atlas_new, atlas_data, atlas_base, atlas_fill, atlas_rect_uv,
+import { atlas_new, atlas_data, atlas_base, atlas_fill,
          atlas_get } from "../../../wobbleweed/src/atlas.hml";
 import { font_new, font_add_glyph, font_bake, font_glyph_index,
          font_glyph_count, font_set_glyph_advance,
@@ -129,15 +167,79 @@ export fn hudgen_rect(id: i32, out: array<i32>, off: i32) {
     out[off + 3] = g_hud_rect[s + 3];
 }
 
-// Half-texel-inset uv rect of a sprite: out[off..off+3] = u0, v0, u1, v1.
+// WHOLE-TEXEL uv rect of a sprite: out[off..off+3] = u0, v0, u1, v1, on the
+// texel EDGES, not the texel centres.  See the header note — ATLAS_HUD is a
+// 1:1 atlas and the half-texel inset costs it a texel of outline.  128 is a
+// power of two, so every value here is exact in binary and `u * HUD_ATLAS_W`
+// recovers the integer texel edge with no rounding; `hudgen_selftest` asserts
+// exactly that, which is what stops the inset creeping back in.
 export fn hudgen_uv(id: i32, out: array<f64>, off: i32) {
     if (g_hud_atlas == null || id < 0 || id >= HUD_RECT_COUNT) {
         out[off] = 0.0; out[off + 1] = 0.0; out[off + 2] = 0.0; out[off + 3] = 0.0;
         return;
     }
     let s: i32 = id * 4;
-    atlas_rect_uv(g_hud_atlas, g_hud_rect[s], g_hud_rect[s + 1],
-                  g_hud_rect[s + 2], g_hud_rect[s + 3], out, off);
+    let fw: f64 = f64(HUD_ATLAS_W);
+    let fh: f64 = f64(HUD_ATLAS_H);
+    out[off] = f64(g_hud_rect[s]) / fw;
+    out[off + 1] = f64(g_hud_rect[s + 1]) / fh;
+    out[off + 2] = f64(g_hud_rect[s] + g_hud_rect[s + 2]) / fw;
+    out[off + 3] = f64(g_hud_rect[s + 1] + g_hud_rect[s + 3]) / fh;
+}
+
+// ---------------------------------------------------------------------------
+// CROSSHAIR PLACEMENT — ART_BIBLE §9.3
+// ---------------------------------------------------------------------------
+// "4 ticks, each 1 px wide x 4 px long, gap = 3 + spread px from centre.
+//  spread = 0 (still ADS) -> 9 (sprinting/firing).  No centre dot by default."
+//
+// This function exists because `hudgen_rect` alone is not enough to place a
+// crosshair and the two callers that tried both got it wrong in the same way.
+// A tick's INK is not its rect: HUD_XH_TICK_V is a 3x6 rect holding a 1x4 ink
+// column at rect-local (1, 1), because the mandatory UI_BLACK outline has to
+// live inside the sprite's own rect (see the sprite-id note above).  A caller
+// centring on the rect instead of the ink puts the vertical arms on one column
+// and the horizontal arms on another, and the four arms stop being a cross.
+// That knowledge belongs here, with the rect table that creates it, not copied
+// into every HUD that draws a crosshair.
+//
+// The centre is a PIXEL BOUNDARY, not a pixel.  At 320x240 `view_project` puts
+// the aim axis at exactly (160.0, 120.0), which is the corner between pixels
+// 159 and 160 — a 1-px tick cannot straddle it, so the arms are made symmetric
+// about the boundary and the two 1-px axis lines commit to the pixel that
+// `quad_screen_uv`'s own `floor(v + 0.5)` snapping selects, i.e. (cx, cy).
+//
+// out[off+0..1]  left   tick, draw with HUD_XH_TICK_H
+// out[off+2..3]  right  tick, HUD_XH_TICK_H
+// out[off+4..5]  top    tick, HUD_XH_TICK_V
+// out[off+6..7]  bottom tick, HUD_XH_TICK_V
+export let HUD_XH_GAP = 3;    // §9.3 base gap from centre, in pixels
+export let HUD_XH_LEN = 4;    // §9.3 tick length, in pixels
+
+// The `p_` here is NOT the hot-path idiom (this runs once a frame) — it is
+// defensive.  An `i32`-annotated PARAMETER does not coerce its argument: pass
+// `divi(g_RES_W, 2)` and the value arrives float-typed, sails through every
+// arithmetic step, and only detonates at the first `array<i32>` store as
+// "Type mismatch in typed array", a very long way from the call site.  The
+// explicit `i32(...)` copy-in makes the boundary total.  Reproduced on v2.9.1;
+// see the task report.
+export fn hudgen_xh_place(p_cx: i32, p_cy: i32, p_spread: i32,
+                          out: array<i32>, p_off: i32) {
+    let cx: i32 = i32(p_cx);
+    let cy: i32 = i32(p_cy);
+    let off: i32 = i32(p_off);
+    let g: i32 = HUD_XH_GAP + i32(p_spread);
+    if (g < 0) { g = 0; }
+    let inset: i32 = 1;                       // ink is 1 texel in from the rect
+    let arm: i32 = g + HUD_XH_LEN + inset;
+    out[off] = cx - arm;                      // left
+    out[off + 1] = cy - inset;
+    out[off + 2] = cx + g - inset;            // right
+    out[off + 3] = cy - inset;
+    out[off + 4] = cx - inset;                // top
+    out[off + 5] = cy - arm;
+    out[off + 6] = cx - inset;                // bottom
+    out[off + 7] = cy + g - inset;
 }
 
 export fn hudgen_sprite_name(id: i32): string {
@@ -486,14 +588,23 @@ fn hud_outline(d: buffer, x0: i32, y0: i32, w: i32, h: i32) {
 
 // The four diagonal ticks of the hitmarker, drawn into the 16x16 rect: each is
 // 4 texels long with a 4-texel gap from centre, exactly ART_BIBLE §9.3.
+//
+// `a` and `b` are already RECT-relative and already mirrored about the rect
+// centre (b == 15 - a), so they must be used as-is.  The original code added a
+// further `+ 1` to both — the `hud_ink` "1 texel in from the edge" idiom, which
+// does not apply here — and that pushed the ink to 3..6 / 11..14, symmetric
+// about texel 8.5 in a rect whose centre is 7.5.  The hitmarker therefore
+// landed a pixel down-right of the crosshair it is supposed to sit on, and its
+// outline ran flush into the rect edge instead of keeping the 1-texel gutter
+// every other sprite here has.
 fn hud_hitmark(d: buffer, x0: i32, y0: i32) {
     for (let k = 0; k < 4; k++) {
-        let a: i32 = 2 + k;          // 2..5 from the ink origin
-        let b: i32 = 13 - k;         // mirrored
-        hud_dot(d, x0 + 1 + a, y0 + 1 + a);
-        hud_dot(d, x0 + 1 + b, y0 + 1 + a);
-        hud_dot(d, x0 + 1 + a, y0 + 1 + b);
-        hud_dot(d, x0 + 1 + b, y0 + 1 + b);
+        let a: i32 = 2 + k;          // 2..5
+        let b: i32 = 13 - k;         // 13..10 — the mirror of `a` about 7.5
+        hud_dot(d, x0 + a, y0 + a);
+        hud_dot(d, x0 + b, y0 + a);
+        hud_dot(d, x0 + a, y0 + b);
+        hud_dot(d, x0 + b, y0 + b);
     }
 }
 fn hud_dot(d: buffer, x: i32, y: i32) {
@@ -618,6 +729,33 @@ fn runs2_row(bits: i32, w: i32): i32 {
     }
     if (n == 1) { let bad2: i32 = 0; return bad2; }
     let ok: i32 = 1;
+    return ok;
+}
+
+// Rect-local bounding box of a sprite's WHITE ink, compared against what the
+// caller expects.  Returns 1 on an exact match.  This is how the crosshair
+// placement stays honest: `hudgen_xh_place` hard-codes "the ink is one texel
+// inside the rect", and this proves that against the baked atlas rather than
+// against the comment next to it.
+fn ink_bbox_is(a, r: array<i32>, bx: i32, by: i32, bw: i32, bh: i32): i32 {
+    let x0: i32 = r[2];
+    let y0: i32 = r[3];
+    let x1: i32 = 0 - 1;
+    let y1: i32 = 0 - 1;
+    for (let y = 0; y < r[3]; y++) {
+        for (let x = 0; x < r[2]; x++) {
+            let p: u32 = atlas_get(a, r[0] + x, r[1] + y);
+            if (i32((p >> 24) & 255) != 255) { continue; }
+            if (i32(p & 255) != 255) { continue; }        // only white ink
+            if (x < x0) { x0 = x; }
+            if (y < y0) { y0 = y; }
+            if (x > x1) { x1 = x; }
+            if (y > y1) { y1 = y; }
+        }
+    }
+    if (x1 < 0) { let none: i32 = 0; return none; }
+    let ok: i32 = 0;
+    if (x0 == bx && y0 == by && x1 - x0 + 1 == bw && y1 - y0 + 1 == bh) { ok = 1; }
     return ok;
 }
 
@@ -780,6 +918,92 @@ export fn hudgen_selftest(): i32 {
     }
     hck("every icon's ink is fully enclosed by a 1-px UI_BLACK outline", outlined);
     hck("no icon ink touches its own rect edge", (leaked == 0) ? 1 : 0);
+
+    // --- the uv rect is on WHOLE TEXEL EDGES, so a 1:1 blit is exact -------
+    // This is the guard on the defect the first human playtest called "the
+    // crosshair is totally wonky".  A half-texel inset here re-introduces it
+    // on every sprite in the atlas, and it is invisible in code review, so it
+    // gets an assertion rather than a comment.
+    let uvexact: i32 = 1;
+    let uvspan: i32 = 1;
+    let uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    for (let id = 0; id < HUD_RECT_COUNT; id++) {
+        hudgen_uv(id, uvq, 0);
+        let e0: f64 = uvq[0] * f64(HUD_ATLAS_W);
+        let e1: f64 = uvq[1] * f64(HUD_ATLAS_H);
+        let e2: f64 = uvq[2] * f64(HUD_ATLAS_W);
+        let e3: f64 = uvq[3] * f64(HUD_ATLAS_H);
+        if (e0 != f64(rt[id * 4])) { uvexact = 0; }
+        if (e1 != f64(rt[id * 4 + 1])) { uvexact = 0; }
+        if (e2 != f64(rt[id * 4] + rt[id * 4 + 2])) { uvexact = 0; }
+        if (e3 != f64(rt[id * 4 + 1] + rt[id * 4 + 3])) { uvexact = 0; }
+        // and the uv span must be exactly the texel span — an inset shortens it
+        if (e2 - e0 != f64(rt[id * 4 + 2])) { uvspan = 0; }
+        if (e3 - e1 != f64(rt[id * 4 + 3])) { uvspan = 0; }
+    }
+    hck("hudgen_uv lands on whole texel edges (no half-texel inset)", uvexact);
+    hck("hudgen_uv spans the sprite's full texel count, so 1:1 blits are exact",
+        uvspan);
+
+    // --- the crosshair and the hitmarker are centred on their own rects ----
+    // Four ticks that do not share two axes are not a crosshair.  These check
+    // the ink, not the rect, because the ink is what the player sees.
+    let xhv: array<i32> = [0, 0, 0, 0];
+    let xhh: array<i32> = [0, 0, 0, 0];
+    hudgen_rect(HUD_XH_TICK_V, xhv, 0);
+    hudgen_rect(HUD_XH_TICK_H, xhh, 0);
+    let vok: i32 = ink_bbox_is(a, xhv, 1, 1, 1, HUD_XH_LEN);
+    let hok: i32 = ink_bbox_is(a, xhh, 1, 1, HUD_XH_LEN, 1);
+    hck("HUD_XH_TICK_V ink is a 1x4 column one texel inside its rect", vok);
+    hck("HUD_XH_TICK_H ink is a 4x1 row one texel inside its rect", hok);
+
+    let xp: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0];
+    hudgen_xh_place(160, 120, 0, xp, 0);
+    // ink coordinates implied by those placements (ink sits at rect-local 1,1)
+    let rowL: i32 = xp[1] + 1;
+    let rowR: i32 = xp[3] + 1;
+    let colT: i32 = xp[4] + 1;
+    let colB: i32 = xp[6] + 1;
+    hck("the two horizontal crosshair arms share one row", (rowL == rowR) ? 1 : 0);
+    hck("the two vertical crosshair arms share one column", (colT == colB) ? 1 : 0);
+    // symmetry is measured against the CONTINUOUS centre 160.0 / 120.0, since
+    // that is where view.hml projects the aim axis (probe_view asserts it).
+    let leftEdge: i32 = xp[0] + 1 + HUD_XH_LEN;      // px just past the left arm
+    let rightEdge: i32 = xp[2] + 1;                  // first px of the right arm
+    let topEdge: i32 = xp[5] + 1 + HUD_XH_LEN;
+    let botEdge: i32 = xp[7] + 1;
+    hck("the horizontal arms are symmetric about the aim axis",
+        (160 - leftEdge == rightEdge - 160) ? 1 : 0);
+    hck("the vertical arms are symmetric about the aim axis",
+        (120 - topEdge == botEdge - 120) ? 1 : 0);
+    hck("the crosshair gap is ART_BIBLE §9.3's 3 + spread",
+        (160 - leftEdge == HUD_XH_GAP) ? 1 : 0);
+    let sp: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0];
+    hudgen_xh_place(160, 120, 9, sp, 0);
+    hck("spread widens the gap and nothing else",
+        (160 - (sp[0] + 1 + HUD_XH_LEN) == HUD_XH_GAP + 9
+         && sp[4] + 1 == colT) ? 1 : 0);
+
+    // The hitmarker sits ON the crosshair, so it must be centred in its rect:
+    // mirror-symmetric in both axes, ink and outline together.
+    let hmr: array<i32> = [0, 0, 0, 0];
+    hudgen_rect(HUD_HITMARK, hmr, 0);
+    let hmsym: i32 = 1;
+    let hmgut: i32 = 1;
+    for (let y = 0; y < hmr[3]; y++) {
+        for (let x = 0; x < hmr[2]; x++) {
+            let p: u32 = atlas_get(a, hmr[0] + x, hmr[1] + y);
+            let qx: u32 = atlas_get(a, hmr[0] + hmr[2] - 1 - x, hmr[1] + y);
+            let qy: u32 = atlas_get(a, hmr[0] + x, hmr[1] + hmr[3] - 1 - y);
+            if (p != qx) { hmsym = 0; }
+            if (p != qy) { hmsym = 0; }
+            let edge: i32 = 0;
+            if (x == 0 || y == 0 || x == hmr[2] - 1 || y == hmr[3] - 1) { edge = 1; }
+            if (edge == 1 && i32((p >> 24) & 255) != 0) { hmgut = 0; }
+        }
+    }
+    hck("the hitmarker is mirror-symmetric about its own rect centre", hmsym);
+    hck("the hitmarker keeps a clear 1-texel gutter, outline included", hmgut);
 
     // --- the vignette strip is a clean, band-free ramp ---------------------
     let vx: i32 = rt[HUD_VIGNETTE * 4];

@@ -93,7 +93,7 @@ import { target_begin, target_end, target_present }
        from "../../../wobbleweed/src/target.hml";
 import { batch_new, batch_reset, batch_reserve, batch_commit, batch_vbuf,
          batch_flush, batch_sort, batch_sort_flush, batch_count,
-         batch_write_vertex,
+         batch_write_vertex, batch_set_depth_far,
          LAYER_SKY, LAYER_WORLD, LAYER_FX, LAYER_HUD }
        from "../../../wobbleweed/src/batch.hml";
 import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
@@ -846,6 +846,46 @@ export fn frame_render(): i32 {
     batch_reset(g_bworld);
     batch_reset(g_bfx);
     batch_reset(g_bhud);
+
+    // ---- THE PAINTER-SORT QUANTUM FOLLOWS THE FOG WALL --------------------
+    // There is no z-buffer on this path by design (CLAUDE.md §6), so the ONLY
+    // thing separating two surfaces at similar depth is which bucket they land
+    // in: `batch_sort` quantizes to `depth_far / 2048` and everything inside
+    // one bucket keeps EMISSION order. Two surfaces closer together than the
+    // quantum therefore swap the moment emission order changes, which is what
+    // "textures kinda clip into each other" looks like in motion.
+    //
+    // `frame_batches` sizes the world batch for the worst case, 80 m, giving a
+    // 39.06 mm quantum. But the far plane is `FOG_FAR * 1.06` and FOG_FAR is a
+    // per-scene number: at storm_assault's 20 m the far plane is 21.2 m, so
+    // 73 % of the 2048 buckets were addressing space beyond the fog wall and
+    // the quantum was 3.8x coarser than it needed to be. Retuning it per frame
+    // is two field writes (`batch_set_depth_far` does no allocation and no
+    // work proportional to n). quantum = min(FOG_FAR * 1.06, 80) / 2048:
+    //
+    //     FOG_FAR   far plane   quantum before -> after
+    //        72 m      76.32 m    39.06 mm ->  37.27 mm    (x1.05)
+    //        64 m      67.84 m    39.06 mm ->  33.13 mm    (x1.18)
+    //        52 m      55.12 m    39.06 mm ->  26.91 mm    (x1.45)
+    //        48 m      50.88 m    39.06 mm ->  24.84 mm    (x1.57)
+    //        30 m      31.80 m    39.06 mm ->  15.53 mm    (x2.52)
+    //        26 m      27.56 m    39.06 mm ->  13.46 mm    (x2.90)
+    //        20 m      21.20 m    39.06 mm ->  10.35 mm    (x3.77)
+    //
+    // Only the FAR end clamps, and only for geometry past the far plane — a
+    // chunk is kept when its NEAREST point is inside `fog_far`, so its far
+    // corner can overshoot, and there is no far-plane rejection in emit.hml.
+    // Anything that overshoots is at or beyond the fog wall, where fog alpha
+    // is at maximum and the ordering is not visible; it lands in bucket 0 and
+    // is drawn first, which is where far geometry belongs. Nothing NEW is
+    // clamped that was not already clamped past 80 m, and no triangle changes
+    // whether it is drawn — only which bucket it sorts into.
+    // The sky has its own batch (400 m) and is not touched.
+    let sort_far: f64 = far;
+    if (sort_far > 80.0) { sort_far = 80.0; }
+    if (sort_far < 1.0) { sort_far = 1.0; }
+    batch_set_depth_far(g_bworld, sort_far);
+    batch_set_depth_far(g_bfx, sort_far);
     stat_end(STAT_T_BATCH_RESET);
 
     stat_begin(STAT_T_EMIT);
@@ -935,16 +975,34 @@ export fn frame_render(): i32 {
             let tr2: i32 = clampi(i32(f64(g_pr_tr[k]) * plr * (1.0 - f * (1.0 - ftr))), 0, 255);
             let tg3: i32 = clampi(i32(f64(g_pr_tg[k]) * plg * (1.0 - f * (1.0 - ftg2))), 0, 255);
             let tb2: i32 = clampi(i32(f64(g_pr_tb[k]) * plb * (1.0 - f * (1.0 - ftb))), 0, 255);
-            mesh_emit_yaw(m, g_bworld, g_tex_world, px2, py2, pz2,
-                          g_pr_yaw[k], g_pr_s[k], tr2, tg3, tb2, a);
             // The contact blob — a 2-triangle card, laid on the ground the
             // prop was placed on. MANDATORY, no exceptions, not even in a test
             // scene (CLAUDE.md §9 rule 6): the highest value-per-triangle
             // spend we have.
+            //
+            // IT IS EMITTED BEFORE ITS PROP, AND THE ORDER IS LOAD-BEARING.
+            // The blob sits 35 mm above the ground directly under the prop, so
+            // its depth and the depth of the prop's lowest triangles differ by
+            // a few centimetres — the same order as the painter-sort quantum
+            // (37 mm at FOG_FAR 72, see stage 11). Whenever they tie, the
+            // bucket keeps EMISSION order, and with the prop emitted first the
+            // shadow card was painted OVER the foot of the crate, the barrel
+            // and the tree trunk it belongs under. That is the most common
+            // instance of "textures kinda clip into each other" in the build:
+            // it happens under every prop in the frame, and it flickers,
+            // because a step of a few centimetres toward the prop flips which
+            // bucket it lands in.
+            //
+            // Emitting the blob first makes the prop win every tie. The prop
+            // is always ON the blob, so "prop over shadow" is correct at every
+            // depth, not merely preferable at ties. Zero triangles, zero
+            // milliseconds — the two calls simply swap.
             let sh: f64 = g_pr_shadow[k] * g_pr_s[k] * 0.5;
             mesh_emit_yaw(blob, g_bworld, g_tex_world,
                           px2, py2 + 0.035, pz2,
                           0.0, sh, 255, 255, 255, a);
+            mesh_emit_yaw(m, g_bworld, g_tex_world, px2, py2, pz2,
+                          g_pr_yaw[k], g_pr_s[k], tr2, tg3, tb2, a);
             edrawn++;
         }
     }

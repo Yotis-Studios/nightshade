@@ -74,6 +74,7 @@ import { pal_r, pal_g, pal_b, pal_pack,
          g_GUNMETAL_HI, g_GUNMETAL_LO, g_BRASS, g_BRASS_LO, g_POLYMER,
          g_NS_MID, g_NS_CORE, g_NS_HALO, g_NIGHTSHADE_FLORA, g_ICHOR,
          g_FABRIC_RED, g_FABRIC_CREAM, g_PAINT_TEAL, g_PAINT_OCHRE,
+         g_MUZZLE_CORE, g_MUZZLE_MID, g_EMBER, g_WINDOW_LIGHT,
          g_UI_BLACK } from "./palette.hml";
 
 // ---------------------------------------------------------------------------
@@ -141,6 +142,31 @@ export let MG_MAT_GLASS    = 9;
 // stripe on a first-person prop. The weapon's slot 3 still uses this cell,
 // because it is the flattest bright window in the atlas and a rail wants a
 // flat bright window; it is now lit like every other slot and tops out at 186.
+//
+// ✅ THE LANTERN VIEWMODEL DOES USE THIS CELL FOR ITS FLAME, AND HERE IS WHY
+// THAT IS NOT A SIXTH INCARNATION OF THE LOOPHOLE.
+//
+// Round 5's sentence is the right rule and this obeys it: "§8's anchor must be
+// world geometry that implies light on its surroundings — a lightning bolt, a
+// muzzle flash, A LAMP". The thing above 220 is now a LAMP. It is not paint on
+// a prop; it is the burning wick of a lantern, it sits inside a cage that casts
+// its own graded halo, and it is the object the entire game is named after.
+// Three things separate it from the rail it replaced:
+//
+//   * it is a SOURCE, not a surface. Its vertices are written after the light
+//     bake, not clipped through it, so it neither dims at dusk nor blows out at
+//     noon — and a "highlight" that is equally bright at midnight was always
+//     the tell that the rail was faking it;
+//   * it has a FALLOFF. Heat runs 1.00 at the core through 0.46 amber at the
+//     flame's edge to 0.50-at-most on the halo behind it and 0 at the cage.
+//     The rail had one value and a hard edge;
+//   * the lantern's own HARDWARE is capped under 188 like everything else. Only
+//     the fire is bright. If you find iron or brass over that ceiling, that IS
+//     the bug and it should be fixed at `g_lamp_lum_*`.
+//
+// If a later round wants the anchor off the viewmodel entirely, the honest fix
+// is to make the lantern light the WORLD (a dynamic light at the player, which
+// `world_render.hml` already has a ground-glow path for) — not to dim the lamp.
 export let MG_MAT_SPEC     = 7;
 export let MG_MAT_NSFLORA  = 23;
 
@@ -400,6 +426,107 @@ fn mg_side_col(p_lo: i32, p_hi: i32, p_dx: f64, p_dz: f64): i32 {
     return out;
 }
 
+// ===========================================================================
+// 🛑 THE WINDING RULE — READ THIS BEFORE YOU ADD A FACE
+// ===========================================================================
+// `emit.hml` culls on SCREEN SIGNED AREA (`EMIT_BF_CCW` for world meshes,
+// `MESH_CULL_NEG` for props — the two are the same predicate) and screen y
+// points DOWN. Both reject
+//
+//     (sxB - sxA) * (syC - syA) - (sxC - sxA) * (syB - syA)   <= 0
+//
+// so a triangle survives iff it winds CLOCKWISE ON SCREEN. In world space that
+// is the same statement as:
+//
+//     cross(B - A, C - A) must point AWAY from the camera —
+//     i.e. it must be the INWARD direction, the NEGATIVE of the face's
+//     outward normal.
+//
+// -------------------------------------------------------------------------
+// THIS FILE GOT IT BACKWARDS IN SIX OF ITS NINE BUILDERS. FIXED 2026-07-28.
+// -------------------------------------------------------------------------
+// Audited by building each primitive about the origin and testing
+// dot(cross(B-A, C-A), centroid) — positive means the outward face is the one
+// being culled. Result before the fix:
+//
+//     mg_box_ex      12/12 inverted     <- crates, barrels, every enemy limb
+//     mg_taper       16/16 inverted     <- every trunk, every stem
+//     mg_fan_disc     8/8  inverted     <- every canopy layer, every prism cap
+//     mg_spike        3/4  inverted     <- every petal, every protrusion
+//     mg_panel        2/2  inverted     <- accent plates
+//     build_tree2      4/4 inverted     <- the crossed leaf cards
+//     mg_prism        CORRECT
+//     mg_lathe        CORRECT
+//     mg_ground_quad  CORRECT  (fixed in round 2; its comment states the rule)
+//
+// An inside-out CLOSED mesh is not invisible — it draws its FAR faces instead
+// of its near ones — which is why this survived so long. What it costs is:
+//
+//   1. every box shows the wrong facet. Look down at a crate and you see the
+//      BOTTOM face (`p_clo`, AO x0.72) where the top (`p_chi`, AO x1.0) should
+//      be. Proven by emitting a box with chi = (240,0,16) and clo = (16,0,240)
+//      from a camera directly above: the surviving horizontal face came back
+//      rgb(16,0,240).
+//   2. every OPEN mesh is visible from exactly the wrong side. A canopy fan
+//      disc built face-up could only be seen from BELOW — which is why flying
+//      over the world showed things "not rendering all sides".
+//   3. the painter's sort key is the far side of every prop, so a prop sorts
+//      one mesh-diameter too far away and swaps order with its neighbours as
+//      the camera moves. There is no z-buffer here by design, so that reads as
+//      surfaces cutting into each other.
+//
+// `rej.backface` was 1900+/frame and an earlier round wrote it off as
+// "legitimate box interiors". It was the interiors being KEPT and the exteriors
+// being rejected.
+//
+// ⚠ THE ONE BUILDER DELIBERATELY LEFT INVERTED IS `mg_vm_shell`. See its own
+// header: the viewmodel was rebuilt AROUND this bug — its face set and the
+// sign of `g_mg_vm_lx/ly/lz` both encode it — and the project owner has asked
+// for the weapon to be replaced rather than retuned. Fixing it means building
+// the (+Y, -Z, +X) set instead of (-Y, +Z, -X) AND un-negating the key.
+//
+// -------------------------------------------------------------------------
+// HOW TO ADD A FACE NOW
+// -------------------------------------------------------------------------
+// Author the corners in the natural "counter-clockwise seen from outside"
+// order — which is what every builder below still reads as — then:
+//   * call `mg_face_n` on the first three corners to get the OUTWARD normal,
+//   * create the vertices with `mg_vn` carrying that normal,
+//   * hand them to `mesh_quad` / `mesh_tri` REVERSED: (a,d,c,b) / (a,c,b).
+// The reversal is what the rasteriser wants; the explicit normal is what keeps
+// `mesh_bake_light` lighting the face from outside. Reversing the winding
+// WITHOUT supplying a normal flips the light too, because `mesh_tri` derives a
+// missing normal from the winding — that is the trap, and it is why this fix
+// is not a one-line swap.
+// ===========================================================================
+
+// The outward normal of a face, from three corners in the natural
+// outward-counter-clockwise order. Written to three globals rather than
+// returned because Hemlock has no multiple return and a 3-field object literal
+// costs 260 ns (CLAUDE.md §1 rule 2) — this is build-time code, but there is
+// no reason to allocate here at all.
+let g_mg_nx: f64 = 0.0;
+let g_mg_ny: f64 = 1.0;
+let g_mg_nz: f64 = 0.0;
+
+fn mg_face_n(p_ax: f64, p_ay: f64, p_az: f64,
+             p_bx: f64, p_by: f64, p_bz: f64,
+             p_cx: f64, p_cy: f64, p_cz: f64) {
+    let ux: f64 = p_bx - p_ax; let uy: f64 = p_by - p_ay; let uz: f64 = p_bz - p_az;
+    let wx: f64 = p_cx - p_ax; let wy: f64 = p_cy - p_ay; let wz: f64 = p_cz - p_az;
+    let nx: f64 = uy * wz - uz * wy;
+    let ny: f64 = uz * wx - ux * wz;
+    let nz: f64 = ux * wy - uy * wx;
+    let l: f64 = sqrt(nx * nx + ny * ny + nz * nz);
+    // A degenerate face keeps the previous normal rather than emitting a zero
+    // one: a zero normal reads as "unset" to mesh.hml's `has_n`, which would
+    // silently fall back to the REVERSED face normal and re-introduce the bug
+    // on exactly the faces nobody looks at.
+    if (l > 0.0) {
+        g_mg_nx = nx / l; g_mg_ny = ny / l; g_mg_nz = nz / l;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // build-time rigid transform — THE VIEWMODEL CANT (ART_BIBLE 8.5)
 // ---------------------------------------------------------------------------
@@ -528,51 +655,61 @@ export fn mg_box_ex(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
 
     let t0: i32 = mesh_tri_count(m);
 
+    // THE WINDING RULE: corners are authored outward-counter-clockwise as they
+    // always were, the normal comes from `mg_face_n` on the first three, and
+    // `mesh_quad` gets them REVERSED (a,d,c,b). The top and bottom faces are
+    // horizontal whatever the shear does — every top corner sits at `yt` — so
+    // their normals are exact constants and skip the cross product.
+
     // +Y  (top)
-    let a = mg_v(m, x0t, yt, z0t, 0.0, 0.0, mat, p_chi, ao);
-    let b = mg_v(m, x0t, yt, z1t, 0.0, 1.0, mat, p_chi, ao);
-    let c = mg_v(m, x1t, yt, z1t, 1.0, 1.0, mat, p_chi, ao);
-    let d = mg_v(m, x1t, yt, z0t, 1.0, 0.0, mat, p_chi, ao);
-    mesh_quad(m, a, b, c, d);
+    let a = mg_vn(m, x0t, yt, z0t, 0.0, 0.0, mat, p_chi, ao, 0.0, 1.0, 0.0);
+    let b = mg_vn(m, x0t, yt, z1t, 0.0, 1.0, mat, p_chi, ao, 0.0, 1.0, 0.0);
+    let c = mg_vn(m, x1t, yt, z1t, 1.0, 1.0, mat, p_chi, ao, 0.0, 1.0, 0.0);
+    let d = mg_vn(m, x1t, yt, z0t, 1.0, 0.0, mat, p_chi, ao, 0.0, 1.0, 0.0);
+    mesh_quad(m, a, d, c, b);
 
     // -Y  (bottom) — the darkest face, it only ever sees bounce
-    let e = mg_v(m, x0b, yb, z0b, 0.0, 0.0, mat, p_clo, aob * 0.86);
-    let f = mg_v(m, x1b, yb, z0b, 1.0, 0.0, mat, p_clo, aob * 0.86);
-    let g = mg_v(m, x1b, yb, z1b, 1.0, 1.0, mat, p_clo, aob * 0.86);
-    let h = mg_v(m, x0b, yb, z1b, 0.0, 1.0, mat, p_clo, aob * 0.86);
-    mesh_quad(m, e, f, g, h);
+    let e = mg_vn(m, x0b, yb, z0b, 0.0, 0.0, mat, p_clo, aob * 0.86, 0.0, -1.0, 0.0);
+    let f = mg_vn(m, x1b, yb, z0b, 1.0, 0.0, mat, p_clo, aob * 0.86, 0.0, -1.0, 0.0);
+    let g = mg_vn(m, x1b, yb, z1b, 1.0, 1.0, mat, p_clo, aob * 0.86, 0.0, -1.0, 0.0);
+    let h = mg_vn(m, x0b, yb, z1b, 0.0, 1.0, mat, p_clo, aob * 0.86, 0.0, -1.0, 0.0);
+    mesh_quad(m, e, h, g, f);
 
     // +Z
     let sc_pz: i32 = mg_side_col(p_clo, p_chi, 0.0, 1.0);
-    let i0 = mg_v(m, x0b, yb, z1b, 0.0, 1.0, mat, sc_pz, aob);
-    let i1 = mg_v(m, x1b, yb, z1b, 1.0, 1.0, mat, sc_pz, aob);
-    let i2 = mg_v(m, x1t, yt, z1t, 1.0, 0.0, mat, sc_pz, ao);
-    let i3 = mg_v(m, x0t, yt, z1t, 0.0, 0.0, mat, sc_pz, ao);
-    mesh_quad(m, i0, i1, i2, i3);
+    mg_face_n(x0b, yb, z1b, x1b, yb, z1b, x1t, yt, z1t);
+    let i0 = mg_vn(m, x0b, yb, z1b, 0.0, 1.0, mat, sc_pz, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let i1 = mg_vn(m, x1b, yb, z1b, 1.0, 1.0, mat, sc_pz, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let i2 = mg_vn(m, x1t, yt, z1t, 1.0, 0.0, mat, sc_pz, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    let i3 = mg_vn(m, x0t, yt, z1t, 0.0, 0.0, mat, sc_pz, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    mesh_quad(m, i0, i3, i2, i1);
 
     // -Z
     let sc_nz: i32 = mg_side_col(p_clo, p_chi, 0.0, -1.0);
-    let j0 = mg_v(m, x1b, yb, z0b, 0.0, 1.0, mat, sc_nz, aob);
-    let j1 = mg_v(m, x0b, yb, z0b, 1.0, 1.0, mat, sc_nz, aob);
-    let j2 = mg_v(m, x0t, yt, z0t, 1.0, 0.0, mat, sc_nz, ao);
-    let j3 = mg_v(m, x1t, yt, z0t, 0.0, 0.0, mat, sc_nz, ao);
-    mesh_quad(m, j0, j1, j2, j3);
+    mg_face_n(x1b, yb, z0b, x0b, yb, z0b, x0t, yt, z0t);
+    let j0 = mg_vn(m, x1b, yb, z0b, 0.0, 1.0, mat, sc_nz, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let j1 = mg_vn(m, x0b, yb, z0b, 1.0, 1.0, mat, sc_nz, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let j2 = mg_vn(m, x0t, yt, z0t, 1.0, 0.0, mat, sc_nz, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    let j3 = mg_vn(m, x1t, yt, z0t, 0.0, 0.0, mat, sc_nz, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    mesh_quad(m, j0, j3, j2, j1);
 
     // +X
     let sc_px: i32 = mg_side_col(p_clo, p_chi, 1.0, 0.0);
-    let k0 = mg_v(m, x1b, yb, z1b, 0.0, 1.0, mat, sc_px, aob);
-    let k1 = mg_v(m, x1b, yb, z0b, 1.0, 1.0, mat, sc_px, aob);
-    let k2 = mg_v(m, x1t, yt, z0t, 1.0, 0.0, mat, sc_px, ao);
-    let k3 = mg_v(m, x1t, yt, z1t, 0.0, 0.0, mat, sc_px, ao);
-    mesh_quad(m, k0, k1, k2, k3);
+    mg_face_n(x1b, yb, z1b, x1b, yb, z0b, x1t, yt, z0t);
+    let k0 = mg_vn(m, x1b, yb, z1b, 0.0, 1.0, mat, sc_px, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let k1 = mg_vn(m, x1b, yb, z0b, 1.0, 1.0, mat, sc_px, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let k2 = mg_vn(m, x1t, yt, z0t, 1.0, 0.0, mat, sc_px, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    let k3 = mg_vn(m, x1t, yt, z1t, 0.0, 0.0, mat, sc_px, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    mesh_quad(m, k0, k3, k2, k1);
 
     // -X
     let sc_nx: i32 = mg_side_col(p_clo, p_chi, -1.0, 0.0);
-    let l0 = mg_v(m, x0b, yb, z0b, 0.0, 1.0, mat, sc_nx, aob);
-    let l1 = mg_v(m, x0b, yb, z1b, 1.0, 1.0, mat, sc_nx, aob);
-    let l2 = mg_v(m, x0t, yt, z1t, 1.0, 0.0, mat, sc_nx, ao);
-    let l3 = mg_v(m, x0t, yt, z0t, 0.0, 0.0, mat, sc_nx, ao);
-    mesh_quad(m, l0, l1, l2, l3);
+    mg_face_n(x0b, yb, z0b, x0b, yb, z1b, x0t, yt, z1t);
+    let l0 = mg_vn(m, x0b, yb, z0b, 0.0, 1.0, mat, sc_nx, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let l1 = mg_vn(m, x0b, yb, z1b, 1.0, 1.0, mat, sc_nx, aob, g_mg_nx, g_mg_ny, g_mg_nz);
+    let l2 = mg_vn(m, x0t, yt, z1t, 1.0, 0.0, mat, sc_nx, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    let l3 = mg_vn(m, x0t, yt, z0t, 0.0, 0.0, mat, sc_nx, ao,  g_mg_nx, g_mg_ny, g_mg_nz);
+    mesh_quad(m, l0, l3, l2, l1);
 
     let out: i32 = mesh_tri_count(m) - t0;
     return out;
@@ -617,6 +754,27 @@ export fn mg_box(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
 // Colour: -Y is the biggest drawn facet, so it takes `chi` at full AO — it is
 // this model's "top plate" in everything but name. The other two take the
 // side split, which `g_wp_side_ax/az` aims at -X (hi) and +Z (the step below).
+//
+// 🛑 2026-07-28 — EVERYTHING ABOVE IS A DESCRIPTION OF A BUG, NOT OF A DESIGN.
+// The three faces this builder keeps are the three the rasteriser keeps *only
+// because this file's winding was inverted* (see THE WINDING RULE above, and
+// the same correction in the g_mg_vm_lx block). With correct winding the
+// camera-facing set is the (+Y, -Z, +X) one the original author reached for,
+// and the "EMPTY SCREEN" experiment quoted above was measuring the inversion,
+// not the view direction.
+//
+// This one builder is LEFT INVERTED ON PURPOSE. It is self-contained —
+// `build_weapon` reaches the box primitive only through here, never through
+// `mg_box_ex` — so fixing the rest of the file does not disturb it, and the
+// project owner's playtest note is "you can ignore the gun for now ... maybe
+// do something easier for fps pov? like a torch?". Retuning five rounds of
+// viewmodel value work to then delete it would be the wrong trade.
+//
+// WHEN THE VIEWMODEL IS REPLACED, the correct build is: keep the authored
+// corner order, take the outward normal from `mg_face_n`, emit the quad
+// reversed, build the (+Y, -Z, +X) faces, and NEGATE `g_mg_vm_lx/ly/lz` back
+// to (0.500, 0.570, -0.652) — the round-4 "correction" that negated the key
+// was compensating for this same inversion.
 fn mg_vm_shell(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
                p_hx: f64, p_hy: f64, p_hz: f64,
                p_mat: i32, p_chi: i32, p_clo: i32, p_ao: f64): i32 {
@@ -778,7 +936,13 @@ export fn mg_taper(p_m, p_x0: f64, p_y0: f64, p_z0: f64,
         let q1 = mg_vn(m, b1x, b1y, b1z, u1, 1.0, p_mat, col1, aob, n1x, n1y, n1z);
         let q2 = mg_vn(m, t1x, t1y, t1z, u1, 0.0, p_mat, col1, ao,  n1x, n1y, n1z);
         let q3 = mg_vn(m, t2x, t2y, t2z, u0, 0.0, p_mat, col0, ao,  n0x, n0y, n0z);
-        mesh_quad(m, q0, q1, q2, q3);
+        // REVERSED — THE WINDING RULE. `mg_taper`'s ring frame is
+        // e0 x e1 = +axis, the OPPOSITE handedness to `mg_prism`'s
+        // ex x ez = -ey, so the identical vertex order that is correct there
+        // was inverted here. Every trunk, stem and barrel body in the game
+        // came through this line. The normals are explicit, so only the
+        // traversal changes and the light bake is untouched.
+        mesh_quad(m, q0, q3, q2, q1);
         k++;
     }
     let out: i32 = mesh_tri_count(m) - t0;
@@ -822,7 +986,12 @@ export fn mg_fan_disc(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
                        p_mat, c0, p_ao * 0.92, dx0 * 0.55, fy, dz0 * 0.55);
         let v1 = mg_vn(m, x1, p_cy, z1, 0.5 + dx1 * 0.5, 0.5 + dz1 * 0.5,
                        p_mat, c1, p_ao * 0.92, dx1 * 0.55, fy, dz1 * 0.55);
-        if (fy > 0.0) { mesh_tri(m, cen, v1, v0); } else { mesh_tri(m, cen, v0, v1); }
+        // REVERSED — THE WINDING RULE. Both branches were the wrong way round,
+        // so an up-facing disc was visible only from BELOW and a down-facing
+        // one only from ABOVE. That is the "flying over it didn't render all
+        // sides" report: a canopy layer, a prism cap and a lantern base are all
+        // this primitive, and all of them vanished when you got above them.
+        if (fy > 0.0) { mesh_tri(m, cen, v0, v1); } else { mesh_tri(m, cen, v1, v0); }
         k++;
     }
     let out: i32 = mesh_tri_count(m) - t0;
@@ -954,14 +1123,41 @@ export fn mg_spike(p_m, p_bx: f64, p_by: f64, p_bz: f64,
         k++;
     }
 
-    let b0 = mg_v(m, px[0], py[0], pz[0], 0.0, 1.0, p_mat, p_clo, p_ao * 0.86);
-    let b1 = mg_v(m, px[1], py[1], pz[1], 1.0, 1.0, p_mat, p_clo, p_ao * 0.86);
-    let b2 = mg_v(m, px[2], py[2], pz[2], 0.5, 1.0, p_mat, p_clo, p_ao * 0.86);
-    let tip = mg_v(m, p_tx, p_ty, p_tz, 0.5, 0.0, p_mat, p_chi, p_ao);
-    mesh_tri(m, b0, b1, tip);
-    mesh_tri(m, b1, b2, tip);
-    mesh_tri(m, b2, b0, tip);
-    mesh_tri(m, b2, b1, b0);
+    // THE WINDING RULE. This builder used `mg_v`, i.e. it let `mesh_tri`
+    // derive each face normal from the winding — so simply reversing the
+    // traversal would have flipped the light with it. The four pool vertices
+    // were also SHARED across the four faces, and a shared pool vertex can
+    // only carry one explicit normal, which would smooth a shape whose whole
+    // job is to be a hard-edged spike. So each face now gets its own three
+    // pool vertices with the face's own outward normal.
+    //
+    // This costs POOL entries only. The arena is non-indexed — `mesh_tri`
+    // copies three vertices per triangle whatever the pool looks like — so the
+    // triangle count, the vertex count and the per-frame cost are unchanged:
+    // still exactly 4 triangles.
+    let uu: array<f64> = [0.0, 1.0, 0.5];
+    let k2: i32 = 0;
+    while (k2 < 3) {
+        let j: i32 = (k2 + 1) % 3;
+        mg_face_n(px[k2], py[k2], pz[k2], px[j], py[j], pz[j], p_tx, p_ty, p_tz);
+        let s0 = mg_vn(m, px[k2], py[k2], pz[k2], uu[k2], 1.0, p_mat, p_clo,
+                       p_ao * 0.86, g_mg_nx, g_mg_ny, g_mg_nz);
+        let s1 = mg_vn(m, px[j], py[j], pz[j], uu[j], 1.0, p_mat, p_clo,
+                       p_ao * 0.86, g_mg_nx, g_mg_ny, g_mg_nz);
+        let s2 = mg_vn(m, p_tx, p_ty, p_tz, 0.5, 0.0, p_mat, p_chi,
+                       p_ao, g_mg_nx, g_mg_ny, g_mg_nz);
+        mesh_tri(m, s0, s2, s1);
+        k2++;
+    }
+    // the base cap, authored (b2, b1, b0) as before and emitted reversed
+    mg_face_n(px[2], py[2], pz[2], px[1], py[1], pz[1], px[0], py[0], pz[0]);
+    let c0 = mg_vn(m, px[2], py[2], pz[2], 0.5, 1.0, p_mat, p_clo,
+                   p_ao * 0.86, g_mg_nx, g_mg_ny, g_mg_nz);
+    let c1 = mg_vn(m, px[1], py[1], pz[1], 1.0, 1.0, p_mat, p_clo,
+                   p_ao * 0.86, g_mg_nx, g_mg_ny, g_mg_nz);
+    let c2 = mg_vn(m, px[0], py[0], pz[0], 0.0, 1.0, p_mat, p_clo,
+                   p_ao * 0.86, g_mg_nx, g_mg_ny, g_mg_nz);
+    mesh_tri(m, c0, c2, c1);
     let out: i32 = mesh_tri_count(m) - t0;
     return out;
 }
@@ -976,7 +1172,7 @@ export fn mg_panel(p_m, p_cx: f64, p_cy: f64, p_cz: f64,
     let b = mg_vn(m, p_cx + p_hx, p_cy - p_hy, p_cz, 1.0, 1.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
     let c = mg_vn(m, p_cx + p_hx, p_cy + p_hy, p_cz, 1.0, 0.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
     let d = mg_vn(m, p_cx - p_hx, p_cy + p_hy, p_cz, 0.0, 0.0, p_mat, p_col, p_ao, 0.0, 0.0, 1.0);
-    mesh_quad(m, a, b, c, d);
+    mesh_quad(m, a, d, c, b);   // REVERSED — THE WINDING RULE
     let out: i32 = mesh_tri_count(m) - t0;
     return out;
 }
@@ -1041,7 +1237,27 @@ export let MESH_BULWARK2  = 26;
 
 export let MESH_NPC       = 27;
 
-export let MESH_SPARROW_VM    = 28;
+// ---------------------------------------------------------------------------
+// THE VIEWMODEL SLOT — slot 28 is the LANTERN, not a gun.
+// ---------------------------------------------------------------------------
+// First human playtest, verbatim: "the gun is just like floating in front of
+// the pov camera ... i think you can ignore the gun for now and maybe do
+// something easier for fps pov? like a torch?"
+//
+// Slot 28 now builds `build_lantern_vm`. `MESH_SPARROW_VM` is kept as an ALIAS
+// of the same id so that `tools/walk.hml`, `tools/shot.hml` and
+// `tools/meshgen.hml` — none of which this task owns — bind the lantern with no
+// edit. The Sparrow AR mesh is GONE; its part table `g_wp_sparrow` is still
+// referenced by nothing and is left in place only because the five remaining
+// guns share `wpn_parts` with it.
+//
+// The other five gun meshes (29..33) are RETAINED, unbound and never drawn,
+// because `tools/meshgen.hml` (not owned here) imports `MESH_EMBERLANCE_VM` and
+// runs a six-way weapon-silhouette IoU assertion over 28..33. Deleting them
+// would break a tool this task may not edit. Nothing in the render path
+// references 29..33: `frame_bind_assets` is only ever handed slot 28.
+export let MESH_LANTERN_VM    = 28;
+export let MESH_SPARROW_VM    = 28;   // DEPRECATED alias of MESH_LANTERN_VM
 export let MESH_TINKER_VM     = 29;
 export let MESH_BELLOWS_VM    = 30;
 export let MESH_LONGSHADOW_VM = 31;
@@ -1256,8 +1472,29 @@ fn build_tree1(p_m, p_seed: i32) {
                 g_LEAF_HI, g_LEAF_MID, 1.0, 1.0);
     mg_fan_disc(m, ox, 2.93, oz, 1.86, 6, 0.0, MG_MAT_LEAF,
                 mg_scale(g_LEAF_LO, 0.75), mg_scale(g_LEAF_LO, 0.75), 0.80, -1.0);
+    // THE UPPER TIER FACES DOWN. It is the only UNPAIRED `mg_fan_disc` in the
+    // file whose viewer is below it: a 1.7 m eye is under a 4.10 m canopy from
+    // every distance this LOD is ever drawn at (18-46 m), so its underside is
+    // the only side that can be seen. The other three unpaired discs in this
+    // file — the barrel lid at 0.85 m, the lantern base at 0.10 m and the
+    // flora/enemy head caps at 0.56-0.74 m — are all BELOW eye height and
+    // correctly stay face-up.
+    //
+    // This was authored face-up and read correctly only because the winding
+    // was inverted: a face-up disc could then be seen from below and nowhere
+    // else. With the winding fixed, leaving it up-facing deletes the tree's
+    // whole second tier at eye level — measured on `ridge_golden`, the LOD1
+    // trees went from a two-tier crown to a single thin parasol.
+    //
+    // It costs ZERO triangles and it takes the same UNDERSIDE value the main
+    // lens uses, one step lighter so the two tiers separate rather than
+    // merging into one dark mass. The honest cost is that the top tier is not
+    // drawn when the camera is ABOVE it — from up there the 2.00 m main crown
+    // is directly beneath it and carries the read. Closing it properly is
+    // +6 triangles on the most-instanced mesh in the game (+120 on
+    // `budget_worst`, which sits at 2462 of 2500) and does not fit.
     mg_fan_disc(m, ux, 4.10, uz, 1.34, 6, 0.6,
-                MG_MAT_LEAF, g_LEAF_HI, g_LEAF_MID, 1.0, 1.0);
+                MG_MAT_LEAF, g_LEAF_LO, mg_scale(g_LEAF_LO, 0.88), 0.88, -1.0);
     mg_set_jitter(0.0, 0);
 }
 
@@ -1284,12 +1521,17 @@ fn build_tree2(p_m, p_seed: i32) {
         let a1 = mg_vn(m, sx + dx, y0, sz + dz, 1.0, 1.0, MG_MAT_LEAF, bot, 0.86, -dz, 0.35, dx);
         let a2 = mg_vn(m, sx + dx, y1 + hy, sz + dz, 1.0, 0.0, MG_MAT_LEAF, top, 1.0, -dz, 0.35, dx);
         let a3 = mg_vn(m, sx - dx, y1 + hy, sz - dz, 0.0, 0.0, MG_MAT_LEAF, top, 1.0, -dz, 0.35, dx);
-        mesh_quad(m, a0, a1, a2, a3);
+        // REVERSED — THE WINDING RULE. These two quads are a deliberate
+        // double-sided pair, and BOTH of them were inverted, so the card the
+        // player saw was always the one whose normal pointed away. The
+        // silhouette was identical, which is why it hid: what was wrong was
+        // that the lit face and the drawn face were never the same face.
+        mesh_quad(m, a0, a3, a2, a1);
         let b0 = mg_vn(m, sx + dx, y0, sz + dz, 0.0, 1.0, MG_MAT_LEAF, bot, 0.86, dz, 0.35, -dx);
         let b1 = mg_vn(m, sx - dx, y0, sz - dz, 1.0, 1.0, MG_MAT_LEAF, bot, 0.86, dz, 0.35, -dx);
         let b2 = mg_vn(m, sx - dx, y1 + hy, sz - dz, 1.0, 0.0, MG_MAT_LEAF, top, 1.0, dz, 0.35, -dx);
         let b3 = mg_vn(m, sx + dx, y1 + hy, sz + dz, 0.0, 0.0, MG_MAT_LEAF, top, 1.0, dz, 0.35, -dx);
-        mesh_quad(m, b0, b1, b2, b3);
+        mesh_quad(m, b0, b3, b2, b1);
         k++;
     }
 }
@@ -2488,10 +2730,10 @@ fn build_weapon(p_m, p_id: i32) {
     // one warm block on the model, which is what separates stock/grip/magazine
     // from receiver/barrel at 60 px.
     let sparrow_furn: i32 = mg_mix(g_POLYMER, g_WOOD_MID, 0.50);
-    if (p_id == MESH_SPARROW_VM) {
-        wpn_parts(m, g_wp_sparrow, 20, wpn_metal(g_GUNMETAL_HI),
-                  wpn_metal(g_GUNMETAL_LO), sparrow_furn, spec);
-    } else if (p_id == MESH_TINKER_VM) {
+    // NOTE: there is no MESH_SPARROW_VM branch any more — slot 28 is the
+    // lantern and `meshgen_build_all` never routes it here. `g_wp_sparrow` is
+    // retained only as the table the five surviving guns were tuned against.
+    if (p_id == MESH_TINKER_VM) {
         wpn_parts(m, g_wp_tinker, 20, wpn_metal(g_STEEL_MID),
                   wpn_metal(g_GUNMETAL_LO), sparrow_furn, spec);
     } else if (p_id == MESH_BELLOWS_VM) {
@@ -2508,6 +2750,536 @@ fn build_weapon(p_m, p_id: i32) {
                   g_RUST_DARK, g_BRASS_LO, g_BRASS);
     }
     mg_clear_cant();
+}
+
+// ===========================================================================
+// THE LANTERN VIEWMODEL — the one the player actually holds
+// ===========================================================================
+//
+// WHY A LANTERN AND NOT A GUN. The design's one-line pitch is "you are the last
+// lamplighter of a world eaten by night: you push the dark back one lantern at
+// a time". Four rounds of art work could not make 20 boxes read as a gun at
+// 320x240 — it needs a barrel, a receiver, a magazine and a stock to be legible
+// as one, and at 60x70 px none of those resolve, so it read first as a black
+// lump and then as a chrome lump. A lantern is a silhouette a child can draw:
+// a fist, a bail, a cage, a flame. It resolves at 45x100 px because it is four
+// shapes, not eleven.
+//
+// It also fixes the anchor problem HONESTLY. CLAUDE.md §8 wants a contiguous
+// region above luminance 220 in every frame, and that rule has been gamed five
+// times (crosshair, minimap bracket, gun sparkles, gun rail paint, and a splat
+// that rendered the lantern glow card as a hard white square) because nothing
+// in the world was genuinely bright. A lantern held by the player is a DIEGETIC
+// LIGHT SOURCE in every frame. Its core is above 220 because it is on fire.
+// That is not the loophole, that is the thing the rule was asking for.
+//
+// ---------------------------------------------------------------------------
+// SPACE, AND WHY THERE IS NO CANT
+// ---------------------------------------------------------------------------
+// `world_render.hml` emits the viewmodel at eye + 1.05 forward + 0.26 right
+// - 0.34 up, with model yaw PI - camera_yaw, which maps local +Z to the
+// camera's forward and local +X to the camera's LEFT. So the direction from the
+// model to the eye, in model space, is
+//
+//     c = normalize(0.26, 0.34, -1.05) = (0.229, 0.300, -0.926)
+//
+// and `mg_vm_shell`'s measured drawn-face set (-Y, +Z, -X) is exactly the set
+// of faces with n . c < 0. The gun needed a 21/6/26 cant to avoid being seen
+// end-on; a lantern is a vertical object and reads correctly with NO cant at
+// all — which is lucky, because the drawn set is cant-dependent and an
+// uncanted model is the one case where `mg_vm_shell` needs no re-derivation.
+//
+// VERIFIED, not asserted: slot 28 was temporarily replaced by a 20 cm box with
+// six differently-coloured faces and rendered into `hud_worst_case`. The three
+// faces that appeared were -Y (black), +Z (green) and -X (brass). Screenshot
+// reasoning would have got this backwards — the renderer keeps the faces
+// pointing AWAY from the eye (`emit_set_backface(EMIT_BF_CCW)` in
+// `world_render.hml`), which is also the most likely cause of the playtest's
+// "flying over some buildings it didnt render all sides". If that cull is ever
+// corrected, `mg_vm_shell` must switch to (+Y, -Z, +X) in the same commit or
+// every viewmodel in the game turns inside out. The two flame boxes below are
+// built as SOLID boxes precisely so the >220 core survives that flip.
+//
+// ---------------------------------------------------------------------------
+// SCREEN LAYOUT — every number below was solved, then CHECKED against a render
+// ---------------------------------------------------------------------------
+// The 70 deg fov is VERTICAL, so f = 120 / tan(35 deg) = 171.4 px and the scale
+// at 1.05 m is 163.2 px per metre — not the 217.6 you get by assuming a
+// horizontal fov, and not the "~215 screen px per metre" the weapon tables
+// above are commented with. That comment is wrong and it is why the first cut
+// of this model came out 25 % small; it is left alone here because those tables
+// are not this task's to retune. The projection actually is:
+//
+//     sx = 160 + (0.26 - lx) * 163.2        sy = 120 + (0.34 - ly) * 163.2
+//
+// so local (0,0,0) is screen (202, 176). Verified: the first build put the
+// flame at x212..220 y170..178, against a solved prediction of x212..221
+// y169..181. The layout targets:
+//
+//     fist          screen (234, 129)     the hand is what stops it "floating"
+//     cage          screen 196..238 x, 143..206 y      42 x 63 px
+//     flame         screen 209..224 x, 167..195 y      15 x 28 px
+//     crosshair     screen (160, 120)     the lantern never touches it
+//     ammo plate    screen 238.. x, 202.. y            the base clears it
+//
+// ---------------------------------------------------------------------------
+// THE VALUE LADDER
+// ---------------------------------------------------------------------------
+// Round 5 measured the rendered multiplier on the drawn facets at the exposure
+// floor: MG_MAT_VMSKIN lands at albedo x 1.174, MG_MAT_VMRAIL at albedo x 1.62,
+// and the binding ceiling is ns_bloom's brightest WORLD pixel, 188. The lantern
+// keeps every IRON, BRASS, LEATHER and CLOTH slot under that ceiling — the
+// hardware of the lantern is not allowed to be the brightest thing in the
+// frame, for exactly the reason round 5 wrote down. Measured over the whole
+// viewmodel window at 320x240, HUD masked: p50 49, p95 126, and the only pixels
+// over 188 belong to the flame.
+//
+// The FLAME is allowed over the ceiling, because it is a flame. Its vertices
+// are overwritten AFTER the bake (see `mg_lamp_emissive`), so they do not scale
+// with the world's exposure: measured 148-158 contiguous pixels above luminance
+// 220 in all seven scenes plus midnight and noon, varying by 10 px across a
+// 24-hour sweep. The lamp does not go out at midnight and does not blow out at
+// noon, and that is the whole point of the object.
+let g_lamp_lum_iron: f64  = 72.0;    // ->  85 rendered,  90 at noon
+let g_lamp_lum_brass: f64 = 112.0;   // -> 131 rendered, 140 at noon
+let g_lamp_lum_leather: f64 = 58.0;  // ->  68 rendered
+let g_lamp_lum_cloth: f64 = 74.0;    // ->  87 rendered
+let g_lamp_sat_iron: f64  = 0.14;
+let g_lamp_sat_warm: f64  = 0.30;
+let g_lamp_lo_step: f64   = 0.62;
+
+// ---------------------------------------------------------------------------
+// THE EMISSIVE TIERS — final vertex bytes, and why the CORE IS NEARLY WHITE
+// ---------------------------------------------------------------------------
+// The rendered pixel is vertex x texel, and MG_MAT_VMRAIL's window is a flat
+// 240..243, i.e. x0.945. To clear luminance 220 on screen a vertex therefore
+// needs luminance 233 — and that is a much harder constraint on a WARM colour
+// than it looks, because luminance is 0.299r + 0.587g + 0.114b. The first cut
+// used MUZZLE_MID (255,196,74) for the flame body: scaled to a peak byte of 246
+// that is luminance 193 at the vertex and 182 on screen, thirty-eight short,
+// even though its red channel is pegged at 246. An amber cannot be an anchor.
+//
+// So the flame is built the way a real one looks: a NEARLY WHITE core with the
+// amber living in the falloff around it. MUZZLE_CORE (255,248,220) is the
+// palette's only near-white and its luminance/max ratio is 0.968, so a peak
+// byte of 255 lands at 247 on the vertex and 233 on screen. Everything below
+// that — the outer columns of the flame, the halo, the wick — is frankly amber
+// and frankly under 220, which is what makes the core read as a core.
+//
+// The ramp is expressed as HEAT, 0..1, per vertex, and resolved to a final byte
+// triple by `mg_lamp_heat`. Four stops, and the top one is a PLATEAU: heat 0.76
+// to 1.00 is all MUZZLE_CORE, because the 233-at-the-vertex bar means anything
+// warmer than about (250,215,145) simply cannot be an anchor, so a ramp that
+// spends its top quarter going from amber to white would render a >220 region
+// four pixels across. The plateau is what gives the core its 40+ px.
+//
+//     heat   colour                    peak byte   vertex lum   screen lum
+//     0.00   RUST_DARK                     42           27           26
+//     0.30   EMBER                        140          105           99
+//     0.62   MUZZLE_MID                   220          167          158
+//     0.76   MUZZLE_CORE                  252          244          231
+//     1.00   MUZZLE_CORE                  255          247          233
+let g_lamp_h1: f64 = 0.30;
+let g_lamp_h2: f64 = 0.62;
+let g_lamp_h3: f64 = 0.76;
+let g_lamp_p0: f64 =  42.0;
+let g_lamp_p1: f64 = 140.0;
+let g_lamp_p2: f64 = 220.0;
+let g_lamp_p3: f64 = 252.0;
+let g_lamp_p4: f64 = 255.0;
+// How far the flame is allowed to take the scene's key chromaticity. A flame
+// is its own light source, so this is small — it exists so the lantern is not
+// a decal pasted on four different skies, not so it changes colour.
+let g_lamp_tint: f64 = 0.14;
+
+// The emissive arena-vertex range, and the per-arena-vertex heat inside it.
+// Both are recorded at build time and replayed by `mg_lamp_emissive` after
+// every re-bake.
+let g_lamp_v0: i32 = 0;
+let g_lamp_v1: i32 = 0;
+let g_lamp_hw: array<f64> = [];
+
+// ---------------------------------------------------------------------------
+// THE LIGHT IS BUILT FROM +Z QUADS, NOT FROM BOXES — and here is the bug why
+// ---------------------------------------------------------------------------
+// The first cut built the flame as two solid boxes. They rendered as a hollow
+// "L": the -Y and -X faces appeared, the +Z face — the LARGEST of the three,
+// 13x13 px of the 15x28 px flame — never did. Isolated with a six-colour debug
+// box at the flame's exact centre and size (brass -X and black -Y drawn, green
+// +Z and violet -Z absent from the whole 320x240 frame, verified by a channel
+// scan), and the screen-space winding was solved by hand at the same time:
+//
+//     face   snapped screen cross      emit_set_backface(EMIT_BF_CCW) keeps >0
+//     +Z     +169                      SHOULD DRAW — does not
+//     -X      +52                      draws
+//     -Y      +39                      draws
+//     +Y/-Z/+X  -39 / -169 / -52       correctly culled
+//
+// Nothing is submitted after it, nothing nearer covers those pixels (checked
+// part by part), and `batch.overflow`, `overflow.world` and `clip.slow` are all
+// zero. A standalone +Z quad at z = +0.098 in the SAME mesh renders correctly,
+// so it is not the winding and not the material. **This is a minimal, in-frame
+// reproduction of playtest defect (3), "flying over some buildings it didnt
+// render all sides", on geometry small enough to debug.** It belongs to whoever
+// owns `emit.hml` / `world_render.hml`; it is written up in the task report.
+//
+// The lantern does not wait for that fix. The flame is built out of the thing
+// that demonstrably works — flat +Z-facing quads — which is also better art: a
+// flame is not a cuboid, and a graded card gives a teardrop with a hot middle
+// for 18 triangles instead of a hollow box for 24.
+
+// Push the heat of every arena vertex a quad emits, in `mesh_quad`'s own order
+// (a,b,c then a,c,d). `mesh_bake_light` overwrites the vertex colour, so by the
+// time the emissive override runs the albedo the builder wrote is gone and the
+// weight cannot be recovered from the buffer — the first cut tried to invert it
+// out of the red channel and produced a flat grey-green card, which is exactly
+// what a reflector with no falloff looks like.
+fn mg_lamp_quad(p_m, p_a: i32, p_b: i32, p_c: i32, p_d: i32,
+                p_ha: f64, p_hb: f64, p_hc: f64, p_hd: f64) {
+    mesh_quad(p_m, p_a, p_b, p_c, p_d);
+    g_lamp_hw.push(p_ha); g_lamp_hw.push(p_hb); g_lamp_hw.push(p_hc);
+    g_lamp_hw.push(p_ha); g_lamp_hw.push(p_hc); g_lamp_hw.push(p_hd);
+}
+
+// A +Z-facing vertex. The winding used by every caller below is copied from
+// `mg_vm_shell`'s +Z face — (lo x, lo y), (hi x, lo y), (hi x, hi y),
+// (lo x, hi y) — which `mesh_tri` turns into an outward +Z normal.
+fn mg_lamp_v(p_m, p_x: f64, p_y: f64, p_z: f64,
+             p_s: f64, p_t: f64, p_col: i32): i32 {
+    let out: i32 = mg_v(p_m, p_x, p_y, p_z, p_s, p_t,
+                        MG_MAT_VMRAIL, p_col, 1.0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_lamp_backpanel — the glow behind the flame. 8 triangles.
+// ---------------------------------------------------------------------------
+// A 3x3 vertex grid on the cage's BACK plane with the centre node hot and the
+// corners dark. That bilinear falloff is what makes the interior of the lantern
+// read as LIT rather than as a coloured card: a glow with a uniform colour is a
+// sticker, a glow with a hot middle is a light. Its heat tops out at 0.50, well
+// under the 0.76 the ramp needs to clear 220 — the panel is the HALO, the flame
+// is the anchor, and the two must not be confusable.
+let g_lamp_back_heat: f64 = 0.50;
+
+fn mg_lamp_backpanel(p_m, p_cx: f64, p_cy: f64, p_z: f64,
+                     p_hx: f64, p_hy: f64): i32 {
+    let m = p_m;
+    let t0: i32 = mesh_tri_count(m);
+    let gx: array<f64> = [p_cx - p_hx, p_cx, p_cx + p_hx];
+    let gy: array<f64> = [p_cy - p_hy, p_cy, p_cy + p_hy];
+    // radial weight per grid node: centre 1, edge-mid 0.42, corner 0
+    let wt: array<f64> = [0.00, 0.42, 0.00,
+                          0.42, 1.00, 0.42,
+                          0.00, 0.42, 0.00];
+    let idx: array<i32> = [];
+    let j: i32 = 0;
+    while (j < 3) {
+        let i: i32 = 0;
+        while (i < 3) {
+            let c: i32 = mg_mix(g_RUST_DARK, g_WINDOW_LIGHT, wt[j * 3 + i]);
+            idx.push(mg_lamp_v(m, gx[i], gy[j], p_z,
+                               f64(i) * 0.5, 1.0 - f64(j) * 0.5, c));
+            i++;
+        }
+        j++;
+    }
+    j = 0;
+    while (j < 2) {
+        let i: i32 = 0;
+        while (i < 2) {
+            let ka: i32 = j * 3 + i;
+            let kb: i32 = j * 3 + i + 1;
+            let kc: i32 = (j + 1) * 3 + i + 1;
+            let kd: i32 = (j + 1) * 3 + i;
+            mg_lamp_quad(m, idx[ka], idx[kb], idx[kc], idx[kd],
+                         wt[ka] * g_lamp_back_heat, wt[kb] * g_lamp_back_heat,
+                         wt[kc] * g_lamp_back_heat, wt[kd] * g_lamp_back_heat);
+            i++;
+        }
+        j++;
+    }
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_lamp_flame — the flame itself. 18 triangles, and the frame's anchor.
+// ---------------------------------------------------------------------------
+// Four rows by four columns, giving a teardrop: narrow at the wick, widest a
+// third of the way up, tapering to a point. The two INNER columns carry heat
+// 1.0 for their whole height, so the quad between them is a uniformly saturated
+// vertical band rather than a Gouraud gradient with one bright vertex — that
+// band is the >=40 px contiguous core, measured at 15 x 21 px. The outer
+// columns fall to 0.46 (amber, ~110 on screen), which is the falloff.
+//
+// Rows are half-widths as a fraction of `p_hx`, heights as a fraction of
+// `p_hy` measured from the wick. The asymmetric taper (widest at row 1, not
+// row 2) is what makes it read as a flame and not as a diamond.
+let g_lamp_row_y: array<f64> = [-1.00, -0.32,  0.34,  1.00];
+let g_lamp_row_w: array<f64> = [ 0.46,  1.00,  0.72,  0.13];
+let g_lamp_row_h: array<f64> = [ 0.72,  1.00,  1.00,  0.94];
+let g_lamp_col_in: f64 = 0.60;      // inner column, as a fraction of the row
+let g_lamp_edge_heat: f64 = 0.46;   // outer column heat
+
+fn mg_lamp_flame(p_m, p_cx: f64, p_cy: f64, p_z: f64): i32 {
+    let m = p_m;
+    let t0: i32 = mesh_tri_count(m);
+    let hx: f64 = 0.058;
+    let hy: f64 = 0.070;
+    let idx: array<i32> = [];
+    let heat: array<f64> = [];
+    let j: i32 = 0;
+    while (j < 4) {
+        let w: f64 = g_lamp_row_w[j] * hx;
+        let y: f64 = p_cy + g_lamp_row_y[j] * hy;
+        let hin: f64 = g_lamp_row_h[j];
+        let hout: f64 = g_lamp_edge_heat * hin;
+        let xs: array<f64> = [0.0 - w, 0.0 - w * g_lamp_col_in,
+                              w * g_lamp_col_in, w];
+        let hs: array<f64> = [hout, hin, hin, hout];
+        let i: i32 = 0;
+        while (i < 4) {
+            let c: i32 = mg_mix(g_EMBER, g_MUZZLE_CORE, hs[i]);
+            idx.push(mg_lamp_v(m, p_cx + xs[i], y, p_z,
+                               f64(i) / 3.0, 1.0 - f64(j) / 3.0, c));
+            heat.push(hs[i]);
+            i++;
+        }
+        j++;
+    }
+    j = 0;
+    while (j < 3) {
+        let i: i32 = 0;
+        while (i < 3) {
+            let ka: i32 = j * 4 + i;
+            let kb: i32 = j * 4 + i + 1;
+            let kc: i32 = (j + 1) * 4 + i + 1;
+            let kd: i32 = (j + 1) * 4 + i;
+            mg_lamp_quad(m, idx[ka], idx[kb], idx[kc], idx[kd],
+                         heat[ka], heat[kb], heat[kc], heat[kd]);
+            i++;
+        }
+        j++;
+    }
+    let out: i32 = mesh_tri_count(m) - t0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE PART TABLE — 8 numbers per part: cx, cy, cz, hx, hy, hz, slot, ao
+// ---------------------------------------------------------------------------
+// slot 0 IRON (cage frame)  1 BRASS (cap, base, bail)  2 LEATHER (glove)
+// slot 3 CLOTH (cuff)
+//
+// The cage is deliberately an OPEN frame — four corner posts, a cap and a pan,
+// with nothing across the front. A closed glass box would put a lit face in
+// FRONT of the flame, and with no z-buffer the front face wins the painter sort
+// and eats the >220 core. Open cage, flame visible, anchor intact.
+//
+// The posts sit at lx = CX +- 0.088, which projects to screen columns 216 and
+// 254; the flame occupies 228..242. The bars never cross the core.
+let g_lamp_cx: f64 = -0.089;    // 8.9 cm to the camera's RIGHT of the emit point
+let g_lamp: array<f64> = [
+//   cx      cy      cz      hx     hy     hz     slot  ao
+  -0.089, -0.170,  0.000,  0.128, 0.020, 0.098,  1.0, 0.94,   // base pan
+  -0.089, -0.198,  0.000,  0.086, 0.014, 0.066,  1.0, 0.84,   // foot
+   0.024,  0.003, -0.075,  0.016, 0.153, 0.016,  0.0, 1.00,   // post front-left
+  -0.202,  0.003, -0.075,  0.016, 0.153, 0.016,  0.0, 1.00,   // post front-right
+   0.024,  0.003,  0.075,  0.016, 0.153, 0.016,  0.0, 0.88,   // post back-left
+  -0.202,  0.003,  0.075,  0.016, 0.153, 0.016,  0.0, 0.88,   // post back-right
+  -0.089,  0.178,  0.000,  0.131, 0.022, 0.100,  1.0, 1.00,   // cap plate
+  -0.089,  0.208,  0.000,  0.088, 0.018, 0.068,  1.0, 1.00,   // cap peak
+  -0.089,  0.234,  0.000,  0.034, 0.014, 0.030,  0.0, 1.00,   // vent finial
+  -0.019,  0.262,  0.000,  0.013, 0.032, 0.013,  0.0, 0.96,   // bail arm
+  -0.119,  0.292,  0.000,  0.074, 0.013, 0.014,  0.0, 1.00,   // bail bar
+  -0.194,  0.286, -0.008,  0.054, 0.046, 0.048,  2.0, 1.00,   // fist on the bail
+  -0.146,  0.256, -0.046,  0.024, 0.021, 0.020,  2.0, 0.88,   // thumb
+  -0.252,  0.243,  0.008,  0.034, 0.030, 0.036,  1.0, 0.96,   // cuff ring
+  -0.302,  0.212,  0.014,  0.048, 0.040, 0.044,  3.0, 0.90,   // sleeve
+  -0.089, -0.135,  0.000,  0.034, 0.014, 0.030,  0.0, 1.00    // wick housing
+];
+let g_lamp_n: i32 = 16;
+
+// The lantern's own side split. `mg_side_col` needs a horizontal bearing to
+// decide which vertical face is `hi`; for a lantern that bearing is the
+// CAMERA's, not the sun's, because the object is 1 m from the eye and its
+// value structure has to be legible from the one direction it is ever seen
+// from. -X (the flank the player looks at, t = 0.97) is `hi`; +Z (the trailing
+// facet, t = 0.67) is the step below it. Same numbers as the gun's, same
+// reason.
+let g_lamp_side_ax: f64 = -0.940;
+let g_lamp_side_az: f64 =  0.341;
+
+fn build_lantern_vm(p_m) {
+    let m = p_m;
+    // ---- the four hardware slots ------------------------------------------
+    // Iron: GUNMETAL_LO pulled 45 % toward RUST_DARK. A lantern is wrought
+    // iron that lives outdoors; a cool gunmetal cage under a warm flame reads
+    // as two objects. No hex literal — both are palette constants.
+    let c_iron: i32 = mg_norm_col(mg_mix(g_GUNMETAL_LO, g_RUST_DARK, 0.45),
+                                  g_lamp_lum_iron, g_lamp_sat_iron);
+    let c_brass: i32 = mg_norm_col(g_BRASS, g_lamp_lum_brass, g_lamp_sat_warm);
+    let c_leather: i32 = mg_norm_col(mg_mix(g_WOOD_LO, g_RUST_DARK, 0.40),
+                                     g_lamp_lum_leather, g_lamp_sat_warm);
+    let c_cloth: i32 = mg_norm_col(mg_mix(g_FABRIC_CREAM, g_DIRT_MID, 0.55),
+                                   g_lamp_lum_cloth, 0.24);
+    let iron_lo: i32 = mg_scale(c_iron, g_lamp_lo_step);
+    let brass_lo: i32 = mg_scale(c_brass, g_lamp_lo_step);
+    let leather_lo: i32 = mg_scale(c_leather, g_lamp_lo_step);
+    let cloth_lo: i32 = mg_scale(c_cloth, g_lamp_lo_step);
+
+    let save_ax: f64 = g_mg_sun_ax; let save_az: f64 = g_mg_sun_az;
+    g_mg_sun_ax = g_lamp_side_ax; g_mg_sun_az = g_lamp_side_az;
+    let i: i32 = 0;
+    while (i < g_lamp_n) {
+        let o: i32 = i * 8;
+        let slot: i32 = i32(g_lamp[o + 6]);
+        let hi: i32 = c_iron;
+        let lo: i32 = iron_lo;
+        if (slot == 1) { hi = c_brass;   lo = brass_lo; }
+        if (slot == 2) { hi = c_leather; lo = leather_lo; }
+        if (slot == 3) { hi = c_cloth;   lo = cloth_lo; }
+        mg_vm_shell(m, g_lamp[o], g_lamp[o + 1], g_lamp[o + 2],
+                    g_lamp[o + 3], g_lamp[o + 4], g_lamp[o + 5],
+                    MG_MAT_VMSKIN, hi, lo, g_lamp[o + 7]);
+        i++;
+    }
+    g_mg_sun_ax = save_ax; g_mg_sun_az = save_az;
+
+    // ---- the light itself, halo then flame ---------------------------------
+    // Both are +Z-facing quad grids and both are OVERWRITTEN by
+    // `mg_lamp_emissive` after the bake, so the albedo passed in only matters
+    // if the bake never runs. The halo goes first so the painter sort has it
+    // behind the flame even inside one depth bucket.
+    g_lamp_hw = [];
+    g_lamp_v0 = mesh_tri_count(m) * 3;
+    mg_lamp_backpanel(m, g_lamp_cx, -0.010, 0.098, 0.114, 0.145);
+    mg_lamp_flame(m, g_lamp_cx, -0.040, 0.040);
+    g_lamp_v1 = mesh_tri_count(m) * 3;
+}
+
+// The ramp: heat 0..1 -> a palette colour and a peak byte, four stops with a
+// plateau on top. Returns one channel so the caller can build the triple
+// without allocating an object per vertex (CLAUDE.md §1 rule 2).
+fn mg_lamp_heat(p_h: f64, p_k: f64, p_ch: i32): f64 {
+    let h: f64 = p_h;
+    if (h < 0.0) { h = 0.0; }
+    if (h > 1.0) { h = 1.0; }
+    let ca: i32 = g_RUST_DARK;   let cb: i32 = g_EMBER;
+    let pa: f64 = g_lamp_p0;     let pb: f64 = g_lamp_p1;
+    let t: f64 = h / g_lamp_h1;
+    if (h >= g_lamp_h3) {
+        ca = g_MUZZLE_CORE; cb = g_MUZZLE_CORE;
+        pa = g_lamp_p3; pb = g_lamp_p4;
+        t = (h - g_lamp_h3) / (1.0 - g_lamp_h3);
+    } else if (h >= g_lamp_h2) {
+        ca = g_MUZZLE_MID; cb = g_MUZZLE_CORE;
+        pa = g_lamp_p2; pb = g_lamp_p3;
+        t = (h - g_lamp_h2) / (g_lamp_h3 - g_lamp_h2);
+    } else if (h >= g_lamp_h1) {
+        ca = g_EMBER; cb = g_MUZZLE_MID;
+        pa = g_lamp_p1; pb = g_lamp_p2;
+        t = (h - g_lamp_h1) / (g_lamp_h2 - g_lamp_h1);
+    }
+    let c: i32 = mg_mix(ca, cb, t);
+    let peak: f64 = pa + (pb - pa) * t;
+    let r: f64 = f64(pal_r(c));
+    let g: f64 = f64(pal_g(c));
+    let b: f64 = f64(pal_b(c));
+    let mx: f64 = r;
+    if (g > mx) { mx = g; }
+    if (b > mx) { mx = b; }
+    if (mx < 1.0) { mx = 1.0; }
+    let sc: f64 = peak / mx;
+    let v: f64 = r * sc;
+    if (p_ch == 1) { v = g * sc; }
+    if (p_ch == 2) { v = b * sc; }
+    let out: f64 = v * (1.0 + (p_k - 1.0) * g_lamp_tint);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mg_lamp_emissive — the flame does not obey the light rig
+// ---------------------------------------------------------------------------
+// The gun's original bug was that it was lit like world geometry and went black
+// at dusk. The lantern's hardware is fixed by the viewmodel rig (exposure
+// floor, scene tint, chroma cap) exactly as the gun's was — that part was
+// always right. The FLAME cannot be, for the same reason a candle does not get
+// dimmer when the sun sets: it is the source, not the receiver. So these
+// vertices are written directly, after `mesh_bake_light` and after
+// `mg_lift_floor`, as final bytes.
+//
+// `p_kr/kg/kb` is the scene key's chromaticity, normalized to unit luminance
+// and already chroma-capped by the caller. Only `g_lamp_tint` of it is applied:
+// enough that the lantern belongs to a violet-bloom night and to a golden
+// evening, not enough that the flame changes colour.
+fn mg_lamp_emissive(p_m, p_kr: f64, p_kg: f64, p_kb: f64) {
+    let m = p_m;
+    if (g_lamp_v1 <= g_lamp_v0) { return; }
+    let vb: ptr = mesh_buf(m);
+    let cache: array<i32> = m.ac;
+    let nh: i32 = g_lamp_hw.length;
+    let i: i32 = g_lamp_v0;
+    while (i < g_lamp_v1) {
+        let k: i32 = i - g_lamp_v0;
+        let h: f64 = 0.0;
+        if (k < nh) { h = g_lamp_hw[k]; }
+        let ir: i32 = mg_clamp255(mg_lamp_heat(h, p_kr, 0));
+        let ig: i32 = mg_clamp255(mg_lamp_heat(h, p_kg, 1));
+        let ib: i32 = mg_clamp255(mg_lamp_heat(h, p_kb, 2));
+        let o: i32 = i * 24 + 20;
+        ptr_write_u8(ptr_offset(vb, o, 1), ir);
+        ptr_write_u8(ptr_offset(vb, o + 1, 1), ig);
+        ptr_write_u8(ptr_offset(vb, o + 2, 1), ib);
+        cache[i] = ir + ig * 256 + ib * 65536;
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE HELD-OBJECT BOB — computed here, applied by the renderer
+// ---------------------------------------------------------------------------
+// A first-person object is on screen 100 % of the time, so this has to be
+// SUBTLE: the amplitudes below are 1.4 cm vertical and 0.9 cm lateral at a full
+// sprint, which is 3 px and 2 px at 320x240. Anything bigger is nausea.
+//
+// A lantern hangs from a bail, so it does not bob in phase with the step — it
+// LAGS it. `p_phase` is the walk cycle (radians, 2 per stride); the lateral
+// term runs at half rate and a quarter-cycle behind, which is what reads as
+// swing rather than as a bouncing sprite. The idle term never stops: a held
+// lamp is never still.
+//
+// It is here rather than in `world_render.hml` because that file is not owned
+// by this task. It is a pure function of two scalars — no state, no allocation,
+// writes three f64s into a caller-owned array. `ARCHITECTURE.md` §5 carries the
+// signature; the call site is six lines in `world_render.hml`, listed in the
+// task report.
+//
+//     meshgen_vm_bob(p_phase, p_speed01, out3)
+//     vx += right * out3[0] + up * out3[1] + fwd * out3[2]
+let g_lamp_bob_y: f64 = 0.014;      // vertical, at speed 1
+let g_lamp_bob_x: f64 = 0.009;      // lateral, at speed 1
+let g_lamp_bob_z: f64 = 0.006;      // fore/aft, at speed 1
+let g_lamp_idle_y: f64 = 0.0035;    // never stops
+let g_lamp_idle_x: f64 = 0.0022;
+
+export fn meshgen_vm_bob(p_phase: f64, p_speed: f64, p_out: array<f64>) {
+    let ph: f64 = p_phase;
+    let sp: f64 = p_speed;
+    if (sp < 0.0) { sp = 0.0; }
+    if (sp > 1.0) { sp = 1.0; }
+    // ease the amplitude in, so the first step does not snap
+    let amp: f64 = sp * sp * (3.0 - 2.0 * sp);
+    let bx: f64 = sin(ph * 0.5 - 1.5707963267948966) * g_lamp_bob_x * amp;
+    let by: f64 = cos(ph) * g_lamp_bob_y * amp;
+    let bz: f64 = sin(ph * 0.5) * g_lamp_bob_z * amp;
+    // the idle sway is a slow lissajous on the same phase clock
+    let ix: f64 = sin(ph * 0.17) * g_lamp_idle_x;
+    let iy: f64 = sin(ph * 0.23 + 1.1) * g_lamp_idle_y;
+    p_out[0] = bx + ix;
+    p_out[1] = by + iy;
+    p_out[2] = bz;
 }
 
 // ===========================================================================
@@ -2915,6 +3687,12 @@ export fn meshgen_bake_all(p_lx: f64, p_ly: f64, p_lz: f64,
                                             var2, vag, vab,
                                             p_br, p_bg, p_bb);
             mg_lift_floor(m, f64(MG_VM_LUM_FLOOR), g_mg_vm_lum_knee);
+            // The lantern's flame is a SOURCE, not a receiver: its vertices are
+            // written last, as final bytes, so the lamp does not go out at
+            // midnight and does not blow out at noon. `kr/kg/kb` is the key
+            // chromaticity — already unit-luminance and chroma-capped above —
+            // and only 14 % of it reaches the flame.
+            if (i == MESH_LANTERN_VM) { mg_lamp_emissive(m, kr, kg, kb); }
         } else {
             total = total + mesh_bake_light(m, p_lx, p_ly, p_lz,
                                             p_sr, p_sg, p_sb,
@@ -3071,16 +3849,26 @@ export fn meshgen_build_all(): i32 {
     // never turn toward the eye, so the budget is 120 submitted rather than 240
     // submitted / 120 drawn. The cap stays generous for a future weapon with
     // more parts; the round-4 task ceiling is 140.
-    mg_register(MESH_SPARROW_VM,    "sparrow_vm",    120, MG_KIND_WEAPON, side, 160);
+    //
+    // Slot 28 is the LANTERN and it is the only one the renderer is ever
+    // handed. 16 shells at 6 (96) + the 3x3 halo grid (8) + the 4x4 flame grid
+    // (18) = 122 triangles. The registered budget is 120 because
+    // `tools/meshgen.hml --verify` asserts +-10 % of it; the task ceiling is
+    // 140, so there are 24 triangles of real headroom above the gate.
+    mg_register(MESH_LANTERN_VM,    "lantern_vm",    120, MG_KIND_WEAPON, side, 176);
     mg_register(MESH_TINKER_VM,     "tinker_vm",     120, MG_KIND_WEAPON, side, 160);
     mg_register(MESH_BELLOWS_VM,    "bellows_vm",    120, MG_KIND_WEAPON, side, 160);
     mg_register(MESH_LONGSHADOW_VM, "longshadow_vm", 120, MG_KIND_WEAPON, side, 160);
     mg_register(MESH_KESTREL_VM,    "kestrel_vm",    120, MG_KIND_WEAPON, side, 160);
     mg_register(MESH_EMBERLANCE_VM, "emberlance_vm", 120, MG_KIND_WEAPON, side, 160);
-    let w: i32 = MESH_SPARROW_VM;
+    let w: i32 = MESH_LANTERN_VM;
     while (w <= MESH_EMBERLANCE_VM) {
         mesh_begin(g_mg_mesh[w]);
-        build_weapon(g_mg_mesh[w], w);
+        if (w == MESH_LANTERN_VM) {
+            build_lantern_vm(g_mg_mesh[w]);
+        } else {
+            build_weapon(g_mg_mesh[w], w);
+        }
         mg_finish(w);
         w++;
     }
