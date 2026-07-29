@@ -1,0 +1,262 @@
+// ===========================================================================
+// nightshade/src/render/terrain_render.hml — STAGE 13         (renderer-split)
+// ===========================================================================
+//
+// ARCHITECTURE.md §5.6: "Ring walk, per-chunk frustum sphere test, LOD
+// selection by distance, skirts, `emit_mesh_buf` per chunk."
+// Exports: `terrain_emit, terrain_stats`.
+//
+// EXTRACTED, UNCHANGED IN BEHAVIOUR, out of `world_render.hml`, which carried
+// it because Wave 2 built the whole frame graph as one function inside
+// `tools/shot.hml`. Every expression below is the same expression, in the same
+// order, on the same values; the only difference is that the camera, the
+// frustum, the fog wall, the batch and the texture arrive as ARGUMENTS instead
+// of being read out of the orchestrator's globals. The nine committed scenes
+// render byte-identically across the move — hashes are in the task report.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS FILE OWNS
+// ---------------------------------------------------------------------------
+//   * the ground-height field: `terrain_set` / `terrain_h` / `vnoise2` / `h2`
+//   * the CHUNK REGISTRY — the struct-of-arrays the ring walk walks
+//   * stage 13 itself: distance cull -> frustum sphere -> emit_mesh_buf
+//   * the per-chunk counters (§4's mandatory ablation)
+//
+// It owns NO layer order, NO raster order, NO present. `world_render.hml` calls
+// `terrain_emit` from inside its own `stat_begin(STAT_T_EMIT_TERRAIN)` pair, so
+// the stage timer measures exactly what it measured before the split.
+//
+// ---------------------------------------------------------------------------
+// `terrain_h` IS STILL ON LOAN — the note moved with the code
+// ---------------------------------------------------------------------------
+// It is a WORLD GENERATOR living in a render file. It is here for one reason:
+// stage 16 lays a ground glow card under every dynamic light, the card's four
+// corners move with the light, and a light that moves (every muzzle flash) can
+// never be precomputed caller-side. `src/sim/worldgen.hml` (W3-1) and
+// `src/sim/chunk.hml` (W3-2) own this properly; when they land, `terrain_h`
+// becomes a three-line adapter over `chunk_height_at` and the noise goes away.
+// It is exported meanwhile so the harness, the walkaround, the game and
+// `src/render/fx.hml` all stand on the same ground, byte for byte.
+// ===========================================================================
+
+import { sqrt, floor } from "@stdlib/math";
+
+import { batch_reserve, batch_commit, batch_vbuf }
+       from "../../../wobbleweed/src/batch.hml";
+import { emit_mesh_buf } from "../../../wobbleweed/src/emit.hml";
+import { mesh_buf, mesh_tri_count } from "../../../wobbleweed/src/mesh.hml";
+import { frustum_sphere } from "../../../wobbleweed/src/frustum.hml";
+import { stat_add, stat_set,
+         STAT_REJ_FRUSTUM, STAT_REJ_DISTANCE,
+         STAT_CHUNKS_TESTED, STAT_CHUNKS_CULLED, STAT_CHUNKS_DRAWN }
+       from "../../../wobbleweed/src/stats.hml";
+
+// ===========================================================================
+// 1. THE GROUND FIELD
+// ===========================================================================
+
+let g_ground_seed: i32 = 1;
+let g_ridge: f64 = 0.0;
+
+export fn terrain_set(p_seed: i32, p_ridge: f64) {
+    g_ground_seed = p_seed;
+    g_ridge = p_ridge;
+}
+export fn terrain_seed(): i32 { let out: i32 = g_ground_seed; return out; }
+export fn terrain_ridge(): f64 { let out: f64 = g_ridge; return out; }
+
+// Position-keyed hash: same coordinate, same value, whatever the order of
+// evaluation. Masked into u64 before every multiply (CLAUDE.md A13 — i32/i64
+// * + - TRAP on overflow).
+export fn h2(p_x: i32, p_y: i32, p_s: i32): f64 {
+    let hx: u64 = u64(p_x & 1048575);
+    let hy: u64 = u64(p_y & 1048575);
+    let hs: u64 = u64(p_s & 1048575);
+    let h: u64 = hx * 374761393 + hy * 668265263 + hs * 2246822519 + 3266489917;
+    h = h ^ (h >> 13);
+    h = h * 1274126177;
+    h = h ^ (h >> 16);
+    let out: f64 = f64(h & 65535) * 0.0000152587890625;
+    return out;
+}
+
+export fn vnoise2(p_x: f64, p_y: f64, p_s: i32): f64 {
+    let xi: i32 = i32(floor(p_x));
+    let yi: i32 = i32(floor(p_y));
+    let xf: f64 = p_x - f64(xi);
+    let yf: f64 = p_y - f64(yi);
+    let u: f64 = xf * xf * (3.0 - 2.0 * xf);
+    let v: f64 = yf * yf * (3.0 - 2.0 * yf);
+    let a: f64 = h2(xi, yi, p_s);
+    let b: f64 = h2(xi + 1, yi, p_s);
+    let c: f64 = h2(xi, yi + 1, p_s);
+    let d: f64 = h2(xi + 1, yi + 1, p_s);
+    let ab: f64 = a + (b - a) * u;
+    let cd: f64 = c + (d - c) * u;
+    let out: f64 = ab + (cd - ab) * v;
+    return out;
+}
+
+// Terrain height. ±1.5 m of undulation over 32 m destroys the ruler horizon
+// (CLAUDE.md §9 rule 5); the ridge term adds the spine ridge_golden needs.
+export fn terrain_h(p_x: f64, p_z: f64): f64 {
+    let x: f64 = p_x; let z: f64 = p_z;
+    let n0: f64 = vnoise2(x * 0.031, z * 0.031, g_ground_seed);
+    let n1: f64 = vnoise2(x * 0.089, z * 0.089, g_ground_seed + 3);
+    let n2: f64 = vnoise2(x * 0.215, z * 0.215, g_ground_seed + 9);
+    let h: f64 = (n0 - 0.5) * 5.2 + (n1 - 0.5) * 1.9 + (n2 - 0.5) * 0.55;
+    if (g_ridge > 0.0) {
+        let d: f64 = (z + 26.0) * 0.09;
+        let ridge: f64 = 13.0 / (1.0 + d * d);
+        h = h + ridge * g_ridge;
+        if (z < -40.0) { h = h - 5.5 * g_ridge; }
+    }
+    let out: f64 = h;
+    return out;
+}
+
+// ===========================================================================
+// 2. THE CHUNK REGISTRY
+// ---------------------------------------------------------------------------
+// Struct-of-arrays (CLAUDE.md A7), filled by the caller, never by this file.
+// A chunk is any world-space baked mesh: terrain tile, near apron, building.
+// ===========================================================================
+
+let g_ch_mesh: array = [];
+let g_ch_ox: array<f64> = [];
+let g_ch_oz: array<f64> = [];
+let g_ch_cx: array<f64> = [];
+let g_ch_cy: array<f64> = [];
+let g_ch_cz: array<f64> = [];
+let g_ch_r: array<f64> = [];
+
+export fn terrain_chunk_clear() {
+    g_ch_mesh = []; g_ch_ox = []; g_ch_oz = [];
+    g_ch_cx = []; g_ch_cy = []; g_ch_cz = []; g_ch_r = [];
+}
+
+// (p_ox, p_oz) is the mesh origin in world space; a mesh already built in world
+// space (an apron, a building) passes zeros. (p_cx, p_cy, p_cz, p_r) is its
+// bounding sphere, which is what the frustum and the fog wall test.
+export fn terrain_chunk_add(p_mesh, p_ox: f64, p_oz: f64,
+                            p_cx: f64, p_cy: f64, p_cz: f64, p_r: f64): i32 {
+    let idx: i32 = g_ch_mesh.length;
+    g_ch_mesh.push(p_mesh);
+    g_ch_ox.push(p_ox);
+    g_ch_oz.push(p_oz);
+    g_ch_cx.push(p_cx);
+    g_ch_cy.push(p_cy);
+    g_ch_cz.push(p_cz);
+    g_ch_r.push(p_r);
+    let out: i32 = idx;
+    return out;
+}
+
+export fn terrain_chunk_count(): i32 { let out: i32 = g_ch_mesh.length; return out; }
+export fn terrain_chunk_mesh(p_i: i32) { let out = g_ch_mesh[p_i]; return out; }
+
+// ===========================================================================
+// 3. THE EMIT HELPER
+// ---------------------------------------------------------------------------
+// NOTE (reported, not fixed — batch.hml is not this task's file): `batch.hml`
+// has no `batch_release(b, n)`. `batch_reserve` advances the triangle count by
+// the full reservation, but `emit_mesh_buf` may write FEWER triangles than
+// reserved (culled, near-clipped, guard-rejected). The unwritten tail must be
+// handed back or the flush draws uninitialised memory. The only way to do that
+// today is to write `b.n` directly, which is what mesh.hml itself does
+// internally.
+// ===========================================================================
+
+// Depth scratch, allocated once and grown monotonically (A8 / N6). Its contents
+// are written by `emit_mesh_buf` and read on the very next line, so nothing
+// carries between calls and it is safe for this module to hold its own.
+let g_dep: array<f64> = [];
+
+fn emit_chunk(p_b, p_tex, p_mesh, p_ox: f64, p_oy: f64, p_oz: f64): i32 {
+    let ntris: i32 = mesh_tri_count(p_mesh);
+    if (ntris < 1) { let z: i32 = 0; return z; }
+    while (g_dep.length < ntris) { g_dep.push(0.0); }
+    let cur: i32 = batch_reserve(p_b, ntris);
+    if (cur < 0) { let z2: i32 = 0; return z2; }
+    let n: i32 = emit_mesh_buf(batch_vbuf(p_b), cur, ntris, g_dep, 0,
+                               mesh_buf(p_mesh), ntris,
+                               p_ox, p_oy, p_oz, 1.0, 0.0, 0.0, 1.0, 0.0);
+    p_b.n = p_b.n - (ntris - n);
+    for (let k = 0; k < n; k++) {
+        batch_commit(p_b, cur + k * 60, p_tex, g_dep[k]);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 4. STAGE 13 — the ring walk
+// ---------------------------------------------------------------------------
+// Distance cull FIRST (the fog wall is the triangle budget, CLAUDE.md §6 —
+// nothing is drawn past it), then the frustum sphere, then the emit. The order
+// of the two rejections is load-bearing for the counters, not for the pixels:
+// a chunk past the fog wall books REJ_DISTANCE and never reaches the frustum
+// test, which is what `STAT_REJ_DISTANCE` has always meant.
+// ===========================================================================
+
+let g_t_tested: i32 = 0;
+let g_t_culled: i32 = 0;
+let g_t_drawn: i32 = 0;
+
+export let g_TSTAT_TESTED: i32 = 0;
+export let g_TSTAT_CULLED: i32 = 1;
+export let g_TSTAT_DRAWN: i32 = 2;
+
+export fn terrain_stats(p_field: i32): i32 {
+    let fld: i32 = p_field;
+    if (fld == g_TSTAT_TESTED) { let a: i32 = g_t_tested; return a; }
+    if (fld == g_TSTAT_CULLED) { let b: i32 = g_t_culled; return b; }
+    if (fld == g_TSTAT_DRAWN) { let c: i32 = g_t_drawn; return c; }
+    let z: i32 = 0;
+    return z;
+}
+
+// Returns the number of chunks DRAWN. Writes STAT_CHUNKS_* itself, exactly
+// where the monolith wrote them: inside the caller's stage timer, after the
+// walk and before `stat_end`.
+export fn terrain_emit(p_b, p_tex, p_frustum: array<f64>,
+                       p_camx: f64, p_camz: f64, p_fog_far: f64): i32 {
+    let camx: f64 = p_camx;
+    let camz: f64 = p_camz;
+    let fog_far: f64 = p_fog_far;
+    let fr: array<f64> = p_frustum;
+    let tested: i32 = 0; let culled: i32 = 0; let drawn: i32 = 0;
+    let nc: i32 = g_ch_mesh.length;
+    for (let i = 0; i < nc; i++) {
+        tested++;
+        let cx: f64 = g_ch_cx[i]; let cy: f64 = g_ch_cy[i]; let cz: f64 = g_ch_cz[i];
+        // distance cull first: never draw past the fog far plane
+        let ddx: f64 = cx - camx; let ddz: f64 = cz - camz;
+        let dist: f64 = sqrt(ddx * ddx + ddz * ddz) - g_ch_r[i];
+        if (dist > fog_far) { culled++; stat_add(STAT_REJ_DISTANCE, 1); continue; }
+        if (frustum_sphere(fr, cx, cy, cz, g_ch_r[i]) == 0) {
+            culled++;
+            stat_add(STAT_REJ_FRUSTUM, 1);
+            continue;
+        }
+        emit_chunk(p_b, p_tex, g_ch_mesh[i], g_ch_ox[i], 0.0, g_ch_oz[i]);
+        drawn++;
+    }
+    g_t_tested = tested; g_t_culled = culled; g_t_drawn = drawn;
+    stat_set(STAT_CHUNKS_TESTED, tested);
+    stat_set(STAT_CHUNKS_CULLED, culled);
+    stat_set(STAT_CHUNKS_DRAWN, drawn);
+    let out: i32 = drawn;
+    return out;
+}
+
+// Sheet mode draws no world at all, but the counters must still be published or
+// a contact sheet would report the PREVIOUS frame's chunk counts. The monolith
+// got this for free by initialising the three locals to zero above its
+// `if (sheet == 0)` guard; this is that same behaviour, named.
+export fn terrain_emit_none() {
+    g_t_tested = 0; g_t_culled = 0; g_t_drawn = 0;
+    stat_set(STAT_CHUNKS_TESTED, 0);
+    stat_set(STAT_CHUNKS_CULLED, 0);
+    stat_set(STAT_CHUNKS_DRAWN, 0);
+}

@@ -1,0 +1,266 @@
+// ===========================================================================
+// nightshade/src/render/entity_render.hml — STAGE 14          (renderer-split)
+// ===========================================================================
+//
+// ARCHITECTURE.md §5.6: "Entities/props/pickups -> mesh instances with LOD,
+// hit-flash tint, dissolve scale, ONE CONTACT-SHADOW QUAD EACH (mandatory),
+// emissive markers into LAYER_FX." Exports: `entity_emit`.
+//
+// EXTRACTED, UNCHANGED IN BEHAVIOUR, out of `world_render.hml`. Same
+// expressions, same order, same values; the camera, the frustum, the env, the
+// fog wall, the blob mesh, the batch and the texture arrive as ARGUMENTS
+// instead of being read out of the orchestrator's globals. The nine committed
+// scenes render byte-identically across the move.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS FILE OWNS
+// ---------------------------------------------------------------------------
+//   * the PROP REGISTRY — the struct-of-arrays stage 14 walks
+//   * the LOD switch, including the fog-relative far threshold
+//   * per-instance point lighting and per-instance fog
+//   * the mandatory contact blob, and the ORDER it is emitted in
+//   * the per-entity counters (§4's mandatory ablation)
+//
+// It owns no layer order and no raster order. `world_render.hml` calls
+// `entity_emit` from inside its own `stat_begin(STAT_T_EMIT_ENTITY)` pair, so
+// the stage timer measures what it measured before the split.
+// ===========================================================================
+
+import { sqrt } from "@stdlib/math";
+
+import { mesh_emit_yaw } from "../../../wobbleweed/src/mesh.hml";
+import { frustum_sphere } from "../../../wobbleweed/src/frustum.hml";
+import { env_field, env_fog_factor, env_fog_alpha, env_light_count,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_LIGHT0_X, ENV_LIGHT_STRIDE }
+       from "../../../wobbleweed/src/shade.hml";
+import { stat_add, stat_set,
+         STAT_REJ_FRUSTUM, STAT_REJ_DISTANCE,
+         STAT_ENTS_TESTED, STAT_ENTS_CULLED, STAT_ENTS_DRAWN }
+       from "../../../wobbleweed/src/stats.hml";
+
+import { clampi } from "../core/mathx.hml";
+
+// entity_prop_add: pass this as p_d2 to get the FOG-RELATIVE far-LOD switch
+// instead of an absolute metre distance. See the long note on lod_pick.
+export let g_LOD_FOG_CARD: f64 = -1.0;
+
+// ===========================================================================
+// 1. THE PROP REGISTRY
+// ---------------------------------------------------------------------------
+// Struct-of-arrays (CLAUDE.md A7), filled by the caller, never by this file.
+// A prop is a mesh INSTANCE with three LODs and a contact blob.
+// ===========================================================================
+
+let g_pr_m0: array = [];
+let g_pr_m1: array = [];
+let g_pr_m2: array = [];
+let g_pr_d1: array<f64> = [];
+let g_pr_d2: array<f64> = [];
+let g_pr_rad: array<f64> = [];
+let g_pr_x: array<f64> = [];
+let g_pr_y: array<f64> = [];
+let g_pr_z: array<f64> = [];
+let g_pr_yaw: array<f64> = [];
+let g_pr_s: array<f64> = [];
+let g_pr_tr: array<i32> = [];
+let g_pr_tg: array<i32> = [];
+let g_pr_tb: array<i32> = [];
+let g_pr_shadow: array<f64> = [];
+let g_pr_tag: array<i32> = [];      // opaque to this file; the caller's class
+
+export fn entity_prop_clear() {
+    g_pr_m0 = []; g_pr_m1 = []; g_pr_m2 = [];
+    g_pr_d1 = []; g_pr_d2 = []; g_pr_rad = [];
+    g_pr_x = []; g_pr_y = []; g_pr_z = [];
+    g_pr_yaw = []; g_pr_s = []; g_pr_tr = []; g_pr_tg = []; g_pr_tb = [];
+    g_pr_shadow = []; g_pr_tag = [];
+}
+
+// p_m0/p_m1/p_m2 are the three LOD meshes (pass the same handle three times for
+// an asset that has one), p_d1/p_d2 the switch distances in metres, p_rad the
+// LOD0 cull radius, p_y the GROUND height at (x, z) — the prop stands on it and
+// its contact blob is laid 3.5 cm above it.
+export fn entity_prop_add(p_m0, p_m1, p_m2, p_d1: f64, p_d2: f64, p_rad: f64,
+                          p_x: f64, p_y: f64, p_z: f64,
+                          p_yaw: f64, p_s: f64,
+                          p_tr: i32, p_tg: i32, p_tb: i32,
+                          p_shadow: f64, p_tag: i32): i32 {
+    let idx: i32 = g_pr_m0.length;
+    g_pr_m0.push(p_m0); g_pr_m1.push(p_m1); g_pr_m2.push(p_m2);
+    g_pr_d1.push(p_d1); g_pr_d2.push(p_d2); g_pr_rad.push(p_rad);
+    g_pr_x.push(p_x); g_pr_y.push(p_y); g_pr_z.push(p_z);
+    g_pr_yaw.push(p_yaw); g_pr_s.push(p_s);
+    g_pr_tr.push(p_tr); g_pr_tg.push(p_tg); g_pr_tb.push(p_tb);
+    g_pr_shadow.push(p_shadow);
+    g_pr_tag.push(p_tag);
+    let out: i32 = idx;
+    return out;
+}
+
+export fn entity_prop_count(): i32 { let out: i32 = g_pr_m0.length; return out; }
+export fn entity_prop_tag(p_i: i32): i32 { let out: i32 = g_pr_tag[p_i]; return out; }
+export fn entity_prop_x(p_i: i32): f64 { let out: f64 = g_pr_x[p_i]; return out; }
+export fn entity_prop_y(p_i: i32): f64 { let out: f64 = g_pr_y[p_i]; return out; }
+export fn entity_prop_z(p_i: i32): f64 { let out: f64 = g_pr_z[p_i]; return out; }
+export fn entity_prop_scale(p_i: i32): f64 { let out: f64 = g_pr_s[p_i]; return out; }
+
+// ---------------------------------------------------------------------------
+// THE LOD SWITCH, and why p_d2 can be fog-relative.
+// ---------------------------------------------------------------------------
+// ⚠ THE FAR SWITCH IS FOG-RELATIVE, NOT A FIXED 46 m. READ THIS BEFORE PUTTING
+// THE CONSTANT BACK. A far LOD is usually a flat crossed-quad card with no
+// texture detail left, and a flat opaque card is only honest where the fog has
+// genuinely closed over it. 46 m is only past the fog wall in a scene whose
+// FOG_FAR is about 48; `ridge_golden`'s is 64 and it scatters trees out to
+// 61 m, so a dozen of them crossed into the card LOD while the fog was still
+// two-thirds open. MEASURED off that frame: one card sat on the crest at native
+// x164-180 y70-83 as RGB(189,139,90), luminance 148.1 with a luminance std of
+// 10.4 across 208 pixels — an opaque untextured slab 33 luminance off the sky
+// beside it, which the round-3 critic booked as "a naked untextured quad".
+//
+// So the threshold is where linear fog leaves under 8 % of the albedo, with a
+// 46 m floor that keeps every short-fog scene (26 m, 20 m) on exactly the LODs
+// it had. This can only cost triangles in the deep scenes that showed the bug.
+fn lod_pick(p_env: array<f64>, p_i: i32, p_dist: f64) {
+    let i: i32 = p_i;
+    let d: f64 = p_dist;
+    if (d < g_pr_d1[i]) { let m0 = g_pr_m0[i]; return m0; }
+    let d2: f64 = g_pr_d2[i];
+    if (d2 < 0.0) {
+        let fnear: f64 = env_field(p_env, ENV_FOG_NEAR);
+        let ffar: f64 = env_field(p_env, ENV_FOG_FAR);
+        d2 = fnear + (ffar - fnear) * 0.92;
+        if (d2 < 46.0) { d2 = 46.0; }
+    }
+    if (d < d2) { let m1 = g_pr_m1[i]; return m1; }
+    let m2 = g_pr_m2[i];
+    return m2;
+}
+
+// ===========================================================================
+// 2. STAGE 14 — real LOD + ONE contact blob each
+// ===========================================================================
+
+let g_e_tested: i32 = 0;
+let g_e_culled: i32 = 0;
+let g_e_drawn: i32 = 0;
+
+export let g_ESTAT_TESTED: i32 = 0;
+export let g_ESTAT_CULLED: i32 = 1;
+export let g_ESTAT_DRAWN: i32 = 2;
+
+export fn entity_stats(p_field: i32): i32 {
+    let fld: i32 = p_field;
+    if (fld == g_ESTAT_TESTED) { let a: i32 = g_e_tested; return a; }
+    if (fld == g_ESTAT_CULLED) { let b: i32 = g_e_culled; return b; }
+    if (fld == g_ESTAT_DRAWN) { let c: i32 = g_e_drawn; return c; }
+    let z: i32 = 0;
+    return z;
+}
+
+// Returns the number of props DRAWN. Writes STAT_ENTS_* itself, exactly where
+// the monolith wrote them: inside the caller's stage timer.
+export fn entity_emit(p_b, p_tex, p_env: array<f64>, p_frustum: array<f64>,
+                      p_blob, p_camx: f64, p_camz: f64, p_fog_far: f64): i32 {
+    let camx: f64 = p_camx;
+    let camz: f64 = p_camz;
+    let fog_far: f64 = p_fog_far;
+    let env: array<f64> = p_env;
+    let fr: array<f64> = p_frustum;
+    let etested: i32 = 0; let eculled: i32 = 0; let edrawn: i32 = 0;
+    let np: i32 = g_pr_m0.length;
+    let ftr: f64 = env_field(env, ENV_FOG_R);
+    let ftg2: f64 = env_field(env, ENV_FOG_G);
+    let ftb: f64 = env_field(env, ENV_FOG_B);
+    let blob = p_blob;
+    for (let k = 0; k < np; k++) {
+        etested++;
+        let px2: f64 = g_pr_x[k]; let py2: f64 = g_pr_y[k]; let pz2: f64 = g_pr_z[k];
+        let dx2: f64 = px2 - camx; let dz2: f64 = pz2 - camz;
+        let dd: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
+        let rad2: f64 = g_pr_rad[k] * g_pr_s[k];
+        if (dd - rad2 > fog_far) {
+            eculled++;
+            stat_add(STAT_REJ_DISTANCE, 1);
+            continue;
+        }
+        if (frustum_sphere(fr, px2, py2 + rad2 * 0.5, pz2, rad2 + 1.0) == 0) {
+            eculled++;
+            stat_add(STAT_REJ_FRUSTUM, 1);
+            continue;
+        }
+        let m = lod_pick(env, k, dd);
+        // Per-instance point lighting. mesh_bake_light folds ambient + sun
+        // + bounce only, so a dynamic light reaches a static prop through
+        // its instance tint — the same approximation the fog uses, and
+        // exact enough for a prop small next to the light's radius.
+        let plr: f64 = 1.0; let plg: f64 = 1.0; let plb: f64 = 1.0;
+        let nl: i32 = env_light_count(env);
+        for (let li = 0; li < nl; li++) {
+            let lb2: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
+            let ldx: f64 = env_field(env, lb2) - px2;
+            let ldy: f64 = env_field(env, lb2 + 1) - (py2 + rad2 * 0.4);
+            let ldz: f64 = env_field(env, lb2 + 2) - pz2;
+            let lrad: f64 = env_field(env, lb2 + 6);
+            let ld: f64 = sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
+            if (ld < lrad) {
+                let att: f64 = (1.0 - ld / lrad) * (1.0 - ld / lrad);
+                plr = plr + env_field(env, lb2 + 3) * att;
+                plg = plg + env_field(env, lb2 + 4) * att;
+                plb = plb + env_field(env, lb2 + 5) * att;
+            }
+        }
+        // Per-instance fog: exact for props small next to the fog gradient.
+        let f: f64 = env_fog_factor(px2, py2 + rad2 * 0.4, pz2);
+        let a: i32 = i32(env_fog_alpha(f));
+        let tr2: i32 = clampi(i32(f64(g_pr_tr[k]) * plr * (1.0 - f * (1.0 - ftr))), 0, 255);
+        let tg3: i32 = clampi(i32(f64(g_pr_tg[k]) * plg * (1.0 - f * (1.0 - ftg2))), 0, 255);
+        let tb2: i32 = clampi(i32(f64(g_pr_tb[k]) * plb * (1.0 - f * (1.0 - ftb))), 0, 255);
+        // The contact blob — a 2-triangle card, laid on the ground the
+        // prop was placed on. MANDATORY, no exceptions, not even in a test
+        // scene (CLAUDE.md §9 rule 6): the highest value-per-triangle
+        // spend we have.
+        //
+        // IT IS EMITTED BEFORE ITS PROP, AND THE ORDER IS LOAD-BEARING.
+        // The blob sits 35 mm above the ground directly under the prop, so
+        // its depth and the depth of the prop's lowest triangles differ by
+        // a few centimetres — the same order as the painter-sort quantum
+        // (37 mm at FOG_FAR 72, see stage 11). Whenever they tie, the
+        // bucket keeps EMISSION order, and with the prop emitted first the
+        // shadow card was painted OVER the foot of the crate, the barrel
+        // and the tree trunk it belongs under. That is the most common
+        // instance of "textures kinda clip into each other" in the build:
+        // it happens under every prop in the frame, and it flickers,
+        // because a step of a few centimetres toward the prop flips which
+        // bucket it lands in.
+        //
+        // Emitting the blob first makes the prop win every tie. The prop
+        // is always ON the blob, so "prop over shadow" is correct at every
+        // depth, not merely preferable at ties. Zero triangles, zero
+        // milliseconds — the two calls simply swap.
+        let sh: f64 = g_pr_shadow[k] * g_pr_s[k] * 0.5;
+        mesh_emit_yaw(blob, p_b, p_tex,
+                      px2, py2 + 0.035, pz2,
+                      0.0, sh, 255, 255, 255, a);
+        mesh_emit_yaw(m, p_b, p_tex, px2, py2, pz2,
+                      g_pr_yaw[k], g_pr_s[k], tr2, tg3, tb2, a);
+        edrawn++;
+    }
+    g_e_tested = etested; g_e_culled = eculled; g_e_drawn = edrawn;
+    stat_set(STAT_ENTS_TESTED, etested);
+    stat_set(STAT_ENTS_CULLED, eculled);
+    stat_set(STAT_ENTS_DRAWN, edrawn);
+    let out: i32 = edrawn;
+    return out;
+}
+
+// Sheet mode draws no props, but the counters must still be published or a
+// contact sheet would report the PREVIOUS frame's entity counts. This is the
+// monolith's behaviour (three locals zeroed above the `if (sheet == 0)`), named.
+export fn entity_emit_none() {
+    g_e_tested = 0; g_e_culled = 0; g_e_drawn = 0;
+    stat_set(STAT_ENTS_TESTED, 0);
+    stat_set(STAT_ENTS_CULLED, 0);
+    stat_set(STAT_ENTS_DRAWN, 0);
+}

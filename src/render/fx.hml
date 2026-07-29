@@ -1,0 +1,209 @@
+// ===========================================================================
+// nightshade/src/render/fx.hml — STAGE 16                     (renderer-split)
+// ===========================================================================
+//
+// ARCHITECTURE.md §5.6: "Client-only particle SoA (cap 512, negative ids),
+// tracers, muzzle flashes, impact bursts, ember motes, damage numbers, decals,
+// glow cards."  §5's export list is `fx_new, fx_update, fx_emit, fx_spawn_*`.
+//
+// WHAT ACTUALLY EXISTS TODAY IS THE EMIT HALF, and this file is exactly that
+// half, EXTRACTED UNCHANGED IN BEHAVIOUR out of `world_render.hml`. The
+// SPAWN/UPDATE half (`fx_new`, `fx_update`, `fx_spawn_muzzle`, ...) is Wave-4
+// work that has not been written by anybody yet — the four consumers of the
+// frame graph each fill the registry themselves through `fx_add`, which is what
+// the monolith's `world_fx_add` was. It is NOT stubbed here: an empty
+// `fx_update` that nobody calls is the stand-in-art defect one layer up.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS FILE OWNS
+// ---------------------------------------------------------------------------
+//   * the PARTICLE REGISTRY — position, size, atlas cell, shape, rgba
+//   * the three billboard SHAPES (sprite / rain streak / tracer streak)
+//   * the per-light ground GLOW CARD, and the 14 m cutoff that keeps it honest
+//   * per-particle fog attenuation
+//
+// It owns no layer order and no raster order. `world_render.hml` calls `fx_emit`
+// from inside its own `stat_begin(STAT_T_EMIT_FX)` pair.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS FILE IMPORTS terrain_render.hml
+// ---------------------------------------------------------------------------
+// A glow card follows the ground: its four corners are `terrain_h` sampled at
+// the light's four corners. The light MOVES (every muzzle flash), so no amount
+// of caller-side precomputation covers it. `src/render/**` may import
+// `src/render/**` (CLAUDE.md §3, ci_imports.sh R1), and both files stand on the
+// same height field by construction rather than by convention. When
+// `src/sim/chunk.hml` takes the ground over, this import becomes the sim one.
+// ===========================================================================
+
+import { sqrt } from "@stdlib/math";
+
+import { batch_reserve, batch_commit, batch_vbuf }
+       from "../../../wobbleweed/src/batch.hml";
+import { emit_quad_world } from "../../../wobbleweed/src/emit.hml";
+import { billboard_set_uv, billboard_world, billboard_stretched }
+       from "../../../wobbleweed/src/billboard.hml";
+import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
+import { env_field, env_fog_factor, env_light_count,
+         ENV_LIGHT0_X, ENV_LIGHT_STRIDE }
+       from "../../../wobbleweed/src/shade.hml";
+
+import { clampi } from "../core/mathx.hml";
+import { terrain_h } from "./terrain_render.hml";
+
+// ---------------------------------------------------------------------------
+// fx_add draw kinds. The frame graph must not know what a "rain" sprite is — it
+// knows three billboard SHAPES, and the caller says which one its fxgen cell
+// wants. (Wave 2 branched on `cell == FX_RAIN`, which would have dragged
+// src/art through the import wall.)
+// ---------------------------------------------------------------------------
+export let g_FXK_SPRITE: i32 = 0;       // camera-facing card, size p_s
+export let g_FXK_RAIN: i32 = 1;         // vertical streak, 1.5 m, 5 cm wide
+export let g_FXK_TRACER: i32 = 2;       // 2.6 m streak away from the camera
+
+// ===========================================================================
+// 1. THE PARTICLE REGISTRY
+// ---------------------------------------------------------------------------
+// Struct-of-arrays (CLAUDE.md A7), filled by the caller, never by this file.
+// ===========================================================================
+
+let g_fx_x: array<f64> = [];
+let g_fx_y: array<f64> = [];
+let g_fx_z: array<f64> = [];
+let g_fx_s: array<f64> = [];
+let g_fx_cell: array<i32> = [];
+let g_fx_kind: array<i32> = [];
+let g_fx_r: array<i32> = [];
+let g_fx_g: array<i32> = [];
+let g_fx_b: array<i32> = [];
+let g_fx_a: array<i32> = [];
+
+export fn fx_clear() {
+    g_fx_x = []; g_fx_y = []; g_fx_z = []; g_fx_s = [];
+    g_fx_cell = []; g_fx_kind = []; g_fx_r = []; g_fx_g = []; g_fx_b = [];
+    g_fx_a = [];
+}
+
+export fn fx_add(p_x: f64, p_y: f64, p_z: f64, p_s: f64,
+                 p_cell: i32, p_kind: i32,
+                 p_r: i32, p_g: i32, p_b: i32, p_a: i32): i32 {
+    let idx: i32 = g_fx_x.length;
+    g_fx_x.push(p_x); g_fx_y.push(p_y); g_fx_z.push(p_z); g_fx_s.push(p_s);
+    g_fx_cell.push(p_cell); g_fx_kind.push(p_kind);
+    g_fx_r.push(p_r); g_fx_g.push(p_g); g_fx_b.push(p_b); g_fx_a.push(p_a);
+    let out: i32 = idx;
+    return out;
+}
+
+export fn fx_count(): i32 { let out: i32 = g_fx_x.length; return out; }
+
+// ===========================================================================
+// 2. THE GROUND-QUAD HELPER
+// ---------------------------------------------------------------------------
+// Scratch allocated once (A8 / N6). `g_dep`'s contents are written by
+// `emit_quad_world` and read on the very next line; `g_uvs` is refilled before
+// every use. Nothing carries between calls, so this module holding its own copy
+// is behaviourally identical to sharing the monolith's.
+//
+// NOTE (reported, not fixed — batch.hml is not this task's file): `batch.hml`
+// has no `batch_release(b, n)`, so the unwritten tail of a reservation has to be
+// handed back by writing `b.n` directly. See terrain_render.hml.
+// ===========================================================================
+
+let g_dep: array<f64> = [];
+let g_uvs: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+fn emit_world_quad(p_b, p_tex,
+                   p_ax: f64, p_ay: f64, p_az: f64,
+                   p_bx: f64, p_by: f64, p_bz: f64,
+                   p_cx: f64, p_cy: f64, p_cz: f64,
+                   p_dx: f64, p_dy: f64, p_dz: f64,
+                   p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
+                   p_rgb: i32): i32 {
+    while (g_dep.length < 2) { g_dep.push(0.0); }
+    let cur: i32 = batch_reserve(p_b, 2);
+    if (cur < 0) { let z: i32 = 0; return z; }
+    let n: i32 = emit_quad_world(batch_vbuf(p_b), cur, g_dep, 0,
+                                 p_ax, p_ay, p_az, p_bx, p_by, p_bz,
+                                 p_cx, p_cy, p_cz, p_dx, p_dy, p_dz,
+                                 p_u0, p_v0, p_u1, p_v0, p_u1, p_v1, p_u0, p_v1,
+                                 0.0, 1.0, 0.0, p_rgb);
+    p_b.n = p_b.n - (2 - n);
+    for (let k = 0; k < n; k++) { batch_commit(p_b, cur + k * 60, p_tex, g_dep[k]); }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 3. STAGE 16 — particles, glow cards, tracers, rain
+// ---------------------------------------------------------------------------
+// Returns the PARTICLE count, which is what `STAT_PARTICLES` has always
+// reported: the registry length, not the number of billboards that survived.
+// The caller publishes the stat, because in sheet mode it must publish 0 without
+// this function running at all.
+// ===========================================================================
+
+export fn fx_emit(p_b, p_tex, p_atlas, p_env: array<f64>,
+                  p_glow_cell: i32, p_camx: f64, p_camz: f64): i32 {
+    let camx: f64 = p_camx;
+    let camz: f64 = p_camz;
+    let env: array<f64> = p_env;
+    let nfx: i32 = g_fx_x.length;
+    for (let q = 0; q < nfx; q++) {
+        atlas_cell_uv(p_atlas, g_fx_cell[q], g_uvs, 0);
+        billboard_set_uv(g_uvs[0], g_uvs[1], g_uvs[2], g_uvs[3]);
+        let fa: f64 = env_fog_factor(g_fx_x[q], g_fx_y[q], g_fx_z[q]);
+        let al: i32 = clampi(i32(f64(g_fx_a[q]) * (1.0 - fa * 0.85)), 0, 255);
+        if (g_fx_kind[q] == g_FXK_RAIN) {
+            billboard_stretched(p_b, p_tex,
+                                g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                g_fx_x[q] + 0.12, g_fx_y[q] - 1.5, g_fx_z[q],
+                                0.05, g_fx_r[q], g_fx_g[q], g_fx_b[q], al);
+        } else if (g_fx_kind[q] == g_FXK_TRACER) {
+            let tdx: f64 = g_fx_x[q] - camx;
+            let tdz: f64 = g_fx_z[q] - camz;
+            let tl: f64 = sqrt(tdx * tdx + tdz * tdz);
+            if (tl < 0.001) { tl = 1.0; }
+            billboard_stretched(p_b, p_tex,
+                                g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                g_fx_x[q] + tdx / tl * 2.6, g_fx_y[q],
+                                g_fx_z[q] + tdz / tl * 2.6,
+                                0.06, g_fx_r[q], g_fx_g[q], g_fx_b[q], al);
+        } else {
+            billboard_world(p_b, p_tex, g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                            g_fx_s[q], g_fx_r[q], g_fx_g[q], g_fx_b[q], al);
+        }
+    }
+    // One flat ground glow card per dynamic light. mesh_bake_light folds
+    // only ambient + sun + bounce, so this 2-triangle additive card is how
+    // a point light reaches the GROUND — which is what ART_BIBLE 12.2 asks
+    // for and what a PS1-era renderer would have done.
+    let nl2: i32 = env_light_count(env);
+    atlas_cell_uv(p_atlas, p_glow_cell, g_uvs, 0);
+    for (let li = 0; li < nl2; li++) {
+        let lb3: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
+        let lx2: f64 = env_field(env, lb3);
+        let lz2: f64 = env_field(env, lb3 + 2);
+        // The card is a 2-triangle quad with only four corners following
+        // the ground, so beyond ~14 m it is seen edge-on and reads as a
+        // bright LINE across the terrain instead of a pool of light. Near
+        // lights (the muzzle flash, a lantern you are standing by) are
+        // exactly where a ground pool earns its two triangles.
+        let ldc: f64 = sqrt((lx2 - camx) * (lx2 - camx)
+                            + (lz2 - camz) * (lz2 - camz));
+        if (ldc > 14.0) { continue; }
+        let lrad2: f64 = env_field(env, lb3 + 6) * 0.62;
+        let lr2: i32 = clampi(i32(env_field(env, lb3 + 3) * 96.0), 0, 255);
+        let lg2: i32 = clampi(i32(env_field(env, lb3 + 4) * 96.0), 0, 255);
+        let lb4: i32 = clampi(i32(env_field(env, lb3 + 5) * 96.0), 0, 255);
+        emit_world_quad(p_b, p_tex,
+                        lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
+                        lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
+                        lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
+                        lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
+                        g_uvs[0], g_uvs[1], g_uvs[2], g_uvs[3],
+                        (lr2 << 16) | (lg2 << 8) | lb4);
+    }
+    let out: i32 = nfx;
+    return out;
+}
