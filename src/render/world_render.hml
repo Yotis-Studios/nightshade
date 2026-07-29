@@ -108,7 +108,8 @@ import { env_new, env_field, env_far_plane, env_fog_factor, env_fog_alpha,
          ENV_LIGHT0_X, ENV_LIGHT_STRIDE }
        from "../../../wobbleweed/src/shade.hml";
 import { mesh_buf, mesh_tri_count, mesh_set_mvp, mesh_set_viewport,
-         mesh_set_near, mesh_set_cull, mesh_emit_yaw, mesh_reset_counters,
+         mesh_set_near, mesh_set_cull, mesh_emit, mesh_emit_yaw,
+         mesh_reset_counters,
          mesh_rej_near, mesh_rej_guard, mesh_rej_backface, MESH_CULL_NEG }
        from "../../../wobbleweed/src/mesh.hml";
 import { billboard_set_mvp, billboard_set_viewport, billboard_set_near,
@@ -196,6 +197,75 @@ let g_solid_u1: f64 = 1.0; let g_solid_v1: f64 = 1.0;
 let g_env: array<f64> = env_new();
 let g_frustum: array<f64> = frustum_new();
 let g_mvp: array<f64> = [];
+// The projection alone, without the view matrix. It is the MVP of VIEW SPACE,
+// and it is what the viewmodel is drawn under -- see THE VIEWMODEL IS IN VIEW
+// SPACE, below. Rebuilt beside g_mvp at stage 8.
+let g_proj: array<f64> = [];
+
+// ---------------------------------------------------------------------------
+// THE VIEWMODEL IS IN VIEW SPACE -- and that is the whole fix for defect 6b.
+// ---------------------------------------------------------------------------
+// It used to be emitted with `mesh_emit_yaw`, which can express yaw and
+// nothing else, so the model was given a pitch-aware WORLD POSITION and a
+// pitch-blind ORIENTATION. Those two disagree the instant you look up or down:
+// by pitch -45 the eye has swung above the lantern while the lantern stayed
+// upright, so you see it from on top, its own top pan eclipses the flame, the
+// model reads as a grey slab, and the frame loses its >220 anchor outright.
+// Measured before the fix, hub_dawn at 00:30, largest contiguous >220 region
+// inside the viewmodel window, HUD masked, native 320x240:
+//
+//     pitch  +45  +20    0   -15   -30   -45   -60   -80
+//     anchor 160  192  156   127    98     0     0     0  px
+//
+// Adding a pitch term to the model would fix the symptom and leave the CLASS
+// of bug alive -- the next person to add roll, or weapon sway, or a lowered
+// pose gets to rediscover it. A first-person held object is not a thing in the
+// world that happens to travel with you; it is a thing bolted to the camera.
+// So draw it where it lives: in VIEW SPACE, with the view matrix left out of
+// its MVP entirely.
+//
+// MVP_vm = proj . VM_MODEL, with no `view` term. The camera is at the origin
+// looking down -Z (mat_look_dir's convention), so VM_MODEL is a CONSTANT: the
+// same sixteen numbers on every frame, at every yaw, at every pitch, forever.
+//
+//     local +X  ->  view -X   (the model's +X is the camera's LEFT)
+//     local +Y  ->  view +Y   (up is up)
+//     local +Z  ->  view -Z   (the model's +Z is the camera's FORWARD)
+//     origin    ->  (0.26, -0.34, -1.05)   0.26 right, 0.34 down, 1.05 fwd
+//
+// Those four lines are exactly what the old code produced AT PITCH 0: the
+// basis map is what `mesh_emit_yaw(yaw = PI - camera_yaw)` reduces to once the
+// view rotation is composed onto it, and the offset is the old
+// `cam + fwd*1.05 + right*0.26 + up*(-0.34)` with fwd/right/up read at pitch
+// 0. So this does not re-pose the lantern; it FREEZES the pose that was
+// already correct, at every pitch. Verified, not asserted: at pitch 0 the
+// frame is BYTE-IDENTICAL before and after (0 differing pixels of 76800), and
+// at every other pitch the only pixels that change lie inside the viewmodel's
+// own screen window.
+//
+// It also retires a latent trap in `meshgen.hml`: `mg_vm_shell` drops the
+// faces the eye cannot see, derived from a constant model-space eye direction
+// normalize(0.26, 0.34, -1.05). That derivation was only ever true at pitch 0.
+// It is now true everywhere, which is why the lantern needed no geometry
+// change to satisfy this task.
+//
+// The 3x3 block is diag(-1, 1, -1), determinant +1 -- the same handedness as
+// the Ry() it replaces, so MESH_CULL_NEG culls exactly the faces it culled
+// before and nothing turns inside out.
+//
+// COST: two `mesh_set_mvp` calls (16 array copies each) plus mesh_emit's
+// 64-multiply concatenation instead of mesh_emit_yaw's 24 -- once per frame,
+// for one instance. It replaces six trig calls and eighteen multiplies, and
+// measures 0.129 -> 0.133 ms on the emit.viewmodel stage, min-of-7.
+let g_VM_RIGHT: f64 = 0.26;     // metres right of the eye
+let g_VM_DOWN: f64  = 0.34;     // metres below the eye
+let g_VM_FWD: f64   = 1.05;     // metres in front of the eye
+let g_vm_model: array<f64> = [
+    -1.0, 0.0,  0.0, g_VM_RIGHT,
+     0.0, 1.0,  0.0, 0.0 - g_VM_DOWN,
+     0.0, 0.0, -1.0, 0.0 - g_VM_FWD,
+     0.0, 0.0,  0.0, 1.0
+];
 
 let g_bsky = null;
 let g_bworld = null;
@@ -703,7 +773,18 @@ export fn sky_uv_at(p_ndcx: f64, p_ndcy: f64) {
     let az: f64 = atan2(0.0 - wx, wz);
     let el: f64 = asin(clampf(wy, -1.0, 1.0));
     g_sk_u = az / 6.283185307179586 + 0.5;
-    g_sk_v = clampf(1.0 - el / 1.5707963267948966, 0.0, 1.0);
+    // ⚠ V STOPS HALF A TEXEL SHORT OF 1.0, NOT AT 1.0. A uv of exactly 1.0 is
+    // the texture's trailing EDGE, and the sample there lands on index SKY_H —
+    // one row past the end of a 160-row panorama. This is not theoretical: the
+    // identical bug on the u axis (a u of exactly 1.0 at the +-180 split) draws
+    // a pure rgb(255,255,255) column, measured at yaw 0. Below the horizon
+    // EVERY corner of the lower grid rows clamps here, so the exact-1.0 form
+    // put an out-of-bounds fetch under a large part of the frame — the
+    // near-white blocks the playtest reported whenever the camera pitched down.
+    // 1 - 0.5/SKY_H samples the CENTRE of the last row instead: the same texel
+    // under nearest-neighbour, so it is still the FOG_TINT_MUL row that the
+    // no-seam-at-the-skyline contract (ART_BIBLE §11.5, §6.6) depends on.
+    g_sk_v = clampf(1.0 - el / 1.5707963267948966, 0.0, 0.996875);
 }
 
 export fn sky_u(): f64 { let out: f64 = g_sk_u; return out; }
@@ -771,6 +852,19 @@ fn sky_emit(p_depth: f64): i32 {
             if (hi > 1.0) {
                 // This is the one column that straddles the panorama seam.
                 // Split it there rather than letting it run off the texture.
+                //
+                // ⚠ KNOWN DEFECT, NOT FIXED — playtest round 2. Over a ~7-degree
+                // window of yaw centred on the seam this path puts a 1 px
+                // vertical stripe down the sky: pure rgb(255,255,255) where the
+                // left half fetches texel 512 of 512 (u = 1.0 is the trailing
+                // EDGE, not the last texel), and the CLEAR colour where the cut
+                // leaves a column that neither half's fill rule claims.
+                // Measured, ridge_golden 01:24, yaw swept -4..+4 in 0.25 steps:
+                // 13 of 33 headings show it, 91 white px and 343 clear px in
+                // total, always at a cell boundary (x=159 or x=191).
+                // Three fixes were tried and all measured WORSE than this code
+                // (inset split trigger 15/33; inset + cut overlap 14/33), so
+                // the original is kept. See the task report for the full data.
                 let t: f64 = (1.0 - ua) / (ub - ua);
                 let xc: f64 = x0 + (x1 - x0) * t;
                 tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, xc, y1,
@@ -820,6 +914,7 @@ export fn frame_render(): i32 {
     let proj = mat_perspective(fovr, aspect, g_NEAR, far);
     let view = mat_look_dir(v3(g_camx, g_camy, g_camz), g_yaw * g_D2R, g_pitch * g_D2R);
     g_mvp = mat_mul(proj, view);
+    g_proj = proj;                      // view space, for the viewmodel (15)
     emit_set_mvp(g_mvp);
     emit_set_viewport(f64(g_RES_W), f64(g_RES_H), g_GUARD);
     emit_set_near(g_NEAR);
@@ -1011,25 +1106,26 @@ export fn frame_render(): i32 {
     stat_set(STAT_ENTS_DRAWN, edrawn);
     stat_end(STAT_T_EMIT_ENTITY);
 
-    // -- 15  viewmodel: never culled, never fogged --------------------------
+    // -- 15  viewmodel: never culled, never fogged, and IN VIEW SPACE -------
+    //
+    // Full rationale at g_vm_model's declaration. In one line: the viewmodel is
+    // bolted to the camera, so it is drawn under `proj` alone -- the view
+    // matrix is the camera's own rotation, and that is the one transform a
+    // first-person held object must NOT receive. No yaw term, no pitch term,
+    // no camera position: g_vm_model is the same sixteen constants forever,
+    // which is why no camera angle can pose it wrongly again.
     stat_begin(STAT_T_EMIT_VIEWMODEL);
     if (sheet == 0 && g_opt_viewmodel != 0) {
-        let cy2: f64 = cos(g_yaw * g_D2R); let sy2: f64 = sin(g_yaw * g_D2R);
-        let cp2: f64 = cos(g_pitch * g_D2R); let sp2: f64 = sin(g_pitch * g_D2R);
-        let ffx: f64 = sy2 * cp2; let ffy: f64 = sp2; let ffz: f64 = 0.0 - (cy2 * cp2);
-        let rrx: f64 = cy2; let rrz: f64 = sy2;
-        let uux: f64 = 0.0 - (sy2 * sp2); let uuy: f64 = cp2; let uuz: f64 = cy2 * sp2;
-        // mesh_emit_yaw rotates local +z to (sin yaw, cos yaw); the camera
-        // looks down (sin yaw_c, -cos yaw_c), so the model yaw is PI - yaw_c.
-        let vyaw: f64 = 3.141592653589793 - g_yaw * g_D2R;
-        let vx: f64 = g_camx + ffx * 1.05 + rrx * 0.26 + uux * (0.0 - 0.34);
-        let vy: f64 = g_camy + ffy * 1.05 + uuy * (0.0 - 0.34);
-        let vz: f64 = g_camz + ffz * 1.05 + rrz * 0.26 + uuz * (0.0 - 0.34);
-        // The viewmodel is never fogged (§6.6) but it IS lit: a full-albedo gun
-        // at night is the single most common first-person lighting bug. It is
-        // baked with the world, so the tint is neutral and alpha is opaque.
-        mesh_emit_yaw(g_mesh_vm, g_bworld, g_tex_world,
-                      vx, vy, vz, vyaw, 1.0, 255, 255, 255, 255);
+        // The viewmodel is never fogged (§6.6) but it IS lit: a full-albedo
+        // lantern at night is the single most common first-person lighting
+        // bug. It is baked with the world, so the tint is neutral and alpha is
+        // opaque. Depth is mesh_emit's usual view-space w, which under this
+        // placement is z_local + 1.05 m -- nearer than anything in the world,
+        // so it still paints last inside LAYER_WORLD, exactly as before.
+        mesh_set_mvp(g_proj);
+        mesh_emit(g_mesh_vm, g_bworld, g_tex_world, g_vm_model,
+                  255, 255, 255, 255);
+        mesh_set_mvp(g_mvp);            // restore world space for stage 16 on
     }
     stat_end(STAT_T_EMIT_VIEWMODEL);
 
