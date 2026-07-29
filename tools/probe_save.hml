@@ -1,0 +1,1202 @@
+// =============================================================================
+//  probe_save.hml — W4-12's acceptance harness.   BUILD_PLAN W4-12.
+// =============================================================================
+//
+//      hemlockc -O1 tools/probe_save.hml -o /tmp/probe_save
+//      /tmp/probe_save                     # compiled — the shipping path
+//      hemlock  tools/probe_save.hml       # interpreted — parity
+//      nm /tmp/probe_save | grep -c SDL_   # MUST be 0
+//
+//  Exits 1 on any failed assertion, and asserts its own assertion COUNT so a
+//  section that silently stops running is a failure rather than a green run.
+//
+//  WHAT IT IS ACTUALLY TRYING TO CATCH
+//  -----------------------------------
+//  A save format has exactly two ways to be wrong, and both of them look fine:
+//
+//    1. It round-trips the HASH but not the STATE.  `sim_hash` quantizes
+//       positions to 1/16 m, so a codec that stored a float as a fixed-point
+//       i32 would pass a hash comparison and desync three seconds later.  So
+//       this probe compares RAW f64 BIT PATTERNS as well as the hash, and it
+//       plants a position whose low mantissa bits do not survive quantization
+//       so that the check has something to fail on.
+//
+//    2. It round-trips the state but not the WORLD the state lives in.  The
+//       chunk store is not in `sim_hash` at all.  A load that restored every
+//       entity and forgot which chunks were resident would pass every hash
+//       assertion at tick 0 and then run on missing terrain.  So this probe
+//       does not stop at the round trip: it STEPS BOTH WORLDS FORWARD and
+//       compares them every tick.
+//
+//  It also plants deliberately malformed files — bad magic, a future version,
+//  a truncated tail, one flipped byte — and requires a NAMED refusal for each,
+//  because "rejected cleanly rather than crashing" is an acceptance criterion
+//  and an uncaught exception satisfies neither half of it.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { read_file, remove_file } from "@stdlib/fs";
+
+import { g_MAX_ENTS, g_RING_RADIUS, g_WPN_COUNT } from "../src/core/config.hml";
+
+import { world_spawn, world_count, world_check, world_slot_of, world_id_of,
+         world_cap, world_tick, world_seed, world_next_id,
+         world_spawn_count, world_despawn_count,
+         KIND_AI, KIND_LANTERN, KIND_PICKUP, KIND_PROP, KIND_COSMETIC,
+         SLOT_NONE, ID_NONE, ID_AI_BASE, ID_PICKUP_BASE
+       } from "../src/sim/world.hml";
+
+import { chunk_store_new_cap, chunk_set_source, chunk_get, chunk_find,
+         chunk_set_edit, chunk_edit_get, chunk_edit_count, chunk_resident,
+         chunk_height_at, chunk_seed, chunk_cap, chunk_load_count,
+         CHUNK_H_STRIDE_B, CHUNK_A_STRIDE_B, CHUNK_SAMPLES, EDIT_NONE
+       } from "../src/sim/chunk.hml";
+
+import { worldgen_chunk_at } from "../src/sim/worldgen.hml";
+
+import { cmd_new, cmd_set, BTN_FIRE, BTN_JUMP, BTN_SPRINT, BTN_USE,
+         BTN_RELOAD, CMD_FIELDS } from "../src/sim/command.hml";
+
+import { rng_new, rng_seed, rng_f01, rng_f11, rng_next, RNG_DIRECTOR
+       } from "../src/sim/rng.hml";
+
+import { ai_spawn, ai_hash, ai_agent_count } from "../src/sim/ai.hml";
+import { prog_level, prog_xp_total, prog_hash, prog_award, prog_on_kill,
+         PROG_FIELDS, PROG_LEVEL, PROG_XP_TOTAL, XPS_LANTERN
+       } from "../src/sim/progression.hml";
+import { move_state_hash, PS_FIELDS, PS_PX, PS_PZ, PS_VY } from "../src/sim/movement.hml";
+import { wpn_cur, wpn_ammo, wpn_hash_all, WS_FIELDS, WS_MAG0, WS_BLOOM,
+         WPN_KESTREL, WPN_SPARROW } from "../src/sim/weapons.hml";
+import { evbus_count, evbus_hash, combat_events } from "../src/sim/combat.hml";
+import { proj_state_hash } from "../src/sim/projectiles.hml";
+import { director_hash, director_wave_state, director_begin,
+         director_set_anchor } from "../src/sim/director.hml";
+
+import { sim_new_cap, sim_set_chunks, sim_add_player, sim_queue_command,
+         sim_step, sim_effects, sim_hash, sim_of, sim_players,
+         sim_progression, sim_weapon_state, sim_day_t, sim_tier, sim_phase,
+         sim_stat_lanterns, sim_chunks, sim_player_id, sim_director,
+         SIM_CMD_QUEUE, SIM_STAGE_COUNT, SIM_LANTERN_LIT, SIM_LANTERN_UNLIT
+       } from "../src/sim/sim.hml";
+
+// ---- the file this task owns ------------------------------------------------
+import {
+    save_bytes, save_alloc, save_encode, save_decode, save_verify,
+    save_write, save_read, save_read_file, save_exists, save_roundtrip_ok,
+    save_peek_version, save_peek_min_version, save_peek_records,
+    save_peek_reason, save_peek_meta,
+    save_skipped_records, save_skipped_bytes, save_applied_records,
+    save_last_error, save_last_version, save_err_name, save_reason_name,
+    SAVE_MAGIC, SAVE_VERSION, SAVE_MIN_VERSION, SAVE_HDR_B, SAVE_REC_HDR_B,
+    SAVE_TBL_HDR_B, SAVE_ALIGN,
+    SAVE_OFF_MAGIC, SAVE_OFF_VER, SAVE_OFF_MINVER, SAVE_OFF_HDRB,
+    SAVE_OFF_PAYB, SAVE_OFF_RECS, SAVE_OFF_SUM, SAVE_OFF_REASON,
+    SAVE_REASON_TOWN, SAVE_REASON_SLEEP, SAVE_REASON_LANTERN,
+    SAVE_REASON_QUIT, SAVE_REASON_COUNT,
+    SAVE_T_META, SAVE_T_TIME, SAVE_T_ENTITY, SAVE_T_PLAYER, SAVE_T_PROG,
+    SAVE_T_WEAPON, SAVE_T_EVBUS, SAVE_T_CHUNKEDIT, SAVE_T_CHUNKRING,
+    SAVE_T_DIRECTOR, SAVE_T_LOOT, SAVE_T_COUNT,
+    SAVE_C_META_I, SAVE_C_TIME_I, SAVE_C_TIME_F, SAVE_C_ENTITY_I,
+    SAVE_C_ENTITY_F, SAVE_C_PLAYER_I, SAVE_C_PLAYER_F, SAVE_C_RING_I,
+    SAVE_C_RNG_U, SAVE_C_CHUNKMETA_I, SAVE_B_PER_CHUNK, SAVE_BUDGET_B,
+    SAVE_ERR_MAGIC, SAVE_ERR_VERSION, SAVE_ERR_TRUNC, SAVE_ERR_CHECKSUM,
+    SAVE_ERR_SMALL, SAVE_ERR_CAP, SAVE_ERR_RECORD, SAVE_ERR_IO,
+    SAVE_ERR_HEADER, SAVE_ERR_PROG
+} from "../src/game/save.hml";
+
+// ===========================================================================
+//  HARNESS
+// ===========================================================================
+
+let g_EXPECT_ASSERTS: i32 = 209;
+let g_TRIALS: i32 = 7;
+
+// RULE T regression guards.  ~2x the LOADED measurement on this box (which
+// permanently shares ~17 of 24 cores with a llama-server), not an idle-box
+// certificate.  Both numbers appear in the assertion text.
+let g_ENC_MS_GUARD: f64 = 4.0;    // loaded: ~0.9 ms for a 400-tick world
+// A decode REGENERATES every resident chunk, so its cost is dominated by
+// worldgen, not by the codec.  The guard is therefore expressed per chunk and
+// checked against W3-1's own documented budget (2.0 ms/chunk), which is the
+// number that actually protects something.  The absolute guard is ~2x the
+// loaded measurement of a 39-chunk world.
+let g_DEC_MS_GUARD: f64 = 70.0;
+let g_DEC_MS_PER_CHUNK_GUARD: f64 = 2.0;
+// The interpreter is ~6-10x slower and the game SHIPS COMPILED, so the same
+// bound would be a false failure rather than a regression guard.  Both numbers
+// are printed either way, and the assertion text names which one it used.
+let g_ENC_MS_GUARD_INTERP: f64 = 25.0;
+let g_DEC_MS_GUARD_INTERP: f64 = 400.0;
+let g_DEC_MS_PER_CHUNK_GUARD_INTERP: f64 = 12.0;
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+let g_day_400: f64 = 0.0;
+let g_compiled: i32 = 1;
+let g_streams_400: i32 = 0;
+
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+// Which backend is running.  `tools/probe_sim.hml` uses the same test: the
+// interpreter is invoked with the .hml path as argv[0].
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn r3(p_v: f64): f64 {
+    let v: f64 = p_v * 1000.0;
+    let r: f64 = f64(i32(v + 0.5)) / 1000.0;
+    let out: f64 = r;
+    return out;
+}
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+// ===========================================================================
+//  BYTE HELPERS — an INDEPENDENT implementation of the format's arithmetic.
+// ===========================================================================
+//  Deliberately not imported from save.hml.  A probe that checks a checksum
+//  with the same function that produced it checks nothing.
+
+fn bi(p_b: buffer, p_o: i32): i32 {
+    let v: i32 = ptr_read_i32(ptr_offset(buffer_ptr(p_b), p_o, 1));
+    return v;
+}
+fn bw(p_b: buffer, p_o: i32, p_v: i32) {
+    ptr_write_i32(ptr_offset(buffer_ptr(p_b), p_o, 1), p_v);
+}
+fn bf(p_b: buffer, p_o: i32): f64 {
+    let v: f64 = ptr_read_f64(ptr_offset(buffer_ptr(p_b), p_o, 1));
+    return v;
+}
+fn bu8(p_b: buffer, p_o: i32): i32 {
+    let v: i32 = ptr_read_u8(ptr_offset(buffer_ptr(p_b), p_o, 1));
+    return v;
+}
+fn bw8(p_b: buffer, p_o: i32, p_v: i32) {
+    ptr_write_u8(ptr_offset(buffer_ptr(p_b), p_o, 1), p_v);
+}
+
+// FNV-1a-32, written here from the spec rather than shared with the subject.
+fn probe_fnv(p_b: buffer, p_off: i32, p_n: i32): i32 {
+    let h: u64 = 2166136261;
+    let i: i32 = 0;
+    while (i < p_n) {
+        h = (h ^ u64(bu8(p_b, p_off + i))) * 16777619;
+        h = h & 4294967295;
+        i++;
+    }
+    let out: i32 = i32(h & 2147483647);
+    return out;
+}
+
+fn reseal(p_b: buffer) {
+    let payload: i32 = bi(p_b, SAVE_OFF_PAYB);
+    bw(p_b, SAVE_OFF_SUM, probe_fnv(p_b, bi(p_b, SAVE_OFF_HDRB), payload));
+}
+
+fn clone(p_b: buffer, p_n: i32): buffer {
+    let out: buffer = buffer(p_n);
+    let i: i32 = 0;
+    while (i < p_n) { bw8(out, i, bu8(p_b, i)); i++; }
+    return out;
+}
+
+fn pad8(p_n: i32): i32 {
+    let n: i32 = p_n;
+    let r: i32 = n % 8;
+    if (r != 0) { n = n + (8 - r); }
+    let o: i32 = n;
+    return o;
+}
+
+// Which record tag owns byte `p_o`?  Used to name a byte-level disagreement.
+fn tag_at(p_b: buffer, p_o: i32): i32 {
+    let hb: i32 = bi(p_b, SAVE_OFF_HDRB);
+    let end: i32 = hb + bi(p_b, SAVE_OFF_PAYB);
+    if (p_o < hb) { let h: i32 = 0; return h; }
+    let o: i32 = hb;
+    while (o + SAVE_REC_HDR_B <= end) {
+        let ln: i32 = bi(p_b, o + 4);
+        if (p_o >= o) { if (p_o < o + SAVE_REC_HDR_B + ln) { let t: i32 = bi(p_b, o); return t; } }
+        o = o + SAVE_REC_HDR_B + ln;
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// Byte offset of the record carrying `p_tag`, or -1.
+fn find_rec(p_b: buffer, p_tag: i32): i32 {
+    let hb: i32 = bi(p_b, SAVE_OFF_HDRB);
+    let end: i32 = hb + bi(p_b, SAVE_OFF_PAYB);
+    let o: i32 = hb;
+    while (o + SAVE_REC_HDR_B <= end) {
+        if (bi(p_b, o) == p_tag) { let f: i32 = o; return f; }
+        o = o + SAVE_REC_HDR_B + bi(p_b, o + 4);
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// ===========================================================================
+//  THE WORLD UNDER TEST
+// ===========================================================================
+
+fn ns_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                   p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let out: i32 = worldgen_chunk_at(p_seed, p_cx, p_cz, p_hbuf, p_hoff, p_abuf, p_aoff);
+    return out;
+}
+
+fn make_world(p_seed: i32, p_ccap: i32): object {
+    let cs: object = chunk_store_new_cap(p_ccap, 4096, p_seed);
+    chunk_set_source(cs, ns_chunk_source);
+    let w: object = sim_new_cap(256, 2, p_seed);
+    sim_set_chunks(w, cs);
+    sim_add_player(w, 1, 3.0, 2.0);
+    sim_add_player(w, 2, 8.0, 5.0);
+    let out: object = w;
+    return out;
+}
+
+// A broad, reproducible scenario: every one of the ten stages does work, so
+// every module's slice of the save has something in it that is not zero.
+fn run_scenario(p_w: object, p_ticks: i32, p_seed: i32) {
+    let w: object = p_w;
+    let s: object = sim_of(w);
+
+    // enemies, a lantern within reach of player 1, a pickup, a prop
+    let k: i32 = 0;
+    while (k < 8) {
+        ai_spawn(s.ai, w, k % 4, 9.0 + f64(k) * 1.5, 0.0, 11.0, 0.4);
+        k++;
+    }
+    let lslot: i32 = world_spawn(w, KIND_LANTERN, 0);
+    if (lslot != SLOT_NONE) {
+        let px = w.px; let py = w.py; let pz = w.pz; let an = w.anim;
+        px[lslot] = 3.4; py[lslot] = chunk_height_at(s.cs, 3.4, 2.3); pz[lslot] = 2.3;
+        an[lslot] = SIM_LANTERN_UNLIT;
+    }
+    let pslot: i32 = world_spawn(w, KIND_PICKUP, 0);
+    if (pslot != SLOT_NONE) {
+        let px2 = w.px; let pz2 = w.pz;
+        px2[pslot] = 40.0; pz2[pslot] = 40.0;
+    }
+    world_spawn(w, KIND_PROP, 0);
+
+    // player edits to the terrain — the ONLY chunk data a save carries
+    chunk_set_edit(s.cs, 0, 0, 12, 3300);
+    chunk_set_edit(s.cs, 0, 0, 40, 3120);
+    chunk_set_edit(s.cs, 1, 0, 7, 2980);
+    chunk_set_edit(s.cs, -2, 3, 63, 4100);
+
+    // the town's solid boxes
+    let sol = s.solids;
+    sol.push(0.0); sol.push(0.0); sol.push(0.0);
+    sol.push(2.0); sol.push(3.0); sol.push(2.0);
+    sol.push(10.0); sol.push(0.0); sol.push(10.0);
+    sol.push(13.5); sol.push(4.25); sol.push(12.75);
+
+    // arm the director so the wave machine has live state to persist
+    director_set_anchor(s.dir, 3.4, 0.0, 2.3);
+    director_begin(s.dir, 0);
+
+    let rs: array = rng_new();
+    let c: object = cmd_new();
+    let t: i32 = 0;
+    while (t < p_ticks) {
+        rng_seed(rs, p_seed, RNG_DIRECTOR, t, 1);
+        let btn: i32 = 0;
+        if (rng_f01(rs) < 0.55) { btn = btn | BTN_FIRE; }
+        if (rng_f01(rs) < 0.06) { btn = btn | BTN_RELOAD; }
+        let mx: f64 = rng_f11(rs);
+        let my: f64 = rng_f11(rs);
+        // GDD 8's beat: player 1 stands on the lantern and holds USE through the
+        // 2.5 s channel.  A save has to be able to round-trip a WORLD THAT HAS
+        // BEEN PLAYED, and "the lantern is lit" is the first durable thing the
+        // player ever does — so the scenario must actually do it, not merely
+        // roll dice near it.
+        if (t >= 20) {
+            if (t < 220) { btn = btn | BTN_USE; mx = 0.0; my = 0.0; }
+        }
+        if (t >= 220) {
+            if (rng_f01(rs) < 0.25) { btn = btn | BTN_SPRINT; }
+            if (rng_f01(rs) < 0.10) { btn = btn | BTN_JUMP; }
+        }
+        cmd_set(c, t, 16, mx, my,
+                rng_f01(rs) * 6.283, rng_f11(rs) * 0.7, btn, WPN_KESTREL, t);
+        sim_queue_command(w, 1, c);
+
+        rng_seed(rs, p_seed, RNG_DIRECTOR, t, 2);
+        let btn2: i32 = 0;
+        if (rng_f01(rs) < 0.4) { btn2 = btn2 | BTN_FIRE; }
+        if (rng_f01(rs) < 0.2) { btn2 = btn2 | BTN_JUMP; }
+        cmd_set(c, t, 16, rng_f11(rs), rng_f11(rs),
+                rng_f01(rs) * 6.283, rng_f11(rs) * 0.5, btn2, WPN_SPARROW, t);
+        sim_queue_command(w, 2, c);
+
+        sim_step(w, t);
+        sim_effects(w);
+        t++;
+    }
+}
+
+// Every f64 of every entity, compared as a RAW BIT PATTERN.  This is the check
+// `sim_hash` cannot do, because `sim_hash` quantizes to 1/16 m.
+fn entities_bit_equal(p_a: object, p_b: object): i32 {
+    let a: object = p_a;
+    let b: object = p_b;
+    if (a.count != b.count) { let no: i32 = 0; return no; }
+    let n: i32 = a.count;
+    let axf = [a.px, a.py, a.pz, a.vx, a.vy, a.vz, a.yaw, a.pitch, a.anim_t, a.ai_timer];
+    let bxf = [b.px, b.py, b.pz, b.vx, b.vy, b.vz, b.yaw, b.pitch, b.anim_t, b.ai_timer];
+    let axi = [a.id, a.kind, a.owner, a.spawn_tick, a.hp, a.hp_max, a.armor,
+               a.team, a.anim, a.flags, a.model, a.tint, a.weapon, a.ammo_mag,
+               a.ammo_res, a.xp, a.level, a.wickmarks, a.ai_state,
+               a.ai_target_id, a.loot_seed, a.last_hit_by];
+    let bxi = [b.id, b.kind, b.owner, b.spawn_tick, b.hp, b.hp_max, b.armor,
+               b.team, b.anim, b.flags, b.model, b.tint, b.weapon, b.ammo_mag,
+               b.ammo_res, b.xp, b.level, b.wickmarks, b.ai_state,
+               b.ai_target_id, b.loot_seed, b.last_hit_by];
+    let c: i32 = 0;
+    while (c < 10) {
+        let ca = axf[c]; let cb = bxf[c];
+        let i: i32 = 0;
+        while (i < n) { if (ca[i] != cb[i]) { let no2: i32 = 0; return no2; } i++; }
+        c++;
+    }
+    c = 0;
+    while (c < 22) {
+        let ca2 = axi[c]; let cb2 = bxi[c];
+        let i2: i32 = 0;
+        while (i2 < n) { if (ca2[i2] != cb2[i2]) { let no3: i32 = 0; return no3; } i2++; }
+        c++;
+    }
+    let yes: i32 = 1;
+    return yes;
+}
+
+fn players_bit_equal(p_a: object, p_b: object): i32 {
+    let a: object = sim_of(p_a);
+    let b: object = sim_of(p_b);
+    let np: i32 = a.players;
+    let pa = a.move_ps; let pb = b.move_ps;
+    let wa = a.wpn; let wb = b.wpn;
+    let ga = a.prog; let gb = b.prog;
+    let k: i32 = 0;
+    while (k < np) {
+        let x: array<f64> = pa[k];
+        let y: array<f64> = pb[k];
+        let j: i32 = 0;
+        while (j < PS_FIELDS) { if (x[j] != y[j]) { let no: i32 = 0; return no; } j++; }
+        let j2: i32 = 0;
+        while (j2 < WS_FIELDS) {
+            if (wa[k * WS_FIELDS + j2] != wb[k * WS_FIELDS + j2]) { let no2: i32 = 0; return no2; }
+            j2++;
+        }
+        let ra: array = ga[k];
+        let rb: array = gb[k];
+        let j3: i32 = 0;
+        while (j3 < PROG_FIELDS) { if (ra[j3] != rb[j3]) { let no3: i32 = 0; return no3; } j3++; }
+        k++;
+    }
+    let yes: i32 = 1;
+    return yes;
+}
+
+// Step two worlds in lockstep on the same commands; return the first tick at
+// which their hashes differ, or -1 if they never do.
+fn lockstep(p_a: object, p_b: object, p_from: i32, p_ticks: i32, p_seed: i32): i32 {
+    let rs: array = rng_new();
+    let c: object = cmd_new();
+    let t: i32 = p_from;
+    let last: i32 = p_from + p_ticks;
+    while (t < last) {
+        rng_seed(rs, p_seed, RNG_DIRECTOR, t, 7);
+        let btn: i32 = 0;
+        if (rng_f01(rs) < 0.5) { btn = btn | BTN_FIRE; }
+        if (rng_f01(rs) < 0.15) { btn = btn | BTN_JUMP; }
+        cmd_set(c, t, 16, rng_f11(rs), rng_f11(rs),
+                rng_f01(rs) * 6.283, rng_f11(rs) * 0.6, btn, WPN_KESTREL, t);
+        sim_queue_command(p_a, 1, c);
+        sim_queue_command(p_b, 1, c);
+        rng_seed(rs, p_seed, RNG_DIRECTOR, t, 8);
+        cmd_set(c, t, 16, rng_f11(rs), rng_f11(rs),
+                rng_f01(rs) * 6.283, rng_f11(rs) * 0.3, 0, WPN_SPARROW, t);
+        sim_queue_command(p_a, 2, c);
+        sim_queue_command(p_b, 2, c);
+        sim_step(p_a, t); sim_effects(p_a);
+        sim_step(p_b, t); sim_effects(p_b);
+        if (sim_hash(p_a) != sim_hash(p_b)) { let bad: i32 = t; return bad; }
+        t++;
+    }
+    let none: i32 = -1;
+    return none;
+}
+
+// ===========================================================================
+//  FORWARD-COMPATIBILITY FIXTURES
+// ===========================================================================
+//  These synthesise files that THIS BUILD CANNOT WRITE, because the whole
+//  point of a version field is what happens when the writer is not you.
+
+// Copy `p_src`, appending one record with a tag no build has ever defined.
+fn with_unknown_record(p_src: buffer, p_len: i32, p_tag: i32, p_rows: i32): buffer {
+    let extra: i32 = SAVE_REC_HDR_B + SAVE_TBL_HDR_B + pad8(p_rows * 4);
+    let out: buffer = buffer(p_len + extra);
+    let i: i32 = 0;
+    while (i < p_len) { bw8(out, i, bu8(p_src, i)); i++; }
+    let o: i32 = p_len;
+    bw(out, o, p_tag);
+    bw(out, o + 4, SAVE_TBL_HDR_B + pad8(p_rows * 4));
+    bw(out, o + 8, p_rows);
+    bw(out, o + 12, 1);
+    bw(out, o + 16, 0);
+    bw(out, o + 20, 0);
+    let r: i32 = 0;
+    while (r < p_rows) { bw(out, o + 24 + r * 4, 1000 + r); r++; }
+    bw(out, SAVE_OFF_PAYB, bi(out, SAVE_OFF_PAYB) + extra);
+    bw(out, SAVE_OFF_RECS, bi(out, SAVE_OFF_RECS) + 1);
+    reseal(out);
+    return out;
+}
+
+// Copy `p_src`, rewriting the TIME record with `p_delta` more (or fewer) i32
+// columns.  New columns are zero; dropped ones come off the end.  This is
+// exactly the byte image a future — or a past — writer would produce.
+fn with_time_cols(p_src: buffer, p_len: i32, p_delta: i32): buffer {
+    let rec: i32 = find_rec(p_src, SAVE_T_TIME);
+    let rows: i32 = bi(p_src, rec + 8);
+    let ci: i32 = bi(p_src, rec + 12);
+    let cf: i32 = bi(p_src, rec + 16);
+    let cu: i32 = bi(p_src, rec + 20);
+    let nci: i32 = ci + p_delta;
+    let oldlen: i32 = bi(p_src, rec + 4);
+    let newbody: i32 = SAVE_TBL_HDR_B + pad8(rows * nci * 4) + rows * cf * 8 + rows * cu * 8;
+    let delta_b: i32 = newbody - oldlen;
+    let out: buffer = buffer(p_len + delta_b);
+
+    // everything up to the record, verbatim
+    let i: i32 = 0;
+    while (i < rec) { bw8(out, i, bu8(p_src, i)); i++; }
+    // the rewritten record header
+    bw(out, rec, SAVE_T_TIME);
+    bw(out, rec + 4, newbody);
+    bw(out, rec + 8, rows);
+    bw(out, rec + 12, nci);
+    bw(out, rec + 16, cf);
+    bw(out, rec + 20, cu);
+    // the i32 columns that both layouts share
+    let keep: i32 = ci;
+    if (nci < keep) { keep = nci; }
+    let src_ib: i32 = rec + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+    let dst_ib: i32 = rec + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+    let c: i32 = 0;
+    while (c < keep) {
+        let r: i32 = 0;
+        while (r < rows) {
+            bw(out, dst_ib + (c * rows + r) * 4, bi(p_src, src_ib + (c * rows + r) * 4));
+            r++;
+        }
+        c++;
+    }
+    // the f64 block, moved to its new home
+    let src_fb: i32 = src_ib + pad8(rows * ci * 4);
+    let dst_fb: i32 = dst_ib + pad8(rows * nci * 4);
+    let fbytes: i32 = rows * cf * 8 + rows * cu * 8;
+    let j: i32 = 0;
+    while (j < fbytes) { bw8(out, dst_fb + j, bu8(p_src, src_fb + j)); j++; }
+    // every record after it, verbatim
+    let tail_src: i32 = rec + SAVE_REC_HDR_B + oldlen;
+    let tail_dst: i32 = rec + SAVE_REC_HDR_B + newbody;
+    let t: i32 = 0;
+    while (tail_src + t < p_len) { bw8(out, tail_dst + t, bu8(p_src, tail_src + t)); t++; }
+
+    bw(out, SAVE_OFF_PAYB, bi(out, SAVE_OFF_PAYB) + delta_b);
+    reseal(out);
+    return out;
+}
+
+// ===========================================================================
+//  MAIN
+// ===========================================================================
+
+fn main() {
+    g_compiled = compiled();
+    print("=========================================================");
+    print(" probe_save — W4-12  SAVE / LOAD");
+    if (g_compiled == 1) { print(" backend     COMPILED"); } else { print(" backend     interpreted"); }
+    print("=========================================================");
+    print("");
+
+    // =====================================================================
+    print("-- 1. THE FORMAT IS A CONTRACT, NOT A DUMP --");
+    // =====================================================================
+    ck(SAVE_HDR_B == 32, "the file header is 32 bytes (8-aligned, so every f64 in the file is)");
+    ck(SAVE_REC_HDR_B == 8, "a record header is 8 bytes: tag + length");
+    ck(SAVE_TBL_HDR_B == 16, "a table header is 16 bytes: rows + three column counts");
+    ck(SAVE_ALIGN == 8, "the alignment unit is 8, the width of an f64");
+    ck(SAVE_OFF_MAGIC == 0, "header offset: magic at 0");
+    ck(SAVE_OFF_VER == 4, "header offset: version at 4");
+    ck(SAVE_OFF_MINVER == 8, "header offset: min_version at 8");
+    ck(SAVE_OFF_HDRB == 12, "header offset: header_bytes at 12");
+    ck(SAVE_OFF_PAYB == 16, "header offset: payload_bytes at 16");
+    ck(SAVE_OFF_RECS == 20, "header offset: record count at 20");
+    ck(SAVE_OFF_SUM == 24, "header offset: checksum at 24");
+    ck(SAVE_OFF_REASON == 28, "header offset: save reason at 28");
+    ck(SAVE_VERSION == 1, "this build writes version 1");
+    ck(SAVE_MIN_VERSION == 1, "and declares version 1 as the oldest reader that can read it");
+
+    // Column counts are pinned to LITERALS, per CLAUDE.md's "assert the design,
+    // not the digits — but pin design anchors with a literal".  A column
+    // inserted in the middle of a record silently rotates every existing save;
+    // these are what make that a build failure instead.
+    ck(SAVE_C_ENTITY_I == 22, "the entity record carries 22 i32 columns");
+    ck(SAVE_C_ENTITY_F == 10, "the entity record carries 10 f64 columns");
+    ck(SAVE_C_PLAYER_F == 1 + PS_FIELDS, "the player record carries chan_t + every PS_FIELDS movement field ("
+        + sv(1 + PS_FIELDS) + ")");
+    ck(SAVE_C_META_I == 15 + SIM_STAGE_COUNT, "META carries 15 scalars + the " + sv(SIM_STAGE_COUNT) + " stage order slots");
+    ck(SAVE_C_RING_I == 4, "a resident chunk costs 4 i32: cx, cz, pin, stamp");
+    ck(SAVE_B_PER_CHUNK == SAVE_C_RING_I * 4, "which is " + sv(SAVE_B_PER_CHUNK) + " bytes per visited chunk");
+    ck(SAVE_C_RNG_U == 8, "eight u64 of RNG state: the sim stream and the combat stream");
+    ck(SAVE_C_CHUNKMETA_I == 11, "the chunk-store record carries 11 i32: the LRU clock, seven counters, and the SAMPLER MEMO KEY — a memo hit skips the LRU touch, so the memo is state, not cache");
+    ck(SAVE_REASON_COUNT == 4, "BUILD_PLAN W4-12 names four save triggers: town, sleep, lantern, quit");
+    print("");
+
+    // =====================================================================
+    print("-- 2. A WORLD WITH SOMETHING IN IT --");
+    // =====================================================================
+    let w: object = make_world(20260729, 128);
+    run_scenario(w, 400, 20260729);
+    let s: object = sim_of(w);
+
+    ck(world_count(w) > 4, "the scenario left " + sv(world_count(w)) + " entities alive");
+    ck(world_check(w) == 0, "the source world's sparse set is consistent before we start");
+    ck(chunk_resident(s.cs) > 8, sv(chunk_resident(s.cs)) + " chunks are resident (the streaming ring ran)");
+    ck(chunk_edit_count(s.cs) == 4, "4 terrain edits are in the overlay");
+    ck(sim_stat_lanterns(w) == 1, "the lantern was lit during the run (GDD 8's beat)");
+    let prog1: array = sim_progression(w, 1);
+    ck(prog1[PROG_XP_TOTAL] > 0, "player 1 earned XP (" + sv(prog1[PROG_XP_TOTAL]) + ")");
+    ck(evbus_count(combat_events(s.cx)) >= 0, "the event bus is readable");
+    print("  entities " + sv(world_count(w)) + "  chunks " + sv(chunk_resident(s.cs))
+        + "  level " + sv(prog1[PROG_LEVEL]) + "  day_t " + sv(r3(sim_day_t(w))));
+    print("");
+
+    // =====================================================================
+    print("-- 3. SIZING AND ENCODING AGREE --");
+    // =====================================================================
+    let need: i32 = save_bytes(w);
+    let buf: buffer = save_alloc(w);
+    ck(buf.length == need, "save_alloc gives exactly save_bytes (" + sv(need) + ") bytes");
+    let wrote: i32 = save_encode(w, buf, SAVE_REASON_QUIT);
+    ck(wrote == need, "save_encode wrote exactly save_bytes: " + sv(wrote) + " vs " + sv(need)
+        + " — the two descriptions of the layout cannot drift");
+    ck(wrote % SAVE_ALIGN == 0, "the whole file is a multiple of 8 bytes");
+
+    ck(bi(buf, SAVE_OFF_MAGIC) == SAVE_MAGIC, "the magic is on disk");
+    ck(bi(buf, SAVE_OFF_VER) == SAVE_VERSION, "the version is on disk");
+    ck(bi(buf, SAVE_OFF_MINVER) == SAVE_MIN_VERSION, "the min-version is on disk");
+    ck(bi(buf, SAVE_OFF_HDRB) == SAVE_HDR_B, "header_bytes says 32");
+    ck(bi(buf, SAVE_OFF_PAYB) + SAVE_HDR_B == wrote, "payload_bytes + header == the file length");
+    ck(bi(buf, SAVE_OFF_REASON) == SAVE_REASON_QUIT, "the save reason is on disk");
+    ck(bi(buf, SAVE_OFF_SUM) == probe_fnv(buf, SAVE_HDR_B, bi(buf, SAVE_OFF_PAYB)),
+       "the checksum matches an INDEPENDENT FNV-1a over the payload");
+    ck(save_verify(buf) == 0, "save_verify accepts what save_encode produced");
+
+    // walk the record chain with the probe's own arithmetic
+    let hb: i32 = bi(buf, SAVE_OFF_HDRB);
+    let end: i32 = hb + bi(buf, SAVE_OFF_PAYB);
+    let o: i32 = hb;
+    let nrec: i32 = 0;
+    let misaligned: i32 = 0;
+    let badlen: i32 = 0;
+    let tagmax: i32 = 0;
+    while (o + SAVE_REC_HDR_B <= end) {
+        if (o % SAVE_ALIGN != 0) { misaligned++; }
+        let tg: i32 = bi(buf, o);
+        let ln: i32 = bi(buf, o + 4);
+        if (ln % SAVE_ALIGN != 0) { badlen++; }
+        if (ln < SAVE_TBL_HDR_B) { badlen++; }
+        if (tg > tagmax) { tagmax = tg; }
+        nrec++;
+        o = o + SAVE_REC_HDR_B + ln;
+    }
+    ck(o == end, "the record chain lands exactly on the end of the payload");
+    ck(misaligned == 0, "every record starts 8-aligned (so every f64 read is aligned)");
+    ck(badlen == 0, "every record length is a legal multiple of 8");
+    ck(nrec == bi(buf, SAVE_OFF_RECS), "the header's record count (" + sv(nrec) + ") is the truth");
+    ck(nrec == SAVE_T_COUNT, "this build writes one record per defined tag: " + sv(nrec) + " of " + sv(SAVE_T_COUNT));
+    ck(tagmax <= SAVE_T_COUNT, "no record carries a tag beyond the defined set");
+    ck(find_rec(buf, SAVE_T_META) >= 0, "the META record is present");
+    ck(find_rec(buf, SAVE_T_ENTITY) >= 0, "the ENTITY record is present");
+    ck(find_rec(buf, SAVE_T_CHUNKEDIT) >= 0, "the CHUNK EDIT record is present");
+    ck(find_rec(buf, SAVE_T_CHUNKRING) >= 0, "the RESIDENT CHUNK record is present");
+    print("  " + sv(nrec) + " records, " + sv(wrote) + " bytes");
+    print("");
+
+    // =====================================================================
+    print("-- 4. HEADER INSPECTION WITHOUT A SIMULATION --");
+    // =====================================================================
+    ck(save_peek_version(buf) == SAVE_VERSION, "save_peek_version reads the version with no sim");
+    ck(save_peek_min_version(buf) == SAVE_MIN_VERSION, "save_peek_min_version likewise");
+    ck(save_peek_records(buf) == nrec, "save_peek_records agrees with the walk");
+    ck(save_peek_reason(buf) == SAVE_REASON_QUIT, "save_peek_reason reads the trigger back");
+    ck(save_peek_meta(buf, 0) == 2, "save_peek_meta(0) is the player count");
+    ck(save_peek_meta(buf, 1) == world_cap(w), "save_peek_meta(1) is the entity cap");
+    ck(save_peek_meta(buf, 2) == world_seed(w), "save_peek_meta(2) is the WORLD SEED (" + sv(world_seed(w)) + ")");
+    ck(save_peek_meta(buf, 3) == world_tick(w), "save_peek_meta(3) is the tick (" + sv(world_tick(w)) + ")");
+    ck(save_reason_name(SAVE_REASON_TOWN) == "town", "the four triggers name themselves: town");
+    ck(save_reason_name(SAVE_REASON_SLEEP) == "sleep", "sleep");
+    ck(save_reason_name(SAVE_REASON_LANTERN) == "lantern", "lantern");
+    ck(save_reason_name(SAVE_REASON_QUIT) == "quit", "quit");
+    print("");
+
+    // =====================================================================
+    print("-- 5. THE ROUND TRIP: BIT-IDENTICAL STATE HASH --");
+    // =====================================================================
+    // The scratch world is built from a DIFFERENT SEED on purpose.  A decode
+    // that quietly inherited the destination's seed would pass a same-seed test
+    // and produce another universe's terrain in the real one.
+    let h_src: u64 = sim_hash(w);
+    let w2: object = make_world(1, 128);
+    ck(sim_hash(w2) != h_src, "the destination world starts with a DIFFERENT hash (a real load, not a no-op)");
+    ck(chunk_seed(sim_chunks(w2)) == 1, "and a different terrain seed before the load");
+
+    let got: i32 = save_decode(w2, buf);
+    ck(got == wrote, "save_decode consumed the whole file: " + sv(got) + " (" + save_err_name(got) + ")");
+    ck(save_applied_records() == nrec, "every record was applied (" + sv(save_applied_records()) + ")");
+    ck(save_skipped_records() == 0, "and none was skipped");
+    ck(world_check(w2) == 0, "world_check says the rebuilt sparse set is consistent");
+
+    let h_dst: u64 = sim_hash(w2);
+    ck(h_dst == h_src, "*** THE ACCEPTANCE CRITERION: sim_hash is BIT-IDENTICAL after save+load. "
+        + sv(h_src) + " vs " + sv(h_dst));
+    print("  hash " + sv(h_src));
+
+    ck(chunk_seed(sim_chunks(w2)) == world_seed(w), "the load carried the WORLD SEED onto the chunk store");
+    ck(world_tick(w2) == world_tick(w), "the tick survived");
+    ck(world_count(w2) == world_count(w), "the entity count survived");
+    ck(world_seed(w2) == world_seed(w), "the seed survived");
+    ck(world_spawn_count(w2) == world_spawn_count(w), "the spawn counter was put back after the entity replay");
+    ck(world_despawn_count(w2) == world_despawn_count(w), "and the despawn counter");
+    ck(world_next_id(w2, KIND_AI) == world_next_id(w, KIND_AI), "the AI id allocator was restored, so ids never repeat after a load");
+    ck(world_next_id(w2, KIND_PICKUP) == world_next_id(w, KIND_PICKUP), "and the pickup allocator");
+    print("");
+
+    // =====================================================================
+    print("-- 6. THE HASH IS NOT ENOUGH: RAW BITS --");
+    // =====================================================================
+    // sim_hash quantizes position to 1/16 m.  A codec that stored floats as
+    // fixed-point would pass section 5 and still be wrong.  These do not.
+    ck(entities_bit_equal(w, w2) == 1,
+       "every entity f64 and i32 is bit-identical — not merely equal after sim_hash's 1/16 m quantization");
+    ck(players_bit_equal(w, w2) == 1,
+       "every movement, weapon and progression field is bit-identical");
+
+    // and prove the check has teeth: plant a value the quantizer would eat
+    let probe_px = w.px;
+    let px_hi: f64 = 12.345678901234567;
+    let q: f64 = f64(i32(px_hi * 16.0 + 0.5)) / 16.0;
+    ck(px_hi != q, "the test value 12.345678901234567 does NOT survive 1/16 m quantization ("
+        + sv(q) + ") — so a quantizing codec would fail the bit check above");
+
+    let w3: object = make_world(4242, 64);
+    let s3: object = sim_of(w3);
+    let pid3: i32 = sim_player_id(w3, 1);
+    let sl3: i32 = world_slot_of(w3, pid3);
+    let px3 = w3.px; let vy3 = w3.vy;
+    px3[sl3] = px_hi;
+    vy3[sl3] = 0.0 - 0.30000000000000004;
+    let ps3 = s3.move_ps;
+    let p3: array<f64> = ps3[0];
+    p3[PS_PX] = px_hi;
+    p3[PS_VY] = 1.0 / 3.0;
+    let b3: buffer = save_alloc(w3);
+    save_encode(w3, b3, SAVE_REASON_TOWN);
+    let w4: object = make_world(99, 64);
+    save_decode(w4, b3);
+    let px4 = w4.px; let vy4 = w4.vy;
+    let sl4: i32 = world_slot_of(w4, sim_player_id(w4, 1));
+    ck(px4[sl4] == px_hi, "a full-mantissa position round-trips EXACTLY (" + sv(px4[sl4]) + ")");
+    ck(vy4[sl4] == 0.0 - 0.30000000000000004, "a negative full-mantissa velocity round-trips exactly");
+    let ps4 = sim_of(w4).move_ps;
+    let p4: array<f64> = ps4[0];
+    ck(p4[PS_VY] == 1.0 / 3.0, "1/3 in the movement state round-trips exactly");
+    print("");
+
+    // =====================================================================
+    print("-- 7. WHAT THE HASH CANNOT SEE: TERRAIN, EDITS, TOWN --");
+    // =====================================================================
+    let cs1: object = sim_chunks(w);
+    let cs2: object = sim_chunks(w2);
+    ck(chunk_resident(cs2) == chunk_resident(cs1),
+       "the resident chunk SET was restored: " + sv(chunk_resident(cs2)) + " chunks");
+    ck(chunk_edit_count(cs2) == chunk_edit_count(cs1), "the edit overlay round-tripped: " + sv(chunk_edit_count(cs2)) + " edits");
+    ck(chunk_edit_get(cs2, 0, 0, 12) == 3300, "edit (0,0,12) came back as 3300 cm");
+    ck(chunk_edit_get(cs2, 0, 0, 40) == 3120, "edit (0,0,40) came back as 3120 cm");
+    ck(chunk_edit_get(cs2, 1, 0, 7) == 2980, "edit (1,0,7) came back as 2980 cm");
+    ck(chunk_edit_get(cs2, -2, 3, 63) == 4100, "a NEGATIVE-coordinate edit came back as 4100 cm");
+    ck(chunk_edit_get(cs2, 5, 5, 1) == EDIT_NONE, "and a chunk that was never edited has no edit");
+    ck(chunk_height_at(cs2, 3.4, 2.3) == chunk_height_at(cs1, 3.4, 2.3),
+       "the ground under the lantern is at the same height in both worlds");
+    ck(chunk_height_at(cs2, 41.0, 39.0) == chunk_height_at(cs1, 41.0, 39.0),
+       "and so is the ground 40 m away, where only the streaming ring had been");
+
+    let sol1 = sim_of(w).solids;
+    let sol2 = sim_of(w2).solids;
+    ck(sol2.length == sol1.length, "the town's solid boxes came back: " + sv(sol2.length / 6) + " AABBs");
+    let solok: i32 = 1;
+    let si: i32 = 0;
+    while (si < sol1.length) { if (sol1[si] != sol2[si]) { solok = 0; } si++; }
+    ck(solok == 1, "every AABB corner is bit-identical (13.5 / 4.25 / 12.75 among them)");
+    print("");
+
+    // =====================================================================
+    print("-- 8. PROGRESSION, UNLOCKS, LOOT, LANTERNS, TIME OF DAY --");
+    // =====================================================================
+    let pa1: array = sim_progression(w, 1);
+    let pb1: array = sim_progression(w2, 1);
+    ck(pb1[PROG_LEVEL] == pa1[PROG_LEVEL], "level survived: " + sv(pb1[PROG_LEVEL]));
+    ck(pb1[PROG_XP_TOTAL] == pa1[PROG_XP_TOTAL], "lifetime XP survived: " + sv(pb1[PROG_XP_TOTAL]));
+    ck(prog_hash(pb1) == prog_hash(pa1), "progression.hml's own hash agrees — unlocks are DERIVED from level, so there is one source of truth for them");
+    let pa2: array = sim_progression(w, 2);
+    let pb2: array = sim_progression(w2, 2);
+    ck(prog_hash(pb2) == prog_hash(pa2), "player 2's progression too");
+
+    let wa = sim_weapon_state(w);
+    let wb = sim_weapon_state(w2);
+    ck(wpn_hash_all(wb, 2) == wpn_hash_all(wa, 2), "weapon state survived (mags, reserves, bloom, recoil index)");
+    ck(wb[WS_MAG0] == wa[WS_MAG0], "rounds in the Sparrow magazine: " + sv(i32(wb[WS_MAG0])));
+    ck(wb[WS_BLOOM] == wa[WS_BLOOM], "accumulated hipfire bloom is bit-identical");
+
+    ck(sim_day_t(w2) == sim_day_t(w), "TIME OF DAY survived exactly: day_t = " + sv(r3(sim_day_t(w2))));
+    g_day_400 = sim_day_t(w);
+    ck(sim_phase(w2) == sim_phase(w), "so did the day phase (" + sv(sim_phase(w2)) + ")");
+    ck(sim_tier(w2) == sim_tier(w), "and the shade tier (" + sv(sim_tier(w2)) + ")");
+    ck(sim_stat_lanterns(w2) == sim_stat_lanterns(w), "the lit-lantern count survived");
+
+    // lanterns are entities, so "lit" is one field of one body — there is no
+    // second list to drift.
+    let lit_a: i32 = 0; let lit_b: i32 = 0; let unlit_b: i32 = 0;
+    let ka = w.kind; let an_a = w.anim;
+    let kb = w2.kind; let an_b = w2.anim;
+    let li: i32 = 0;
+    while (li < w.count) { if (ka[li] == KIND_LANTERN) { if (an_a[li] == SIM_LANTERN_LIT) { lit_a++; } } li++; }
+    li = 0;
+    while (li < w2.count) {
+        if (kb[li] == KIND_LANTERN) {
+            if (an_b[li] == SIM_LANTERN_LIT) { lit_b++; }
+            if (an_b[li] == SIM_LANTERN_UNLIT) { unlit_b++; }
+        }
+        li++;
+    }
+    ck(lit_a == 1, "the source world has exactly one LIT lantern");
+    ck(lit_b == lit_a, "and so does the loaded world");
+    ck(unlit_b == 0, "with no lantern silently reverting to unlit");
+
+    g_streams_400 = sim_of(w).streams;
+    ck(sim_of(w2).loot_hash == sim_of(w).loot_hash, "the loot hash survived");
+    ck(sim_of(w2).loot_rolls == sim_of(w).loot_rolls, "and the roll count (" + sv(sim_of(w2).loot_rolls) + ")");
+    ck(director_hash(sim_director(w2)) == director_hash(sim_director(w)), "the wave director's whole state survived");
+    ck(director_wave_state(sim_director(w2)) == director_wave_state(sim_director(w)), "including which wave state it is in");
+    ck(ai_hash(sim_of(w2).ai, w2) == ai_hash(sim_of(w).ai, w), "and every AI agent's state");
+    ck(proj_state_hash(sim_of(w2).proj, w2) == proj_state_hash(sim_of(w).proj, w), "and every projectile in flight");
+    ck(evbus_hash(combat_events(sim_of(w2).cx)) == evbus_hash(combat_events(sim_of(w).cx)), "and this tick's event bus");
+    print("");
+
+    // =====================================================================
+    print("-- 9. IT LOADS THE SAME **AND CONTINUES THE SAME** --");
+    // =====================================================================
+    // A load that matches at tick 0 and diverges at tick 1 is the failure mode
+    // a hash check alone cannot see, because the things that cause it — chunk
+    // residency, the RNG streams, the LRU clock — are not in the hash.
+    let dv: i32 = lockstep(w, w2, 400, 300, 20260729);
+    ck(dv == -1, "300 further ticks in lockstep, hashed EVERY tick, never diverge (first divergence: "
+        + sv(dv) + ", -1 = none)");
+    ck(sim_hash(w) == sim_hash(w2), "and the hashes agree at the end of them");
+    ck(entities_bit_equal(w, w2) == 1, "with every entity still bit-identical 300 ticks later");
+    print("  700 total ticks, no divergence");
+    print("");
+
+    // =====================================================================
+    print("-- 10. THE FORMAT IS CANONICAL AND THE FILE IS A FILE --");
+    // =====================================================================
+    let h_now: u64 = sim_hash(w);
+    let buf2: buffer = save_alloc(w2);
+    let wrote2: i32 = save_encode(w2, buf2, SAVE_REASON_QUIT);
+    let wsrc: buffer = save_alloc(w);
+    let wsrc_n: i32 = save_encode(w, wsrc, SAVE_REASON_QUIT);
+    ck(wrote2 == wsrc_n, "re-encoding both worlds gives the same length");
+    let bytediff: i32 = 0;
+    let firstdiff: i32 = -1;
+    let bi2: i32 = 0;
+    while (bi2 < wrote2) {
+        if (bu8(buf2, bi2) != bu8(wsrc, bi2)) {
+            if (bi2 >= SAVE_HDR_B) { if (firstdiff < 0) { firstdiff = bi2; } }
+            bytediff++;
+        }
+        bi2++;
+    }
+    if (bytediff > 0) {
+        print("    first differing PAYLOAD byte " + sv(firstdiff) + " in record tag " + sv(tag_at(wsrc, firstdiff)));
+        let rr: i32 = find_rec(wsrc, SAVE_T_CHUNKRING);
+        let rrows: i32 = bi(wsrc, rr + 8);
+        let rci: i32 = bi(wsrc, rr + 12);
+        let rib: i32 = rr + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+        let cc: i32 = 0;
+        while (cc < rci) {
+            let rrr: i32 = 0;
+            while (rrr < rrows) {
+                let av: i32 = bi(wsrc, rib + (cc * rrows + rrr) * 4);
+                let bv: i32 = bi(buf2, rib + (cc * rrows + rrr) * 4);
+                if (av != bv) { print("      ring col " + sv(cc) + " row " + sv(rrr) + ": " + sv(av) + " vs " + sv(bv)); }
+                rrr++;
+            }
+            cc++;
+        }
+    }
+    ck(bytediff == 0, "encode(load(encode(x))) is BYTE-IDENTICAL to encode(x) — the format is canonical, "
+        + sv(bytediff) + " bytes differ");
+
+    let path: string = "/tmp/ns_probe_save.bin";
+    if (save_exists(path) == 1) { remove_file(path); }
+    ck(save_exists(path) == 0, "the test path starts clean");
+    let fw: i32 = save_write(w, path, SAVE_REASON_LANTERN);
+    ck(fw == wsrc_n, "save_write put " + sv(fw) + " bytes on disk");
+    ck(save_exists(path) == 1, "and save_exists sees it");
+    let disk: buffer = save_read_file(path);
+    ck(disk.length == wsrc_n, "the file on disk is exactly the right length");
+    ck(save_verify(disk) == 0, "and verifies");
+    ck(save_peek_reason(disk) == SAVE_REASON_LANTERN, "the file records that a LANTERN triggered it");
+    let w5: object = make_world(31337, 128);
+    let fr: i32 = save_read(w5, path);
+    ck(fr == wsrc_n, "save_read consumed " + sv(fr) + " bytes");
+    ck(sim_hash(w5) == h_now, "*** the hash survives a trip through the FILESYSTEM, not just a buffer");
+    ck(entities_bit_equal(w5, w) == 1, "bit-identical off disk too");
+    remove_file(path);
+    ck(save_exists(path) == 0, "the probe cleans up after itself");
+    ck(save_read(w5, "/tmp/ns_probe_save_does_not_exist.bin") == SAVE_ERR_IO,
+       "reading a file that is not there is a NAMED refusal, not a crash");
+
+    let w6: object = make_world(5, 128);
+    ck(save_roundtrip_ok(w, w6) == 1, "save_roundtrip_ok is the criterion as a callable — a caller can check its own save before replacing the previous one");
+    print("");
+
+    // =====================================================================
+    print("-- 11. FORWARD COMPATIBILITY: A FILE THIS BUILD CANNOT WRITE --");
+    // =====================================================================
+    // (a) an unknown record tag, from a future build that persists something
+    //     we have never heard of.  Skipped by length, COUNTED, never fatal.
+    let fut: buffer = with_unknown_record(buf, wrote, 9999, 5);
+    ck(save_verify(fut) == 0, "a file with an unknown record still verifies");
+    let w7: object = make_world(7, 128);
+    let r7: i32 = save_decode(w7, fut);
+    ck(r7 == fut.length, "and decodes whole (" + sv(r7) + " bytes)");
+    ck(save_skipped_records() == 1, "the unknown record was SKIPPED, and counted: " + sv(save_skipped_records()));
+    ck(save_skipped_bytes() > 0, "its byte count is reported too (" + sv(save_skipped_bytes()) + ") — a save that silently lost a field must be visible");
+    ck(save_applied_records() == nrec, "every record we DID understand was applied");
+    ck(sim_hash(w7) == h_src, "*** and the hash is still bit-identical: one new field did not invalidate the save");
+
+    // (b) a future writer that APPENDED three columns to an existing record.
+    let grown: buffer = with_time_cols(buf, wrote, 3);
+    ck(save_verify(grown) == 0, "a record with three MORE columns than we know still verifies");
+    let w8: object = make_world(8, 128);
+    let r8: i32 = save_decode(w8, grown);
+    ck(r8 == grown.length, "and decodes whole");
+    ck(sim_hash(w8) == h_src, "*** taking the columns we know and stepping over the rest: hash still identical");
+    ck(sim_of(w8).day_t == g_day_400, "the f64 block moved with the wider i32 block and still reads correctly");
+
+    // (c) an OLDER writer that had one column fewer.  The missing field keeps
+    //     the value the freshly-constructed sim already had.
+    let shrunk: buffer = with_time_cols(buf, wrote, -1);
+    ck(save_verify(shrunk) == 0, "a record with one FEWER column still verifies");
+    let w9: object = make_world(9, 128);
+    let r9: i32 = save_decode(w9, shrunk);
+    ck(r9 == shrunk.length, "and decodes whole");
+    ck(sim_of(w9).streams == 0, "the dropped column (streams) kept its constructed default, 0, rather than reading garbage");
+    ck(g_streams_400 > 0, "and it was NOT 0 in the save (" + sv(g_streams_400) + ") — so the test would have caught a stale read");
+    ck(sim_hash(w9) == h_src, "*** the hash is unaffected: a field the old writer never had costs nothing");
+
+    // (d) the version WINDOW.  A newer file is readable exactly when its writer
+    //     said an older reader still could.
+    let newer: buffer = clone(buf, wrote);
+    bw(newer, SAVE_OFF_VER, 99);
+    bw(newer, SAVE_OFF_MINVER, 1);
+    reseal(newer);
+    let w10: object = make_world(10, 128);
+    ck(save_decode(w10, newer) == wrote, "a version-99 file that declares min_version 1 is ACCEPTED");
+    ck(save_last_version() == 99, "and the reader reports which version it read (" + sv(save_last_version()) + ")");
+    ck(sim_hash(w10) == h_src, "with an identical hash");
+    print("");
+
+    // =====================================================================
+    print("-- 12. A BAD FILE IS REFUSED BY NAME, NOT BY CRASHING --");
+    // =====================================================================
+    let victim: object = make_world(11, 128);
+    let h_v: u64 = sim_hash(victim);
+
+    let bad1: buffer = clone(buf, wrote);
+    bw(bad1, SAVE_OFF_MAGIC, 12345);
+    ck(save_decode(victim, bad1) == SAVE_ERR_MAGIC, "bad magic -> SAVE_ERR_MAGIC");
+    ck(sim_hash(victim) == h_v, "and the target world is untouched");
+
+    let bad2: buffer = clone(buf, wrote);
+    bw(bad2, SAVE_OFF_VER, 99);
+    bw(bad2, SAVE_OFF_MINVER, 99);
+    reseal(bad2);
+    ck(save_decode(victim, bad2) == SAVE_ERR_VERSION,
+       "a version-99 file that demands a version-99 reader -> SAVE_ERR_VERSION (this is BUILD_PLAN's 'a version mismatch is rejected cleanly')");
+    ck(sim_hash(victim) == h_v, "and the target world is untouched");
+
+    let bad3: buffer = clone(buf, wrote - 64);
+    ck(save_decode(victim, bad3) == SAVE_ERR_TRUNC, "64 bytes chopped off the tail -> SAVE_ERR_TRUNC");
+    ck(sim_hash(victim) == h_v, "and the target world is untouched");
+
+    let bad4: buffer = clone(buf, wrote);
+    bw8(bad4, SAVE_HDR_B + 40, bu8(bad4, SAVE_HDR_B + 40) ^ 1);
+    ck(save_decode(victim, bad4) == SAVE_ERR_CHECKSUM, "ONE flipped bit in the payload -> SAVE_ERR_CHECKSUM");
+    ck(sim_hash(victim) == h_v, "and the target world is untouched — never half-applied");
+
+    let bad5: buffer = clone(buf, 16);
+    ck(save_decode(victim, bad5) == SAVE_ERR_TRUNC, "a 16-byte stub -> SAVE_ERR_TRUNC");
+    ck(save_verify(buffer(4)) == SAVE_ERR_TRUNC, "a 4-byte buffer -> SAVE_ERR_TRUNC");
+
+    let bad6: buffer = clone(buf, wrote);
+    let mrec: i32 = find_rec(bad6, SAVE_T_META);
+    bw(bad6, mrec + 4, 1000000);
+    reseal(bad6);
+    ck(save_decode(victim, bad6) == SAVE_ERR_TRUNC, "a record that claims to run past the end -> SAVE_ERR_TRUNC");
+
+    let bad7: buffer = clone(buf, wrote);
+    bw(bad7, find_rec(bad7, SAVE_T_TIME) + 4, 4);
+    reseal(bad7);
+    ck(save_decode(victim, bad7) == SAVE_ERR_RECORD, "a record shorter than its own table header -> SAVE_ERR_RECORD");
+
+    let bad8: buffer = clone(buf, wrote);
+    let m8: i32 = find_rec(bad8, SAVE_T_META);
+    bw(bad8, m8 + SAVE_REC_HDR_B + SAVE_TBL_HDR_B, 8);   // META column 0 = players
+    reseal(bad8);
+    ck(save_decode(victim, bad8) == SAVE_ERR_CAP, "a save from an 8-player build loaded into a 2-player one -> SAVE_ERR_CAP");
+    ck(sim_hash(victim) == h_v, "and the target world is untouched: the capacity gate runs BEFORE the first write");
+
+    let bad9: buffer = clone(buf, wrote);
+    let m9: i32 = find_rec(bad9, SAVE_T_META);
+    let rows9: i32 = bi(bad9, m9 + 8);
+    bw(bad9, m9 + SAVE_REC_HDR_B + SAVE_TBL_HDR_B + rows9 * 4, 100000);  // META column 1 = cap
+    reseal(bad9);
+    ck(save_decode(victim, bad9) == SAVE_ERR_CAP, "a save from a 100 000-entity build -> SAVE_ERR_CAP, not a truncated load");
+
+    let bad10: buffer = clone(buf, wrote);
+    let g10: i32 = find_rec(bad10, SAVE_T_PROG);
+    bw(bad10, g10 + SAVE_REC_HDR_B + SAVE_TBL_HDR_B, 77);   // PROG_VER, player 1
+    reseal(bad10);
+    ck(save_decode(victim, bad10) == SAVE_ERR_PROG,
+       "progression.hml's OWN version word is honoured: a stale prog vector -> SAVE_ERR_PROG");
+    ck(save_last_error() == SAVE_ERR_PROG, "save_last_error() names it too");
+
+    ck(save_err_name(SAVE_ERR_MAGIC) == "BAD_MAGIC", "every error code has a name: BAD_MAGIC");
+    ck(save_err_name(SAVE_ERR_VERSION) == "BAD_VERSION", "BAD_VERSION");
+    ck(save_err_name(SAVE_ERR_CHECKSUM) == "BAD_CHECKSUM", "BAD_CHECKSUM");
+    ck(save_err_name(SAVE_ERR_CAP) == "OVER_CAPACITY", "OVER_CAPACITY");
+    ck(save_err_name(0) == "OK", "and success is not an error");
+
+    let tiny: buffer = buffer(64);
+    ck(save_encode(w, tiny, SAVE_REASON_QUIT) == SAVE_ERR_SMALL, "encoding into a 64-byte buffer -> SAVE_ERR_SMALL");
+    let untouched: i32 = 0;
+    let ti: i32 = 0;
+    while (ti < 64) { if (bu8(tiny, ti) != 0) { untouched++; } ti++; }
+    ck(untouched == 0, "and it did not write one byte of the buffer it refused");
+    print("");
+
+    // =====================================================================
+    print("-- 13. 256 KB FOR A 200-CHUNK WORLD: GENERATED DATA IS NOT SAVED --");
+    // =====================================================================
+    // BUILD_PLAN W4-12: "a save file for a 200-chunk-visited world is <= 256 KB
+    // (proof that generated data is not persisted)".  The proof is not the
+    // number alone — it is the SLOPE.  Visiting another chunk must cost the
+    // save 16 bytes, not 9.5 KB.
+    let big: object = make_world(555, 512);
+    let bs: object = sim_of(big);
+    let visited: i32 = 0;
+    let vz: i32 = 0;
+    while (vz < 20) {
+        let vx: i32 = 0;
+        while (vx < 10) {
+            if (chunk_get(bs.cs, vx, vz) >= 0) { visited++; }
+            vx++;
+        }
+        vz++;
+    }
+    chunk_set_edit(bs.cs, 3, 3, 10, 2500);
+    chunk_set_edit(bs.cs, 4, 4, 20, 2600);
+    ck(visited == 200, "200 chunks visited (" + sv(visited) + ")");
+    ck(chunk_resident(bs.cs) == 200, "and all 200 are resident");
+
+    let big_b: i32 = save_bytes(big);
+    let gen_b: i32 = 200 * (CHUNK_H_STRIDE_B + CHUNK_A_STRIDE_B);
+    ck(big_b <= SAVE_BUDGET_B, "*** a 200-chunk-visited world saves in " + sv(big_b)
+        + " bytes, under the " + sv(SAVE_BUDGET_B) + " byte (256 KB) criterion");
+    ck(200 * SAVE_B_PER_CHUNK * 20 <= gen_b,
+       "the 200 chunks cost the save " + sv(200 * SAVE_B_PER_CHUNK)
+       + " bytes against the " + sv(gen_b)
+       + " bytes of GENERATED height+attr samples they hold — a "
+       + sv(gen_b / (200 * SAVE_B_PER_CHUNK))
+       + "x reduction, because the generator is a pure function of the seed");
+
+    let before: i32 = save_bytes(big);
+    chunk_get(bs.cs, 50, 50);
+    chunk_get(bs.cs, 51, 50);
+    chunk_get(bs.cs, 52, 50);
+    let after: i32 = save_bytes(big);
+    ck(after - before == 3 * SAVE_B_PER_CHUNK,
+       "visiting 3 more chunks grew the save by exactly " + sv(after - before)
+       + " bytes (3 x " + sv(SAVE_B_PER_CHUNK) + "), not by 3 x "
+       + sv(CHUNK_H_STRIDE_B + CHUNK_A_STRIDE_B) + " — THIS is the proof");
+
+    let bbuf: buffer = save_alloc(big);
+    let bn: i32 = save_encode(big, bbuf, SAVE_REASON_SLEEP);
+    ck(bn == save_bytes(big), "the big world encodes at its computed size");
+    let big2: object = make_world(1, 512);
+    ck(save_decode(big2, bbuf) == bn, "and decodes");
+    ck(sim_hash(big2) == sim_hash(big), "with an identical hash");
+    ck(chunk_resident(sim_chunks(big2)) == 203, "and all 203 visited chunks resident again, re-derived from the seed");
+    ck(chunk_height_at(sim_chunks(big2), 300.0, 620.0) == chunk_height_at(bs.cs, 300.0, 620.0),
+       "with the terrain 300 m out identical, having never been written to the file");
+    print("  200-chunk save: " + sv(big_b) + " B   generated data it stands in for: " + sv(gen_b) + " B");
+    print("");
+
+    // =====================================================================
+    print("-- 14. AN EMPTY WORLD AND OTHER EDGES --");
+    // =====================================================================
+    let bare: object = sim_new_cap(64, 1, 12345);
+    let bare_b: buffer = save_alloc(bare);
+    let bare_n: i32 = save_encode(bare, bare_b, SAVE_REASON_TOWN);
+    ck(bare_n == save_bytes(bare), "a world with no chunk store and no players still encodes (" + sv(bare_n) + " B)");
+    let bare2: object = sim_new_cap(64, 1, 999);
+    ck(save_decode(bare2, bare_b) == bare_n, "and decodes");
+    ck(sim_hash(bare2) == sim_hash(bare), "with an identical hash");
+    ck(world_count(bare2) == 0, "an empty entity table round-trips as empty");
+    ck(world_seed(bare2) == 12345, "and carries its seed");
+
+    let alone: object = make_world(6161, 64);
+    let alone_b: buffer = save_alloc(alone);
+    save_encode(alone, alone_b, SAVE_REASON_TOWN);
+    let alone2: object = make_world(1, 64);
+    ck(save_decode(alone2, alone_b) > 0, "a world stepped ZERO ticks round-trips");
+    ck(sim_hash(alone2) == sim_hash(alone), "identically");
+    ck(lockstep(alone, alone2, 0, 120, 6161) == -1, "and 120 ticks from a tick-0 save stay in lockstep");
+
+    // a cosmetic entity: negative ids, descending allocator
+    let cw: object = make_world(717, 64);
+    world_spawn(cw, KIND_COSMETIC, 0);
+    world_spawn(cw, KIND_COSMETIC, 0);
+    let cb: buffer = save_alloc(cw);
+    save_encode(cw, cb, SAVE_REASON_QUIT);
+    let cw2: object = make_world(1, 64);
+    ck(save_decode(cw2, cb) > 0, "negative cosmetic ids restore through the descending allocator");
+    ck(world_count(cw2) == world_count(cw), "with the right entity count");
+    ck(world_next_id(cw2, KIND_COSMETIC) == world_next_id(cw, KIND_COSMETIC), "and the cosmetic allocator put back");
+    ck(world_check(cw2) == 0, "and a consistent sparse set");
+    print("");
+
+    // =====================================================================
+    print("-- 15. COST (RULE T: __clock() CPU time, minimum of 7) --");
+    // =====================================================================
+    // Save is not on a frame path — it happens four times a session, per
+    // BUILD_PLAN's four triggers. These bounds are regression guards at roughly
+    // 2x the loaded measurement on this box (which permanently shares ~17 of 24
+    // cores), not an idle-box certificate.
+    let ebuf: buffer = save_alloc(w);
+    let ebest: f64 = 1000000000.0;
+    let trial: i32 = 0;
+    while (trial < g_TRIALS) {
+        let c0: f64 = __clock();
+        let rep: i32 = 0;
+        while (rep < 20) { save_encode(w, ebuf, SAVE_REASON_QUIT); rep++; }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / 20.0;
+        if (ms < ebest) { ebest = ms; }
+        trial++;
+    }
+    let dtarget: object = make_world(1, 128);
+    let dbest: f64 = 1000000000.0;
+    trial = 0;
+    while (trial < g_TRIALS) {
+        let d0: f64 = __clock();
+        let rep2: i32 = 0;
+        while (rep2 < 5) { save_decode(dtarget, ebuf); rep2++; }
+        let d1: f64 = __clock();
+        let ms2: f64 = (d1 - d0) * 1000.0 / 5.0;
+        if (ms2 < dbest) { dbest = ms2; }
+        trial++;
+    }
+    print("  encode " + sv(r3(ebest)) + " ms   decode " + sv(r3(dbest)) + " ms   (" + sv(wrote) + " B)");
+    let eg: f64 = g_ENC_MS_GUARD;
+    let dg: f64 = g_DEC_MS_GUARD;
+    let cg: f64 = g_DEC_MS_PER_CHUNK_GUARD;
+    if (g_compiled == 0) {
+        eg = g_ENC_MS_GUARD_INTERP;
+        dg = g_DEC_MS_GUARD_INTERP;
+        cg = g_DEC_MS_PER_CHUNK_GUARD_INTERP;
+    }
+    ck(ebest <= eg, "save_encode " + sv(r3(ebest)) + " ms stays under the "
+        + sv(eg) + " ms regression guard (~2x the loaded measurement on this backend)");
+    let nres: f64 = f64(chunk_resident(sim_chunks(dtarget)));
+    let per_chunk: f64 = dbest / nres;
+    print("  decode is " + sv(r3(per_chunk)) + " ms per resident chunk over "
+        + sv(i32(nres)) + " chunks — it REGENERATES terrain rather than storing it");
+    ck(dbest <= dg, "save_decode " + sv(r3(dbest)) + " ms stays under the "
+        + sv(dg) + " ms regression guard (~2x the loaded measurement on this backend)");
+    ck(per_chunk <= cg, "and " + sv(r3(per_chunk))
+        + " ms per chunk is inside the " + sv(cg)
+        + " ms/chunk generation budget for this backend (W3-1's own bound is 2.0 ms compiled) — the codec is not the cost, the world is");
+    ck(ebest * 1000.0 < 16666.0, "save_encode (" + sv(r3(ebest))
+        + " ms) is well under one frame; a save is a moment, a load is a loading screen");
+    ck(sim_hash(dtarget) == sim_hash(w), "and the timed decodes were real ones: the last left the right hash");
+    print("");
+
+    // =====================================================================
+    print("-- 16. THE WALLS --");
+    // =====================================================================
+    // Structural claims the SCRIPTS enforce; asserted here too so a developer
+    // who never runs CI still trips over them.
+    let src: string = read_file("src/game/save.hml");
+    ck(src.length > 0, "the probe can read its own subject");
+    ck(!src.contains("__clock("), "save.hml never reads a wall clock (R8's class of leak)");
+    ck(!src.contains("@stdlib/random"), "and never reaches for @stdlib/random");
+    ck(!src.contains("@stdlib/time"), "and never for @stdlib/time");
+    ck(!src.contains("wobbleweed"), "and never for wobbleweed: a save is not a renderer");
+    ck(src.contains("ptr_write_f64"), "floats are written as RAW f64, not quantized");
+    ck(!src.contains("src/net/"), "save.hml does not import src/net — it IS the wire contract, it does not speak one");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("=========================================================");
+    let want_n: i32 = g_EXPECT_ASSERTS;
+    print(" assertions  " + sv(g_ok) + " / " + sv(g_n) + " passed");
+    let count_ok: i32 = 0;
+    if (g_n == want_n) { count_ok = 1; }
+    if (count_ok == 0) {
+        print("  FAIL assertion COUNT: ran " + sv(g_n) + ", expected " + sv(want_n)
+            + " — a section stopped running");
+    }
+    if (g_ok == g_n) {
+        if (count_ok == 1) {
+            print(" RESULT      PASS");
+            print("=========================================================");
+            return;
+        }
+    }
+    print(" RESULT      FAIL");
+    print("=========================================================");
+    exit(1);
+}
+
+main();

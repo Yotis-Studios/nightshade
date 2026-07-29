@@ -1,0 +1,2141 @@
+// =============================================================================
+//  save.hml — W4-12.  THE SAVE FILE, AS A WIRE CONTRACT.
+// =============================================================================
+//
+//  BUILD_PLAN W4-12:
+//    "versioned binary save on entering town, sleeping, lighting a lantern, and
+//     quitting.  Persists the seed, player state, progression, the chunk EDIT
+//     OVERLAY ONLY (never generated chunk data), lit lanterns, town layout,
+//     almanac."
+//    Acceptance: a save/load round-trip reproduces an identical world hash; a
+//    save for a 200-chunk-visited world is <= 256 KB; a version mismatch is
+//    rejected cleanly rather than crashing.
+//
+// -----------------------------------------------------------------------------
+//  1.  WHY THIS IS A WIRE FORMAT AND NOT A DUMP
+// -----------------------------------------------------------------------------
+//  `docs/recon/NETWORKING.md` says this state becomes SERVER-AUTHORITATIVE
+//  player state.  A dump is a format you can only ever read with the exact
+//  binary that wrote it; the moment a server holds a million of these, that is
+//  a migration outage.  So the file is framed the way a protocol is framed:
+//
+//    * a VERSION and a MIN_VERSION, so a writer can declare "newer, but still
+//      readable by an older reader" and mean it;
+//    * LENGTH-PREFIXED RECORDS, so an unknown record is SKIPPED, not fatal;
+//    * every record is a COLUMN TABLE with its own row and column counts, so
+//      appending a column (a new movement field, a new counter) does not
+//      invalidate a single existing save in either direction;
+//    * a checksum over the payload, so a truncated or corrupted file is
+//      REJECTED rather than half-applied.
+//
+//  The three growth directions, and what each does:
+//
+//    old file, new reader   record carries FEWER columns  -> the reader takes
+//                           what is there and leaves the rest at the value the
+//                           freshly-constructed sim already has.
+//    new file, old reader   record carries MORE columns   -> the reader takes
+//                           the ones it knows and steps over the tail using the
+//                           column counts.
+//    new file, old reader   a record TAG it has never seen -> skipped whole,
+//                           using the record length.  Counted, never silent:
+//                           `save_skipped_records()`.
+//
+// -----------------------------------------------------------------------------
+//  2.  WHAT "ROUND-TRIPS EXACTLY" MEANS HERE
+// -----------------------------------------------------------------------------
+//  `sim_hash(w)` (W4-9) is the authority's fingerprint.  This file persists
+//  EVERY input `sim_hash` reads, plus everything else the next tick needs, so
+//  the round trip is bit-identical UNCONDITIONALLY — not only at a quiet save
+//  point.  That matters because GDD 8's headline beat is lighting a lantern
+//  DURING a wave, with bodies on the field and bolts in the air, and "save on
+//  lighting a lantern" is one of the four triggers.  A format that could only
+//  round-trip an empty field would quietly not cover its own trigger.
+//
+//  Floats are stored as raw IEEE-754 f64 (`ptr_write_f64`), never quantized.
+//  `sim_hash` quantizes to 1/16 m, so a quantized save would LOOK like it round
+//  -tripped while the underlying state had drifted, and the drift would only
+//  appear a few hundred ticks later as a desync.  That is precisely the class
+//  of bug a hash is supposed to catch, so the hash must not be able to hide it.
+//
+//  DELIBERATELY NOT PERSISTED, and why:
+//    * generated chunk heights/biomes  — `worldgen` is a pure function of
+//      (seed, cx, cz).  Persisting it is the 256 KB acceptance criterion's
+//      whole point.  Only the sparse EDIT OVERLAY is written.
+//    * `history.hml`'s rewind ring      — a lag-compensation buffer.  A loaded
+//      session has no history for the same reason a joining client has none.
+//      Not in `sim_hash`; rebuilt at one entry per tick.
+//    * projectile TRACERS               — cosmetic by construction, suppressed
+//      while replaying, never hashed.
+//    * `sim`'s fx queue                 — stage (j) output.  Cosmetic.  It is
+//      rebuilt from the event bus, which IS persisted.
+//
+// -----------------------------------------------------------------------------
+//  3.  ZONE
+// -----------------------------------------------------------------------------
+//  `src/game/**` is the integrator: ci_imports.sh R1 lets it import everything,
+//  and it is the only zone that may both touch `src/sim/**` state and open a
+//  file.  Nothing here is on a frame path — `save_encode` runs at a save point,
+//  four times a session.  It still allocates exactly one buffer.
+// =============================================================================
+
+import { exists, open, remove_file, rename, file_stat } from "@stdlib/fs";
+
+import { g_WPN_COUNT } from "../core/config.hml";
+
+import {
+    world_reset, world_spawn, world_spawn_player, world_check,
+    KIND_NONE, KIND_PLAYER, KIND_AI, KIND_NPC, KIND_PROJECTILE,
+    KIND_PICKUP, KIND_PROP, KIND_LANTERN, KIND_COSMETIC, KIND_COUNT,
+    SLOT_NONE
+} from "../sim/world.hml";
+
+import {
+    sim_of, sim_hash,
+    SIM_STAGE_COUNT, SIM_CMD_QUEUE
+} from "../sim/sim.hml";
+
+import { PS_FIELDS } from "../sim/movement.hml";
+import { WS_FIELDS } from "../sim/weapons.hml";
+import { PROG_FIELDS, prog_serialize, prog_deserialize } from "../sim/progression.hml";
+import { ITEM_FIELDS } from "../sim/loot.hml";
+import { CMD_FIELDS } from "../sim/command.hml";
+import { CHAIN_SLOTS, evbus_count, evbus_reset, evbus_push,
+         evbus_tick, evbus_type, evbus_sub, evbus_actor, evbus_target,
+         evbus_xq, evbus_yq, evbus_zq, combat_events } from "../sim/combat.hml";
+import { DIR_ROSTER_CAP, DIR_REQ_CAP } from "../sim/director.hml";
+import { chunk_edits_bytes, chunk_edits_save, chunk_edits_load,
+         chunk_clear_edits, chunk_set_seed, chunk_pin_ring, chunk_drop_all,
+         chunk_get, chunk_find, chunk_cap, chunk_resident } from "../sim/chunk.hml";
+import { g_RING_RADIUS } from "../core/config.hml";
+
+// =============================================================================
+//  4.  THE FORMAT
+// =============================================================================
+//
+//  FILE
+//    +0   u32  magic        SAVE_MAGIC
+//    +4   i32  version      the version that WROTE this file
+//    +8   i32  min_version  the oldest reader that can still make sense of it
+//    +12  i32  header_bytes so a later version may grow this header
+//    +16  i32  payload_bytes
+//    +20  i32  records
+//    +24  u32  checksum     FNV-1a-32 over the payload bytes
+//    +28  i32  reason       SAVE_REASON_*, why the file was written
+//    ---- 32 bytes, 8-aligned -------------------------------------------------
+//
+//  RECORD (repeated; every record length is a multiple of 8, so every record
+//          and every f64 inside one lands 8-aligned)
+//    +0   i32  tag          SAVE_T_*
+//    +4   i32  bytes        payload length, EXCLUDING this 8-byte header
+//    +8   i32  rows
+//    +12  i32  cols_i32
+//    +16  i32  cols_f64
+//    +20  i32  cols_u64
+//    +24  ..   cols_i32 columns of `rows` i32   (column-major, SoA)
+//         ..   pad to 8
+//         ..   cols_f64 columns of `rows` f64
+//         ..   cols_u64 columns of `rows` u64
+//
+//  COLUMN ORDER IS THE CONTRACT.  New columns are APPENDED, never inserted.
+//  `tools/probe_save.hml` pins every column count with a literal, so inserting
+//  one in the middle fails the build instead of silently rotating a save.
+// =============================================================================
+
+export let SAVE_MAGIC: i32 = 1314080342;    // 'NSAV' folded into 31 bits
+export let SAVE_VERSION: i32 = 1;
+export let SAVE_MIN_VERSION: i32 = 1;       // what THIS build writes as min_version
+export let SAVE_HDR_B: i32 = 32;
+export let SAVE_REC_HDR_B: i32 = 8;
+export let SAVE_TBL_HDR_B: i32 = 16;
+export let SAVE_ALIGN: i32 = 8;
+
+// Header field offsets — quoted by the probe so a layout change is a failure.
+export let SAVE_OFF_MAGIC: i32   = 0;
+export let SAVE_OFF_VER: i32     = 4;
+export let SAVE_OFF_MINVER: i32  = 8;
+export let SAVE_OFF_HDRB: i32    = 12;
+export let SAVE_OFF_PAYB: i32    = 16;
+export let SAVE_OFF_RECS: i32    = 20;
+export let SAVE_OFF_SUM: i32     = 24;
+export let SAVE_OFF_REASON: i32  = 28;
+
+// ---- why a save happened.  BUILD_PLAN W4-12 names exactly these four. -------
+export let SAVE_REASON_TOWN: i32    = 0;   // entering town
+export let SAVE_REASON_SLEEP: i32   = 1;   // sleeping
+export let SAVE_REASON_LANTERN: i32 = 2;   // lighting a lantern
+export let SAVE_REASON_QUIT: i32    = 3;   // quitting
+export let SAVE_REASON_COUNT: i32   = 4;
+
+// ---- record tags.  NEVER reused, NEVER renumbered. --------------------------
+export let SAVE_T_META: i32       = 1;
+export let SAVE_T_TIME: i32       = 2;
+export let SAVE_T_ENTITY: i32     = 3;
+export let SAVE_T_PLAYER: i32     = 4;
+export let SAVE_T_PROG: i32       = 5;
+export let SAVE_T_WEAPON: i32     = 6;
+export let SAVE_T_EVBUS: i32      = 7;
+export let SAVE_T_PROJ: i32       = 8;
+export let SAVE_T_AI_EVENT: i32   = 9;
+export let SAVE_T_DIRECTOR: i32   = 10;
+export let SAVE_T_LOOT: i32       = 11;
+export let SAVE_T_CHUNKEDIT: i32  = 12;
+export let SAVE_T_SOLIDS: i32     = 13;
+export let SAVE_T_COMMAND: i32    = 14;
+export let SAVE_T_COUNTER: i32    = 15;
+export let SAVE_T_RNG: i32        = 16;
+export let SAVE_T_COMBAT: i32     = 17;
+export let SAVE_T_CHAIN: i32      = 18;
+export let SAVE_T_PROJ_BURN: i32  = 19;
+export let SAVE_T_PROJ_META: i32  = 20;
+export let SAVE_T_PROJ_SHOTS: i32 = 21;
+export let SAVE_T_PROJ_EVENT: i32 = 22;
+export let SAVE_T_AI_META: i32    = 23;
+export let SAVE_T_ROSTER: i32     = 24;
+export let SAVE_T_DIRREQ: i32     = 25;
+export let SAVE_T_CMDQUEUE: i32   = 26;
+export let SAVE_T_CHUNKRING: i32  = 27;
+export let SAVE_T_CHUNKMETA: i32  = 28;
+export let SAVE_T_COUNT: i32      = 28;    // how many tags THIS build writes
+
+// ---- column counts.  Pinned by the probe with literals. ---------------------
+export let SAVE_C_META_I: i32     = 25;    // 15 scalars + SIM_STAGE_COUNT order
+export let SAVE_C_TIME_I: i32     = 6;
+export let SAVE_C_TIME_F: i32     = 1;
+export let SAVE_C_ENTITY_I: i32   = 22;
+export let SAVE_C_ENTITY_F: i32   = 10;
+export let SAVE_C_PLAYER_I: i32   = 7;
+export let SAVE_C_PLAYER_F: i32   = 37;    // chan_t + PS_FIELDS
+export let SAVE_C_EVBUS_I: i32    = 8;
+export let SAVE_C_COMBAT_I: i32   = 15;
+export let SAVE_C_CHAIN_I: i32    = 2;
+export let SAVE_C_PROJ_I: i32     = 6;
+export let SAVE_C_PROJ_F: i32     = 3;
+export let SAVE_C_BURN_I: i32     = 6;
+export let SAVE_C_PROJMETA_I: i32 = 10;
+export let SAVE_C_PROJEV_I: i32   = 5;
+export let SAVE_C_PROJEV_F: i32   = 3;
+export let SAVE_C_AIEV_I: i32     = 6;
+export let SAVE_C_AIEV_F: i32     = 3;
+export let SAVE_C_AIMETA_I: i32   = 12;
+export let SAVE_C_DIR_I: i32      = 29;
+export let SAVE_C_DIR_F: i32      = 3;
+export let SAVE_C_DIR_U: i32      = 4;
+export let SAVE_C_ROSTER_I: i32   = 3;
+export let SAVE_C_DIRREQ_I: i32   = 2;
+export let SAVE_C_DIRREQ_F: i32   = 3;
+export let SAVE_C_LOOT_I: i32     = 15;    // 3 scalars + ITEM_FIELDS
+export let SAVE_C_SOLIDS_F: i32   = 6;
+export let SAVE_C_RNG_U: i32      = 8;     // sim rng 4 + combat rng 4
+export let SAVE_C_RING_I: i32     = 4;     // cx, cz, pin, stamp — 8 bytes/chunk
+export let SAVE_C_CHUNKMETA_I: i32 = 11;
+
+// THE 256 KB CRITERION, IN ONE NUMBER.  A resident chunk holds 324 bytes of
+// GENERATED samples (CHUNK_H_STRIDE_B 162 + CHUNK_A_STRIDE_B 162) and costs
+// SAVE_C_RING_I * 4 = 16 bytes of save — a 20x reduction, and the reason a
+// 200-chunk-visited world fits in 256 KB with three orders of magnitude spare.
+export let SAVE_B_PER_CHUNK: i32 = 16;
+
+// ---- error codes.  Every one of them is a CLEAN refusal. --------------------
+export let SAVE_ERR_MAGIC: i32    = -1;
+export let SAVE_ERR_VERSION: i32  = -2;
+export let SAVE_ERR_TRUNC: i32    = -3;
+export let SAVE_ERR_CHECKSUM: i32 = -4;
+export let SAVE_ERR_SMALL: i32    = -5;    // caller's dst buffer is too small
+export let SAVE_ERR_CAP: i32      = -6;    // the save needs more room than this build has
+export let SAVE_ERR_RECORD: i32   = -7;    // a record's own framing is impossible
+export let SAVE_ERR_IO: i32       = -8;
+export let SAVE_ERR_HEADER: i32   = -9;
+export let SAVE_ERR_PROG: i32     = -10;   // progression.hml rejected its own vector
+
+// The size that triggers the 256 KB acceptance criterion, as a literal so the
+// probe asserts the DESIGN and not a config value that could be widened.
+export let SAVE_BUDGET_B: i32 = 262144;
+
+// ---- decode telemetry.  A skipped record must never be silent. --------------
+let g_save_skipped: i32 = 0;
+let g_save_skipped_bytes: i32 = 0;
+let g_save_applied: i32 = 0;
+let g_save_last_err: i32 = 0;
+let g_save_last_ver: i32 = 0;
+
+// ---- the META stash ---------------------------------------------------------
+// Restoring the entity table REPLAYS every spawn through `world.hml`'s public
+// path, which moves all four id allocators and all three spawn counters.  Their
+// saved values are parked here by the META record and re-applied by `decode`
+// AFTER the whole record loop, so the file's record ORDER stays free — a reader
+// that depended on META preceding ENTITY would be a reader that breaks the
+// moment a writer reorders two records it is allowed to reorder.
+let g_save_next_ai: i32 = 0;
+let g_save_next_proj: i32 = 0;
+let g_save_next_pick: i32 = 0;
+let g_save_next_cos: i32 = 0;
+let g_save_spawns: i32 = 0;
+let g_save_despawns: i32 = 0;
+let g_save_spawnfail: i32 = 0;
+let g_save_have_meta: i32 = 0;
+
+// ---- the chunk stash --------------------------------------------------------
+// The chunk store is REBUILT in the decode epilogue, not inside a record
+// handler, because it needs three saved records applied in a fixed order
+// (residency, then metadata, then the edit overlay) and record order in the
+// file is deliberately not part of the contract.  These hold the byte offsets
+// of those records inside the source buffer until the epilogue runs.
+let g_save_ring_ib: i32 = -1;
+let g_save_ring_rows: i32 = 0;
+let g_save_ring_ci: i32 = 0;
+let g_save_edit_ib: i32 = -1;
+let g_save_edit_rows: i32 = 0;
+let g_save_cmeta_ib: i32 = -1;
+let g_save_cmeta_ci: i32 = 0;
+
+export fn save_skipped_records(): i32 { let o: i32 = g_save_skipped; return o; }
+export fn save_skipped_bytes(): i32   { let o: i32 = g_save_skipped_bytes; return o; }
+export fn save_applied_records(): i32 { let o: i32 = g_save_applied; return o; }
+export fn save_last_error(): i32      { let o: i32 = g_save_last_err; return o; }
+export fn save_last_version(): i32    { let o: i32 = g_save_last_ver; return o; }
+
+export fn save_err_name(p_code: i32): string {
+    let c: i32 = p_code;
+    if (c >= 0)                { let s: string = "OK"; return s; }
+    if (c == SAVE_ERR_MAGIC)   { let s: string = "BAD_MAGIC"; return s; }
+    if (c == SAVE_ERR_VERSION) { let s: string = "BAD_VERSION"; return s; }
+    if (c == SAVE_ERR_TRUNC)   { let s: string = "TRUNCATED"; return s; }
+    if (c == SAVE_ERR_CHECKSUM){ let s: string = "BAD_CHECKSUM"; return s; }
+    if (c == SAVE_ERR_SMALL)   { let s: string = "BUFFER_TOO_SMALL"; return s; }
+    if (c == SAVE_ERR_CAP)     { let s: string = "OVER_CAPACITY"; return s; }
+    if (c == SAVE_ERR_RECORD)  { let s: string = "BAD_RECORD"; return s; }
+    if (c == SAVE_ERR_IO)      { let s: string = "IO"; return s; }
+    if (c == SAVE_ERR_HEADER)  { let s: string = "BAD_HEADER"; return s; }
+    if (c == SAVE_ERR_PROG)    { let s: string = "PROGRESSION_REJECTED"; return s; }
+    let s: string = "UNKNOWN";
+    return s;
+}
+
+export fn save_reason_name(p_r: i32): string {
+    let r: i32 = p_r;
+    if (r == SAVE_REASON_TOWN)    { let s: string = "town"; return s; }
+    if (r == SAVE_REASON_SLEEP)   { let s: string = "sleep"; return s; }
+    if (r == SAVE_REASON_LANTERN) { let s: string = "lantern"; return s; }
+    if (r == SAVE_REASON_QUIT)    { let s: string = "quit"; return s; }
+    let s: string = "unknown";
+    return s;
+}
+
+// =============================================================================
+//  5.  BYTE PRIMITIVES
+// =============================================================================
+
+fn pad8(p_n: i32): i32 {
+    let n: i32 = p_n;
+    let r: i32 = n % SAVE_ALIGN;
+    if (r != 0) { n = n + (SAVE_ALIGN - r); }
+    let o: i32 = n;
+    return o;
+}
+
+fn wi(p_p: ptr, p_o: i32, p_v: i32) { ptr_write_i32(ptr_offset(p_p, p_o, 1), p_v); }
+fn ri(p_p: ptr, p_o: i32): i32 { let v: i32 = ptr_read_i32(ptr_offset(p_p, p_o, 1)); return v; }
+fn wf(p_p: ptr, p_o: i32, p_v: f64) { ptr_write_f64(ptr_offset(p_p, p_o, 1), p_v); }
+fn rf(p_p: ptr, p_o: i32): f64 { let v: f64 = ptr_read_f64(ptr_offset(p_p, p_o, 1)); return v; }
+fn wu(p_p: ptr, p_o: i32, p_v: u64) { ptr_write_u64(ptr_offset(p_p, p_o, 1), p_v); }
+fn ru(p_p: ptr, p_o: i32): u64 { let v: u64 = ptr_read_u64(ptr_offset(p_p, p_o, 1)); return v; }
+
+// FNV-1a-32 over a byte range.  Not a security hash — a corruption detector.
+// It exists so a half-written file (a power cut mid-save) is REFUSED instead of
+// being applied as a world with sixty per cent of its enemies.
+fn fnv32(p_p: ptr, p_off: i32, p_n: i32): i32 {
+    let h: u64 = 2166136261;
+    let n: i32 = p_n;
+    let base: i32 = p_off;
+    let i: i32 = 0;
+    while (i < n) {
+        let b: i32 = ptr_read_u8(ptr_offset(p_p, base + i, 1));
+        h = (h ^ u64(b)) * 16777619;
+        h = h & 4294967295;
+        i++;
+    }
+    let out: i32 = i32(h & 2147483647);
+    return out;
+}
+
+// Bytes a table record occupies, header included.
+fn tbl_bytes(p_rows: i32, p_ci: i32, p_cf: i32, p_cu: i32): i32 {
+    let rows: i32 = p_rows;
+    let ib: i32 = pad8(rows * p_ci * 4);
+    let fb: i32 = rows * p_cf * 8;
+    let ub: i32 = rows * p_cu * 8;
+    let out: i32 = SAVE_REC_HDR_B + SAVE_TBL_HDR_B + ib + fb + ub;
+    return out;
+}
+
+// Write a table record header at `p_o`.  Returns the offset of the i32 block.
+fn tbl_begin(p_p: ptr, p_o: i32, p_tag: i32, p_rows: i32,
+             p_ci: i32, p_cf: i32, p_cu: i32): i32 {
+    let o: i32 = p_o;
+    let total: i32 = tbl_bytes(p_rows, p_ci, p_cf, p_cu);
+    wi(p_p, o, p_tag);
+    wi(p_p, o + 4, total - SAVE_REC_HDR_B);
+    wi(p_p, o + 8, p_rows);
+    wi(p_p, o + 12, p_ci);
+    wi(p_p, o + 16, p_cf);
+    wi(p_p, o + 20, p_cu);
+    let out: i32 = o + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+    return out;
+}
+
+// Offset of column `p_c`, row `p_r` inside a table whose i32 block starts at
+// `p_ib`.  Columns are contiguous (SoA), which is how a reader steps over a
+// column it does not know about without understanding it.
+fn col_i(p_ib: i32, p_rows: i32, p_c: i32, p_r: i32): i32 {
+    let o: i32 = p_ib + (p_c * p_rows + p_r) * 4;
+    return o;
+}
+fn blk_f(p_ib: i32, p_rows: i32, p_ci: i32): i32 {
+    let o: i32 = p_ib + pad8(p_rows * p_ci * 4);
+    return o;
+}
+fn col_f(p_fb: i32, p_rows: i32, p_c: i32, p_r: i32): i32 {
+    let o: i32 = p_fb + (p_c * p_rows + p_r) * 8;
+    return o;
+}
+fn blk_u(p_fb: i32, p_rows: i32, p_cf: i32): i32 {
+    let o: i32 = p_fb + p_rows * p_cf * 8;
+    return o;
+}
+// u64 columns have the same 8-byte stride as f64 columns; named separately so
+// the call sites read as what they are.
+fn col_u(p_ub: i32, p_rows: i32, p_c: i32, p_r: i32): i32 {
+    let o: i32 = p_ub + (p_c * p_rows + p_r) * 8;
+    return o;
+}
+
+// =============================================================================
+//  6.  SIZING
+// =============================================================================
+//  `save_bytes` and `save_encode` are two descriptions of the same layout, so
+//  they can disagree.  `tools/probe_save.hml` asserts they never do:
+//      save_bytes(w) == save_encode(w, buf)
+//  on every scenario it builds.  That is the only thing standing between a
+//  format change and a buffer overrun, so it is asserted rather than trusted.
+
+export fn save_bytes(p_w: object): i32 {
+    let w: object = p_w;
+    let s: object = sim_of(w);
+    let np: i32 = s.players;
+    let n: i32 = w.count;
+
+    let cx: object = s.cx;
+    let bus: object = combat_events(cx);
+    let pj: object = s.proj;
+    let ai: object = s.ai;
+    let d: object = s.dir;
+    let sol = s.solids;
+
+    let total: i32 = SAVE_HDR_B;
+    total = total + tbl_bytes(1, SAVE_C_META_I, 0, 0);
+    total = total + tbl_bytes(1, SAVE_C_TIME_I, SAVE_C_TIME_F, 0);
+    total = total + tbl_bytes(n, SAVE_C_ENTITY_I, SAVE_C_ENTITY_F, 0);
+    total = total + tbl_bytes(np, SAVE_C_PLAYER_I, SAVE_C_PLAYER_F, 0);
+    total = total + tbl_bytes(np, PROG_FIELDS, 0, 0);
+    total = total + tbl_bytes(np, 0, WS_FIELDS, 0);
+    total = total + tbl_bytes(bus.count, SAVE_C_EVBUS_I, 0, 0);
+    total = total + tbl_bytes(1, SAVE_C_COMBAT_I, 0, 0);
+    total = total + tbl_bytes(CHAIN_SLOTS, SAVE_C_CHAIN_I, 0, 0);
+    total = total + tbl_bytes(pj.n, SAVE_C_PROJ_I, SAVE_C_PROJ_F, 0);
+    total = total + tbl_bytes(pj.bn, SAVE_C_BURN_I, 0, 0);
+    total = total + tbl_bytes(1, SAVE_C_PROJMETA_I, 0, 0);
+    total = total + tbl_bytes(g_WPN_COUNT, 1, 0, 0);
+    total = total + tbl_bytes(pj.ev_n, SAVE_C_PROJEV_I, SAVE_C_PROJEV_F, 0);
+    total = total + tbl_bytes(ai.ev_n, SAVE_C_AIEV_I, SAVE_C_AIEV_F, 0);
+    total = total + tbl_bytes(1, SAVE_C_AIMETA_I, 0, 0);
+    total = total + tbl_bytes(1, SAVE_C_DIR_I, SAVE_C_DIR_F, SAVE_C_DIR_U);
+    total = total + tbl_bytes(d.n_ros, SAVE_C_ROSTER_I, 0, 0);
+    total = total + tbl_bytes(d.req_n, SAVE_C_DIRREQ_I, SAVE_C_DIRREQ_F, 0);
+    total = total + tbl_bytes(1, SAVE_C_LOOT_I, 0, 0);
+    total = total + tbl_bytes(chunk_words(w), 1, 0, 0);
+    total = total + tbl_bytes(chunk_rows(w), SAVE_C_RING_I, 0, 0);
+    total = total + tbl_bytes(1, SAVE_C_CHUNKMETA_I, 0, 0);
+    total = total + tbl_bytes(sol.length / 6, 0, SAVE_C_SOLIDS_F, 0);
+    total = total + tbl_bytes(np, CMD_FIELDS, 0, 0);
+    total = total + tbl_bytes(np * SIM_CMD_QUEUE, CMD_FIELDS, 0, 0);
+    total = total + tbl_bytes(1, 19, 0, 0);
+    total = total + tbl_bytes(1, 0, 0, SAVE_C_RNG_U);
+    let out: i32 = total;
+    return out;
+}
+
+// The chunk EDIT OVERLAY, in i32 words.  This is the whole reason a save of a
+// 200-chunk world is small: generated heights are a pure function of the seed
+// and are never written.  With no store installed the overlay is empty.
+fn chunk_words(p_w: object): i32 {
+    let w: object = p_w;
+    let s: object = sim_of(w);
+    if (s.has_cs != 1) { let none: i32 = 0; return none; }
+    let b: i32 = chunk_edits_bytes(s.cs);
+    let out: i32 = b / 4;
+    return out;
+}
+
+// How many chunks are RESIDENT.  Their (cx, cz) keys are saved — 16 bytes each
+// — and their 324 bytes of generated heights and attributes are not.
+//
+// This record is what makes a load continue identically rather than merely LOAD
+// identically.  Residency is invisible to `sim_hash`, but it is not invisible to
+// the simulation: a chunk that is not resident returns CHUNK_H_MISS, and a
+// player standing over a missing chunk freezes in place instead of walking.  A
+// save that restored every entity perfectly and dropped the resident set would
+// pass a hash check at tick 0 and desync by tick 1, which is the worst kind of
+// wrong — it looks right exactly long enough to be shipped.
+fn chunk_rows(p_w: object): i32 {
+    let w: object = p_w;
+    let s: object = sim_of(w);
+    if (s.has_cs != 1) { let none: i32 = 0; return none; }
+    let out: i32 = chunk_resident(s.cs);
+    return out;
+}
+
+// Allocate a buffer of exactly the right size for `p_w`.
+export fn save_alloc(p_w: object): buffer {
+    let n: i32 = save_bytes(p_w);
+    let b: buffer = buffer(n);
+    return b;
+}
+
+// =============================================================================
+//  7.  ENCODE
+// =============================================================================
+
+export fn save_encode(p_w: object, p_dst: buffer, p_reason: i32): i32 {
+    let w: object = p_w;
+    let dst: buffer = p_dst;
+    let need: i32 = save_bytes(w);
+    if (dst.length < need) { let small: i32 = SAVE_ERR_SMALL; return small; }
+
+    let p: ptr = buffer_ptr(dst);
+    let s: object = sim_of(w);
+    let np: i32 = s.players;
+    let n: i32 = w.count;
+    let recs: i32 = 0;
+    let o: i32 = SAVE_HDR_B;
+
+    // ---- META -------------------------------------------------------------
+    let b0: i32 = tbl_begin(p, o, SAVE_T_META, 1, SAVE_C_META_I, 0, 0);
+    wi(p, col_i(b0, 1, 0, 0), np);
+    wi(p, col_i(b0, 1, 1, 0), w.cap);
+    wi(p, col_i(b0, 1, 2, 0), w.seed);
+    wi(p, col_i(b0, 1, 3, 0), w.tick);
+    wi(p, col_i(b0, 1, 4, 0), s.prev_tick);
+    wi(p, col_i(b0, 1, 5, 0), w.replaying);
+    wi(p, col_i(b0, 1, 6, 0), w.spawns);
+    wi(p, col_i(b0, 1, 7, 0), w.despawns);
+    wi(p, col_i(b0, 1, 8, 0), w.spawn_fail);
+    wi(p, col_i(b0, 1, 9, 0), w.next_ai);
+    wi(p, col_i(b0, 1, 10, 0), w.next_proj);
+    wi(p, col_i(b0, 1, 11, 0), w.next_pickup);
+    wi(p, col_i(b0, 1, 12, 0), w.next_cosmetic);
+    wi(p, col_i(b0, 1, 13, 0), s.steps);
+    wi(p, col_i(b0, 1, 14, 0), s.swaps);
+    let ord = s.order;
+    let oi: i32 = 0;
+    while (oi < SIM_STAGE_COUNT) { wi(p, col_i(b0, 1, 15 + oi, 0), ord[oi]); oi++; }
+    o = o + tbl_bytes(1, SAVE_C_META_I, 0, 0); recs++;
+
+    // ---- TIME OF DAY ------------------------------------------------------
+    let b1: i32 = tbl_begin(p, o, SAVE_T_TIME, 1, SAVE_C_TIME_I, SAVE_C_TIME_F, 0);
+    wi(p, col_i(b1, 1, 0, 0), s.phase);
+    wi(p, col_i(b1, 1, 1, 0), s.horn);
+    wi(p, col_i(b1, 1, 2, 0), s.tier);
+    wi(p, col_i(b1, 1, 3, 0), s.ccx);
+    wi(p, col_i(b1, 1, 4, 0), s.ccz);
+    wi(p, col_i(b1, 1, 5, 0), s.streams);
+    let f1: i32 = blk_f(b1, 1, SAVE_C_TIME_I);
+    wf(p, col_f(f1, 1, 0, 0), s.day_t);
+    o = o + tbl_bytes(1, SAVE_C_TIME_I, SAVE_C_TIME_F, 0); recs++;
+
+    // ---- ENTITIES ---------------------------------------------------------
+    // Lit lanterns live here: a lantern is a KIND_LANTERN body whose `anim` is
+    // SIM_LANTERN_LIT.  There is no second list to drift out of sync with.
+    let e0: i32 = tbl_begin(p, o, SAVE_T_ENTITY, n, SAVE_C_ENTITY_I, SAVE_C_ENTITY_F, 0);
+    let ef: i32 = blk_f(e0, n, SAVE_C_ENTITY_I);
+    let c_id = w.id;         let c_kind = w.kind;     let c_own = w.owner;
+    let c_st = w.spawn_tick; let c_hp = w.hp;         let c_hpm = w.hp_max;
+    let c_arm = w.armor;     let c_team = w.team;     let c_anim = w.anim;
+    let c_fl = w.flags;      let c_mdl = w.model;     let c_tint = w.tint;
+    let c_wp = w.weapon;     let c_am = w.ammo_mag;   let c_ar = w.ammo_res;
+    let c_xp = w.xp;         let c_lv = w.level;      let c_wm = w.wickmarks;
+    let c_ais = w.ai_state;  let c_ait = w.ai_target_id; let c_ls = w.loot_seed;
+    let c_lh = w.last_hit_by;
+    let c_px = w.px; let c_py = w.py; let c_pz = w.pz;
+    let c_vx = w.vx; let c_vy = w.vy; let c_vz = w.vz;
+    let c_yaw = w.yaw; let c_pit = w.pitch; let c_at = w.anim_t; let c_aim = w.ai_timer;
+    let i: i32 = 0;
+    while (i < n) {
+        wi(p, col_i(e0, n, 0, i), c_id[i]);
+        wi(p, col_i(e0, n, 1, i), c_kind[i]);
+        wi(p, col_i(e0, n, 2, i), c_own[i]);
+        wi(p, col_i(e0, n, 3, i), c_st[i]);
+        wi(p, col_i(e0, n, 4, i), c_hp[i]);
+        wi(p, col_i(e0, n, 5, i), c_hpm[i]);
+        wi(p, col_i(e0, n, 6, i), c_arm[i]);
+        wi(p, col_i(e0, n, 7, i), c_team[i]);
+        wi(p, col_i(e0, n, 8, i), c_anim[i]);
+        wi(p, col_i(e0, n, 9, i), c_fl[i]);
+        wi(p, col_i(e0, n, 10, i), c_mdl[i]);
+        wi(p, col_i(e0, n, 11, i), c_tint[i]);
+        wi(p, col_i(e0, n, 12, i), c_wp[i]);
+        wi(p, col_i(e0, n, 13, i), c_am[i]);
+        wi(p, col_i(e0, n, 14, i), c_ar[i]);
+        wi(p, col_i(e0, n, 15, i), c_xp[i]);
+        wi(p, col_i(e0, n, 16, i), c_lv[i]);
+        wi(p, col_i(e0, n, 17, i), c_wm[i]);
+        wi(p, col_i(e0, n, 18, i), c_ais[i]);
+        wi(p, col_i(e0, n, 19, i), c_ait[i]);
+        wi(p, col_i(e0, n, 20, i), c_ls[i]);
+        wi(p, col_i(e0, n, 21, i), c_lh[i]);
+        wf(p, col_f(ef, n, 0, i), c_px[i]);
+        wf(p, col_f(ef, n, 1, i), c_py[i]);
+        wf(p, col_f(ef, n, 2, i), c_pz[i]);
+        wf(p, col_f(ef, n, 3, i), c_vx[i]);
+        wf(p, col_f(ef, n, 4, i), c_vy[i]);
+        wf(p, col_f(ef, n, 5, i), c_vz[i]);
+        wf(p, col_f(ef, n, 6, i), c_yaw[i]);
+        wf(p, col_f(ef, n, 7, i), c_pit[i]);
+        wf(p, col_f(ef, n, 8, i), c_at[i]);
+        wf(p, col_f(ef, n, 9, i), c_aim[i]);
+        i++;
+    }
+    o = o + tbl_bytes(n, SAVE_C_ENTITY_I, SAVE_C_ENTITY_F, 0); recs++;
+
+    // ---- PLAYER SLOTS -----------------------------------------------------
+    let p0: i32 = tbl_begin(p, o, SAVE_T_PLAYER, np, SAVE_C_PLAYER_I, SAVE_C_PLAYER_F, 0);
+    let pf: i32 = blk_f(p0, np, SAVE_C_PLAYER_I);
+    let pid = s.pslot_id; let mev = s.move_ev; let pdd = s.p_dead;
+    let hcm = s.has_cmd;  let qh = s.q_head;   let qn = s.q_n; let qs = s.q_seq;
+    let chan = s.chan_t;  let psa = s.move_ps;
+    let k: i32 = 0;
+    while (k < np) {
+        wi(p, col_i(p0, np, 0, k), pid[k]);
+        wi(p, col_i(p0, np, 1, k), mev[k]);
+        wi(p, col_i(p0, np, 2, k), pdd[k]);
+        wi(p, col_i(p0, np, 3, k), hcm[k]);
+        wi(p, col_i(p0, np, 4, k), qh[k]);
+        wi(p, col_i(p0, np, 5, k), qn[k]);
+        wi(p, col_i(p0, np, 6, k), qs[k]);
+        wf(p, col_f(pf, np, 0, k), chan[k]);
+        let ps: array<f64> = psa[k];
+        let j: i32 = 0;
+        while (j < PS_FIELDS) { wf(p, col_f(pf, np, 1 + j, k), ps[j]); j++; }
+        k++;
+    }
+    o = o + tbl_bytes(np, SAVE_C_PLAYER_I, SAVE_C_PLAYER_F, 0); recs++;
+
+    // ---- PROGRESSION + UNLOCKS -------------------------------------------
+    // Through `prog_serialize`, so the vector's own version word (PROG_VER,
+    // slot 0) travels inside the record and `prog_deserialize` gets to refuse.
+    // Unlocks are DERIVED from PROG_LEVEL (progression.hml 8), so persisting
+    // a second unlock bitmask would create two sources of truth for the single
+    // most valuable thing in the game to cheat.  There is one.
+    let g0: i32 = tbl_begin(p, o, SAVE_T_PROG, np, PROG_FIELDS, 0, 0);
+    let progs = s.prog;
+    let scratch: array = [];
+    let z: i32 = 0;
+    while (z < PROG_FIELDS) { scratch.push(0); z++; }
+    k = 0;
+    while (k < np) {
+        prog_serialize(progs[k], scratch, 0);
+        let j2: i32 = 0;
+        while (j2 < PROG_FIELDS) { wi(p, col_i(g0, np, j2, k), scratch[j2]); j2++; }
+        k++;
+    }
+    o = o + tbl_bytes(np, PROG_FIELDS, 0, 0); recs++;
+
+    // ---- WEAPON STATE -----------------------------------------------------
+    let wt: i32 = tbl_begin(p, o, SAVE_T_WEAPON, np, 0, WS_FIELDS, 0);
+    let wf0: i32 = blk_f(wt, np, 0);
+    let wst = s.wpn;
+    k = 0;
+    while (k < np) {
+        let base: i32 = k * WS_FIELDS;
+        let j3: i32 = 0;
+        while (j3 < WS_FIELDS) { wf(p, col_f(wf0, np, j3, k), wst[base + j3]); j3++; }
+        k++;
+    }
+    o = o + tbl_bytes(np, 0, WS_FIELDS, 0); recs++;
+
+    // ---- THE EVENT BUS ----------------------------------------------------
+    let cx: object = s.cx;
+    let bus: object = combat_events(cx);
+    let bn: i32 = bus.count;
+    let v0: i32 = tbl_begin(p, o, SAVE_T_EVBUS, bn, SAVE_C_EVBUS_I, 0, 0);
+    i = 0;
+    while (i < bn) {
+        wi(p, col_i(v0, bn, 0, i), evbus_tick(bus, i));
+        wi(p, col_i(v0, bn, 1, i), evbus_type(bus, i));
+        wi(p, col_i(v0, bn, 2, i), evbus_sub(bus, i));
+        wi(p, col_i(v0, bn, 3, i), evbus_actor(bus, i));
+        wi(p, col_i(v0, bn, 4, i), evbus_target(bus, i));
+        wi(p, col_i(v0, bn, 5, i), evbus_xq(bus, i));
+        wi(p, col_i(v0, bn, 6, i), evbus_yq(bus, i));
+        wi(p, col_i(v0, bn, 7, i), evbus_zq(bus, i));
+        i++;
+    }
+    o = o + tbl_bytes(bn, SAVE_C_EVBUS_I, 0, 0); recs++;
+
+    // ---- COMBAT COUNTERS --------------------------------------------------
+    let m0: i32 = tbl_begin(p, o, SAVE_T_COMBAT, 1, SAVE_C_COMBAT_I, 0, 0);
+    wi(p, col_i(m0, 1, 0, 0), bus.dropped);
+    wi(p, col_i(m0, 1, 1, 0), bus.pushed);
+    wi(p, col_i(m0, 1, 2, 0), cx.last_plated);
+    wi(p, col_i(m0, 1, 3, 0), cx.shots);
+    wi(p, col_i(m0, 1, 4, 0), cx.pellets_fired);
+    wi(p, col_i(m0, 1, 5, 0), cx.pellets_hit);
+    wi(p, col_i(m0, 1, 6, 0), cx.terrain_hits);
+    wi(p, col_i(m0, 1, 7, 0), cx.misses);
+    wi(p, col_i(m0, 1, 8, 0), cx.kills);
+    wi(p, col_i(m0, 1, 9, 0), cx.headshots);
+    wi(p, col_i(m0, 1, 10, 0), cx.plate_blocks);
+    wi(p, col_i(m0, 1, 11, 0), cx.damage_dealt);
+    wi(p, col_i(m0, 1, 12, 0), cx.no_weapon_source);
+    wi(p, col_i(m0, 1, 13, 0), cx.start_solid);
+    wi(p, col_i(m0, 1, 14, 0), cx.overkill);
+    o = o + tbl_bytes(1, SAVE_C_COMBAT_I, 0, 0); recs++;
+
+    // ---- THE HIT-SOUND PITCH CHAIN ----------------------------------------
+    let h0: i32 = tbl_begin(p, o, SAVE_T_CHAIN, CHAIN_SLOTS, SAVE_C_CHAIN_I, 0, 0);
+    let ch_n = cx.chain_n; let ch_t = cx.chain_tick;
+    i = 0;
+    while (i < CHAIN_SLOTS) {
+        wi(p, col_i(h0, CHAIN_SLOTS, 0, i), ch_n[i]);
+        wi(p, col_i(h0, CHAIN_SLOTS, 1, i), ch_t[i]);
+        i++;
+    }
+    o = o + tbl_bytes(CHAIN_SLOTS, SAVE_C_CHAIN_I, 0, 0); recs++;
+
+    // ---- PROJECTILES IN FLIGHT --------------------------------------------
+    let pj: object = s.proj;
+    let jn: i32 = pj.n;
+    let j0: i32 = tbl_begin(p, o, SAVE_T_PROJ, jn, SAVE_C_PROJ_I, SAVE_C_PROJ_F, 0);
+    let jf: i32 = blk_f(j0, jn, SAVE_C_PROJ_I);
+    let a_id = pj.p_id; let a_ty = pj.p_type; let a_ow = pj.p_owner;
+    let a_tm = pj.p_team; let a_ag = pj.p_age; let a_fu = pj.p_fuse;
+    let a_x0 = pj.p_x0; let a_y0 = pj.p_y0; let a_z0 = pj.p_z0;
+    i = 0;
+    while (i < jn) {
+        wi(p, col_i(j0, jn, 0, i), a_id[i]);
+        wi(p, col_i(j0, jn, 1, i), a_ty[i]);
+        wi(p, col_i(j0, jn, 2, i), a_ow[i]);
+        wi(p, col_i(j0, jn, 3, i), a_tm[i]);
+        wi(p, col_i(j0, jn, 4, i), a_ag[i]);
+        wi(p, col_i(j0, jn, 5, i), a_fu[i]);
+        wf(p, col_f(jf, jn, 0, i), a_x0[i]);
+        wf(p, col_f(jf, jn, 1, i), a_y0[i]);
+        wf(p, col_f(jf, jn, 2, i), a_z0[i]);
+        i++;
+    }
+    o = o + tbl_bytes(jn, SAVE_C_PROJ_I, SAVE_C_PROJ_F, 0); recs++;
+
+    // ---- BURNING ENTITIES -------------------------------------------------
+    let bcn: i32 = pj.bn;
+    let u0: i32 = tbl_begin(p, o, SAVE_T_PROJ_BURN, bcn, SAVE_C_BURN_I, 0, 0);
+    let b_id = pj.b_id; let b_src = pj.b_src; let b_dps = pj.b_dps;
+    let b_dur = pj.b_dur; let b_el = pj.b_el; let b_out = pj.b_out;
+    i = 0;
+    while (i < bcn) {
+        wi(p, col_i(u0, bcn, 0, i), b_id[i]);
+        wi(p, col_i(u0, bcn, 1, i), b_src[i]);
+        wi(p, col_i(u0, bcn, 2, i), b_dps[i]);
+        wi(p, col_i(u0, bcn, 3, i), b_dur[i]);
+        wi(p, col_i(u0, bcn, 4, i), b_el[i]);
+        wi(p, col_i(u0, bcn, 5, i), b_out[i]);
+        i++;
+    }
+    o = o + tbl_bytes(bcn, SAVE_C_BURN_I, 0, 0); recs++;
+
+    // ---- PROJECTILE COUNTERS ----------------------------------------------
+    let q0: i32 = tbl_begin(p, o, SAVE_T_PROJ_META, 1, SAVE_C_PROJMETA_I, 0, 0);
+    wi(p, col_i(q0, 1, 0, 0), pj.spawns);
+    wi(p, col_i(q0, 1, 1, 0), pj.spawn_fail);
+    wi(p, col_i(q0, 1, 2, 0), pj.detonations);
+    wi(p, col_i(q0, 1, 3, 0), pj.expiries);
+    wi(p, col_i(q0, 1, 4, 0), pj.hits);
+    wi(p, col_i(q0, 1, 5, 0), pj.kills);
+    wi(p, col_i(q0, 1, 6, 0), pj.burn_applied);
+    wi(p, col_i(q0, 1, 7, 0), pj.burn_ticks);
+    wi(p, col_i(q0, 1, 8, 0), pj.burn_fail);
+    wi(p, col_i(q0, 1, 9, 0), pj.ev_drop);
+    o = o + tbl_bytes(1, SAVE_C_PROJMETA_I, 0, 0); recs++;
+
+    // ---- PER-WEAPON SHOT COUNTERS (the 1-in-3 tracer cadence) -------------
+    let t0: i32 = tbl_begin(p, o, SAVE_T_PROJ_SHOTS, g_WPN_COUNT, 1, 0, 0);
+    let sh = pj.shots;
+    i = 0;
+    while (i < g_WPN_COUNT) { wi(p, col_i(t0, g_WPN_COUNT, 0, i), sh[i]); i++; }
+    o = o + tbl_bytes(g_WPN_COUNT, 1, 0, 0); recs++;
+
+    // ---- THIS TICK'S PROJECTILE EVENTS ------------------------------------
+    let pen: i32 = pj.ev_n;
+    let r0: i32 = tbl_begin(p, o, SAVE_T_PROJ_EVENT, pen, SAVE_C_PROJEV_I, SAVE_C_PROJEV_F, 0);
+    let rf0: i32 = blk_f(r0, pen, SAVE_C_PROJEV_I);
+    let e_k = pj.e_kind; let e_a = pj.e_a; let e_b = pj.e_b;
+    let e_0 = pj.e_i0; let e_1 = pj.e_i1;
+    let e_x = pj.e_x; let e_y = pj.e_y; let e_z = pj.e_z;
+    i = 0;
+    while (i < pen) {
+        wi(p, col_i(r0, pen, 0, i), e_k[i]);
+        wi(p, col_i(r0, pen, 1, i), e_a[i]);
+        wi(p, col_i(r0, pen, 2, i), e_b[i]);
+        wi(p, col_i(r0, pen, 3, i), e_0[i]);
+        wi(p, col_i(r0, pen, 4, i), e_1[i]);
+        wf(p, col_f(rf0, pen, 0, i), e_x[i]);
+        wf(p, col_f(rf0, pen, 1, i), e_y[i]);
+        wf(p, col_f(rf0, pen, 2, i), e_z[i]);
+        i++;
+    }
+    o = o + tbl_bytes(pen, SAVE_C_PROJEV_I, SAVE_C_PROJEV_F, 0); recs++;
+
+    // ---- AI EVENTS (ai_hash reads these) ----------------------------------
+    let ai: object = s.ai;
+    let aen: i32 = ai.ev_n;
+    let y0: i32 = tbl_begin(p, o, SAVE_T_AI_EVENT, aen, SAVE_C_AIEV_I, SAVE_C_AIEV_F, 0);
+    let yf: i32 = blk_f(y0, aen, SAVE_C_AIEV_I);
+    let v_t = ai.ev_type; let v_k = ai.ev_tick; let v_i = ai.ev_id;
+    let v_c = ai.ev_class; let v_g = ai.ev_target; let v_v = ai.ev_i;
+    let v_x = ai.ev_x; let v_y = ai.ev_y; let v_z = ai.ev_z;
+    i = 0;
+    while (i < aen) {
+        wi(p, col_i(y0, aen, 0, i), v_t[i]);
+        wi(p, col_i(y0, aen, 1, i), v_k[i]);
+        wi(p, col_i(y0, aen, 2, i), v_i[i]);
+        wi(p, col_i(y0, aen, 3, i), v_c[i]);
+        wi(p, col_i(y0, aen, 4, i), v_g[i]);
+        wi(p, col_i(y0, aen, 5, i), v_v[i]);
+        wf(p, col_f(yf, aen, 0, i), v_x[i]);
+        wf(p, col_f(yf, aen, 1, i), v_y[i]);
+        wf(p, col_f(yf, aen, 2, i), v_z[i]);
+        i++;
+    }
+    o = o + tbl_bytes(aen, SAVE_C_AIEV_I, SAVE_C_AIEV_F, 0); recs++;
+
+    // ---- AI COUNTERS ------------------------------------------------------
+    let z0: i32 = tbl_begin(p, o, SAVE_T_AI_META, 1, SAVE_C_AIMETA_I, 0, 0);
+    wi(p, col_i(z0, 1, 0, 0), ai.tick);
+    wi(p, col_i(z0, 1, 1, 0), ai.agents);
+    wi(p, col_i(z0, 1, 2, 0), ai.players);
+    wi(p, col_i(z0, 1, 3, 0), ai.steps);
+    wi(p, col_i(z0, 1, 4, 0), ai.spawns);
+    wi(p, col_i(z0, 1, 5, 0), ai.spawn_fail);
+    wi(p, col_i(z0, 1, 6, 0), ai.relax_passes);
+    wi(p, col_i(z0, 1, 7, 0), ai.terrain_miss);
+    wi(p, col_i(z0, 1, 8, 0), ai.attacks);
+    wi(p, col_i(z0, 1, 9, 0), ai.whiffs);
+    wi(p, col_i(z0, 1, 10, 0), ai.tells);
+    wi(p, col_i(z0, 1, 11, 0), ai.ev_dropped);
+    o = o + tbl_bytes(1, SAVE_C_AIMETA_I, 0, 0); recs++;
+
+    // ---- THE WAVE DIRECTOR ------------------------------------------------
+    let d: object = s.dir;
+    let d0: i32 = tbl_begin(p, o, SAVE_T_DIRECTOR, 1, SAVE_C_DIR_I, SAVE_C_DIR_F, SAVE_C_DIR_U);
+    wi(p, col_i(d0, 1, 0, 0), d.seed);
+    wi(p, col_i(d0, 1, 1, 0), d.tier);
+    wi(p, col_i(d0, 1, 2, 0), d.state);
+    wi(p, col_i(d0, 1, 3, 0), d.wave);
+    wi(p, col_i(d0, 1, 4, 0), d.budget);
+    wi(p, col_i(d0, 1, 5, 0), d.spent);
+    wi(p, col_i(d0, 1, 6, 0), d.reserve);
+    wi(p, col_i(d0, 1, 7, 0), d.bulwark_pending);
+    wi(p, col_i(d0, 1, 8, 0), d.spawn_timer);
+    wi(p, col_i(d0, 1, 9, 0), d.gap_timer);
+    wi(p, col_i(d0, 1, 10, 0), d.spawn_seq);
+    wi(p, col_i(d0, 1, 11, 0), d.wave_spawned);
+    wi(p, col_i(d0, 1, 12, 0), d.hold_spawned);
+    wi(p, col_i(d0, 1, 13, 0), d.holds_done);
+    wi(p, col_i(d0, 1, 14, 0), d.prev_tick);
+    wi(p, col_i(d0, 1, 15, 0), d.tick);
+    wi(p, col_i(d0, 1, 16, 0), d.hold_start_tick);
+    wi(p, col_i(d0, 1, 17, 0), d.wave_start_tick);
+    wi(p, col_i(d0, 1, 18, 0), d.hold_ticks);
+    wi(p, col_i(d0, 1, 19, 0), d.events);
+    wi(p, col_i(d0, 1, 20, 0), d.alive);
+    wi(p, col_i(d0, 1, 21, 0), d.onscreen);
+    wi(p, col_i(d0, 1, 22, 0), d.peak_alive);
+    wi(p, col_i(d0, 1, 23, 0), d.peak_onscreen);
+    wi(p, col_i(d0, 1, 24, 0), d.peak_onscreen_at_spawn);
+    wi(p, col_i(d0, 1, 25, 0), d.defer_alive);
+    wi(p, col_i(d0, 1, 26, 0), d.defer_onscreen);
+    wi(p, col_i(d0, 1, 27, 0), d.spawn_fail);
+    wi(p, col_i(d0, 1, 28, 0), d.req_n);
+    let df: i32 = blk_f(d0, 1, SAVE_C_DIR_I);
+    wf(p, col_f(df, 1, 0, 0), d.ax);
+    wf(p, col_f(df, 1, 1, 0), d.ay);
+    wf(p, col_f(df, 1, 2, 0), d.az);
+    let du: i32 = blk_u(df, 1, SAVE_C_DIR_F);
+    let drng = d.rng;
+    i = 0;
+    while (i < 4) { wu(p, col_u(du, 1, i, 0), drng[i]); i++; }
+    o = o + tbl_bytes(1, SAVE_C_DIR_I, SAVE_C_DIR_F, SAVE_C_DIR_U); recs++;
+
+    // ---- THE ROSTER -------------------------------------------------------
+    let rn: i32 = d.n_ros;
+    let s0: i32 = tbl_begin(p, o, SAVE_T_ROSTER, rn, SAVE_C_ROSTER_I, 0, 0);
+    let r_id = d.ros_id; let r_kd = d.ros_kind; let r_wv = d.ros_wave;
+    i = 0;
+    while (i < rn) {
+        wi(p, col_i(s0, rn, 0, i), r_id[i]);
+        wi(p, col_i(s0, rn, 1, i), r_kd[i]);
+        wi(p, col_i(s0, rn, 2, i), r_wv[i]);
+        i++;
+    }
+    o = o + tbl_bytes(rn, SAVE_C_ROSTER_I, 0, 0); recs++;
+
+    // ---- PENDING SPAWN REQUESTS -------------------------------------------
+    let qn2: i32 = d.req_n;
+    let x0: i32 = tbl_begin(p, o, SAVE_T_DIRREQ, qn2, SAVE_C_DIRREQ_I, SAVE_C_DIRREQ_F, 0);
+    let xf: i32 = blk_f(x0, qn2, SAVE_C_DIRREQ_I);
+    let q_k = d.req_kind; let q_b = d.req_bound;
+    let q_x = d.req_x; let q_y = d.req_y; let q_z = d.req_z;
+    i = 0;
+    while (i < qn2) {
+        wi(p, col_i(x0, qn2, 0, i), q_k[i]);
+        wi(p, col_i(x0, qn2, 1, i), q_b[i]);
+        wf(p, col_f(xf, qn2, 0, i), q_x[i]);
+        wf(p, col_f(xf, qn2, 1, i), q_y[i]);
+        wf(p, col_f(xf, qn2, 2, i), q_z[i]);
+        i++;
+    }
+    o = o + tbl_bytes(qn2, SAVE_C_DIRREQ_I, SAVE_C_DIRREQ_F, 0); recs++;
+
+    // ---- LOOT -------------------------------------------------------------
+    let l0: i32 = tbl_begin(p, o, SAVE_T_LOOT, 1, SAVE_C_LOOT_I, 0, 0);
+    wi(p, col_i(l0, 1, 0, 0), s.loot_hash);
+    wi(p, col_i(l0, 1, 1, 0), s.loot_rolls);
+    wi(p, col_i(l0, 1, 2, 0), s.last_rarity);
+    let item = s.item;
+    i = 0;
+    while (i < ITEM_FIELDS) { wi(p, col_i(l0, 1, 3 + i, 0), item[i]); i++; }
+    o = o + tbl_bytes(1, SAVE_C_LOOT_I, 0, 0); recs++;
+
+    // ---- THE CHUNK EDIT OVERLAY.  NEVER generated data. -------------------
+    let cw: i32 = chunk_words(w);
+    let k0: i32 = tbl_begin(p, o, SAVE_T_CHUNKEDIT, cw, 1, 0, 0);
+    if (cw > 0) {
+        let blob: buffer = buffer(cw * 4);
+        chunk_edits_save(s.cs, blob);
+        let bp: ptr = buffer_ptr(blob);
+        i = 0;
+        while (i < cw) { wi(p, col_i(k0, cw, 0, i), ri(bp, i * 4)); i++; }
+    }
+    o = o + tbl_bytes(cw, 1, 0, 0); recs++;
+
+    // ---- THE RESIDENT CHUNK SET.  KEYS ONLY — never the generated samples. --
+    let crn: i32 = chunk_rows(w);
+    // Rows are emitted SORTED by (cz, cx), never in slot order.  Slot order is
+    // an artefact of one store's load/evict history: two stores holding the
+    // identical set of chunks can hold them in different slots, and emitting
+    // slot order would make the file's bytes depend on how the player got here
+    // rather than on where they are.  Sorting makes the encoding CANONICAL —
+    // equal state, equal bytes — which is what lets a save be diffed, deduped
+    // or content-hashed, and what lets `probe_save` assert
+    // `encode(load(encode(x))) == encode(x)` byte for byte.  It also makes the
+    // slot assignment on the next load deterministic, because the decoder
+    // replays the rows in this order.
+    let g2: i32 = tbl_begin(p, o, SAVE_T_CHUNKRING, crn, SAVE_C_RING_I, 0, 0);
+    if (crn > 0) {
+        let cs2: object = s.cs;
+        let a_cx = cs2.cx; let a_cz = cs2.cz;
+        let a_lv = cs2.live; let a_pn = cs2.pin; let a_sp = cs2.stamp;
+        let cc: i32 = cs2.cap;
+        let k_cx: array<i32> = [];
+        let k_cz: array<i32> = [];
+        let k_pn: array<i32> = [];
+        let k_sp: array<i32> = [];
+        i = 0;
+        while (i < cc) {
+            if (a_lv[i] == 1) {
+                k_cx.push(a_cx[i]); k_cz.push(a_cz[i]);
+                k_pn.push(a_pn[i]); k_sp.push(a_sp[i]);
+            }
+            i++;
+        }
+        // Insertion sort by (cz, cx).  Off every hot path — a save happens four
+        // times a session — and it needs no comparator closure (CLAUDE.md 1
+        // rule 8) and no allocation per comparison.
+        let m: i32 = k_cx.length;
+        let a: i32 = 1;
+        while (a < m) {
+            let vx: i32 = k_cx[a]; let vz: i32 = k_cz[a];
+            let vp: i32 = k_pn[a]; let vs: i32 = k_sp[a];
+            let b: i32 = a - 1;
+            let go: i32 = 1;
+            while (go == 1) {
+                go = 0;
+                if (b >= 0) {
+                    let gt: i32 = 0;
+                    if (k_cz[b] > vz) { gt = 1; }
+                    if (k_cz[b] == vz) { if (k_cx[b] > vx) { gt = 1; } }
+                    if (gt == 1) {
+                        k_cx[b + 1] = k_cx[b]; k_cz[b + 1] = k_cz[b];
+                        k_pn[b + 1] = k_pn[b]; k_sp[b + 1] = k_sp[b];
+                        b = b - 1;
+                        go = 1;
+                    }
+                }
+            }
+            k_cx[b + 1] = vx; k_cz[b + 1] = vz;
+            k_pn[b + 1] = vp; k_sp[b + 1] = vs;
+            a++;
+        }
+        let r: i32 = 0;
+        while (r < crn) {
+            if (r < m) {
+                wi(p, col_i(g2, crn, 0, r), k_cx[r]);
+                wi(p, col_i(g2, crn, 1, r), k_cz[r]);
+                wi(p, col_i(g2, crn, 2, r), k_pn[r]);
+                wi(p, col_i(g2, crn, 3, r), k_sp[r]);
+            }
+            r++;
+        }
+    }
+    o = o + tbl_bytes(crn, SAVE_C_RING_I, 0, 0); recs++;
+
+    // ---- CHUNK STORE CLOCK AND COUNTERS -----------------------------------
+    let g3: i32 = tbl_begin(p, o, SAVE_T_CHUNKMETA, 1, SAVE_C_CHUNKMETA_I, 0, 0);
+    if (s.has_cs == 1) {
+        let cs3: object = s.cs;
+        wi(p, col_i(g3, 1, 0, 0), cs3.clock);
+        wi(p, col_i(g3, 1, 1, 0), cs3.loads);
+        wi(p, col_i(g3, 1, 2, 0), cs3.evicts);
+        wi(p, col_i(g3, 1, 3, 0), cs3.hits);
+        wi(p, col_i(g3, 1, 4, 0), cs3.misses);
+        wi(p, col_i(g3, 1, 5, 0), cs3.refused);
+        wi(p, col_i(g3, 1, 6, 0), cs3.edit_full);
+        wi(p, col_i(g3, 1, 7, 0), cs3.no_source);
+        wi(p, col_i(g3, 1, 8, 0), cs3.sample_miss);
+        // The one-entry sampler memo.  It looks like a pure cache and is not:
+        // a memo HIT skips `chunk_get`, so it skips the LRU `touch` that would
+        // have bumped the store's clock.  Two stores holding the identical set
+        // of chunks with different memos drift one LRU stamp apart on the very
+        // next height query, and from there they evict different chunks.  The
+        // SLOT is deliberately not saved — slots are an artefact of one store's
+        // history — so the key is saved and the slot re-derived on load.
+        wi(p, col_i(g3, 1, 9, 0), cs3.mcx);
+        wi(p, col_i(g3, 1, 10, 0), cs3.mcz);
+    }
+    o = o + tbl_bytes(1, SAVE_C_CHUNKMETA_I, 0, 0); recs++;
+
+    // ---- TOWN LAYOUT: the solid AABBs the movement code collides against ---
+    let sol = s.solids;
+    let sn: i32 = sol.length / 6;
+    let n0: i32 = tbl_begin(p, o, SAVE_T_SOLIDS, sn, 0, SAVE_C_SOLIDS_F, 0);
+    let nf: i32 = blk_f(n0, sn, 0);
+    i = 0;
+    while (i < sn) {
+        let sb: i32 = i * 6;
+        let j4: i32 = 0;
+        while (j4 < 6) { wf(p, col_f(nf, sn, j4, i), sol[sb + j4]); j4++; }
+        i++;
+    }
+    o = o + tbl_bytes(sn, 0, SAVE_C_SOLIDS_F, 0); recs++;
+
+    // ---- THE LATCHED COMMAND ----------------------------------------------
+    let c0: i32 = tbl_begin(p, o, SAVE_T_COMMAND, np, CMD_FIELDS, 0, 0);
+    let ca = s.cmd;
+    k = 0;
+    while (k < np) { cmd_out(p, c0, np, k, ca[k]); k++; }
+    o = o + tbl_bytes(np, CMD_FIELDS, 0, 0); recs++;
+
+    // ---- THE PENDING COMMAND RING -----------------------------------------
+    let qrows: i32 = np * SIM_CMD_QUEUE;
+    let cq: i32 = tbl_begin(p, o, SAVE_T_CMDQUEUE, qrows, CMD_FIELDS, 0, 0);
+    let qa = s.queue;
+    k = 0;
+    while (k < np) {
+        let ring = qa[k];
+        let j5: i32 = 0;
+        while (j5 < SIM_CMD_QUEUE) {
+            cmd_out(p, cq, qrows, k * SIM_CMD_QUEUE + j5, ring[j5]);
+            j5++;
+        }
+        k++;
+    }
+    o = o + tbl_bytes(qrows, CMD_FIELDS, 0, 0); recs++;
+
+    // ---- SIM COUNTERS -----------------------------------------------------
+    let y1: i32 = tbl_begin(p, o, SAVE_T_COUNTER, 1, 19, 0, 0);
+    wi(p, col_i(y1, 1, 0, 0), s.cmds_queued);
+    wi(p, col_i(y1, 1, 1, 0), s.cmds_applied);
+    wi(p, col_i(y1, 1, 2, 0), s.cmds_dropped);
+    wi(p, col_i(y1, 1, 3, 0), s.cmds_stale);
+    wi(p, col_i(y1, 1, 4, 0), s.cmds_bad);
+    wi(p, col_i(y1, 1, 5, 0), s.cmds_missing);
+    wi(p, col_i(y1, 1, 6, 0), s.shots);
+    wi(p, col_i(y1, 1, 7, 0), s.reloads);
+    wi(p, col_i(y1, 1, 8, 0), s.swaps_wpn);
+    wi(p, col_i(y1, 1, 9, 0), s.spawns_req);
+    wi(p, col_i(y1, 1, 10, 0), s.spawns_ok);
+    wi(p, col_i(y1, 1, 11, 0), s.deaths);
+    wi(p, col_i(y1, 1, 12, 0), s.player_deaths);
+    wi(p, col_i(y1, 1, 13, 0), s.ai_attacks);
+    wi(p, col_i(y1, 1, 14, 0), s.adds_spawned);
+    wi(p, col_i(y1, 1, 15, 0), s.pickups);
+    wi(p, col_i(y1, 1, 16, 0), s.lanterns_lit);
+    wi(p, col_i(y1, 1, 17, 0), s.fall_hits);
+    wi(p, col_i(y1, 1, 18, 0), s.ground_miss);
+    o = o + tbl_bytes(1, 19, 0, 0); recs++;
+
+    // ---- RNG STATE --------------------------------------------------------
+    let g1: i32 = tbl_begin(p, o, SAVE_T_RNG, 1, 0, 0, SAVE_C_RNG_U);
+    let gu: i32 = blk_u(blk_f(g1, 1, 0), 1, 0);
+    let srng = s.rng;
+    let crng = cx.rng;
+    i = 0;
+    while (i < 4) { wu(p, col_u(gu, 1, i, 0), srng[i]); i++; }
+    i = 0;
+    while (i < 4) { wu(p, col_u(gu, 1, 4 + i, 0), crng[i]); i++; }
+    o = o + tbl_bytes(1, 0, 0, SAVE_C_RNG_U); recs++;
+
+    // ---- THE HEADER, LAST, BECAUSE IT SUMS WHAT CAME BEFORE ---------------
+    let payload: i32 = o - SAVE_HDR_B;
+    wi(p, SAVE_OFF_MAGIC, SAVE_MAGIC);
+    wi(p, SAVE_OFF_VER, SAVE_VERSION);
+    wi(p, SAVE_OFF_MINVER, SAVE_MIN_VERSION);
+    wi(p, SAVE_OFF_HDRB, SAVE_HDR_B);
+    wi(p, SAVE_OFF_PAYB, payload);
+    wi(p, SAVE_OFF_RECS, recs);
+    wi(p, SAVE_OFF_SUM, fnv32(p, SAVE_HDR_B, payload));
+    wi(p, SAVE_OFF_REASON, p_reason);
+
+    let out: i32 = o;
+    return out;
+}
+
+fn cmd_out(p_p: ptr, p_base: i32, p_rows: i32, p_r: i32, p_c: object) {
+    let c: object = p_c;
+    wi(p_p, col_i(p_base, p_rows, 0, p_r), c.tick);
+    wi(p_p, col_i(p_base, p_rows, 1, p_r), c.dt_ms);
+    wi(p_p, col_i(p_base, p_rows, 2, p_r), c.move_x);
+    wi(p_p, col_i(p_base, p_rows, 3, p_r), c.move_y);
+    wi(p_p, col_i(p_base, p_rows, 4, p_r), c.yaw_q);
+    wi(p_p, col_i(p_base, p_rows, 5, p_r), c.pitch_q);
+    wi(p_p, col_i(p_base, p_rows, 6, p_r), c.buttons);
+    wi(p_p, col_i(p_base, p_rows, 7, p_r), c.weapon_sel);
+    wi(p_p, col_i(p_base, p_rows, 8, p_r), c.seq);
+}
+
+fn cmd_in(p_p: ptr, p_base: i32, p_rows: i32, p_cols: i32, p_r: i32, p_c: object) {
+    let c: object = p_c;
+    let nc: i32 = p_cols;
+    if (nc > CMD_FIELDS) { nc = CMD_FIELDS; }
+    if (nc > 0) { c.tick       = ri(p_p, col_i(p_base, p_rows, 0, p_r)); }
+    if (nc > 1) { c.dt_ms      = ri(p_p, col_i(p_base, p_rows, 1, p_r)); }
+    if (nc > 2) { c.move_x     = ri(p_p, col_i(p_base, p_rows, 2, p_r)); }
+    if (nc > 3) { c.move_y     = ri(p_p, col_i(p_base, p_rows, 3, p_r)); }
+    if (nc > 4) { c.yaw_q      = ri(p_p, col_i(p_base, p_rows, 4, p_r)); }
+    if (nc > 5) { c.pitch_q    = ri(p_p, col_i(p_base, p_rows, 5, p_r)); }
+    if (nc > 6) { c.buttons    = ri(p_p, col_i(p_base, p_rows, 6, p_r)); }
+    if (nc > 7) { c.weapon_sel = ri(p_p, col_i(p_base, p_rows, 7, p_r)); }
+    if (nc > 8) { c.seq        = ri(p_p, col_i(p_base, p_rows, 8, p_r)); }
+}
+
+// =============================================================================
+//  8.  HEADER INSPECTION — you may look before you leap
+// =============================================================================
+//  A launcher wants to list save slots ("Ember Hollow, day 3") without
+//  instantiating a simulation.  Every one of these is a pure read that touches
+//  no sim state and cannot throw.
+
+export fn save_peek_version(p_src: buffer): i32 {
+    let src: buffer = p_src;
+    if (src.length < SAVE_HDR_B) { let t: i32 = SAVE_ERR_TRUNC; return t; }
+    let p: ptr = buffer_ptr(src);
+    if (ri(p, SAVE_OFF_MAGIC) != SAVE_MAGIC) { let m: i32 = SAVE_ERR_MAGIC; return m; }
+    let v: i32 = ri(p, SAVE_OFF_VER);
+    return v;
+}
+
+export fn save_peek_min_version(p_src: buffer): i32 {
+    let src: buffer = p_src;
+    if (src.length < SAVE_HDR_B) { let t: i32 = SAVE_ERR_TRUNC; return t; }
+    let p: ptr = buffer_ptr(src);
+    if (ri(p, SAVE_OFF_MAGIC) != SAVE_MAGIC) { let m: i32 = SAVE_ERR_MAGIC; return m; }
+    let v: i32 = ri(p, SAVE_OFF_MINVER);
+    return v;
+}
+
+export fn save_peek_records(p_src: buffer): i32 {
+    let src: buffer = p_src;
+    if (src.length < SAVE_HDR_B) { let t: i32 = SAVE_ERR_TRUNC; return t; }
+    let p: ptr = buffer_ptr(src);
+    let v: i32 = ri(p, SAVE_OFF_RECS);
+    return v;
+}
+
+export fn save_peek_reason(p_src: buffer): i32 {
+    let src: buffer = p_src;
+    if (src.length < SAVE_HDR_B) { let t: i32 = SAVE_ERR_TRUNC; return t; }
+    let p: ptr = buffer_ptr(src);
+    let v: i32 = ri(p, SAVE_OFF_REASON);
+    return v;
+}
+
+// The four things a save-slot menu needs, without a sim: seed, tick, players,
+// entity cap.  `p_which` 0..3.  Returns SAVE_ERR_* on a malformed file.
+export fn save_peek_meta(p_src: buffer, p_which: i32): i32 {
+    let src: buffer = p_src;
+    let vfy: i32 = save_verify(src);
+    if (vfy != 0) { let e: i32 = vfy; return e; }
+    let p: ptr = buffer_ptr(src);
+    // META is written first, so it is the first record — but find it by TAG,
+    // never by position.  Record ORDER is not part of the contract; tags are.
+    let end: i32 = SAVE_HDR_B + ri(p, SAVE_OFF_PAYB);
+    let o: i32 = SAVE_HDR_B;
+    while (o + SAVE_REC_HDR_B <= end) {
+        let tag: i32 = ri(p, o);
+        let len: i32 = ri(p, o + 4);
+        if (len < SAVE_TBL_HDR_B) { let bad: i32 = SAVE_ERR_RECORD; return bad; }
+        if (o + SAVE_REC_HDR_B + len > end) { let t: i32 = SAVE_ERR_TRUNC; return t; }
+        if (tag == SAVE_T_META) {
+            let rows: i32 = ri(p, o + 8);
+            let ci: i32 = ri(p, o + 12);
+            if (rows < 1 || ci < 4) { let bad2: i32 = SAVE_ERR_RECORD; return bad2; }
+            let ib: i32 = o + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+            let wh: i32 = p_which;
+            if (wh < 0 || wh > 3) { wh = 0; }
+            // 0 players, 1 cap, 2 seed, 3 tick — the first four META columns.
+            let v: i32 = ri(p, col_i(ib, rows, wh, 0));
+            return v;
+        }
+        o = o + SAVE_REC_HDR_B + len;
+    }
+    let miss: i32 = SAVE_ERR_RECORD;
+    return miss;
+}
+
+// Structural validation only: magic, version window, framing, checksum.
+// Returns 0 if the file is loadable, else the SAVE_ERR_* that stops it.
+export fn save_verify(p_src: buffer): i32 {
+    let src: buffer = p_src;
+    if (src.length < SAVE_HDR_B) { let t: i32 = SAVE_ERR_TRUNC; return t; }
+    let p: ptr = buffer_ptr(src);
+    if (ri(p, SAVE_OFF_MAGIC) != SAVE_MAGIC) { let m: i32 = SAVE_ERR_MAGIC; return m; }
+
+    let hb: i32 = ri(p, SAVE_OFF_HDRB);
+    if (hb < SAVE_HDR_B) { let h: i32 = SAVE_ERR_HEADER; return h; }
+    if (hb > src.length) { let h2: i32 = SAVE_ERR_TRUNC; return h2; }
+
+    // THE VERSION WINDOW.  A newer file is readable exactly when its writer
+    // declared that an older reader still can: min_version <= ours <= version.
+    // A file that predates us is always readable.  Nothing else is guessed at.
+    let ver: i32 = ri(p, SAVE_OFF_VER);
+    let minv: i32 = ri(p, SAVE_OFF_MINVER);
+    if (ver < 1) { let v0: i32 = SAVE_ERR_VERSION; return v0; }
+    if (minv > SAVE_VERSION) { let v1: i32 = SAVE_ERR_VERSION; return v1; }
+    if (minv > ver) { let v2: i32 = SAVE_ERR_HEADER; return v2; }
+
+    let payload: i32 = ri(p, SAVE_OFF_PAYB);
+    if (payload < 0) { let r: i32 = SAVE_ERR_RECORD; return r; }
+    if (hb + payload > src.length) { let t2: i32 = SAVE_ERR_TRUNC; return t2; }
+    if (fnv32(p, hb, payload) != ri(p, SAVE_OFF_SUM)) {
+        let c: i32 = SAVE_ERR_CHECKSUM;
+        return c;
+    }
+    let ok: i32 = 0;
+    return ok;
+}
+
+// =============================================================================
+//  9.  DECODE
+// =============================================================================
+//  Restores into an EXISTING world built by `sim_new_cap`.  The caller keeps
+//  ownership of the chunk store and the injected worldgen adapter, exactly as
+//  `sim_set_chunks` requires — a save never smuggles a generator across a
+//  process boundary, it carries the SEED and the EDITS and nothing else.
+//
+//  Returns the number of bytes consumed, or a negative SAVE_ERR_*.  It NEVER
+//  throws and it never leaves the world half-applied on a framing error: the
+//  structural checks all run in `save_verify` BEFORE the first byte is applied.
+
+export fn save_decode(p_w: object, p_src: buffer): i32 {
+    let w: object = p_w;
+    let src: buffer = p_src;
+    g_save_skipped = 0;
+    g_save_skipped_bytes = 0;
+    g_save_applied = 0;
+    g_save_last_err = 0;
+    g_save_have_meta = 0;
+    g_save_ring_ib = -1;
+    g_save_ring_rows = 0;
+    g_save_ring_ci = 0;
+    g_save_edit_ib = -1;
+    g_save_edit_rows = 0;
+    g_save_cmeta_ib = -1;
+    g_save_cmeta_ci = 0;
+
+    let vfy: i32 = save_verify(src);
+    if (vfy != 0) { g_save_last_err = vfy; let e: i32 = vfy; return e; }
+
+    let p: ptr = buffer_ptr(src);
+    let hb: i32 = ri(p, SAVE_OFF_HDRB);
+    let payload: i32 = ri(p, SAVE_OFF_PAYB);
+    let end: i32 = hb + payload;
+    g_save_last_ver = ri(p, SAVE_OFF_VER);
+
+    let s: object = sim_of(w);
+
+    // ---- capacity gate, BEFORE anything is written ------------------------
+    // A save from a build with a bigger world must be refused, not truncated.
+    // A truncated load is the worst possible outcome: it looks like it worked.
+    let o: i32 = hb;
+    let saw_meta: i32 = 0;
+    while (o + SAVE_REC_HDR_B <= end) {
+        let tag: i32 = ri(p, o);
+        let len: i32 = ri(p, o + 4);
+        if (len < SAVE_TBL_HDR_B) { g_save_last_err = SAVE_ERR_RECORD; let b: i32 = SAVE_ERR_RECORD; return b; }
+        if (o + SAVE_REC_HDR_B + len > end) { g_save_last_err = SAVE_ERR_TRUNC; let t: i32 = SAVE_ERR_TRUNC; return t; }
+        let rows: i32 = ri(p, o + 8);
+        if (rows < 0) { g_save_last_err = SAVE_ERR_RECORD; let b2: i32 = SAVE_ERR_RECORD; return b2; }
+        if (tag == SAVE_T_META) {
+            let ib: i32 = o + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+            let ci: i32 = ri(p, o + 12);
+            if (rows < 1 || ci < 15) { g_save_last_err = SAVE_ERR_RECORD; let b3: i32 = SAVE_ERR_RECORD; return b3; }
+            let f_np: i32 = ri(p, col_i(ib, rows, 0, 0));
+            let f_cap: i32 = ri(p, col_i(ib, rows, 1, 0));
+            if (f_np != s.players) { g_save_last_err = SAVE_ERR_CAP; let c: i32 = SAVE_ERR_CAP; return c; }
+            if (f_cap > w.cap) { g_save_last_err = SAVE_ERR_CAP; let c2: i32 = SAVE_ERR_CAP; return c2; }
+            saw_meta = 1;
+        }
+        if (tag == SAVE_T_ENTITY) {
+            if (rows > w.cap) { g_save_last_err = SAVE_ERR_CAP; let c3: i32 = SAVE_ERR_CAP; return c3; }
+        }
+        o = o + SAVE_REC_HDR_B + len;
+    }
+    if (o != end) { g_save_last_err = SAVE_ERR_TRUNC; let t2: i32 = SAVE_ERR_TRUNC; return t2; }
+    if (saw_meta == 0) { g_save_last_err = SAVE_ERR_RECORD; let m: i32 = SAVE_ERR_RECORD; return m; }
+
+    // ---- apply -------------------------------------------------------------
+    world_reset(w);
+    o = hb;
+    while (o + SAVE_REC_HDR_B <= end) {
+        let tag: i32 = ri(p, o);
+        let len: i32 = ri(p, o + 4);
+        let rows: i32 = ri(p, o + 8);
+        let ci: i32 = ri(p, o + 12);
+        let cf: i32 = ri(p, o + 16);
+        let cu: i32 = ri(p, o + 20);
+        let ib: i32 = o + SAVE_REC_HDR_B + SAVE_TBL_HDR_B;
+        let rc: i32 = apply_record(w, s, p, tag, rows, ci, cf, cu, ib);
+        if (rc < 0) { g_save_last_err = rc; let e2: i32 = rc; return e2; }
+        if (rc == 0) {
+            // An unknown tag.  Skipped whole, using the length — and COUNTED,
+            // because "the save silently lost your almanac" must be visible.
+            g_save_skipped = g_save_skipped + 1;
+            g_save_skipped_bytes = g_save_skipped_bytes + len;
+        } else {
+            g_save_applied = g_save_applied + 1;
+        }
+        o = o + SAVE_REC_HDR_B + len;
+    }
+
+    // ---- the epilogue -----------------------------------------------------
+    // Everything the entity replay disturbed, put back to what the save said.
+    w.next_ai = g_save_next_ai;
+    w.next_proj = g_save_next_proj;
+    w.next_pickup = g_save_next_pick;
+    w.next_cosmetic = g_save_next_cos;
+    w.spawns = g_save_spawns;
+    w.despawns = g_save_despawns;
+    w.spawn_fail = g_save_spawnfail;
+
+    // ---- the terrain, RE-DERIVED rather than stored ------------------------
+    // The save carries the SEED and the KEYS of the resident chunks, never the
+    // 9.5 KB of samples each one holds.  Rebuilding is three steps in a fixed
+    // order and every one of them matters:
+    //
+    //   1. the seed.  A caller who hands us a store seeded differently would
+    //      otherwise get a world whose entities were restored exactly and whose
+    //      GROUND was from another universe.  `sim_hash` cannot see terrain, so
+    //      it would call that load perfect.
+    //   2. residency, by REPLAYING `chunk_get` over the saved keys.  The
+    //      generator is pure, so replaying the keys reproduces the samples
+    //      bit-for-bit.  Pin flags and LRU stamps are then restored, because
+    //      they decide which chunk gets evicted next and that decision changes
+    //      the simulation.
+    //   3. the edit overlay LAST — `chunk_edits_load` rebuilds every resident
+    //      chunk's edit count, which is what makes an edited height visible.
+    //      Applied before step 2 it would be silently overwritten.
+    if (s.has_cs == 1) {
+        let cs: object = s.cs;
+        chunk_set_seed(cs, w.seed);
+        chunk_drop_all(cs);
+
+        if (g_save_ring_ib >= 0) {
+            let rrows: i32 = g_save_ring_rows;
+            let rib: i32 = g_save_ring_ib;
+            let rci: i32 = g_save_ring_ci;
+            let a_pn = cs.pin; let a_sp = cs.stamp;
+            let i: i32 = 0;
+            while (i < rrows) {
+                let ccx: i32 = ri(p, col_i(rib, rrows, 0, i));
+                let ccz: i32 = ri(p, col_i(rib, rrows, 1, i));
+                let slot: i32 = chunk_get(cs, ccx, ccz);
+                if (slot < 0) { g_save_last_err = SAVE_ERR_CAP; let e: i32 = SAVE_ERR_CAP; return e; }
+                if (rci > 2) { a_pn[slot] = ri(p, col_i(rib, rrows, 2, i)); }
+                if (rci > 3) { a_sp[slot] = ri(p, col_i(rib, rrows, 3, i)); }
+                i++;
+            }
+        } else {
+            // An older save with no ring record: fall back to pinning the ring
+            // at the saved streaming centre, which is the best that file says.
+            if (s.ccx != 2147483647) {
+                if (s.ccz != 2147483647) {
+                    chunk_pin_ring(cs, s.ccx, s.ccz, g_RING_RADIUS);
+                }
+            }
+        }
+
+        if (g_save_cmeta_ib >= 0) {
+            let mib: i32 = g_save_cmeta_ib;
+            let mci: i32 = g_save_cmeta_ci;
+            if (mci > 0) { cs.clock = ri(p, col_i(mib, 1, 0, 0)); }
+            if (mci > 1) { cs.loads = ri(p, col_i(mib, 1, 1, 0)); }
+            if (mci > 2) { cs.evicts = ri(p, col_i(mib, 1, 2, 0)); }
+            if (mci > 3) { cs.hits = ri(p, col_i(mib, 1, 3, 0)); }
+            if (mci > 4) { cs.misses = ri(p, col_i(mib, 1, 4, 0)); }
+            if (mci > 5) { cs.refused = ri(p, col_i(mib, 1, 5, 0)); }
+            if (mci > 6) { cs.edit_full = ri(p, col_i(mib, 1, 6, 0)); }
+            if (mci > 7) { cs.no_source = ri(p, col_i(mib, 1, 7, 0)); }
+            if (mci > 8) { cs.sample_miss = ri(p, col_i(mib, 1, 8, 0)); }
+            if (mci > 10) {
+                let mcx: i32 = ri(p, col_i(mib, 1, 9, 0));
+                let mcz: i32 = ri(p, col_i(mib, 1, 10, 0));
+                cs.mcx = mcx;
+                cs.mcz = mcz;
+                cs.mslot = chunk_find(cs, mcx, mcz);
+            }
+        }
+
+        if (g_save_edit_ib >= 0) {
+            let erows: i32 = g_save_edit_rows;
+            if (erows == 0) {
+                chunk_clear_edits(cs);
+            } else {
+                let blob: buffer = buffer(erows * 4);
+                let bp: ptr = buffer_ptr(blob);
+                let j: i32 = 0;
+                while (j < erows) { wi(bp, j * 4, ri(p, col_i(g_save_edit_ib, erows, 0, j))); j++; }
+                if (chunk_edits_load(cs, blob) < 0) {
+                    g_save_last_err = SAVE_ERR_RECORD;
+                    let e2: i32 = SAVE_ERR_RECORD;
+                    return e2;
+                }
+            }
+        }
+    }
+
+    // The sparse set is world.hml's invariant, not ours.  Ask it.
+    if (world_check(w) != 0) {
+        g_save_last_err = SAVE_ERR_RECORD;
+        let e3: i32 = SAVE_ERR_RECORD;
+        return e3;
+    }
+
+    let out: i32 = end;
+    return out;
+}
+
+// 1 = applied, 0 = unknown tag (skip), negative = SAVE_ERR_*.
+fn apply_record(p_w: object, p_s: object, p_p: ptr, p_tag: i32, p_rows: i32,
+                p_ci: i32, p_cf: i32, p_cu: i32, p_ib: i32): i32 {
+    let w: object = p_w;
+    let s: object = p_s;
+    let p: ptr = p_p;
+    let tag: i32 = p_tag;
+    let rows: i32 = p_rows;
+    let ci: i32 = p_ci;
+    let cf: i32 = p_cf;
+    let ib: i32 = p_ib;
+    let fb: i32 = blk_f(ib, rows, ci);
+    let ub: i32 = blk_u(fb, rows, cf);
+    let one: i32 = 1;
+
+    if (tag == SAVE_T_META) {
+        w.seed = ri(p, col_i(ib, rows, 2, 0));
+        w.tick = ri(p, col_i(ib, rows, 3, 0));
+        s.prev_tick = ri(p, col_i(ib, rows, 4, 0));
+        w.replaying = ri(p, col_i(ib, rows, 5, 0));
+        // 6..12 (the spawn counters and the four id allocators) are applied
+        // AFTER the whole record loop, because replaying the entity spawns
+        // moves every one of them.  Stashed, not applied.
+        g_save_spawns = ri(p, col_i(ib, rows, 6, 0));
+        g_save_despawns = ri(p, col_i(ib, rows, 7, 0));
+        g_save_spawnfail = ri(p, col_i(ib, rows, 8, 0));
+        g_save_next_ai = ri(p, col_i(ib, rows, 9, 0));
+        g_save_next_proj = ri(p, col_i(ib, rows, 10, 0));
+        g_save_next_pick = ri(p, col_i(ib, rows, 11, 0));
+        g_save_next_cos = ri(p, col_i(ib, rows, 12, 0));
+        g_save_have_meta = 1;
+        s.steps = ri(p, col_i(ib, rows, 13, 0));
+        s.swaps = ri(p, col_i(ib, rows, 14, 0));
+        let ord = s.order;
+        let n_ord: i32 = ci - 15;
+        if (n_ord > SIM_STAGE_COUNT) { n_ord = SIM_STAGE_COUNT; }
+        let i: i32 = 0;
+        while (i < n_ord) { ord[i] = ri(p, col_i(ib, rows, 15 + i, 0)); i++; }
+        return one;
+    }
+
+    if (tag == SAVE_T_TIME) {
+        if (ci > 0) { s.phase = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { s.horn = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { s.tier = ri(p, col_i(ib, rows, 2, 0)); }
+        if (ci > 3) { s.ccx = ri(p, col_i(ib, rows, 3, 0)); }
+        if (ci > 4) { s.ccz = ri(p, col_i(ib, rows, 4, 0)); }
+        if (ci > 5) { s.streams = ri(p, col_i(ib, rows, 5, 0)); }
+        if (cf > 0) { s.day_t = rf(p, col_f(fb, rows, 0, 0)); }
+        return one;
+    }
+
+    if (tag == SAVE_T_ENTITY) {
+        let rc: i32 = restore_entities(w, p, rows, ci, cf, ib, fb);
+        return rc;
+    }
+
+    if (tag == SAVE_T_PLAYER) {
+        let np: i32 = s.players;
+        if (rows != np) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let pid = s.pslot_id; let mev = s.move_ev; let pdd = s.p_dead;
+        let hcm = s.has_cmd; let qh = s.q_head; let qn = s.q_n; let qs = s.q_seq;
+        let chan = s.chan_t; let psa = s.move_ps;
+        let nps: i32 = cf - 1;
+        if (nps > PS_FIELDS) { nps = PS_FIELDS; }
+        if (nps < 0) { nps = 0; }
+        let k: i32 = 0;
+        while (k < np) {
+            if (ci > 0) { pid[k] = ri(p, col_i(ib, rows, 0, k)); }
+            if (ci > 1) { mev[k] = ri(p, col_i(ib, rows, 1, k)); }
+            if (ci > 2) { pdd[k] = ri(p, col_i(ib, rows, 2, k)); }
+            if (ci > 3) { hcm[k] = ri(p, col_i(ib, rows, 3, k)); }
+            if (ci > 4) { qh[k] = ri(p, col_i(ib, rows, 4, k)); }
+            if (ci > 5) { qn[k] = ri(p, col_i(ib, rows, 5, k)); }
+            if (ci > 6) { qs[k] = ri(p, col_i(ib, rows, 6, k)); }
+            if (cf > 0) { chan[k] = rf(p, col_f(fb, rows, 0, k)); }
+            let ps: array<f64> = psa[k];
+            let j: i32 = 0;
+            while (j < nps) { ps[j] = rf(p, col_f(fb, rows, 1 + j, k)); j++; }
+            k++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_PROG) {
+        let np: i32 = s.players;
+        if (rows != np) { let c: i32 = SAVE_ERR_CAP; return c; }
+        if (ci < PROG_FIELDS) { let c2: i32 = SAVE_ERR_PROG; return c2; }
+        let progs = s.prog;
+        let scratch: array = [];
+        let z: i32 = 0;
+        while (z < PROG_FIELDS) { scratch.push(0); z++; }
+        let k: i32 = 0;
+        while (k < np) {
+            let j: i32 = 0;
+            while (j < PROG_FIELDS) { scratch[j] = ri(p, col_i(ib, rows, j, k)); j++; }
+            // progression.hml owns its own version word and its own refusal.
+            if (prog_deserialize(progs[k], scratch, 0) < 0) {
+                let c3: i32 = SAVE_ERR_PROG;
+                return c3;
+            }
+            k++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_WEAPON) {
+        let np: i32 = s.players;
+        if (rows != np) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let nw: i32 = cf;
+        if (nw > WS_FIELDS) { nw = WS_FIELDS; }
+        let wst = s.wpn;
+        let k: i32 = 0;
+        while (k < np) {
+            let base: i32 = k * WS_FIELDS;
+            let j: i32 = 0;
+            while (j < nw) { wst[base + j] = rf(p, col_f(fb, rows, j, k)); j++; }
+            k++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_EVBUS) {
+        let bus: object = combat_events(s.cx);
+        if (rows > bus.cap) { let c: i32 = SAVE_ERR_CAP; return c; }
+        evbus_reset(bus);
+        let i: i32 = 0;
+        while (i < rows) {
+            evbus_push(bus, ri(p, col_i(ib, rows, 0, i)),
+                            ri(p, col_i(ib, rows, 1, i)),
+                            ri(p, col_i(ib, rows, 2, i)),
+                            ri(p, col_i(ib, rows, 3, i)),
+                            ri(p, col_i(ib, rows, 4, i)),
+                            ri(p, col_i(ib, rows, 5, i)),
+                            ri(p, col_i(ib, rows, 6, i)),
+                            ri(p, col_i(ib, rows, 7, i)));
+            i++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_COMBAT) {
+        let cx: object = s.cx;
+        let bus: object = combat_events(cx);
+        // `evbus_push` above bumped `pushed`; the saved value is the truth.
+        if (ci > 0) { bus.dropped = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { bus.pushed = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { cx.last_plated = ri(p, col_i(ib, rows, 2, 0)); }
+        if (ci > 3) { cx.shots = ri(p, col_i(ib, rows, 3, 0)); }
+        if (ci > 4) { cx.pellets_fired = ri(p, col_i(ib, rows, 4, 0)); }
+        if (ci > 5) { cx.pellets_hit = ri(p, col_i(ib, rows, 5, 0)); }
+        if (ci > 6) { cx.terrain_hits = ri(p, col_i(ib, rows, 6, 0)); }
+        if (ci > 7) { cx.misses = ri(p, col_i(ib, rows, 7, 0)); }
+        if (ci > 8) { cx.kills = ri(p, col_i(ib, rows, 8, 0)); }
+        if (ci > 9) { cx.headshots = ri(p, col_i(ib, rows, 9, 0)); }
+        if (ci > 10) { cx.plate_blocks = ri(p, col_i(ib, rows, 10, 0)); }
+        if (ci > 11) { cx.damage_dealt = ri(p, col_i(ib, rows, 11, 0)); }
+        if (ci > 12) { cx.no_weapon_source = ri(p, col_i(ib, rows, 12, 0)); }
+        if (ci > 13) { cx.start_solid = ri(p, col_i(ib, rows, 13, 0)); }
+        if (ci > 14) { cx.overkill = ri(p, col_i(ib, rows, 14, 0)); }
+        return one;
+    }
+
+    if (tag == SAVE_T_CHAIN) {
+        let cx: object = s.cx;
+        let cn = cx.chain_n; let ct = cx.chain_tick;
+        let n: i32 = rows;
+        if (n > CHAIN_SLOTS) { n = CHAIN_SLOTS; }
+        let i: i32 = 0;
+        while (i < n) {
+            if (ci > 0) { cn[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { ct[i] = ri(p, col_i(ib, rows, 1, i)); }
+            i++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_PROJ) {
+        let pj: object = s.proj;
+        if (rows > pj.cap) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let a_id = pj.p_id; let a_ty = pj.p_type; let a_ow = pj.p_owner;
+        let a_tm = pj.p_team; let a_ag = pj.p_age; let a_fu = pj.p_fuse;
+        let a_x0 = pj.p_x0; let a_y0 = pj.p_y0; let a_z0 = pj.p_z0;
+        let i: i32 = 0;
+        while (i < rows) {
+            if (ci > 0) { a_id[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { a_ty[i] = ri(p, col_i(ib, rows, 1, i)); }
+            if (ci > 2) { a_ow[i] = ri(p, col_i(ib, rows, 2, i)); }
+            if (ci > 3) { a_tm[i] = ri(p, col_i(ib, rows, 3, i)); }
+            if (ci > 4) { a_ag[i] = ri(p, col_i(ib, rows, 4, i)); }
+            if (ci > 5) { a_fu[i] = ri(p, col_i(ib, rows, 5, i)); }
+            if (cf > 0) { a_x0[i] = rf(p, col_f(fb, rows, 0, i)); }
+            if (cf > 1) { a_y0[i] = rf(p, col_f(fb, rows, 1, i)); }
+            if (cf > 2) { a_z0[i] = rf(p, col_f(fb, rows, 2, i)); }
+            i++;
+        }
+        pj.n = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_PROJ_BURN) {
+        let pj: object = s.proj;
+        if (rows > pj.burn_cap) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let b_id = pj.b_id; let b_src = pj.b_src; let b_dps = pj.b_dps;
+        let b_dur = pj.b_dur; let b_el = pj.b_el; let b_out = pj.b_out;
+        let i: i32 = 0;
+        while (i < rows) {
+            if (ci > 0) { b_id[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { b_src[i] = ri(p, col_i(ib, rows, 1, i)); }
+            if (ci > 2) { b_dps[i] = ri(p, col_i(ib, rows, 2, i)); }
+            if (ci > 3) { b_dur[i] = ri(p, col_i(ib, rows, 3, i)); }
+            if (ci > 4) { b_el[i] = ri(p, col_i(ib, rows, 4, i)); }
+            if (ci > 5) { b_out[i] = ri(p, col_i(ib, rows, 5, i)); }
+            i++;
+        }
+        pj.bn = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_PROJ_META) {
+        let pj: object = s.proj;
+        if (ci > 0) { pj.spawns = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { pj.spawn_fail = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { pj.detonations = ri(p, col_i(ib, rows, 2, 0)); }
+        if (ci > 3) { pj.expiries = ri(p, col_i(ib, rows, 3, 0)); }
+        if (ci > 4) { pj.hits = ri(p, col_i(ib, rows, 4, 0)); }
+        if (ci > 5) { pj.kills = ri(p, col_i(ib, rows, 5, 0)); }
+        if (ci > 6) { pj.burn_applied = ri(p, col_i(ib, rows, 6, 0)); }
+        if (ci > 7) { pj.burn_ticks = ri(p, col_i(ib, rows, 7, 0)); }
+        if (ci > 8) { pj.burn_fail = ri(p, col_i(ib, rows, 8, 0)); }
+        if (ci > 9) { pj.ev_drop = ri(p, col_i(ib, rows, 9, 0)); }
+        return one;
+    }
+
+    if (tag == SAVE_T_PROJ_SHOTS) {
+        let pj: object = s.proj;
+        let sh = pj.shots;
+        let n: i32 = rows;
+        if (n > g_WPN_COUNT) { n = g_WPN_COUNT; }
+        let i: i32 = 0;
+        while (i < n) { if (ci > 0) { sh[i] = ri(p, col_i(ib, rows, 0, i)); } i++; }
+        return one;
+    }
+
+    if (tag == SAVE_T_PROJ_EVENT) {
+        let pj: object = s.proj;
+        if (rows > pj.ev_cap) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let e_k = pj.e_kind; let e_a = pj.e_a; let e_b = pj.e_b;
+        let e_0 = pj.e_i0; let e_1 = pj.e_i1;
+        let e_x = pj.e_x; let e_y = pj.e_y; let e_z = pj.e_z;
+        let i: i32 = 0;
+        while (i < rows) {
+            if (ci > 0) { e_k[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { e_a[i] = ri(p, col_i(ib, rows, 1, i)); }
+            if (ci > 2) { e_b[i] = ri(p, col_i(ib, rows, 2, i)); }
+            if (ci > 3) { e_0[i] = ri(p, col_i(ib, rows, 3, i)); }
+            if (ci > 4) { e_1[i] = ri(p, col_i(ib, rows, 4, i)); }
+            if (cf > 0) { e_x[i] = rf(p, col_f(fb, rows, 0, i)); }
+            if (cf > 1) { e_y[i] = rf(p, col_f(fb, rows, 1, i)); }
+            if (cf > 2) { e_z[i] = rf(p, col_f(fb, rows, 2, i)); }
+            i++;
+        }
+        pj.ev_n = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_AI_EVENT) {
+        let ai: object = s.ai;
+        let v_t = ai.ev_type; let v_k = ai.ev_tick; let v_i = ai.ev_id;
+        let v_c = ai.ev_class; let v_g = ai.ev_target; let v_v = ai.ev_i;
+        let v_x = ai.ev_x; let v_y = ai.ev_y; let v_z = ai.ev_z;
+        if (rows > v_t.length) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let i: i32 = 0;
+        while (i < rows) {
+            if (ci > 0) { v_t[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { v_k[i] = ri(p, col_i(ib, rows, 1, i)); }
+            if (ci > 2) { v_i[i] = ri(p, col_i(ib, rows, 2, i)); }
+            if (ci > 3) { v_c[i] = ri(p, col_i(ib, rows, 3, i)); }
+            if (ci > 4) { v_g[i] = ri(p, col_i(ib, rows, 4, i)); }
+            if (ci > 5) { v_v[i] = ri(p, col_i(ib, rows, 5, i)); }
+            if (cf > 0) { v_x[i] = rf(p, col_f(fb, rows, 0, i)); }
+            if (cf > 1) { v_y[i] = rf(p, col_f(fb, rows, 1, i)); }
+            if (cf > 2) { v_z[i] = rf(p, col_f(fb, rows, 2, i)); }
+            i++;
+        }
+        ai.ev_n = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_AI_META) {
+        let ai: object = s.ai;
+        if (ci > 0) { ai.tick = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { ai.agents = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { ai.players = ri(p, col_i(ib, rows, 2, 0)); }
+        if (ci > 3) { ai.steps = ri(p, col_i(ib, rows, 3, 0)); }
+        if (ci > 4) { ai.spawns = ri(p, col_i(ib, rows, 4, 0)); }
+        if (ci > 5) { ai.spawn_fail = ri(p, col_i(ib, rows, 5, 0)); }
+        if (ci > 6) { ai.relax_passes = ri(p, col_i(ib, rows, 6, 0)); }
+        if (ci > 7) { ai.terrain_miss = ri(p, col_i(ib, rows, 7, 0)); }
+        if (ci > 8) { ai.attacks = ri(p, col_i(ib, rows, 8, 0)); }
+        if (ci > 9) { ai.whiffs = ri(p, col_i(ib, rows, 9, 0)); }
+        if (ci > 10) { ai.tells = ri(p, col_i(ib, rows, 10, 0)); }
+        if (ci > 11) { ai.ev_dropped = ri(p, col_i(ib, rows, 11, 0)); }
+        return one;
+    }
+
+    if (tag == SAVE_T_DIRECTOR) {
+        let d: object = s.dir;
+        if (ci > 0) { d.seed = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { d.tier = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { d.state = ri(p, col_i(ib, rows, 2, 0)); }
+        if (ci > 3) { d.wave = ri(p, col_i(ib, rows, 3, 0)); }
+        if (ci > 4) { d.budget = ri(p, col_i(ib, rows, 4, 0)); }
+        if (ci > 5) { d.spent = ri(p, col_i(ib, rows, 5, 0)); }
+        if (ci > 6) { d.reserve = ri(p, col_i(ib, rows, 6, 0)); }
+        if (ci > 7) { d.bulwark_pending = ri(p, col_i(ib, rows, 7, 0)); }
+        if (ci > 8) { d.spawn_timer = ri(p, col_i(ib, rows, 8, 0)); }
+        if (ci > 9) { d.gap_timer = ri(p, col_i(ib, rows, 9, 0)); }
+        if (ci > 10) { d.spawn_seq = ri(p, col_i(ib, rows, 10, 0)); }
+        if (ci > 11) { d.wave_spawned = ri(p, col_i(ib, rows, 11, 0)); }
+        if (ci > 12) { d.hold_spawned = ri(p, col_i(ib, rows, 12, 0)); }
+        if (ci > 13) { d.holds_done = ri(p, col_i(ib, rows, 13, 0)); }
+        if (ci > 14) { d.prev_tick = ri(p, col_i(ib, rows, 14, 0)); }
+        if (ci > 15) { d.tick = ri(p, col_i(ib, rows, 15, 0)); }
+        if (ci > 16) { d.hold_start_tick = ri(p, col_i(ib, rows, 16, 0)); }
+        if (ci > 17) { d.wave_start_tick = ri(p, col_i(ib, rows, 17, 0)); }
+        if (ci > 18) { d.hold_ticks = ri(p, col_i(ib, rows, 18, 0)); }
+        if (ci > 19) { d.events = ri(p, col_i(ib, rows, 19, 0)); }
+        if (ci > 20) { d.alive = ri(p, col_i(ib, rows, 20, 0)); }
+        if (ci > 21) { d.onscreen = ri(p, col_i(ib, rows, 21, 0)); }
+        if (ci > 22) { d.peak_alive = ri(p, col_i(ib, rows, 22, 0)); }
+        if (ci > 23) { d.peak_onscreen = ri(p, col_i(ib, rows, 23, 0)); }
+        if (ci > 24) { d.peak_onscreen_at_spawn = ri(p, col_i(ib, rows, 24, 0)); }
+        if (ci > 25) { d.defer_alive = ri(p, col_i(ib, rows, 25, 0)); }
+        if (ci > 26) { d.defer_onscreen = ri(p, col_i(ib, rows, 26, 0)); }
+        if (ci > 27) { d.spawn_fail = ri(p, col_i(ib, rows, 27, 0)); }
+        if (ci > 28) { d.req_n = ri(p, col_i(ib, rows, 28, 0)); }
+        if (cf > 0) { d.ax = rf(p, col_f(fb, rows, 0, 0)); }
+        if (cf > 1) { d.ay = rf(p, col_f(fb, rows, 1, 0)); }
+        if (cf > 2) { d.az = rf(p, col_f(fb, rows, 2, 0)); }
+        let drng = d.rng;
+        let nu: i32 = p_cu;
+        if (nu > 4) { nu = 4; }
+        let i: i32 = 0;
+        while (i < nu) { drng[i] = ru(p, col_u(ub, rows, i, 0)); i++; }
+        return one;
+    }
+
+    if (tag == SAVE_T_ROSTER) {
+        let d: object = s.dir;
+        if (rows > DIR_ROSTER_CAP) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let r_id = d.ros_id; let r_kd = d.ros_kind; let r_wv = d.ros_wave;
+        let i: i32 = 0;
+        while (i < rows) {
+            if (ci > 0) { r_id[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { r_kd[i] = ri(p, col_i(ib, rows, 1, i)); }
+            if (ci > 2) { r_wv[i] = ri(p, col_i(ib, rows, 2, i)); }
+            i++;
+        }
+        d.n_ros = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_DIRREQ) {
+        let d: object = s.dir;
+        if (rows > DIR_REQ_CAP) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let q_k = d.req_kind; let q_b = d.req_bound;
+        let q_x = d.req_x; let q_y = d.req_y; let q_z = d.req_z;
+        let i: i32 = 0;
+        while (i < rows) {
+            if (ci > 0) { q_k[i] = ri(p, col_i(ib, rows, 0, i)); }
+            if (ci > 1) { q_b[i] = ri(p, col_i(ib, rows, 1, i)); }
+            if (cf > 0) { q_x[i] = rf(p, col_f(fb, rows, 0, i)); }
+            if (cf > 1) { q_y[i] = rf(p, col_f(fb, rows, 1, i)); }
+            if (cf > 2) { q_z[i] = rf(p, col_f(fb, rows, 2, i)); }
+            i++;
+        }
+        d.req_n = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_LOOT) {
+        if (ci > 0) { s.loot_hash = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { s.loot_rolls = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { s.last_rarity = ri(p, col_i(ib, rows, 2, 0)); }
+        let item = s.item;
+        let n: i32 = ci - 3;
+        if (n > ITEM_FIELDS) { n = ITEM_FIELDS; }
+        let i: i32 = 0;
+        while (i < n) { item[i] = ri(p, col_i(ib, rows, 3 + i, 0)); i++; }
+        return one;
+    }
+
+    // The three chunk records are STASHED, not applied: the epilogue applies
+    // them in the one order that works (residency, metadata, then edits), and
+    // that order must not depend on the order they happen to sit in the file.
+    if (tag == SAVE_T_CHUNKEDIT) {
+        if (s.has_cs != 1) {
+            // No store installed: an empty overlay is a no-op, a non-empty one
+            // would be silently discarded — so say so rather than pretend.
+            if (rows == 0) { return one; }
+            let c: i32 = SAVE_ERR_CAP;
+            return c;
+        }
+        g_save_edit_ib = ib;
+        g_save_edit_rows = rows;
+        return one;
+    }
+
+    if (tag == SAVE_T_CHUNKRING) {
+        if (s.has_cs != 1) {
+            if (rows == 0) { return one; }
+            let c: i32 = SAVE_ERR_CAP;
+            return c;
+        }
+        if (rows > chunk_cap(s.cs)) { let c2: i32 = SAVE_ERR_CAP; return c2; }
+        g_save_ring_ib = ib;
+        g_save_ring_rows = rows;
+        g_save_ring_ci = ci;
+        return one;
+    }
+
+    if (tag == SAVE_T_CHUNKMETA) {
+        g_save_cmeta_ib = ib;
+        g_save_cmeta_ci = ci;
+        return one;
+    }
+
+    if (tag == SAVE_T_SOLIDS) {
+        let sol = s.solids;
+        while (sol.length > 0) { sol.pop(); }
+        let i: i32 = 0;
+        while (i < rows) {
+            let j: i32 = 0;
+            while (j < 6) {
+                let v: f64 = 0.0;
+                if (j < cf) { v = rf(p, col_f(fb, rows, j, i)); }
+                sol.push(v);
+                j++;
+            }
+            i++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_COMMAND) {
+        let np: i32 = s.players;
+        if (rows != np) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let ca = s.cmd;
+        let k: i32 = 0;
+        while (k < np) { cmd_in(p, ib, rows, ci, k, ca[k]); k++; }
+        return one;
+    }
+
+    if (tag == SAVE_T_CMDQUEUE) {
+        let np: i32 = s.players;
+        if (rows != np * SIM_CMD_QUEUE) { let c: i32 = SAVE_ERR_CAP; return c; }
+        let qa = s.queue;
+        let k: i32 = 0;
+        while (k < np) {
+            let ring = qa[k];
+            let j: i32 = 0;
+            while (j < SIM_CMD_QUEUE) {
+                cmd_in(p, ib, rows, ci, k * SIM_CMD_QUEUE + j, ring[j]);
+                j++;
+            }
+            k++;
+        }
+        return one;
+    }
+
+    if (tag == SAVE_T_COUNTER) {
+        if (ci > 0) { s.cmds_queued = ri(p, col_i(ib, rows, 0, 0)); }
+        if (ci > 1) { s.cmds_applied = ri(p, col_i(ib, rows, 1, 0)); }
+        if (ci > 2) { s.cmds_dropped = ri(p, col_i(ib, rows, 2, 0)); }
+        if (ci > 3) { s.cmds_stale = ri(p, col_i(ib, rows, 3, 0)); }
+        if (ci > 4) { s.cmds_bad = ri(p, col_i(ib, rows, 4, 0)); }
+        if (ci > 5) { s.cmds_missing = ri(p, col_i(ib, rows, 5, 0)); }
+        if (ci > 6) { s.shots = ri(p, col_i(ib, rows, 6, 0)); }
+        if (ci > 7) { s.reloads = ri(p, col_i(ib, rows, 7, 0)); }
+        if (ci > 8) { s.swaps_wpn = ri(p, col_i(ib, rows, 8, 0)); }
+        if (ci > 9) { s.spawns_req = ri(p, col_i(ib, rows, 9, 0)); }
+        if (ci > 10) { s.spawns_ok = ri(p, col_i(ib, rows, 10, 0)); }
+        if (ci > 11) { s.deaths = ri(p, col_i(ib, rows, 11, 0)); }
+        if (ci > 12) { s.player_deaths = ri(p, col_i(ib, rows, 12, 0)); }
+        if (ci > 13) { s.ai_attacks = ri(p, col_i(ib, rows, 13, 0)); }
+        if (ci > 14) { s.adds_spawned = ri(p, col_i(ib, rows, 14, 0)); }
+        if (ci > 15) { s.pickups = ri(p, col_i(ib, rows, 15, 0)); }
+        if (ci > 16) { s.lanterns_lit = ri(p, col_i(ib, rows, 16, 0)); }
+        if (ci > 17) { s.fall_hits = ri(p, col_i(ib, rows, 17, 0)); }
+        if (ci > 18) { s.ground_miss = ri(p, col_i(ib, rows, 18, 0)); }
+        return one;
+    }
+
+    if (tag == SAVE_T_RNG) {
+        let srng = s.rng;
+        let crng = s.cx.rng;
+        let nu: i32 = p_cu;
+        if (nu > SAVE_C_RNG_U) { nu = SAVE_C_RNG_U; }
+        let i: i32 = 0;
+        while (i < nu) {
+            let v: u64 = ru(p, col_u(ub, rows, i, 0));
+            if (i < 4) { srng[i] = v; }
+            if (i >= 4) { crng[i - 4] = v; }
+            i++;
+        }
+        return one;
+    }
+
+    // An unknown tag.  The caller skips it by length.
+    let unknown: i32 = 0;
+    return unknown;
+}
+
+// -----------------------------------------------------------------------------
+//  ENTITY RESTORE
+// -----------------------------------------------------------------------------
+//  The sparse set's hash table is PRIVATE to world.hml — as it should be.  So
+//  the world is not rebuilt by writing into `w.sparse`; it is rebuilt by
+//  REPLAYING the spawns through the public spawn path, in the saved slot order,
+//  with each kind's id allocator pre-positioned so `world_spawn` mints exactly
+//  the id the save recorded.  The allocators are then restored to their saved
+//  values, so ids stay monotone and never repeat after a load.
+//
+//  The alternative — reimplementing `ht_insert`'s probe sequence here — would
+//  put a second copy of the world's most delicate invariant in a file that has
+//  no business knowing it.  `world_check(w)` is asserted after every load.
+fn restore_entities(p_w: object, p_p: ptr, p_rows: i32, p_ci: i32, p_cf: i32,
+                    p_ib: i32, p_fb: i32): i32 {
+    let w: object = p_w;
+    let p: ptr = p_p;
+    let rows: i32 = p_rows;
+    let ci: i32 = p_ci;
+    let cf: i32 = p_cf;
+    let ib: i32 = p_ib;
+    let fb: i32 = p_fb;
+    if (ci < 3) { let bad: i32 = SAVE_ERR_RECORD; return bad; }
+
+    let c_id = w.id;         let c_kind = w.kind;     let c_own = w.owner;
+    let c_st = w.spawn_tick; let c_hp = w.hp;         let c_hpm = w.hp_max;
+    let c_arm = w.armor;     let c_team = w.team;     let c_anim = w.anim;
+    let c_fl = w.flags;      let c_mdl = w.model;     let c_tint = w.tint;
+    let c_wp = w.weapon;     let c_am = w.ammo_mag;   let c_ar = w.ammo_res;
+    let c_xp = w.xp;         let c_lv = w.level;      let c_wm = w.wickmarks;
+    let c_ais = w.ai_state;  let c_ait = w.ai_target_id; let c_ls = w.loot_seed;
+    let c_lh = w.last_hit_by;
+    let c_px = w.px; let c_py = w.py; let c_pz = w.pz;
+    let c_vx = w.vx; let c_vy = w.vy; let c_vz = w.vz;
+    let c_yaw = w.yaw; let c_pit = w.pitch; let c_at = w.anim_t; let c_aim = w.ai_timer;
+
+    let i: i32 = 0;
+    while (i < rows) {
+        let id: i32 = ri(p, col_i(ib, rows, 0, i));
+        let kind: i32 = ri(p, col_i(ib, rows, 1, i));
+        let own: i32 = ri(p, col_i(ib, rows, 2, i));
+        if (kind <= KIND_NONE || kind >= KIND_COUNT) { let b: i32 = SAVE_ERR_RECORD; return b; }
+
+        let slot: i32 = SLOT_NONE;
+        if (kind == KIND_PLAYER) {
+            slot = world_spawn_player(w, id);
+        } else {
+            if (kind == KIND_AI || kind == KIND_NPC)        { w.next_ai = id; }
+            if (kind == KIND_PROJECTILE)                    { w.next_proj = id; }
+            if (kind == KIND_PICKUP || kind == KIND_PROP)   { w.next_pickup = id; }
+            if (kind == KIND_LANTERN)                       { w.next_pickup = id; }
+            if (kind == KIND_COSMETIC)                      { w.next_cosmetic = id; }
+            slot = world_spawn(w, kind, own);
+        }
+        if (slot == SLOT_NONE) { let b2: i32 = SAVE_ERR_CAP; return b2; }
+        // Slot order IS the entity record's row order.  If the two ever
+        // disagree the world's dense array no longer matches the save, and
+        // every id-indexed structure that survived the load (the roster, the
+        // burn list, ai_target_id) would point at the wrong body.
+        if (slot != i) { let b3: i32 = SAVE_ERR_RECORD; return b3; }
+        if (c_id[slot] != id) { let b4: i32 = SAVE_ERR_RECORD; return b4; }
+
+        c_kind[slot] = kind;
+        c_own[slot] = own;
+        if (ci > 3) { c_st[slot] = ri(p, col_i(ib, rows, 3, i)); }
+        if (ci > 4) { c_hp[slot] = ri(p, col_i(ib, rows, 4, i)); }
+        if (ci > 5) { c_hpm[slot] = ri(p, col_i(ib, rows, 5, i)); }
+        if (ci > 6) { c_arm[slot] = ri(p, col_i(ib, rows, 6, i)); }
+        if (ci > 7) { c_team[slot] = ri(p, col_i(ib, rows, 7, i)); }
+        if (ci > 8) { c_anim[slot] = ri(p, col_i(ib, rows, 8, i)); }
+        if (ci > 9) { c_fl[slot] = ri(p, col_i(ib, rows, 9, i)); }
+        if (ci > 10) { c_mdl[slot] = ri(p, col_i(ib, rows, 10, i)); }
+        if (ci > 11) { c_tint[slot] = ri(p, col_i(ib, rows, 11, i)); }
+        if (ci > 12) { c_wp[slot] = ri(p, col_i(ib, rows, 12, i)); }
+        if (ci > 13) { c_am[slot] = ri(p, col_i(ib, rows, 13, i)); }
+        if (ci > 14) { c_ar[slot] = ri(p, col_i(ib, rows, 14, i)); }
+        if (ci > 15) { c_xp[slot] = ri(p, col_i(ib, rows, 15, i)); }
+        if (ci > 16) { c_lv[slot] = ri(p, col_i(ib, rows, 16, i)); }
+        if (ci > 17) { c_wm[slot] = ri(p, col_i(ib, rows, 17, i)); }
+        if (ci > 18) { c_ais[slot] = ri(p, col_i(ib, rows, 18, i)); }
+        if (ci > 19) { c_ait[slot] = ri(p, col_i(ib, rows, 19, i)); }
+        if (ci > 20) { c_ls[slot] = ri(p, col_i(ib, rows, 20, i)); }
+        if (ci > 21) { c_lh[slot] = ri(p, col_i(ib, rows, 21, i)); }
+        if (cf > 0) { c_px[slot] = rf(p, col_f(fb, rows, 0, i)); }
+        if (cf > 1) { c_py[slot] = rf(p, col_f(fb, rows, 1, i)); }
+        if (cf > 2) { c_pz[slot] = rf(p, col_f(fb, rows, 2, i)); }
+        if (cf > 3) { c_vx[slot] = rf(p, col_f(fb, rows, 3, i)); }
+        if (cf > 4) { c_vy[slot] = rf(p, col_f(fb, rows, 4, i)); }
+        if (cf > 5) { c_vz[slot] = rf(p, col_f(fb, rows, 5, i)); }
+        if (cf > 6) { c_yaw[slot] = rf(p, col_f(fb, rows, 6, i)); }
+        if (cf > 7) { c_pit[slot] = rf(p, col_f(fb, rows, 7, i)); }
+        if (cf > 8) { c_at[slot] = rf(p, col_f(fb, rows, 8, i)); }
+        if (cf > 9) { c_aim[slot] = rf(p, col_f(fb, rows, 9, i)); }
+        i++;
+    }
+
+    let ok: i32 = 1;
+    return ok;
+}
+
+// =============================================================================
+//  10.  FILES
+// =============================================================================
+
+export fn save_exists(p_path: string): i32 {
+    let e = exists(p_path);
+    let out: i32 = 0;
+    if (e) { out = 1; }
+    return out;
+}
+
+// Write `p_w` to `p_path`.  Returns bytes written, or a negative SAVE_ERR_*.
+//
+// It writes to `<path>.tmp` and renames.  A save is triggered by entering town,
+// sleeping, lighting a lantern and quitting — three of the four are moments the
+// player might also choose to alt-F4, and a half-written save over the only
+// copy of a 30-hour character is not a bug anyone forgives.
+export fn save_write(p_w: object, p_path: string, p_reason: i32): i32 {
+    let w: object = p_w;
+    let buf: buffer = save_alloc(w);
+    let n: i32 = save_encode(w, buf, p_reason);
+    if (n < 0) { let e: i32 = n; return e; }
+
+    let tmp: string = p_path + ".tmp";
+    let f = open(tmp, "wb");
+    f.write_bytes(buf);
+    f.close();
+
+    if (save_exists(p_path) == 1) { remove_file(p_path); }
+    rename(tmp, p_path);
+    if (save_exists(p_path) == 0) { let e3: i32 = SAVE_ERR_IO; return e3; }
+    let out: i32 = n;
+    return out;
+}
+
+// Read `p_path` into `p_w`.  Returns bytes consumed, or a negative SAVE_ERR_*.
+export fn save_read(p_w: object, p_path: string): i32 {
+    if (save_exists(p_path) == 0) { let e: i32 = SAVE_ERR_IO; return e; }
+    let buf: buffer = save_read_file(p_path);
+    if (buf.length < SAVE_HDR_B) { let e3: i32 = SAVE_ERR_TRUNC; return e3; }
+    let out: i32 = save_decode(p_w, buf);
+    return out;
+}
+
+// The file, as bytes.  Zero-length if it does not exist.  Exposed so a caller
+// can `save_verify` a candidate file — or hexdump it — without a simulation.
+export fn save_read_file(p_path: string): buffer {
+    if (save_exists(p_path) == 0) { let z: buffer = buffer(1); return z; }
+    let st = file_stat(p_path);
+    let n: i32 = st.size;
+    if (n <= 0) { let z2: buffer = buffer(1); return z2; }
+    let f = open(p_path, "rb");
+    let buf: buffer = f.read_bytes(n);
+    f.close();
+    return buf;
+}
+
+// =============================================================================
+//  11.  THE ROUND-TRIP ASSERTION, AS A FUNCTION
+// =============================================================================
+//  The acceptance criterion is "a save/load round-trip reproduces an identical
+//  world hash".  It lives here, not only in the probe, so that any caller —
+//  `main.hml` on quit, a future dedicated server on checkpoint — can afford to
+//  CHECK ITS OWN SAVE before it replaces the previous one.  It costs one
+//  encode, one decode into a scratch world and two hashes.
+//
+//  `p_scratch` must be a world built with the same cap and player count.
+//  Returns 1 if the hashes match, 0 if they do not, negative on a codec error.
+export fn save_roundtrip_ok(p_w: object, p_scratch: object): i32 {
+    let w: object = p_w;
+    let sc: object = p_scratch;
+    let buf: buffer = save_alloc(w);
+    let n: i32 = save_encode(w, buf, SAVE_REASON_QUIT);
+    if (n < 0) { let e: i32 = n; return e; }
+    let m: i32 = save_decode(sc, buf);
+    if (m < 0) { let e2: i32 = m; return e2; }
+    if (world_check(sc) != 0) { let e3: i32 = SAVE_ERR_RECORD; return e3; }
+    let a: u64 = sim_hash(w);
+    let b: u64 = sim_hash(sc);
+    let out: i32 = 0;
+    if (a == b) { out = 1; }
+    return out;
+}

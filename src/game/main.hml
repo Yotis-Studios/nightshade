@@ -1,0 +1,2353 @@
+// =============================================================================
+//  main.hml — NIGHTSHADE.  THE GAME LOOP.                             W4-11.
+// =============================================================================
+//
+//      hemlockc -O3 src/game/main.hml -o build/nightshade
+//      DISPLAY=:0 build/nightshade
+//
+//  This is ARCHITECTURE §3's loop, verbatim in shape, wired to the real world:
+//
+//      while (running) {
+//          now = clock_now();  frame_ms = clock_ms_between(prev, now);
+//          input_sample(...)                      // EVERY frame
+//          n = sim_accum_advance(acc, frame_ms);  // 0, 1 or N.  Never "one".
+//          while (i < n) {
+//              client_send_command(cl, tick);     // input -> command -> wire
+//              server_tick(sv, tick);             // the authoritative sim step
+//              client_apply(cl, packet, local);   // wire -> client state
+//              tick++;
+//          }
+//          alpha = sim_accum_alpha(acc);
+//          client_build_render(cl, alpha);        // interpolate; zero alloc
+//          frame_render(); hud_build(); frame_present();
+//      }
+//
+//  -----------------------------------------------------------------------------
+//  WHAT THIS FILE IS, AND WHAT IT DELIBERATELY IS NOT
+//  -----------------------------------------------------------------------------
+//  It is the SHELL: the window, the boot, the clock, the loop, the HUD, and the
+//  presentation-side world (the terrain ring, the apron, the props, the sky
+//  bridge, the light bake) that `src/render/**` does not own yet — W3-3's
+//  `chunkmesh.hml`, W3-4's `terrain_render.hml`, W3-8's `hud.hml`, W3-10's
+//  `fx.hml` and W3-11's `entity_render.hml` are all still unwritten, and the
+//  only place their work can legally live today is here, in the one zone that
+//  may import everything. The code is a direct port of `tools/walk.hml`'s
+//  proven scaffolding — the same chunk ring, the same apron, the same uv rules,
+//  the same rolling bake — because that scaffolding was playtested twice and
+//  holds 60 fps, and reinventing it would have been a way to lose both.
+//
+//  It is NOT the game logic. Every rule lives in `src/sim/**` behind the import
+//  wall; every authoritative decision lives in `server.hml`; every piece of
+//  input-to-picture plumbing lives in `client.hml`. This file holds no health,
+//  no ammo, no wave state and no enemy — it asks the client, which asks the
+//  packet.
+//
+//  -----------------------------------------------------------------------------
+//  THE THREE WALLS, AS THEY APPEAR HERE
+//  -----------------------------------------------------------------------------
+//   * `frame_render()` reads `g_rsnap` and `g_env` and nothing else. The world
+//     registry it walks is filled from `client_ent_*`, which is the decoded
+//     snapshot. There is no path from the renderer to `world.*`.
+//   * The sim's clock is a TICK. This file owns the only `clock_now()`, and it
+//     hands `sim_accum_advance` a millisecond count and gets back an integer.
+//   * `tod_eval` and the skygen bridge are the CALLER's (ARCHITECTURE §5.6b) —
+//     `src/render/**` may not import `src/art/**`, so stages 6 and 7 are here,
+//     exactly where §4 draws them.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { getenv } from "@stdlib/env";
+import { make_dirs } from "@stdlib/fs";
+import { sin, cos, sqrt, floor, atan2, divi } from "@stdlib/math";
+
+// ---------------------------------------------------------------------------
+// the engine
+// ---------------------------------------------------------------------------
+import { window_open_ex, window_close, set_relative_mouse, sdl_error,
+         set_vsync, set_window_title,
+         BLEND_BLEND, BLEND_ADD,
+         SC_A, SC_D, SC_E, SC_F, SC_G, SC_H, SC_L, SC_M, SC_P, SC_Q, SC_R,
+         SC_S, SC_T, SC_V, SC_W, SC_X, SC_Z,
+         SC_1, SC_2, SC_3,
+         SC_ESCAPE, SC_SPACE, SC_LSHIFT, SC_LCTRL, SC_TAB, SC_RETURN }
+       from "../../../wobbleweed/src/sdl.hml";
+import { target_new, target_free, target_set_shake, target_set_border }
+       from "../../../wobbleweed/src/target.hml";
+import { input_new, input_sample, input_down, input_pressed, input_quit,
+         input_set_relative, input_relative_status, INPUT_REL_OK,
+         input_mouse_dx, input_mouse_dy, input_button,
+         INPUT_MB_LEFT, INPUT_MB_RIGHT }
+       from "../../../wobbleweed/src/input.hml";
+import { clock_now, clock_ms_between, clock_sleep_ms }
+       from "../../../wobbleweed/src/time.hml";
+import { write_png } from "../../../wobbleweed/src/png.hml";
+import { emit_set_env } from "../../../wobbleweed/src/emit.hml";
+import { env_set_camera, env_set_fog, env_set_mist,
+         env_clear_lights, env_add_light, env_field, env_light_count,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_FOG_ALPHA_MAX }
+       from "../../../wobbleweed/src/shade.hml";
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_quad, mesh_end,
+         mesh_bake_light, mesh_tri_count }
+       from "../../../wobbleweed/src/mesh.hml";
+import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
+import { font_text_shadowed, font_width }
+       from "../../../wobbleweed/src/font.hml";
+import { quad_screen_uv } from "../../../wobbleweed/src/quad.hml";
+import { mat_perspective } from "../../../wobbleweed/src/vec.hml";
+import { audio_init, audio_shutdown, audio_ready, audio_play_panned,
+         audio_out_freq, audio_set_volume, audio_error,
+         AUDIO_FMT_S16, AUDIO_DEFAULT_CHUNK, AUDIO_DEFAULT_VOICES }
+       from "../../../wobbleweed/src/audio.hml";
+import { stat_get, stat_ms, stat_set, stat_begin, stat_end,
+         STAT_TRIS_SUBMITTED, STAT_TRIS_DRAWN, STAT_DRAW_CALLS,
+         STAT_BATCH_OVERFLOW, STAT_LIGHTS, STAT_CHUNKS_DRAWN,
+         STAT_ENTS_DRAWN, STAT_PARTICLES, STAT_SKY_ROWS, STAT_CHUNKS_MESHED,
+         STAT_T_FRAME, STAT_T_TOD, STAT_T_SKYBAKE, STAT_T_HUD }
+       from "../../../wobbleweed/src/stats.hml";
+
+// ---------------------------------------------------------------------------
+// THE FRAME GRAPH — src/render/world_render.hml. The only one.
+// ---------------------------------------------------------------------------
+import { frame_init, frame_render, frame_present, frame_begin,
+         frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
+         frame_set_camera, frame_set_clear, frame_set_options,
+         frame_set_hud_solid_uv, frame_set_vignette_colour,
+         frame_set_flash_colour, frame_env, frame_mvp, frame_batch_hud,
+         world_clear, world_chunk_add, world_prop_add, world_fx_add,
+         world_prop_count, world_prop_tag, world_prop_x, world_prop_y,
+         world_prop_z,
+         terrain_set, terrain_seed, terrain_h, vnoise2, h2,
+         g_D2R, g_NEAR, g_FXK_SPRITE, g_FXK_RAIN, g_FXK_TRACER,
+         g_LOD_FOG_CARD }
+       from "../render/world_render.hml";
+
+import { vm_new, vm_bind_mesh, vm_set_eye_height, vm_set_motion,
+         vm_read_weapon, vm_fire, vm_drop_mag, vm_step, vm_emit, vm_model,
+         vm_tris, vm_take_clack, vm_take_reload_done, vm_reload_stage,
+         vm_mesh_tris }
+       from "../render/viewmodel.hml";
+
+// ---------------------------------------------------------------------------
+// the game — core, art, sim, net
+// ---------------------------------------------------------------------------
+import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_FRAME_BUDGET_MS,
+         g_FOG_FAR_CAP, g_MIST_HEIGHT, g_UPSCALE_DEFAULT, g_TICK_MS,
+         g_WORLD_SEED_DEFAULT, g_DAY_TICKS, g_EYE_STAND, g_LOW_HP,
+         g_BUDGET_SIM_MS, g_TICK_DT, g_ENEMY_WISP, g_ENEMY_MOTE,
+         g_ENEMY_HUSK, g_LANTERN_R_T1, g_XP_LANTERN, g_LANTERN_CHANNEL_S }
+       from "../core/config.hml";
+import { clamp01, lerpf, clampi, clampf } from "../core/mathx.hml";
+
+import { pal_r, pal_g, pal_b, pal_pack,
+         g_UI_WHITE, g_UI_DIM, g_UI_BLACK, g_UI_AMBER, g_UI_DANGER,
+         g_UI_GOOD, g_NS_CORE, g_NS_HALO, g_EMBER, g_LIGHTNING,
+         g_WINDOW_LIGHT,
+         g_GRASS_MID, g_GRASS_DRY, g_DIRT_MID, g_STONE_HI }
+       from "../art/palette.hml";
+import { tod_eval, tod_set_weather, tod_set_mist_band, tod_sky_keys,
+         tod_lightning_active, tod_clock_hours,
+         WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM, WX_BLOOM,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R, TODSKY_STAR_ALPHA,
+         TODSKY_HALO, TODSKY_BODY_X, TODSKY_CLOUD_COVER, TODSKY_COUNT }
+       from "../art/tod.hml";
+import { CELL_GRASS_A, CELL_GRASS_B, CELL_DIRT, CELL_CLIFF,
+         CELL_PATH, CELL_COBBLE, CELL_GRAVEL }
+       from "../art/texgen.hml";
+import { skygen_keys_new, skygen_set_keys, skygen_set_clock,
+         skygen_mark_dirty, skygen_rebake_slice, skygen_dirty_rows,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER }
+       from "../art/skygen.hml";
+import { FX_EMBER, FX_XP_MOTE, FX_GLOW_S, FX_GLOW_L, FX_RAIN,
+         FX_SPARK_0, FX_TRACER, FX_MUZZLE_0 }
+       from "../art/fxgen.hml";
+import { hudgen_uv, hudgen_rect, hud_font_micro, hud_font_big,
+         HUD_SOLID, HUD_XH_TICK_V, HUD_XH_TICK_H, HUD_XH_DOT, HUD_HITMARK,
+         HUD_CHEVRON, HUD_TICK_MINOR, HUD_TICK_MAJOR, HUD_ICON_LANTERN,
+         HUD_ICON_DIAMOND, HUD_ICON_ARROW, HUD_ICON_AMMO, HUD_ICON_HEART }
+       from "../art/hudgen.hml";
+import { meshgen_mesh, meshgen_radius, meshgen_tris,
+         meshgen_enemy_mesh, meshgen_set_sun_azimuth, meshgen_bake_all,
+         MESH_TREE0, MESH_TREE1, MESH_TREE2, MESH_BUSH, MESH_ROCK,
+         MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB,
+         MESH_WISP0, MESH_LANTERN_VM }
+       from "../art/meshgen.hml";
+
+import { assets_build, assets_build_stage, assets_atlas, assets_tex,
+         assets_mesh, assets_print_report, assets_total_ms, assets_seed,
+         assets_set_seed, assets_stages_done, assets_stage_label,
+         assets_error, assets_texture_count,
+         ASSET_WORLD, ASSET_FX, ASSET_HUD, ASSET_SKY, AS_STAGE_COUNT }
+       from "./assets.hml";
+import { bank_build_at, bank_sound, bank_is_built, bank_total_bytes,
+         bank_hit_sfx, bank_step_sfx,
+         SFX_KESTREL, SFX_DRYFIRE, SFX_RELOAD_DROP, SFX_RELOAD_INS,
+         SFX_RELOAD_SEAT, SFX_MAG_CLACK, SFX_HIT, SFX_KILL, SFX_BELL,
+         SFX_HORN, SFX_LEVELUP, SFX_WAVECLEAR, SFX_XP_BLIP, SFX_HURT,
+         SFX_STEP_GRASS, SFX_EMBER, SFX_IMP_SOIL, SFX_IMP_METAL,
+         SFX_WISP_CHIME, SFX_HUSK_GROWL }
+       from "./audiobank.hml";
+
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha,
+         sim_accum_ticks, sim_accum_stalls, sim_accum_forgiven,
+         sim_accum_reset, sim_accum_frame_ms }
+       from "../sim/sim.hml";
+import { BTN_FIRE, BTN_ADS, BTN_JUMP, BTN_CROUCH, BTN_SPRINT, BTN_RELOAD,
+         BTN_USE, BTN_MELEE } from "../sim/command.hml";
+import { DIR_IDLE, DIR_ARMED, DIR_SPAWNING, DIR_CLEARING, DIR_GAP, DIR_DONE
+       } from "../sim/director.hml";
+
+import { chunk_height_at, chunk_pin_ring, CHUNK_H_MISS }
+       from "../sim/chunk.hml";
+
+import { transport_loopback, transport_set_latency, transport_set_jitter,
+         transport_latency_ms, transport_jitter_ms, transport_stats
+       } from "../net/transport.hml";
+
+import { server_new, server_tick, server_snapshot, server_local,
+         server_t0, server_beat, server_beat_name,
+         server_lantern_x, server_lantern_z, server_lantern_lit,
+         server_spawn_x, server_spawn_z, server_spawn_yaw, server_hash,
+         server_enemies_alive, server_snap_bytes, server_tier_at,
+         server_path_lit, server_hold_begun, server_session, server_chunks,
+         SV_PSLOT, SV_MODEL_LANTERN, SV_MODEL_PICKUP,
+         SV_BEAT_WAKE, SV_BEAT_STAND, SV_BEAT_LIT, SV_BEAT_HORN,
+         SV_BEAT_CLEAR, SV_BEAT_PATH }
+       from "./server.hml";
+
+import { client_new, client_bind_fx_cells, client_set_sens, client_look,
+         client_look_axis, client_set_move, client_set_button,
+         client_set_angles,
+         client_press_fire, client_press_reload, client_send_command,
+         client_apply, client_frame, client_build_render,
+         client_cam_x, client_cam_y, client_cam_z, client_cam_yaw,
+         client_cam_pitch, client_cam_roll, client_cam_fov,
+         client_shake_x, client_shake_y,
+         client_hp, client_hp_max, client_hp01, client_dead,
+         client_respawn_t, client_ammo, client_reserve, client_reloading,
+         client_reload_stage, client_level, client_xp_into, client_xp_need,
+         client_speed, client_grounded, client_step_dist,
+         client_px, client_py, client_pz, client_day_t, client_tier,
+         client_alive, client_wave, client_wave_state, client_beat,
+         client_session, client_intro_alpha, client_stand01,
+         client_hitmarker, client_hitmarker_kill, client_damage_t,
+         client_damage_dir, client_banner, client_banner_t, client_card,
+         client_card_t, client_toast, client_toast_t, client_level_t,
+         client_chan01, client_lantern_dist, client_lantern_lit,
+         client_lit_ring_t, client_prompt, client_lantern_bearing,
+         client_has_control, client_ent_count, client_ent_id, client_ent_x,
+         client_ent_y, client_ent_z, client_ent_yaw, client_ent_model,
+         client_ent_flags, client_fx_count, client_fx_cell, client_fx_kind,
+         client_fx_x, client_fx_y, client_fx_z, client_fx_r, client_fx_g,
+         client_fx_b, client_fx_size, client_fx_alpha, client_fx_dropped,
+         client_sound_count, client_sound_id, client_sound_gain,
+         client_sound_pan, client_sounds_reset, client_sounds_total,
+         client_cmds_sent, client_packets, client_decode_fail,
+         client_fire_shots, client_ads, client_weapon,
+         CFX_TRACER, CFX_RAIN,
+         CSND_SHOT, CSND_DRYFIRE, CSND_RELOAD_DROP, CSND_RELOAD_INS,
+         CSND_RELOAD_SEAT, CSND_MAG_CLACK, CSND_HIT0, CSND_HIT_STEPS,
+         CSND_KILL, CSND_IMPACT, CSND_IMPACT_ARMOR, CSND_BELL, CSND_HORN,
+         CSND_LEVELUP, CSND_WAVECLEAR, CSND_XP, CSND_HURT, CSND_STEP,
+         CSND_EMBER, CSND_WISP, CSND_HUSK, CSND_COUNT }
+       from "./client.hml";
+
+// ===========================================================================
+//  0.  FIXED SHAPE
+// ===========================================================================
+
+let g_VERSION: string = "NIGHTSHADE W4-11 - the first 60 seconds";
+
+let g_CHUNK_Q: i32 = 8;                 // quads per terrain chunk edge
+let g_QUAD_M: f64 = 4.0;                // metres per terrain quad
+let g_CHUNK_M: f64 = 32.0;
+let g_CHUNK_SLOTS: i32 = 72;            // mesh pool; a 7x7 ring is 49
+let g_CHUNK_BUILD_PER_FRAME: i32 = 2;   // amortised, g_BUDGET_CHUNKGEN_MS
+let g_APRON_SEGS: i32 = 24;
+let g_APRON_SNAP: f64 = 0.25;
+
+let g_PROP_TRIES: i32 = 10;             // candidates per 32 m chunk
+let g_LOD_NEVER: f64 = 1000000.0;
+
+let g_K_TREE: i32 = 0;
+let g_K_ROCK: i32 = 1;
+let g_K_CRATE: i32 = 2;
+let g_K_BARREL: i32 = 3;
+let g_K_LANTERN: i32 = 4;
+let g_K_BUSH: i32 = 5;
+let g_K_ENEMY: i32 = 6;
+let g_K_POST: i32 = 7;                  // the sim's lantern post
+
+// A deterministic hash in [lo,hi). Same one `walk.hml` uses; the props must be
+// a pure function of position so a chunk re-meshes identically forever.
+fn hrange(p_a: i32, p_b: i32, p_s: i32, p_lo: f64, p_hi: f64): f64 {
+    let v: f64 = h2(p_a, p_b, p_s);
+    let out: f64 = p_lo + (p_hi - p_lo) * v;
+    return out;
+}
+
+fn absf(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE GROUND YOU SEE IS THE GROUND YOU STAND ON.
+// ---------------------------------------------------------------------------
+// `world_render.hml` exports `terrain_h`, and `tools/walk.hml` builds its
+// terrain from it. That is correct for a walkaround, which has no simulation,
+// and WRONG for the game: the sim's collision, the AI's steering, the
+// projectile raycast and the spawn heights all come from `src/sim/chunk.hml`
+// over `src/sim/worldgen.hml`, and those are a different heightfield. Building
+// the picture from `terrain_h` puts the player's feet at one height and the
+// visible ground at another -- which is not a subtle artefact, it is walking
+// through the floor.
+//
+// So every height in this file comes from the SIM's store, and `terrain_h` is
+// used for exactly one thing: the fallback when a chunk is neither resident nor
+// generatable, which cannot happen with the ring pinned but must not return a
+// hole if it ever does.
+//
+// `chunk_height_at` generates on demand through `memo_slot` -> `chunk_get`, and
+// memoises the last chunk, so the mesh builder's 4-taps-per-vertex pattern hits
+// the memo almost every time.
+let g_cs = null;
+
+fn ground_h(p_x: f64, p_z: f64): f64 {
+    let h: f64 = chunk_height_at(g_cs, p_x, p_z);
+    if (h <= CHUNK_H_MISS) {
+        let fb: f64 = terrain_h(p_x, p_z);
+        return fb;
+    }
+    let out: f64 = h;
+    return out;
+}
+
+// ===========================================================================
+//  1.  BOOT STATE
+// ===========================================================================
+
+let g_win = null;
+let g_target = null;
+let g_in = null;
+let g_bhud = null;
+let g_fb: ptr = alloc(320 * 240 * 4);
+
+let g_atlas_world = null;
+let g_atlas_fx = null;
+let g_tex_world = null;
+let g_tex_fx = null;
+let g_tex_hud = null;
+let g_tex_sky = null;
+
+let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_rect: array<i32> = [0, 0, 0, 0];
+let g_skyk: array<f64> = [];
+let g_todsky: array<f64> = [];
+
+let g_seed: i32 = g_WORLD_SEED_DEFAULT;
+let g_upscale: i32 = g_UPSCALE_DEFAULT;
+let g_audio_on: i32 = 0;
+let g_snd_map: array<i32> = [];
+
+let g_net = null;
+let g_sv = null;
+let g_cl = null;
+let g_acc = null;
+let g_vm = null;
+
+let g_tick: i32 = 0;
+let g_frames: i32 = 0;
+let g_camx: f64 = 0.0;
+let g_camy: f64 = 2.0;
+let g_camz: f64 = 0.0;
+let g_yaw_deg: f64 = 0.0;
+let g_pitch_deg: f64 = 0.0;
+let g_fov: f64 = 70.0;
+let g_fog_far: f64 = 64.0;
+let g_day_t: f64 = 0.5;
+let g_wx: i32 = 0;
+let g_ground_y: f64 = 0.0;
+let g_relative_ok: i32 = 0;
+let g_hud_on: i32 = 1;
+let g_vm_mode: i32 = 2;                 // 0 off, 1 the frame graph's, 2 driven
+let g_headless: i32 = 0;
+let g_shot_dir: string = "";
+let g_shot_seq: i32 = 0;
+let g_mouse_sens: f64 = 1.0;
+let g_sky_want: i32 = 1;
+let g_sky_burst: i32 = 1;
+let g_vsync: i32 = 0;
+
+// ===========================================================================
+//  2.  STAGE 6 + 7 — THE CALLER'S HALF OF THE FRAME
+// ---------------------------------------------------------------------------
+//  `src/render/**` may not import `src/art/**` (ARCHITECTURE §5.6b), so
+//  `tod_eval` and the skygen bridge are the caller's, in every caller, forever.
+//  This is the third caller (`shot.hml`, `walk.hml`, here) and it hits the same
+//  unit mismatch the other two documented: `tod_sky_keys` hands out 0..1 and
+//  skygen's key block is 0..255. Pass them through unscaled and the panorama
+//  bakes BLACK. Reported again, not patched: neither art module is this task's.
+// ===========================================================================
+
+fn sky_keys_from_tod(p_env: array<f64>) {
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(p_env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(p_env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(p_env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+}
+
+// Stage 6. The day fraction comes from the SIM (the client's copy of it), never
+// from a wall clock: `daycycle.hml` says a full day is exactly 57 600 ticks and
+// the picture has to agree with the simulation about what time it is.
+fn tod_step() {
+    let env: array<f64> = frame_env();
+    tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
+    tod_eval(env, g_day_t, g_wx);
+    env_set_camera(env, g_camx, g_camy, g_camz);
+
+    let fnear: f64 = env_field(env, ENV_FOG_NEAR);
+    let ffar: f64 = env_field(env, ENV_FOG_FAR);
+
+    // The shade tier IS the fog wall (GDD §2.2 / config §9). A lit lantern
+    // forces tier 0 inside its radius, which is the "fog warms one step" of
+    // GDD §8 at 0:30 and it has to be visible from the first frame after.
+    let tier: f64 = f64(client_tier(g_cl));
+    if (client_lantern_lit(g_cl) == 1) {
+        let d: f64 = client_lantern_dist(g_cl);
+        if (d < g_LANTERN_R_T1) { tier = 0.0; }
+    }
+    ffar = ffar - tier * 6.0;
+    if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (ffar < 18.0) { ffar = 18.0; }
+    if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
+    env_set_fog(env, fnear, ffar,
+                env_field(env, ENV_FOG_R), env_field(env, ENV_FOG_G),
+                env_field(env, ENV_FOG_B), env_field(env, ENV_FOG_ALPHA_MAX));
+    g_fog_far = ffar;
+    sky_keys_from_tod(env);
+}
+
+fn sky_now() {
+    skygen_mark_dirty();
+    g_sky_want = 0;
+    while (skygen_dirty_rows() > 0) { skygen_rebake_slice(); }
+}
+
+// ===========================================================================
+//  3.  THE GROUND MATERIAL   (ported from tools/walk.hml — see the header)
+// ---------------------------------------------------------------------------
+//  Two rules, both load-bearing and both easy to break with a moving camera:
+//  the TILE flips per quad but the VALUE is a continuous field, and the path is
+//  a WORLD line, not a camera-relative one.
+// ===========================================================================
+
+let g_path_dx: f64 = 0.2588190451025208;    // sin(15 deg)
+let g_path_dz: f64 = -0.9659258262890683;   // -cos(15 deg)
+let g_path_half: f64 = 2.1;
+
+fn path_w(p_x: f64, p_z: f64): f64 {
+    let t: f64 = p_x * g_path_dx + p_z * g_path_dz;
+    let s: f64 = p_x * g_path_dz - p_z * g_path_dx;
+    let wig: f64 = sin(t * 0.030) * 6.5 + sin(t * 0.011) * 4.0;
+    let off: f64 = absf(s - wig);
+    let out: f64 = clamp01((g_path_half + 1.6 - off) / 1.6);
+    return out;
+}
+
+fn ground_cell(p_x: f64, p_z: f64, p_slope: f64): i32 {
+    let pw: f64 = path_w(p_x, p_z);
+    if (pw > 0.74) { let o: i32 = CELL_COBBLE; return o; }
+    if (pw > 0.32) { let o: i32 = CELL_PATH; return o; }
+    if (pw > 0.10) { let o: i32 = CELL_GRAVEL; return o; }
+    if (p_slope > 1.15) { let o: i32 = CELL_CLIFF; return o; }
+    if (p_slope > 0.72) { let o: i32 = CELL_DIRT; return o; }
+    let v: f64 = vnoise2(p_x * 0.083, p_z * 0.083, terrain_seed() + 33);
+    if (v > 0.50) { let o: i32 = CELL_GRASS_B; return o; }
+    let o2: i32 = CELL_GRASS_A;
+    return o2;
+}
+
+fn ground_vcol(p_x: f64, p_z: f64, p_slope01: f64): i32 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let dry: f64 = clamp01((vnoise2(x * 0.083, z * 0.083, terrain_seed() + 33) - 0.40) * 2.2);
+    let r: f64 = lerpf(f64(pal_r(g_GRASS_MID)), f64(pal_r(g_GRASS_DRY)), dry);
+    let g: f64 = lerpf(f64(pal_g(g_GRASS_MID)), f64(pal_g(g_GRASS_DRY)), dry);
+    let b: f64 = lerpf(f64(pal_b(g_GRASS_MID)), f64(pal_b(g_GRASS_DRY)), dry);
+    r = lerpf(r, f64(pal_r(g_DIRT_MID)), p_slope01);
+    g = lerpf(g, f64(pal_g(g_DIRT_MID)), p_slope01);
+    b = lerpf(b, f64(pal_b(g_DIRT_MID)), p_slope01);
+    let pw: f64 = path_w(x, z);
+    if (pw > 0.0) {
+        r = lerpf(r, f64(pal_r(g_STONE_HI)) * 1.42, pw);
+        g = lerpf(g, f64(pal_g(g_STONE_HI)) * 1.42, pw);
+        b = lerpf(b, f64(pal_b(g_STONE_HI)) * 1.42, pw);
+    }
+    let p: f64 = 0.86 + 0.28 * vnoise2(x * 0.06, z * 0.06, terrain_seed() + 21);
+    let out: i32 = pal_pack(clampi(i32(r * p), 0, 255),
+                            clampi(i32(g * p), 0, 255),
+                            clampi(i32(b * p), 0, 255));
+    return out;
+}
+
+// ===========================================================================
+//  4.  THE STREAMING CHUNK RING
+// ---------------------------------------------------------------------------
+//  A fixed pool of meshes rebuilt in place (`mesh_begin` resets the arena and
+//  keeps the allocation), at most `g_CHUNK_BUILD_PER_FRAME` per frame, nearest
+//  first. The props in a chunk are derived ONCE at mesh time and cached beside
+//  it — walk.hml measured 6.4 ms of a 13.6 ms frame when they were re-derived
+//  every frame, and that measurement is why the cache exists.
+// ===========================================================================
+
+let g_cc_mesh: array = [];
+let g_cc_cx: array<i32> = [];
+let g_cc_cz: array<i32> = [];
+let g_cc_live: array<i32> = [];
+let g_cc_stamp: array<i32> = [];
+let g_cc_baked: array<i32> = [];
+let g_cc_cy: array<f64> = [];
+
+let g_cp_n: array<i32> = [];
+let g_cp_kind: array<i32> = [];
+let g_cp_x: array<f64> = [];
+let g_cp_y: array<f64> = [];
+let g_cp_z: array<f64> = [];
+let g_cp_yaw: array<f64> = [];
+let g_cp_s: array<f64> = [];
+let g_cp_sh: array<f64> = [];
+let g_cp_t: array<i32> = [];
+
+fn chunks_init() {
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        g_cc_mesh.push(mesh_new(g_CHUNK_Q * g_CHUNK_Q * 2 + 4));
+        g_cc_cx.push(0); g_cc_cz.push(0); g_cc_live.push(0);
+        g_cc_stamp.push(0); g_cc_baked.push(0); g_cc_cy.push(0.0);
+        g_cp_n.push(0);
+        for (let k = 0; k < g_PROP_TRIES; k++) {
+            g_cp_kind.push(0); g_cp_x.push(0.0); g_cp_y.push(0.0);
+            g_cp_z.push(0.0); g_cp_yaw.push(0.0); g_cp_s.push(1.0);
+            g_cp_sh.push(1.0); g_cp_t.push(255);
+        }
+    }
+}
+
+fn chunk_find(p_cx: i32, p_cz: i32): i32 {
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        if (g_cc_live[i] != 0 && g_cc_cx[i] == p_cx && g_cc_cz[i] == p_cz) {
+            let out: i32 = i;
+            return out;
+        }
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+fn chunk_evict(): i32 {
+    let best: i32 = 0;
+    let bstamp: i32 = 2147483647;
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        if (g_cc_live[i] == 0) { let out: i32 = i; return out; }
+        if (g_cc_stamp[i] < bstamp) { bstamp = g_cc_stamp[i]; best = i; }
+    }
+    let out2: i32 = best;
+    return out2;
+}
+
+fn chunk_props_gen(p_slot: i32, p_cx: i32, p_cz: i32) {
+    let n: i32 = 0;
+    let base: i32 = p_slot * g_PROP_TRIES;
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    let seed: i32 = terrain_seed();
+    for (let k = 0; k < g_PROP_TRIES; k++) {
+        let px: f64 = ox + hrange(p_cx * 97 + k, p_cz * 89 + k, seed + 7, 0.0, 32.0);
+        let pz: f64 = oz + hrange(p_cx * 89 + k, p_cz * 97 + k, seed + 11, 0.0, 32.0);
+        if (path_w(px, pz) > 0.30) { continue; }
+        let dens: f64 = vnoise2(px * 0.017, pz * 0.017, seed + 41);
+        if (h2(p_cx * 13 + k, p_cz * 17 + k, seed + 13) > dens * 1.35) { continue; }
+        let pick: f64 = h2(p_cx * 31 + k, p_cz * 37 + k, seed + 19);
+        let kind: i32 = g_K_TREE;
+        let sc: f64 = hrange(p_cx * 41 + k, p_cz * 43 + k, seed + 23, 0.85, 1.25);
+        let sh: f64 = 1.9;
+        // NOTE: no decorative lanterns. GAME_DESIGN §8 at 0:06 says the unlit
+        // lantern is "the ONLY vertical thing on the horizon" and "the
+        // brightest object on screen" -- scattering nine more of them through
+        // the props would be the single most effective way to break the beat
+        // this whole task exists to deliver. The only lanterns in the world are
+        // the sim's.
+        if (pick > 0.88) { kind = g_K_BARREL; sh = 1.1; }
+        else if (pick > 0.82) { kind = g_K_CRATE; sh = 1.0; }
+        else if (pick > 0.64) { kind = g_K_BUSH; sc = 0.8 + sc * 0.5; sh = 0.9; }
+        else if (pick > 0.44) { kind = g_K_ROCK; sc = 0.7 + sc * 0.9; sh = 1.2; }
+        let j: f64 = hrange(p_cx * 53 + k, p_cz * 59 + k, seed + 29, 0.92, 1.08);
+        let i: i32 = base + n;
+        g_cp_kind[i] = kind;
+        g_cp_x[i] = px;
+        g_cp_y[i] = ground_h(px, pz);
+        g_cp_z[i] = pz;
+        g_cp_yaw[i] = hrange(p_cx * 61 + k, p_cz * 67 + k, seed + 31, 0.0, 6.283185307179586);
+        g_cp_s[i] = sc;
+        g_cp_sh[i] = sh;
+        g_cp_t[i] = clampi(i32(255.0 * j), 0, 255);
+        n++;
+    }
+    g_cp_n[p_slot] = n;
+}
+
+fn chunk_mesh_build(p_slot: i32, p_cx: i32, p_cz: i32) {
+    let q: i32 = g_CHUNK_Q;
+    let m = g_cc_mesh[p_slot];
+    mesh_begin(m);
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    for (let j = 0; j < q; j++) {
+        for (let i = 0; i < q; i++) {
+            let x0: f64 = ox + f64(i) * g_QUAD_M;
+            let z0: f64 = oz + f64(j) * g_QUAD_M;
+            let x1: f64 = x0 + g_QUAD_M;
+            let z1: f64 = z0 + g_QUAD_M;
+            let y00: f64 = ground_h(x0, z0);
+            let y10: f64 = ground_h(x1, z0);
+            let y11: f64 = ground_h(x1, z1);
+            let y01: f64 = ground_h(x0, z1);
+            let slope: f64 = (absf(y10 - y00) + absf(y01 - y00)) / g_QUAD_M;
+            let cell: i32 = ground_cell(x0, z0, slope);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            let nx0: f64 = ground_h(x0 - 1.0, z0) - ground_h(x0 + 1.0, z0);
+            let nz0: f64 = ground_h(x0, z0 - 1.0) - ground_h(x0, z0 + 1.0);
+            let nx1: f64 = ground_h(x1 - 1.0, z1) - ground_h(x1 + 1.0, z1);
+            let nz1: f64 = ground_h(x1, z1 - 1.0) - ground_h(x1, z1 + 1.0);
+            let s0: f64 = clamp01(sqrt(nx0 * nx0 + nz0 * nz0) * 0.55);
+            let s1: f64 = clamp01(sqrt(nx1 * nx1 + nz1 * nz1) * 0.55);
+            let k00: i32 = ground_vcol(x0, z0, s0);
+            let k10: i32 = ground_vcol(x1, z0, s0);
+            let k11: i32 = ground_vcol(x1, z1, s1);
+            let k01: i32 = ground_vcol(x0, z1, s1);
+            let a = mesh_vert_n(m, x0 - ox, y00, z0 - oz, u0, v0,
+                                pal_r(k00), pal_g(k00), pal_b(k00), nx0, 2.0, nz0);
+            let b = mesh_vert_n(m, x1 - ox, y10, z0 - oz, u1, v0,
+                                pal_r(k10), pal_g(k10), pal_b(k10), nx1, 2.0, nz0);
+            let c = mesh_vert_n(m, x1 - ox, y11, z1 - oz, u1, v1,
+                                pal_r(k11), pal_g(k11), pal_b(k11), nx1, 2.0, nz1);
+            let d = mesh_vert_n(m, x0 - ox, y01, z1 - oz, u0, v1,
+                                pal_r(k01), pal_g(k01), pal_b(k01), nx0, 2.0, nz1);
+            mesh_quad(m, a, b, c, d);
+        }
+    }
+    mesh_end(m);
+    g_cc_cx[p_slot] = p_cx;
+    g_cc_cz[p_slot] = p_cz;
+    g_cc_cy[p_slot] = ground_h(ox + g_CHUNK_M * 0.5, oz + g_CHUNK_M * 0.5);
+    g_cc_live[p_slot] = 1;
+    g_cc_baked[p_slot] = 0;
+    chunk_props_gen(p_slot, p_cx, p_cz);
+}
+
+// ===========================================================================
+//  5.  THE NEAR APRON
+// ---------------------------------------------------------------------------
+//  A terrain quad that CONTAINS the camera straddles the near plane and is
+//  dropped, leaving a hole exactly where a first-person camera looks. The apron
+//  is a radial fan centred on the camera; every triangle lies wholly inside one
+//  15-degree sector so nothing in the view cone can span w = 0. The uv comes
+//  off a WORLD lattice, never off the ring/sector indices — a texture that
+//  rotates with the viewer is the most immersion-breaking thing there is.
+// ===========================================================================
+
+let g_apron_mesh = null;
+let g_apron_x: f64 = 1e30;
+let g_apron_z: f64 = 1e30;
+let g_apron_baked: i32 = 0;
+let g_AP_R: array<f64> = [0.01, 1.0, 2.2, 4.2, 8.0];
+let g_AP_NR: i32 = 5;
+
+let g_ap_x: array<f64> = [];
+let g_ap_y: array<f64> = [];
+let g_ap_z: array<f64> = [];
+let g_ap_nx: array<f64> = [];
+let g_ap_nz: array<f64> = [];
+let g_ap_c: array<i32> = [];
+let g_ap_cs: array<f64> = [];
+let g_ap_sn: array<f64> = [];
+
+let g_GUV_P: f64 = 1.0;
+let g_guv_ox: f64 = 0.0;
+let g_guv_oz: f64 = 0.0;
+
+fn ground_uv_org(p_x0: f64, p_x1: f64, p_x2: f64, p_x3: f64,
+                 p_z0: f64, p_z1: f64, p_z2: f64, p_z3: f64) {
+    let xlo: f64 = p_x0;
+    if (p_x1 < xlo) { xlo = p_x1; }
+    if (p_x2 < xlo) { xlo = p_x2; }
+    if (p_x3 < xlo) { xlo = p_x3; }
+    let zlo: f64 = p_z0;
+    if (p_z1 < zlo) { zlo = p_z1; }
+    if (p_z2 < zlo) { zlo = p_z2; }
+    if (p_z3 < zlo) { zlo = p_z3; }
+    g_guv_ox = floor(xlo / g_GUV_P) * g_GUV_P;
+    g_guv_oz = floor(zlo / g_GUV_P) * g_GUV_P;
+}
+
+fn ground_uv_u(p_x: f64, p_u0: f64, p_u1: f64): f64 {
+    let f: f64 = clamp01((p_x - g_guv_ox) / g_GUV_P);
+    let out: f64 = p_u0 + (p_u1 - p_u0) * f;
+    return out;
+}
+
+fn ground_uv_v(p_z: f64, p_v0: f64, p_v1: f64): f64 {
+    let f: f64 = clamp01((p_z - g_guv_oz) / g_GUV_P);
+    let out: f64 = p_v0 + (p_v1 - p_v0) * f;
+    return out;
+}
+
+fn apron_init() {
+    g_apron_mesh = mesh_new(g_APRON_SEGS * (g_AP_NR - 1) * 2 + 8);
+    let n: i32 = g_AP_NR * g_APRON_SEGS;
+    for (let i = 0; i < n; i++) {
+        g_ap_x.push(0.0); g_ap_y.push(0.0); g_ap_z.push(0.0);
+        g_ap_nx.push(0.0); g_ap_nz.push(0.0); g_ap_c.push(0);
+    }
+    let step: f64 = 6.283185307179586 / f64(g_APRON_SEGS);
+    for (let i = 0; i < g_APRON_SEGS; i++) {
+        g_ap_cs.push(cos(f64(i) * step));
+        g_ap_sn.push(sin(f64(i) * step));
+    }
+}
+
+fn apron_build(p_cx: f64, p_cz: f64) {
+    let segs: i32 = g_APRON_SEGS;
+    let nr: i32 = g_AP_NR;
+    for (let r = 0; r < nr; r++) {
+        let rad: f64 = g_AP_R[r];
+        for (let i = 0; i < segs; i++) {
+            let idx: i32 = r * segs + i;
+            let x: f64 = p_cx + g_ap_cs[i] * rad;
+            let z: f64 = p_cz + g_ap_sn[i] * rad;
+            let nx: f64 = ground_h(x - 1.0, z) - ground_h(x + 1.0, z);
+            let nz: f64 = ground_h(x, z - 1.0) - ground_h(x, z + 1.0);
+            let slope: f64 = clamp01(sqrt(nx * nx + nz * nz) * 0.55);
+            g_ap_x[idx] = x;
+            g_ap_z[idx] = z;
+            g_ap_y[idx] = ground_h(x, z) + 0.012;
+            g_ap_nx[idx] = nx;
+            g_ap_nz[idx] = nz;
+            g_ap_c[idx] = ground_vcol(x, z, slope);
+        }
+    }
+    let m = g_apron_mesh;
+    mesh_begin(m);
+    for (let r = 0; r < nr - 1; r++) {
+        for (let i = 0; i < segs; i++) {
+            let i1: i32 = i + 1;
+            if (i1 >= segs) { i1 = 0; }
+            let a0: i32 = r * segs + i;
+            let a1: i32 = r * segs + i1;
+            let b0: i32 = (r + 1) * segs + i;
+            let b1: i32 = (r + 1) * segs + i1;
+            let cell: i32 = ground_cell(g_ap_x[a0], g_ap_z[a0], 0.0);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            let c0: i32 = g_ap_c[a0]; let c1: i32 = g_ap_c[a1];
+            let c2: i32 = g_ap_c[b1]; let c3: i32 = g_ap_c[b0];
+            ground_uv_org(g_ap_x[a0], g_ap_x[a1], g_ap_x[b1], g_ap_x[b0],
+                          g_ap_z[a0], g_ap_z[a1], g_ap_z[b1], g_ap_z[b0]);
+            let a = mesh_vert_n(m, g_ap_x[a0], g_ap_y[a0], g_ap_z[a0],
+                                ground_uv_u(g_ap_x[a0], u0, u1),
+                                ground_uv_v(g_ap_z[a0], v0, v1),
+                                pal_r(c0), pal_g(c0), pal_b(c0),
+                                g_ap_nx[a0], 2.0, g_ap_nz[a0]);
+            let b = mesh_vert_n(m, g_ap_x[a1], g_ap_y[a1], g_ap_z[a1],
+                                ground_uv_u(g_ap_x[a1], u0, u1),
+                                ground_uv_v(g_ap_z[a1], v0, v1),
+                                pal_r(c1), pal_g(c1), pal_b(c1),
+                                g_ap_nx[a1], 2.0, g_ap_nz[a1]);
+            let c = mesh_vert_n(m, g_ap_x[b1], g_ap_y[b1], g_ap_z[b1],
+                                ground_uv_u(g_ap_x[b1], u0, u1),
+                                ground_uv_v(g_ap_z[b1], v0, v1),
+                                pal_r(c2), pal_g(c2), pal_b(c2),
+                                g_ap_nx[b1], 2.0, g_ap_nz[b1]);
+            let d = mesh_vert_n(m, g_ap_x[b0], g_ap_y[b0], g_ap_z[b0],
+                                ground_uv_u(g_ap_x[b0], u0, u1),
+                                ground_uv_v(g_ap_z[b0], v0, v1),
+                                pal_r(c3), pal_g(c3), pal_b(c3),
+                                g_ap_nx[b0], 2.0, g_ap_nz[b0]);
+            mesh_quad(m, a, d, c, b);
+        }
+    }
+    mesh_end(m);
+    g_apron_x = p_cx;
+    g_apron_z = p_cz;
+}
+
+// ===========================================================================
+//  6.  THE PER-FRAME WORLD REBUILD
+// ---------------------------------------------------------------------------
+//  The registry is rebuilt from scratch every frame: ~50 chunk rows, ~150 prop
+//  rows and the entity stream. Cheap bookkeeping only — the expensive things
+//  (chunk meshes, prop caches, the light bake) are cached and amortised.
+// ===========================================================================
+
+let g_prime: i32 = 1;
+let g_ring_built: i32 = 0;
+let g_prop_n: i32 = 0;
+let g_ent_n: i32 = 0;
+
+fn prop_push(p_kind: i32, p_x: f64, p_z: f64, p_y: f64,
+             p_yaw: f64, p_scale: f64, p_shadow: f64, p_tint: i32) {
+    let k: i32 = p_kind;
+    let id0: i32 = MESH_ROCK;
+    if (k == g_K_TREE) { id0 = MESH_TREE0; }
+    else if (k == g_K_CRATE) { id0 = MESH_CRATE; }
+    else if (k == g_K_BARREL) { id0 = MESH_BARREL; }
+    else if (k == g_K_LANTERN) { id0 = MESH_LANTERN; }
+    else if (k == g_K_POST) { id0 = MESH_LANTERN; }
+    else if (k == g_K_BUSH) { id0 = MESH_BUSH; }
+    let id1: i32 = id0;
+    let id2: i32 = id0;
+    let d1: f64 = g_LOD_NEVER;
+    let d2: f64 = g_LOD_NEVER;
+    if (k == g_K_TREE) {
+        id1 = MESH_TREE1; id2 = MESH_TREE2;
+        d1 = 18.0; d2 = g_LOD_FOG_CARD;
+    }
+    world_prop_add(meshgen_mesh(id0), meshgen_mesh(id1), meshgen_mesh(id2),
+                   d1, d2, meshgen_radius(id0),
+                   p_x, p_y, p_z, p_yaw, p_scale,
+                   p_tint, p_tint, p_tint, p_shadow, k);
+}
+
+fn chunk_props_push(p_slot: i32): i32 {
+    let n: i32 = g_cp_n[p_slot];
+    let base: i32 = p_slot * g_PROP_TRIES;
+    for (let k = 0; k < n; k++) {
+        let i: i32 = base + k;
+        prop_push(g_cp_kind[i], g_cp_x[i], g_cp_z[i], g_cp_y[i],
+                  g_cp_yaw[i], g_cp_s[i], g_cp_sh[i], g_cp_t[i]);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+fn fx_push(p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_cell: i32,
+           p_kind: i32, p_r: i32, p_g: i32, p_b: i32, p_a: i32) {
+    world_fx_add(p_x, p_y, p_z, p_s, p_cell, p_kind, p_r, p_g, p_b, p_a);
+}
+
+// ---------------------------------------------------------------------------
+// THE ENTITY PASS — the only place a body reaches the picture.
+// ---------------------------------------------------------------------------
+// Everything here comes out of `client_ent_*`, which is the DECODED SNAPSHOT.
+// There is no `world` in scope in this function and there never will be.
+// `model` carries the enemy class for KIND_AI (ai.hml sets `model = class`),
+// so the mesh is `MESH_WISP0 + class * 3` and the three LODs are contiguous —
+// which is exactly how meshgen lays them out.
+fn entities_push(): i32 {
+    let n: i32 = client_ent_count(g_cl);
+    let drawn: i32 = 0;
+    let far: f64 = g_fog_far;
+    for (let i = 0; i < n; i++) {
+        let fl: i32 = client_ent_flags(g_cl, i);
+        if ((fl & 1) == 0) { continue; }            // RSF_VISIBLE
+        let id: i32 = client_ent_id(g_cl, i);
+        let x: f64 = client_ent_x(g_cl, i);
+        let y: f64 = client_ent_y(g_cl, i);
+        let z: f64 = client_ent_z(g_cl, i);
+        let dx: f64 = x - g_camx;
+        let dz: f64 = z - g_camz;
+        if (dx * dx + dz * dz > far * far) { continue; }
+        let md: i32 = client_ent_model(g_cl, i);
+        let yaw: f64 = client_ent_yaw(g_cl, i);
+
+        if (md == SV_MODEL_LANTERN) {
+            // The post. Unlit it is a silhouette; lit it is the brightest thing
+            // in the world and it gets a glow card and a light.
+            world_prop_add(meshgen_mesh(MESH_LANTERN), meshgen_mesh(MESH_LANTERN),
+                           meshgen_mesh(MESH_LANTERN),
+                           g_LOD_NEVER, g_LOD_NEVER, meshgen_radius(MESH_LANTERN),
+                           x, y, z, 0.0, 1.25, 255, 255, 255, 1.4, g_K_POST);
+            drawn++;
+            continue;
+        }
+        if (md == SV_MODEL_PICKUP) {
+            fx_push(x, y + 0.4, z, 0.5, FX_XP_MOTE, g_FXK_SPRITE,
+                    pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER), 220);
+            drawn++;
+            continue;
+        }
+        // The player's own body is never drawn: this is first person.
+        if (id == SV_PSLOT) { continue; }
+
+        // An enemy. Three LODs, contiguous from MESH_WISP0.
+        let cls: i32 = md;
+        if (cls < 0) { cls = 0; }
+        if (cls > 5) { cls = 5; }
+        let m0: i32 = meshgen_enemy_mesh(cls, 0);
+        let m1: i32 = meshgen_enemy_mesh(cls, 1);
+        let m2: i32 = meshgen_enemy_mesh(cls, 2);
+        let tint: i32 = 255;
+        if ((fl & 2) != 0) { tint = 255; }          // RSF_HIT_FLASH
+        world_prop_add(meshgen_mesh(m0), meshgen_mesh(m1),
+                       meshgen_mesh(m2),
+                       16.0, g_LOD_FOG_CARD, meshgen_radius(m0),
+                       x, y, z, yaw, 1.0,
+                       tint, tint, tint, 1.1, g_K_ENEMY);
+        // GDD §7: a violet rim on hostiles is `entity_render.hml`'s job; until
+        // it exists the readability at 12 px comes from a small NS_HALO glow,
+        // which is the same signal one layer cheaper.
+        if (dx * dx + dz * dz < 2500.0) {
+            fx_push(x, y + 0.9, z, 0.55, FX_GLOW_S, g_FXK_SPRITE,
+                    pal_r(g_NS_HALO), pal_g(g_NS_HALO), pal_b(g_NS_HALO), 90);
+        }
+        drawn++;
+    }
+    let out: i32 = drawn;
+    return out;
+}
+
+fn client_fx_push(): i32 {
+    let n: i32 = client_fx_count(g_cl);
+    let far: f64 = g_fog_far;
+    let used: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let x: f64 = client_fx_x(g_cl, i);
+        let y: f64 = client_fx_y(g_cl, i);
+        let z: f64 = client_fx_z(g_cl, i);
+        let dx: f64 = x - g_camx;
+        let dz: f64 = z - g_camz;
+        if (dx * dx + dz * dz > far * far) { continue; }
+        let kind: i32 = g_FXK_SPRITE;
+        if (client_fx_kind(g_cl, i) == CFX_TRACER) { kind = g_FXK_TRACER; }
+        if (client_fx_kind(g_cl, i) == CFX_RAIN) { kind = g_FXK_RAIN; }
+        fx_push(x, y, z, client_fx_size(g_cl, i), client_fx_cell(g_cl, i), kind,
+                client_fx_r(g_cl, i), client_fx_g(g_cl, i), client_fx_b(g_cl, i),
+                client_fx_alpha(g_cl, i));
+        used++;
+    }
+    let out: i32 = used;
+    return out;
+}
+
+let g_pin_cx: i32 = 2147483647;
+let g_pin_cz: i32 = 2147483647;
+
+fn world_rebuild(p_dt: f64, p_t: f64) {
+    world_clear();
+    // The sim pins a 5x5 ring (`g_RING_RADIUS`); the PICTURE reaches the fog
+    // wall plus a chunk, so it pins 7x7. Pinning is what stops the LRU from
+    // evicting a chunk the mesh builder is about to sample four times.
+    let pcx: i32 = i32(floor(g_camx / g_CHUNK_M));
+    let pcz: i32 = i32(floor(g_camz / g_CHUNK_M));
+    if (pcx != g_pin_cx || pcz != g_pin_cz) {
+        chunk_pin_ring(g_cs, pcx, pcz, 3);
+        g_pin_cx = pcx;
+        g_pin_cz = pcz;
+    }
+    g_ring_built = 0;
+    g_prop_n = 0;
+    g_ent_n = 0;
+
+    let far: f64 = g_fog_far;
+    let rad: i32 = i32(far / g_CHUNK_M) + 1;
+    if (rad > 3) { rad = 3; }
+    let ccx: i32 = i32(floor(g_camx / g_CHUNK_M));
+    let ccz: i32 = i32(floor(g_camz / g_CHUNK_M));
+
+    for (let d = 0; d <= rad; d++) {
+        for (let j = 0 - d; j <= d; j++) {
+            for (let i = 0 - d; i <= d; i++) {
+                let ai: i32 = i; if (ai < 0) { ai = 0 - ai; }
+                let aj: i32 = j; if (aj < 0) { aj = 0 - aj; }
+                if (ai != d && aj != d) { continue; }
+                let cx: i32 = ccx + i;
+                let cz: i32 = ccz + j;
+                let ox: f64 = f64(cx) * g_CHUNK_M;
+                let oz: f64 = f64(cz) * g_CHUNK_M;
+                let mx: f64 = ox + g_CHUNK_M * 0.5;
+                let mz: f64 = oz + g_CHUNK_M * 0.5;
+                let ddx: f64 = mx - g_camx; let ddz: f64 = mz - g_camz;
+                let dist: f64 = sqrt(ddx * ddx + ddz * ddz) - g_CHUNK_M * 0.78;
+                if (dist > far) { continue; }
+                let slot: i32 = chunk_find(cx, cz);
+                if (slot < 0) {
+                    if (g_prime == 0 && g_ring_built >= g_CHUNK_BUILD_PER_FRAME) { continue; }
+                    slot = chunk_evict();
+                    chunk_mesh_build(slot, cx, cz);
+                    g_ring_built++;
+                }
+                g_cc_stamp[slot] = g_frames;
+                world_chunk_add(g_cc_mesh[slot], ox, oz,
+                                mx, g_cc_cy[slot], mz,
+                                g_CHUNK_M * 0.78 + 9.0);
+                if (dist < far - 8.0) { g_prop_n = g_prop_n + chunk_props_push(slot); }
+            }
+        }
+    }
+
+    let ax: f64 = floor(g_camx / g_APRON_SNAP + 0.5) * g_APRON_SNAP;
+    let az: f64 = floor(g_camz / g_APRON_SNAP + 0.5) * g_APRON_SNAP;
+    if (ax != g_apron_x || az != g_apron_z) { apron_build(ax, az); g_apron_baked = 0; }
+    world_chunk_add(g_apron_mesh, 0.0, 0.0,
+                    g_apron_x, ground_h(g_apron_x, g_apron_z), g_apron_z, 9.5);
+
+    g_ent_n = entities_push();
+    client_fx_push();
+
+    // The lantern's own glow. Unlit it is a dim ember on the post -- enough to
+    // be "the brightest object on screen" against a dusk hillside without
+    // lying about it being lit; lit it is the big one.
+    let lit: i32 = client_lantern_lit(g_cl);
+    let lx: f64 = server_lantern_x(g_sv);
+    let lz: f64 = server_lantern_z(g_sv);
+    let ly: f64 = ground_h(lx, lz);
+    let ddx: f64 = lx - g_camx; let ddz: f64 = lz - g_camz;
+    if (ddx * ddx + ddz * ddz < far * far) {
+        if (lit == 1) {
+            fx_push(lx, ly + 1.2, lz, 3.4, FX_GLOW_L, g_FXK_SPRITE,
+                    pal_r(g_WINDOW_LIGHT), pal_g(g_WINDOW_LIGHT),
+                    pal_b(g_WINDOW_LIGHT), 210);
+        } else {
+            fx_push(lx, ly + 1.2, lz, 1.1, FX_GLOW_S, g_FXK_SPRITE,
+                    pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER), 150);
+        }
+    }
+
+    // Ambient embers, animated on FRAME time (they are cosmetic and they are
+    // allowed to be), in an 18 m box that follows the camera.
+    let t: f64 = p_t;
+    let nemb: i32 = 22;
+    for (let q = 0; q < nemb; q++) {
+        let fx: f64 = g_camx - 9.0 + hrange(q, 4, 83, 0.0, 18.0);
+        let fz: f64 = g_camz - 9.0 + hrange(q, 5, 89, 0.0, 18.0);
+        let ph: f64 = hrange(q, 6, 97, 0.0, 6.28);
+        let fy: f64 = ground_h(fx, fz) + 0.6 + 1.5 * (0.5 + 0.5 * sin(t * 0.6 + ph));
+        fx_push(fx + sin(t * 0.4 + ph) * 0.6, fy, fz, 0.17, FX_EMBER,
+                g_FXK_SPRITE, pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER), 150);
+    }
+
+    // One dynamic light, spent on the lit lantern. BUDGET_ACTUAL's cap is 2.
+    let env: array<f64> = frame_env();
+    env_clear_lights(env);
+    if (lit == 1 && ddx * ddx + ddz * ddz < 3600.0) {
+        env_add_light(env, lx, ly + 1.2, lz,
+                      f64(pal_r(g_WINDOW_LIGHT)) / 255.0 * 2.4,
+                      f64(pal_g(g_WINDOW_LIGHT)) / 255.0 * 2.4,
+                      f64(pal_b(g_WINDOW_LIGHT)) / 255.0 * 2.4, 11.0);
+    }
+    stat_set(STAT_LIGHTS, env_light_count(env));
+    stat_set(STAT_CHUNKS_MESHED, g_ring_built);
+    stat_set(STAT_ENTS_DRAWN, g_ent_n);
+    g_prime = 0;
+}
+
+// ===========================================================================
+//  7.  THE ROLLING LIGHT BAKE
+// ---------------------------------------------------------------------------
+//  Every chunk vertex carries a baked sun term and the sun moves every frame.
+//  Anything freshly meshed is baked NOW (an unbaked mesh is a black mesh);
+//  everything else rolls two chunks a frame, which is a full pass every ~36
+//  frames and 0.2 game-minutes of sun lag.
+// ===========================================================================
+
+let g_bake_cursor: i32 = 0;
+let g_bake_sun_x: f64 = 1e30;
+let g_last_sun_x: f64 = 1e30;
+
+fn bake_chunk(p_mesh, p_lx: f64, p_ly: f64, p_lz: f64) {
+    let env: array<f64> = frame_env();
+    mesh_bake_light(p_mesh, p_lx, p_ly, p_lz,
+                    env_field(env, ENV_SUN_R), env_field(env, ENV_SUN_G),
+                    env_field(env, ENV_SUN_B),
+                    env_field(env, ENV_AMB_R), env_field(env, ENV_AMB_G),
+                    env_field(env, ENV_AMB_B),
+                    env_field(env, ENV_BOUNCE_R), env_field(env, ENV_BOUNCE_G),
+                    env_field(env, ENV_BOUNCE_B));
+}
+
+fn bake_step() {
+    let env: array<f64> = frame_env();
+    let lx: f64 = env_field(env, ENV_SUN_X);
+    let ly: f64 = env_field(env, ENV_SUN_Y);
+    let lz: f64 = env_field(env, ENV_SUN_Z);
+
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        if (g_cc_live[i] != 0 && g_cc_baked[i] == 0) {
+            bake_chunk(g_cc_mesh[i], lx, ly, lz);
+            g_cc_baked[i] = 1;
+        }
+    }
+    if (g_apron_baked == 0) {
+        bake_chunk(g_apron_mesh, lx, ly, lz);
+        g_apron_baked = 1;
+    }
+
+    let moved: f64 = absf(lx - g_last_sun_x);
+    g_last_sun_x = lx;
+    if (moved > 0.0) {
+        for (let k = 0; k < 2; k++) {
+            let i: i32 = g_bake_cursor;
+            g_bake_cursor = g_bake_cursor + 1;
+            if (g_bake_cursor >= g_CHUNK_SLOTS) { g_bake_cursor = 0; }
+            if (g_cc_live[i] != 0) { bake_chunk(g_cc_mesh[i], lx, ly, lz); }
+        }
+        g_apron_baked = 0;
+    }
+
+    let dsun: f64 = absf(lx - g_bake_sun_x);
+    if (dsun > 0.004 || g_bake_sun_x > 1e29) {
+        meshgen_set_sun_azimuth(lx, lz);
+        meshgen_bake_all(lx, ly, lz,
+                         env_field(env, ENV_SUN_R), env_field(env, ENV_SUN_G),
+                         env_field(env, ENV_SUN_B),
+                         env_field(env, ENV_AMB_R), env_field(env, ENV_AMB_G),
+                         env_field(env, ENV_AMB_B),
+                         env_field(env, ENV_BOUNCE_R), env_field(env, ENV_BOUNCE_G),
+                         env_field(env, ENV_BOUNCE_B));
+        g_bake_sun_x = lx;
+    }
+}
+
+// ===========================================================================
+//  8.  AUDIO — semantic client ids -> audiobank sfx -> the mixer
+// ---------------------------------------------------------------------------
+//  `client.hml` emits CSND_*, which name MEANINGS. This is the only table that
+//  knows a meaning is a waveform, and it is the reason `client.hml` links no
+//  SDL. A missing device is not a failure: `g_audio_on` stays 0 and the queue
+//  is drained into nothing.
+// ===========================================================================
+
+fn snd_map_init() {
+    for (let i = 0; i < CSND_COUNT; i++) { g_snd_map.push(SFX_KESTREL); }
+    g_snd_map[CSND_SHOT] = SFX_KESTREL;
+    g_snd_map[CSND_DRYFIRE] = SFX_DRYFIRE;
+    g_snd_map[CSND_RELOAD_DROP] = SFX_RELOAD_DROP;
+    g_snd_map[CSND_RELOAD_INS] = SFX_RELOAD_INS;
+    g_snd_map[CSND_RELOAD_SEAT] = SFX_RELOAD_SEAT;
+    g_snd_map[CSND_MAG_CLACK] = SFX_MAG_CLACK;
+    // The GDD §7.2 pitch chain: five consecutive steps, +2 semitones each.
+    for (let k = 0; k < CSND_HIT_STEPS; k++) {
+        g_snd_map[CSND_HIT0 + k] = SFX_HIT + k;
+    }
+    g_snd_map[CSND_KILL] = SFX_KILL;
+    g_snd_map[CSND_IMPACT] = SFX_IMP_SOIL;
+    g_snd_map[CSND_IMPACT_ARMOR] = SFX_IMP_METAL;
+    g_snd_map[CSND_BELL] = SFX_BELL;
+    g_snd_map[CSND_HORN] = SFX_HORN;
+    g_snd_map[CSND_LEVELUP] = SFX_LEVELUP;
+    g_snd_map[CSND_WAVECLEAR] = SFX_WAVECLEAR;
+    g_snd_map[CSND_XP] = SFX_XP_BLIP;
+    g_snd_map[CSND_HURT] = SFX_HURT;
+    g_snd_map[CSND_STEP] = SFX_STEP_GRASS;
+    g_snd_map[CSND_EMBER] = SFX_EMBER;
+    g_snd_map[CSND_WISP] = SFX_WISP_CHIME;
+    g_snd_map[CSND_HUSK] = SFX_HUSK_GROWL;
+}
+
+fn audio_boot() {
+    if (audio_init(22050, AUDIO_FMT_S16, 2, AUDIO_DEFAULT_CHUNK,
+                   AUDIO_DEFAULT_VOICES) != 1) {
+        eprint(`nightshade: no audio device (${audio_error()}); running silent`);
+        g_audio_on = 0;
+        return;
+    }
+    bank_build_at(audio_out_freq());
+    audio_set_volume(0.85);
+    g_audio_on = 1;
+}
+
+// The mix rule of GDD §7: the gun is the loudest thing in the game, always.
+fn audio_drain() {
+    let n: i32 = client_sound_count(g_cl);
+    if (g_audio_on == 1) {
+        for (let i = 0; i < n; i++) {
+            let cid: i32 = client_sound_id(g_cl, i);
+            if (cid < 0 || cid >= CSND_COUNT) { continue; }
+            let sid: i32 = bank_sound(g_snd_map[cid]);
+            if (sid < 0) { continue; }
+            audio_play_panned(sid, client_sound_gain(g_cl, i),
+                              client_sound_pan(g_cl, i));
+        }
+    }
+    client_sounds_reset(g_cl);
+}
+
+// ===========================================================================
+//  9.  THE HUD  (ARCHITECTURE §4 stage 24 — the CALLER's)
+// ---------------------------------------------------------------------------
+//  ART_BIBLE §9's layout at native pixel rects, hard-capped at
+//  `g_HUD_TRI_CAP` = 250. FONT_MICRO is 2 triangles a glyph and the mandatory
+//  1-px shadow doubles it to FOUR, so text budgets are explicit per line and
+//  `font_text_shadowed` TRUNCATES at its budget rather than overspending —
+//  which is what makes the cap structural instead of aspirational.
+// ===========================================================================
+
+let g_TB_AMMO: i32 = 40;
+let g_TB_HP: i32 = 28;
+let g_TB_BANNER: i32 = 88;
+let g_TB_CARD: i32 = 72;
+let g_TB_PROMPT: i32 = 108;
+let g_TB_DBG: i32 = 120;
+let g_hud_tris: i32 = 0;
+let g_hud_over: i32 = 0;
+
+fn hud_rect(p_x: f64, p_y: f64, p_w: f64, p_h: f64, p_c: i32, p_a: i32): i32 {
+    let u: f64 = (g_uvw[0] + g_uvw[2]) * 0.5;
+    let v: f64 = (g_uvw[1] + g_uvw[3]) * 0.5;
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y, p_w, p_h,
+                                  u, v, u, v,
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
+
+fn hud_sprite(p_id: i32, p_x: f64, p_y: f64, p_c: i32, p_a: i32): i32 {
+    hudgen_uv(p_id, g_uvq, 0);
+    hudgen_rect(p_id, g_rect, 0);
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y,
+                                  f64(g_rect[2]), f64(g_rect[3]),
+                                  g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3],
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
+
+fn hud_text(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    let out: i32 = font_text_shadowed(hud_font_micro(), g_bhud, g_tex_hud,
+                                      p_x, p_y, p_s,
+                                      pal_r(p_c), pal_g(p_c), pal_b(p_c), 255,
+                                      pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
+                                      pal_b(g_UI_BLACK), 255, 1.0, 1.0, p_budget);
+    return out;
+}
+
+fn hud_text_big(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    let out: i32 = font_text_shadowed(hud_font_big(), g_bhud, g_tex_hud,
+                                      p_x, p_y, p_s,
+                                      pal_r(p_c), pal_g(p_c), pal_b(p_c), 255,
+                                      pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
+                                      pal_b(g_UI_BLACK), 255, 1.0, 1.0, p_budget);
+    return out;
+}
+
+fn hud_centre(p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    let w: f64 = f64(p_s.length) * 4.0;
+    let out: i32 = hud_text(f64(g_RES_W) * 0.5 - w * 0.5, p_y, p_s, p_c, p_budget);
+    return out;
+}
+
+fn hud_centre_big(p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    let w: f64 = f64(p_s.length) * 8.0;
+    let out: i32 = hud_text_big(f64(g_RES_W) * 0.5 - w * 0.5, p_y, p_s, p_c, p_budget);
+    return out;
+}
+
+fn hud_build() {
+    let used: i32 = 0;
+    let cx: f64 = f64(g_RES_W) * 0.5;
+    let cy: f64 = f64(g_RES_H) * 0.5;
+
+    // SIX TRIANGLES OF RESERVE. The text budgets below are exact --
+    // `font_text_shadowed` truncates at its budget -- but the plates and bars
+    // around them are fixed 2-triangle quads that are emitted after their
+    // gate. Reserving six for them is what turns "254 of 250" into a cap that
+    // holds. MEASURED: without it, the lantern-lit frame landed on 254.
+    let cap: i32 = g_HUD_TRI_CAP - 6;
+    if (g_hud_on == 2) { cap = 512; }
+    // The remaining budget, clamped to what this element would like. Passing it
+    // as the TEXT budget is what makes the cap structural: `font_text_shadowed`
+    // TRUNCATES at its budget instead of overspending, so a line can only ever
+    // draw the glyphs there is room for. Gating on an ESTIMATE (the first
+    // version of this) measured 266 at the lantern-lit moment, because a
+    // 26-glyph unlock card costs 104 and the estimate said 80.
+
+    // ---- the fade from black. GDD §8 at 0:00. ---------------------------
+    let fade: f64 = client_intro_alpha(g_cl);
+    if (fade > 0.002) {
+        used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
+                               g_UI_BLACK, clampi(i32(fade * 255.0), 0, 255));
+        if (fade > 0.35) {
+            used = used + hud_centre(112.0, "THE LAMPS WENT OUT ON A TUESDAY",
+                                     g_UI_DIM, clampi(cap - used, 0, 128));
+        }
+    }
+
+    if (g_hud_on == 0) {
+        g_hud_tris = used;
+        return;
+    }
+
+    // ---- the crosshair, with real spread bloom --------------------------
+    // The gap grows with hipfire bloom, exactly as ART_BIBLE §9.3 asks. ADS
+    // pulls it in; a dry magazine turns it red (GDD §7.12).
+    let spread: f64 = 3.0 + 4.0 * (1.0 - client_ads(g_cl));
+    if (client_speed(g_cl) > 5.6) { spread = spread + 3.0; }
+    let xc: i32 = g_UI_WHITE;
+    if (client_ammo(g_cl) <= 0) { xc = g_UI_DANGER; }
+    used = used + hud_sprite(HUD_XH_TICK_H, cx - 6.0 - spread, cy - 1.0, xc, 255);
+    used = used + hud_sprite(HUD_XH_TICK_H, cx + 2.0 + spread, cy - 1.0, xc, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, cx - 1.0, cy - 6.0 - spread, xc, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, cx - 1.0, cy + 2.0 + spread, xc, 255);
+    used = used + hud_sprite(HUD_XH_DOT, cx - 1.0, cy - 1.0, xc, 255);
+
+    // ---- the hitmarker (GDD §7.4) ----------------------------------------
+    let hm: f64 = client_hitmarker(g_cl);
+    if (hm > 0.0) {
+        let hc: i32 = g_UI_WHITE;
+        if (client_hitmarker_kill(g_cl) == 1) { hc = g_UI_AMBER; }
+        used = used + hud_sprite(HUD_HITMARK, cx - 8.0, cy - 8.0, hc,
+                                 clampi(i32(hm / 0.09 * 255.0), 0, 255));
+    }
+
+    // ---- the compass -----------------------------------------------------
+    used = used + hud_rect(cx - 46.0, 3.0, 92.0, 9.0, g_UI_BLACK, 160);
+    let yawn: f64 = g_yaw_deg;
+    while (yawn < 0.0) { yawn = yawn + 360.0; }
+    while (yawn >= 360.0) { yawn = yawn - 360.0; }
+    for (let t = 0; t < 8; t++) {
+        let ang: f64 = f64(t) * 45.0 - yawn;
+        while (ang < -180.0) { ang = ang + 360.0; }
+        while (ang > 180.0) { ang = ang - 360.0; }
+        if (ang > -44.0 && ang < 44.0) {
+            let id: i32 = HUD_TICK_MINOR;
+            let c: i32 = g_UI_DIM;
+            if (t % 2 == 0) { id = HUD_TICK_MAJOR; c = g_UI_WHITE; }
+            used = used + hud_sprite(id, cx + ang, 4.0, c, 255);
+        }
+    }
+    used = used + hud_sprite(HUD_CHEVRON, cx - 2.0, 1.0, g_UI_AMBER, 255);
+
+    // ---- the objective marker: the lantern -------------------------------
+    // GDD §8 at 0:06: "You will walk toward it. Everyone does." The marker is
+    // what makes that true when the fog has closed and you cannot see it.
+    if (client_lantern_lit(g_cl) == 0 && client_has_control(g_cl) == 1) {
+        let br: f64 = client_lantern_bearing(g_cl);
+        let px: f64 = cx + clampf(br * 92.0, -44.0, 44.0);
+        used = used + hud_sprite(HUD_ICON_DIAMOND, px - 3.0, 14.0, g_UI_AMBER, 230);
+    }
+
+    // ---- health ----------------------------------------------------------
+    let hp01: f64 = client_hp01(g_cl);
+    used = used + hud_rect(9.0, 219.0, 62.0, 6.0, g_UI_BLACK, 190);
+    let hc2: i32 = g_UI_GOOD;
+    if (f64(client_hp(g_cl)) <= g_LOW_HP) { hc2 = g_UI_DANGER; }
+    used = used + hud_rect(10.0, 220.0, 60.0 * hp01, 4.0, hc2, 255);
+    used = used + hud_text(10.0, 228.0, `${client_hp(g_cl)}`, hc2, g_TB_HP);
+
+    // ---- ammo: GDD §8 says the counter reads 6 / 12 ----------------------
+    let ammo: i32 = client_ammo(g_cl);
+    let ac: i32 = g_UI_WHITE;
+    if (ammo <= 1) { ac = g_UI_DANGER; }
+    let astr: string = `${ammo} / ${client_reserve(g_cl)}`;
+    used = used + hud_rect(238.0, 218.0, 76.0, 16.0, g_UI_BLACK, 170);
+    used = used + hud_text_big(242.0, 220.0, astr, ac, g_TB_AMMO);
+
+    // ---- the reload bar --------------------------------------------------
+    let rt: f64 = client_reloading(g_cl);
+    if (rt > 0.0) {
+        used = used + hud_rect(cx - 24.0, cy + 16.0, 48.0, 3.0, g_UI_BLACK, 200);
+        let f: f64 = clamp01(1.0 - rt / 1.6);
+        used = used + hud_rect(cx - 23.0, cy + 17.0, 46.0 * f, 1.0, g_UI_AMBER, 255);
+        used = used + hud_centre(cy + 22.0, "RELOADING", g_UI_DIM, 40);
+    }
+
+    // ---- the XP bar ------------------------------------------------------
+    let need: i32 = client_xp_need(g_cl);
+    let into: i32 = client_xp_into(g_cl);
+    let xf: f64 = 0.0;
+    if (need > 0) { xf = clamp01(f64(into) / f64(need)); }
+    used = used + hud_rect(0.0, 237.0, f64(g_RES_W), 3.0, g_UI_BLACK, 170);
+    used = used + hud_rect(0.0, 238.0, f64(g_RES_W) * xf, 1.0, g_NS_HALO, 255);
+
+    // ---- the damage vignette + direction arc (GDD §7.13) -----------------
+    let dt2: f64 = client_damage_t(g_cl);
+    if (dt2 > 0.0) {
+        let a: i32 = clampi(i32(dt2 / 1.2 * 90.0 * (1.0 - hp01 + 0.35)), 0, 130);
+        used = used + hud_rect(0.0, 0.0, f64(g_RES_W), 5.0, g_UI_DANGER, a);
+        used = used + hud_rect(0.0, 235.0, f64(g_RES_W), 5.0, g_UI_DANGER, a);
+        let br2: f64 = client_damage_dir(g_cl) - g_yaw_deg * g_D2R;
+        used = used + hud_sprite(HUD_ICON_ARROW,
+                                 cx + clampf(sin(br2) * 40.0, -44.0, 44.0),
+                                 cy - 34.0, g_UI_DANGER,
+                                 clampi(i32(dt2 / 1.2 * 255.0), 0, 255));
+    }
+
+    // ---- the interact prompt.  GAME_DESIGN §8 at 0:24. -------------------
+    if (client_prompt(g_cl) == 1) {
+        let ch: f64 = client_chan01(g_cl);
+        used = used + hud_rect(cx - 62.0, 150.0, 124.0, 22.0, g_UI_BLACK, 190);
+        used = used + hud_centre(154.0, "HOLD [E] - LIGHT THE LANTERN",
+                                 g_UI_WHITE, clampi(cap - used, 0, g_TB_PROMPT));
+        used = used + hud_centre(162.0, "IT'S GOING TO GET THEIR ATTENTION",
+                                 g_UI_DIM, clampi(cap - used, 0, g_TB_PROMPT));
+        if (ch > 0.0) {
+            used = used + hud_rect(cx - 40.0, 172.0, 80.0, 3.0, g_UI_BLACK, 210);
+            used = used + hud_rect(cx - 39.0, 173.0, 78.0 * ch, 1.0, g_UI_AMBER, 255);
+        }
+    }
+
+    // ---- FROM HERE DOWN EVERY BLOCK IS OPTIONAL AND BUDGETED. -----------
+    // ART_BIBLE §9's 250-triangle cap is a HARD cap, and FONT_MICRO costs FOUR
+    // triangles a glyph once the mandatory 1-px shadow is counted: a 26-glyph
+    // unlock card is 104 triangles all by itself. Stacking the lantern flash,
+    // the LEVEL card, the unlock card and a wave banner in the same frame
+    // measured 264. The fix is not a bigger cap and it is not shorter strings
+    // -- it is a gate, so that the elements that must never disappear
+    // (crosshair, health, ammo, prompt) are emitted FIRST and the celebratory
+    // ones yield when there is no room. `left` is re-read before each block.
+
+    // ---- the lantern-lit flash and the level card ------------------------
+    let ring: f64 = client_lit_ring_t(g_cl);
+    if (ring > 0.0 && used + 2 <= cap) {
+        used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H), g_EMBER,
+                               clampi(i32(ring / 1.2 * 70.0), 0, 90));
+    }
+    let lvt: f64 = client_level_t(g_cl);
+    if (lvt > 0.0 && used + 60 <= cap) {
+        used = used + hud_centre_big(96.0, `LEVEL ${client_level(g_cl)}`,
+                                     g_UI_AMBER, clampi(cap - used, 0, 60));
+    }
+    let ct: f64 = client_card_t(g_cl);
+    if (ct > 0.0 && used + 80 <= cap) {
+        let slide: f64 = clampf((1.0 - ct / 2.5) * 6.0, 0.0, 1.0);
+        let x0: f64 = 320.0 - 128.0 * slide;
+        used = used + hud_rect(x0, 60.0, 126.0, 20.0, g_UI_BLACK, 200);
+        used = used + hud_text(x0 + 4.0, 63.0, "UNLOCKED", g_UI_AMBER,
+                               clampi(cap - used, 0, 36));
+        used = used + hud_text(x0 + 4.0, 71.0, client_card(g_cl), g_UI_WHITE,
+                               clampi(cap - used, 0, g_TB_CARD));
+    }
+
+    // ---- banners: waves, the horn, the clear -----------------------------
+    let bt: f64 = client_banner_t(g_cl);
+    if (bt > 0.0 && used + 96 <= cap) {
+        used = used + hud_centre_big(40.0, client_banner(g_cl), g_UI_AMBER,
+                                     clampi(cap - used, 0, g_TB_BANNER));
+    }
+    let tt: f64 = client_toast_t(g_cl);
+    if (tt > 0.0 && used + 60 <= cap) {
+        used = used + hud_centre(56.0, client_toast(g_cl), g_UI_DIM,
+                                 clampi(cap - used, 0, 60));
+    }
+
+    // ---- death -----------------------------------------------------------
+    if (client_dead(g_cl) == 1 && used + 62 <= cap) {
+        used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H), g_UI_DANGER, 60);
+        used = used + hud_centre_big(110.0, "THE DARK TOOK YOU", g_UI_WHITE,
+                                     clampi(cap - used, 0, 60));
+    }
+
+    // ---- the wave readout ------------------------------------------------
+    let ws: i32 = client_wave_state(g_cl);
+    if (ws != DIR_IDLE && used + 44 <= cap) {
+        used = used + hud_text(4.0, 16.0,
+                               `WAVE ${client_wave(g_cl) + 1}  x${client_alive(g_cl)}`,
+                               g_UI_DIM, clampi(cap - used, 0, 44));
+    }
+
+    // ---- the debug readout (H). Over the cap, and it says so. ------------
+    if (g_hud_on == 2) {
+        used = used + hud_rect(2.0, 24.0, 132.0, 34.0, g_UI_BLACK, 185);
+        used = used + hud_text(4.0, 26.0, g_l_tri, g_UI_GOOD, g_TB_DBG);
+        used = used + hud_text(4.0, 34.0, g_l_ms, g_UI_WHITE, g_TB_DBG);
+        used = used + hud_text(4.0, 42.0, g_l_net, g_UI_DIM, g_TB_DBG);
+        used = used + hud_text(4.0, 50.0, g_l_beat, g_UI_AMBER, g_TB_DBG);
+    }
+
+    g_hud_tris = used;
+    if (g_hud_on != 2 && used > g_HUD_TRI_CAP) {
+        if (g_hud_over == 0) {
+            eprint(`nightshade: HUD emitted ${used} triangles, over the ${g_HUD_TRI_CAP} cap`);
+            g_hud_over = 1;
+        }
+    }
+}
+
+let g_l_tri: string = "";
+let g_l_ms: string = "";
+let g_l_net: string = "";
+let g_l_beat: string = "";
+let g_frame_ms: f64 = 0.0;
+let g_wall_ms: f64 = 0.0;
+let g_fps: f64 = 60.0;
+
+fn f1(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let s: i32 = i32(x * 10.0 + 0.5);
+    let w: i32 = divi(s, 10);
+    let f: i32 = s - w * 10;
+    let out: string = `${w}.${f}`;
+    if (neg == 1) { out = "-" + out; }
+    return out;
+}
+
+fn hud_strings() {
+    g_l_tri = `TRI ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)} DC${stat_get(STAT_DRAW_CALLS)} HUD${g_hud_tris}`;
+    g_l_ms = `${f1(g_frame_ms)}MS ${i32(g_fps)}FPS SIM${f1(g_sim_ms)}`;
+    g_l_net = `T${g_tick} CMD${client_cmds_sent(g_cl)} PKT${client_packets(g_cl)} ${server_snap_bytes(g_sv)}B L${i32(transport_latency_ms(g_net))}`;
+    g_l_beat = `${server_beat_name(server_beat(g_sv))} S${server_session(g_sv)} TIER${client_tier(g_cl)} ${f1(tod_clock_hours(g_day_t))}H`;
+}
+
+// ===========================================================================
+//  10.  THE FRAME
+// ===========================================================================
+
+let g_sim_ms: f64 = 0.0;
+let g_ms_world: f64 = 0.0;
+let g_ms_bake: f64 = 0.0;
+
+fn frame_once(p_dt: f64, p_t: f64) {
+    frame_begin();
+
+    // -- 6  tod_eval -> the frame graph's RenderEnv ------------------------
+    stat_begin(STAT_T_TOD);
+    tod_step();
+    emit_set_env(frame_env());
+    stat_end(STAT_T_TOD);
+
+    // -- the caller's world registry ---------------------------------------
+    let w0: u64 = clock_now();
+    world_rebuild(p_dt, p_t);
+    let w1: u64 = clock_now();
+    bake_step();
+    let w2: u64 = clock_now();
+    g_ms_world = clock_ms_between(w0, w1);
+    g_ms_bake = clock_ms_between(w1, w2);
+
+    // -- 7  skygen's rolling re-bake, one slice per frame -------------------
+    stat_begin(STAT_T_SKYBAKE);
+    let rows: i32 = 0;
+    if (skygen_dirty_rows() == 0 && g_sky_want == 1) {
+        skygen_mark_dirty();
+        g_sky_want = 0;
+    }
+    for (let k = 0; k < g_sky_burst; k++) {
+        if (skygen_dirty_rows() <= 0) { break; }
+        rows = rows + skygen_rebake_slice();
+    }
+    g_sky_burst = 1;
+    stat_end(STAT_T_SKYBAKE);
+    stat_set(STAT_SKY_ROWS, rows);
+    g_sky_want = 1;
+
+    // -- 8..23  the frame graph. THE ONLY ONE. -----------------------------
+    frame_set_camera(g_camx, g_camy, g_camz, g_yaw_deg, g_pitch_deg, g_fov);
+    frame_set_clear(g_skyk[SKYK_ZEN], g_skyk[SKYK_ZEN + 1], g_skyk[SKYK_ZEN + 2]);
+    let bolt: i32 = 0;
+    if (tod_lightning_active() != 0) { bolt = 1; }
+    let vmb: i32 = 0;
+    if (g_vm_mode == 1) { vmb = 1; }
+    frame_set_options(0, vmb, bolt);
+
+    // Screen shake is a PRESENT-time translation, never in the MVP: frustum
+    // culling has to stay stable while the screen shakes (view.hml's rule).
+    target_set_shake(g_target, client_shake_x(g_cl), client_shake_y(g_cl));
+
+    frame_render();
+
+    // -- 24  the caller's half: the viewmodel, then the HUD ----------------
+    stat_begin(STAT_T_HUD);
+    viewmodel_emit();
+    hud_build();
+    stat_end(STAT_T_HUD);
+
+    // -- 25..28 ------------------------------------------------------------
+    frame_present();
+    g_frames++;
+}
+
+// ---------------------------------------------------------------------------
+// THE VIEWMODEL, AND THE ONE PLACE THIS FILE DEVIATES FROM §4's STAGE ORDER.
+// ---------------------------------------------------------------------------
+// §4 puts the viewmodel at stage 15, inside LAYER_WORLD, and `world_render.hml`
+// does exactly that for its own static lantern. `src/render/viewmodel.hml`
+// (W4-10) is the DRIVEN one — idle sway, footstep bob, fire kick, reload
+// stages — and it cannot be emitted at stage 15 from out here: LAYER_WORLD is
+// reset at stage 11 and flushed at stage 21, both inside `frame_render()`, and
+// there is no hook between them. `frame_render` would have to take a callback.
+//
+// So the driven viewmodel is emitted into LAYER_HUD at stage 24, under its own
+// projection, before the HUD. The consequences, measured rather than assumed:
+//   * ORDER. LAYER_HUD is flushed in insertion order and the viewmodel goes in
+//     first, so it sits under every HUD element and over the world. A held
+//     object is nearer than everything in the world, so painting it after the
+//     world flush is not a compromise — it is the same result the depth sort
+//     produces, arrived at for free.
+//   * THE VIGNETTE. Stage 23 puts the vignette ring into LAYER_HUD before the
+//     caller, so the ring now sits UNDER the viewmodel instead of over it. The
+//     ring is a 42-px edge inset and the viewmodel occupies the lower middle;
+//     the overlap is the bottom corners.
+//   * SELF-OCCLUSION. LAYER_HUD is not depth-sorted, so the mesh relies on
+//     backface culling alone. `--vm 1` selects the frame graph's stage-15
+//     static viewmodel instead, which IS depth-sorted, and `--vm 0` turns it
+//     off; the switch exists so the choice can be re-checked, not so it can be
+//     forgotten.
+// `frame_render()` for the world path is untouched either way.
+let g_vm_proj: array<f64> = [];
+let g_vm_tris: i32 = 0;
+
+fn viewmodel_emit() {
+    g_vm_tris = 0;
+    if (g_vm_mode != 2) { return; }
+    let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
+    let far: f64 = g_fog_far * 1.06;
+    g_vm_proj = mat_perspective(g_fov * g_D2R, aspect, g_NEAR, far);
+    g_vm_tris = vm_emit(g_vm, g_bhud, g_tex_world, g_vm_proj, frame_mvp());
+}
+
+// ===========================================================================
+//  11.  BOOT AND SHUTDOWN
+// ===========================================================================
+
+fn boot_window(): i32 {
+    g_win = window_open_ex("NIGHTSHADE", g_RES_W, g_RES_H, g_upscale, 0);
+    if (g_win == null) {
+        eprint(`nightshade: window_open failed: ${sdl_error()}`);
+        let bad: i32 = -1;
+        return bad;
+    }
+    // 0 == the renderer accepted vsync; -1 == unavailable (software renderer,
+    // or the dummy driver). The RETURN MATTERS: see the pace comment in
+    // `run_loop`. Presenting under vsync already blocks for the flip, and
+    // spinning to a 16.67 ms deadline ON TOP of that pushes the frame past the
+    // next vblank and costs a whole interval.
+    g_vsync = 0;
+    if (set_vsync(g_win, 1) == 0) { g_vsync = 1; }
+    g_target = target_new(g_win, g_RES_W, g_RES_H, g_upscale);
+    if (g_target == null) {
+        eprint("nightshade: target_new failed");
+        let bad2: i32 = -1;
+        return bad2;
+    }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+    if (frame_init(g_win, g_target, g_fb) != 0) {
+        eprint("nightshade: frame_init failed");
+        let bad3: i32 = -1;
+        return bad3;
+    }
+    g_bhud = frame_batch_hud();
+    let ok: i32 = 0;
+    return ok;
+}
+
+// The title card of ARCHITECTURE §6: seven stages, a frame between each, so the
+// boot is seven visible steps instead of one frozen window.
+fn boot_assets() {
+    assets_set_seed(g_seed);
+    let s: i32 = 0;
+    while (s < AS_STAGE_COUNT) {
+        assets_build_stage(g_win, s);
+        s++;
+    }
+    if (assets_error() != 0) {
+        eprint(`nightshade: asset boot failed with ${assets_error()}`);
+    }
+    g_atlas_world = assets_atlas(ASSET_WORLD);
+    g_atlas_fx = assets_atlas(ASSET_FX);
+    g_tex_world = assets_tex(ASSET_WORLD);
+    g_tex_fx = assets_tex(ASSET_FX);
+    g_tex_hud = assets_tex(ASSET_HUD);
+    g_tex_sky = assets_tex(ASSET_SKY);
+
+    hudgen_uv(HUD_SOLID, g_uvw, 0);
+    skygen_set_clock(0.0);
+    g_skyk = skygen_keys_new();
+    g_todsky = [];
+    for (let i = 0; i < TODSKY_COUNT; i++) { g_todsky.push(0.0); }
+
+    frame_bind_textures(g_tex_world, g_tex_fx, g_tex_hud, g_tex_sky);
+    frame_bind_fx_atlas(g_atlas_fx);
+    frame_bind_assets(meshgen_mesh(MESH_BLOB), meshgen_mesh(MESH_LANTERN_VM),
+                      FX_GLOW_L);
+    frame_set_hud_solid_uv(g_uvw[0], g_uvw[1], g_uvw[2], g_uvw[3]);
+    frame_set_vignette_colour(pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+    frame_set_flash_colour(pal_r(g_LIGHTNING), pal_g(g_LIGHTNING), pal_b(g_LIGHTNING));
+}
+
+fn boot_game() {
+    terrain_set(g_seed, 1.0);
+
+    g_net = transport_loopback();
+    g_sv = server_new(g_seed, g_net);
+    g_cs = server_chunks(g_sv);
+    g_cl = client_new(g_net, g_seed);
+    g_acc = sim_accum_new();
+    client_set_sens(g_cl, g_mouse_sens);
+    client_bind_fx_cells(g_cl, FX_EMBER, FX_XP_MOTE, FX_GLOW_S, FX_GLOW_L,
+                         FX_SPARK_0, FX_RAIN, FX_TRACER);
+
+    // ---- THE HELD OBJECT IS THE LANTERN, NOT THE KESTREL. --------------
+    // GAME_DESIGN §8 says "a Kestrel is in your hands", and the shipped art
+    // says otherwise, on purpose and in writing: `meshgen.hml`'s
+    // "THE LANTERN VIEWMODEL - the one the player actually holds" records that
+    // four rounds of art work could not make a gun legible at 320x240 ("it read
+    // first as a black lump and then as a chrome lump"), that slot 28's
+    // `MESH_SPARROW_VM` is now an ALIAS of `MESH_LANTERN_VM`, and that a held
+    // lantern is the diegetic light source CLAUDE.md §8's "something above
+    // luminance 220 in every frame" was actually asking for. W4-10's cap box
+    // and its 1215-pose probe were derived against that mesh's three drawn
+    // normals; binding a gun instead pastes a differently-canted model into a
+    // pose validated for another and puts a hole in it at the first kick.
+    //
+    // Verified by screenshot at 320x240: `--vm 2` with MESH_KESTREL_VM is an
+    // unreadable grey lump in the lower right; with MESH_LANTERN_VM it is a
+    // lantern. The GDD line is the older document and this is reported, not
+    // silently reversed -- the weapon is still a Kestrel in every place that
+    // matters (the ammo counter reads 6 / 12, the report is `SFX_KESTREL`, the
+    // damage table is `WPN_KESTREL`); only the held prop differs.
+    g_vm = vm_new();
+    vm_bind_mesh(g_vm, meshgen_mesh(MESH_LANTERN_VM));
+    vm_set_eye_height(g_vm, g_EYE_STAND);
+
+    g_tick = server_t0(g_sv);
+    g_camx = server_spawn_x(g_sv);
+    g_camz = server_spawn_z(g_sv);
+    g_camy = ground_h(g_camx, g_camz) + g_EYE_STAND;
+    g_ground_y = ground_h(g_camx, g_camz);
+    g_yaw_deg = server_spawn_yaw(g_sv) / g_D2R;
+    // GAME_DESIGN §8 at 0:06: the lantern is the thing you are looking at when
+    // you stand up. It is not found; it is handed to you.
+    client_set_angles(g_cl, server_spawn_yaw(g_sv), -0.04);
+
+    // The world starts one tick in so the client has a snapshot to interpolate
+    // from before the first frame is drawn: interpolating from nothing is a
+    // frame of the player at the origin, and that frame is the first thing
+    // anybody sees.
+    server_tick(g_sv, g_tick);
+    client_apply(g_cl, server_snapshot(g_sv), server_local(g_sv), g_tick);
+    client_build_render(g_cl, 0.0);
+    g_tick = g_tick + 1;
+    g_day_t = client_day_t(g_cl);
+}
+
+fn shutdown() {
+    if (g_in != null) { input_set_relative(g_in, 0); }
+    if (g_audio_on == 1) { audio_shutdown(); }
+    if (g_target != null) { target_free(g_target); g_target = null; }
+    if (g_win != null) { window_close(g_win); g_win = null; }
+}
+
+fn controls_print() {
+    print("");
+    print("  ===================== NIGHTSHADE =====================");
+    print(`  ${g_VERSION}`);
+    print("");
+    print("   MOVE      W A S D           SPRINT    hold SHIFT");
+    print("   LOOK      mouse             JUMP      SPACE");
+    print("   FIRE      left mouse / F    ADS       right mouse / Q");
+    print("   RELOAD    R                 CROUCH    CTRL");
+    print("   USE       hold E            MELEE     V");
+    print("");
+    print("   HUD       H                 GUN       G");
+    print("   SHOT      P                 QUIT      ESC");
+    print("");
+    print("   THE FIRST SIXTY SECONDS");
+    print("     You wake on your back at dusk. Forty metres downhill there is");
+    print("     an unlit lantern on a post -- the brightest thing you can see.");
+    print("     Walk to it. Three Wisps will drift up on the way; they die to");
+    print("     one shot each. Hold E at the post for two and a half seconds.");
+    print("     Then the horn sounds, and they come up the hill.");
+    print("  ======================================================");
+    print("");
+}
+
+// ===========================================================================
+//  12.  THE LOOP  (ARCHITECTURE §3, verbatim in shape)
+// ===========================================================================
+
+fn read_input(p_dt: f64) {
+    let inp = g_in;
+    if (input_quit(inp)) { g_running = 0; }
+    if (input_pressed(inp, SC_ESCAPE)) { g_running = 0; }
+
+    if (g_relative_ok == 1) {
+        client_look(g_cl, f64(input_mouse_dx(inp)), f64(input_mouse_dy(inp)));
+    } else {
+        // No relative mouse (headless, or a compositor that refused): the
+        // arrow-free keyboard fallback, so the game is still playable and the
+        // demo driver has a path in.
+        let ky: f64 = 0.0;
+        let kp: f64 = 0.0;
+        if (input_down(inp, SC_L)) { ky = ky + 1.4; }
+        if (input_down(inp, SC_M)) { ky = ky - 1.4; }
+        if (ky != 0.0 || kp != 0.0) { client_look_axis(g_cl, ky * p_dt, kp * p_dt); }
+    }
+
+    let fwd: f64 = 0.0;
+    let str: f64 = 0.0;
+    if (input_down(inp, SC_W)) { fwd = fwd + 1.0; }
+    if (input_down(inp, SC_S)) { fwd = fwd - 1.0; }
+    if (input_down(inp, SC_D)) { str = str + 1.0; }
+    if (input_down(inp, SC_A)) { str = str - 1.0; }
+    client_set_move(g_cl, fwd, str);
+
+    client_set_button(g_cl, BTN_SPRINT, b01(input_down(inp, SC_LSHIFT)));
+    client_set_button(g_cl, BTN_CROUCH, b01(input_down(inp, SC_LCTRL)));
+    client_set_button(g_cl, BTN_JUMP, b01(input_down(inp, SC_SPACE)));
+    client_set_button(g_cl, BTN_USE, b01(input_down(inp, SC_E)));
+    client_set_button(g_cl, BTN_MELEE, b01(input_down(inp, SC_V)));
+
+    let ads: i32 = 0;
+    if (input_down(inp, SC_Q)) { ads = 1; }
+    if (input_button(inp, INPUT_MB_RIGHT)) { ads = 1; }
+    client_set_button(g_cl, BTN_ADS, ads);
+
+    let fire: i32 = 0;
+    if (input_down(inp, SC_F)) { fire = 1; }
+    if (input_button(inp, INPUT_MB_LEFT)) { fire = 1; }
+    client_set_button(g_cl, BTN_FIRE, fire);
+    // THE FRAME-0 SHOT. `client_press_fire` gates itself on the client's own
+    // rate-of-fire timer, so holding the trigger produces exactly one call per
+    // shot regardless of frame rate.
+    if (fire == 1) {
+        if (client_press_fire(g_cl) == 1) { vm_fire(g_vm, 1.0); }
+    }
+
+    let rel: i32 = b01(input_pressed(inp, SC_R));
+    client_set_button(g_cl, BTN_RELOAD, rel);
+    if (rel == 1) {
+        if (client_press_reload(g_cl) == 1) { vm_drop_mag(g_vm); }
+    }
+
+    if (input_pressed(inp, SC_H)) {
+        g_hud_on = g_hud_on + 1;
+        if (g_hud_on > 2) { g_hud_on = 0; }
+    }
+    if (input_pressed(inp, SC_G)) {
+        g_vm_mode = g_vm_mode + 1;
+        if (g_vm_mode > 2) { g_vm_mode = 0; }
+    }
+    if (input_pressed(inp, SC_P)) { screenshot("key"); }
+}
+
+fn b01(p_b: bool): i32 {
+    let out: i32 = 0;
+    if (p_b) { out = 1; }
+    return out;
+}
+
+let g_running: i32 = 1;
+let g_demo_s: f64 = 0.0;
+let g_next_shot: f64 = 1.0e30;
+let g_shot_every: f64 = 5.0;
+
+// The headless/demo driver: walks to the lantern, lights it, and shoots at
+// whatever is in front. It exists so the first 60 seconds can be RUN in CI, on
+// the dummy driver, with no hands — which is the only way a 60-second scripted
+// sequence ever gets tested more than once.
+fn demo_drive(p_t: f64, p_dt: f64) {
+    let bx: f64 = server_lantern_x(g_sv) - client_px(g_cl);
+    let bz: f64 = server_lantern_z(g_sv) - client_pz(g_cl);
+    let d: f64 = sqrt(bx * bx + bz * bz);
+    let want: f64 = atan2(bx, 0.0 - bz);
+    let cur: f64 = client_cam_yaw(g_cl);
+    let dy: f64 = want - cur;
+    while (dy > 3.141592653589793) { dy = dy - 6.283185307179586; }
+    while (dy < -3.141592653589793) { dy = dy + 6.283185307179586; }
+    client_look_axis(g_cl, clampf(dy * 4.0, -3.0, 3.0) * p_dt, 0.0);
+
+    if (d > 2.0 && client_lantern_lit(g_cl) == 0) {
+        client_set_move(g_cl, 1.0, 0.0);
+        client_set_button(g_cl, BTN_USE, 0);
+    } else if (client_lantern_lit(g_cl) == 0) {
+        client_set_move(g_cl, 0.0, 0.0);
+        client_set_button(g_cl, BTN_USE, 1);
+    } else {
+        // The lantern is lit: hold the ground next to it, keep the light at
+        // your back, and shoot whatever is nearest. Face the closest hostile,
+        // not the post.
+        client_set_button(g_cl, BTN_USE, 0);
+        let tx: f64 = 0.0;
+        let tz: f64 = 0.0;
+        let best: f64 = 1.0e30;
+        let n: i32 = client_ent_count(g_cl);
+        for (let i = 0; i < n; i++) {
+            let md: i32 = client_ent_model(g_cl, i);
+            if (md == SV_MODEL_LANTERN || md == SV_MODEL_PICKUP) { continue; }
+            if (client_ent_id(g_cl, i) == SV_PSLOT) { continue; }
+            let ex: f64 = client_ent_x(g_cl, i) - client_px(g_cl);
+            let ez: f64 = client_ent_z(g_cl, i) - client_pz(g_cl);
+            let dd: f64 = ex * ex + ez * ez;
+            if (dd < best) { best = dd; tx = ex; tz = ez; }
+        }
+        if (best < 1.0e29) {
+            let wa: f64 = atan2(tx, 0.0 - tz);
+            let dd2: f64 = wa - client_cam_yaw(g_cl);
+            while (dd2 > 3.141592653589793) { dd2 = dd2 - 6.283185307179586; }
+            while (dd2 < -3.141592653589793) { dd2 = dd2 + 6.283185307179586; }
+            client_look_axis(g_cl, clampf(dd2 * 6.0, -6.0, 6.0) * p_dt, 0.0);
+            // Back away if it is on top of you; hold otherwise.
+            let close: f64 = sqrt(best);
+            if (close < 5.0) { client_set_move(g_cl, -1.0, 0.4); }
+            else { client_set_move(g_cl, 0.0, 0.0); }
+            if (close < 26.0) {
+                client_set_button(g_cl, BTN_FIRE, 1);
+                if (client_press_fire(g_cl) == 1) { vm_fire(g_vm, 1.0); }
+            }
+        } else {
+            client_set_move(g_cl, 0.0, 0.0);
+            client_set_button(g_cl, BTN_FIRE, 0);
+        }
+        if (client_ammo(g_cl) <= 0) {
+            if (client_press_reload(g_cl) == 1) { vm_drop_mag(g_vm); }
+        }
+    }
+}
+
+fn framebuffer_to_rgb(): buffer {
+    let w: i32 = g_RES_W;
+    let h: i32 = g_RES_H;
+    let out: buffer = buffer(w * h * 3);
+    let op: ptr = buffer_ptr(out);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let si: i32 = (y * w + x) * 4;
+            let di: i32 = (y * w + x) * 3;
+            ptr_write_u8(ptr_offset(op, di, 1), ptr_deref_u8(ptr_offset(g_fb, si + 2, 1)));
+            ptr_write_u8(ptr_offset(op, di + 1, 1), ptr_deref_u8(ptr_offset(g_fb, si + 1, 1)));
+            ptr_write_u8(ptr_offset(op, di + 2, 1), ptr_deref_u8(ptr_offset(g_fb, si, 1)));
+        }
+    }
+    let r: buffer = out;
+    return r;
+}
+
+fn screenshot(p_tag: string) {
+    if (g_shot_dir.length == 0) { return; }
+    let img: buffer = framebuffer_to_rgb();
+    let path: string = `${g_shot_dir}/ns_${g_shot_seq}_${p_tag}.png`;
+    write_png(path, img, g_RES_W, g_RES_H);
+    print(`nightshade: wrote ${path}  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  hud ${g_hud_tris}  vm ${g_vm_tris}  dc ${stat_get(STAT_DRAW_CALLS)}  beat ${server_beat_name(server_beat(g_sv))}  pos ${i32(client_px(g_cl))},${i32(client_pz(g_cl))}  d ${i32(client_lantern_dist(g_cl))}  hp ${client_hp(g_cl)} ammo ${client_ammo(g_cl)}/${client_reserve(g_cl)} rl ${f1(client_reloading(g_cl))} alive ${client_alive(g_cl)} ctl ${client_has_control(g_cl)} fog ${i32(g_fog_far)} h ${f1(tod_clock_hours(g_day_t))} camy ${f1(g_camy)} gy ${f1(g_ground_y)} p ${i32(g_pitch_deg)}`);
+    g_shot_seq++;
+}
+
+fn run_loop() {
+    controls_print();
+
+    // Prime the sky and the ring OUTSIDE the loop. The first rebuild meshes the
+    // whole ring in one pass — walk.hml measured 129 ms — and a 129 ms frame
+    // one frame in poisons every average that follows it.
+    tod_step();
+    sky_now();
+    world_rebuild(0.016, 0.0);
+    bake_step();
+
+    let t: f64 = 0.0;
+    let loop_t0: u64 = clock_now();
+    let prev: u64 = clock_now();
+    let ms_n: i32 = 0;
+    let ms_acc: f64 = 0.0;
+    let ms_worst: f64 = 0.0;
+    let wall_acc: f64 = 0.0;
+    let over: i32 = 0;
+    let tri_peak: i32 = 0;
+    let hud_peak: i32 = 0;
+    let vm_peak: i32 = 0;
+    let sim_worst: f64 = 0.0;
+    let body_acc: f64 = 0.0;
+    let sim_acc2: f64 = 0.0;
+    let pre_acc: f64 = 0.0;
+
+    // RULE T (CLAUDE.md §1.2): __clock() CPU time, batched in sevens, minimum
+    // batch reported. Wall time is reported too, because 60 fps is a wall-clock
+    // promise and the reader needs both to tell a slow renderer from a busy box.
+    let cpu_batch: f64 = 0.0;
+    let cpu_bn: i32 = 0;
+    let cpu_min: f64 = 1.0e30;
+    let cpu_acc: f64 = 0.0;
+
+    let hud_at: f64 = -1.0;
+
+    while (g_running == 1) {
+        let top: u64 = clock_now();
+        let frame_ms: f64 = clock_ms_between(prev, top);
+        prev = top;
+        let dt: f64 = frame_ms * 0.001;
+        if (dt > 0.25) { dt = 0.25; }
+        if (dt <= 0.0) { dt = 0.0001; }
+        t = t + dt;
+
+        // -- 1  input_sample: EVERY frame, before the tick loop -------------
+        input_sample(g_in, g_win);
+        if (g_demo_s > 0.0) {
+            demo_drive(t, dt);
+            if (input_quit(g_in)) { g_running = 0; }
+            if (t >= g_demo_s) { g_running = 0; }
+        } else {
+            read_input(dt);
+        }
+
+        // -- 2..3  the fixed-timestep tick loop: 0, 1 or N times ------------
+        let sim0: f64 = __clock();
+        let n: i32 = sim_accum_advance(g_acc, frame_ms);
+        let i: i32 = 0;
+        while (i < n) {
+            client_send_command(g_cl, g_tick);
+            server_tick(g_sv, g_tick);
+            client_apply(g_cl, server_snapshot(g_sv), server_local(g_sv), g_tick);
+            g_tick++;
+            i++;
+        }
+        let sim_ms: f64 = (__clock() - sim0) * 1000.0;
+        sim_acc2 = sim_acc2 + sim_ms;
+        g_sim_ms = sim_ms;
+        if (sim_ms > sim_worst) { sim_worst = sim_ms; }
+
+        pre_acc = pre_acc + clock_ms_between(top, clock_now());
+        // -- 4  the interpolated render snapshot ---------------------------
+        let alpha: f64 = sim_accum_alpha(g_acc);
+        client_frame(g_cl, dt, g_tick);
+        client_build_render(g_cl, alpha);
+
+        // The camera the picture uses: position from the AUTHORITATIVE
+        // interpolated snapshot, angles from the LOCAL view.
+        g_camx = client_cam_x(g_cl);
+        g_camy = client_cam_y(g_cl);
+        g_camz = client_cam_z(g_cl);
+        g_yaw_deg = client_cam_yaw(g_cl) / g_D2R;
+        g_pitch_deg = client_cam_pitch(g_cl) / g_D2R;
+        g_fov = client_cam_fov(g_cl);
+        g_day_t = client_day_t(g_cl);
+        g_ground_y = client_py(g_cl);
+
+        // The viewmodel is driven by REAL weapon state, read only.
+        vm_set_motion(g_vm, client_speed(g_cl), client_grounded(g_cl),
+                      b01(client_speed(g_cl) > 5.6), client_step_dist(g_cl));
+        vm_step(g_vm, dt);
+        if (vm_take_clack(g_vm) == 1) { }
+        audio_drain();
+
+        // -- 5..28  the frame ----------------------------------------------
+        let cpu0: f64 = __clock();
+        frame_once(dt, t);
+        let cpu_ms: f64 = (__clock() - cpu0) * 1000.0;
+        cpu_acc = cpu_acc + cpu_ms;
+        cpu_batch = cpu_batch + cpu_ms;
+        cpu_bn++;
+        if (cpu_bn == 7) {
+            let b: f64 = cpu_batch / 7.0;
+            if (b < cpu_min) { cpu_min = b; }
+            cpu_batch = 0.0;
+            cpu_bn = 0;
+        }
+
+        g_frame_ms = stat_ms(STAT_T_FRAME);
+        ms_acc = ms_acc + g_frame_ms;
+        ms_n++;
+        if (g_frame_ms > ms_worst) { ms_worst = g_frame_ms; }
+        if (g_frame_ms > g_FRAME_BUDGET_MS) { over++; }
+        let tri: i32 = stat_get(STAT_TRIS_DRAWN);
+        if (tri > tri_peak) { tri_peak = tri; }
+        if (g_hud_tris > hud_peak) { hud_peak = g_hud_tris; }
+        g_st_tri_peak = tri_peak;
+        g_st_hud_peak = hud_peak;
+        if (g_frame_ms > g_st_worst_ms) { g_st_worst_ms = g_frame_ms; }
+        if (g_vm_tris > vm_peak) { vm_peak = g_vm_tris; }
+
+        if (t > hud_at + 0.25) { hud_strings(); hud_at = t; }
+        if (g_shot_dir.length > 0 && t >= g_next_shot) {
+            screenshot(`t${i32(t)}`);
+            g_next_shot = g_next_shot + g_shot_every;
+        }
+
+        // The 60 fps pace. vsync does it on a real display; this keeps the
+        // dummy driver from spinning a core and keeps the pace honest when
+        // vsync is unavailable. SDL_Delay overshoots under load, so sleep to
+        // 2 ms short and spin the rest.
+        // ---- THE PACE, AND WHY THE SLEEP MARGIN IS FOUR MILLISECONDS ----
+        // vsync does this on a real display; the spin is what stops the dummy
+        // driver spinning a core at 900 fps and what keeps the pace honest when
+        // vsync is unavailable. `clock_sleep_ms` is SDL_Delay, whose
+        // granularity is 1-2 ms and which OVERSHOOTS under load in proportion
+        // to how long you ask for.
+        //
+        // MEASURED on this box (17 of 24 cores busy), 20 s demo on DISPLAY=:0:
+        //   sleep to 2 ms short : 1187 frames / 24 s -> 49.5 fps, mean 20.9 ms
+        //   sleep to 4 ms short : see the report
+        // `tools/walk.hml` uses a 2 ms margin and holds 59.9 fps because its
+        // frame is 9 ms and it therefore only ever asks for ~5 ms of sleep;
+        // this loop's frame is 7 ms, asks for ~8, and eats a proportionally
+        // bigger overshoot. The margin is the fix, not the frame.
+        // ---- THE PACE, AND WHY THE SLEEP IS IN ONE-MILLISECOND SLICES ----
+        // vsync paces this on a real display; the sleep-and-spin is what stops
+        // the dummy driver spinning a core at 900 fps and what keeps the pace
+        // honest when vsync is unavailable.
+        //
+        // `clock_sleep_ms` is SDL_Delay, and on a box sharing 17 of 24 cores it
+        // OVERSHOOTS IN PROPORTION TO THE REQUEST. MEASURED, 12 s demo on
+        // DISPLAY=:0: the frame body is bimodal (2 ms when SDL's event pump
+        // returns immediately, ~13 ms when it waits on the compositor), so one
+        // `SDL_Delay(10)` on every fast frame overshot to a 23.7 ms mean frame
+        // -- 42 fps out of a 6 ms renderer. `tools/walk.hml` never hit it
+        // because its 9 ms frame never asks for more than ~5 ms of sleep.
+        //
+        // One-millisecond slices bound the overshoot to one granule instead of
+        // the whole request, and the deadline is re-read every slice so a slice
+        // that overshoots simply ends the loop.
+        // ---- THE PACE ----------------------------------------------------
+        // WITH VSYNC THERE IS NOTHING TO DO. `SDL_RenderPresent` blocks for the
+        // flip and the next frame's event pump finishes the wait, so the loop
+        // is already on the refresh. Pacing it AGAIN is not belt-and-braces, it
+        // is a bug: the extra spin pushes the frame past the next vblank and
+        // the display hands back a whole interval. MEASURED on DISPLAY=:0, a
+        // 12 s demo with a 6.2 ms renderer:
+        //     spin to 16.67 on top of vsync : 707 frames / 15.7 s -> 45 fps
+        //     vsync alone                   : see the report
+        // The sleep-and-spin therefore runs ONLY when vsync was refused --
+        // the dummy driver in CI, or a software renderer -- where it is what
+        // stops the loop burning a core at 900 fps. `clock_sleep_ms` is
+        // SDL_Delay and overshoots in proportion to the request on a loaded
+        // box, so it is asked for one millisecond at a time.
+        let spent: f64 = clock_ms_between(top, clock_now());
+        body_acc = body_acc + spent;
+        if (g_vsync == 0) {
+            while (clock_ms_between(top, clock_now()) < g_FRAME_BUDGET_MS - 2.0) {
+                clock_sleep_ms(1);
+            }
+            while (clock_ms_between(top, clock_now()) < g_FRAME_BUDGET_MS) { }
+        }
+        g_wall_ms = clock_ms_between(top, clock_now());
+        wall_acc = wall_acc + g_wall_ms;
+        if (g_wall_ms > 0.01) { g_fps = 1000.0 / g_wall_ms; }
+    }
+
+    let loop_ms: f64 = clock_ms_between(loop_t0, clock_now());
+    if (ms_n > 0) {
+        let n2: f64 = f64(ms_n);
+        print("");
+        print(`nightshade: ${ms_n} frames in ${f1(t)} s`);
+        print(`   render, wall (STAT_T_FRAME)  mean ${f1(ms_acc / n2)} ms  worst ${f1(ms_worst)} ms`);
+        print(`   render, CPU  (RULE T, min of 7-frame batches)  ${f1(cpu_min)} ms`);
+        print(`   headroom at 60 fps: ${f1(16.667 - cpu_min)} ms/frame on the CPU-time number`);
+        // The honest frame rate: frames divided by the loop's OWN elapsed
+        // wall time. `t` above is a sum of per-frame deltas CLAMPED at 250 ms,
+        // which is the right input for the accumulator and the wrong input for
+        // a frame-rate claim -- one clamped stall silently shortens it.
+        print(`   whole frame  mean ${f1(loop_ms / n2)} ms -> ${f1(1000.0 * n2 / loop_ms)} fps  (${ms_n} frames in ${f1(loop_ms / 1000.0)} s of loop)`);
+        print(`   frames over 16.67 ms: ${over} of ${ms_n}`);
+        print(`   where the frame goes, mean: input+tick ${f1(pre_acc / n2)} ms (sim CPU ${f1(sim_acc2 / n2)})  render ${f1(ms_acc / n2)}  body ${f1(body_acc / n2)}`);
+        print(`   triangles: PEAK ${tri_peak} of ${g_TRIS_STEADY}   HUD peak ${hud_peak} of ${g_HUD_TRI_CAP}   viewmodel peak ${vm_peak}`);
+        print(`   sim+net: worst ${f1(sim_worst)} ms of the ${f1(g_BUDGET_SIM_MS)} ms budget   ticks ${g_tick - server_t0(g_sv)}`);
+        print(`   stalls ${sim_accum_stalls(g_acc)}  forgiven ${sim_accum_forgiven(g_acc)}  cmds ${client_cmds_sent(g_cl)}  packets ${client_packets(g_cl)}  decode-fail ${client_decode_fail(g_cl)}`);
+        print(`   beat reached: ${server_beat_name(server_beat(g_sv))}   lantern ${server_lantern_lit(g_sv)}   path ${server_path_lit(g_sv)}   sounds ${client_sounds_total(g_cl)}`);
+    }
+}
+
+// ===========================================================================
+//  13.  CLI
+// ===========================================================================
+
+fn is_number(p_s: string): bool {
+    let s: string = p_s;
+    if (s.length == 0) { return false; }
+    let seen: i32 = 0;
+    for (let i = 0; i < s.length; i++) {
+        let c: string = s.slice(i, i + 1);
+        if (c == "-" || c == "+") {
+            if (i != 0) { return false; }
+        } else if (c == ".") {
+        } else if (c >= "0" && c <= "9") {
+            seen = seen + 1;
+        } else {
+            return false;
+        }
+    }
+    let out: bool = seen > 0;
+    return out;
+}
+
+fn num_or(p_s: string, p_def: f64): f64 {
+    if (!is_number(p_s)) { let d: f64 = p_def; return d; }
+    let out: f64 = f64(p_s);
+    return out;
+}
+
+fn usage() {
+    print("nightshade [options]");
+    print("  --seed <n>        world seed (default 1337)");
+    print("  --scale <2|3|4>   integer upscale (default 3)");
+    print("  --sens <f>        mouse sensitivity multiplier");
+    print("  --demo <s>        run the scripted first-60-seconds, hands off");
+    print("  --shots <dir>     write a PNG every 5 s (with --demo)");
+    print("  --vm <0|1|2>      viewmodel: off / frame-graph static / driven");
+    print("  --no-audio        do not open an audio device");
+    print("  --headless        SDL_VIDEODRIVER=dummy is expected; no mouse grab");
+    print("  --selftest        headless smoke test; exits 0 on pass");
+}
+
+let g_no_audio: i32 = 0;
+let g_selftest: i32 = 0;
+
+// ---------------------------------------------------------------------------
+// THE SHELL'S SMOKE TEST.  `tools/probe_game.hml` is the acceptance harness —
+// 81 assertions over the loop, the wire, the latency modes and the sixty
+// seconds, headless and with no SDL linked. It cannot test THIS file, because
+// this file needs a window. So `--selftest` asserts the things only a booted
+// shell can know: that the assets came up, that the frame graph produced a
+// frame inside its budget, that the HUD stayed under its cap, and that the
+// picture and the simulation agree about where the ground is.
+//
+// Exit status is the contract: 0 iff every assertion passed AND the expected
+// NUMBER of assertions ran.
+let g_ST_EXPECT: i32 = 11;
+let g_st_n: i32 = 0;
+let g_st_ok: i32 = 0;
+let g_st_tri_peak: i32 = 0;
+let g_st_hud_peak: i32 = 0;
+let g_st_worst_ms: f64 = 0.0;
+
+fn stck(p_ok: bool, p_msg: string) {
+    g_st_n = g_st_n + 1;
+    if (p_ok) { g_st_ok = g_st_ok + 1; }
+    if (!p_ok) { print(`  FAIL [${g_st_n}] ${p_msg}`); }
+}
+
+fn selftest_report(): i32 {
+    print("");
+    print("nightshade --selftest");
+
+    stck(assets_texture_count() == 4,
+         `exactly FOUR SDL textures exist after boot (a fifth is a bug); got ${assets_texture_count()}`);
+    stck(assets_error() == 0, `the asset boot reported no error; got ${assets_error()}`);
+    stck(g_frames > 100, `the loop ran real frames; got ${g_frames}`);
+    stck(g_st_tri_peak > 200,
+         `the world actually drew: peak ${g_st_tri_peak} triangles`);
+    stck(g_st_tri_peak <= g_TRIS_STEADY,
+         `peak triangles ${g_st_tri_peak} <= the ${g_TRIS_STEADY} budget`);
+    stck(g_st_hud_peak <= g_HUD_TRI_CAP,
+         `peak HUD triangles ${g_st_hud_peak} <= the ${g_HUD_TRI_CAP} cap`);
+    stck(g_st_worst_ms < 33.4,
+         `no frame took two vsync intervals: worst ${f1(g_st_worst_ms)} ms`);
+
+    // The picture and the simulation must agree about the ground. This is the
+    // assertion the first build of this file would have failed: `world_render`
+    // exports a `terrain_h` of its own, and building the visible terrain from
+    // it puts the player's feet at one height and the floor at another.
+    let px: f64 = client_px(g_cl);
+    let pz: f64 = client_pz(g_cl);
+    let dh: f64 = absf(ground_h(px, pz) - client_py(g_cl));
+    stck(dh < 0.35,
+         `the visible ground is the ground the sim stands on at the player: ${f1(dh)} m apart`);
+
+    stck(client_decode_fail(g_cl) == 0,
+         `every snapshot decoded: ${client_packets(g_cl)} packets, ${client_decode_fail(g_cl)} failures`);
+    stck(client_cmds_sent(g_cl) > 100,
+         `commands reached the wire: ${client_cmds_sent(g_cl)}`);
+    stck(server_beat(g_sv) >= SV_BEAT_STAND,
+         `the opening sequence advanced past WAKE: ${server_beat_name(server_beat(g_sv))}`);
+
+    if (g_st_n != g_ST_EXPECT) {
+        print(`FAIL: ran ${g_st_n} assertions, expected ${g_ST_EXPECT}`);
+        let bad: i32 = 1;
+        return bad;
+    }
+    if (g_st_ok != g_st_n) {
+        print(`FAIL ${g_st_ok} / ${g_st_n}`);
+        let bad2: i32 = 1;
+        return bad2;
+    }
+    print(`PASS ${g_st_ok} / ${g_st_n}`);
+    let ok: i32 = 0;
+    return ok;
+}
+
+fn parse_args(): i32 {
+    let n: i32 = args.length;
+    let i: i32 = 1;
+    while (i < n) {
+        let a: string = args[i];
+        if (a == "--help" || a == "-h") { usage(); let q: i32 = 1; return q; }
+        else if (a == "--seed" && i + 1 < n) { i++; g_seed = i32(num_or(args[i], 1337.0)); }
+        else if (a == "--scale" && i + 1 < n) { i++; g_upscale = clampi(i32(num_or(args[i], 3.0)), 1, 6); }
+        else if (a == "--sens" && i + 1 < n) { i++; g_mouse_sens = num_or(args[i], 1.0); }
+        else if (a == "--demo" && i + 1 < n) { i++; g_demo_s = num_or(args[i], 20.0); }
+        else if (a == "--shots" && i + 1 < n) { i++; g_shot_dir = args[i]; make_dirs(g_shot_dir); g_next_shot = 1.0; }
+        else if (a == "--vm" && i + 1 < n) { i++; g_vm_mode = clampi(i32(num_or(args[i], 2.0)), 0, 2); }
+        else if (a == "--no-audio") { g_no_audio = 1; }
+        else if (a == "--headless") { g_headless = 1; }
+        else if (a == "--selftest") { g_headless = 1; g_no_audio = 1; g_demo_s = 3.0; g_selftest = 1; }
+        else { eprint(`nightshade: unknown argument '${a}'`); usage(); let bad: i32 = 2; return bad; }
+        i++;
+    }
+    let ok: i32 = 0;
+    return ok;
+}
+
+fn main() {
+    let rc: i32 = parse_args();
+    if (rc != 0) {
+        if (rc == 1) { exit(0); }
+        exit(rc);
+    }
+
+    if (boot_window() != 0) { exit(1); }
+    if (g_no_audio == 0) { audio_boot(); }
+    snd_map_init();
+
+    let b0: u64 = clock_now();
+    boot_assets();
+    let boot_ms: f64 = clock_ms_between(b0, clock_now());
+
+    chunks_init();
+    apron_init();
+    boot_game();
+
+    g_in = input_new();
+    if (g_headless == 0) {
+        // The engine contract is INPUT_REL_OK = 0 / INPUT_REL_FAIL = -1, so
+        // SUCCESS IS ZERO. This compared against 1, so g_relative_ok was 0 on
+        // success, read_input never called client_look, and the game printed
+        // "relative mouse unavailable" on every launch -- you could walk and
+        // shoot but only ever face the direction you spawned in. walk.hml has
+        // always done this correctly (`if (rc == 0)`), which is why the
+        // walkaround could look around and the game could not.
+        let rc: i32 = input_set_relative(g_in, 1);
+        if (rc == INPUT_REL_OK) {
+            g_relative_ok = 1;
+        } else {
+            g_relative_ok = 0;
+            eprint("nightshade: relative mouse unavailable; mouse-look is off");
+        }
+    }
+
+    print(`nightshade: boot ${f1(boot_ms)} ms, ${assets_texture_count()} textures, audio ${g_audio_on}, seed ${g_seed}`);
+    print(`nightshade: spawn (${i32(server_spawn_x(g_sv))}, ${i32(server_spawn_z(g_sv))})  tier ${server_tier_at(g_sv, server_spawn_x(g_sv), server_spawn_z(g_sv), 0)}  lantern ${i32(server_lantern_x(g_sv))}, ${i32(server_lantern_z(g_sv))}  vm ${vm_mesh_tris(g_vm)} tris`);
+
+    run_loop();
+    let rc2: i32 = 0;
+    if (g_selftest == 1) { rc2 = selftest_report(); }
+    shutdown();
+    exit(rc2);
+}
+
+main();

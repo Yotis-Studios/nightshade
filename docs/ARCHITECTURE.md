@@ -822,6 +822,158 @@ fn ns_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
 }
 ```
 
+#### 5.4c `sim.hml` and `snapshot.hml` — exact signatures (added by W4-9; `src/game/main.hml`, `client.hml`, `server.hml`, `tools/replay.hml` and `tools/benchframe.hml` code against these)
+
+**The first argument is the world, exactly as §5.4 and §5.6 say.** `sim_new` builds it through
+`world_new_cap` and attaches ONE extra field, `world.sim`, holding the eight Wave-4a module states.
+`world.hml` is untouched, and `sim_step(world, tick)`, `snapshot_write(world, …)` and
+`rsnap_build(rs, world, alpha)` all keep the same first argument. The alternative — a wrapper object
+holding the world — would have changed the first argument of three documented functions to buy
+nothing, and would have made the renderer's `world` and the sim's `world` two different things.
+
+```hemlock
+// ---- construction.  EVERYTHING allocates here; sim_step allocates nothing.
+sim_new(seed: i32): object                       // g_MAX_ENTS, SIM_PLAYERS_DEFAULT (4)
+sim_new_cap(cap: i32, players: i32, seed: i32): object
+sim_set_chunks(w: object, cs: object): i32       // the boot path owns the worldgen adapter (§5.4b)
+
+// ---- players.  `pslot` is the POSITIONAL player slot, 1..players; the id IS pslot.
+sim_add_player(w, pslot: i32, x: f64, z: f64): i32       // -> entity id, or ID_NONE
+sim_respawn_player(w, pslot: i32, x: f64, z: f64): i32   // the PRIMITIVE; the 4 s timer is W4-11's
+sim_player_id(w, pslot): i32 · sim_player_dead(w, pslot): i32
+sim_predicted(w, pslot): array<f64>              // movement.hml's PredictedState
+sim_progression(w, pslot): array · sim_command(w, pslot): object
+
+// ---- commands.  All input reaches the sim through these and nowhere else.
+sim_queue_command(w, pslot: i32, cmd: object): i32   // the transport calls this; COPIES the command
+sim_apply_command(w, pslot: i32, cmd: object): i32   // §4.3 stage (a) for ONE command: validate,
+                                                     // reject a stale seq, latch.  Writes no world
+                                                     // field, emits no event, reads no clock.
+sim_queued(w, pslot): i32
+
+// ---- the step.  The order is API and it is DATA (see below).
+sim_step(w: object, tick: i32): i32              // -> SIM_STAGE_COUNT (10)
+sim_effects(w: object): i32                      // stage (j); a no-op when world.replaying == 1
+sim_set_replaying(w, r: i32): i32
+sim_stage_at(w, i: i32): i32                     // the stage id at position i of the executed order
+sim_stage_swap(w, i: i32, j: i32): i32           // TEST HOOK; counted in sim_stat_swaps
+sim_stage_order_reset(w): i32
+
+// ---- the accumulator.  CLOCK-FREE: main.hml owns clock_now(), the sim owns the arithmetic.
+sim_accum_new(): object · sim_accum_reset(a) · sim_accum_set_clamp_ms(a, ms: f64)
+sim_accum_advance(a: object, frame_ms: f64): i32  // -> ticks due THIS frame, 0..15
+sim_accum_alpha(a: object): f64                   // [0,1) — rsnap_build's third argument
+sim_accum_ticks(a): i64 · sim_accum_stalls(a): i32 · sim_accum_forgiven(a): i32
+sim_accum_frame_ms(a): f64 · sim_accum_raw_ms(a): f64 · sim_accum_total_ms(a): f64
+sim_accum_residual_ms(a): f64
+
+// ---- state hashes.  The acceptance criterion, in one number.
+sim_hash(w: object): u64        // every authoritative field + every module's own hash.  NEVER the
+                                // cosmetic queue, so a replay's hash is comparable to a live run's.
+sim_pos_hash(w: object): u64    // transforms only; cheap enough for a per-tick 10 000-tick trace
+
+// ---- handles into the module states, for the HUD, the transport and the tools
+sim_of(w): object · sim_combat(w): object · sim_events(w): object · sim_projectiles(w): object
+sim_ai(w): object · sim_director(w): object · sim_history(w): object · sim_chunks(w): object
+sim_weapon_state(w): array · sim_players(w): i32 · sim_steps(w): i32
+sim_phase(w): i32 · sim_day_t(w): f64 · sim_tier(w): i32
+
+// ---- the client-side effect queue that stage (j) fills.  Never hashed, never replicated,
+//      always empty while replaying.  src/game/client.hml turns these into sound and particles.
+sim_fx_count(w): i32 · sim_fx_total(w): i32 · sim_fx_dropped(w): i32
+sim_fx_kind(w, i): i32 · sim_fx_a(w, i): i32 · sim_fx_b(w, i): i32
+sim_fx_x/y/z(w, i): f64
+
+// ---- counters.  Every refusal is visible.
+sim_stat_cmds_applied / _dropped / _stale / _bad / _missing · sim_stat_shots · sim_stat_reloads
+sim_stat_deaths · sim_stat_player_deaths · sim_stat_spawns · sim_stat_ai_attacks
+sim_stat_pickups · sim_stat_lanterns · sim_stat_loot_rolls · sim_stat_last_rarity
+sim_stat_fall_hits · sim_stat_ground_miss · sim_stat_streams · sim_stat_swaps
+```
+
+**Constants:** `SIM_STAGE_COMMANDS(0) .. SIM_STAGE_EFFECTS(9), SIM_STAGE_COUNT(10),
+SIM_PLAYERS_DEFAULT(4), SIM_CMD_QUEUE(8), SIM_FX_CAP(128), SIM_FX_{SOUND,PARTICLE,SHAKE,HITMARKER,
+FLASH,NUMBER}, SIM_FX_KIND_COUNT, SIM_INTERACT_R_M(2.5), SIM_LANTERN_{UNLIT,LIT},
+SIM_MAX_FRAME_MS(250.0), SIM_MAX_TICKS_PER_FRAME(15), SIM_MISS(-1)`.
+
+**THE STAGE ORDER IS DATA.** `sim.order` is a ten-element `array<i32>` initialised to the identity,
+and `sim_step` dispatches through it. W4-9's acceptance criterion is a test that *reorders two
+stages and expects a different hash*; a hard-coded sequence of ten calls could only be reordered by
+editing `sim.hml`, so the assertion would test a copy of the order rather than the order — the same
+defect Gate 4a found in the enemy caps. The cost is ten array reads per tick, below the noise floor.
+`sim_stage_swap` counts its own use, so a shipping build that called it is visible in the stats.
+
+**The sub-orders inside two stages are API too.** Stage (e) runs `director_step` + `director_bind`
+*before* `ai_step`, because a body released this tick must steer this tick (`director.hml`'s own
+header calls itself stage (e) for the same reason). Stage (c) runs swap → reload → `wpn_step` →
+fire, because a cooldown that expires this tick must expire *before* the trigger is read or the
+weapon loses a tick of rate of fire on every shot.
+
+**One deliberate one-tick lag.** The shade tier reaches the director on the tick *after* the day
+cycle publishes it, because `director_step` is stage (e) and the day cycle is stage (h). Moving the
+tier earlier would mean running the day cycle before the AI, which contradicts §4.3 — and §4.3 is
+API. The tier changes at a 200 m chunk boundary or a phase edge of a 16-minute cycle; one tick of
+lag on either is 16.7 ms.
+
+**`world_spawn_player` returns a SLOT, not an id.** §5.4's phrase "a player id **is** its slot" means
+the *positional player slot* (1..64), which is the id — not the dense entity index the function
+returns, which is 0-based like `world_spawn`'s. Reading the return value as an id yields `0` for
+player 1, which is `ID_NONE`; the body then exists and is never driven again. `world.hml` is
+consistent and correct; the sentence is what misleads. Use
+`let slot = world_spawn_player(w, pslot); let id = world_id_of(w, slot);`.
+
+---
+
+`snapshot.hml` is the **authoritative world state serialised for one viewer** — what a packet
+*contains*. It is not `render_snapshot.hml`, which is what a frame *draws*. The one place they meet
+is deliberate: the object `snapshot_read` fills carries the field names `rsnap_ingest` reads
+(`count, tick, id, px, py, pz, yaw, pitch, model, anim, tint, flags`), field-for-field
+`rsnap_netframe_new`'s, so the v2 client ingest path is two calls and no rewrite.
+
+```hemlock
+snapshot_new(): object                                   // SNAP_CAP (256) entities
+snapshot_new_cap(cap: i32): object                       // allocates the byte buffer for the worst case
+snapshot_reset(s: object)                                // a reset snapshot is a legal baseline
+snapshot_set_radius(s: object, r: f64)                   // interest radius, metres; 0 disables
+
+// The write ALWAYS takes a viewer, so interest management has a home.  `viewer_slot` = SLOT_NONE
+// means "no viewer": no cull, ID_NONE on the wire.  That is the mode replay/determinism runs in.
+// The DESTINATION is the first argument — §5.4's three-argument form has nowhere to put the output.
+snapshot_write(s: object, w: object, viewer_slot: i32, baseline: object): i32   // -> bytes
+snapshot_read(dst: object, src: object, baseline: object): i32                 // -> count, or SNAP_MISS
+snapshot_size(s: object): i32                            // bytes the LAST write produced
+snapshot_copy(dst: object, src: object): i32             // promote a write to "the new baseline"
+snapshot_hash(s: object): u64                            // folds the QUANTISED integers, not the f64s
+snapshot_check(s: object): i32                           // 0 = sound; a bit per broken invariant
+
+snapshot_count/cap/tick/viewer/mode/uid/radius(s): i32|f64
+snapshot_removed_count(s): i32 · snapshot_removed_id(s, i): i32
+snapshot_index_of(s, id: i32): i32                       // row, or SNAP_MISS
+snapshot_field_{id,px,py,pz,yaw,pitch,model,anim,tint,flags,hp,kind}(s): array
+snapshot_buffer(s): buffer
+snapshot_dropped/culled/skipped/writes/reads/full_records/delta_records/bytes_total(s): i32
+snap_q_pos(v: f64): i32 · snap_dq_pos(q: i32): f64 · snap_dq_pitch(q: i32): f64
+```
+
+**Constants:** `SNAP_CAP(256), SNAP_POS_Q_PER_M(16.0), SNAP_POS_Q_INV, SNAP_RADIUS_DEFAULT(72.0),
+SNAP_HDR_B(13), SNAP_REM_B(4), SNAP_REC_MIN_B(5), SNAP_REC_MAX_B(30),
+SNAP_OFF_{COUNT 0, NREM 2, TICK 4, VIEWER 8, MODE 12}, SNAP_MODE_{FULL,DELTA},
+SNAP_F_{POS 1, ANG 2, MODEL 4, TINT 8, FLAGS 16, HP 32, NEW 64, ALL 63}, SNAP_MISS(-1)`.
+
+**Everything is quantised BEFORE it is stored.** `snapshot_write` writes the *dequantised* value back
+into its own arrays, not the raw f64 it read from the world. So the number the client will see is the
+number the server recorded, a desync cannot hide inside the rounding, and `snapshot_read`'s output is
+assertable bit-identical to `snapshot_write`'s with no epsilon. Positions ride the 1/16 m grid (the
+same grid `combat.hml` quantises event positions onto); angles ride `command.hml`'s `q_ang`/`dq_ang`,
+which is the project's only angle quantiser.
+
+**The wire form** is a 13-byte header, then `n_removed` × `i32` removed ids, then one record per
+entity in world slot order: `i32 id`, `u8 mask`, and only the fields the mask names — 5 bytes when
+nothing changed, 30 when everything did. Removed ids are carried even though the decoder does not
+need them to reconstruct (every present entity appears in the record list), because the client needs
+a despawn *event*: deriving one from a set difference at the far end is how a corpse silently
+disappears instead of dissolving.
+
 ### 5.5 `nightshade/src/net/` — v1 loopback, v2 gn.hml
 
 | File | Purpose | Exports |
@@ -934,6 +1086,69 @@ them, in the SNAPSHOT block above VIEW. Two knock-ons for the rest of Wave 3:
   so this preserves the postfx-under-HUD order exactly; it is the only structural difference
   between the extracted graph and the Wave-2 function it came from.
 
+#### 5.6c `viewmodel.hml` — exact signatures (added by W4-10)
+
+§5.6's table lists `vm_new, vm_step, vm_emit, vm_fire, vm_reload_stage` and no shapes. The shipped
+surface is below. Three things about it are load-bearing rather than stylistic:
+
+1. **`vm_emit` takes the PROJECTION, not the MVP.** The viewmodel is drawn in view space under
+   `proj` alone — §5.6's `world_render.hml` entry and that file's `g_vm_model` header explain why
+   (a first-person held object must not receive the camera's own rotation, or it becomes an
+   unrecognisable slab below -40° of pitch). `p_restore` is the caller's world MVP, put back before
+   `vm_emit` returns, so stage 16 onward is untouched. `vm_model()` is the alternative for a caller
+   that would rather emit the mesh itself: at rest it returns exactly the sixteen constants
+   `world_render.hml` ships today, bit for bit.
+2. **The weapon state arrives as `(array, offset)` and is only ever read.** `vm_read_weapon` indexes
+   it with `weapons.hml`'s `WS_*` constants and performs no assignment. GAME_DESIGN §2.4's "never
+   let visual kick move the actual bullet" is therefore a structural property, not a convention.
+3. **Everything art-derived arrives as a handle or a number** (§5.6b): the lantern mesh through
+   `vm_bind_mesh`, the falling magazine's atlas rect and tint through `vm_bind_mag`. Until the
+   magazine is bound it is not emitted at all.
+
+```hemlock
+fn vm_new(): object                       // preallocated; rest pose ready to emit
+fn vm_reset(vm: object)
+
+// binding — handles and numbers only, never an src/art import
+fn vm_bind_mesh(vm, mesh)                             // meshgen slot MESH_LANTERN_VM
+fn vm_bind_mag(vm, u0, v0, u1, v1, rgb: i32)          // the spent-magazine card
+fn vm_set_rest(vm, right, down, fwd)                  // default 0.26 / 0.34 / 1.05
+fn vm_set_pivot(vm, x, y, z)                          // view space; default the fist
+fn vm_set_eye_height(vm, h)                           // for the magazine's floor clack
+
+// drive
+fn vm_set_motion(vm, speed_mps, grounded: i32, sprint: i32, step_dist)  // movement PS_STEP_DIST
+fn vm_read_weapon(vm, wst: array, off: i32): i32      // READ ONLY; returns shots fired since last
+fn vm_events(vm, bus: object, tick: i32): i32         // EV_RELOAD_DONE / EV_WEAPON_SWITCH, v2 path
+fn vm_fire(vm, mult)                                  // mult = the shot's rc_v, in DEGREES
+fn vm_drop_mag(vm)
+fn vm_step(vm, dt_seconds)                            // once per FRAME, not per tick
+
+// emit — ARCHITECTURE §4 stage 15
+fn vm_model(vm): array<f64>                           // retained, view-space, 16 elements
+fn vm_emit(vm, batch, tex, proj: array<f64>, restore: array<f64>): i32   // returns triangles
+fn vm_build_matrix(vm)                                // rebuild from the pose fields
+
+// readers
+fn vm_reload_stage(vm): i32     // g_VM_STAGE_NONE / DROP / INSERT / SEAT
+fn vm_kick(vm): f64             fn vm_ads(vm): f64          fn vm_sprint(vm): f64
+fn vm_off_right|off_down|off_fwd(vm): f64               fn vm_rot_x|rot_y|rot_z(vm): f64
+fn vm_mag_active(vm): i32       fn vm_mag_x|mag_y|mag_z(vm): f64
+fn vm_take_clack(vm): i32       fn vm_take_reload_done(vm): i32   // latches; the caller drains
+fn vm_state(vm): array<f64>     fn vm_field(vm, i): f64
+fn vm_clamps(vm): i32           fn vm_tris(vm): i32     fn vm_kicks(vm): i32
+fn vm_stage_bits(vm): i32       fn vm_kick_peak_s(): f64          fn vm_ppm(): f64
+fn vm_mesh_tris(vm): i32
+```
+
+**The cap box is part of the contract.** `g_VM_ROT_X_MIN/MAX`, `g_VM_ROT_Y_ABS`, `g_VM_ROT_Z_ABS`
+and `g_VM_OFF_{R,D,F}_{MIN,MAX}` bound the pose, and `vm_step` clamps to them. They exist because
+`meshgen.hml`'s `mg_vm_shell` deletes the three faces the eye cannot see at the rest pose: the
+shipped lantern has normals in only three directions, so a pose that rotates one of them past the
+eye puts a hole in the lamp. `tools/probe_viewmodel.hml` projects all 122 triangles of the real mesh
+through the real projection at 1215 poses spanning the whole box and requires 122 drawn every time,
+with a negative control just outside the box. **Widen a cap only with that probe green.**
+
 ### 5.7 `nightshade/src/game/`
 
 | File | Purpose | Exports |
@@ -946,6 +1161,246 @@ them, in the SNAPSHOT block above VIEW. Two knock-ons for the rest of Wave 3:
 | `hub.hml` | Ember Hollow: layout, the 5 NPCs' placement, bench/well/board/museum/plots. (Wave 4.) | `hub_init, hub_step, hub_emit` |
 | `npc.hml` | NPC state, daily line rotation, head-turn, interaction prompts. (Wave 4.) | `npc_step, npc_line` |
 | `save.hml` | Save/load on: entering town, sleeping, lighting a lantern, quitting. Binary, versioned. | `save_write, save_read, save_exists` |
+
+#### 5.7a `save.hml` — the save file as a WIRE CONTRACT  *(added by W4-12)*
+
+`§5.7` names three functions. These are the rest, and the on-disk layout, because
+`docs/recon/NETWORKING.md` makes this state server-authoritative later and a format nobody wrote
+down is a format nobody can migrate.
+
+```hemlock
+// ---- the codec (no I/O; testable headless) ---------------------------------
+fn save_bytes(w): i32                       // exact size of the next encode
+fn save_alloc(w): buffer                    // a buffer of exactly that size
+fn save_encode(w, dst: buffer, reason): i32 // bytes written, or a negative SAVE_ERR_*
+fn save_decode(w, src: buffer): i32         // bytes consumed, or a negative SAVE_ERR_*
+fn save_verify(src: buffer): i32            // 0 if loadable, else the SAVE_ERR_* that stops it
+
+// ---- files ------------------------------------------------------------------
+fn save_write(w, path: string, reason): i32 // via <path>.tmp + rename; never a torn save
+fn save_read(w, path: string): i32
+fn save_read_file(path: string): buffer     // the bytes, for a hexdump or a verify
+fn save_exists(path: string): i32
+
+// ---- inspection: a save-slot menu needs no simulation ------------------------
+fn save_peek_version(src): i32      fn save_peek_min_version(src): i32
+fn save_peek_records(src): i32      fn save_peek_reason(src): i32
+fn save_peek_meta(src, which): i32  // 0 players, 1 cap, 2 SEED, 3 tick
+
+// ---- the criterion, as a callable --------------------------------------------
+fn save_roundtrip_ok(w, scratch): i32   // 1 if sim_hash survives encode+decode
+
+// ---- decode telemetry: a skipped record is never silent -----------------------
+fn save_skipped_records(): i32   fn save_skipped_bytes(): i32
+fn save_applied_records(): i32   fn save_last_error(): i32   fn save_last_version(): i32
+fn save_err_name(code): string   fn save_reason_name(r): string
+```
+
+**Layout.** Little-endian throughout. Every record length is a multiple of 8, so every record and
+every `f64` inside one lands 8-aligned.
+
+```
+FILE HEADER, 32 B
+  +0  u32 magic  +4 i32 version  +8 i32 min_version  +12 i32 header_bytes
+ +16  i32 payload_bytes  +20 i32 records  +24 u32 checksum (FNV-1a-32 over payload)
+ +28  i32 reason (SAVE_REASON_TOWN | SLEEP | LANTERN | QUIT — BUILD_PLAN's four triggers)
+
+RECORD
+  +0  i32 tag   +4 i32 bytes (excluding this 8-byte header)
+  +8  i32 rows  +12 i32 cols_i32  +16 i32 cols_f64  +20 i32 cols_u64
+ +24  cols_i32 columns of `rows` i32, column-major (SoA); pad to 8;
+      then the f64 columns, then the u64 columns.
+```
+
+**Column order is the contract. New columns are APPENDED, never inserted.** `tools/probe_save.hml`
+pins every column count with a literal, so an insertion is a build failure rather than a silently
+rotated save.
+
+**The three growth directions, and what each does.** This is why the framing exists:
+
+| | |
+|---|---|
+| old file, new reader | the record carries FEWER columns → the reader takes what is there and leaves the rest at the value the freshly-constructed sim already has |
+| new file, old reader | the record carries MORE columns → the reader takes the ones it knows and steps over the tail using the column counts |
+| new file, old reader | a TAG it has never seen → the record is skipped whole by length, and **counted** (`save_skipped_records`) |
+| a version it cannot read | `min_version > SAVE_VERSION` → `SAVE_ERR_VERSION`, a clean refusal |
+
+**28 record tags** (`SAVE_T_*`, never renumbered): META, TIME, ENTITY, PLAYER, PROG, WEAPON, EVBUS,
+PROJ, AI_EVENT, DIRECTOR, LOOT, CHUNKEDIT, SOLIDS, COMMAND, COUNTER, RNG, COMBAT, CHAIN, PROJ_BURN,
+PROJ_META, PROJ_SHOTS, PROJ_EVENT, AI_META, ROSTER, DIRREQ, CMDQUEUE, CHUNKRING, CHUNKMETA.
+
+**What is persisted, and what is deliberately not.**
+
+*Persisted:* every input `sim_hash` reads — so the round trip is bit-identical **unconditionally**,
+not only at a quiet save point. GDD §8's headline beat is lighting a lantern *during a wave*, and
+"lighting a lantern" is one of the four save triggers; a format that could only round-trip an empty
+field would not cover its own trigger. Floats are stored as raw IEEE-754 `f64`, never quantized —
+`sim_hash` quantizes to 1/16 m, so a quantizing codec would *look* like it round-tripped while the
+state underneath had drifted.
+
+*Not persisted:* generated chunk heights and attributes (`worldgen` is a pure function of
+`(seed, cx, cz)`; only the sparse **edit overlay** and the resident chunk **keys** are written — 16 B
+per visited chunk against 324 B of samples); `history.hml`'s rewind ring (a lag-compensation buffer;
+a loaded session has none for the same reason a joining client has none); projectile tracers and the
+sim's fx queue (cosmetic, never hashed, rebuilt from the event bus, which *is* persisted).
+
+**Two things a hash cannot see, and both are saved anyway.** The resident chunk **set** — a chunk
+that is not resident returns `CHUNK_H_MISS`, so a save that restored every entity and dropped
+residency would pass a hash check at tick 0 and desync at tick 1. And the chunk store's **sampler
+memo key** — a memo hit skips `chunk_get` and therefore skips the LRU `touch`, so two stores holding
+the identical chunk set with different memos drift one LRU stamp apart on the next height query.
+The `CHUNKRING` rows are emitted **sorted by (cz, cx)**, never in slot order, which makes the
+encoding canonical: equal state produces equal bytes, and `encode(decode(encode(x))) == encode(x)`
+byte for byte.
+
+**Decode is a loading screen, not a frame.** It regenerates every resident chunk (~0.75 ms each
+compiled, inside W3-1's 2.0 ms/chunk budget). `save_encode` is 0.83 ms for a 400-tick two-player
+world. Neither is on a frame path: BUILD_PLAN gives four save triggers per session.
+
+#### 5.7b `main.hml`, `client.hml`, `server.hml` — exact signatures (added by W4-11; `tools/probe_game.hml`, `tools/benchframe.hml`, `save.hml` and every later game module code against these)
+
+§5.7's table names `main`, `client_new/client_apply/client_events` and
+`server_new/server_tick/server_apply_command` and gives no shapes. The shipped surface is below.
+Five things about it are load-bearing rather than stylistic.
+
+1. **Exactly TWO things cross from the server to the client, and neither is a `World`.**
+   `server_snapshot()` is a real `src/sim/snapshot.hml` snapshot — a 13-byte header and one
+   quantised record per entity — and `client.hml` decodes it with `snapshot_read` and hands the
+   result to `rsnap_build_from_net`. `server_local()` is the OWNER BLOCK: the per-player state that
+   is not in the entity stream (hp, magazine, xp, the lantern channel, the wave state, this tick's
+   cosmetic queue). `client.hml` **does not import `src/sim/world.hml`** and `main.hml` contains no
+   call to `server_world()`; BUILD_PLAN W4-11's "the renderer never reads `world.*`" is therefore
+   structural rather than a grep that happens to be clean. `server_world()` exists for the loopback
+   tools and is named so its callers are visible in one grep.
+
+2. **`client_events` is a QUEUE, not a callback.** §5.7 names `client_events`; the shipped form is
+   `client_sound_count/id/gain/pan` + `client_sounds_reset` and `client_fx_*`. The client emits
+   SEMANTIC ids (`CSND_*` for a sound's meaning, `CFX_*` for a particle's look) and `main.hml` binds
+   them to `audiobank` sfx and `fxgen` cells. That is ARCHITECTURE §5.6b's rule applied one layer
+   up, and it is what lets `tools/probe_game.hml` link `client.hml` with **zero SDL symbols**.
+
+3. **The aim that reaches the sim and the aim that reaches the MVP are different numbers, and both
+   are client-authored.** `client_make_command` samples `view_aim_*`; the camera renders from
+   `client_cam_yaw/pitch/roll`, which is `view_render_*`. Mouse-look never waits for a packet, which
+   is the whole reason 120 ms of fake latency is playable with no prediction.
+
+4. **`server_tick(sv, tick)` takes an ABSOLUTE tick, not a session tick.** The session starts at
+   `SV_T0_DAY` so that `daycycle.hml`'s own dusk-horn edge lands on GAME_DESIGN §8's 0:33.
+   `server_session()` is the offset the script uses.
+
+5. **The GAME_DESIGN §8 script lives in `server.hml` and is TICK-driven.** `SV_T_STAND`,
+   `SV_T_WISPS`, `SV_T_MOTE`, `SV_T_HORN_LAG`, `SV_T_PATH_LAG` and the counts `SV_N_WISPS/MOTES/HUSKS`
+   are the document's numbers at 60 Hz. Nothing in the sequence is frame-driven, which is why the
+   whole minute can be asserted headless.
+
+```hemlock
+// ---- src/game/server.hml — THE AUTHORITATIVE HOST -------------------------
+server_new(seed: i32, transport): object      // transport may be null (direct-drive tools)
+server_boot(sv: object): i32                  // the opening scene; called by server_new
+server_chunks_new(seed: i32): object          // the heightfield store + worldgen adapter
+server_tick(sv: object, tick: i32): i32       // drain -> sim_step -> script -> publish
+server_apply_command(sv, pslot: i32, cmd: object): i32
+
+server_snapshot(sv): object                   // THE PACKET (src/sim/snapshot.hml)
+server_local(sv): object                      // THE OWNER BLOCK
+server_world(sv): object                      // loopback/tools ONLY. client.hml never calls it.
+server_chunks(sv): object                     // the sim heightfield; main.hml renders FROM it
+
+server_seed/t0/tick_now/session/beat/beat_tick/ticks/cmds_in(sv): i32
+server_snap_bytes/bytes_out/lantern_id/lantern_lit/path_lit/hold_begun(sv): i32
+server_deaths/supplied/enemies_alive(sv): i32
+server_lantern_x/lantern_z/spawn_x/spawn_z/spawn_yaw(sv): f64
+server_hash(sv): u64
+server_tier_at(sv, x: f64, z: f64, phase_bonus: i32): i32
+server_beat_name(beat: i32): string
+
+constants  SV_PSLOT(1), SV_BEAT_{WAKE..PATH}, SV_BEAT_COUNT(12),
+           SV_T_STAND(180), SV_T_WISPS(600), SV_T_MOTE(1080),
+           SV_T_HORN_LAG(180), SV_T_PATH_LAG(120), SV_T0_DAY,
+           SV_N_WISPS(3), SV_N_MOTES(1), SV_N_HUSKS(4),
+           SV_LANTERN_M(40.0), SV_START_RESERVE(12), SV_SUPPLY_S(0.8),
+           SV_PATH_N(5), SV_PATH_STEP_M(22.0), SV_PATH_TURN_DEG(40.0),
+           SV_MODEL_LANTERN(90), SV_MODEL_PICKUP(120), SV_FX_CAP, SV_MISS(-1)
+
+// ---- src/game/client.hml — INPUT -> WIRE, PACKET -> PICTURE ---------------
+client_new(transport, seed: i32): object
+client_bind_fx_cells(cl, ember, mote, glow_s, glow_l, spark, rain, tracer): i32
+client_set_sens(cl, s: f64)      client_set_invert_y(cl, on: i32)
+client_set_angles(cl, yaw: f64, pitch: f64)   // ABSOLUTE; the spawn look direction
+
+// input — every frame, before the tick loop
+client_look(cl, dx: f64, dy: f64)             // raw SDL counts
+client_look_axis(cl, dyaw: f64, dpitch: f64)  // radians (no-mouse / demo path)
+client_set_move(cl, fwd: f64, strafe: f64)    client_set_button(cl, bit: i32, down: i32)
+client_press_fire(cl): i32                    // THE FRAME-0 SHOT: all cosmetics, no world write
+client_press_reload(cl): i32                  // latches BTN_RELOAD onto the next command
+
+// the tick — once per fixed tick, around server_tick
+client_make_command(cl, tick: i32): object    client_send_command(cl, tick: i32): i32
+client_apply(cl, packet: object, local: object, tick: i32): i32
+
+// the frame
+client_frame(cl, dt_seconds: f64, tick: i32): i32     // view_build, timers, particles
+client_build_render(cl, alpha: f64): i32              // §4 stage 4
+
+// the camera — position from the snapshot, angles from the local view
+client_cam_x/cam_y/cam_z/cam_yaw/cam_pitch/cam_roll/cam_fov(cl): f64
+client_shake_x/shake_y(cl): f64                       // present-time, never in the MVP
+
+// the entity stream (the decoded snapshot, interpolated)
+client_ent_count(cl): i32
+client_ent_id/model/flags(cl, i: i32): i32     client_ent_x/y/z/yaw(cl, i: i32): f64
+
+// the cosmetic queues main.hml drains
+client_fx_count(cl): i32   client_fx_cell/kind/r/g/b/alpha(cl, i): i32
+client_fx_x/y/z/size(cl, i): f64
+client_sound_count(cl): i32  client_sound_id(cl, i): i32
+client_sound_gain/pan(cl, i): f64   client_sounds_reset(cl)
+
+// HUD state — the only source the HUD reads
+client_hp/hp_max/dead/ammo/reserve/reload_stage/level/xp_into/xp_need/xp_total(cl): i32
+client_tier/alive/wave/wave_state/beat/session/grounded/prompt(cl): i32
+client_hitmarker_kill/has_control/packets/decode_fail/cmds_sent/fire_shots(cl): i32
+client_hp01/hitmarker/damage_t/damage_dir/banner_t/card_t/toast_t/level_t(cl): f64
+client_chan01/lantern_dist/lit_ring_t/muzzle_t/intro_alpha/stand01(cl): f64
+client_speed/step_dist/px/py/pz/day_t/ads/reloading/latency_ms(cl): f64
+client_banner/card/toast(cl): string
+client_lantern_bearing(cl): f64          // radians, relative to the render yaw
+client_view(cl): object                  client_rsnap(cl): object
+
+constants  CFX_{EMBER,MOTE,GLOW_S,GLOW_L,SPARK,RAIN,TRACER}, CFX_CELL_COUNT(7),
+           CFXB_{BALLISTIC,HOME,RING,STREAK}, CFX_CAP(256), CSND_QUEUE(32),
+           CSND_{SHOT,DRYFIRE,RELOAD_DROP,RELOAD_INS,RELOAD_SEAT,MAG_CLACK,
+                 HIT0,KILL,IMPACT,IMPACT_ARMOR,BELL,HORN,LEVELUP,WAVECLEAR,
+                 XP,HURT,STEP,EMBER,WISP,HUSK}, CSND_HIT_STEPS(5), CSND_COUNT(24),
+           CL_{INTRO_FADE_S,STAND_S,LIE_EYE_M,LIE_PITCH,BANNER_S,CARD_S,
+               LEVEL_S,HITMARK_S,PROMPT_M}, CL_MISS(-1)
+
+// ---- src/game/main.hml — THE SHELL.  `main` is the only export. -----------
+//  --seed <n> --scale <2|3|4> --sens <f> --demo <s> --shots <dir>
+//  --vm <0|1|2> --no-audio --headless --selftest
+```
+
+**Two deviations from §4's stage order, both deliberate and both measured.**
+
+* **Stage 15 (the viewmodel) moved to stage 24 when it is DRIVEN.** `world_render.hml` emits its own
+  static viewmodel inside `frame_render()` at stage 15, in `LAYER_WORLD`. `src/render/viewmodel.hml`
+  (W4-10) is the animated one and cannot be emitted there from outside: `LAYER_WORLD` is reset at
+  stage 11 and flushed at 21, both inside `frame_render()`, and there is no hook between them —
+  `frame_render` would have to take a callback. So `main.hml` emits it into `LAYER_HUD` at stage 24,
+  under its own projection, before the HUD. `LAYER_HUD` flushes in insertion order, so the viewmodel
+  lands over the world and under the HUD; a held object is nearer than everything in the world, so
+  that is the same result the depth sort gives. The cost is that the stage-23 vignette now sits
+  *under* the viewmodel instead of over it. `--vm 1` selects the stage-15 static one and `--vm 0`
+  turns it off, so the choice can be re-checked.
+* **The terrain the picture draws comes from `src/sim/chunk.hml`, not from `world_render.hml`'s
+  `terrain_h`.** `terrain_h` is the walkaround's heightfield and the sim's is `worldgen.hml`'s; they
+  are different surfaces, and building the visible ground from the first puts the player's feet at
+  one height and the floor at another. `main.hml`'s `ground_h()` samples the sim's store (which
+  generates on demand through `chunk_get`) and falls back to `terrain_h` only on a miss that cannot
+  happen with the ring pinned. `--selftest` asserts the two agree at the player's feet within
+  0.35 m. The store is created with 256 resident chunks rather than 64 because it now has two
+  readers.
 
 ### 5.8 `nightshade/src/data/`
 

@@ -1,0 +1,1646 @@
+// benchframe.hml — the per-stage frame bench and the budget regression gate. W4-13.
+//
+// CLAUDE.md §2 has documented this command since Wave 0:
+//
+//     hemlockc -O1 tools/benchframe.hml -o /tmp/bf && SDL_VIDEODRIVER=dummy /tmp/bf
+//
+// A Gate 3a verifier found the file did not exist, so the documented command
+// was a lie. This is that file. It drives the REAL frame graph
+// (`src/render/world_render.hml`) and the REAL simulation (`src/sim/sim.hml`)
+// over a moving camera at the shipping triangle budget, prints the
+// ARCHITECTURE.md §4 stage table with per-stage deltas, and EXITS 1 when a
+// stage, a counter or the allocation gate regresses past its guard.
+//
+//   modes
+//     (none)      bench + gate. exits 1 on any failure.   <- the CI form
+//     --quick     fewer frames; a smoke test, still gated
+//     --ablate    stage ablation: what each optional stage actually costs
+//     --csv       machine-readable stage table on top of the human one
+//     --frames N  frames per trial (default 90)
+//     --trials N  trials (default 7, RULE T)
+//     --no-gate   print the table, never exit 1 (for exploring, never for CI)
+//     --help
+//
+// ---------------------------------------------------------------------------
+// HOW IT TIMES, AND WHY IT IS NOT NAIVELY __clock()
+// ---------------------------------------------------------------------------
+// RULE T is "__clock() CPU time + minimum of 7". Both halves are used, but not
+// in the same column, and the reason is measured rather than assumed:
+//
+//   * THE MINIMUM OF 7 IS USED EVERYWHERE. Preemption can only make a sample
+//     slower, so the minimum stays near true cost while the mean drifts with
+//     load (BUDGET_ACTUAL: +62 % naive, +29 % with the full recipe). Every
+//     number in the stage table is a min over `--trials` independent trials of
+//     `--frames` frames each, divided by the frame count.
+//
+//   * THE PER-STAGE COLUMN IS THE SDL PERFORMANCE COUNTER, not __clock(), and
+//     that is deliberate. `tools/walk.hml` measured the two side by side on the
+//     real display and recorded the result in its own source: __clock() is
+//     PROCESS CPU time summed over every thread, so with a GL driver thread
+//     alive it reported 12.2 ms of "render CPU" against a 12.1 ms wall frame
+//     and attributed the driver's concurrent work to whichever stage happened
+//     to be open. stats.hml — the shipping instrumentation, the thing the game
+//     actually carries — is on the performance counter. Timing the stages on a
+//     different clock from the one the game reports would bench something the
+//     game does not run.
+//
+//   * __clock() IS STILL MEASURED, around the whole frame and around the sim
+//     step, and printed as its own column with the CPU/wall skew. Under the
+//     dummy video driver there is no driver thread, so the two agree; on the
+//     real display they do not, and the printed skew is the evidence for the
+//     paragraph above rather than a claim about it.
+//
+// Guards are set at ~2x the number measured under this box's permanent ~17/24
+// core load, and every assertion prints BOTH numbers, as RULE T requires. A
+// guard that false-fails trains everyone to ignore red, which costs more than
+// the regression it was protecting against.
+//
+// ---------------------------------------------------------------------------
+// WHAT IT DRIVES
+// ---------------------------------------------------------------------------
+// R7 forbids a tool from carrying its own frame graph, and it is right to: a
+// bench against a private copy of the renderer measures the copy. This file
+// defines no `frame_render`. It calls `frame_begin` / `frame_render` /
+// `frame_present` — the same three the walkaround and the screenshot tool call
+// — with the same caller-owned stages 6, 7 and 24 the import wall leaves with
+// every caller (ARCHITECTURE §5.6b).
+//
+// The WORLD is benchframe's own: a deterministic ring of terrain chunks, props
+// from the real `meshgen`, real FX cards and a real HUD, sized to land on the
+// 2500-triangle budget. It is not walk.hml's art and does not try to be — what
+// has to be identical is the SHAPE of the work (triangle count per layer, prop
+// count, draw calls, texture runs), because that is what the stage costs are a
+// function of. The art is what the frame LOOKS like; this file measures what it
+// COSTS. `tools/shot.hml` owns the former.
+//
+// The SIM is the real one: `sim_new_cap` over the real worldgen chunk source,
+// two players, eight steered agents, a lantern and a pickup, stepped at the
+// fixed timestep through `sim_accum_advance` exactly as `main.hml` will.
+
+import { exit } from "@stdlib/process";
+import { open_fd } from "@stdlib/fs";
+import { sin, cos, sqrt, floor } from "@stdlib/math";
+
+// ---------------------------------------------------------------------------
+// the engine
+// ---------------------------------------------------------------------------
+import { window_open_ex, window_close, sdl_error, set_vsync,
+         read_pixels_rect, FMT_ARGB8888,
+         BLEND_BLEND, BLEND_ADD }
+       from "../../wobbleweed/src/sdl.hml";
+import { target_new, target_free } from "../../wobbleweed/src/target.hml";
+import { clock_now, clock_ms_between } from "../../wobbleweed/src/time.hml";
+import { emit_set_env } from "../../wobbleweed/src/emit.hml";
+import { env_set_camera, env_set_fog, env_clear_lights, env_add_light,
+         env_field, env_light_count,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_FOG_ALPHA_MAX }
+       from "../../wobbleweed/src/shade.hml";
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_quad, mesh_end,
+         mesh_bake_light, mesh_tri_count }
+       from "../../wobbleweed/src/mesh.hml";
+import { atlas_new, atlas_cell_uv, atlas_upload }
+       from "../../wobbleweed/src/atlas.hml";
+import { font_text_shadowed } from "../../wobbleweed/src/font.hml";
+import { quad_screen_uv } from "../../wobbleweed/src/quad.hml";
+import { stat_get, stat_ms, stat_set, stat_begin, stat_end, stat_timer_name,
+         STAT_TRIS_SUBMITTED, STAT_TRIS_DRAWN, STAT_DRAW_CALLS, STAT_TEX_RUNS,
+         STAT_BATCH_OVERFLOW, STAT_VERTS_DRAWN,
+         STAT_REJ_FRUSTUM, STAT_REJ_BACKFACE, STAT_REJ_NEAR, STAT_REJ_GUARD,
+         STAT_REJ_DISTANCE, STAT_CLIP_STRADDLE, STAT_CLIP_SLOW,
+         STAT_CHUNKS_TESTED, STAT_CHUNKS_CULLED, STAT_CHUNKS_DRAWN,
+         STAT_ENTS_TESTED, STAT_ENTS_CULLED, STAT_ENTS_DRAWN,
+         STAT_PARTICLES, STAT_LIGHTS, STAT_SIM_TICKS, STAT_SKY_ROWS,
+         STAT_T_FRAME, STAT_T_SIM, STAT_T_SNAPSHOT, STAT_T_TOD, STAT_T_SKYBAKE,
+         STAT_T_VIEW, STAT_T_BATCH_RESET, STAT_T_EMIT_SKY, STAT_T_EMIT_TERRAIN,
+         STAT_T_EMIT_ENTITY, STAT_T_EMIT_VIEWMODEL, STAT_T_EMIT_FX,
+         STAT_T_EMIT, STAT_T_TARGET_BEGIN, STAT_T_CLEAR, STAT_T_FLUSH_SKY,
+         STAT_T_SORT_WORLD, STAT_T_FLUSH_WORLD, STAT_T_SORT_FX,
+         STAT_T_FLUSH_FX, STAT_T_POSTFX, STAT_T_HUD, STAT_T_FLUSH_HUD,
+         STAT_T_PRESENT, STAT_T_COUNT }
+       from "../../wobbleweed/src/stats.hml";
+
+// ---------------------------------------------------------------------------
+// THE FRAME GRAPH — src/render/world_render.hml. The only one. R7 enforces it.
+// ---------------------------------------------------------------------------
+import { frame_init, frame_render, frame_present, frame_begin,
+         frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
+         frame_set_camera, frame_set_clear, frame_set_options,
+         frame_set_hud_solid_uv, frame_set_vignette_colour,
+         frame_set_flash_colour, frame_env, frame_batch_hud,
+         world_clear, world_chunk_add, world_prop_add, world_fx_add,
+         world_chunk_count, world_prop_count, world_fx_count,
+         terrain_set, terrain_h, vnoise2, h2,
+         g_D2R, g_FXK_SPRITE, g_FXK_RAIN, g_FXK_TRACER, g_LOD_FOG_CARD,
+         g_CAP_WORLD, g_CAP_FX, g_CAP_HUD }
+       from "../src/render/world_render.hml";
+
+// ---------------------------------------------------------------------------
+// the game — core
+// ---------------------------------------------------------------------------
+import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_TRIS_CLAMP,
+         g_FOG_FAR_CAP, g_MIST_HEIGHT, g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS,
+         g_UPSCALE_DEFAULT, g_FRAME_BUDGET_MS, g_TICK_MS,
+         g_BUDGET_RENDER_MS, g_BUDGET_SIM_MS, g_BUDGET_IO_MS,
+         g_BUDGET_SKY_REBAKE_MS, g_BUDGET_RSS_MB,
+         g_WORLD_SEED_DEFAULT, g_ENEMY_WISP, g_ENEMY_HUSK }
+       from "../src/core/config.hml";
+import { clamp01, lerpf, clampi, clampf } from "../src/core/mathx.hml";
+
+// ---------------------------------------------------------------------------
+// the game — art
+// ---------------------------------------------------------------------------
+import { pal_r, pal_g, pal_b,
+         g_UI_WHITE, g_UI_DIM, g_UI_BLACK, g_UI_AMBER, g_UI_DANGER, g_UI_GOOD,
+         g_GRASS_MID, g_GRASS_DRY, g_DIRT_MID, g_DIRT_LO,
+         g_STONE_MID, g_STONE_HI, g_EMBER, g_WINDOW_LIGHT }
+       from "../src/art/palette.hml";
+import { tod_eval, tod_reset, tod_set_weather, tod_set_mist_band,
+         tod_sky_keys, tod_lightning_active,
+         WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R, TODSKY_STAR_ALPHA,
+         TODSKY_HALO, TODSKY_BODY_X, TODSKY_CLOUD_COVER, TODSKY_COUNT }
+       from "../src/art/tod.hml";
+import { texgen_build_world_atlas,
+         CELL_GRASS_A, CELL_GRASS_B, CELL_DIRT, CELL_CLIFF, CELL_PATH }
+       from "../src/art/texgen.hml";
+import { skygen_init, skygen_build, skygen_keys_new, skygen_set_keys,
+         skygen_set_clock, skygen_mark_dirty, skygen_rebake_slice,
+         skygen_dirty_rows,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER }
+       from "../src/art/skygen.hml";
+import { fxgen_build_atlas, FX_EMBER, FX_GLOW_S, FX_GLOW_L, FX_RAIN }
+       from "../src/art/fxgen.hml";
+import { hudgen_build_atlas, hudgen_uv, hudgen_rect, hud_font_micro,
+         HUD_SOLID, HUD_XH_TICK_V, HUD_XH_TICK_H, HUD_XH_DOT,
+         HUD_CHEVRON, HUD_TICK_MINOR, HUD_TICK_MAJOR, HUD_ICON_LANTERN }
+       from "../src/art/hudgen.hml";
+import { meshgen_build_all, meshgen_bake_all, meshgen_mesh, meshgen_radius,
+         meshgen_set_material_uv, meshgen_set_sun_azimuth,
+         MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT, MG_MAT_GLASS,
+         MESH_TREE0, MESH_TREE1, MESH_TREE2, MESH_BUSH, MESH_ROCK,
+         MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_NPC,
+         MESH_SPARROW_VM }
+       from "../src/art/meshgen.hml";
+
+// ---------------------------------------------------------------------------
+// the game — the simulation (W4-9). Tools are not walled; the SIM still is.
+// ---------------------------------------------------------------------------
+import { world_spawn, world_id_of, world_slot_of,
+         KIND_LANTERN, KIND_PICKUP, EF_VISIBLE, SLOT_NONE, ID_NONE }
+       from "../src/sim/world.hml";
+import { chunk_store_new_cap, chunk_set_source, chunk_pin_ring,
+         chunk_height_at, CHUNK_H_MISS }
+       from "../src/sim/chunk.hml";
+import { worldgen_chunk_at } from "../src/sim/worldgen.hml";
+import { cmd_new, cmd_set, cmd_yaw, cmd_pitch,
+         BTN_FIRE, BTN_SPRINT, BTN_JUMP }
+       from "../src/sim/command.hml";
+import { ai_spawn } from "../src/sim/ai.hml";
+import { move_px, move_py, move_pz, move_eye_y } from "../src/sim/movement.hml";
+import { sim_new_cap, sim_set_chunks, sim_add_player, sim_queue_command,
+         sim_step, sim_effects, sim_hash, sim_chunks, sim_ai,
+         sim_player_id, sim_predicted, sim_steps, sim_fx_count, sim_fx_total,
+         sim_accum_new, sim_accum_advance, sim_accum_alpha, sim_accum_ticks,
+         sim_stat_shots, sim_stat_cmds_applied,
+         SIM_LANTERN_UNLIT }
+       from "../src/sim/sim.hml";
+import { rsnap_new_cap, rsnap_build, rsnap_set_viewer, rsnap_set_cull_radius,
+         rsnap_count, rsnap_cam_x, rsnap_cam_y, rsnap_cam_z, rsnap_cam_yaw,
+         rsnap_cam_pitch, rsnap_field_x, rsnap_field_y, rsnap_field_z,
+         rsnap_field_yaw, rsnap_field_flags, rsnap_field_model }
+       from "../src/render/render_snapshot.hml";
+
+// ===========================================================================
+//  0. HARNESS
+// ===========================================================================
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_gate: i32 = 1;
+let g_notes: array = [];
+
+fn ok(p_label: string, p_cond: bool) {
+    g_n = g_n + 1;
+    if (p_cond) { g_pass = g_pass + 1; print(`  PASS  ${p_label}`); }
+    else { print(`  FAIL  ${p_label}`); }
+}
+fn note(p_s: string) { g_notes.push(p_s); }
+
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: f64 = floor(x * 1000.0 + 0.5);
+    let whole: i64 = i64(scaled / 1000.0);
+    let frac: i64 = i64(scaled) - whole * 1000;
+    let fs: string = `${frac}`;
+    while (fs.length < 3) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    let out: string = s;
+    return out;
+}
+
+fn f1(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: f64 = floor(x * 10.0 + 0.5);
+    let whole: i64 = i64(scaled / 10.0);
+    let frac: i64 = i64(scaled) - whole * 10;
+    let s: string = `${whole}.${frac}`;
+    if (neg == 1) { s = `-${s}`; }
+    let out: string = s;
+    return out;
+}
+
+fn pad(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = `${s} `; }
+    let out: string = s;
+    return out;
+}
+fn padl(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = ` ${s}`; }
+    let out: string = s;
+    return out;
+}
+
+// Resident set size, in KB. `read_file` returns empty on procfs (the file
+// reports size 0), so it is read through a raw fd — the same recipe
+// `tools/probe_rsnap.hml` uses for its own allocation gate.
+fn rss_kb(): i32 {
+    let fd: i32 = open_fd("/proc/self/statm", "r");
+    if (fd < 0) { let e: i32 = -1; return e; }
+    let s: string = __read_fd(fd, 256);
+    __close_fd(fd);
+    let parts = s.split(" ");
+    if (parts.length < 2) { let e2: i32 = -2; return e2; }
+    let pages: i32 = i32(parts[1]);
+    let out: i32 = pages * 4;
+    return out;
+}
+
+fn running_interpreted(): bool {
+    if (args.length < 1) { return false; }
+    let a0: string = args[0];
+    let out: bool = a0.ends_with(".hml");
+    return out;
+}
+
+// ===========================================================================
+//  1. FIXED SHAPE
+// ===========================================================================
+
+let g_VERSION: string = "benchframe.hml W4-13";
+
+let g_FRAMES: i32 = 90;          // frames per trial
+let g_TRIALS: i32 = 7;           // RULE T
+let g_WARM: i32 = 12;            // frames discarded before every trial
+
+// 16 m chunks of 4x4 four-metre quads = 32 triangles each. NOT walk.hml's 32 m
+// chunk: `world_render.hml`'s terrain path has no LOD, so the chunk edge IS the
+// culling granularity, and a 32 m chunk that passes a bounding-sphere test
+// against a 70-degree frustum drags 128 triangles in with it. At 16 m the ring
+// walk rejects far more and the ground lands near W3-4's designed
+// "(pi/4)*FOG_FAR^2/16*2 +-15 %", which is what a bench should be measuring.
+let g_CHUNK_Q: i32 = 4;          // quads per chunk edge -> 32 tris
+let g_QUAD_M: f64 = 4.0;
+let g_CHUNK_M: f64 = 16.0;
+let g_RING: i32 = 5;             // (2*5+1)^2 = 121 chunks, 176 m across
+let g_SEED: i32 = 1337;
+
+// The bench camera walks a closed loop so terrain and props stream through the
+// frustum every frame — a static camera benches a cache, not a renderer.
+let g_PATH_R: f64 = 26.0;
+// The loop is EXACTLY g_PATH_N frames long and the camera is a function of
+// (frame index mod g_PATH_N), so the worst frame is a property of the world and
+// not of how many frames someone asked for. The triangle peak is swept over one
+// whole loop before the timing trials, for the same reason: a budget is a
+// worst-case promise and a peak taken over half a lap keeps half a promise.
+let g_PATH_N: i32 = 360;
+
+let g_DAY_T: f64 = 0.5625;       // 18:00, dusk — the frame GATE 4 is judged on
+let g_WX: i32 = 0;               // WX_CLEAR
+
+// ===========================================================================
+//  2. ART
+// ===========================================================================
+
+let g_atlas_world = null;
+let g_atlas_fx = null;
+let g_atlas_hud = null;
+let g_tex_world = null;
+let g_tex_fx = null;
+let g_tex_hud = null;
+let g_tex_sky = null;
+let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_skyk: array<f64> = [];
+let g_todsky: array<f64> = [];
+let g_boot_ms: f64 = 0.0;
+
+fn art_bind_materials() {
+    meshgen_set_material_uv(MG_MAT_BARK, 0.0, 0.0, 0.0, 0.0);
+    let pairs: array<i32> = [
+        MG_MAT_BARK, 18, MG_MAT_LEAF, 20, MG_MAT_STONE, 8,
+        MG_MAT_WOOD, 16, MG_MAT_METAL, 27, MG_MAT_CONCRETE, 24,
+        MG_MAT_CLOTH, 35, MG_MAT_HIDE, 17, MG_MAT_DIRT, 3,
+        MG_MAT_GLASS, 38
+    ];
+    let n: i32 = pairs.length;
+    for (let i = 0; i < n; i = i + 2) {
+        atlas_cell_uv(g_atlas_world, pairs[i + 1], g_uvq, 0);
+        meshgen_set_material_uv(pairs[i], g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3]);
+    }
+}
+
+fn art_build(p_win) {
+    let b0: u64 = clock_now();
+    g_atlas_world = atlas_new(g_ATLAS_WORLD_PX, g_ATLAS_WORLD_PX,
+                              g_ATLAS_WORLD_CELLS, g_ATLAS_WORLD_CELLS);
+    texgen_build_world_atlas(g_atlas_world, g_SEED);
+    g_atlas_fx = fxgen_build_atlas();
+    g_atlas_hud = hudgen_build_atlas();
+    hudgen_uv(HUD_SOLID, g_uvw, 0);
+    art_bind_materials();
+    meshgen_build_all();
+
+    skygen_init();
+    skygen_set_clock(0.0);          // no wall clock ever reaches the bake
+    g_skyk = skygen_keys_new();
+    g_todsky = [];
+    for (let i = 0; i < TODSKY_COUNT; i++) { g_todsky.push(0.0); }
+
+    g_tex_world = atlas_upload(p_win, g_atlas_world, BLEND_BLEND);
+    g_tex_fx = atlas_upload(p_win, g_atlas_fx, BLEND_ADD);
+    g_tex_hud = atlas_upload(p_win, g_atlas_hud, BLEND_BLEND);
+    g_tex_sky = skygen_build(p_win);
+    g_boot_ms = clock_ms_between(b0, clock_now());
+}
+
+// The tod <-> skygen unit bridge. `tod_sky_keys` hands out 0..1; skygen's key
+// block is 0..255. walk.hml and shot.hml both carry this same eight lines and
+// both flagged it; this is the third caller and it flags it too. Reported, not
+// patched — neither art module is this task's file.
+fn sky_keys_from_tod(p_env: array<f64>) {
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(p_env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(p_env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(p_env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+}
+
+// ===========================================================================
+//  3. THE GROUND
+// ---------------------------------------------------------------------------
+//  A bench needs the ground's COST, which is a function of triangle count,
+//  texture-run count and bounding-sphere culling — not of which grass cell a
+//  quad picks. So the material rule here is deliberately the simplest thing
+//  that still produces several texture runs and per-vertex colour variation:
+//  slope picks cliff, a low-frequency noise field picks between two grasses and
+//  dirt, and the vertex colour is a continuous field so nothing is flat.
+//  `tools/shot.hml` owns what the ground LOOKS like.
+// ===========================================================================
+
+fn ground_cell(p_x: f64, p_z: f64, p_slope: f64): i32 {
+    if (p_slope > 0.55) { let c: i32 = CELL_CLIFF; return c; }
+    let n: f64 = vnoise2(p_x * 0.045, p_z * 0.045, g_SEED + 11);
+    if (n > 0.62) { let a: i32 = CELL_DIRT; return a; }
+    if (n > 0.38) { let b: i32 = CELL_GRASS_B; return b; }
+    let d: i32 = CELL_GRASS_A;
+    return d;
+}
+
+fn ground_vcol(p_x: f64, p_z: f64, p_slope: f64): i32 {
+    if (p_slope > 0.55) {
+        let v: f64 = vnoise2(p_x * 0.08, p_z * 0.08, g_SEED + 5);
+        if (v > 0.5) { let s: i32 = g_STONE_HI; return s; }
+        let s2: i32 = g_STONE_MID;
+        return s2;
+    }
+    let n: f64 = vnoise2(p_x * 0.032, p_z * 0.032, g_SEED + 7);
+    if (n > 0.66) { let a: i32 = g_DIRT_MID; return a; }
+    if (n > 0.55) { let b: i32 = g_DIRT_LO; return b; }
+    if (n > 0.30) { let c: i32 = g_GRASS_DRY; return c; }
+    let d: i32 = g_GRASS_MID;
+    return d;
+}
+
+let g_cc_mesh: array = [];
+let g_cc_cx: array<i32> = [];
+let g_cc_cz: array<i32> = [];
+let g_cc_cy: array<f64> = [];
+
+fn chunk_mesh_build(p_slot: i32, p_cx: i32, p_cz: i32) {
+    let q: i32 = g_CHUNK_Q;
+    let m = g_cc_mesh[p_slot];
+    mesh_begin(m);
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    for (let j = 0; j < q; j++) {
+        for (let i = 0; i < q; i++) {
+            let x0: f64 = ox + f64(i) * g_QUAD_M;
+            let z0: f64 = oz + f64(j) * g_QUAD_M;
+            let x1: f64 = x0 + g_QUAD_M;
+            let z1: f64 = z0 + g_QUAD_M;
+            let y00: f64 = terrain_h(x0, z0);
+            let y10: f64 = terrain_h(x1, z0);
+            let y11: f64 = terrain_h(x1, z1);
+            let y01: f64 = terrain_h(x0, z1);
+            let dy: f64 = y10 - y00; if (dy < 0.0) { dy = 0.0 - dy; }
+            let dz: f64 = y01 - y00; if (dz < 0.0) { dz = 0.0 - dz; }
+            let slope: f64 = (dy + dz) / g_QUAD_M;
+            let cell: i32 = ground_cell(x0, z0, slope);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            let nx0: f64 = terrain_h(x0 - 1.0, z0) - terrain_h(x0 + 1.0, z0);
+            let nz0: f64 = terrain_h(x0, z0 - 1.0) - terrain_h(x0, z0 + 1.0);
+            let nx1: f64 = terrain_h(x1 - 1.0, z1) - terrain_h(x1 + 1.0, z1);
+            let nz1: f64 = terrain_h(x1, z1 - 1.0) - terrain_h(x1, z1 + 1.0);
+            let s0: f64 = clamp01(sqrt(nx0 * nx0 + nz0 * nz0) * 0.55);
+            let s1: f64 = clamp01(sqrt(nx1 * nx1 + nz1 * nz1) * 0.55);
+            let k00: i32 = ground_vcol(x0, z0, s0);
+            let k10: i32 = ground_vcol(x1, z0, s0);
+            let k11: i32 = ground_vcol(x1, z1, s1);
+            let k01: i32 = ground_vcol(x0, z1, s1);
+            let a = mesh_vert_n(m, x0 - ox, y00, z0 - oz, u0, v0,
+                                pal_r(k00), pal_g(k00), pal_b(k00), nx0, 2.0, nz0);
+            let b = mesh_vert_n(m, x1 - ox, y10, z0 - oz, u1, v0,
+                                pal_r(k10), pal_g(k10), pal_b(k10), nx1, 2.0, nz0);
+            let c = mesh_vert_n(m, x1 - ox, y11, z1 - oz, u1, v1,
+                                pal_r(k11), pal_g(k11), pal_b(k11), nx1, 2.0, nz1);
+            let d = mesh_vert_n(m, x0 - ox, y01, z1 - oz, u0, v1,
+                                pal_r(k01), pal_g(k01), pal_b(k01), nx0, 2.0, nz1);
+            mesh_quad(m, a, b, c, d);
+        }
+    }
+    mesh_end(m);
+    g_cc_cx[p_slot] = p_cx;
+    g_cc_cz[p_slot] = p_cz;
+    g_cc_cy[p_slot] = terrain_h(ox + g_CHUNK_M * 0.5, oz + g_CHUNK_M * 0.5);
+}
+
+// ===========================================================================
+//  4. PROPS — the real meshgen assets, at a deterministic density.
+// ===========================================================================
+
+let g_PROP_TRIES: i32 = 2;      // candidates per chunk; tuned to sit ON the 2500-tri budget
+
+let g_pr_kind: array<i32> = [];
+let g_pr_x: array<f64> = [];
+let g_pr_y: array<f64> = [];
+let g_pr_z: array<f64> = [];
+let g_pr_yaw: array<f64> = [];
+let g_pr_s: array<f64> = [];
+
+fn prop_kind_of(p_r: f64): i32 {
+    if (p_r < 0.30) { let a: i32 = MESH_TREE0; return a; }
+    if (p_r < 0.46) { let b: i32 = MESH_TREE1; return b; }
+    if (p_r < 0.56) { let c: i32 = MESH_TREE2; return c; }
+    if (p_r < 0.74) { let d: i32 = MESH_BUSH; return d; }
+    if (p_r < 0.86) { let e: i32 = MESH_ROCK; return e; }
+    if (p_r < 0.92) { let f: i32 = MESH_CRATE; return f; }
+    if (p_r < 0.97) { let g: i32 = MESH_BARREL; return g; }
+    let h: i32 = MESH_LANTERN;
+    return h;
+}
+
+fn props_gen() {
+    g_pr_kind = []; g_pr_x = []; g_pr_y = []; g_pr_z = [];
+    g_pr_yaw = []; g_pr_s = [];
+    for (let cz = 0 - g_RING; cz <= g_RING; cz++) {
+        for (let cx = 0 - g_RING; cx <= g_RING; cx++) {
+            for (let k = 0; k < g_PROP_TRIES; k++) {
+                let rx: f64 = h2(cx * 131 + k * 17, cz * 71 + k * 29, g_SEED + 3);
+                let rz: f64 = h2(cx * 197 + k * 41, cz * 113 + k * 7, g_SEED + 9);
+                let rk: f64 = h2(cx * 53 + k * 61, cz * 149 + k * 13, g_SEED + 21);
+                if (rk > 0.86) { continue; }          // ~14 % of candidates rejected
+                let x: f64 = f64(cx) * g_CHUNK_M + rx * g_CHUNK_M;
+                let z: f64 = f64(cz) * g_CHUNK_M + rz * g_CHUNK_M;
+                let ry: f64 = h2(i32(x * 4.0), i32(z * 4.0), g_SEED + 33);
+                let rs: f64 = h2(i32(z * 4.0), i32(x * 4.0), g_SEED + 47);
+                g_pr_kind.push(prop_kind_of(rk / 0.86));
+                g_pr_x.push(x);
+                g_pr_y.push(terrain_h(x, z));
+                g_pr_z.push(z);
+                g_pr_yaw.push(ry * 360.0);
+                g_pr_s.push(0.85 + rs * 0.40);
+            }
+        }
+    }
+}
+
+// ===========================================================================
+//  5. THE SIMULATION — the real one (W4-9), over the real worldgen.
+// ===========================================================================
+
+let g_sim = null;
+let g_accum = null;
+let g_rsnap = null;
+let g_cmd1 = null;
+let g_cmd2 = null;
+let g_sim_tick: i32 = 0;
+
+fn ns_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                   p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let out: i32 = worldgen_chunk_at(p_seed, p_cx, p_cz, p_hbuf, p_hoff, p_abuf, p_aoff);
+    return out;
+}
+
+fn spawn_static(p_w: object, p_kind: i32, p_x: f64, p_z: f64, p_model: i32): i32 {
+    let w: object = p_w;
+    let slot: i32 = world_spawn(w, p_kind, 0);
+    if (slot == SLOT_NONE) { let bad: i32 = ID_NONE; return bad; }
+    let px = w.px; let py = w.py; let pz = w.pz;
+    let anim = w.anim; let flags = w.flags; let model = w.model;
+    let h: f64 = chunk_height_at(sim_chunks(w), p_x, p_z);
+    if (h <= CHUNK_H_MISS) { h = 0.0; }
+    px[slot] = p_x; py[slot] = h; pz[slot] = p_z;
+    anim[slot] = SIM_LANTERN_UNLIT;
+    model[slot] = p_model;
+    flags[slot] = flags[slot] | EF_VISIBLE;
+    let out: i32 = world_id_of(w, slot);
+    return out;
+}
+
+fn sim_build() {
+    let cs: object = chunk_store_new_cap(64, 256, g_SEED);
+    chunk_set_source(cs, ns_chunk_source);
+    chunk_pin_ring(cs, 0, 0, 2);
+    let w: object = sim_new_cap(256, 2, g_SEED);
+    sim_set_chunks(w, cs);
+    sim_add_player(w, 1, 0.0, 0.0);
+    sim_add_player(w, 2, 5.0, 1.0);
+
+    // Eight steered agents, the director's shipping alive-cap ballpark, on a
+    // deterministic ring so every AI stage does real work every tick.
+    let ai: object = sim_ai(w);
+    for (let i = 0; i < 6; i++) {
+        let ang: f64 = f64(i) * 1.0471975511965976;
+        let rad: f64 = 8.0 + f64(i % 3) * 3.0;
+        let x: f64 = rad * cos(ang);
+        let z: f64 = rad * sin(ang);
+        let h: f64 = chunk_height_at(cs, x, z);
+        if (h <= CHUNK_H_MISS) { h = 0.0; }
+        let kind: i32 = g_ENEMY_WISP;
+        if (i % 4 == 3) { kind = g_ENEMY_HUSK; }
+        ai_spawn(ai, w, kind, x, h, z, 0.0);
+    }
+    spawn_static(w, KIND_LANTERN, 1.0, 0.6, 90);
+    spawn_static(w, KIND_PICKUP, 0.8, 0.4, 120);
+    g_sim = w;
+
+    g_accum = sim_accum_new();
+    g_rsnap = rsnap_new_cap(256);
+    rsnap_set_viewer(g_rsnap, sim_player_id(w, 1));
+    rsnap_set_cull_radius(g_rsnap, g_FOG_FAR_CAP);
+    g_cmd1 = cmd_new();
+    g_cmd2 = cmd_new();
+    g_sim_tick = 0;
+}
+
+// One tick of scripted input. Deterministic: a function of the tick alone, so
+// two runs of the bench step the identical simulation and `sim_hash` proves it.
+fn sim_drive_tick() {
+    let t: i32 = g_sim_tick;
+    let ft: f64 = f64(t);
+    let yaw: f64 = ft * 0.011;
+    let pitch: f64 = sin(ft * 0.017) * 0.18;
+    let btn: i32 = 0;
+    if (t % 9 == 0) { btn = btn | BTN_FIRE; }
+    if ((t / 40) % 2 == 0) { btn = btn | BTN_SPRINT; }
+    if (t % 97 == 0) { btn = btn | BTN_JUMP; }
+    // cmd_set(c, tick, dt_ms, move_x, move_y, yaw_rad, pitch_rad, buttons,
+    //         weapon, seq) — move_* are in [-1,1] and are quantized in cmd_set.
+    cmd_set(g_cmd1, t, 17, 0.95, 0.30, yaw, pitch, btn, 4, t);
+    cmd_set(g_cmd2, t, 17, -0.70, 0.70, 0.0 - yaw, 0.0 - pitch, 0, 0, t);
+    sim_queue_command(g_sim, 1, g_cmd1);
+    sim_queue_command(g_sim, 2, g_cmd2);
+    sim_step(g_sim, t);
+    sim_effects(g_sim);
+    g_sim_tick = t + 1;
+}
+
+// ===========================================================================
+//  6. THE FRAME — stages 6, 7 and 24 are the caller's (ARCHITECTURE §5.6b);
+//     8..23 and 25..28 belong to world_render.hml and to nothing else.
+// ===========================================================================
+
+let g_win = null;
+let g_target = null;
+let g_fb: ptr = alloc(320 * 240 * 4);
+
+let g_camx: f64 = 0.0;
+let g_camy: f64 = 2.0;
+let g_camz: f64 = 26.0;
+let g_yaw: f64 = 180.0;
+let g_pitch: f64 = -4.0;
+let g_fov: f64 = 70.0;
+let g_ground_y: f64 = 0.0;
+let g_fog_far: f64 = 64.0;
+let g_theta: f64 = 0.0;
+let g_frame_i: i32 = 0;
+
+let g_opt_vm: i32 = 1;
+let g_opt_hud: i32 = 1;
+let g_opt_fx: i32 = 1;
+let g_opt_props: i32 = 1;
+let g_fog_alpha_override: f64 = -1.0;
+
+// The __clock() column, in seconds, accumulated over a trial.
+let g_cpu_frame: f64 = 0.0;
+let g_cpu_sim: f64 = 0.0;
+
+fn tod_step() {
+    let env: array<f64> = frame_env();
+    tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
+    tod_eval(env, g_DAY_T, g_WX);
+    env_set_camera(env, g_camx, g_camy, g_camz);
+    let fnear: f64 = env_field(env, ENV_FOG_NEAR);
+    let ffar: f64 = env_field(env, ENV_FOG_FAR);
+    if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (ffar < 14.0) { ffar = 14.0; }
+    if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
+    let amax: f64 = env_field(env, ENV_FOG_ALPHA_MAX);
+    if (g_fog_alpha_override >= 0.0) { amax = g_fog_alpha_override; }
+    env_set_fog(env, fnear, ffar,
+                env_field(env, ENV_FOG_R), env_field(env, ENV_FOG_G),
+                env_field(env, ENV_FOG_B), amax);
+    g_fog_far = ffar;
+
+    // The two dynamic light slots the budget affords (BUDGET_ACTUAL: cap 2):
+    // a lantern the camera orbits and a muzzle flash while firing.
+    env_clear_lights(env);
+    env_add_light(env, 1.0, terrain_h(1.0, 0.6) + 1.6, 0.6,
+                  1.00, 0.72, 0.38, 9.0);
+    if (g_frame_i % 9 == 0) {
+        env_add_light(env, g_camx, g_camy, g_camz, 1.0, 0.86, 0.55, 6.0);
+    }
+    stat_set(STAT_LIGHTS, env_light_count(env));
+    sky_keys_from_tod(env);
+}
+
+// The world registry, rebuilt every frame from the cached chunk meshes and the
+// prop table — the same per-frame push-only rebuild walk.hml settled on.
+fn world_rebuild() {
+    world_clear();
+    let n: i32 = g_cc_mesh.length;
+    for (let i = 0; i < n; i++) {
+        let ox: f64 = f64(g_cc_cx[i]) * g_CHUNK_M;
+        let oz: f64 = f64(g_cc_cz[i]) * g_CHUNK_M;
+        world_chunk_add(g_cc_mesh[i], ox, oz,
+                        ox + g_CHUNK_M * 0.5, g_cc_cy[i], oz + g_CHUNK_M * 0.5,
+                        12.0);
+    }
+    if (g_opt_props != 0) {
+        let np: i32 = g_pr_kind.length;
+        for (let k = 0; k < np; k++) {
+            let dx: f64 = g_pr_x[k] - g_camx;
+            let dz: f64 = g_pr_z[k] - g_camz;
+            if (dx * dx + dz * dz > (g_fog_far + 6.0) * (g_fog_far + 6.0)) { continue; }
+            let kind: i32 = g_pr_kind[k];
+            let m0 = meshgen_mesh(kind);
+            world_prop_add(m0, m0, m0, 18.0, g_LOD_FOG_CARD,
+                           meshgen_radius(kind),
+                           g_pr_x[k], g_pr_y[k], g_pr_z[k],
+                           g_pr_yaw[k], g_pr_s[k],
+                           255, 255, 255, 1.0, kind);
+        }
+    }
+    // The sim's own entities, read out of the RenderSnapshot — the sim/render
+    // seam, exercised every frame rather than described in a comment.
+    let ne: i32 = rsnap_count(g_rsnap);
+    let ex: array<f64> = rsnap_field_x(g_rsnap);
+    let ey: array<f64> = rsnap_field_y(g_rsnap);
+    let ez: array<f64> = rsnap_field_z(g_rsnap);
+    let eyaw: array<f64> = rsnap_field_yaw(g_rsnap);
+    let npc = meshgen_mesh(MESH_NPC);
+    let nrad: f64 = meshgen_radius(MESH_NPC);
+    for (let e = 0; e < ne; e++) {
+        world_prop_add(npc, npc, npc, 20.0, g_LOD_FOG_CARD, nrad,
+                       ex[e], ey[e], ez[e], eyaw[e] * 57.29577951308232, 1.0,
+                       255, 235, 210, 0.9, MESH_NPC);
+    }
+    if (g_opt_fx != 0) {
+        // Ember motes on a deterministic drift + a rain band. The FX layer is
+        // where a frame's cost hides, so the bench keeps it populated.
+        for (let f = 0; f < 36; f++) {
+            let a: f64 = f64(f) * 0.7 + g_theta * 2.0;
+            let r: f64 = 3.0 + f64(f % 7) * 1.6;
+            let fx: f64 = g_camx + cos(a) * r;
+            let fz: f64 = g_camz + sin(a) * r;
+            let fy: f64 = terrain_h(fx, fz) + 0.8 + f64(f % 5) * 0.45;
+            world_fx_add(fx, fy, fz, 0.16, FX_EMBER, g_FXK_SPRITE,
+                         255, 176, 96, 210);
+        }
+        for (let g = 0; g < 18; g++) {
+            let a2: f64 = f64(g) * 1.31 + g_theta;
+            let r2: f64 = 2.0 + f64(g % 5) * 2.2;
+            let gx: f64 = g_camx + cos(a2) * r2;
+            let gz: f64 = g_camz + sin(a2) * r2;
+            world_fx_add(gx, terrain_h(gx, gz) + 2.4 + f64(g % 4) * 0.5, gz,
+                         0.05, FX_RAIN, g_FXK_RAIN, 190, 205, 225, 130);
+        }
+        world_fx_add(1.0, terrain_h(1.0, 0.6) + 1.6, 0.6, 1.1,
+                     FX_GLOW_L, g_FXK_SPRITE, 255, 190, 110, 190);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 24 — the caller's HUD. ART_BIBLE §9's shape, capped at 250 triangles.
+// ---------------------------------------------------------------------------
+let g_bhud = null;
+let g_l1: string = "";
+let g_l2: string = "";
+let g_l3: string = "";
+
+// quad_screen_uv's rect is (x, y, WIDTH, HEIGHT) — not two corners.
+let g_hrect: array<i32> = [0, 0, 0, 0];
+
+fn hud_rect(p_x: f64, p_y: f64, p_w: f64, p_h: f64, p_c: i32, p_a: i32): i32 {
+    let u: f64 = (g_uvw[0] + g_uvw[2]) * 0.5;
+    let v: f64 = (g_uvw[1] + g_uvw[3]) * 0.5;
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y, p_w, p_h,
+                                  u, v, u, v,
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
+
+fn hud_sprite(p_id: i32, p_x: f64, p_y: f64, p_c: i32, p_a: i32): i32 {
+    hudgen_uv(p_id, g_uvq, 0);
+    hudgen_rect(p_id, g_hrect, 0);
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y,
+                                  f64(g_hrect[2]), f64(g_hrect[3]),
+                                  g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3],
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
+
+// 1-px UI_BLACK shadow at (+1,+1), always (CLAUDE.md §9 rule 8).
+fn hud_text(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    let out: i32 = font_text_shadowed(hud_font_micro(), g_bhud, g_tex_hud,
+                                      p_x, p_y, p_s,
+                                      pal_r(p_c), pal_g(p_c), pal_b(p_c), 255,
+                                      pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
+                                      pal_b(g_UI_BLACK), 255, 1.0, 1.0, p_budget);
+    return out;
+}
+
+fn hud_build() {
+    if (g_opt_hud == 0) { return; }
+    let cx: f64 = f64(g_RES_W) * 0.5;
+    let cy: f64 = f64(g_RES_H) * 0.5;
+    // crosshair, with the spread bloom the weapon state drives
+    hud_sprite(HUD_XH_TICK_H, cx - 10.0, cy - 1.0, g_UI_WHITE, 255);
+    hud_sprite(HUD_XH_TICK_H, cx + 4.0, cy - 1.0, g_UI_WHITE, 255);
+    hud_sprite(HUD_XH_TICK_V, cx - 1.0, cy - 10.0, g_UI_WHITE, 255);
+    hud_sprite(HUD_XH_TICK_V, cx - 1.0, cy + 4.0, g_UI_WHITE, 255);
+    hud_sprite(HUD_XH_DOT, cx - 1.0, cy - 1.0, g_UI_WHITE, 255);
+    // compass
+    hud_rect(cx - 46.0, 4.0, 92.0, 9.0, g_UI_BLACK, 170);
+    for (let i = 0; i < 8; i++) {
+        let ang: f64 = f64(i) * 11.0 - 40.0;
+        let id: i32 = HUD_TICK_MINOR;
+        if (i % 4 == 0) { id = HUD_TICK_MAJOR; }
+        hud_sprite(id, cx + ang, 5.0, g_UI_DIM, 255);
+    }
+    hud_sprite(HUD_CHEVRON, cx - 2.0, 2.0, g_UI_AMBER, 255);
+    // health / ammo plates + the readout the bench exists to print
+    hud_rect(2.0, 15.0, 84.0, 27.0, g_UI_BLACK, 180);
+    hud_text(4.0, 17.0, g_l1, g_UI_GOOD, 60);
+    hud_text(4.0, 25.0, g_l2, g_UI_WHITE, 60);
+    hud_text(4.0, 33.0, g_l3, g_UI_DIM, 60);
+    hud_rect(4.0, 226.0, 60.0, 5.0, g_UI_DANGER, 200);
+    hud_rect(256.0, 226.0, 60.0, 5.0, g_UI_AMBER, 200);
+    hud_sprite(HUD_ICON_LANTERN, 4.0, 210.0, g_UI_AMBER, 255);
+}
+
+fn hud_strings() {
+    g_l1 = `TRI ${stat_get(STAT_TRIS_SUBMITTED)}/${g_TRIS_STEADY}`;
+    g_l2 = `MS  ${f3(stat_ms(STAT_T_FRAME))}`;
+    g_l3 = `DC  ${stat_get(STAT_DRAW_CALLS)}  E ${stat_get(STAT_ENTS_DRAWN)}`;
+}
+
+// ---------------------------------------------------------------------------
+// ONE FRAME. The six calls, in ARCHITECTURE §4's order.
+// ---------------------------------------------------------------------------
+fn frame_once() {
+    let c0: f64 = __clock();
+    frame_begin();
+
+    // -- 1..3  input + the fixed-timestep sim -------------------------------
+    // The accumulator is fed a CONSTANT tick-length frame, not the wall clock.
+    // A bench must step the identical simulation on every trial or the sim
+    // column measures scheduler noise; `sim_hash` is asserted equal across
+    // trials, which is only meaningful if the tick count is too.
+    stat_begin(STAT_T_SIM);
+    let cs0: f64 = __clock();
+    let due: i32 = sim_accum_advance(g_accum, g_TICK_MS);
+    let t: i32 = 0;
+    while (t < due) { sim_drive_tick(); t++; }
+    g_cpu_sim = g_cpu_sim + (__clock() - cs0);
+    stat_end(STAT_T_SIM);
+    stat_set(STAT_SIM_TICKS, due);
+
+    // -- 4  the render snapshot, interpolated ------------------------------
+    stat_begin(STAT_T_SNAPSHOT);
+    rsnap_build(g_rsnap, g_sim, sim_accum_alpha(g_accum));
+    stat_end(STAT_T_SNAPSHOT);
+
+    // -- the camera: a closed loop over the terrain -------------------------
+    g_theta = 6.283185307179586 * f64(g_frame_i % g_PATH_N) / f64(g_PATH_N);
+    g_camx = cos(g_theta) * g_PATH_R;
+    g_camz = sin(g_theta) * g_PATH_R;
+    g_ground_y = terrain_h(g_camx, g_camz);
+    g_camy = g_ground_y + 1.62;
+    g_yaw = 0.0 - g_theta * 57.29577951308232 + 90.0;
+    g_pitch = sin(g_theta * 3.0) * 6.0 - 2.0;
+
+    // -- 6  tod_eval -> the frame graph's RenderEnv -------------------------
+    stat_begin(STAT_T_TOD);
+    tod_step();
+    emit_set_env(frame_env());
+    stat_end(STAT_T_TOD);
+
+    // -- the caller's world registry ---------------------------------------
+    // Timed on clock_now(), not __clock(), for the reason in this file's
+    // header: stat.hml's whole table is on the performance counter and the
+    // columns have to add up.
+    let w0: u64 = clock_now();
+    world_rebuild();
+    g_ms_world = g_ms_world + clock_ms_between(w0, clock_now());
+
+    // -- 7  the rolling sky re-bake, one slice a frame ----------------------
+    stat_begin(STAT_T_SKYBAKE);
+    let rows: i32 = 0;
+    if (skygen_dirty_rows() > 0) { rows = skygen_rebake_slice(); }
+    stat_end(STAT_T_SKYBAKE);
+    stat_set(STAT_SKY_ROWS, rows);
+
+    frame_set_camera(g_camx, g_camy, g_camz, g_yaw, g_pitch, g_fov);
+    frame_set_clear(g_skyk[SKYK_ZEN], g_skyk[SKYK_ZEN + 1], g_skyk[SKYK_ZEN + 2]);
+    frame_set_options(0, g_opt_vm, 0);
+
+    // -- 8..23  the frame graph. THE ONLY ONE. -----------------------------
+    // Bracketed on the caller's clock as well, so the residual can be
+    // ATTRIBUTED rather than guessed at: `frame_render` wall minus the stage
+    // timers inside it is whatever world_render.hml leaves untimed, and the
+    // same for `frame_present`.
+    let r0: u64 = clock_now();
+    frame_render();
+    g_ms_fr = g_ms_fr + clock_ms_between(r0, clock_now());
+
+    // -- 24  the caller's HUD ----------------------------------------------
+    stat_begin(STAT_T_HUD);
+    hud_strings();
+    hud_build();
+    stat_end(STAT_T_HUD);
+
+    // -- 25..28  flush, readback, present, stats ---------------------------
+    let p0: u64 = clock_now();
+    frame_present();
+    g_ms_fp = g_ms_fp + clock_ms_between(p0, clock_now());
+    g_cpu_frame = g_cpu_frame + (__clock() - c0);
+    g_frame_i = g_frame_i + 1;
+}
+
+let g_ms_world: f64 = 0.0;
+let g_ms_fr: f64 = 0.0;      // wall time inside frame_render()
+let g_ms_fp: f64 = 0.0;      // wall time inside frame_present()
+
+// ===========================================================================
+//  7. THE TRIAL LOOP — min of N, per RULE T.
+// ===========================================================================
+
+// Accumulators, one slot per stat.hml timer, plus the derived rows.
+let g_acc: array<f64> = [];
+let g_best: array<f64> = [];
+let g_best_cpu: f64 = 1000000.0;
+let g_best_cpu_sim: f64 = 1000000.0;
+let g_best_world: f64 = 1000000.0;
+let g_best_fr: f64 = 1000000.0;
+let g_best_fp: f64 = 1000000.0;
+
+// Counter snapshots from the last frame of the last trial, plus running peaks.
+let g_rb_ms: f64 = 0.0;      // one measured 320x240 ARGB8888 readback, ms
+let g_resid_ms: f64 = 0.0;   // frame - every timer, ms
+
+// explained / residual. 1.0 means the stage table plus the two measured
+// untimed quantities account for the whole frame.
+fn rb_best_ratio(): f64 {
+    if (g_resid_ms == 0.0) { let z: f64 = 1.0; return z; }
+    let out: f64 = g_rb_ms / g_resid_ms;
+    return out;
+}
+
+let g_peak_tris: i32 = 0;
+let g_peak_drawn: i32 = 0;
+let g_peak_draw: i32 = 0;
+let g_peak_hud: i32 = 0;
+let g_peak_fx: i32 = 0;
+let g_ovf_total: i32 = 0;
+let g_last_c: array<i32> = [];
+let g_hash_first: u64 = 0;
+let g_hash_last: u64 = 0;
+
+// Resets EVERY running minimum, not just the stage table's. g_best_fr and
+// g_best_fp were left out of the first version and the ablation's cheaper
+// configurations then poisoned them, so the residual attribution subtracted a
+// props-off frame_render() from a props-on stage table and reported a negative
+// untimed cost. Anything that is a min-so-far belongs in here.
+fn acc_init() {
+    g_acc = []; g_best = [];
+    for (let i = 0; i < STAT_T_COUNT; i++) { g_acc.push(0.0); g_best.push(1000000.0); }
+    g_best_cpu = 1000000.0;
+    g_best_cpu_sim = 1000000.0;
+    g_best_world = 1000000.0;
+    g_best_fr = 1000000.0;
+    g_best_fp = 1000000.0;
+}
+
+fn trial_run(p_frames: i32) {
+    for (let i = 0; i < STAT_T_COUNT; i++) { g_acc[i] = 0.0; }
+    g_cpu_frame = 0.0;
+    g_cpu_sim = 0.0;
+    g_ms_world = 0.0;
+    g_ms_fr = 0.0;
+    g_ms_fp = 0.0;
+    let f: i32 = 0;
+    while (f < p_frames) {
+        frame_once();
+        for (let i = 0; i < STAT_T_COUNT; i++) { g_acc[i] = g_acc[i] + stat_ms(i); }
+        // Peaks are over EVERY frame of every trial: a budget is a worst-case
+        // promise, and an average triangle count keeps no promise at all.
+        let tris: i32 = stat_get(STAT_TRIS_SUBMITTED);
+        if (tris > g_peak_tris) { g_peak_tris = tris; }
+        let drawn: i32 = stat_get(STAT_TRIS_DRAWN);
+        if (drawn > g_peak_drawn) { g_peak_drawn = drawn; }
+        let dc: i32 = stat_get(STAT_DRAW_CALLS);
+        if (dc > g_peak_draw) { g_peak_draw = dc; }
+        g_ovf_total = g_ovf_total + stat_get(STAT_BATCH_OVERFLOW);
+        f++;
+    }
+    let fm: f64 = f64(p_frames);
+    for (let i = 0; i < STAT_T_COUNT; i++) {
+        let per: f64 = g_acc[i] / fm;
+        if (per < g_best[i]) { g_best[i] = per; }
+    }
+    let cpu: f64 = g_cpu_frame * 1000.0 / fm;
+    if (cpu < g_best_cpu) { g_best_cpu = cpu; }
+    let cpus: f64 = g_cpu_sim * 1000.0 / fm;
+    if (cpus < g_best_cpu_sim) { g_best_cpu_sim = cpus; }
+    let wm: f64 = g_ms_world / fm;
+    if (wm < g_best_world) { g_best_world = wm; }
+    let frm: f64 = g_ms_fr / fm;
+    if (frm < g_best_fr) { g_best_fr = frm; }
+    let fpm: f64 = g_ms_fp / fm;
+    if (fpm < g_best_fp) { g_best_fp = fpm; }
+    g_last_c = [];
+    for (let c = 0; c < 33; c++) { g_last_c.push(stat_get(c)); }
+}
+
+// ===========================================================================
+//  8. THE STAGE TABLE
+// ===========================================================================
+
+// Derived rows the task names: sim, emit, sort, flush, present, HUD.
+fn ms_sort(): f64 {
+    let out: f64 = g_best[STAT_T_SORT_WORLD] + g_best[STAT_T_SORT_FX];
+    return out;
+}
+fn ms_flush(): f64 {
+    // flush.world contains a second (idempotent) sort — world_render.hml times
+    // the sort separately and says so in its stage-21 comment. Subtracting it
+    // gives the pure gather + SDL_RenderGeometry cost, which is what the
+    // "flush" budget in BUDGET_ACTUAL.md was measured as.
+    let w: f64 = g_best[STAT_T_FLUSH_WORLD] - g_best[STAT_T_SORT_WORLD];
+    if (w < 0.0) { w = 0.0; }
+    let f: f64 = g_best[STAT_T_FLUSH_FX] - g_best[STAT_T_SORT_FX];
+    if (f < 0.0) { f = 0.0; }
+    let out: f64 = g_best[STAT_T_FLUSH_SKY] + w + f + g_best[STAT_T_FLUSH_HUD];
+    return out;
+}
+// The RAW cost of the sort/flush stages: `flush.world` already contains an
+// (idempotent) second sort, so ms_flush()'s subtraction is the right number for
+// the BUDGET comparison but the wrong number for adding the frame up.
+fn ms_flush_raw(): f64 {
+    let out: f64 = g_best[STAT_T_FLUSH_SKY] + g_best[STAT_T_FLUSH_WORLD]
+                 + g_best[STAT_T_FLUSH_FX] + g_best[STAT_T_FLUSH_HUD];
+    return out;
+}
+
+// What `frame_render` spends outside its own eleven stage timers (stage 17's
+// overflow accounting, the emit_set_env at the top, the mesh/billboard state
+// pushes).
+fn ms_untimed_render(): f64 {
+    let inside: f64 = g_best[STAT_T_VIEW] + g_best[STAT_T_BATCH_RESET]
+                    + g_best[STAT_T_EMIT] + g_best[STAT_T_TARGET_BEGIN]
+                    + g_best[STAT_T_CLEAR] + g_best[STAT_T_FLUSH_SKY]
+                    + g_best[STAT_T_SORT_WORLD] + g_best[STAT_T_FLUSH_WORLD]
+                    + g_best[STAT_T_SORT_FX] + g_best[STAT_T_FLUSH_FX]
+                    + g_best[STAT_T_POSTFX];
+    let out: f64 = g_best_fr - inside;
+    return out;
+}
+
+// What `frame_present` spends outside stages 25 and 26-27: the
+// read_pixels_rect(320x240 ARGB8888) it makes between them, and nothing else.
+fn ms_readback(): f64 {
+    let out: f64 = g_best_fp - g_best[STAT_T_FLUSH_HUD] - g_best[STAT_T_PRESENT];
+    return out;
+}
+
+// Every timer this file or world_render.hml opens, summed once.
+fn ms_timed(): f64 {
+    let out: f64 = g_best[STAT_T_SIM] + g_best[STAT_T_SNAPSHOT] + g_best_world
+                 + g_best[STAT_T_TOD] + g_best[STAT_T_SKYBAKE]
+                 + g_best[STAT_T_VIEW] + g_best[STAT_T_BATCH_RESET]
+                 + g_best[STAT_T_EMIT] + g_best[STAT_T_TARGET_BEGIN]
+                 + g_best[STAT_T_CLEAR] + ms_sort() + ms_flush_raw()
+                 + g_best[STAT_T_POSTFX] + g_best[STAT_T_HUD]
+                 + g_best[STAT_T_PRESENT];
+    return out;
+}
+
+fn ms_render(): f64 {
+    // ARCHITECTURE §8's "render" line: emit + sort + flush + present, plus the
+    // three small stages that sit between them and belong to no other budget.
+    let out: f64 = g_best[STAT_T_VIEW] + g_best[STAT_T_EMIT] + ms_sort()
+                 + ms_flush_raw() + g_best[STAT_T_TARGET_BEGIN] + g_best[STAT_T_CLEAR]
+                 + g_best[STAT_T_POSTFX] + g_best[STAT_T_PRESENT];
+    return out;
+}
+
+fn row(p_stage: string, p_name: string, p_ms: f64, p_frame: f64) {
+    let pct: f64 = 0.0;
+    if (p_frame > 0.0) { pct = p_ms / p_frame * 100.0; }
+    let bar: string = "";
+    let bn: i32 = i32(pct * 0.4);
+    if (bn > 40) { bn = 40; }
+    for (let i = 0; i < bn; i++) { bar = `${bar}#`; }
+    print(`  ${pad(p_stage, 7)} ${pad(p_name, 16)} ${padl(f3(p_ms), 8)} ${padl(f1(pct), 6)}%  ${bar}`);
+}
+
+// One ablation point: rewind the camera to the same place in the lap, warm,
+// then min-of-trials exactly as the headline number is measured.
+fn ablate_measure(p_frames: i32, p_trials: i32): f64 {
+    acc_init();
+    g_frame_i = 0;
+    for (let w = 0; w < g_WARM; w++) { frame_once(); }
+    let t: i32 = 0;
+    while (t < p_trials) {
+        g_frame_i = 0;
+        trial_run(p_frames);
+        t++;
+    }
+    let out: f64 = g_best[STAT_T_FRAME];
+    return out;
+}
+
+fn csv_row(p_name: string, p_ms: f64) {
+    print(`CSV,stage,${p_name},${f3(p_ms)}`);
+}
+
+// ===========================================================================
+//  9. MAIN
+// ===========================================================================
+
+fn usage() {
+    print("benchframe.hml — per-stage frame bench and budget regression gate (W4-13)");
+    print("");
+    print("  hemlockc -O1 tools/benchframe.hml -o /tmp/bf");
+    print("  SDL_VIDEODRIVER=dummy /tmp/bf            # headless, the CI form");
+    print("  DISPLAY=:0 /tmp/bf                       # on the real display");
+    print("");
+    print("  --frames N   frames per trial   (default 90)");
+    print("  --trials N   trials             (default 7, RULE T)");
+    print("  --quick      24 frames x 3 trials, still gated");
+    print("  --ablate     what each optional stage actually costs");
+    print("  --csv        machine-readable stage rows as well as the table");
+    print("  --no-gate    print, never exit 1. Never use this in CI.");
+    print("  --help");
+}
+
+fn num_or(p_s: string, p_d: f64): f64 {
+    let v: f64 = f64(p_s);
+    if (v != v) { let d: f64 = p_d; return d; }
+    let out: f64 = v;
+    return out;
+}
+
+fn main() {
+    if (running_interpreted()) {
+        eprint("benchframe.hml is COMPILED-ONLY. The game ships compiled, compiled is");
+        eprint("5-18x faster, and a performance number from the interpreter is not a");
+        eprint("performance number (CLAUDE.md §2):");
+        eprint("    hemlockc -O1 tools/benchframe.hml -o /tmp/bf");
+        eprint("    SDL_VIDEODRIVER=dummy /tmp/bf");
+        exit(2);
+    }
+
+    let want_ablate: i32 = 0;
+    let want_csv: i32 = 0;
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--help" || a == "-h") { usage(); exit(0); }
+        else if (a == "--frames" && i + 1 < args.length) {
+            i++; g_FRAMES = clampi(i32(num_or(args[i], 90.0)), 4, 100000);
+        }
+        else if (a == "--trials" && i + 1 < args.length) {
+            i++; g_TRIALS = clampi(i32(num_or(args[i], 7.0)), 1, 64);
+        }
+        else if (a == "--quick") { g_FRAMES = 24; g_TRIALS = 3; }
+        else if (a == "--ablate") { want_ablate = 1; }
+        else if (a == "--csv") { want_csv = 1; }
+        else if (a == "--no-gate") { g_gate = 0; }
+        else { eprint(`benchframe: unknown option '${a}'`); usage(); exit(2); }
+        i++;
+    }
+
+    print("===========================================================================");
+    print(` ${g_VERSION} — ARCHITECTURE.md §4 stage table vs docs/BUDGET_ACTUAL.md`);
+    print("===========================================================================");
+
+    let rss0: i32 = rss_kb();
+
+    // ---- boot -------------------------------------------------------------
+    g_win = window_open_ex("nightshade benchframe", g_RES_W, g_RES_H,
+                           g_UPSCALE_DEFAULT, 1);
+    if (g_win == null) {
+        eprint(`benchframe: window_open_ex failed: ${sdl_error()}`);
+        eprint("            headless? run under SDL_VIDEODRIVER=dummy");
+        exit(3);
+    }
+    set_vsync(g_win, 0);            // a bench must never be paced by the display
+    g_target = target_new(g_win, g_RES_W, g_RES_H, g_UPSCALE_DEFAULT);
+    // RSS with the video driver up and a render target allocated, but before a
+    // single byte of game data exists. Everything below this line is OURS; a
+    // GL driver's own mappings are not, and on this box they are 150+ MB, which
+    // is more than ARCHITECTURE §8's whole 96 MB line. Gating the raw process
+    // total would make the budget a property of the graphics driver.
+    let rss_win: i32 = rss_kb();
+    if (frame_init(g_win, g_target, g_fb) != 0) {
+        eprint("benchframe: frame_init failed");
+        exit(3);
+    }
+    terrain_set(g_SEED, 1.0);
+    art_build(g_win);
+    frame_bind_textures(g_tex_world, g_tex_fx, g_tex_hud, g_tex_sky);
+    frame_bind_fx_atlas(g_atlas_fx);
+    frame_bind_assets(meshgen_mesh(MESH_BLOB), meshgen_mesh(MESH_SPARROW_VM),
+                      FX_GLOW_S);
+    frame_set_hud_solid_uv(g_uvw[0], g_uvw[1], g_uvw[2], g_uvw[3]);
+    frame_set_vignette_colour(6, 5, 10);
+    frame_set_flash_colour(220, 232, 255);
+    g_bhud = frame_batch_hud();
+
+    // the sun the props are baked against, once
+    let env0: array<f64> = frame_env();
+    tod_reset();
+    tod_set_weather(g_WX);
+    tod_eval(env0, g_DAY_T, g_WX);
+    meshgen_set_sun_azimuth(env_field(env0, ENV_SUN_X), env_field(env0, ENV_SUN_Z));
+    meshgen_bake_all(env_field(env0, ENV_SUN_X), env_field(env0, ENV_SUN_Y),
+                     env_field(env0, ENV_SUN_Z),
+                     env_field(env0, ENV_SUN_R), env_field(env0, ENV_SUN_G),
+                     env_field(env0, ENV_SUN_B),
+                     env_field(env0, ENV_AMB_R), env_field(env0, ENV_AMB_G),
+                     env_field(env0, ENV_AMB_B),
+                     env_field(env0, ENV_BOUNCE_R), env_field(env0, ENV_BOUNCE_G),
+                     env_field(env0, ENV_BOUNCE_B));
+
+    // ---- the world --------------------------------------------------------
+    let nslots: i32 = (2 * g_RING + 1) * (2 * g_RING + 1);
+    for (let s = 0; s < nslots; s++) {
+        g_cc_mesh.push(mesh_new(g_CHUNK_Q * g_CHUNK_Q * 2 + 4));
+        g_cc_cx.push(0); g_cc_cz.push(0); g_cc_cy.push(0.0);
+    }
+    let slot: i32 = 0;
+    for (let cz = 0 - g_RING; cz <= g_RING; cz++) {
+        for (let cx = 0 - g_RING; cx <= g_RING; cx++) {
+            chunk_mesh_build(slot, cx, cz);
+            let m = g_cc_mesh[slot];
+            mesh_bake_light(m,
+                            env_field(env0, ENV_SUN_X), env_field(env0, ENV_SUN_Y),
+                            env_field(env0, ENV_SUN_Z),
+                            env_field(env0, ENV_SUN_R), env_field(env0, ENV_SUN_G),
+                            env_field(env0, ENV_SUN_B),
+                            env_field(env0, ENV_AMB_R), env_field(env0, ENV_AMB_G),
+                            env_field(env0, ENV_AMB_B),
+                            env_field(env0, ENV_BOUNCE_R), env_field(env0, ENV_BOUNCE_G),
+                            env_field(env0, ENV_BOUNCE_B));
+            slot++;
+        }
+    }
+    props_gen();
+    sim_build();
+    let rss1: i32 = rss_kb();
+
+    print("");
+    print(` boot            ${f3(g_boot_ms)} ms   (ARCHITECTURE §8 allows 400 ms behind a title card)`);
+    print(` terrain         ${g_cc_mesh.length} chunks of ${g_CHUNK_Q * g_CHUNK_Q * 2} tris   props ${g_pr_kind.length}`);
+    print(` meshes          npc ${mesh_tri_count(meshgen_mesh(MESH_NPC))} tris   tree0 ${mesh_tri_count(meshgen_mesh(MESH_TREE0))}   rock ${mesh_tri_count(meshgen_mesh(MESH_ROCK))}   viewmodel ${mesh_tri_count(meshgen_mesh(MESH_SPARROW_VM))}   blob ${mesh_tri_count(meshgen_mesh(MESH_BLOB))}`);
+    print(` resolution      ${g_RES_W}x${g_RES_H} at x${g_UPSCALE_DEFAULT}`);
+    print(` camera          a ${f1(g_PATH_R)} m closed loop, exactly ${g_PATH_N} frames per lap`);
+    print(` timing          min of ${g_TRIALS} trials x ${g_FRAMES} frames (RULE T), warm ${g_WARM}`);
+    print("");
+
+    // ---- warm, then the trials -------------------------------------------
+    // ---- the budget sweep: one whole lap, for the worst-case counters -----
+    for (let w = 0; w < g_WARM; w++) { frame_once(); }
+    g_frame_i = 0;
+    let sweep_worst: i32 = 0;
+    for (let sw = 0; sw < g_PATH_N; sw++) {
+        frame_once();
+        let d: i32 = stat_get(STAT_TRIS_DRAWN);
+        if (d > g_peak_drawn) { g_peak_drawn = d; sweep_worst = sw; }
+        let sub: i32 = stat_get(STAT_TRIS_SUBMITTED);
+        if (sub > g_peak_tris) { g_peak_tris = sub; }
+        let dc2: i32 = stat_get(STAT_DRAW_CALLS);
+        if (dc2 > g_peak_draw) { g_peak_draw = dc2; }
+        g_ovf_total = g_ovf_total + stat_get(STAT_BATCH_OVERFLOW);
+    }
+    print(` budget sweep    one ${g_PATH_N}-frame lap: worst frame is #${sweep_worst}, ${g_peak_drawn} triangles drawn, ${g_peak_draw} draw calls`);
+
+    acc_init();
+    for (let w = 0; w < g_WARM; w++) { frame_once(); }
+    print(` sim             ${rsnap_count(g_rsnap)} replicated entities in the render snapshot after warm-up`);
+    print("");
+    g_hash_first = sim_hash(g_sim);
+    let rss_warm: i32 = rss_kb();
+    let tr: i32 = 0;
+    let rss_t1: i32 = rss_warm;
+    while (tr < g_TRIALS) {
+        trial_run(g_FRAMES);
+        // The allocation gate is measured from the END of the first trial, not
+        // from the warm-up. A GL driver lazily maps buffers for several frames
+        // after the first draw; measured on this box, 1.9 MB of the growth over
+        // a 630-frame run happens inside trial 1 and then stops dead. Counting
+        // it would make the gate a driver-warm-up detector, and loosening the
+        // guard to swallow it would stop it detecting anything.
+        if (tr == 0) { rss_t1 = rss_kb(); }
+        tr++;
+    }
+    g_hash_last = sim_hash(g_sim);
+    let rss2: i32 = rss_kb();
+    let frame: f64 = g_best[STAT_T_FRAME];
+
+    // ---- the table --------------------------------------------------------
+    print("===========================================================================");
+    print(" STAGE TABLE — ms/frame, min of the trials, SDL performance counter");
+    print("===========================================================================");
+    print("  §4      stage                ms/f       %  ");
+    row("1-3", "sim", g_best[STAT_T_SIM], frame);
+    row("4", "snapshot", g_best[STAT_T_SNAPSHOT], frame);
+    row("—", "world registry", g_best_world, frame);
+    row("6", "env (tod_eval)", g_best[STAT_T_TOD], frame);
+    row("7", "sky.bake", g_best[STAT_T_SKYBAKE], frame);
+    row("8-10", "view/mvp/frustum", g_best[STAT_T_VIEW], frame);
+    row("11", "batch.reset", g_best[STAT_T_BATCH_RESET], frame);
+    row("12", "emit.sky", g_best[STAT_T_EMIT_SKY], frame);
+    row("13", "emit.terrain", g_best[STAT_T_EMIT_TERRAIN], frame);
+    row("14", "emit.entity", g_best[STAT_T_EMIT_ENTITY], frame);
+    row("15", "emit.viewmodel", g_best[STAT_T_EMIT_VIEWMODEL], frame);
+    row("16", "emit.fx", g_best[STAT_T_EMIT_FX], frame);
+    row("11-17", "EMIT total", g_best[STAT_T_EMIT], frame);
+    row("18", "target.begin", g_best[STAT_T_TARGET_BEGIN], frame);
+    row("19", "clear", g_best[STAT_T_CLEAR], frame);
+    row("20", "flush.sky", g_best[STAT_T_FLUSH_SKY], frame);
+    row("21a", "sort.world", g_best[STAT_T_SORT_WORLD], frame);
+    row("21b", "flush.world", g_best[STAT_T_FLUSH_WORLD], frame);
+    row("22a", "sort.fx", g_best[STAT_T_SORT_FX], frame);
+    row("22b", "flush.fx", g_best[STAT_T_FLUSH_FX], frame);
+    row("23", "postfx", g_best[STAT_T_POSTFX], frame);
+    row("24", "hud", g_best[STAT_T_HUD], frame);
+    row("25", "flush.hud", g_best[STAT_T_FLUSH_HUD], frame);
+    row("26-27", "present", g_best[STAT_T_PRESENT], frame);
+    row("25-26", "readback*", ms_readback(), frame);
+    row("8-23", "untimed in 8-23*", ms_untimed_render(), frame);
+    print("  ------------------------------------------------------------");
+    row("", "SORT total", ms_sort(), frame);
+    row("", "FLUSH pure", ms_flush(), frame);
+    row("", "RENDER total", ms_render(), frame);
+    row("", "timed sum", ms_timed(), frame);
+    row("0", "FRAME", frame, frame);
+    print("");
+    print("  * The two starred rows are MEASURED, not inferred: this file brackets");
+    print("    frame_render() and frame_present() on its own clock and subtracts the");
+    print("    stage timers inside each. `readback` is world_render.hml's");
+    print("    read_pixels_rect(320x240 ARGB8888) between stages 25 and 26, which sits");
+    print("    outside every stat_begin. See this run's notes.");
+    print("");
+    let fps: f64 = 0.0;
+    if (frame > 0.0) { fps = 1000.0 / frame; }
+    print(` frame ${f3(frame)} ms  =  ${f1(fps)} fps   against a ${g_FRAME_BUDGET_MS} ms budget`);
+    print(` headroom ${f3(g_FRAME_BUDGET_MS - frame)} ms`);
+    print("");
+    print(` __clock() CPU column (RULE T's other half):`);
+    print(`   whole frame  ${f3(g_best_cpu)} ms CPU  vs  ${f3(frame)} ms wall   skew x${f3(g_best_cpu / frame)}`);
+    print(`   sim step     ${f3(g_best_cpu_sim)} ms CPU  vs  ${f3(g_best[STAT_T_SIM])} ms wall`);
+    print("   A skew far from 1.0 means a driver thread is burning CPU beside us —");
+    print("   see this file's header for why the stage column is on the wall clock.");
+    print("");
+
+    // ---- the ablation -----------------------------------------------------
+    if (want_ablate == 1) {
+        print("===========================================================================");
+        print(" ABLATION — what each optional stage actually costs");
+        print("===========================================================================");
+        // Every configuration is measured the SAME way: the camera is rewound
+        // to frame 0 of the lap, warmed, then run for the same trials x frames.
+        // The first version of this section reused the headline number as the
+        // baseline and let the camera keep walking, which produced NEGATIVE
+        // costs — the ablated runs were cheaper configurations measured over a
+        // more expensive stretch of the loop. A cost that comes out negative is
+        // the measurement telling you the two runs were not comparable.
+        let af: i32 = g_FRAMES;
+        let at: i32 = g_TRIALS;
+        let base: f64 = ablate_measure(af, at);
+        g_opt_vm = 0;   let no_vm: f64 = ablate_measure(af, at);   g_opt_vm = 1;
+        g_opt_hud = 0;  let no_hud: f64 = ablate_measure(af, at);  g_opt_hud = 1;
+        g_opt_fx = 0;   let no_fx: f64 = ablate_measure(af, at);   g_opt_fx = 1;
+        g_opt_props = 0; let no_pr: f64 = ablate_measure(af, at);  g_opt_props = 1;
+        g_fog_alpha_override = 0.0;
+        let no_alpha: f64 = ablate_measure(af, at);
+        g_fog_alpha_override = -1.0;
+        let again: f64 = ablate_measure(af, at);
+
+        print(`  shipping frame          ${f3(base)} ms`);
+        print(`  - viewmodel             ${f3(no_vm)} ms   -> viewmodel costs ${f3(base - no_vm)} ms`);
+        print(`  - HUD                   ${f3(no_hud)} ms   -> HUD costs       ${f3(base - no_hud)} ms`);
+        print(`  - FX layer              ${f3(no_fx)} ms   -> FX costs        ${f3(base - no_fx)} ms`);
+        print(`  - props                 ${f3(no_pr)} ms   -> props cost      ${f3(base - no_pr)} ms`);
+        print(`  fog_alpha_max = 0       ${f3(no_alpha)} ms   -> fog alpha costs ${f3(base - no_alpha)} ms   <- the D7 number`);
+        print(`  shipping again          ${f3(again)} ms   -> repeatability   ${f3(again - base)} ms`);
+        print("");
+        print("  D7 (BUILD_PLAN W3-7): if fog alpha costs > 1.0 ms the 0.35 alpha");
+        print("  threshold should be raised. The figure above is that measurement.");
+        print("");
+        // Restore the shipping measurement for the gate below.
+        acc_init();
+        g_frame_i = 0;
+        for (let rw = 0; rw < g_WARM; rw++) { frame_once(); }
+        let rt: i32 = 0;
+        while (rt < g_TRIALS) { trial_run(g_FRAMES); rt++; }
+        frame = g_best[STAT_T_FRAME];
+    }
+
+    // ---- attributing the residual ----------------------------------------
+    // Nothing here is inferred. `frame_render` and `frame_present` are each
+    // bracketed on the caller's clock in frame_once(), so the time they spend
+    // outside their own stage timers is a subtraction, not a guess. The only
+    // remainder after that is the handful of untimed calls in frame_once
+    // itself, which is printed too and is a rounding error by construction.
+    let resid: f64 = frame - ms_timed();
+    g_rb_ms = ms_readback() + ms_untimed_render();
+    g_resid_ms = resid;
+    let explained: f64 = ms_readback() + ms_untimed_render();
+    let leftover: f64 = resid - explained;
+    // A readback of the same rect from the BACKBUFFER, for contrast: the same
+    // pixel count and the same format, but not out of a render TARGET.
+    let rb_bb: f64 = 1000000.0;
+    let rbt: i32 = 0;
+    while (rbt < g_TRIALS) {
+        let r0: u64 = clock_now();
+        let rk: i32 = 0;
+        while (rk < 32) {
+            read_pixels_rect(g_win, 0, 0, g_RES_W, g_RES_H, FMT_ARGB8888,
+                             g_fb, g_RES_W * 4);
+            rk++;
+        }
+        let rms: f64 = clock_ms_between(r0, clock_now()) / 32.0;
+        if (rms < rb_bb) { rb_bb = rms; }
+        rbt++;
+    }
+    print("===========================================================================");
+    print(" RESIDUAL ATTRIBUTION — measured by subtraction, not inferred");
+    print("===========================================================================");
+    print(`  frame                                     ${f3(frame)} ms`);
+    print(`  every stat.hml timer, summed              ${f3(ms_timed())} ms`);
+    print(`  residual                                  ${f3(resid)} ms`);
+    print("  ---------------------------------------------------------------");
+    print(`  frame_present() wall                      ${f3(g_best_fp)} ms`);
+    print(`    - stage 25 flush.hud                    ${f3(g_best[STAT_T_FLUSH_HUD])} ms`);
+    print(`    - stages 26-27 present                  ${f3(g_best[STAT_T_PRESENT])} ms`);
+    print(`    = read_pixels_rect, UNTIMED             ${f3(ms_readback())} ms   <- the residual`);
+    print(`  frame_render() wall minus its 11 timers   ${f3(ms_untimed_render())} ms`);
+    print(`  explained                                 ${f3(explained)} ms of ${f3(resid)} ms`);
+    print(`  left over (frame_once's own odds and ends)${f3(leftover)} ms`);
+    print("  ---------------------------------------------------------------");
+    print(`  for contrast, the same ${g_RES_W}x${g_RES_H} ARGB8888 readback from the`);
+    print(`  BACKBUFFER rather than from the render target: ${f3(rb_bb)} ms`);
+    print(`  — ${f3(ms_readback() / rb_bb)}x cheaper. Reading OUT OF a target texture is the cost.`);
+    print("");
+
+    if (want_csv == 1) {
+        for (let c = 0; c < STAT_T_COUNT; c++) { csv_row(stat_timer_name(c), g_best[c]); }
+        csv_row("derived.sort", ms_sort());
+        csv_row("derived.flush", ms_flush());
+        csv_row("derived.render", ms_render());
+        csv_row("derived.world_registry", g_best_world);
+        csv_row("derived.cpu_frame", g_best_cpu);
+        csv_row("derived.readback", ms_readback());
+        csv_row("derived.untimed_in_render", ms_untimed_render());
+        print(`CSV,counter,tris.drawn.peak,${g_peak_drawn}`);
+        print(`CSV,counter,tris.submitted.peak,${g_peak_tris}`);
+        print(`CSV,counter,draw.calls.peak,${g_peak_draw}`);
+        print(`CSV,counter,rss.kb,${rss2}`);
+        print("");
+    }
+
+    // ---- counters ---------------------------------------------------------
+    print("===========================================================================");
+    print(" COUNTERS — last frame, and the peak over every frame of every trial");
+    print("===========================================================================");
+    print(`  tris DRAWN       ${g_last_c[STAT_TRIS_DRAWN]}   peak ${g_peak_drawn}   budget ${g_TRIS_STEADY} steady / ${g_TRIS_CLAMP} clamp   <- THE BINDING NUMBER`);
+    print(`  tris submitted   ${g_last_c[STAT_TRIS_SUBMITTED]}   peak ${g_peak_tris}   (UNDER-COUNTS — see the notes)`);
+    print(`  verts drawn      ${g_last_c[STAT_VERTS_DRAWN]}`);
+    // The composition, so "2368 triangles" is a frame someone can picture and
+    // compare against ART_BIBLE §8.3's typical legal combat frame
+    // (500 ground + 400 props/trees + 5 enemies x 90 + 300 structure
+    //  + 250 HUD + 120 FX + 18 post = 2038).
+    let g_tris: i32 = g_last_c[STAT_CHUNKS_DRAWN] * g_CHUNK_Q * g_CHUNK_Q * 2;
+    print(`  composition      ground ${g_tris} (${g_last_c[STAT_CHUNKS_DRAWN]} chunks x ${g_CHUNK_Q * g_CHUNK_Q * 2})   props+entities ${g_last_c[STAT_ENTS_DRAWN]} instances   fx ${g_last_c[STAT_PARTICLES] * 2}   viewmodel 122`);
+    print(`                   ART_BIBLE §8.3's typical legal combat frame is 2038 triangles`);
+    let want_ground: f64 = 0.7853981633974483 * g_fog_far * g_fog_far / 16.0 * 2.0;
+    print(`  ground vs W3-4   design (pi/4)*FOG_FAR^2/16*2 at ${f1(g_fog_far)} m = ${f1(want_ground)} tris; measured ${g_tris}`);
+    print(`  draw calls       ${g_last_c[STAT_DRAW_CALLS]}   peak ${g_peak_draw}      texture runs ${g_last_c[STAT_TEX_RUNS]}`);
+    print(`  batch overflow   ${g_ovf_total}   (any non-zero is a dropped triangle)`);
+    print(`  chunks           tested ${g_last_c[STAT_CHUNKS_TESTED]}  culled ${g_last_c[STAT_CHUNKS_CULLED]}  drawn ${g_last_c[STAT_CHUNKS_DRAWN]}`);
+    print(`  entities         tested ${g_last_c[STAT_ENTS_TESTED]}  culled ${g_last_c[STAT_ENTS_CULLED]}  drawn ${g_last_c[STAT_ENTS_DRAWN]}`);
+    print(`  rejected         frustum ${g_last_c[STAT_REJ_FRUSTUM]}  backface ${g_last_c[STAT_REJ_BACKFACE]}  near ${g_last_c[STAT_REJ_NEAR]}  guard ${g_last_c[STAT_REJ_GUARD]}  distance ${g_last_c[STAT_REJ_DISTANCE]}`);
+    print(`  clip             straddle ${g_last_c[STAT_CLIP_STRADDLE]}  slow path ${g_last_c[STAT_CLIP_SLOW]}`);
+    print(`  particles        ${g_last_c[STAT_PARTICLES]}   dynamic lights ${g_last_c[STAT_LIGHTS]}   sky rows ${g_last_c[STAT_SKY_ROWS]}`);
+    print(`  sim              ${sim_steps(g_sim)} ticks, ${sim_stat_cmds_applied(g_sim)} commands, ${sim_stat_shots(g_sim)} shots, fx ${sim_fx_total(g_sim)}`);
+    print(`  RSS              ${rss0} KB at start -> ${rss_win} KB with the video driver up -> ${rss1} KB after asset boot`);
+    print(`                   -> ${rss_warm} KB after warm -> ${rss2} KB after ${(g_TRIALS * g_FRAMES)} timed frames`);
+    print(`                   game share ${rss2 - rss_win} KB; video driver ${rss_win - rss0} KB (not ours, not budgeted)`);
+    print("");
+
+    // ---- THE GATE ---------------------------------------------------------
+    // Recomputed here, not reused from the table: --ablate re-measures `frame`
+    // after its last configuration, and a stale fps beside a fresh ms is the
+    // kind of two-numbers-that-disagree that makes a whole report untrustworthy.
+    fps = 0.0;
+    if (frame > 0.0) { fps = 1000.0 / frame; }
+    print("===========================================================================");
+    print(" BUDGET GATE — every bound prints the measured number and the guard");
+    print("===========================================================================");
+    print(" Guards are ~2x the number measured under this box's permanent ~17/24-core");
+    print(" load (CLAUDE.md §1.2). They catch regressions; they do not certify an idle");
+    print(" machine. The design ANCHORS — 2500 triangles, 16.67 ms, 11.0 ms render,");
+    print(" 2.0 ms sim — are literals from ARCHITECTURE §8 and BUDGET_ACTUAL.md.");
+    print("");
+
+    // -- the four the acceptance criterion names: frame time, triangles,
+    //    draw calls, allocations.
+    ok(`FRAME <= 16.67 ms (60 fps floor, ARCHITECTURE §8): measured ${f3(frame)} ms, ${f1(fps)} fps`,
+       frame <= 16.67);
+    ok(`config's frame budget is still the doc's 16.67 ms`, g_FRAME_BUDGET_MS == 16.67);
+    ok(`TRIANGLES peak <= 2500 steady (ARCHITECTURE §8): peak ${g_peak_drawn} DRAWN (tris.submitted reads ${g_peak_tris} and under-counts — see the notes)`,
+       g_peak_drawn <= 2500);
+    ok(`config's steady triangle budget is still the doc's 2500`, g_TRIS_STEADY == 2500);
+    ok(`TRIANGLES peak <= 3500 hard clamp: peak ${g_peak_drawn} DRAWN`, g_peak_drawn <= 3500);
+    ok(`DRAW CALLS <= 8 (BUILD_PLAN W3-7): peak ${g_peak_draw}`, g_peak_draw <= 8);
+    // The guard is 2 MB over 540 frames. Very little of it is slack for us:
+    // headless, the same binary measures 0-200 KB, i.e. the frame allocates
+    // nothing per frame. It is slack for the GL DRIVER: on the real display the
+    // same binary running the same frames grows ~2-3 KB/frame inside Mesa's own
+    // mappings, which no amount of care in this repo removes.
+    // It still catches everything that matters. The failure mode this gate
+    // exists for is CLAUDE.md rule 2, an object per vertex: ~30 B x 6000
+    // vertices x 540 frames is about 97 MB. A 2 MB guard is two orders of
+    // magnitude below that and two orders above the driver's noise.
+    ok(`ALLOCATIONS: RSS across the last ${((g_TRIALS - 1) * g_FRAMES)} of ${(g_TRIALS * g_FRAMES)} timed frames — ${rss_t1} -> ${rss2} KB, grew ${rss2 - rss_t1} KB, guard 2048 KB (headless this is 0-200 KB; on a GL display it is the driver, see the comment)`,
+       rss2 - rss_t1 <= 2048);
+    ok(`RSS, GAME SHARE <= ${g_BUDGET_RSS_MB} MB (ARCHITECTURE §8): ${rss2 - rss_win} KB of game data (process total ${rss2} KB, of which ${rss_win - rss0} KB is the video driver's own mappings)`,
+       rss2 - rss_win <= g_BUDGET_RSS_MB * 1024);
+    ok(`BATCH OVERFLOW == 0 over every frame: ${g_ovf_total}`, g_ovf_total == 0);
+
+    // -- the per-stage guards the task names --------------------------------
+    print("");
+    ok(`stage SIM ${f3(g_best[STAT_T_SIM])} ms <= 2.0 ms design budget (ARCHITECTURE §8, net §17.1)`,
+       g_best[STAT_T_SIM] <= 2.0);
+    ok(`config's sim budget is still the doc's 2.0 ms`, g_BUDGET_SIM_MS == 2.0);
+    // BUDGET_ACTUAL's 3.8 ms is `probe_emit`'s KERNEL — emit + pack of an
+    // already-prepared vertex stream. §4 stages 11-17 also carry the chunk ring
+    // walk, a frustum sphere per chunk and per prop, LOD selection, per-instance
+    // point lighting, per-instance fog and the mandatory contact blob. They are
+    // not the same measurement and this guard does not pretend they are.
+    // The guard is DELIBERATELY TIGHTER than RULE T's usual 2x: 2x of the
+    // measured value would be 15+ ms, which exceeds the 11.0 ms render budget
+    // this stage lives inside, and a guard above the budget it protects guards
+    // nothing. RENDER total <= 11.0 ms is asserted separately and is the real
+    // constraint; this bound exists to localise a regression to emit.
+    ok(`stage EMIT ${f3(g_best[STAT_T_EMIT])} ms <= 9.5 ms guard (measured ${f3(g_best[STAT_T_EMIT])} ms loaded; guard set below 2x on purpose — see the comment)`,
+       g_best[STAT_T_EMIT] <= 9.5);
+    ok(`  of which emit.terrain ${f3(g_best[STAT_T_EMIT_TERRAIN])} ms and emit.entity ${f3(g_best[STAT_T_EMIT_ENTITY])} ms; BUDGET_ACTUAL's 3.8 ms is probe_emit's kernel alone, not these stages`,
+       g_best[STAT_T_EMIT_TERRAIN] + g_best[STAT_T_EMIT_ENTITY] <= g_best[STAT_T_EMIT]);
+    ok(`stage SORT ${f3(ms_sort())} ms <= 1.0 ms guard (BUDGET_ACTUAL measured 0.40 ms; the O(n^2) sort this replaced was 107-143 ms)`,
+       ms_sort() <= 1.0);
+    ok(`stage FLUSH ${f3(ms_flush())} ms <= 1.7 ms guard (2x BUDGET_ACTUAL's 0.85 ms arena flush at 2500 tris)`,
+       ms_flush() <= 1.7);
+    ok(`stage PRESENT ${f3(g_best[STAT_T_PRESENT])} ms <= 4.0 ms guard (target_end + integer upscale + SDL present)`,
+       g_best[STAT_T_PRESENT] <= 4.0);
+    ok(`stage HUD ${f3(g_best[STAT_T_HUD])} ms <= 1.0 ms (ARCHITECTURE §8 'input + audio + HUD build')`,
+       g_best[STAT_T_HUD] <= 1.0);
+    ok(`config's I/O budget is still the doc's 1.0 ms`, g_BUDGET_IO_MS == 1.0);
+    ok(`stage SKY.BAKE ${f3(g_best[STAT_T_SKYBAKE])} ms <= 1.2 ms guard (2x ARCHITECTURE §8's 0.6 ms/frame)`,
+       g_best[STAT_T_SKYBAKE] <= 1.2);
+
+    // -- the rollups --------------------------------------------------------
+    print("");
+    ok(`RENDER total ${f3(ms_render())} ms <= 11.0 ms (ARCHITECTURE §8: emit + sort + flush + present)`,
+       ms_render() <= 11.0);
+    ok(`config's render budget is still the doc's 11.0 ms`, g_BUDGET_RENDER_MS == 11.0);
+    let accounted: f64 = ms_timed();
+    let residual: f64 = frame - accounted;
+    let cover: f64 = 0.0;
+    if (frame > 0.0) { cover = accounted / frame * 100.0; }
+    print(`  timed stages ${f3(accounted)} ms of a ${f3(frame)} ms frame = ${f1(cover)} % covered; residual ${f3(residual)} ms`);
+    ok(`the stage table has no NEGATIVE residual (a negative one means a timer double-counts): ${f3(residual)} ms`,
+       residual >= -0.05);
+    ok(`the residual is ACCOUNTED FOR, not unexplained: readback ${f3(ms_readback())} ms + untimed-in-8..23 ${f3(ms_untimed_render())} ms explains ${f1(rb_best_ratio() * 100.0)} % of the ${f3(residual)} ms residual`,
+       rb_best_ratio() >= 0.85 && rb_best_ratio() <= 1.15);
+    ok(`the timed stages cover >= 55 % of the frame: ${f1(cover)} %`, cover >= 55.0);
+
+    // -- the bench measured what it claims to have measured ------------------
+    print("");
+    ok(`the simulation actually ran: ${sim_steps(g_sim)} ticks, ${sim_stat_cmds_applied(g_sim)} commands applied`,
+       sim_steps(g_sim) >= (g_TRIALS * g_FRAMES) && sim_stat_cmds_applied(g_sim) > 0);
+    ok(`the sim state advanced (a bench of a frozen world benches nothing): hash ${g_hash_first} -> ${g_hash_last}`,
+       g_hash_first != g_hash_last);
+    ok(`the frame drew something: ${g_last_c[STAT_TRIS_DRAWN]} triangles, ${g_last_c[STAT_CHUNKS_DRAWN]} chunks, ${g_last_c[STAT_ENTS_DRAWN]} props`,
+       g_last_c[STAT_TRIS_DRAWN] > 500 && g_last_c[STAT_CHUNKS_DRAWN] > 0
+       && g_last_c[STAT_ENTS_DRAWN] > 0);
+    ok(`culling is doing its job: ${g_last_c[STAT_CHUNKS_CULLED]} of ${g_last_c[STAT_CHUNKS_TESTED]} chunks rejected before emit`,
+       g_last_c[STAT_CHUNKS_TESTED] > 0
+       && g_last_c[STAT_CHUNKS_CULLED] * 100 >= g_last_c[STAT_CHUNKS_TESTED] * 40);
+    ok(`every layer is populated (sky, world, fx, hud all emitted)`,
+       g_last_c[STAT_TRIS_SUBMITTED] > 0 && g_last_c[STAT_PARTICLES] > 0
+       && g_last_c[STAT_TEX_RUNS] > 0);
+    ok(`dynamic lights never exceed the ratified cap of 2 (BUDGET_ACTUAL)`,
+       g_last_c[STAT_LIGHTS] <= 2);
+
+    print("");
+    note("tris.submitted UNDER-COUNTS. Only emit.hml calls stat_add(STAT_TRIS_SUBMITTED);");
+    note("  mesh.hml and billboard.hml do not, so every prop, the viewmodel and every");
+    note(`  FX card is missing from it. This run: submitted ${g_peak_tris}, DRAWN ${g_peak_drawn}.`);
+    note("  The budget binds on DRAWN, which is what reaches SDL_RenderGeometry, so that");
+    note("  is what this gate asserts. walk.hml's on-screen readout prints SUBMITTED.");
+    note("read_pixels_rect(320x240 ARGB8888) in world_render.hml's frame_present() sits");
+    note("  outside every stat timer, between stages 25 and 26. MEASURED by subtracting");
+    note(`  stages 25 and 26-27 from a bracketed frame_present(): ${f3(ms_readback())} ms/frame,`);
+    note(`  ${f1(ms_readback() / frame * 100.0)} % of the frame, and the single largest cost after emit. The same`);
+    note(`  readback from the BACKBUFFER costs ${f3(rb_bb)} ms, so the price is reading OUT OF a`);
+    note("  render target. The interactive game never uses those pixels; only");
+    note("  shot.hml's PNG path does. Two things for world_render.hml's owner:");
+    note("  (1) wrap it in a stat timer so it stops hiding, (2) make it opt-in.");
+    note("tod_sky_keys() returns 0..1 and skygen's key block is 0..255. This is the THIRD");
+    note("  caller to carry the same eight-line x255 bridge (shot.hml, walk.hml, here).");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+
+    target_free(g_target);
+    window_close(g_win);
+
+    if (g_pass == g_n) {
+        print(`PASS ${g_pass}/${g_n}   frame ${f3(frame)} ms, ${f1(fps)} fps, ${g_peak_drawn} tris drawn peak, ${g_peak_draw} draw calls`);
+        exit(0);
+    }
+    print(`FAIL ${g_pass}/${g_n}`);
+    if (g_gate == 1) { exit(1); }
+    exit(0);
+}
+
+main();

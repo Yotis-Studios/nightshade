@@ -1,0 +1,1787 @@
+// =============================================================================
+//  sim.hml — THE FIXED-TIMESTEP SIM STEP.  The seam between the two halves.
+//                                                                    W4-9.
+// =============================================================================
+//
+//  ARCHITECTURE §4.3 gives ten stages and says the order is API:
+//
+//      a  apply queued commands (player-slot order, then seq)
+//      b  movement integration + terrain/AABB collision
+//      c  weapons: fire, reload, cooldowns, recoil_aim
+//      d  projectiles
+//      e  AI steering
+//      f  damage resolution + death
+//      g  pickups / interactions / lantern channel / block placement
+//      h  day-cycle tick, chunk streaming decisions
+//      i  history_capture
+//      j  sim_effects  (SKIPPED when world.replaying == 1)
+//
+//  This file executes exactly that, once per fixed tick, and nothing else in
+//  the project may decide when a system runs.
+//
+// -----------------------------------------------------------------------------
+//  WHY THE ORDER IS DATA AND NOT CONTROL FLOW
+// -----------------------------------------------------------------------------
+//  BUILD_PLAN W4-9's acceptance criterion is "the stage order is asserted by a
+//  test that reorders two stages and expects a different hash".  A hard-coded
+//  sequence of ten calls cannot be reordered by a test without editing this
+//  file, which means the assertion would test a COPY of the order rather than
+//  the order — the exact failure mode that made Gate 4a's enemy caps mutable
+//  with every probe still green.
+//
+//  So the order lives in `sim.order`, a ten-element `array<i32>` initialised to
+//  the identity, and `sim_step` dispatches through it.  The cost is one array
+//  read and one integer compare chain per stage per TICK — ten of each, 60
+//  times a second, against a 2.0 ms budget.  Measured below the noise floor.
+//  `sim_stage_swap` is the test hook, and it COUNTS its use in `sim.swaps` so a
+//  shipping build that ever called it is visible in the stats rather than
+//  mysterious in the bug report.
+//
+// -----------------------------------------------------------------------------
+//  WHAT `sim_step` TAKES, AND WHY THE WORLD CARRIES THE SIM
+// -----------------------------------------------------------------------------
+//  ARCHITECTURE §5.4 writes `sim_step(world, tick)`, and §5.6 writes
+//  `rsnap_build(rs, world, alpha)`, and §5.4 writes
+//  `snapshot_write(world, viewer_slot, baseline)`.  Three functions, one first
+//  argument.  Meanwhile the eight Wave-4a modules each own a state object that
+//  has to live SOMEWHERE and must not be a top-level global (a global would
+//  make two worlds in one process impossible, which kills both the dedicated
+//  server and every A/B determinism test that runs two sims side by side).
+//
+//  So `sim_new` builds the world through `world_new()` and attaches ONE extra
+//  field to it — `world.sim` — holding every module's state.  `world.hml` is
+//  untouched, `sim_step(world, tick)` is the documented signature, and the
+//  renderer keeps reading the same object it always did.  The alternative
+//  (a wrapper object holding the world) would have changed the first argument
+//  of three documented functions to buy nothing.
+//
+//  Reported to ARCHITECTURE §5.4c along with the exact signatures below.
+//
+// -----------------------------------------------------------------------------
+//  DETERMINISM — the acceptance criterion
+// -----------------------------------------------------------------------------
+//   * No wall clock.  Not `__clock()`, which is a compiler BUILTIN and needs no
+//     import — `ci_imports.sh` R8 exists because of exactly that hole.
+//   * No `@stdlib/random`.  Every draw is `rng.hml` seeded from
+//     (world_seed, stream, tick, entity).
+//   * `TICK_DT` is a compile-time constant.  No function below sees a measured
+//     delta; `sim_accum_advance` converts milliseconds into a TICK COUNT and
+//     that is the only place a real duration appears.
+//   * The accumulator lives here, clock-free, so the sim owns its own pacing
+//     rule and `src/game/main.hml` only supplies the measured milliseconds.
+//   * Iteration order is world slot order, which is a pure function of the
+//     spawn/despawn sequence.  Nothing iterates a hash table.
+//
+// -----------------------------------------------------------------------------
+//  THE IMPORT WALL
+// -----------------------------------------------------------------------------
+//  `src/sim/**` may import `@stdlib/math`, other `src/sim/**` and `src/core/**`.
+//  This file imports the eight Wave-4a modules plus world/history/command/rng/
+//  chunk/worldgen/daycycle/snapshot and `src/core/**`.  No SDL, no wobbleweed,
+//  no `src/render/**`, no `src/net/**`, no clock.
+// =============================================================================
+
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import { g_TICK_DT, g_TICK_MS, g_FRAME_CLAMP_MS, g_MAX_ENTS,
+         g_HP_MAX, g_RING_RADIUS, g_CHUNK_M, g_LANTERN_CHANNEL_S,
+         g_ENEMY_WISP
+       } from "../core/config.hml";
+
+import { floori } from "../core/mathx.hml";
+
+import { world_new_cap, world_spawn_player, world_despawn,
+         world_slot_of, world_id_of, world_set_seed, world_set_tick,
+         world_set_replaying,
+         KIND_PLAYER, KIND_AI, KIND_PICKUP, KIND_LANTERN,
+         EF_VISIBLE, EF_DEAD, SLOT_NONE, ID_NONE
+       } from "./world.hml";
+
+import { history_new, history_capture } from "./history.hml";
+
+import { cmd_new, cmd_copy, cmd_yaw, cmd_pitch, cmd_btn, cmd_wire_ok,
+         BTN_FIRE, BTN_ADS, BTN_SPRINT, BTN_RELOAD, BTN_USE
+       } from "./command.hml";
+
+import { rng_new, rng_seed, RNG_SPREAD } from "./rng.hml";
+
+import { chunk_store_new_cap, chunk_pin_ring } from "./chunk.hml";
+
+import { worldgen_shade_tier } from "./worldgen.hml";
+
+import { day_phase, day_frac, day_tier_bonus, day_horn_edge } from "./daycycle.hml";
+
+// ---- the eight Wave-4a modules, in stage order -----------------------------
+import { ps_new, move_apply_ex, move_place, move_to_world, move_solids_new,
+         move_take_fall_damage, move_eye_y, move_state_hash,
+         MOVE_EV_FALL_DMG, MOVE_EV_GROUND_MISS
+       } from "./movement.hml";
+
+import { wpn_state_new, wpn_state_reset, wpn_step, wpn_fire, wpn_can_fire,
+         wpn_reload_begin, wpn_swap_begin, wpn_cur, wpn_ammo,
+         wpn_reserve_ammo, wpn_cur_spread, wpn_hash_all,
+         WPN_NONE, WPN_KESTREL, WPN_EMBERLANCE, WS_FIELDS, WS_ADS
+       } from "./weapons.hml";
+
+import { combat_new_cap, combat_set_weapon_source, combat_begin_tick,
+         combat_events, combat_fire, combat_apply_damage,
+         evbus_push, evbus_hash, evbus_count, evbus_type, evbus_sub,
+         evbus_actor, evbus_target, evbus_x, evbus_y, evbus_z, ev_q,
+         EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER, EV_IMPACT, EV_SOUND,
+         EV_DAMAGE_TAKEN, EV_PICKUP, EV_DESPAWN, EV_XP, EV_LEVELUP,
+         HM_HEAD, HM_KILL, DMG_FALL, DMG_CONTACT
+       } from "./combat.hml";
+
+import { wpn_dmg_at, wpn_hs_mult, wpn_pellets, wpn_spread } from "./weapons.hml";
+
+import { proj_new_cap, proj_set_chunks, proj_set_combat, proj_step,
+         proj_spawn_aim, proj_state_hash,
+         PROJ_EMBERLANCE } from "./projectiles.hml";
+
+import { ai_new_cap, ai_step, ai_spawn, ai_hash, ai_yaw_of_dir,
+         ai_event_count, ai_event_type, ai_event_id, ai_event_target,
+         ai_event_ival, ai_event_x, ai_event_y, ai_event_z,
+         AIEV_ATTACK, AIEV_ADDS } from "./ai.hml";
+
+import { director_new, director_reset, director_step, director_bind,
+         director_set_anchor, director_set_tier, director_hash,
+         director_req_count, director_req_kind, director_req_x,
+         director_req_y, director_req_z, director_events, director_tier,
+         DIR_EV_HORN, DIR_EV_WAVE_START, DIR_EV_WAVE_CLEAR, DIR_EV_HOLD_DONE
+       } from "./director.hml";
+
+import { prog_new, prog_reset, prog_on_kill, prog_on_death, prog_award,
+         prog_streak_step,
+         prog_hash, prog_level, prog_last_levels,
+         prog_last_xp, XPS_LANTERN, XPB_NONE, XPB_HEADSHOT
+       } from "./progression.hml";
+
+import { loot_new_item, loot_roll_at, loot_item_hash, loot_clamp_tier,
+         RARITY_NONE } from "./loot.hml";
+
+// ===========================================================================
+//  1.  CONSTANTS
+// ===========================================================================
+
+// The ten stages of ARCHITECTURE §4.3, as integers, in their documented order.
+// These ids are API: `sim.order` holds them and the probe asserts the sequence
+// against these literals, not against the array's own contents.
+export let SIM_STAGE_COMMANDS: i32 = 0;   // a
+export let SIM_STAGE_MOVEMENT: i32 = 1;   // b
+export let SIM_STAGE_WEAPONS: i32  = 2;   // c
+export let SIM_STAGE_PROJ: i32     = 3;   // d
+export let SIM_STAGE_AI: i32       = 4;   // e
+export let SIM_STAGE_DAMAGE: i32   = 5;   // f
+export let SIM_STAGE_INTERACT: i32 = 6;   // g
+export let SIM_STAGE_WORLD: i32    = 7;   // h
+export let SIM_STAGE_HISTORY: i32  = 8;   // i
+export let SIM_STAGE_EFFECTS: i32  = 9;   // j
+export let SIM_STAGE_COUNT: i32    = 10;
+
+// Player slots this sim can hold.  v1 plays one, but the command queue, the
+// per-slot PredictedState and the "player-slot order, then seq" rule only mean
+// something with more than one, and a rule that is never exercised is a rule
+// that is already broken.
+export let SIM_PLAYERS_DEFAULT: i32 = 4;
+
+// Commands buffered per player.  NETWORKING's client sends one per tick and the
+// server consumes one per tick; the buffer absorbs jitter.  Overflow DROPS THE
+// OLDEST and counts it — dropping the newest would make a laggy client
+// permanently stale instead of briefly behind.
+export let SIM_CMD_QUEUE: i32 = 8;
+
+// The cosmetic queue `sim_effects` fills.  Client-only, never hashed, never
+// replicated, always zero while replaying.
+export let SIM_FX_CAP: i32 = 128;
+
+export let SIM_FX_SOUND: i32     = 0;
+export let SIM_FX_PARTICLE: i32  = 1;
+export let SIM_FX_SHAKE: i32     = 2;
+export let SIM_FX_HITMARKER: i32 = 3;
+export let SIM_FX_FLASH: i32     = 4;
+export let SIM_FX_NUMBER: i32    = 5;
+export let SIM_FX_KIND_COUNT: i32 = 6;
+
+// Interaction reach, metres.  OWNED HERE, NOT A GDD NUMBER — GDD §8 says "you
+// reach the lantern post" and never gives a distance.  The channel DURATION is
+// the GDD's (`g_LANTERN_CHANNEL_S`, 2.5 s) and so is the XP (`XPS_LANTERN`,
+// 350).  When W5-6 builds `lantern.hml` it owns this constant and this file
+// should import it.
+export let SIM_INTERACT_R_M: f64 = 2.5;
+
+// Lantern lit state rides the replicated `anim` field: 0 unlit, 1 lit.  Using
+// an existing replicated field costs zero bytes on the wire and means the
+// client learns a lantern is lit through the same path as everything else.
+export let SIM_LANTERN_UNLIT: i32 = 0;
+export let SIM_LANTERN_LIT: i32   = 1;
+
+// A stall longer than this is clamped rather than simulated (ARCHITECTURE §3's
+// spiral-of-death clamp).  250 ms at 60 Hz is 15 ticks — the most `sim_step`
+// can ever be asked to run from one frame.
+export let SIM_MAX_FRAME_MS: f64 = g_FRAME_CLAMP_MS;
+export let SIM_MAX_TICKS_PER_FRAME: i32 = 15;
+
+export let SIM_MISS: i32 = -1;
+
+// ===========================================================================
+//  2.  THE ACCUMULATOR  (clock-free, and that is the whole point)
+// ===========================================================================
+//  `wobbleweed/src/time.hml` has one of these, and it is correct, and this file
+//  MAY NOT IMPORT IT: wobbleweed's version samples SDL's performance counter,
+//  and `src/sim/**` may not link SDL or read a wall clock at all.  So the sim
+//  owns the arithmetic and `src/game/main.hml` owns the clock:
+//
+//      let ms = clock_ms_between(prev, clock_now());   // main.hml, wobbleweed
+//      let n  = sim_accum_advance(g_acc, ms);          // here, pure
+//      while (i < n) { sim_step(g_world, g_tick); g_tick++; i++; }
+//      let alpha = sim_accum_alpha(g_acc);
+//
+//  The arithmetic is deliberately identical to wobbleweed's, for the reasons
+//  written there and re-verified here:
+//
+//    * the tick index is DERIVED from a running total, never accumulated by
+//      repeated subtraction — `total ticks == floor(total_ms / tick_ms)` then
+//      holds exactly, forever, instead of drifting one tick per hour;
+//    * `total_ms` is summed with Kahan compensation, because naive summation
+//      loses a whole tick across 200 000 frames;
+//    * `eps` is `tick_ms * 1e-9`, which repairs 250.0 / (1000.0/60.0) ==
+//      14.999999999999998 without ever firing a tick early.
+//
+//  The one thing this version adds is a HARD CEILING on ticks per call.  The
+//  clamp bounds the milliseconds, but a caller that passes an un-clamped 30 s
+//  (a debugger breakpoint, a laptop lid) would otherwise ask for 1800 steps in
+//  one frame and hang for 0.3 s.  `SIM_MAX_TICKS_PER_FRAME` is the second wall,
+//  and the debt it discards is FORGIVEN (the total is rebased) rather than
+//  carried, because carrying it is the death spiral by another name.
+
+export fn sim_accum_new(): object {
+    let a: object = {
+        tick_ms: g_TICK_MS,
+        eps: g_TICK_MS * 0.000000001,
+        clamp_ms: SIM_MAX_FRAME_MS,
+        max_ticks: SIM_MAX_TICKS_PER_FRAME,
+        total_ms: 0.0,
+        comp: 0.0,
+        ticks: 0,
+        acc: 0.0,
+        frame_ms: 0.0,
+        raw_ms: 0.0,
+        stalls: 0,
+        forgiven: 0
+    };
+    let out: object = a;
+    return out;
+}
+
+export fn sim_accum_reset(p_a: object) {
+    let a: object = p_a;
+    a.total_ms = 0.0;
+    a.comp = 0.0;
+    a.ticks = 0;
+    a.acc = 0.0;
+    a.frame_ms = 0.0;
+    a.raw_ms = 0.0;
+    a.stalls = 0;
+    a.forgiven = 0;
+}
+
+export fn sim_accum_set_clamp_ms(p_a: object, p_ms: f64) {
+    let a: object = p_a;
+    let ms: f64 = p_ms;
+    if (ms > 0.0) { a.clamp_ms = ms; }
+}
+
+// Feed a measured millisecond delta; get back the number of fixed ticks due.
+// The caller runs exactly that many `sim_step`s and no more.
+export fn sim_accum_advance(p_a: object, p_ms: f64): i32 {
+    let a: object = p_a;
+    let ms: f64 = p_ms;
+    if (ms < 0.0) { ms = 0.0; }
+    a.raw_ms = ms;
+    let cap: f64 = a.clamp_ms;
+    if (ms > cap) { ms = cap; a.stalls = a.stalls + 1; }
+    a.frame_ms = ms;
+
+    let prev_total: f64 = a.total_ms;
+    let comp: f64 = a.comp;
+    let y: f64 = ms - comp;
+    let total: f64 = prev_total + y;
+    a.comp = (total - prev_total) - y;
+    a.total_ms = total;
+
+    let tick: f64 = a.tick_ms;
+    let target: i64 = i64((total + a.eps) / tick);
+    let issued: i64 = a.ticks;
+    let n: i32 = i32(target - issued);
+
+    let maxn: i32 = a.max_ticks;
+    if (n > maxn) {
+        // Forgive the excess instead of carrying it.  Rebasing the total keeps
+        // the derived-index invariant true for every FUTURE frame; carrying it
+        // would ask for the same overrun again next frame, and the frame after.
+        let dropped: i32 = n - maxn;
+        n = maxn;
+        target = issued + i64(n);
+        a.total_ms = f64(target) * tick;
+        a.comp = 0.0;
+        total = a.total_ms;
+        a.forgiven = a.forgiven + dropped;
+    }
+
+    a.ticks = target;
+    let acc: f64 = total - f64(target) * tick;
+    if (acc < 0.0) { acc = 0.0; }
+    a.acc = acc;
+    let out: i32 = n;
+    return out;
+}
+
+// The renderer's interpolation factor: how far it is between the last completed
+// tick and the next.  Always in [0, 1).  This is `rsnap_build`'s third argument.
+export fn sim_accum_alpha(p_a: object): f64 {
+    let a: object = p_a;
+    let t: f64 = a.acc / a.tick_ms;
+    if (t < 0.0) { t = 0.0; }
+    if (t >= 1.0) { t = 0.999999999; }
+    let out: f64 = t;
+    return out;
+}
+
+export fn sim_accum_ticks(p_a: object): i64 { let a: object = p_a; let o: i64 = a.ticks; return o; }
+export fn sim_accum_stalls(p_a: object): i32 { let a: object = p_a; let o: i32 = a.stalls; return o; }
+export fn sim_accum_forgiven(p_a: object): i32 { let a: object = p_a; let o: i32 = a.forgiven; return o; }
+export fn sim_accum_frame_ms(p_a: object): f64 { let a: object = p_a; let o: f64 = a.frame_ms; return o; }
+export fn sim_accum_raw_ms(p_a: object): f64 { let a: object = p_a; let o: f64 = a.raw_ms; return o; }
+export fn sim_accum_total_ms(p_a: object): f64 { let a: object = p_a; let o: f64 = a.total_ms; return o; }
+export fn sim_accum_residual_ms(p_a: object): f64 { let a: object = p_a; let o: f64 = a.acc; return o; }
+
+// ===========================================================================
+//  3.  CONSTRUCTION
+// ===========================================================================
+
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// A world with a simulation attached, at the shipping caps.
+export fn sim_new(p_seed: i32): object {
+    let out: object = sim_new_cap(g_MAX_ENTS, SIM_PLAYERS_DEFAULT, p_seed);
+    return out;
+}
+
+// EVERYTHING allocates here.  `sim_step` allocates nothing, ever: no object
+// literal, no array growth, no string.  The probe proves it by stepping 10 000
+// ticks and watching RSS.
+export fn sim_new_cap(p_cap: i32, p_players: i32, p_seed: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 8) { cap = 8; }
+    let np: i32 = p_players;
+    if (np < 1) { np = 1; }
+
+    let w: object = world_new_cap(cap);
+    world_set_seed(w, p_seed);
+    world_set_tick(w, 0);
+
+    // ---- per-player state, one flat array per player ----------------------
+    let ps_all: array = [];
+    let cmd_all: array = [];
+    let q_all: array = [];
+    let prog_all: array = [];
+    let i: i32 = 0;
+    while (i < np) {
+        ps_all.push(ps_new());
+        cmd_all.push(cmd_new());
+        prog_all.push(prog_new());
+        let q: array = [];
+        let k: i32 = 0;
+        while (k < SIM_CMD_QUEUE) { q.push(cmd_new()); k++; }
+        q_all.push(q);
+        i++;
+    }
+
+    // ---- combat needs the weapon table injected, not imported -------------
+    // `combat.hml` deliberately does not import `weapons.hml`: they were built
+    // in the same sub-wave, and a content dependency inside a wave is what the
+    // WAVE-CONSTRUCTION RULE forbids.  The integrator is the correct place to
+    // tie them together, and this is the only place it happens.
+    let cx: object = combat_new_cap(512);
+    combat_set_weapon_source(cx, wpn_dmg_at, wpn_hs_mult, wpn_pellets, wpn_spread);
+
+    let pj: object = proj_new_cap(32, 64, 32);
+    proj_set_combat(pj, cx);
+
+    // A placeholder chunk store with no generator installed.  `chunk_get`
+    // refuses without a source, so terrain reads MISS and the sim runs flat and
+    // obviously unfinished rather than crashing.  `sim_set_chunks` replaces it
+    // with the real one; the boot path owns the worldgen adapter because
+    // `chunk.hml` takes an injected source (ARCHITECTURE §5.4b).
+    let cs: object = chunk_store_new_cap(1, 1, p_seed);
+
+    let s: object = {
+        ver: 1,
+        players: np,
+        cap: cap,
+        prev_tick: -1,
+        steps: 0,
+
+        // ---- the stage order.  DATA, not control flow. -------------------
+        order: zeros_i(SIM_STAGE_COUNT),
+        swaps: 0,
+
+        // ---- the eight Wave-4a modules -----------------------------------
+        move_ps: ps_all,
+        solids: move_solids_new(),
+        wpn: wpn_state_new(np),
+        cx: cx,
+        proj: pj,
+        ai: ai_new_cap(cap),
+        dir: director_new(),
+        prog: prog_all,
+        item: loot_new_item(),
+
+        // ---- support ------------------------------------------------------
+        hist: history_new(cap),
+        cs: cs,
+        has_cs: 0,
+        rng: rng_new(),
+        wpn_out: zeros_f(4),
+
+        // ---- the command pipeline ----------------------------------------
+        cmd: cmd_all,           // the latched command, one per player
+        queue: q_all,           // the pending ring, one per player
+        q_head: zeros_i(np),
+        q_n: zeros_i(np),
+        q_seq: zeros_i(np),     // last applied seq, per player
+        has_cmd: zeros_i(np),
+        pslot_id: zeros_i(np),  // entity id of each player slot, or ID_NONE
+        chan_t: zeros_f(np),    // lantern channel progress, seconds
+        move_ev: zeros_i(np),
+        p_dead: zeros_i(np),    // edge latch: prog_on_death fires exactly once
+
+        // ---- day cycle / streaming ---------------------------------------
+        phase: 0,
+        day_t: 0.0,
+        horn: 0,
+        tier: 0,
+        ccx: 2147483647,
+        ccz: 2147483647,
+        streams: 0,
+
+        // ---- the cosmetic queue.  Never hashed.  Zero while replaying. ----
+        fx_kind: zeros_i(SIM_FX_CAP),
+        fx_a: zeros_i(SIM_FX_CAP),
+        fx_b: zeros_i(SIM_FX_CAP),
+        fx_x: zeros_f(SIM_FX_CAP),
+        fx_y: zeros_f(SIM_FX_CAP),
+        fx_z: zeros_f(SIM_FX_CAP),
+        fx_n: 0,
+        fx_dropped: 0,
+        fx_total: 0,
+
+        // ---- counters.  Every refusal is visible. ------------------------
+        cmds_queued: 0,
+        cmds_applied: 0,
+        cmds_dropped: 0,
+        cmds_stale: 0,
+        cmds_bad: 0,
+        cmds_missing: 0,
+        shots: 0,
+        reloads: 0,
+        swaps_wpn: 0,
+        spawns_req: 0,
+        spawns_ok: 0,
+        deaths: 0,
+        player_deaths: 0,
+        ai_attacks: 0,
+        adds_spawned: 0,
+        pickups: 0,
+        lanterns_lit: 0,
+        loot_rolls: 0,
+        loot_hash: 0,
+        last_rarity: RARITY_NONE,
+        fall_hits: 0,
+        ground_miss: 0
+    };
+
+    // The identity order.  `sim_stage_swap` is the only thing that changes it.
+    let ord = s.order;
+    let j: i32 = 0;
+    while (j < SIM_STAGE_COUNT) { ord[j] = j; j++; }
+
+    let pid = s.pslot_id;
+    let k2: i32 = 0;
+    while (k2 < np) { pid[k2] = ID_NONE; k2++; }
+
+    director_reset(s.dir, p_seed, 0);
+
+    w.sim = s;
+    let out: object = w;
+    return out;
+}
+
+// Install the real heightfield.  The caller owns the store and the injected
+// worldgen adapter (ARCHITECTURE §5.4b); the sim only reads it.
+export fn sim_set_chunks(p_w: object, p_cs: object): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    s.cs = p_cs;
+    s.has_cs = 1;
+    proj_set_chunks(s.proj, p_cs);
+    s.ccx = 2147483647;
+    s.ccz = 2147483647;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn sim_of(p_w: object): object { let w: object = p_w; let s: object = w.sim; return s; }
+export fn sim_players(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.players; return o; }
+export fn sim_steps(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.steps; return o; }
+export fn sim_combat(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = s.cx; return o; }
+export fn sim_events(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = combat_events(s.cx); return o; }
+export fn sim_projectiles(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = s.proj; return o; }
+export fn sim_ai(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = s.ai; return o; }
+export fn sim_director(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = s.dir; return o; }
+export fn sim_history(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = s.hist; return o; }
+export fn sim_chunks(p_w: object): object { let w: object = p_w; let s: object = w.sim; let o: object = s.cs; return o; }
+export fn sim_weapon_state(p_w: object): array { let w: object = p_w; let s: object = w.sim; let o: array = s.wpn; return o; }
+export fn sim_phase(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.phase; return o; }
+export fn sim_day_t(p_w: object): f64 { let w: object = p_w; let s: object = w.sim; let o: f64 = s.day_t; return o; }
+export fn sim_tier(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.tier; return o; }
+
+// Per-player handles.  `p_pslot` is the POSITIONAL player slot, 1..players,
+// exactly as `world_spawn_player` defines it (a player's id IS its slot).
+export fn sim_player_id(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = ID_NONE; return bad; }
+    let a = s.pslot_id;
+    let out: i32 = a[k];
+    return out;
+}
+
+export fn sim_predicted(p_w: object, p_pslot: i32): array<f64> {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0) { k = 0; }
+    if (k >= s.players) { k = s.players - 1; }
+    let a = s.move_ps;
+    let out: array<f64> = a[k];
+    return out;
+}
+
+export fn sim_progression(p_w: object, p_pslot: i32): array {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0) { k = 0; }
+    if (k >= s.players) { k = s.players - 1; }
+    let a = s.prog;
+    let out: array = a[k];
+    return out;
+}
+
+export fn sim_command(p_w: object, p_pslot: i32): object {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0) { k = 0; }
+    if (k >= s.players) { k = s.players - 1; }
+    let a = s.cmd;
+    let out: object = a[k];
+    return out;
+}
+
+// ---- counters ---------------------------------------------------------------
+export fn sim_stat_cmds_applied(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.cmds_applied; return o; }
+export fn sim_stat_cmds_dropped(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.cmds_dropped; return o; }
+export fn sim_stat_cmds_stale(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.cmds_stale; return o; }
+export fn sim_stat_cmds_bad(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.cmds_bad; return o; }
+export fn sim_stat_cmds_missing(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.cmds_missing; return o; }
+export fn sim_stat_shots(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.shots; return o; }
+export fn sim_stat_reloads(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.reloads; return o; }
+export fn sim_stat_deaths(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.deaths; return o; }
+export fn sim_stat_player_deaths(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.player_deaths; return o; }
+export fn sim_player_dead(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = 0; return bad; }
+    let a = s.p_dead;
+    let out: i32 = a[k];
+    return out;
+}
+export fn sim_stat_spawns(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.spawns_ok; return o; }
+export fn sim_stat_ai_attacks(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.ai_attacks; return o; }
+export fn sim_stat_pickups(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.pickups; return o; }
+export fn sim_stat_lanterns(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.lanterns_lit; return o; }
+export fn sim_stat_loot_rolls(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.loot_rolls; return o; }
+export fn sim_stat_last_rarity(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.last_rarity; return o; }
+export fn sim_stat_fall_hits(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.fall_hits; return o; }
+export fn sim_stat_ground_miss(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.ground_miss; return o; }
+export fn sim_stat_streams(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.streams; return o; }
+export fn sim_stat_swaps(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.swaps; return o; }
+
+// ===========================================================================
+//  4.  PLAYERS
+// ===========================================================================
+
+// Create the body for positional player slot `p_pslot` (1..players) at (x, z),
+// standing on the terrain, with the GDD §8 loadout: a Kestrel, `6 / 12`.
+// Returns the entity id, or ID_NONE.
+export fn sim_add_player(p_w: object, p_pslot: i32, p_x: f64, p_z: f64): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = ID_NONE; return bad; }
+
+    // `world_spawn_player` returns the ENTITY SLOT, not the id — the same
+    // convention as `world_spawn`.  ARCHITECTURE §5.4's "a player id IS its
+    // slot" means the POSITIONAL PLAYER slot (1..64), which is the id, not the
+    // dense array index this returns.  Reading it as an id yields 0 == ID_NONE
+    // for player 1 and the body then exists but is never driven.
+    let slot: i32 = world_spawn_player(w, p_pslot);
+    if (slot == SLOT_NONE) { let full: i32 = ID_NONE; return full; }
+    let id: i32 = world_id_of(w, slot);
+    if (id == ID_NONE) { let lost: i32 = ID_NONE; return lost; }
+
+    let psa = s.move_ps;
+    let ps: array<f64> = psa[k];
+    move_place(ps, s.cs, p_x, p_z);
+    move_to_world(w, slot, ps);
+
+    let hp = w.hp;
+    let hpm = w.hp_max;
+    let team = w.team;
+    let flags = w.flags;
+    let model = w.model;
+    let weapon = w.weapon;
+    hp[slot] = i32(g_HP_MAX);
+    hpm[slot] = i32(g_HP_MAX);
+    team[slot] = 1;
+    flags[slot] = flags[slot] | EF_VISIBLE;
+    model[slot] = 0;
+    weapon[slot] = WPN_KESTREL;
+
+    wpn_state_reset(s.wpn, k * WS_FIELDS, WPN_KESTREL);
+    prog_reset(s.prog[k]);
+
+    // Seed the LATCH with the loadout.  A zeroed command selects weapon 0, so a
+    // player who has not sent a command yet would be silently restowed to the
+    // Sparrow on their first tick.  GDD §8: the Kestrel is in your hands.
+    let ca0 = s.cmd;
+    let c0: object = ca0[k];
+    c0.weapon_sel = WPN_KESTREL;
+
+    let pid = s.pslot_id;
+    pid[k] = id;
+    let seq = s.q_seq;
+    seq[k] = -1;
+    let chan = s.chan_t;
+    chan[k] = 0.0;
+    let pd = s.p_dead;
+    pd[k] = 0;
+
+    let out: i32 = id;
+    return out;
+}
+
+// Put a dead player back on their feet.  The sim owns the PRIMITIVE; the
+// RESPAWN TIMER (`g_RESPAWN_S`, 4 s) and the Wick revive of GDD §2.7 are game
+// policy and belong to W4-11 / W5.  A sim that respawned on its own schedule
+// would make that policy unimplementable.
+export fn sim_respawn_player(p_w: object, p_pslot: i32, p_x: f64, p_z: f64): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = 0; return bad; }
+    let pid = s.pslot_id;
+    let id: i32 = pid[k];
+    if (id == ID_NONE) { let none: i32 = 0; return none; }
+    let slot: i32 = world_slot_of(w, id);
+    if (slot == SLOT_NONE) { let gone: i32 = 0; return gone; }
+
+    let psa = s.move_ps;
+    let ps: array<f64> = psa[k];
+    move_place(ps, s.cs, p_x, p_z);
+    move_to_world(w, slot, ps);
+
+    let hp = w.hp;
+    let hpm = w.hp_max;
+    let flags = w.flags;
+    hp[slot] = hpm[slot];
+    if (hp[slot] <= 0) { hp[slot] = i32(g_HP_MAX); hpm[slot] = i32(g_HP_MAX); }
+    flags[slot] = (flags[slot] & (0 - 1 - EF_DEAD)) | EF_VISIBLE;
+    let pd = s.p_dead;
+    pd[k] = 0;
+    let chan = s.chan_t;
+    chan[k] = 0.0;
+    let out: i32 = 1;
+    return out;
+}
+
+// ===========================================================================
+//  5.  THE COMMAND PIPELINE
+// ===========================================================================
+
+// Queue one command for a player.  The transport calls this; nothing else
+// should.  Returns 1 if queued, 0 if the command is malformed (and counted).
+//
+// The command is COPIED, never aliased.  Aliasing the caller's live command is
+// how reconciliation starts lying (command.hml says the same thing about the
+// pending ring).
+export fn sim_queue_command(p_w: object, p_pslot: i32, p_cmd: object): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = 0; return bad; }
+    if (cmd_wire_ok(p_cmd) != 0) {
+        s.cmds_bad = s.cmds_bad + 1;
+        let ill: i32 = 0;
+        return ill;
+    }
+
+    let qn = s.q_n;
+    let qh = s.q_head;
+    let qa = s.queue;
+    let ring: array = qa[k];
+
+    if (qn[k] >= SIM_CMD_QUEUE) {
+        // Drop the OLDEST.  A client that is behind should become current, not
+        // stay permanently one buffer-length in the past.
+        qh[k] = (qh[k] + 1) & (SIM_CMD_QUEUE - 1);
+        qn[k] = qn[k] - 1;
+        s.cmds_dropped = s.cmds_dropped + 1;
+    }
+    let at: i32 = (qh[k] + qn[k]) & (SIM_CMD_QUEUE - 1);
+    cmd_copy(ring[at], p_cmd);
+    qn[k] = qn[k] + 1;
+    s.cmds_queued = s.cmds_queued + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn sim_queued(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = 0; return bad; }
+    let qn = s.q_n;
+    let out: i32 = qn[k];
+    return out;
+}
+
+// ARCHITECTURE §3 / §5.4: `sim_apply_command(world, slot, cmd)`, pure with
+// respect to the world.
+//
+// "Apply" here means STAGE (a) FOR ONE COMMAND: validate it, reject a stale or
+// duplicated sequence number, and latch it as this player's command for the
+// tick.  It deliberately does NOT integrate movement or fire the weapon —
+// §4.3 lists those as stages (b) and (c), and if applying a command ran them
+// then stages a, b and c would be one stage with three names.
+//
+// It writes no world field, emits no event, plays no sound, allocates nothing
+// and reads no clock.  Returns 1 if the command was latched.
+export fn sim_apply_command(p_w: object, p_pslot: i32, p_cmd: object): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let k: i32 = p_pslot - 1;
+    if (k < 0 || k >= s.players) { let bad: i32 = 0; return bad; }
+    if (cmd_wire_ok(p_cmd) != 0) {
+        s.cmds_bad = s.cmds_bad + 1;
+        let ill: i32 = 0;
+        return ill;
+    }
+    let seq = s.q_seq;
+    let sq: i32 = p_cmd.seq;
+    if (sq <= seq[k]) {
+        // A replayed or reordered packet.  Dropping it is what keeps the
+        // authoritative stream monotonic; applying it would rewind the player.
+        s.cmds_stale = s.cmds_stale + 1;
+        let old: i32 = 0;
+        return old;
+    }
+    let ca = s.cmd;
+    cmd_copy(ca[k], p_cmd);
+    seq[k] = sq;
+    let hc = s.has_cmd;
+    hc[k] = 1;
+    s.cmds_applied = s.cmds_applied + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// ===========================================================================
+//  6.  THE TEN STAGES
+// ===========================================================================
+
+// ---- (a) apply queued commands, in player-slot order, then seq -------------
+// One command per player per tick.  A player with an empty queue is stepped
+// with a HOLD command: the same aim, no movement axes, no buttons.  Repeating
+// the last command instead would keep a dropped packet's trigger held down and
+// empty the magazine of a player whose network hiccuped, which is a worse
+// failure than a single frame of stillness.
+fn stage_commands(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let np: i32 = s.players;
+    let qn = s.q_n;
+    let qh = s.q_head;
+    let qa = s.queue;
+    let ca = s.cmd;
+    let hc = s.has_cmd;
+    let tick: i32 = w.tick;
+
+    let k: i32 = 0;
+    while (k < np) {
+        hc[k] = 0;
+        let got: i32 = 0;
+        if (qn[k] > 0) {
+            let ring: array = qa[k];
+            let head: i32 = qh[k];
+            got = sim_apply_command(w, k + 1, ring[head]);
+            qh[k] = (head + 1) & (SIM_CMD_QUEUE - 1);
+            qn[k] = qn[k] - 1;
+        }
+        if (got == 0) {
+            // HOLD.  Keep the quantized aim EXACTLY as it was (no dequantize /
+            // requantize round trip, which is idempotent but not free) and zero
+            // everything a player could be holding down.  `weapon_sel` is left
+            // alone: a dropped packet must not restow the player's weapon.
+            let c: object = ca[k];
+            c.tick = tick;
+            c.move_x = 0;
+            c.move_y = 0;
+            c.buttons = 0;
+            s.cmds_missing = s.cmds_missing + 1;
+            hc[k] = 1;
+        }
+        k++;
+    }
+}
+
+// ---- (b) movement integration + terrain/AABB collision ---------------------
+fn stage_movement(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let np: i32 = s.players;
+    let psa = s.move_ps;
+    let ca = s.cmd;
+    let pid = s.pslot_id;
+    let ev = s.move_ev;
+    let cs: object = s.cs;
+    let sol = s.solids;
+    let flags = w.flags;
+    let tick: i32 = w.tick;
+    let cxo: object = s.cx;
+
+    let k: i32 = 0;
+    while (k < np) {
+        let id: i32 = pid[k];
+        ev[k] = 0;
+        if (id != ID_NONE) {
+            let slot: i32 = world_slot_of(w, id);
+            if (slot != SLOT_NONE) {
+                if ((flags[slot] & EF_DEAD) == 0) {
+                    let ps: array<f64> = psa[k];
+                    let e: i32 = move_apply_ex(ps, cs, ca[k], sol);
+                    ev[k] = e;
+                    move_to_world(w, slot, ps);
+                    if ((e & MOVE_EV_GROUND_MISS) != 0) { s.ground_miss = s.ground_miss + 1; }
+                    if ((e & MOVE_EV_FALL_DMG) != 0) {
+                        let dmg: f64 = move_take_fall_damage(ps);
+                        if (dmg > 0.0) {
+                            // The world, not the player, is the attacker.  A
+                            // fall is DMG_FALL so the plate arc and the hit
+                            // chain never see it.
+                            combat_apply_damage(cxo, w, ID_NONE, slot, dmg,
+                                                WPN_NONE, DMG_FALL, 0,
+                                                0.0, 0.0,
+                                                ps[0], ps[1], ps[2]);
+                            s.fall_hits = s.fall_hits + 1;
+                        }
+                    }
+                }
+            }
+        }
+        k++;
+    }
+}
+
+// ---- (c) weapons: fire, reload, cooldowns, recoil_aim ----------------------
+// Sub-order, and it is API for the same reason the stage order is:
+//     1. swap request   (the command's `weapon_sel` IS the switch)
+//     2. reload request
+//     3. wpn_step       (cooldowns, ADS lerp, bloom decay, recoil recovery)
+//     4. fire
+// Step before fire, because a cooldown that expires this tick must expire
+// BEFORE the trigger is read or the weapon loses one tick of rate of fire on
+// every shot — the same carry argument `wpn_fire` makes about its interval.
+fn stage_weapons(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let np: i32 = s.players;
+    let ca = s.cmd;
+    let pid = s.pslot_id;
+    let psa = s.move_ps;
+    let st: array = s.wpn;
+    let rng: array = s.rng;
+    let outv: array<f64> = s.wpn_out;
+    let cxo: object = s.cx;
+    let pjo: object = s.proj;
+    let cs: object = s.cs;
+    let flags = w.flags;
+    let weapon = w.weapon;
+    let amag = w.ammo_mag;
+    let ares = w.ammo_res;
+    let seed: i32 = w.seed;
+    let tick: i32 = w.tick;
+
+    let k: i32 = 0;
+    while (k < np) {
+        let id: i32 = pid[k];
+        if (id != ID_NONE) {
+            let slot: i32 = world_slot_of(w, id);
+            if (slot != SLOT_NONE) {
+                let o: i32 = k * WS_FIELDS;
+                let c: object = ca[k];
+                let dead: i32 = 0;
+                if ((flags[slot] & EF_DEAD) != 0) { dead = 1; }
+
+                let want: i32 = c.weapon_sel;
+                if (dead == 0) {
+                    if (want != wpn_cur(st, o)) {
+                        if (wpn_swap_begin(st, o, want) == 1) { s.swaps_wpn = s.swaps_wpn + 1; }
+                    }
+                    if (cmd_btn(c, BTN_RELOAD) == 1) {
+                        if (wpn_reload_begin(st, o) == 1) { s.reloads = s.reloads + 1; }
+                    }
+                }
+
+                let ads: i32 = 0;
+                let spr: i32 = 0;
+                if (dead == 0) {
+                    ads = cmd_btn(c, BTN_ADS);
+                    spr = cmd_btn(c, BTN_SPRINT);
+                }
+                wpn_step(st, o, ads, spr);
+
+                if (dead == 0 && cmd_btn(c, BTN_FIRE) == 1) {
+                    if (wpn_can_fire(st, o) == 1) {
+                        // The spread stream is reseeded per shot from
+                        // (world_seed, RNG_SPREAD, tick, shooter id), exactly
+                        // as weapons.hml requires, so a predicting client draws
+                        // the same numbers without talking to the server.
+                        rng_seed(rng, seed, RNG_SPREAD, tick, id);
+                        if (wpn_fire(st, o, rng, outv) == 1) {
+                            s.shots = s.shots + 1;
+                            let wid: i32 = wpn_cur(st, o);
+                            let ps: array<f64> = psa[k];
+                            let eye: f64 = move_eye_y(ps);
+                            if (wid == WPN_EMBERLANCE) {
+                                proj_spawn_aim(pjo, w, PROJ_EMBERLANCE, id,
+                                               ps[0], eye, ps[2],
+                                               cmd_yaw(c), cmd_pitch(c));
+                            } else {
+                                let bl: f64 = wpn_cur_spread(st, o);
+                                let a01: f64 = st[o + WS_ADS];
+                                combat_fire(cxo, w, cs, slot, eye, c, bl, a01);
+                            }
+                        }
+                    }
+                }
+
+                // Mirror the owner-replicated ammo counters onto the entity so
+                // the snapshot carries them.  weapons.hml owns the truth; this
+                // is a copy for the wire, refreshed once per tick.
+                let cur: i32 = wpn_cur(st, o);
+                weapon[slot] = cur;
+                amag[slot] = wpn_ammo(st, o, cur);
+                ares[slot] = wpn_reserve_ammo(st, o, cur);
+            }
+        }
+        k++;
+    }
+}
+
+// ---- (d) projectiles -------------------------------------------------------
+fn stage_projectiles(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    proj_step(s.proj, w);
+}
+
+// ---- (e) AI steering -------------------------------------------------------
+// The director runs FIRST, inside this stage, because a body it releases this
+// tick must steer this tick — a spawn that waits a tick for its first step
+// appears one frame frozen, which at 24 m of spawn distance is visible.
+// director.hml's own header calls itself stage (e) for this reason.
+fn stage_ai(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let d: object = s.dir;
+    let ai: object = s.ai;
+    let tick: i32 = w.tick;
+
+    // The anchor is player slot 1's body: the hold happens where the light is,
+    // and in v1 the light is where the player is.
+    let pid = s.pslot_id;
+    let np: i32 = s.players;
+    let ax: f64 = 0.0;
+    let ay: f64 = 0.0;
+    let az: f64 = 0.0;
+    let ayaw: f64 = 0.0;
+    let have: i32 = 0;
+    let px = w.px;
+    let py = w.py;
+    let pz = w.pz;
+    let yaws = w.yaw;
+    let k: i32 = 0;
+    while (k < np) {
+        if (have == 0) {
+            let id: i32 = pid[k];
+            if (id != ID_NONE) {
+                let slot: i32 = world_slot_of(w, id);
+                if (slot != SLOT_NONE) {
+                    ax = px[slot]; ay = py[slot]; az = pz[slot];
+                    ayaw = yaws[slot];
+                    have = 1;
+                }
+            }
+        }
+        k++;
+    }
+    if (have == 1) { director_set_anchor(d, ax, ay, az); }
+
+    let nreq: i32 = director_step(d, w, tick, ax, az, ayaw);
+    s.spawns_req = s.spawns_req + nreq;
+    let i: i32 = 0;
+    while (i < nreq) {
+        let kind: i32 = director_req_kind(d, i);
+        let sx: f64 = director_req_x(d, i);
+        let sy: f64 = director_req_y(d, i);
+        let sz: f64 = director_req_z(d, i);
+        let yw: f64 = ai_yaw_of_dir(ax - sx, az - sz);
+        let nid: i32 = ai_spawn(ai, w, kind, sx, sy, sz, yw);
+        director_bind(d, i, nid);
+        if (nid != ID_NONE) { s.spawns_ok = s.spawns_ok + 1; }
+        i++;
+    }
+
+    ai_step(ai, w, s.cs);
+}
+
+// ---- (f) damage resolution + death -----------------------------------------
+// Two halves, in this order:
+//   1. the AI's attack events become damage.  `ai.hml` steers and swings; it
+//      does not import `combat.hml` and it must not — the integrator is the
+//      only place the two meet, exactly as with weapons/combat above.
+//   2. the reaper.  `combat.hml` never despawns (its own header says so,
+//      because a stable slot index is what makes a multi-pellet shot correct).
+//      This is the later stage it is talking about.
+fn stage_damage(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let ai: object = s.ai;
+    let cxo: object = s.cx;
+    let tick: i32 = w.tick;
+    let seed: i32 = w.seed;
+
+    let px = w.px;
+    let py = w.py;
+    let pz = w.pz;
+    let flags = w.flags;
+    let kinds = w.kind;
+    let ids = w.id;
+    let lastby = w.last_hit_by;
+
+    // ---- 1. AI swings ------------------------------------------------------
+    let nev: i32 = ai_event_count(ai);
+    let i: i32 = 0;
+    while (i < nev) {
+        let ty: i32 = ai_event_type(ai, i);
+        if (ty == AIEV_ATTACK) {
+            let tid: i32 = ai_event_target(ai, i);
+            let tslot: i32 = world_slot_of(w, tid);
+            if (tslot != SLOT_NONE) {
+                let aid: i32 = ai_event_id(ai, i);
+                let aslot: i32 = world_slot_of(w, aid);
+                let dx: f64 = 0.0;
+                let dz: f64 = 0.0;
+                if (aslot != SLOT_NONE) {
+                    dx = px[tslot] - px[aslot];
+                    dz = pz[tslot] - pz[aslot];
+                    let l: f64 = sqrt(dx * dx + dz * dz);
+                    if (l > 0.0001) { dx = dx / l; dz = dz / l; }
+                }
+                combat_apply_damage(cxo, w, aid, tslot, f64(ai_event_ival(ai, i)),
+                                    WPN_NONE, DMG_CONTACT, 0, dx, dz,
+                                    ai_event_x(ai, i), ai_event_y(ai, i), ai_event_z(ai, i));
+                s.ai_attacks = s.ai_attacks + 1;
+            }
+        } else if (ty == AIEV_ADDS) {
+            let n_add: i32 = ai_event_ival(ai, i);
+            let ex: f64 = ai_event_x(ai, i);
+            let ey: f64 = ai_event_y(ai, i);
+            let ez: f64 = ai_event_z(ai, i);
+            let j: i32 = 0;
+            while (j < n_add) {
+                // Placed on a deterministic ring around the slammer: no RNG
+                // draw, so a replay of the same tick places them identically
+                // without consuming a stream the client cannot reproduce.
+                let ang: f64 = f64(j) * 1.2566370614359172;
+                let ox: f64 = ex + 1.5 * cos(ang);
+                let oz: f64 = ez + 1.5 * sin(ang);
+                let nid: i32 = ai_spawn(ai, w, g_ENEMY_WISP, ox, ey, oz, ang);
+                if (nid != ID_NONE) { s.adds_spawned = s.adds_spawned + 1; }
+                j++;
+            }
+        }
+        i++;
+    }
+
+    // ---- 2. the reaper -----------------------------------------------------
+    // Walked BACKWARDS because `world_despawn` swaps the last slot into the
+    // hole; a forward walk would skip the entity it just moved.
+    let bus: object = combat_events(cxo);
+    let itemv: array = s.item;
+    let progs = s.prog;
+    let np: i32 = s.players;
+    let tier: i32 = loot_clamp_tier(s.tier);
+    let pdead = s.p_dead;
+    let slot: i32 = w.count - 1;
+    while (slot >= 0) {
+        if ((flags[slot] & EF_DEAD) != 0) {
+            let vid: i32 = ids[slot];
+            let vkind: i32 = kinds[slot];
+            if (vkind == KIND_PLAYER) {
+                // A PLAYER IS NEVER REAPED.  The corpse stays in the world so
+                // the client can dissolve it, the killfeed can name it and
+                // `sim_respawn_player` has something to put back on its feet.
+                // Despawning it would drop the id every other system holds.
+                let dk: i32 = vid - 1;
+                if (dk >= 0 && dk < np) {
+                    if (pdead[dk] == 0) {
+                        pdead[dk] = 1;
+                        prog_on_death(progs[dk]);
+                        s.player_deaths = s.player_deaths + 1;
+                        evbus_push(bus, tick, EV_DESPAWN, vkind, ID_NONE, vid,
+                                   ev_q(px[slot]), ev_q(py[slot]), ev_q(pz[slot]));
+                    }
+                }
+                slot = slot - 1;
+                continue;
+            }
+            if (vkind == KIND_AI) {
+                let killer: i32 = lastby[slot];
+                // The corpse's drop is a PURE FUNCTION of
+                // (world seed, victim id, killer id, tier, weapon family), so
+                // it never has to be replicated and it reproduces in a replay.
+                let fam: i32 = 0;
+                let pk: i32 = killer - 1;
+                if (pk >= 0 && pk < np) {
+                    let stw: array = s.wpn;
+                    fam = wpn_cur(stw, pk * WS_FIELDS);
+                    if (fam < 0) { fam = 0; }
+                }
+                let rar: i32 = loot_roll_at(itemv, seed, vid, killer, tier, fam);
+                s.loot_rolls = s.loot_rolls + 1;
+                s.last_rarity = rar;
+                s.loot_hash = s.loot_hash ^ loot_item_hash(itemv);
+
+                if (pk >= 0 && pk < np) {
+                    let bonus: i32 = XPB_NONE;
+                    if (kill_was_headshot(bus, vid) == 1) { bonus = XPB_HEADSHOT; }
+                    let pr: array = progs[pk];
+                    prog_on_kill(pr, ai_class_index(w, slot), bonus);
+                    evbus_push(bus, tick, EV_XP, prog_last_xp(pr), killer, vid,
+                               ev_q(px[slot]), ev_q(py[slot]), ev_q(pz[slot]));
+                    if (prog_last_levels(pr) > 0) {
+                        evbus_push(bus, tick, EV_LEVELUP, prog_level(pr), killer, vid,
+                                   ev_q(px[slot]), ev_q(py[slot]), ev_q(pz[slot]));
+                    }
+                }
+            }
+            evbus_push(bus, tick, EV_DESPAWN, vkind, ID_NONE, vid,
+                       ev_q(px[slot]), ev_q(py[slot]), ev_q(pz[slot]));
+            world_despawn(w, slot);
+            s.deaths = s.deaths + 1;
+        }
+        slot = slot - 1;
+    }
+
+    // Streak timers are a per-tick decay and belong with the rest of the
+    // per-tick bookkeeping, not with the kill that armed them.
+    let k: i32 = 0;
+    while (k < np) {
+        prog_streak_step(progs[k], 1);
+        k++;
+    }
+}
+
+// The enemy CLASS of a slot, for the XP table.  `world.hml` stores the class in
+// `model` offset by nothing at spawn time; `ai.hml` writes `ai_state` and the
+// class-derived hp.  The class is recoverable from `model`, which `ai_spawn`
+// sets to the class index.
+fn ai_class_index(p_w: object, p_slot: i32): i32 {
+    let w: object = p_w;
+    let mdl = w.model;
+    let m: i32 = mdl[p_slot];
+    if (m < 0) { m = 0; }
+    if (m > 5) { m = 5; }
+    let out: i32 = m;
+    return out;
+}
+
+// Did the killing blow on `p_vid` land on the head?  The hitmarker event
+// carries both bits, so this reads the authority's own record rather than
+// keeping a second copy of it.
+fn kill_was_headshot(p_bus: object, p_vid: i32): i32 {
+    let b: object = p_bus;
+    let want: i32 = p_vid;
+    let n: i32 = evbus_count(b);
+    let i: i32 = 0;
+    while (i < n) {
+        if (evbus_type(b, i) == EV_HITMARKER) {
+            if (evbus_target(b, i) == want) {
+                let sb: i32 = evbus_sub(b, i);
+                if ((sb & HM_KILL) != 0 && (sb & HM_HEAD) != 0) {
+                    let yes: i32 = 1;
+                    return yes;
+                }
+            }
+        }
+        i++;
+    }
+    let no: i32 = 0;
+    return no;
+}
+
+// ---- (g) pickups / interactions / lantern channel / block placement --------
+// v1 implements the two that exist:
+//   * the lantern channel — GDD §8's 2.5 s hold, the beat the whole first
+//     minute is built around.  `lantern.hml` is a Wave 5 file; ARCHITECTURE
+//     §4.3 puts the CHANNEL in this stage, so the timer lives here until W5-6
+//     takes it.
+//   * pickups — any KIND_PICKUP body inside reach is collected.
+// Block placement is `build.hml`, Wave 5.  This stage is where it goes.
+fn stage_interact(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let np: i32 = s.players;
+    let pid = s.pslot_id;
+    let ca = s.cmd;
+    let chan = s.chan_t;
+    let progs = s.prog;
+    let bus: object = combat_events(s.cx);
+    let tick: i32 = w.tick;
+
+    let px = w.px;
+    let py = w.py;
+    let pz = w.pz;
+    let kinds = w.kind;
+    let anims = w.anim;
+    let ids = w.id;
+    let r2: f64 = SIM_INTERACT_R_M * SIM_INTERACT_R_M;
+    let n: i32 = w.count;
+
+    let k: i32 = 0;
+    while (k < np) {
+        let id: i32 = pid[k];
+        if (id != ID_NONE) {
+            let slot: i32 = world_slot_of(w, id);
+            if (slot != SLOT_NONE) {
+                let ax: f64 = px[slot];
+                let ay: f64 = py[slot];
+                let az: f64 = pz[slot];
+                let c: object = ca[k];
+                let use: i32 = cmd_btn(c, BTN_USE);
+
+                // ---- the lantern channel -------------------------------
+                let best: i32 = SIM_MISS;
+                let bestd: f64 = r2;
+                let i: i32 = 0;
+                while (i < n) {
+                    if (kinds[i] == KIND_LANTERN) {
+                        if (anims[i] == SIM_LANTERN_UNLIT) {
+                            let dx: f64 = px[i] - ax;
+                            let dy: f64 = py[i] - ay;
+                            let dz: f64 = pz[i] - az;
+                            let d: f64 = dx * dx + dy * dy + dz * dz;
+                            if (d <= bestd) { bestd = d; best = i; }
+                        }
+                    }
+                    i++;
+                }
+                if (use == 1 && best >= 0) {
+                    chan[k] = chan[k] + g_TICK_DT;
+                    if (chan[k] >= g_LANTERN_CHANNEL_S) {
+                        anims[best] = SIM_LANTERN_LIT;
+                        chan[k] = 0.0;
+                        s.lanterns_lit = s.lanterns_lit + 1;
+                        // GDD §8 at 0:30: "+350 XP" — `XPS_LANTERN`.
+                        prog_award(progs[k], XPS_LANTERN, 0);
+                        evbus_push(bus, tick, EV_XP, prog_last_xp(progs[k]),
+                                   id, ids[best],
+                                   ev_q(px[best]), ev_q(py[best]), ev_q(pz[best]));
+                        if (prog_last_levels(progs[k]) > 0) {
+                            evbus_push(bus, tick, EV_LEVELUP, prog_level(progs[k]),
+                                       id, ids[best],
+                                       ev_q(px[best]), ev_q(py[best]), ev_q(pz[best]));
+                        }
+                    }
+                } else {
+                    // Releasing cancels.  A channel that survived a release
+                    // would let a player light a lantern in five separate
+                    // half-second taps while dodging, which is not the beat.
+                    chan[k] = 0.0;
+                }
+
+                // ---- pickups --------------------------------------------
+                // Backwards: `world_despawn` swaps the last slot into the hole.
+                let j: i32 = w.count - 1;
+                while (j >= 0) {
+                    if (kinds[j] == KIND_PICKUP) {
+                        let dx2: f64 = px[j] - ax;
+                        let dy2: f64 = py[j] - ay;
+                        let dz2: f64 = pz[j] - az;
+                        if (dx2 * dx2 + dy2 * dy2 + dz2 * dz2 <= r2) {
+                            evbus_push(bus, tick, EV_PICKUP, 0, id, ids[j],
+                                       ev_q(px[j]), ev_q(py[j]), ev_q(pz[j]));
+                            world_despawn(w, j);
+                            s.pickups = s.pickups + 1;
+                        }
+                    }
+                    j = j - 1;
+                }
+            }
+        }
+        k++;
+    }
+}
+
+// ---- (h) day-cycle tick, chunk streaming decisions -------------------------
+// The day cycle is a pure function of the tick, so this stage does not ADVANCE
+// it — it PUBLISHES it, and derives the two things that depend on it: the shade
+// tier the director will run at, and which chunk ring is resident.
+//
+// The tier reaches the director on the FOLLOWING tick, because `director_step`
+// ran in stage (e).  That is deliberate and it is not a bug: the tier changes
+// at a 200 m chunk boundary or a phase edge of a 16-minute cycle, and one tick
+// of lag on either is 16.7 ms.  Moving the tier before the director would mean
+// running the day cycle before the AI, which contradicts §4.3's order — and the
+// order is API.
+fn stage_world(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let tick: i32 = w.tick;
+    let seed: i32 = w.seed;
+
+    s.phase = day_phase(tick);
+    s.day_t = day_frac(tick);
+    s.horn = day_horn_edge(s.prev_tick, tick);
+
+    let pid = s.pslot_id;
+    let np: i32 = s.players;
+    let px = w.px;
+    let pz = w.pz;
+    let k: i32 = 0;
+    let have: i32 = 0;
+    let ax: f64 = 0.0;
+    let az: f64 = 0.0;
+    while (k < np) {
+        if (have == 0) {
+            let id: i32 = pid[k];
+            if (id != ID_NONE) {
+                let slot: i32 = world_slot_of(w, id);
+                if (slot != SLOT_NONE) { ax = px[slot]; az = pz[slot]; have = 1; }
+            }
+        }
+        k++;
+    }
+    if (have == 0) { return; }
+
+    let cx: i32 = floori(ax / g_CHUNK_M);
+    let cz: i32 = floori(az / g_CHUNK_M);
+    let tier: i32 = worldgen_shade_tier(seed, cx, cz, day_tier_bonus(tick));
+    s.tier = tier;
+    director_set_tier(s.dir, tier);
+
+    if (s.has_cs == 1) {
+        if (cx != s.ccx || cz != s.ccz) {
+            chunk_pin_ring(s.cs, cx, cz, g_RING_RADIUS);
+            s.ccx = cx;
+            s.ccz = cz;
+            s.streams = s.streams + 1;
+        }
+    }
+}
+
+// ---- (i) history_capture ---------------------------------------------------
+// Every tick, even in v1, even though nothing samples it yet.  A history that
+// is only captured when someone is watching has holes exactly where lag
+// compensation needs them.
+fn stage_history(p_w: object, p_s: object) {
+    let w: object = p_w;
+    let s: object = p_s;
+    history_capture(s.hist, w);
+}
+
+// ===========================================================================
+//  7.  sim_effects — STAGE (j), AND THE ONLY COSMETIC CODE IN src/sim
+// ===========================================================================
+//  ARCHITECTURE §3 / CLAUDE.md §7: `sim_apply_command` is pure with respect to
+//  the world — no sound, no particle, no shake — and every cosmetic lives here,
+//  in a pass that is SKIPPED when `world.replaying == 1`.  "Replaying 8
+//  commands must produce 0 sounds."
+//
+//  What it actually does: translate this tick's authoritative events into a
+//  client-side effect queue.  It emits nothing itself — `src/sim/**` has no
+//  audio device and no particle system and must never acquire one — it decides
+//  WHAT should happen and lets `src/game/client.hml` decide HOW.  That split is
+//  what makes the queue empty during a replay observable rather than notional:
+//  the counters are the proof.
+//
+//  It is a READER of the event bus and a WRITER of nothing but the queue.  It
+//  cannot change the simulation, so skipping it cannot change the state hash —
+//  which is the property that makes a replay's hash comparable to a live run's.
+export fn sim_effects(p_w: object): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    s.fx_n = 0;
+    if (w.replaying == 1) { let none: i32 = 0; return none; }
+
+    let bus: object = combat_events(s.cx);
+    let n: i32 = evbus_count(bus);
+    let made: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let ty: i32 = evbus_type(bus, i);
+        let kind: i32 = SIM_MISS;
+        if (ty == EV_SOUND)             { kind = SIM_FX_SOUND; }
+        else if (ty == EV_IMPACT)       { kind = SIM_FX_PARTICLE; }
+        else if (ty == EV_HITMARKER)    { kind = SIM_FX_HITMARKER; }
+        else if (ty == EV_HIT_FLASH)    { kind = SIM_FX_FLASH; }
+        else if (ty == EV_DAMAGE_NUMBER){ kind = SIM_FX_NUMBER; }
+        else if (ty == EV_DAMAGE_TAKEN) { kind = SIM_FX_SHAKE; }
+        if (kind >= 0) {
+            if (fx_push(s, kind, evbus_sub(bus, i), evbus_target(bus, i),
+                        evbus_x(bus, i), evbus_y(bus, i), evbus_z(bus, i)) == 1) {
+                made++;
+            }
+        }
+        i++;
+    }
+
+    // The director's four beats are cosmetic at this layer: the horn, the wave
+    // start, the 0.4 s of silence before the ember rain, and the hold ending.
+    let de: i32 = director_events(s.dir);
+    if ((de & DIR_EV_HORN) != 0)       { if (fx_push(s, SIM_FX_SOUND, DIR_EV_HORN, 0, 0.0, 0.0, 0.0) == 1) { made++; } }
+    if ((de & DIR_EV_WAVE_START) != 0) { if (fx_push(s, SIM_FX_SOUND, DIR_EV_WAVE_START, 0, 0.0, 0.0, 0.0) == 1) { made++; } }
+    if ((de & DIR_EV_WAVE_CLEAR) != 0) { if (fx_push(s, SIM_FX_PARTICLE, DIR_EV_WAVE_CLEAR, 0, 0.0, 0.0, 0.0) == 1) { made++; } }
+    if ((de & DIR_EV_HOLD_DONE) != 0)  { if (fx_push(s, SIM_FX_SOUND, DIR_EV_HOLD_DONE, 0, 0.0, 0.0, 0.0) == 1) { made++; } }
+
+    s.fx_total = s.fx_total + made;
+    let out: i32 = made;
+    return out;
+}
+
+fn fx_push(p_s: object, p_kind: i32, p_a: i32, p_b: i32,
+           p_x: f64, p_y: f64, p_z: f64): i32 {
+    let s: object = p_s;
+    let n: i32 = s.fx_n;
+    if (n >= SIM_FX_CAP) {
+        s.fx_dropped = s.fx_dropped + 1;
+        let full: i32 = 0;
+        return full;
+    }
+    let ak = s.fx_kind; ak[n] = p_kind;
+    let aa = s.fx_a;    aa[n] = p_a;
+    let ab = s.fx_b;    ab[n] = p_b;
+    let ax = s.fx_x;    ax[n] = p_x;
+    let ay = s.fx_y;    ay[n] = p_y;
+    let az = s.fx_z;    az[n] = p_z;
+    s.fx_n = n + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn sim_fx_count(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.fx_n; return o; }
+export fn sim_fx_total(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.fx_total; return o; }
+export fn sim_fx_dropped(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.fx_dropped; return o; }
+export fn sim_fx_kind(p_w: object, p_i: i32): i32 { let w: object = p_w; let s: object = w.sim; let a = s.fx_kind; let o: i32 = a[p_i]; return o; }
+export fn sim_fx_a(p_w: object, p_i: i32): i32 { let w: object = p_w; let s: object = w.sim; let a = s.fx_a; let o: i32 = a[p_i]; return o; }
+export fn sim_fx_b(p_w: object, p_i: i32): i32 { let w: object = p_w; let s: object = w.sim; let a = s.fx_b; let o: i32 = a[p_i]; return o; }
+export fn sim_fx_x(p_w: object, p_i: i32): f64 { let w: object = p_w; let s: object = w.sim; let a = s.fx_x; let o: f64 = a[p_i]; return o; }
+export fn sim_fx_y(p_w: object, p_i: i32): f64 { let w: object = p_w; let s: object = w.sim; let a = s.fx_y; let o: f64 = a[p_i]; return o; }
+export fn sim_fx_z(p_w: object, p_i: i32): f64 { let w: object = p_w; let s: object = w.sim; let a = s.fx_z; let o: f64 = a[p_i]; return o; }
+
+// ===========================================================================
+//  8.  THE STEP
+// ===========================================================================
+
+fn run_stage(p_w: object, p_s: object, p_id: i32) {
+    let w: object = p_w;
+    let s: object = p_s;
+    let id: i32 = p_id;
+    if (id == SIM_STAGE_COMMANDS) { stage_commands(w, s); return; }
+    if (id == SIM_STAGE_MOVEMENT) { stage_movement(w, s); return; }
+    if (id == SIM_STAGE_WEAPONS)  { stage_weapons(w, s); return; }
+    if (id == SIM_STAGE_PROJ)     { stage_projectiles(w, s); return; }
+    if (id == SIM_STAGE_AI)       { stage_ai(w, s); return; }
+    if (id == SIM_STAGE_DAMAGE)   { stage_damage(w, s); return; }
+    if (id == SIM_STAGE_INTERACT) { stage_interact(w, s); return; }
+    if (id == SIM_STAGE_WORLD)    { stage_world(w, s); return; }
+    if (id == SIM_STAGE_HISTORY)  { stage_history(w, s); return; }
+    if (id == SIM_STAGE_EFFECTS)  {
+        // The ONE conditional stage.  Gated here as well as inside
+        // `sim_effects` so a reordering test cannot accidentally run cosmetics
+        // during a replay by moving the stage.
+        if (w.replaying == 0) { sim_effects(w); } else { s.fx_n = 0; }
+        return;
+    }
+}
+
+// ONE fixed tick.  ARCHITECTURE §5.4: `sim_step(world, tick)`.
+//
+// The PROLOGUE below is not a stage and cannot be reordered: the event bus must
+// be empty before anything pushes into it, and `world.tick` must be current
+// before any stage reads it.  Everything that IS a stage goes through
+// `sim.order`.
+//
+// Returns the number of stages executed (SIM_STAGE_COUNT), so a caller that
+// gets 0 knows the sim was never built rather than silently rendering a frozen
+// world.
+export fn sim_step(p_w: object, p_tick: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let tick: i32 = p_tick;
+
+    // ---- prologue ---------------------------------------------------------
+    s.prev_tick = w.tick;
+    w.tick = tick;
+    combat_begin_tick(s.cx);
+
+    // ---- the ten stages, through the order table --------------------------
+    let ord = s.order;
+    let i: i32 = 0;
+    while (i < SIM_STAGE_COUNT) {
+        run_stage(w, s, ord[i]);
+        i++;
+    }
+
+    s.steps = s.steps + 1;
+    let out: i32 = SIM_STAGE_COUNT;
+    return out;
+}
+
+// The stage at position `p_i` of the executed order.
+export fn sim_stage_at(p_w: object, p_i: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let i: i32 = p_i;
+    if (i < 0 || i >= SIM_STAGE_COUNT) { let bad: i32 = SIM_MISS; return bad; }
+    let a = s.order;
+    let out: i32 = a[i];
+    return out;
+}
+
+// TEST HOOK.  Swap two positions in the executed order and count that it
+// happened.  This exists so BUILD_PLAN W4-9's "reorder two stages and expect a
+// different hash" is a test of the REAL order rather than of a copy of it.
+// `sim_stat_swaps` is non-zero forever afterwards, so a build that ever called
+// this is visible in the stats.
+export fn sim_stage_swap(p_w: object, p_i: i32, p_j: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let i: i32 = p_i;
+    let j: i32 = p_j;
+    if (i < 0 || i >= SIM_STAGE_COUNT) { let bad: i32 = 0; return bad; }
+    if (j < 0 || j >= SIM_STAGE_COUNT) { let bad2: i32 = 0; return bad2; }
+    let a = s.order;
+    let t: i32 = a[i];
+    a[i] = a[j];
+    a[j] = t;
+    s.swaps = s.swaps + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// Restore the documented order.
+export fn sim_stage_order_reset(p_w: object): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let a = s.order;
+    let i: i32 = 0;
+    while (i < SIM_STAGE_COUNT) { a[i] = i; i++; }
+    let out: i32 = 1;
+    return out;
+}
+
+// `world.replaying`.  1 makes stage (j) a no-op; nothing else changes, which is
+// exactly why a replay's hash is comparable to a live run's.
+export fn sim_set_replaying(p_w: object, p_r: i32): i32 {
+    let w: object = p_w;
+    world_set_replaying(w, p_r);
+    let out: i32 = p_r;
+    return out;
+}
+
+// ===========================================================================
+//  9.  THE STATE HASH — the acceptance criterion, in one number
+// ===========================================================================
+//  Folds every authoritative field of every entity plus every module's own
+//  hash.  It does NOT fold the cosmetic queue, the effect counters or anything
+//  else stage (j) touches — that is the whole point: a replay with
+//  `replaying = 1` must produce the same number as the live run it is
+//  reproducing, and it cannot if the number contains the cosmetics the replay
+//  deliberately skipped.
+//
+//  Positions are folded through the 1/16 m WIRE grid rather than as raw f64
+//  bits.  A hash over raw bits would flag a 1e-16 difference that the wire
+//  cannot carry and the client can never see, which trains everyone to ignore
+//  the hash.  Divergence that survives quantisation is divergence that would
+//  desync a real client.  `move_state_hash` folds the raw IEEE bytes of the
+//  PredictedState in ADDITION, so a 1e-13 movement divergence is still caught —
+//  by the module that owns those bits.
+fn mixh(p_h: u64, p_v: i32): u64 {
+    let k: i32 = p_v;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    let h: u64 = (p_h ^ u) * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+fn mixh64(p_h: u64, p_v: u64): u64 {
+    let h: u64 = (p_h ^ p_v) * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+fn qpos(p_v: f64): i32 {
+    let v: f64 = p_v * 16.0;
+    if (v > 2147483000.0) { v = 2147483000.0; }
+    if (v < -2147483000.0) { v = -2147483000.0; }
+    let q: i32 = 0;
+    if (v >= 0.0) { q = i32(v + 0.5); }
+    if (v < 0.0)  { q = i32(v - 0.5); }
+    let out: i32 = q;
+    return out;
+}
+
+export fn sim_hash(p_w: object): u64 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let h: u64 = 14695981039346656037;
+
+    h = mixh(h, w.tick);
+    h = mixh(h, w.seed);
+    h = mixh(h, w.count);
+
+    let n: i32 = w.count;
+    let ids = w.id;
+    let kinds = w.kind;
+    let px = w.px;
+    let py = w.py;
+    let pz = w.pz;
+    let vx = w.vx;
+    let vy = w.vy;
+    let vz = w.vz;
+    let yaw = w.yaw;
+    let pit = w.pitch;
+    let hp = w.hp;
+    let armor = w.armor;
+    let flags = w.flags;
+    let model = w.model;
+    let anim = w.anim;
+    let tint = w.tint;
+    let weapon = w.weapon;
+    let amag = w.ammo_mag;
+    let i: i32 = 0;
+    while (i < n) {
+        h = mixh(h, ids[i]);
+        h = mixh(h, kinds[i]);
+        h = mixh(h, qpos(px[i]));
+        h = mixh(h, qpos(py[i]));
+        h = mixh(h, qpos(pz[i]));
+        h = mixh(h, qpos(vx[i]));
+        h = mixh(h, qpos(vy[i]));
+        h = mixh(h, qpos(vz[i]));
+        h = mixh(h, qpos(yaw[i]));
+        h = mixh(h, qpos(pit[i]));
+        h = mixh(h, hp[i]);
+        h = mixh(h, armor[i]);
+        h = mixh(h, flags[i]);
+        h = mixh(h, model[i]);
+        h = mixh(h, anim[i]);
+        h = mixh(h, tint[i]);
+        h = mixh(h, weapon[i]);
+        h = mixh(h, amag[i]);
+        i++;
+    }
+
+    // ---- the eight modules, each through its own hash --------------------
+    let np: i32 = s.players;
+    let psa = s.move_ps;
+    let progs = s.prog;
+    let k: i32 = 0;
+    while (k < np) {
+        h = mixh(h, move_state_hash(psa[k]));
+        h = mixh(h, prog_hash(progs[k]));
+        k++;
+    }
+    h = mixh(h, wpn_hash_all(s.wpn, np));
+    h = mixh(h, evbus_hash(combat_events(s.cx)));
+    h = mixh64(h, proj_state_hash(s.proj, w));
+    h = mixh(h, ai_hash(s.ai, w));
+    h = mixh64(h, director_hash(s.dir));
+    h = mixh(h, s.loot_hash);
+    h = mixh(h, s.loot_rolls);
+
+    let out: u64 = h;
+    return out;
+}
+
+// A cheaper hash for a per-tick trace: transforms only.  `tools/replay.hml`
+// compares one of these per tick over 10 000 ticks, so it has to be cheap
+// enough that the trace is not the measurement.
+export fn sim_pos_hash(p_w: object): u64 {
+    let w: object = p_w;
+    let h: u64 = 14695981039346656037;
+    h = mixh(h, w.tick);
+    let n: i32 = w.count;
+    let ids = w.id;
+    let px = w.px;
+    let py = w.py;
+    let pz = w.pz;
+    let yaw = w.yaw;
+    let i: i32 = 0;
+    while (i < n) {
+        h = mixh(h, ids[i]);
+        h = mixh(h, qpos(px[i]));
+        h = mixh(h, qpos(py[i]));
+        h = mixh(h, qpos(pz[i]));
+        h = mixh(h, qpos(yaw[i]));
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}

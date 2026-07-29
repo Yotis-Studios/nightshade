@@ -1,0 +1,1333 @@
+// =============================================================================
+//  client.hml — INPUT -> COMMAND -> WIRE, and PACKET -> PICTURE.       W4-11.
+// =============================================================================
+//
+//  The client half of ARCHITECTURE §3. It owns four things and nothing else:
+//
+//      1. the CAMERA          (`src/render/view.hml` — aim is client-authored)
+//      2. the COMMAND         (input latched, quantised, sequenced, sent)
+//      3. the RENDER SNAPSHOT (the packet decoded, then interpolated by alpha)
+//      4. the EVENT LOG       (the owner block's cosmetic queue turned into
+//                              sounds, particles and HUD state)
+//
+//  -----------------------------------------------------------------------------
+//  IT CANNOT READ `world.*`, AND THAT IS STRUCTURAL
+//  -----------------------------------------------------------------------------
+//  This file does not import `src/sim/world.hml`. It never sees a `World`. It
+//  is handed exactly two things per tick — the snapshot PACKET and the OWNER
+//  BLOCK — and it decodes the first with `snapshot_read`, which is the same
+//  decoder a v2 client runs on bytes off a socket. `rsnap_build_from_net` then
+//  turns the decoded frame into the RenderSnapshot. Both calls already existed;
+//  W4-11 only had to refuse the shortcut.
+//
+//  BUILD_PLAN W4-11's acceptance criterion "the renderer never reads world.*"
+//  is therefore not a grep result that happens to be clean — there is no code
+//  path from here to a world field.
+//
+//  -----------------------------------------------------------------------------
+//  WHAT IS PREDICTED IN v1, AND WHAT IS NOT.  READ THIS BEFORE ADDING LATENCY.
+//  -----------------------------------------------------------------------------
+//  ARCHITECTURE §3 writes the v1 client as "read back", v2 as "predict +
+//  reconcile", and this file is honest about being v1:
+//
+//    PREDICTED (instant, never waits for the server, never reconciled):
+//      * AIM. Mouse-look is client-authored — `view_aim_*` IS the number that
+//        goes into the command, and `view_render_*` (aim + recoil kick) is the
+//        number that goes into the MVP. Neither ever waits for a packet. This
+//        is the single reason 120 ms of fake latency is playable at all.
+//      * EVERY COSMETIC OF FIRING. The muzzle flash, the viewmodel kick, the
+//        shot sound, the tracer, the screen shake and the dry-fire click all
+//        fire on the INPUT FRAME, from `client_press_fire`, with no server
+//        round trip. NETWORKING's rule and BUILD_PLAN's criterion:
+//        "NS_FAKE_LATENCY_MS=250 still fires the weapon on frame 0 with full
+//        cosmetic feedback."
+//      * The FOV lerp, the shake envelope, the kick decay, the HUD timers, the
+//        particle pool. All frame-time, all client-only, none replicated.
+//
+//    NOT PREDICTED (authoritative, arrives when it arrives):
+//      * POSITION. The body moves when the server says it moved.
+//      * DAMAGE, DEATH, AMMO, XP. Everything with a number in it.
+//
+//  The consequence is exact and it is the right trade for v1: there is no
+//  reconciliation, therefore there is no rubber-banding — not "we tuned it
+//  out", but "the code that could produce it does not exist". The cost is that
+//  translation lags by the one-way delay. `PredictedState`,
+//  `predicted_capture`/`predicted_restore` and the owner block are all already
+//  shaped for the v2 version; what is missing is a replay of unacknowledged
+//  commands, and that is a v2 task with a v2 test.
+//
+//  -----------------------------------------------------------------------------
+//  ART AND AUDIO ARRIVE AS NUMBERS (ARCHITECTURE §5.6b, applied one layer up)
+//  -----------------------------------------------------------------------------
+//  This file names no atlas cell and no sound file. It emits SEMANTIC ids —
+//  `CFX_*` for a particle's look, `CSND_*` for a sound's meaning — and
+//  `main.hml` binds them to `fxgen` cells and `audiobank` sfx with
+//  `client_bind_fx_cells` / by mapping `CSND_*`. That is what keeps this file
+//  linkable with no SDL: `tools/probe_game.hml` builds it headless and asserts
+//  `nm | grep -c SDL_ == 0`.
+// =============================================================================
+
+import { sqrt, sin, cos, floor, atan2 } from "@stdlib/math";
+
+import { g_TICK_DT, g_TICK_MS, g_RES_W, g_RES_H, g_MOUSE_SENS_RAD,
+         g_FOV_HIP, g_FOV_ADS, g_FOV_SPRINT, g_EYE_STAND,
+         g_HITMARKER_S, g_MUZZLE_S, g_TRACER_S, g_TRACER_EVERY,
+         g_IMPACT_S, g_IMPACT_PARTICLES, g_PARTICLE_GRAVITY,
+         g_DMGNUM_S, g_DMGNUM_RISE, g_DISSOLVE_MOTES, g_MOTE_HOME_S,
+         g_KICK_PITCH_DEG, g_LANTERN_LIT_S, g_WAVE_CLEAR_SILENCE_S,
+         g_STEP_INTERVAL_WALK_S, g_STEP_INTERVAL_SPRINT_S,
+         g_MAX_PARTICLES, g_DMG_DIR_FADE_S, g_LOW_HP, g_HP_MAX,
+         g_MAX_RENDER_ENTS, g_FOG_FAR_CAP
+       } from "../core/config.hml";
+
+import { clamp01, clampf, clampi, lerpf } from "../core/mathx.hml";
+
+import { cmd_new, cmd_set, cmd_yaw, cmd_pitch, cmd_btn,
+         BTN_FIRE, BTN_ADS, BTN_JUMP, BTN_CROUCH, BTN_SPRINT,
+         BTN_RELOAD, BTN_USE, BTN_MELEE
+       } from "../sim/command.hml";
+
+import { wpn_shot_interval, wpn_reload_time, wpn_recoil_v, wpn_mag,
+         WPN_KESTREL, WPN_NONE } from "../sim/weapons.hml";
+
+import { snapshot_new_cap, snapshot_read, snapshot_reset, snapshot_count,
+         snapshot_tick, snapshot_size, SNAP_CAP, SNAP_MISS
+       } from "../sim/snapshot.hml";
+
+import { rsnap_new_cap, rsnap_build_from_net, rsnap_set_viewer,
+         rsnap_set_eye_height, rsnap_set_cull_radius, rsnap_set_cam,
+         rsnap_count, rsnap_field_id, rsnap_field_x, rsnap_field_y,
+         rsnap_field_z, rsnap_field_yaw, rsnap_field_model,
+         rsnap_field_flags, rsnap_index_of,
+         rsnap_cam_x, rsnap_cam_y, rsnap_cam_z, rsnap_rolls,
+         RSF_VISIBLE, RSF_DEAD, RSNAP_MISS
+       } from "../render/render_snapshot.hml";
+
+import { view_new, view_build, view_set_viewport, view_set_fog_far,
+         view_set_eye, view_set_angles, view_look_mouse, view_look,
+         view_set_fov_mode, view_snap_fov, view_kick_fire, view_shake_fire,
+         view_shake, view_clear_kick, view_clear_shake, view_set_seed,
+         view_aim_yaw, view_aim_pitch, view_aim_forward_x,
+         view_aim_forward_y, view_aim_forward_z,
+         view_render_yaw, view_render_pitch, view_render_roll,
+         view_eye_x, view_eye_y, view_eye_z, view_fov,
+         view_shake_x, view_shake_y, view_sens_scale, view_wrap_pi,
+         g_VIEW_HIP, g_VIEW_ADS, g_VIEW_SPRINT
+       } from "../render/view.hml";
+
+import { transport_send_command, transport_latency_ms, transport_set_tick
+       } from "../net/transport.hml";
+
+// The beat ids and the cosmetic kinds. `server.hml` is `src/game/**` and this
+// file is too, so this is not a wall crossing — it is one enum, in one place.
+import { SV_BEAT_WAKE, SV_BEAT_STAND, SV_BEAT_SEEK, SV_BEAT_WISPS,
+         SV_BEAT_MOTE, SV_BEAT_REACH, SV_BEAT_CHANNEL, SV_BEAT_LIT,
+         SV_BEAT_HORN, SV_BEAT_WAVE, SV_BEAT_CLEAR, SV_BEAT_PATH,
+         SV_T_STAND, SV_MODEL_LANTERN, SV_MODEL_PICKUP
+       } from "./server.hml";
+
+import { SIM_FX_SOUND, SIM_FX_PARTICLE, SIM_FX_SHAKE, SIM_FX_HITMARKER,
+         SIM_FX_FLASH, SIM_FX_NUMBER } from "../sim/sim.hml";
+
+import { DIR_EV_HORN, DIR_EV_WAVE_START, DIR_EV_WAVE_CLEAR,
+         DIR_EV_HOLD_DONE, DIR_EV_HOLD_START, DIR_IDLE, DIR_SPAWNING,
+         DIR_CLEARING, DIR_GAP, DIR_DONE } from "../sim/director.hml";
+
+// ===========================================================================
+//  1.  THE TWO SEMANTIC ENUMS — the only art/audio vocabulary this file has
+// ===========================================================================
+
+// A particle's LOOK. `main.hml` binds each to an `fxgen` atlas cell.
+export let CFX_EMBER: i32   = 0;   // the warm mote. Kills throw these at you.
+export let CFX_MOTE: i32    = 1;   // the cool XP mote
+export let CFX_GLOW_S: i32  = 2;   // small glow card
+export let CFX_GLOW_L: i32  = 3;   // large glow card: muzzle flash, lantern
+export let CFX_SPARK: i32   = 4;   // impact spark
+export let CFX_RAIN: i32    = 5;   // a vertical streak
+export let CFX_TRACER: i32  = 6;   // a streak away from the camera
+export let CFX_CELL_COUNT: i32 = 7;
+
+// A sound's MEANING. `main.hml` maps each to an `audiobank` sfx id.
+export let CSND_SHOT: i32        = 0;
+export let CSND_DRYFIRE: i32     = 1;
+export let CSND_RELOAD_DROP: i32 = 2;
+export let CSND_RELOAD_INS: i32  = 3;
+export let CSND_RELOAD_SEAT: i32 = 4;
+export let CSND_MAG_CLACK: i32   = 5;
+export let CSND_HIT0: i32        = 6;   // .. +4, the GDD §7.2 pitch chain
+export let CSND_HIT_STEPS: i32   = 5;
+export let CSND_KILL: i32        = 11;
+export let CSND_IMPACT: i32      = 12;
+export let CSND_IMPACT_ARMOR: i32 = 13;
+export let CSND_BELL: i32        = 14;  // the lantern
+export let CSND_HORN: i32        = 15;  // the dusk horn, two long notes
+export let CSND_LEVELUP: i32     = 16;
+export let CSND_WAVECLEAR: i32   = 17;
+export let CSND_XP: i32          = 18;
+export let CSND_HURT: i32        = 19;
+export let CSND_STEP: i32        = 20;
+export let CSND_EMBER: i32       = 21;
+export let CSND_WISP: i32        = 22;
+export let CSND_HUSK: i32        = 23;
+export let CSND_COUNT: i32       = 24;
+
+// The particle pool. Client-only, never replicated. `g_MAX_PARTICLES` is 512;
+// at 2 triangles a particle that is 1024 triangles, so the pool is capped
+// well under it and the EMIT is capped again by distance.
+export let CFX_CAP: i32 = 256;
+export let CSND_QUEUE: i32 = 32;
+
+// Particle behaviours.
+export let CFXB_BALLISTIC: i32 = 0;   // velocity + gravity
+export let CFXB_HOME: i32      = 1;   // homes on the player: the kill motes
+export let CFXB_RING: i32      = 2;   // stationary, grows: the lantern ring
+export let CFXB_STREAK: i32    = 3;   // a tracer
+
+// Client-side presentation timings that are NOT in config.hml because they are
+// this file's presentation, not the game's balance.
+export let CL_INTRO_FADE_S: f64  = 1.4;    // 0:00 black -> the world
+export let CL_STAND_S: f64       = 0.8;    // 0:03 "the camera stands up (0.8 s)"
+export let CL_LIE_EYE_M: f64     = 0.34;   // eye height while on your back
+export let CL_LIE_PITCH: f64     = 1.20;   // ~69 deg: looking at the sky
+export let CL_BANNER_S: f64      = 2.2;
+export let CL_CARD_S: f64        = 2.5;    // "an unlock card ... for 2.5 s"
+export let CL_LEVEL_S: f64       = 1.4;    // "big centred LEVEL 12 for 1.4 s"
+export let CL_HITMARK_S: f64     = g_HITMARKER_S;
+export let CL_PROMPT_M: f64      = 3.2;    // show HOLD [E] from this far out
+
+export let CL_MISS: i32 = -1;
+
+// ===========================================================================
+//  2.  SMALL HELPERS
+// ===========================================================================
+
+fn zeros_i(p_n: i32): array<i32> {
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+fn absf(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a;
+    return out;
+}
+
+// ===========================================================================
+//  3.  CONSTRUCTION
+// ===========================================================================
+
+export fn client_new(p_transport, p_seed: i32): object {
+    let v: object = view_new();
+    view_set_viewport(v, f64(g_RES_W), f64(g_RES_H));
+    view_set_fog_far(v, g_FOG_FAR_CAP);
+    view_set_fov_mode(v, 0);
+    view_snap_fov(v);
+    view_set_seed(v, p_seed);
+
+    let rs: object = rsnap_new_cap(g_MAX_RENDER_ENTS);
+    rsnap_set_eye_height(rs, g_EYE_STAND);
+    rsnap_set_cull_radius(rs, 0.0);
+
+    let cl: object = {
+        ver: 1,
+        seed: p_seed,
+        net: p_transport,
+        view: v,
+        rs: rs,
+        rx: snapshot_new_cap(SNAP_CAP),
+        base: snapshot_new_cap(SNAP_CAP),
+        cmd: cmd_new(),
+        seq: 0,
+        tick: 0,
+        latency_ms: 0.0,
+
+        // ---- input latches -------------------------------------------------
+        in_fwd: 0.0,
+        in_str: 0.0,
+        in_btn: 0,
+        in_btn_prev: 0,
+        in_weapon: WPN_KESTREL,
+        mouse_dx: 0.0,
+        mouse_dy: 0.0,
+        sens: 1.0,
+        invert_y: 0,
+        control: 0,
+
+        // ---- the owner block, copied ---------------------------------------
+        l_tick: -1,
+        hp: i32(g_HP_MAX),
+        hp_max: i32(g_HP_MAX),
+        dead: 0,
+        respawn_t: 0.0,
+        px: 0.0, py: 0.0, pz: 0.0,
+        eye: g_EYE_STAND,
+        eye_abs: g_EYE_STAND,
+        speed: 0.0,
+        grounded: 1,
+        step_dist: 0.0,
+        weapon: WPN_KESTREL,
+        ammo: 0,
+        reserve: 0,
+        reload_t: 0.0,
+        reload_stage: 0,
+        ads: 0.0,
+        rc_v: 0.0,
+        shots: 0,
+        shots_prev: 0,
+        level: 1,
+        xp_total: 0,
+        xp_into: 0,
+        xp_need: 1,
+        phase: 0,
+        day_t: 0.0,
+        tier: 0,
+        alive: 0,
+        wave_state: DIR_IDLE,
+        wave: 0,
+        lantern_x: 0.0, lantern_y: 0.0, lantern_z: 0.0,
+        lantern_lit: 0,
+        lantern_dist: 1.0e9,
+        chan01: 0.0,
+        in_reach: 0,
+        beat: SV_BEAT_WAKE,
+        beat_tick: 0,
+        session: 0,
+
+        // ---- presentation timers --------------------------------------------
+        t: 0.0,
+        intro_a: 1.0,          // 1 = black
+        stand01: 0.0,          // 0 = on your back, 1 = standing
+        hitmark_t: 0.0,
+        hitmark_kill: 0,
+        dmg_t: 0.0,
+        dmg_dir: 0.0,
+        banner: "",
+        banner_t: 0.0,
+        card: "",
+        card_t: 0.0,
+        level_t: 0.0,
+        level_shown: 0,
+        silence_t: 0.0,
+        toast: "",
+        toast_t: 0.0,
+        step_t: 0.0,
+        idle_t: 0.0,
+        muzzle_t: 0.0,
+        lit_ring_t: 0.0,
+
+        // ---- client-side fire prediction ------------------------------------
+        fire_cd: 0.0,
+        fire_shots: 0,
+        pred_reload_t: 0.0,
+        pred_ammo: CL_MISS,
+        want_reload: 0,
+        want_use: 0,
+        tracer_n: 0,
+
+        // ---- the particle pool (SoA, preallocated, zero allocation/frame) ---
+        p_n: 0,
+        p_kind: zeros_i(CFX_CAP),
+        p_beh: zeros_i(CFX_CAP),
+        p_x: zeros_f(CFX_CAP),
+        p_y: zeros_f(CFX_CAP),
+        p_z: zeros_f(CFX_CAP),
+        p_vx: zeros_f(CFX_CAP),
+        p_vy: zeros_f(CFX_CAP),
+        p_vz: zeros_f(CFX_CAP),
+        p_life: zeros_f(CFX_CAP),
+        p_life0: zeros_f(CFX_CAP),
+        p_s0: zeros_f(CFX_CAP),
+        p_s1: zeros_f(CFX_CAP),
+        p_r: zeros_i(CFX_CAP),
+        p_g: zeros_i(CFX_CAP),
+        p_b: zeros_i(CFX_CAP),
+        p_a: zeros_i(CFX_CAP),
+        p_spawned: 0,
+        p_dropped: 0,
+
+        // atlas cells, bound by main.hml
+        cell: zeros_i(CFX_CELL_COUNT),
+        cells_bound: 0,
+
+        // ---- the sound queue -------------------------------------------------
+        s_n: 0,
+        s_id: zeros_i(CSND_QUEUE),
+        s_gain: zeros_f(CSND_QUEUE),
+        s_pan: zeros_f(CSND_QUEUE),
+        s_total: 0,
+        s_dropped: 0,
+
+        // ---- counters ---------------------------------------------------------
+        cmds_sent: 0,
+        packets: 0,
+        decode_fail: 0,
+        applies: 0,
+        frames: 0
+    };
+
+    if (p_transport != null) {
+        cl.latency_ms = transport_latency_ms(p_transport);
+    }
+    let out: object = cl;
+    return out;
+}
+
+// The seven atlas cells this file's particles use, as numbers. See the header:
+// no `src/art` import, ever.
+export fn client_bind_fx_cells(p_cl: object, p_ember: i32, p_mote: i32,
+                               p_glow_s: i32, p_glow_l: i32, p_spark: i32,
+                               p_rain: i32, p_tracer: i32): i32 {
+    let cl: object = p_cl;
+    let c = cl.cell;
+    c[CFX_EMBER] = p_ember;
+    c[CFX_MOTE] = p_mote;
+    c[CFX_GLOW_S] = p_glow_s;
+    c[CFX_GLOW_L] = p_glow_l;
+    c[CFX_SPARK] = p_spark;
+    c[CFX_RAIN] = p_rain;
+    c[CFX_TRACER] = p_tracer;
+    cl.cells_bound = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn client_set_sens(p_cl: object, p_s: f64) {
+    let cl: object = p_cl;
+    let s: f64 = p_s;
+    if (s < 0.01) { s = 0.01; }
+    if (s > 20.0) { s = 20.0; }
+    cl.sens = s;
+}
+
+// The spawn look direction. ABSOLUTE, in radians, and it is the only thing
+// that ever writes the view's angles from outside `client_look`: GAME_DESIGN
+// §8 at 0:06 needs the lantern to be the thing you are already looking at.
+export fn client_set_angles(p_cl: object, p_yaw: f64, p_pitch: f64) {
+    let cl: object = p_cl;
+    view_set_angles(cl.view, p_yaw, p_pitch);
+}
+
+export fn client_set_invert_y(p_cl: object, p_on: i32) {
+    let cl: object = p_cl;
+    cl.invert_y = p_on;
+}
+
+export fn client_view(p_cl: object): object { let cl: object = p_cl; let o: object = cl.view; return o; }
+export fn client_rsnap(p_cl: object): object { let cl: object = p_cl; let o: object = cl.rs; return o; }
+
+// ===========================================================================
+//  4.  INPUT  (§4 stage 1 — every frame, before the tick loop)
+// ===========================================================================
+//
+//  Mouse deltas ACCUMULATE across the frame and are applied to the view
+//  immediately, because aim must not wait for a tick boundary any more than it
+//  waits for a packet. The command then samples `view_aim_*`, which is the
+//  recoil-FREE pair — `view.hml`'s whole reason for having two.
+
+export fn client_look(p_cl: object, p_dx: f64, p_dy: f64) {
+    let cl: object = p_cl;
+    if (cl.control == 0) { return; }
+    let dy: f64 = p_dy;
+    if (cl.invert_y != 0) { dy = 0.0 - dy; }
+    // g_MOUSE_SENS_RAD was applied HERE and again inside view_look_mouse
+    // (`let s = g_MOUSE_SENS_RAD * p_sens`), squaring it. Measured 4.84e-6
+    // rad/count, which is exactly 0.0022^2 -- a 180-degree turn needed 649,089
+    // mouse counts instead of 1428. view_look_mouse owns the unit conversion, so
+    // pass the user's multiplier alone.
+    view_look_mouse(cl.view, p_dx, dy, cl.sens);
+    cl.mouse_dx = cl.mouse_dx + p_dx;
+    cl.mouse_dy = cl.mouse_dy + dy;
+}
+
+// Keyboard/gamepad look, radians per second, for a player with no mouse (and
+// for the headless demo driver).
+export fn client_look_axis(p_cl: object, p_dyaw: f64, p_dpitch: f64) {
+    let cl: object = p_cl;
+    if (cl.control == 0) { return; }
+    view_look(cl.view, p_dyaw, p_dpitch);
+}
+
+export fn client_set_move(p_cl: object, p_fwd: f64, p_strafe: f64) {
+    let cl: object = p_cl;
+    if (cl.control == 0) { cl.in_fwd = 0.0; cl.in_str = 0.0; return; }
+    cl.in_fwd = clampf(p_fwd, -1.0, 1.0);
+    cl.in_str = clampf(p_strafe, -1.0, 1.0);
+}
+
+export fn client_set_button(p_cl: object, p_bit: i32, p_down: i32) {
+    let cl: object = p_cl;
+    if (cl.control == 0) { return; }
+    if (p_down != 0) { cl.in_btn = cl.in_btn | p_bit; }
+    else { cl.in_btn = cl.in_btn & (0 - 1 - p_bit); }
+}
+
+export fn client_buttons(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.in_btn; return o; }
+export fn client_has_control(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.control; return o; }
+
+// ---------------------------------------------------------------------------
+// THE FRAME-0 SHOT.  This is the whole latency criterion, in one function.
+// ---------------------------------------------------------------------------
+// Called on the FRAME the trigger goes down, not on the tick the server
+// resolves it. Everything it does is cosmetic and client-local: no damage, no
+// ammo decrement that the server does not also make, no hit. The command still
+// carries BTN_FIRE and the server still decides whether the shot happened.
+//
+// The gate is the client's own copy of the two facts it is allowed to know —
+// the magazine and the reload timer — plus a local rate-of-fire timer from
+// `wpn_shot_interval`, which is a pure table lookup, not sim state. At 0 ms of
+// latency the prediction and the authority agree every time; at 250 ms the
+// prediction can be one shot optimistic at the moment the magazine empties,
+// which shows as one extra flash and no extra bullet. That is the correct
+// failure: the world stays authoritative and the hands stay responsive.
+export fn client_press_fire(p_cl: object): i32 {
+    let cl: object = p_cl;
+    if (cl.control == 0) { let no: i32 = 0; return no; }
+    if (cl.dead == 1) { let dead: i32 = 0; return dead; }
+    if (cl.fire_cd > 0.0) { let cd: i32 = 0; return cd; }
+    if (cl.reload_t > 0.0 || cl.pred_reload_t > 0.0) { let rl: i32 = 0; return rl; }
+
+    let w: i32 = cl.weapon;
+    let ammo: i32 = cl.ammo;
+    if (cl.pred_ammo != CL_MISS) { ammo = cl.pred_ammo; }
+    if (ammo <= 0) {
+        // GDD §7.12: "Distinct dry-fire click, reticle turns red, 0.2 s."
+        cl_sound(cl, CSND_DRYFIRE, 0.85, 0.0);
+        cl.fire_cd = 0.16;
+        let dry: i32 = 0;
+        return dry;
+    }
+
+    cl.pred_ammo = ammo - 1;
+    cl.fire_cd = wpn_shot_interval(w);
+    cl.fire_shots = cl.fire_shots + 1;
+    cl_fire_cosmetics(cl);
+    let out: i32 = 1;
+    return out;
+}
+
+export fn client_press_reload(p_cl: object): i32 {
+    let cl: object = p_cl;
+    if (cl.control == 0) { let no: i32 = 0; return no; }
+    let w: i32 = cl.weapon;
+    let ammo: i32 = cl.ammo;
+    if (cl.pred_ammo != CL_MISS) { ammo = cl.pred_ammo; }
+    if (cl.reload_t > 0.0 || cl.pred_reload_t > 0.0) { let busy: i32 = 0; return busy; }
+    if (cl.reserve <= 0) { let empty: i32 = 0; return empty; }
+    if (ammo >= wpn_mag(w)) { let full: i32 = 0; return full; }
+    let mt: i32 = 0;
+    if (ammo <= 0) { mt = 1; }
+    cl.pred_reload_t = wpn_reload_time(w, mt);
+    // LATCH IT. A reload is an EDGE, and an edge that is only present in the
+    // frame it happened is an edge the tick loop drops: `sim_accum_advance`
+    // returns 0 ticks on most frames at 60 fps + vsync jitter, and the press
+    // then never reaches a command. The latch is cleared by the command that
+    // carries it, so exactly one command carries it.
+    cl.want_reload = 1;
+    cl_sound(cl, CSND_RELOAD_DROP, 0.8, 0.0);
+    cl_sound(cl, CSND_MAG_CLACK, 0.55, 0.0);
+    let out: i32 = 1;
+    return out;
+}
+
+// The muzzle flash, the kick, the shake, the tracer, the report. All local.
+fn cl_fire_cosmetics(p_cl: object) {
+    let cl: object = p_cl;
+    let v: object = cl.view;
+
+    cl_sound(cl, CSND_SHOT, 1.0, 0.0);
+
+    // The visual kick. `wpn_recoil_v` is the shipping pattern's vertical step
+    // in degrees; `view_kick_fire` scales it into `recoil_view`, which reaches
+    // the MVP and NOTHING ELSE (view.hml's wall).
+    let rv: f64 = wpn_recoil_v(cl.weapon, cl.fire_shots);
+    let scale: f64 = rv / g_KICK_PITCH_DEG;
+    if (scale < 0.4) { scale = 0.4; }
+    if (scale > 3.0) { scale = 3.0; }
+    view_kick_fire(v, scale, 0.35);
+    view_shake_fire(v);
+
+    cl.muzzle_t = g_MUZZLE_S;
+    cl.idle_t = 0.0;
+
+    // Muzzle flash: one large glow card at the gun, one frame's worth.
+    let ex: f64 = view_eye_x(v);
+    let ey: f64 = view_eye_y(v);
+    let ez: f64 = view_eye_z(v);
+    let fx: f64 = view_aim_forward_x(v);
+    let fy: f64 = view_aim_forward_y(v);
+    let fz: f64 = view_aim_forward_z(v);
+    cl_spawn(cl, CFX_GLOW_L, CFXB_BALLISTIC,
+             ex + fx * 0.7, ey + fy * 0.7 - 0.12, ez + fz * 0.7,
+             0.0, 0.0, 0.0, g_MUZZLE_S, 1.5, 0.4, 255, 214, 150, 235);
+
+    // GDD §7.6: a tracer on 1 in `g_TRACER_EVERY` shots.
+    cl.tracer_n = cl.tracer_n + 1;
+    if (cl.tracer_n >= g_TRACER_EVERY) {
+        cl.tracer_n = 0;
+        cl_spawn(cl, CFX_TRACER, CFXB_STREAK,
+                 ex + fx * 2.2, ey + fy * 2.2, ez + fz * 2.2,
+                 fx, fy, fz, g_TRACER_S, 0.5, 0.5, 255, 226, 168, 220);
+    }
+}
+
+// ===========================================================================
+//  5.  THE COMMAND  (§4 stage 2 — once per TICK, quantised at construction)
+// ===========================================================================
+//
+//  Nine integers, and not one of them is a float on the wire. `cmd_set`
+//  quantises as it writes, which is what makes the client and the server
+//  compare identical numbers rather than nearly-identical ones.
+
+export fn client_make_command(p_cl: object, p_tick: i32): object {
+    let cl: object = p_cl;
+    let v: object = cl.view;
+    let c: object = cl.cmd;
+
+    let btn: i32 = cl.in_btn;
+    if (cl.control == 0) { btn = 0; }
+    if (cl.want_reload == 1) { btn = btn | BTN_RELOAD; cl.want_reload = 0; }
+
+    // The aim that reaches the sim is `view_aim_*` — recoil-free, forever.
+    cmd_set(c, p_tick, i32(g_TICK_MS + 0.5),
+            cl.in_str, cl.in_fwd,
+            view_aim_yaw(v), view_aim_pitch(v),
+            btn, cl.in_weapon, cl.seq);
+    cl.seq = cl.seq + 1;
+    cl.tick = p_tick;
+    let out: object = c;
+    return out;
+}
+
+// Post it. In v1 the "wire" is a function call with an optional fake delay; in
+// v2 it is a socket. Nothing above this line knows which.
+export fn client_send_command(p_cl: object, p_tick: i32): i32 {
+    let cl: object = p_cl;
+    let c: object = client_make_command(cl, p_tick);
+    let t = cl.net;
+    if (t == null) { let none: i32 = 0; return none; }
+    let r: i32 = transport_send_command(t, c);
+    if (r == 1) { cl.cmds_sent = cl.cmds_sent + 1; }
+    let out: i32 = r;
+    return out;
+}
+
+// ===========================================================================
+//  6.  THE APPLY  (once per TICK, after `server_tick`)
+// ---------------------------------------------------------------------------
+//  `p_packet` is the snapshot the server published — BYTES, decoded here with
+//  the real decoder. `p_local` is the owner block. Neither is a world.
+// ===========================================================================
+
+export fn client_apply(p_cl: object, p_packet: object, p_local: object,
+                       p_tick: i32): i32 {
+    let cl: object = p_cl;
+
+    // ---- 1. the entity stream, off the wire -------------------------------
+    let n: i32 = snapshot_read(cl.rx, p_packet, cl.base);
+    if (n == SNAP_MISS) {
+        cl.decode_fail = cl.decode_fail + 1;
+    } else {
+        cl.packets = cl.packets + 1;
+    }
+
+    // ---- 2. the owner block ----------------------------------------------
+    let l: object = p_local;
+    cl.l_tick = l.tick;
+    cl.session = l.session_tick;
+    cl.hp = l.hp;
+    cl.hp_max = l.hp_max;
+    cl.dead = l.dead;
+    cl.respawn_t = l.respawn_t;
+    cl.px = l.px; cl.py = l.py; cl.pz = l.pz;
+    cl.eye = l.eye;
+    cl.eye_abs = l.eye_abs;
+    cl.speed = l.speed;
+    cl.grounded = l.grounded;
+    cl.step_dist = l.step_dist;
+    cl.weapon = l.weapon;
+    cl.ammo = l.ammo;
+    cl.reserve = l.reserve;
+    cl.reload_t = l.reload_t;
+    cl.reload_stage = l.reload_stage;
+    cl.ads = l.ads;
+    cl.rc_v = l.rc_v;
+    cl.level = l.level;
+    cl.xp_total = l.xp_total;
+    cl.xp_into = l.xp_into;
+    cl.xp_need = l.xp_need;
+    cl.phase = l.phase;
+    cl.day_t = l.day_t;
+    cl.tier = l.tier;
+    cl.alive = l.alive;
+    cl.wave_state = l.wave_state;
+    cl.wave = l.wave;
+    cl.lantern_x = l.lantern_x;
+    cl.lantern_y = l.lantern_y;
+    cl.lantern_z = l.lantern_z;
+    cl.lantern_dist = l.lantern_dist;
+    cl.chan01 = l.chan01;
+    cl.in_reach = l.in_reach;
+
+    rsnap_set_viewer(cl.rs, l.id);
+    rsnap_set_eye_height(cl.rs, l.eye);
+
+    // The authoritative shot counter closes the loop on the client's optimistic
+    // one: once the server has caught up, the prediction is dropped and the
+    // magazine on the HUD is the magazine in the world.
+    let sh: i32 = l.shots;
+    if (sh != cl.shots) {
+        cl.shots_prev = cl.shots;
+        cl.shots = sh;
+    }
+    if (cl.pred_ammo != CL_MISS) {
+        if (cl.ammo <= cl.pred_ammo) { cl.pred_ammo = CL_MISS; }
+    }
+    if (cl.reload_t > 0.0) { cl.pred_reload_t = 0.0; }
+
+    // ---- 3. the lantern edge, and the biggest moment in the game ----------
+    if (l.lantern_lit == 1 && cl.lantern_lit == 0) {
+        cl.lantern_lit = 1;
+        cl_lantern_lit(cl);
+    }
+    cl.lantern_lit = l.lantern_lit;
+
+    // ---- 4. the beat -------------------------------------------------------
+    if (l.beat != cl.beat) {
+        cl.beat = l.beat;
+        cl.beat_tick = l.beat_tick;
+        cl_on_beat(cl, l.beat);
+    }
+
+    // ---- 5. the level edge -------------------------------------------------
+    if (cl.level > cl.level_shown) {
+        cl.level_shown = cl.level;
+        if (cl.level > 1) {
+            cl.level_t = CL_LEVEL_S;
+            cl_sound(cl, CSND_LEVELUP, 1.0, 0.0);
+        }
+    }
+
+    // ---- 6. the director's four beats -------------------------------------
+    // Read from the owner block, NOT from the cosmetic queue: `sim.hml` pushes
+    // the director bits through `SIM_FX_SOUND`'s `a` field, where DIR_EV_HORN
+    // (1) collides with combat's SFX_HIT_BLIP (1). Reported, not patched — it
+    // is not this task's file. The owner block carries the bitmask cleanly.
+    let de: i32 = l.dir_events;
+    if ((de & DIR_EV_HORN) != 0) {
+        cl_sound(cl, CSND_HORN, 1.0, 0.0);
+        cl_banner(cl, "THE LAMPS ARE OUT");
+    }
+    if ((de & DIR_EV_WAVE_START) != 0) {
+        cl_banner(cl, `WAVE ${l.wave + 1}`);
+    }
+    if ((de & DIR_EV_WAVE_CLEAR) != 0) {
+        // GDD §7.16: "Music stops. 0.4 s of ACTUAL silence. Then ember rain."
+        cl.silence_t = g_WAVE_CLEAR_SILENCE_S;
+        cl_banner(cl, `WAVE ${l.wave + 1} CLEARED`);
+    }
+    if ((de & DIR_EV_HOLD_DONE) != 0) {
+        cl_banner(cl, "THE LIGHT HOLDS");
+    }
+
+    // ---- 7. this tick's cosmetics -----------------------------------------
+    cl_drain_fx(cl, l);
+
+    cl.applies = cl.applies + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// GDD §7.17, and §8 at 0:30. "The single biggest moment: 1.2 s of light
+// expanding outward as a scaling billboard ring, fog tier drops live, a low
+// bell, the world map icon lights, +350 XP."
+fn cl_lantern_lit(p_cl: object) {
+    let cl: object = p_cl;
+    cl.lit_ring_t = g_LANTERN_LIT_S;
+    cl_sound(cl, CSND_BELL, 1.0, 0.0);
+    cl_spawn(cl, CFX_GLOW_L, CFXB_RING,
+             cl.lantern_x, cl.lantern_y + 1.1, cl.lantern_z,
+             0.0, 0.0, 0.0, g_LANTERN_LIT_S, 1.6, 34.0, 255, 208, 140, 210);
+    let i: i32 = 0;
+    while (i < 12) {
+        let a: f64 = f64(i) * 0.5235987755982988;
+        cl_spawn(cl, CFX_EMBER, CFXB_BALLISTIC,
+                 cl.lantern_x, cl.lantern_y + 1.0, cl.lantern_z,
+                 sin(a) * 2.2, 2.6, cos(a) * 2.2,
+                 1.1, 0.24, 0.06, 255, 176, 96, 235);
+        i++;
+    }
+    cl_card(cl, "TINKER SMG - AT THE BENCH");
+}
+
+fn cl_on_beat(p_cl: object, p_beat: i32) {
+    let cl: object = p_cl;
+    let b: i32 = p_beat;
+    if (b == SV_BEAT_STAND) {
+        // GDD §8 at 0:03: "Camera stands up on its own (0.8 s). You have
+        // control. No tutorial text."
+        cl.control = 1;
+    }
+    if (b == SV_BEAT_CLEAR) {
+        // The ember rain of §7.16: 30 motes over 1.5 s. They are spawned over
+        // the following 1.5 s by `client_frame`, from `cl.silence_t`.
+        cl_sound(cl, CSND_WAVECLEAR, 0.9, 0.0);
+    }
+    if (b == SV_BEAT_PATH) {
+        cl_toast(cl, "A PATH OF LIGHT");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The cosmetic queue -> sounds and particles.
+// ---------------------------------------------------------------------------
+fn cl_drain_fx(p_cl: object, p_l: object) {
+    let cl: object = p_cl;
+    let l: object = p_l;
+    let n: i32 = l.fx_n;
+    let fk = l.fx_kind; let fa = l.fx_a; let fb = l.fx_b;
+    let fx = l.fx_x; let fy = l.fx_y; let fz = l.fx_z;
+
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = fk[i];
+        let a: i32 = fa[i];
+        let b: i32 = fb[i];
+        let x: f64 = fx[i];
+        let y: f64 = fy[i];
+        let z: f64 = fz[i];
+
+        if (k == SIM_FX_HITMARKER) {
+            // GDD §7.4: the hitmarker. `a` carries HM_HEAD / HM_KILL bits.
+            cl.hitmark_t = CL_HITMARK_S;
+            if (a >= 2) { cl.hitmark_kill = 1; }
+        } else if (k == SIM_FX_SOUND) {
+            // `b` is the target entity id for a combat sound and 0 for the
+            // director's beats, which are read from `dir_events` instead.
+            if (b != 0) { cl_combat_sound(cl, a, x, y, z); }
+        } else if (k == SIM_FX_PARTICLE) {
+            if (b != 0) { cl_impact(cl, a, x, y, z); }
+        } else if (k == SIM_FX_FLASH) {
+            // A hit flash on a body: eight embers off it, so a kill throws
+            // something at your face (GDD §7.9).
+            cl_spawn(cl, CFX_SPARK, CFXB_BALLISTIC, x, y, z,
+                     0.0, 1.2, 0.0, 0.18, 0.30, 0.10, 255, 240, 220, 220);
+        } else if (k == SIM_FX_NUMBER) {
+            cl_spawn(cl, CFX_MOTE, CFXB_BALLISTIC, x, y + 0.3, z,
+                     0.0, g_DMGNUM_RISE, 0.0, g_DMGNUM_S, 0.13, 0.05,
+                     255, 255, 255, 200);
+        } else if (k == SIM_FX_SHAKE) {
+            // Damage taken. Vignette, direction arc, camera punch away.
+            cl.dmg_t = g_DMG_DIR_FADE_S;
+            cl.dmg_dir = atan2(x - cl.px, z - cl.pz);
+            view_shake(cl.view, 0.45);
+            cl_sound(cl, CSND_HURT, 0.9, 0.0);
+        }
+        i++;
+    }
+}
+
+// combat.hml's EV_SOUND sub ids: 1..5 the pitch-chained hit blip, 6 the kill
+// chime, 7 a world impact, 8 an armour ricochet.
+fn cl_combat_sound(p_cl: object, p_sub: i32, p_x: f64, p_y: f64, p_z: f64) {
+    let cl: object = p_cl;
+    let s: i32 = p_sub;
+    if (s >= 1 && s <= CSND_HIT_STEPS) {
+        cl_sound(cl, CSND_HIT0 + (s - 1), 0.75, 0.0);
+        return;
+    }
+    if (s == 6) {
+        // The kill chime, and eight ember motes that home to the player.
+        cl_sound(cl, CSND_KILL, 0.95, 0.0);
+        cl.hitmark_kill = 1;
+        cl.hitmark_t = CL_HITMARK_S;
+        let i: i32 = 0;
+        while (i < g_DISSOLVE_MOTES) {
+            let a: f64 = f64(i) * 0.7853981633974483;
+            cl_spawn(cl, CFX_EMBER, CFXB_HOME, p_x, p_y + 0.6, p_z,
+                     sin(a) * 1.8, 1.6, cos(a) * 1.8,
+                     g_MOTE_HOME_S, 0.20, 0.08, 255, 168, 88, 240);
+            i++;
+        }
+        return;
+    }
+    if (s == 8) { cl_sound(cl, CSND_IMPACT_ARMOR, 0.7, 0.0); return; }
+    cl_sound(cl, CSND_IMPACT, 0.6, 0.0);
+}
+
+fn cl_impact(p_cl: object, p_surf: i32, p_x: f64, p_y: f64, p_z: f64) {
+    let cl: object = p_cl;
+    let r: i32 = 226; let g: i32 = 198; let b: i32 = 150;
+    if (p_surf == 1) { r = 214; g = 96; b = 84; }        // SURF_FLESH
+    if (p_surf == 2) { r = 200; g = 214; b = 232; }      // SURF_ARMOR
+    let i: i32 = 0;
+    while (i < g_IMPACT_PARTICLES) {
+        let a: f64 = f64(i) * 1.0471975511965976;
+        cl_spawn(cl, CFX_SPARK, CFXB_BALLISTIC, p_x, p_y, p_z,
+                 sin(a) * 1.7, 1.9, cos(a) * 1.7,
+                 g_IMPACT_S, 0.16, 0.04, r, g, b, 215);
+        i++;
+    }
+}
+
+// ===========================================================================
+//  7.  THE FRAME  (client-side presentation; frame time, never tick time)
+// ===========================================================================
+
+export fn client_frame(p_cl: object, p_dt: f64, p_tick: i32): i32 {
+    let cl: object = p_cl;
+    let dt: f64 = p_dt;
+    if (dt < 0.0) { dt = 0.0; }
+    if (dt > 0.25) { dt = 0.25; }
+    cl.t = cl.t + dt;
+    cl.frames = cl.frames + 1;
+
+    // ---- the opening, GDD §8 at 0:00 and 0:03 ------------------------------
+    // "Black. A bell. Text. Fade in — you are lying on your back looking at a
+    // sky at dusk." Then "Camera stands up on its own (0.8 s)."
+    let sess: f64 = f64(cl.session) * g_TICK_DT;
+    let fade: f64 = 1.0 - clamp01((sess - 0.35) / CL_INTRO_FADE_S);
+    cl.intro_a = fade;
+    let stand_t: f64 = sess - f64(SV_T_STAND) * g_TICK_DT;
+    let st: f64 = clamp01(stand_t / CL_STAND_S);
+    // A soft ease so the stand-up is a movement and not a ramp.
+    cl.stand01 = st * st * (3.0 - 2.0 * st);
+
+    // ---- timers ------------------------------------------------------------
+    if (cl.hitmark_t > 0.0) {
+        cl.hitmark_t = cl.hitmark_t - dt;
+        if (cl.hitmark_t <= 0.0) { cl.hitmark_t = 0.0; cl.hitmark_kill = 0; }
+    }
+    if (cl.dmg_t > 0.0) { cl.dmg_t = cl.dmg_t - dt; if (cl.dmg_t < 0.0) { cl.dmg_t = 0.0; } }
+    if (cl.banner_t > 0.0) { cl.banner_t = cl.banner_t - dt; if (cl.banner_t < 0.0) { cl.banner_t = 0.0; } }
+    if (cl.card_t > 0.0) { cl.card_t = cl.card_t - dt; if (cl.card_t < 0.0) { cl.card_t = 0.0; } }
+    if (cl.toast_t > 0.0) { cl.toast_t = cl.toast_t - dt; if (cl.toast_t < 0.0) { cl.toast_t = 0.0; } }
+    if (cl.level_t > 0.0) { cl.level_t = cl.level_t - dt; if (cl.level_t < 0.0) { cl.level_t = 0.0; } }
+    if (cl.muzzle_t > 0.0) { cl.muzzle_t = cl.muzzle_t - dt; if (cl.muzzle_t < 0.0) { cl.muzzle_t = 0.0; } }
+    if (cl.lit_ring_t > 0.0) { cl.lit_ring_t = cl.lit_ring_t - dt; if (cl.lit_ring_t < 0.0) { cl.lit_ring_t = 0.0; } }
+    if (cl.fire_cd > 0.0) { cl.fire_cd = cl.fire_cd - dt; if (cl.fire_cd < 0.0) { cl.fire_cd = 0.0; } }
+    if (cl.pred_reload_t > 0.0) {
+        cl.pred_reload_t = cl.pred_reload_t - dt;
+        if (cl.pred_reload_t <= 0.0) {
+            cl.pred_reload_t = 0.0;
+            cl_sound(cl, CSND_RELOAD_SEAT, 0.8, 0.0);
+            cl.pred_ammo = CL_MISS;
+        }
+    }
+    cl.idle_t = cl.idle_t + dt;
+
+    // ---- the ember rain of GDD §7.16: 30 motes over 1.5 s ------------------
+    if (cl.silence_t > 0.0) {
+        cl.silence_t = cl.silence_t - dt;
+        if (cl.silence_t <= 0.0) {
+            cl.silence_t = 0.0;
+            let i: i32 = 0;
+            while (i < 30) {
+                let a: f64 = f64(i) * 0.20943951023931956;
+                let rr: f64 = 3.0 + f64(i % 7) * 1.6;
+                cl_spawn(cl, CFX_EMBER, CFXB_BALLISTIC,
+                         cl.px + sin(a) * rr, cl.py + 7.0 + f64(i % 5) * 0.9,
+                         cl.pz + cos(a) * rr,
+                         0.0, -1.1 - f64(i % 4) * 0.25, 0.0,
+                         1.5 + f64(i % 5) * 0.3, 0.19, 0.10, 255, 172, 92, 230);
+                i++;
+            }
+        }
+    }
+
+    // ---- footsteps (GDD §7.18) --------------------------------------------
+    if (cl.grounded == 1 && cl.speed > 0.6) {
+        let iv: f64 = g_STEP_INTERVAL_WALK_S;
+        if (cl.speed > 5.6) { iv = g_STEP_INTERVAL_SPRINT_S; }
+        cl.step_t = cl.step_t + dt;
+        if (cl.step_t >= iv) {
+            cl.step_t = 0.0;
+            cl_sound(cl, CSND_STEP, 0.45, 0.0);
+        }
+    } else {
+        cl.step_t = 0.0;
+    }
+
+    // ---- the camera --------------------------------------------------------
+    // Position comes from the AUTHORITATIVE, interpolated snapshot; angles come
+    // from the LOCAL view. That split is the whole reason mouse-look survives
+    // 250 ms of latency.
+    let ex: f64 = rsnap_cam_x(cl.rs);
+    let ey: f64 = rsnap_cam_y(cl.rs);
+    let ez: f64 = rsnap_cam_z(cl.rs);
+    if (cl.stand01 < 1.0) {
+        // On your back: the eye is low and the pitch is at the sky.
+        ey = ey - (1.0 - cl.stand01) * (cl.eye - CL_LIE_EYE_M);
+    }
+    view_set_eye(cl.view, ex, ey, ez);
+
+    // The FOV mode: sprint / ADS / hip, exactly the three of view.hml.
+    let mode: i32 = 0;
+    if ((cl.in_btn & BTN_ADS) != 0) { mode = 1; }
+    else if ((cl.in_btn & BTN_SPRINT) != 0 && cl.speed > 5.6) { mode = 2; }
+    view_set_fov_mode(cl.view, mode);
+
+    view_build(cl.view, dt, p_tick);
+
+    // ---- particles ---------------------------------------------------------
+    cl_particles_step(cl, dt);
+
+    let out: i32 = 1;
+    return out;
+}
+
+// The render snapshot. §4 stage 4: interpolate, zero allocation, every frame.
+export fn client_build_render(p_cl: object, p_alpha: f64): i32 {
+    let cl: object = p_cl;
+    rsnap_build_from_net(cl.rs, cl.rx, p_alpha);
+    let out: i32 = rsnap_count(cl.rs);
+    return out;
+}
+
+// The pitch the CAMERA renders at during the opening: the view's own render
+// pitch, lifted toward the sky while you are still on your back.
+export fn client_cam_pitch(p_cl: object): f64 {
+    let cl: object = p_cl;
+    let p: f64 = view_render_pitch(cl.view);
+    let s: f64 = cl.stand01;
+    let out: f64 = lerpf(CL_LIE_PITCH, p, s);
+    return out;
+}
+
+export fn client_cam_yaw(p_cl: object): f64 {
+    let cl: object = p_cl;
+    let out: f64 = view_render_yaw(cl.view);
+    return out;
+}
+
+export fn client_cam_roll(p_cl: object): f64 {
+    let cl: object = p_cl;
+    let out: f64 = view_render_roll(cl.view);
+    return out;
+}
+
+export fn client_cam_x(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = view_eye_x(cl.view); return o; }
+export fn client_cam_y(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = view_eye_y(cl.view); return o; }
+export fn client_cam_z(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = view_eye_z(cl.view); return o; }
+export fn client_cam_fov(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = view_fov(cl.view); return o; }
+export fn client_shake_x(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = view_shake_x(cl.view); return o; }
+export fn client_shake_y(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = view_shake_y(cl.view); return o; }
+
+// ===========================================================================
+//  8.  THE PARTICLE POOL
+// ---------------------------------------------------------------------------
+//  SoA, preallocated, compacted by swap-with-last. Every id would be NEGATIVE
+//  if these were entities; they are not entities at all, which is stronger —
+//  they never touch the world, are never replicated, and cannot be seen by the
+//  sim. `src/render/fx.hml` (W3-10) will own the shipping version; this is the
+//  minimum the first 60 seconds needs and it is deliberately small.
+// ===========================================================================
+
+fn cl_spawn(p_cl: object, p_kind: i32, p_beh: i32,
+            p_x: f64, p_y: f64, p_z: f64,
+            p_vx: f64, p_vy: f64, p_vz: f64,
+            p_life: f64, p_s0: f64, p_s1: f64,
+            p_r: i32, p_g: i32, p_b: i32, p_a: i32): i32 {
+    let cl: object = p_cl;
+    let n: i32 = cl.p_n;
+    if (n >= CFX_CAP) {
+        cl.p_dropped = cl.p_dropped + 1;
+        let full: i32 = 0;
+        return full;
+    }
+    let ak = cl.p_kind; ak[n] = p_kind;
+    let ab = cl.p_beh;  ab[n] = p_beh;
+    let ax = cl.p_x;    ax[n] = p_x;
+    let ay = cl.p_y;    ay[n] = p_y;
+    let az = cl.p_z;    az[n] = p_z;
+    let bx = cl.p_vx;   bx[n] = p_vx;
+    let by = cl.p_vy;   by[n] = p_vy;
+    let bz = cl.p_vz;   bz[n] = p_vz;
+    let al = cl.p_life; al[n] = p_life;
+    let a0 = cl.p_life0; a0[n] = p_life;
+    let s0 = cl.p_s0;   s0[n] = p_s0;
+    let s1 = cl.p_s1;   s1[n] = p_s1;
+    let cr = cl.p_r;    cr[n] = p_r;
+    let cg = cl.p_g;    cg[n] = p_g;
+    let cb = cl.p_b;    cb[n] = p_b;
+    let ca = cl.p_a;    ca[n] = p_a;
+    cl.p_n = n + 1;
+    cl.p_spawned = cl.p_spawned + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+fn cl_particles_step(p_cl: object, p_dt: f64) {
+    let cl: object = p_cl;
+    let dt: f64 = p_dt;
+    let ak = cl.p_kind; let ab = cl.p_beh;
+    let ax = cl.p_x; let ay = cl.p_y; let az = cl.p_z;
+    let bx = cl.p_vx; let by = cl.p_vy; let bz = cl.p_vz;
+    let al = cl.p_life; let a0 = cl.p_life0;
+    let s0 = cl.p_s0; let s1 = cl.p_s1;
+    let cr = cl.p_r; let cg = cl.p_g; let cb = cl.p_b; let ca = cl.p_a;
+
+    let hx: f64 = cl.px;
+    let hy: f64 = cl.py + cl.eye * 0.8;
+    let hz: f64 = cl.pz;
+    let grav: f64 = g_PARTICLE_GRAVITY;
+
+    let i: i32 = 0;
+    let n: i32 = cl.p_n;
+    while (i < n) {
+        let life: f64 = al[i] - dt;
+        if (life <= 0.0) {
+            // swap with last; do NOT advance i
+            let j: i32 = n - 1;
+            if (j != i) {
+                ak[i] = ak[j]; ab[i] = ab[j];
+                ax[i] = ax[j]; ay[i] = ay[j]; az[i] = az[j];
+                bx[i] = bx[j]; by[i] = by[j]; bz[i] = bz[j];
+                al[i] = al[j]; a0[i] = a0[j];
+                s0[i] = s0[j]; s1[i] = s1[j];
+                cr[i] = cr[j]; cg[i] = cg[j]; cb[i] = cb[j]; ca[i] = ca[j];
+            }
+            n = j;
+        } else {
+            al[i] = life;
+            let beh: i32 = ab[i];
+            if (beh == CFXB_BALLISTIC) {
+                by[i] = by[i] - grav * dt * 0.25;
+                ax[i] = ax[i] + bx[i] * dt;
+                ay[i] = ay[i] + by[i] * dt;
+                az[i] = az[i] + bz[i] * dt;
+            } else if (beh == CFXB_HOME) {
+                // GDD §7.9: "8 ember motes that home to the player over 0.6 s".
+                let k: f64 = 1.0 - clamp01(life / a0[i]);
+                let pull: f64 = k * k * 9.0;
+                bx[i] = bx[i] + (hx - ax[i]) * pull * dt;
+                by[i] = by[i] + (hy - ay[i]) * pull * dt;
+                bz[i] = bz[i] + (hz - az[i]) * pull * dt;
+                ax[i] = ax[i] + bx[i] * dt;
+                ay[i] = ay[i] + by[i] * dt;
+                az[i] = az[i] + bz[i] * dt;
+            }
+            i++;
+        }
+    }
+    cl.p_n = n;
+}
+
+export fn client_fx_count(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.p_n; return o; }
+export fn client_fx_cell(p_cl: object, p_i: i32): i32 {
+    let cl: object = p_cl;
+    let ak = cl.p_kind;
+    let c = cl.cell;
+    let out: i32 = c[ak[p_i]];
+    return out;
+}
+export fn client_fx_kind(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = cl.p_kind; let o: i32 = a[p_i]; return o; }
+export fn client_fx_beh(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = cl.p_beh; let o: i32 = a[p_i]; return o; }
+export fn client_fx_x(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = cl.p_x; let o: f64 = a[p_i]; return o; }
+export fn client_fx_y(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = cl.p_y; let o: f64 = a[p_i]; return o; }
+export fn client_fx_z(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = cl.p_z; let o: f64 = a[p_i]; return o; }
+export fn client_fx_r(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = cl.p_r; let o: i32 = a[p_i]; return o; }
+export fn client_fx_g(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = cl.p_g; let o: i32 = a[p_i]; return o; }
+export fn client_fx_b(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = cl.p_b; let o: i32 = a[p_i]; return o; }
+export fn client_fx_spawned(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.p_spawned; return o; }
+export fn client_fx_dropped(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.p_dropped; return o; }
+
+// Size and alpha are a function of the particle's age, so they are computed
+// on read rather than stored: one less array, and no way for them to drift
+// out of step with `life`.
+export fn client_fx_size(p_cl: object, p_i: i32): f64 {
+    let cl: object = p_cl;
+    let al = cl.p_life; let a0 = cl.p_life0;
+    let s0 = cl.p_s0; let s1 = cl.p_s1;
+    let k: f64 = 1.0 - clamp01(al[p_i] / a0[p_i]);
+    let out: f64 = lerpf(s0[p_i], s1[p_i], k);
+    return out;
+}
+
+export fn client_fx_alpha(p_cl: object, p_i: i32): i32 {
+    let cl: object = p_cl;
+    let al = cl.p_life; let a0 = cl.p_life0; let ca = cl.p_a;
+    let f: f64 = clamp01(al[p_i] / a0[p_i]);
+    // A square-root fade holds the ember visible for most of its life and then
+    // goes, which is what a spark does; a linear fade reads as a dimmer.
+    let out: i32 = clampi(i32(f64(ca[p_i]) * sqrt(f)), 0, 255);
+    return out;
+}
+
+// ===========================================================================
+//  9.  THE SOUND QUEUE
+// ---------------------------------------------------------------------------
+//  Semantic ids only. `main.hml` drains this into the engine mixer once per
+//  frame and resets it. A client with no audio device simply never drains, and
+//  the queue is overwritten — silence is not a failure mode.
+// ===========================================================================
+
+fn cl_sound(p_cl: object, p_id: i32, p_gain: f64, p_pan: f64) {
+    let cl: object = p_cl;
+    let n: i32 = cl.s_n;
+    if (n >= CSND_QUEUE) { cl.s_dropped = cl.s_dropped + 1; return; }
+    let a = cl.s_id;   a[n] = p_id;
+    let g = cl.s_gain; g[n] = p_gain;
+    let p = cl.s_pan;  p[n] = p_pan;
+    cl.s_n = n + 1;
+    cl.s_total = cl.s_total + 1;
+}
+
+export fn client_sound_count(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.s_n; return o; }
+export fn client_sound_id(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = cl.s_id; let o: i32 = a[p_i]; return o; }
+export fn client_sound_gain(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = cl.s_gain; let o: f64 = a[p_i]; return o; }
+export fn client_sound_pan(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = cl.s_pan; let o: f64 = a[p_i]; return o; }
+export fn client_sounds_reset(p_cl: object) { let cl: object = p_cl; cl.s_n = 0; }
+export fn client_sounds_total(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.s_total; return o; }
+export fn client_sounds_dropped(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.s_dropped; return o; }
+
+// ===========================================================================
+//  10.  HUD STATE — everything the HUD draws, and nothing else
+// ===========================================================================
+
+fn cl_banner(p_cl: object, p_s: string) {
+    let cl: object = p_cl;
+    cl.banner = p_s;
+    cl.banner_t = CL_BANNER_S;
+}
+
+fn cl_card(p_cl: object, p_s: string) {
+    let cl: object = p_cl;
+    cl.card = p_s;
+    cl.card_t = CL_CARD_S;
+}
+
+fn cl_toast(p_cl: object, p_s: string) {
+    let cl: object = p_cl;
+    cl.toast = p_s;
+    cl.toast_t = CL_BANNER_S;
+}
+
+export fn client_hp(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.hp; return o; }
+export fn client_hp_max(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.hp_max; return o; }
+export fn client_dead(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.dead; return o; }
+export fn client_respawn_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.respawn_t; return o; }
+export fn client_weapon(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.weapon; return o; }
+
+// The magazine the HUD shows: the client's optimistic count while a predicted
+// shot is outstanding, the authority's the instant it lands.
+export fn client_ammo(p_cl: object): i32 {
+    let cl: object = p_cl;
+    let a: i32 = cl.ammo;
+    if (cl.pred_ammo != CL_MISS && cl.pred_ammo < a) { a = cl.pred_ammo; }
+    let out: i32 = a;
+    return out;
+}
+
+export fn client_reserve(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.reserve; return o; }
+export fn client_reloading(p_cl: object): f64 {
+    let cl: object = p_cl;
+    let t: f64 = cl.reload_t;
+    if (cl.pred_reload_t > t) { t = cl.pred_reload_t; }
+    let out: f64 = t;
+    return out;
+}
+export fn client_reload_stage(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.reload_stage; return o; }
+export fn client_ads(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.ads; return o; }
+export fn client_level(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.level; return o; }
+export fn client_xp_into(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.xp_into; return o; }
+export fn client_xp_need(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.xp_need; return o; }
+export fn client_xp_total(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.xp_total; return o; }
+export fn client_speed(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.speed; return o; }
+export fn client_grounded(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.grounded; return o; }
+export fn client_step_dist(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.step_dist; return o; }
+export fn client_px(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.px; return o; }
+export fn client_py(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.py; return o; }
+export fn client_pz(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.pz; return o; }
+export fn client_day_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.day_t; return o; }
+export fn client_phase(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.phase; return o; }
+export fn client_tier(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.tier; return o; }
+export fn client_alive(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.alive; return o; }
+export fn client_wave(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.wave; return o; }
+export fn client_wave_state(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.wave_state; return o; }
+export fn client_beat(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.beat; return o; }
+export fn client_session(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.session; return o; }
+export fn client_intro_alpha(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.intro_a; return o; }
+export fn client_stand01(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.stand01; return o; }
+export fn client_hitmarker(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.hitmark_t; return o; }
+export fn client_hitmarker_kill(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.hitmark_kill; return o; }
+export fn client_damage_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.dmg_t; return o; }
+export fn client_damage_dir(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.dmg_dir; return o; }
+export fn client_banner(p_cl: object): string { let cl: object = p_cl; let o: string = cl.banner; return o; }
+export fn client_banner_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.banner_t; return o; }
+export fn client_card(p_cl: object): string { let cl: object = p_cl; let o: string = cl.card; return o; }
+export fn client_card_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.card_t; return o; }
+export fn client_toast(p_cl: object): string { let cl: object = p_cl; let o: string = cl.toast; return o; }
+export fn client_toast_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.toast_t; return o; }
+export fn client_level_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.level_t; return o; }
+export fn client_chan01(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.chan01; return o; }
+export fn client_lantern_dist(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.lantern_dist; return o; }
+export fn client_lantern_lit(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.lantern_lit; return o; }
+export fn client_lit_ring_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.lit_ring_t; return o; }
+export fn client_muzzle_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.muzzle_t; return o; }
+export fn client_cmds_sent(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.cmds_sent; return o; }
+export fn client_packets(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.packets; return o; }
+export fn client_decode_fail(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.decode_fail; return o; }
+export fn client_shots(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.shots; return o; }
+export fn client_fire_shots(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.fire_shots; return o; }
+export fn client_latency_ms(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.latency_ms; return o; }
+
+// GDD §8 at 0:24: the prompt. The SERVER decides you are in reach; the client
+// decides that "in reach or nearly" is when the words appear, because a prompt
+// that only exists inside the interaction radius is a prompt you find by
+// accident.
+export fn client_prompt(p_cl: object): i32 {
+    let cl: object = p_cl;
+    if (cl.lantern_lit == 1) { let lit: i32 = 0; return lit; }
+    if (cl.control == 0) { let nc: i32 = 0; return nc; }
+    if (cl.lantern_dist > CL_PROMPT_M) { let far: i32 = 0; return far; }
+    let out: i32 = 1;
+    return out;
+}
+
+// Where the objective marker goes: the bearing to the lantern, relative to the
+// render yaw, in radians, wrapped to +-pi.
+export fn client_lantern_bearing(p_cl: object): f64 {
+    let cl: object = p_cl;
+    // Forward is (sin yaw, -cos yaw) -- view.hml's basis, which movement.hml
+    // explicitly refuses to duplicate. The bearing must use the same one.
+    let a: f64 = atan2(cl.lantern_x - cl.px, cl.pz - cl.lantern_z);
+    let out: f64 = view_wrap_pi(a - view_render_yaw(cl.view));
+    return out;
+}
+
+// The health fraction, for the vignette and the bar.
+export fn client_hp01(p_cl: object): f64 {
+    let cl: object = p_cl;
+    let m: i32 = cl.hp_max;
+    if (m <= 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = clamp01(f64(cl.hp) / f64(m));
+    return out;
+}
+
+// The interpolated entity stream, for the caller that draws bodies. It is a
+// pass-through so that `main.hml` never has to know the RenderSnapshot's field
+// names, and so this file stays the only place a snapshot is read.
+export fn client_ent_count(p_cl: object): i32 {
+    let cl: object = p_cl;
+    let out: i32 = rsnap_count(cl.rs);
+    return out;
+}
+export fn client_ent_id(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = rsnap_field_id(cl.rs); let o: i32 = a[p_i]; return o; }
+export fn client_ent_x(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = rsnap_field_x(cl.rs); let o: f64 = a[p_i]; return o; }
+export fn client_ent_y(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = rsnap_field_y(cl.rs); let o: f64 = a[p_i]; return o; }
+export fn client_ent_z(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = rsnap_field_z(cl.rs); let o: f64 = a[p_i]; return o; }
+export fn client_ent_yaw(p_cl: object, p_i: i32): f64 { let cl: object = p_cl; let a = rsnap_field_yaw(cl.rs); let o: f64 = a[p_i]; return o; }
+export fn client_ent_model(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = rsnap_field_model(cl.rs); let o: i32 = a[p_i]; return o; }
+export fn client_ent_flags(p_cl: object, p_i: i32): i32 { let cl: object = p_cl; let a = rsnap_field_flags(cl.rs); let o: i32 = a[p_i]; return o; }

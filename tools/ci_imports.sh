@@ -404,7 +404,23 @@ while IFS= read -r f; do
     [ -e "$f" ] || continue
     # strip // comments and blank lines before matching, so prose about the ban
     # does not trip the ban
-    if sed 's|//.*||' "$f" | grep -qE '(^|[^A-Za-z0-9_])(__clock|time_ms|now_ms|SDL_GetTicks|clock_now)[[:space:]]*\('; then
+    # PROCESS SUBSTITUTION, NOT A PIPE -- and this is load-bearing.
+    #
+    # This was `sed ... | grep -qE ...` under `set -uo pipefail`. `grep -q` exits
+    # on its FIRST match; `sed` then dies of SIGPIPE (141); `pipefail` propagates
+    # 141 as the pipeline status; and `if` reads non-zero as NO MATCH. So a
+    # violation near the TOP of a file silently passed, while the same violation
+    # near the bottom was caught -- because by then sed had already finished
+    # writing and never saw the broken pipe.
+    #
+    # Measured on src/sim/sim.hml (1787 lines): a planted __clock() at line 30
+    # and at line 200 both FALSE-PASSED; at line 900 and line 1700 both fired.
+    #
+    # I originally "verified" this rule by appending the plant at EOF -- the one
+    # position where the bug cannot manifest. Gate 4b/4c caught it by planting
+    # near the top of a real file. Verify guards at the position most likely to
+    # break them, not the most convenient one.
+    if grep -qE '(^|[^A-Za-z0-9_])(__clock|time_ms|now_ms|SDL_GetTicks|clock_now)[[:space:]]*\(' < <(sed 's|//.*||' "$f"); then
         err R8 "$(basename "$f") reads a wall clock. src/sim must be reproducible from a seed alone -- use the tick counter, never real time. (__clock is a builtin, so no import rule can catch this.)"
     fi
 done < <(find "$NS_ROOT/src/sim" -name '*.hml' 2>/dev/null)

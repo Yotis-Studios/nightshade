@@ -1,0 +1,1041 @@
+// =============================================================================
+//  probe_sim.hml — W4-9's acceptance harness.   ARCHITECTURE §3, §4.3, §5.4.
+// =============================================================================
+//
+//      hemlockc -O1 tools/probe_sim.hml -o /tmp/probe_sim
+//      /tmp/probe_sim                     # compiled — the shipping path
+//      hemlock  tools/probe_sim.hml       # interpreted — parity
+//      nm /tmp/probe_sim | grep -c SDL_   # MUST be 0
+//
+//  Exits 1 on any failed assertion, and asserts its own assertion COUNT so a
+//  section that silently stops running is a failure rather than a green run.
+//
+//  BUILD_PLAN W4-9 says "verified by `simtest`, `replay`, `benchframe`".  Those
+//  three are W2-13's and W4-13's files and several agents are in this tree, so
+//  this probe is a SEPARATE tool rather than an edit to shared ones (CLAUDE.md
+//  §3: edit the files your task lists and no others).  Folding it in at the
+//  wave gate is a one-line call; the assertions are the same either way.
+//
+// -----------------------------------------------------------------------------
+//  WHY THIS FILE IMPORTS `src/render/render_snapshot.hml`
+// -----------------------------------------------------------------------------
+//  W4-9's brief is "emit two snapshots so the renderer can interpolate between
+//  them; rendering must never be locked to the tick rate".  A probe that only
+//  checked the sim side would be checking half a seam.  `tools/*.hml` are NOT
+//  walled by `ci_imports.sh` (they are the things that prove the wall), so this
+//  file drives the REAL renderer-side consumer against the REAL sim and asserts
+//  the two endpoints agree bit-for-bit.  It links no SDL, because
+//  `render_snapshot.hml` imports none.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { floor, sqrt, atan2, sin, cos } from "@stdlib/math";
+
+import { g_TICK_MS, g_TICK_DT, g_BUDGET_SIM_MS, g_MAX_ENTS, g_HP_MAX,
+         g_LANTERN_CHANNEL_S, g_ENEMY_WISP, g_XP_LANTERN, g_FRAME_CLAMP_MS,
+         g_ENEMY_HUSK, g_DIR_ALIVE_CAP
+       } from "../src/core/config.hml";
+
+import { world_spawn, world_slot_of, world_id_of, world_count, world_check,
+         world_replaying, world_set_replaying,
+         KIND_AI, KIND_LANTERN, KIND_PICKUP, KIND_COSMETIC,
+         EF_VISIBLE, EF_NO_REPLICATE, EF_DEAD, SLOT_NONE, ID_NONE
+       } from "../src/sim/world.hml";
+
+import { chunk_store_new_cap, chunk_set_source, chunk_pin_ring,
+         chunk_height_at, CHUNK_H_MISS } from "../src/sim/chunk.hml";
+
+import { worldgen_chunk_at } from "../src/sim/worldgen.hml";
+
+import { cmd_new, cmd_set, cmd_yaw, cmd_pitch,
+         BTN_FIRE, BTN_ADS, BTN_JUMP, BTN_RELOAD, BTN_SPRINT, BTN_USE
+       } from "../src/sim/command.hml";
+
+import { rng_new, rng_seed, rng_f01, rng_f11, rng_pick,
+         RNG_DIRECTOR } from "../src/sim/rng.hml";
+
+import { ai_spawn, ai_agent_count } from "../src/sim/ai.hml";
+
+import { prog_level, prog_xp_total } from "../src/sim/progression.hml";
+
+import { move_px, move_py, move_pz, move_eye_y } from "../src/sim/movement.hml";
+
+import { wpn_cur, wpn_ammo, WPN_KESTREL, WPN_SPARROW, WS_FIELDS } from "../src/sim/weapons.hml";
+
+import { evbus_count } from "../src/sim/combat.hml";
+
+// ---- the two files this task owns ------------------------------------------
+import { sim_new_cap, sim_set_chunks, sim_add_player, sim_queue_command,
+         sim_apply_command, sim_step, sim_effects, sim_hash, sim_pos_hash,
+         sim_stage_at, sim_stage_swap, sim_stage_order_reset, sim_set_replaying,
+         sim_accum_new, sim_accum_advance, sim_accum_alpha, sim_accum_ticks,
+         sim_accum_stalls, sim_accum_forgiven, sim_accum_reset,
+         sim_accum_set_clamp_ms, sim_accum_residual_ms, sim_accum_total_ms,
+         sim_ai, sim_director, sim_chunks, sim_player_id, sim_predicted,
+         sim_progression, sim_command, sim_weapon_state, sim_events,
+         sim_fx_count, sim_fx_total, sim_fx_dropped, sim_fx_kind,
+         sim_stat_cmds_applied, sim_stat_cmds_dropped, sim_stat_cmds_stale,
+         sim_stat_cmds_bad, sim_stat_cmds_missing, sim_stat_shots,
+         sim_stat_deaths, sim_stat_lanterns, sim_stat_pickups,
+         sim_stat_loot_rolls, sim_stat_swaps, sim_stat_ai_attacks,
+         sim_steps, sim_players, sim_tier,
+         SIM_STAGE_COMMANDS, SIM_STAGE_MOVEMENT, SIM_STAGE_WEAPONS,
+         SIM_STAGE_PROJ, SIM_STAGE_AI, SIM_STAGE_DAMAGE, SIM_STAGE_INTERACT,
+         SIM_STAGE_WORLD, SIM_STAGE_HISTORY, SIM_STAGE_EFFECTS,
+         SIM_STAGE_COUNT, SIM_CMD_QUEUE, SIM_MAX_TICKS_PER_FRAME,
+         SIM_LANTERN_LIT, SIM_LANTERN_UNLIT, SIM_INTERACT_R_M
+       } from "../src/sim/sim.hml";
+
+import { snapshot_new_cap, snapshot_reset, snapshot_write, snapshot_read,
+         snapshot_size, snapshot_count, snapshot_tick, snapshot_viewer,
+         snapshot_hash, snapshot_check, snapshot_copy, snapshot_set_radius,
+         snapshot_index_of, snapshot_removed_count, snapshot_mode,
+         snapshot_field_id, snapshot_field_px, snapshot_field_py,
+         snapshot_field_pz, snapshot_field_yaw, snapshot_field_pitch,
+         snapshot_field_model, snapshot_field_anim, snapshot_field_tint,
+         snapshot_field_flags, snapshot_field_hp,
+         snap_q_pos, snap_dq_pos,
+         SNAP_HDR_B, SNAP_REM_B, SNAP_REC_MIN_B, SNAP_REC_MAX_B,
+         SNAP_OFF_COUNT, SNAP_OFF_NREM, SNAP_OFF_TICK, SNAP_OFF_VIEWER,
+         SNAP_OFF_MODE, SNAP_MODE_FULL, SNAP_MODE_DELTA,
+         SNAP_F_POS, SNAP_F_ANG, SNAP_F_NEW, SNAP_F_ALL, SNAP_CAP
+       } from "../src/sim/snapshot.hml";
+
+// ---- the renderer's half of the seam (tools are not walled) ----------------
+import { rsnap_new_cap, rsnap_build, rsnap_build_from_net, rsnap_set_viewer,
+         rsnap_set_cull_radius, rsnap_count, rsnap_field_id, rsnap_field_x,
+         rsnap_field_y, rsnap_field_z, rsnap_field_yaw, rsnap_index_of,
+         rsnap_cam_x, rsnap_cam_y, rsnap_cam_z, rsnap_alpha,
+         rsnap_cur_tick, rsnap_prev_tick, RSNAP_MISS
+       } from "../src/render/render_snapshot.hml";
+
+// ===========================================================================
+//  HARNESS
+// ===========================================================================
+
+let g_PS_EXPECT_ASSERTS: i32 = 122;
+let g_PS_TRIALS: i32 = 7;
+
+// Regression guards, per RULE T.  Both are ~2x the LOADED measurement on this
+// box (which permanently shares ~17 of 24 cores with a llama-server), not an
+// idle-box certification.  The measured numbers are printed next to them and
+// repeated in the assertion text.
+let g_PS_STEP_US_GUARD: f64 = 400.0;          // compiled, us/tick, 1 player + 14 AI
+let g_PS_STEP_US_GUARD_INTERP: f64 = 3600.0; // interpreted; parity only, never a ship claim
+
+// snapshot_write's guard, same methodology.  The interpreter is ~9x slower and
+// its number is a parity check, not a budget claim: the game ships compiled.
+let g_PS_SNAP_US_GUARD: f64 = 60.0;
+let g_PS_SNAP_US_GUARD_INTERP: f64 = 500.0;
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn sv(p_v): string {
+    let out: string = `${p_v}`;
+    return out;
+}
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+// Which backend is running.  `args[0]` is the .hml path under the interpreter
+// and the binary path when compiled -- the same test every other probe uses.
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn r3(p_v: f64): f64 {
+    let out: f64 = floor(p_v * 1000.0) / 1000.0;
+    return out;
+}
+
+fn absf2(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a;
+    return out;
+}
+
+// ===========================================================================
+//  THE HEIGHTFIELD — the real generator, through the documented adapter
+// ===========================================================================
+fn ns_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                   p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let out: i32 = worldgen_chunk_at(p_seed, p_cx, p_cz, p_hbuf, p_hoff, p_abuf, p_aoff);
+    return out;
+}
+
+fn make_chunks(p_seed: i32): object {
+    let cs: object = chunk_store_new_cap(64, 256, p_seed);
+    chunk_set_source(cs, ns_chunk_source);
+    chunk_pin_ring(cs, 0, 0, 2);
+    let out: object = cs;
+    return out;
+}
+
+// ===========================================================================
+//  THE SCENARIO
+// ===========================================================================
+//  Everything below is a pure function of (seed, ticks).  Every command comes
+//  out of `rng.hml` seeded from the world seed, so the whole run reproduces:
+//  same seed twice must give the identical hash, a different seed must not.
+//
+//  It is deliberately BROAD rather than deep — the point of this task is the
+//  ORDER of the ten stages, so every stage has to actually do something:
+//    (a) two players, both queueing, one occasionally dropping a command
+//    (b) full movement: walk, sprint, jump, over real worldgen terrain
+//    (c) firing a Kestrel, reloading when it runs dry
+//    (d) a projectile weapon swap so `proj_step` has bodies to integrate
+//    (e) six Wisps and two Husks steering toward the players
+//    (f) their contact damage, and the reaper collecting the corpses
+//    (g) an unlit lantern within reach of player 1, and a pickup
+//    (h) the day cycle and the shade tier under the player's chunk
+//    (i) history capture
+//    (j) the effect queue
+
+fn spawn_lantern(p_w: object, p_x: f64, p_z: f64): i32 {
+    let w: object = p_w;
+    let slot: i32 = world_spawn(w, KIND_LANTERN, 0);
+    if (slot == SLOT_NONE) { let bad: i32 = ID_NONE; return bad; }
+    let px = w.px; let py = w.py; let pz = w.pz;
+    let anim = w.anim; let flags = w.flags; let model = w.model;
+    let h: f64 = chunk_height_at(sim_chunks(w), p_x, p_z);
+    if (h <= CHUNK_H_MISS) { h = 0.0; }
+    px[slot] = p_x; py[slot] = h; pz[slot] = p_z;
+    anim[slot] = SIM_LANTERN_UNLIT;
+    model[slot] = 90;
+    flags[slot] = flags[slot] | EF_VISIBLE;
+    let out: i32 = world_id_of(w, slot);
+    return out;
+}
+
+fn spawn_pickup(p_w: object, p_x: f64, p_z: f64): i32 {
+    let w: object = p_w;
+    let slot: i32 = world_spawn(w, KIND_PICKUP, 0);
+    if (slot == SLOT_NONE) { let bad: i32 = ID_NONE; return bad; }
+    let px = w.px; let py = w.py; let pz = w.pz;
+    let flags = w.flags; let model = w.model;
+    let h: f64 = chunk_height_at(sim_chunks(w), p_x, p_z);
+    if (h <= CHUNK_H_MISS) { h = 0.0; }
+    px[slot] = p_x; py[slot] = h; pz[slot] = p_z;
+    model[slot] = 120;
+    flags[slot] = flags[slot] | EF_VISIBLE;
+    let out: i32 = world_id_of(w, slot);
+    return out;
+}
+
+fn build_world(p_seed: i32, p_replay: i32): object {
+    let seed: i32 = p_seed;
+    let w: object = sim_new_cap(256, 2, seed);
+    sim_set_chunks(w, make_chunks(seed));
+    sim_add_player(w, 1, 0.0, 0.0);
+    sim_add_player(w, 2, 5.0, 1.0);
+
+    let ai: object = sim_ai(w);
+    let st: array = rng_new();
+    rng_seed(st, seed, RNG_DIRECTOR, 0, 0);
+    let i: i32 = 0;
+    while (i < 6) {
+        let ang: f64 = rng_f01(st) * 6.283185307179586;
+        let rad: f64 = 6.0 + rng_f01(st) * 8.0;
+        // A deterministic ring: the angle comes from the seeded stream, the
+        // radius too, and nothing else.
+        let x: f64 = rad * cos(ang);
+        let z: f64 = rad * sin(ang);
+        let h: f64 = chunk_height_at(sim_chunks(w), x, z);
+        if (h <= CHUNK_H_MISS) { h = 0.0; }
+        ai_spawn(ai, w, g_ENEMY_WISP, x, h, z, 0.0);
+        i++;
+    }
+    let j: i32 = 0;
+    while (j < 2) {
+        let ang2: f64 = rng_f01(st) * 6.283185307179586;
+        let x2: f64 = 10.0 * cos(ang2);
+        let z2: f64 = 10.0 * sin(ang2);
+        let h2: f64 = chunk_height_at(sim_chunks(w), x2, z2);
+        if (h2 <= CHUNK_H_MISS) { h2 = 0.0; }
+        ai_spawn(ai, w, g_ENEMY_HUSK, x2, h2, z2, 0.0);
+        j++;
+    }
+
+    spawn_lantern(w, 1.0, 0.6);
+    spawn_pickup(w, 0.8, 0.4);
+    sim_set_replaying(w, p_replay);
+    let out: object = w;
+    return out;
+}
+
+// Where the scripted player is looking: at the nearest live shade, in the
+// engine's own basis (fwd = sin(yaw)cos(pitch), sin(pitch), -cos(yaw)cos(pitch)).
+// This is world-dependent and therefore still perfectly deterministic — the
+// world is a pure function of the seed — and it is what makes stages (c) and
+// (f) do real work instead of firing 400 shots into the sky.
+let g_aim: array<f64> = [0.0, 0.0];
+
+fn aim_at_nearest(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let id: i32 = sim_player_id(w, p_pslot);
+    if (id == ID_NONE) { let no: i32 = 0; return no; }
+    let slot: i32 = world_slot_of(w, id);
+    if (slot == SLOT_NONE) { let gone: i32 = 0; return gone; }
+    let ps: array<f64> = sim_predicted(w, p_pslot);
+    let ex: f64 = move_px(ps);
+    let ey: f64 = move_eye_y(ps);
+    let ez: f64 = move_pz(ps);
+
+    let kinds = w.kind;
+    let flags = w.flags;
+    let px = w.px;
+    let py = w.py;
+    let pz = w.pz;
+    let n: i32 = w.count;
+    let best: i32 = -1;
+    let bd: f64 = 1000000000.0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (kinds[i] == KIND_AI) {
+            if ((flags[i] & EF_DEAD) == 0) {
+                let dx0: f64 = px[i] - ex;
+                let dz0: f64 = pz[i] - ez;
+                let d0: f64 = dx0 * dx0 + dz0 * dz0;
+                if (d0 < bd) { bd = d0; best = i; }
+            }
+        }
+        i++;
+    }
+    if (best < 0) { let none: i32 = 0; return none; }
+    let dx: f64 = px[best] - ex;
+    let dy: f64 = (py[best] + 0.55) - ey;
+    let dz: f64 = pz[best] - ez;
+    let hor: f64 = sqrt(dx * dx + dz * dz);
+    let ya: f64 = atan2(dx, 0.0 - dz);
+    let pa: f64 = atan2(dy, hor);
+    g_aim[0] = ya + 0.0;
+    g_aim[1] = pa + 0.0;
+    let out: i32 = 1;
+    return out;
+}
+
+// One scripted command for (world, player, tick).  Pure in (seed, tick), because
+// the world is.
+fn script_cmd(p_c: object, p_w: object, p_seed: i32, p_pslot: i32, p_tick: i32) {
+    let st: array = rng_new();
+    rng_seed(st, p_seed, RNG_DIRECTOR, p_tick, p_pslot);
+    let mx: f64 = rng_f11(st);
+    let my: f64 = rng_f11(st);
+    let yaw: f64 = f64(p_tick) * 0.031 + f64(p_pslot);
+    let pit: f64 = rng_f11(st) * 0.25;
+    if (aim_at_nearest(p_w, p_pslot) == 1) {
+        yaw = g_aim[0];
+        pit = g_aim[1];
+    }
+    let b: i32 = 0;
+    if (rng_pick(st, 3) == 0) { b = b | BTN_FIRE; }
+    if (rng_pick(st, 9) == 0) { b = b | BTN_JUMP; }
+    if (rng_pick(st, 7) == 0) { b = b | BTN_SPRINT; }
+    if (rng_pick(st, 5) == 0) { b = b | BTN_ADS; }
+    // Reload when the chamber is empty — the GDD §8 beat at 0:18, and the only
+    // way `wpn_reload_begin` ever gets exercised by a scripted player.
+    let wst: array = sim_weapon_state(p_w);
+    let o: i32 = (p_pslot - 1) * WS_FIELDS;
+    if (wpn_ammo(wst, o, wpn_cur(wst, o)) <= 0) { b = b | BTN_RELOAD; }
+    // Player 1 leans on the lantern: BTN_USE for the whole first 200 ticks, so
+    // the 2.5 s channel (150 ticks) completes and stage (g) is exercised.  The
+    // command is REPLACED, not OR-ed: a channelling player holds E and does
+    // nothing else.  (It has to be exclusive.  With BTN_JUMP in the mix the
+    // player bunny-hops, and a bunny-hopping player on this seed's slope
+    // accelerates downhill to ~5.7 m/s WITH ZERO MOVEMENT AXES and leaves the
+    // lantern's reach — see the W4-9 report, movement.hml observation 1.)
+    if (p_pslot == 1 && p_tick < 200) { b = BTN_USE; mx = 0.0; my = 0.0; }
+    let wsel: i32 = WPN_KESTREL;
+    if (p_tick > 260) { wsel = WPN_SPARROW; }
+    cmd_set(p_c, p_tick, i32(g_TICK_MS), mx, my, yaw, pit, b, wsel, p_tick + 1);
+}
+
+// EXACTLY EIGHT COMMANDS — ARCHITECTURE §3's own wording: "replaying 8
+// commands must produce 0 sounds".  Written out rather than reusing the big
+// scenario so the claim cannot become vacuous: the player fires at the nearest
+// shade on every one of the eight ticks, never sprints (which would lock the
+// trigger) and never channels.
+fn run_eight(p_seed: i32, p_replay: i32): object {
+    let w: object = build_world(p_seed, p_replay);
+    let c: object = cmd_new();
+    let t: i32 = 0;
+    while (t < 8) {
+        let yaw: f64 = 0.0;
+        let pit: f64 = 0.0;
+        if (aim_at_nearest(w, 1) == 1) { yaw = g_aim[0]; pit = g_aim[1]; }
+        cmd_set(c, t, i32(g_TICK_MS), 0.0, 0.0, yaw, pit, BTN_FIRE, WPN_KESTREL, t + 1);
+        sim_queue_command(w, 1, c);
+        sim_step(w, t);
+        t++;
+    }
+    let out: object = w;
+    return out;
+}
+
+// Run the scenario and return the world.  `p_drop_every` makes player 2 lose a
+// command periodically, so the HOLD path in stage (a) is exercised too.
+fn run_scenario(p_seed: i32, p_ticks: i32, p_replay: i32, p_drop_every: i32): object {
+    let w: object = build_world(p_seed, p_replay);
+    let c: object = cmd_new();
+    let t: i32 = 0;
+    while (t < p_ticks) {
+        script_cmd(c, w, p_seed, 1, t);
+        sim_queue_command(w, 1, c);
+        let drop: i32 = 0;
+        if (p_drop_every > 0) { if (t % p_drop_every == 0) { drop = 1; } }
+        if (drop == 0) {
+            script_cmd(c, w, p_seed, 2, t);
+            sim_queue_command(w, 2, c);
+        }
+        sim_step(w, t);
+        t++;
+    }
+    let out: object = w;
+    return out;
+}
+
+// Fill the world to the director's design alive cap, so the budget number is
+// the LOADED case and not an empty field.  `build_world` already placed eight.
+fn perf_fill(p_w: object): i32 {
+    let w: object = p_w;
+    let ai: object = sim_ai(w);
+    let have: i32 = ai_agent_count(ai);
+    let want: i32 = g_DIR_ALIVE_CAP;
+    let i: i32 = have;
+    while (i < want) {
+        let fx: f64 = 8.0 + f64(i) * 0.7;
+        let fh: f64 = chunk_height_at(sim_chunks(w), fx, 4.0);
+        if (fh <= CHUNK_H_MISS) { fh = 0.0; }
+        ai_spawn(ai, w, g_ENEMY_WISP, fx, fh, 4.0, 0.0);
+        i++;
+    }
+    let out: i32 = want;
+    return out;
+}
+
+fn perf_agents(p_w: object): i32 {
+    let w: object = p_w;
+    let kinds = w.kind;
+    let flags = w.flags;
+    let n: i32 = w.count;
+    let c: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (kinds[i] == KIND_AI) { if ((flags[i] & EF_DEAD) == 0) { c++; } }
+        i++;
+    }
+    let out: i32 = c;
+    return out;
+}
+
+// ===========================================================================
+//  MAIN
+// ===========================================================================
+
+fn main() {
+    let comp: i32 = compiled();
+
+    print("=========================================================");
+    print(" probe_sim — W4-9: the fixed-timestep step and snapshots");
+    if (comp == 1) { print(" backend     COMPILED"); } else { print(" backend     interpreted"); }
+    print("=========================================================");
+    print("");
+
+    // =====================================================================
+    print("-- 1. THE STAGE ORDER IS ARCHITECTURE §4.3, AND IT IS DATA --");
+    // =====================================================================
+    // Asserted against the DOC's ten stages by literal id, not against the
+    // array's own contents.  Gate 4a found caps that could be mutated with
+    // every probe still green because the assertions were written relative to
+    // the config value rather than to the design.
+    ck(SIM_STAGE_COUNT == 10, "ARCHITECTURE §4.3 has exactly ten sim stages (got " + sv(SIM_STAGE_COUNT) + ")");
+    ck(SIM_STAGE_COMMANDS == 0, "stage a is commands");
+    ck(SIM_STAGE_MOVEMENT == 1, "stage b is movement");
+    ck(SIM_STAGE_WEAPONS  == 2, "stage c is weapons");
+    ck(SIM_STAGE_PROJ     == 3, "stage d is projectiles");
+    ck(SIM_STAGE_AI       == 4, "stage e is AI");
+    ck(SIM_STAGE_DAMAGE   == 5, "stage f is damage + death");
+    ck(SIM_STAGE_INTERACT == 6, "stage g is pickups / interactions / lantern channel");
+    ck(SIM_STAGE_WORLD    == 7, "stage h is day cycle + streaming");
+    ck(SIM_STAGE_HISTORY  == 8, "stage i is history_capture");
+    ck(SIM_STAGE_EFFECTS  == 9, "stage j is sim_effects");
+
+    let w0: object = build_world(1337, 0);
+    let ord_ok: i32 = 1;
+    let oi: i32 = 0;
+    while (oi < SIM_STAGE_COUNT) {
+        if (sim_stage_at(w0, oi) != oi) { ord_ok = 0; }
+        oi++;
+    }
+    ck(ord_ok == 1, "a fresh sim executes the ten stages in the documented order");
+    ck(sim_step(w0, 0) == SIM_STAGE_COUNT, "sim_step reports the ten stages it ran");
+    ck(w0.tick == 0, "sim_step publishes the tick onto the world before any stage");
+    ck(world_check(w0) == 0, "the world is structurally consistent after a step");
+    ck(sim_players(w0) == 2, "two player slots");
+    ck(sim_steps(w0) == 1, "one step counted");
+    print("  stages      10, in order, dispatched through sim.order");
+    print("");
+
+    // =====================================================================
+    print("-- 2. THE ACCUMULATOR: fixed step, stall clamp, no death spiral --");
+    // =====================================================================
+    let ac: object = sim_accum_new();
+
+    // 60 frames of exactly one tick each.
+    let f1: i32 = 0;
+    let n1: i32 = 0;
+    while (f1 < 60) { n1 = n1 + sim_accum_advance(ac, g_TICK_MS); f1++; }
+    ck(n1 == 60, "60 frames of exactly TICK_MS issue exactly 60 ticks (got " + sv(n1) + ")");
+    ck(sim_accum_alpha(ac) < 1.0, "alpha is always < 1");
+    ck(sim_accum_alpha(ac) >= 0.0, "alpha is never negative");
+
+    // A zero-length frame must issue nothing.
+    ck(sim_accum_advance(ac, 0.0) == 0, "a 0 ms frame issues 0 ticks — the loop runs 0, 1 or N times");
+
+    // THE STALL CLAMP.  A 5-second frame must not queue 300 ticks.
+    sim_accum_reset(ac);
+    let nstall: i32 = sim_accum_advance(ac, 5000.0);
+    ck(nstall <= SIM_MAX_TICKS_PER_FRAME,
+       "a 5000 ms stall issues at most " + sv(SIM_MAX_TICKS_PER_FRAME) + " ticks, not 300 (got " + sv(nstall) + ")");
+    ck(sim_accum_stalls(ac) == 1, "the stall is COUNTED, not silent");
+    // ...and the debt must not still be there next frame.
+    let after: i32 = sim_accum_advance(ac, g_TICK_MS);
+    ck(after == 1, "the frame after a stall issues ONE tick — the debt is forgiven, not carried (got " + sv(after) + ")");
+    ck(g_FRAME_CLAMP_MS == 250.0, "ARCHITECTURE §3's spiral-of-death clamp is 250 ms");
+
+    // A caller that never clamps still cannot hang the sim.
+    sim_accum_reset(ac);
+    sim_accum_set_clamp_ms(ac, 100000.0);
+    let nbig: i32 = sim_accum_advance(ac, 30000.0);
+    ck(nbig == SIM_MAX_TICKS_PER_FRAME,
+       "even with the ms clamp disabled the tick ceiling holds (got " + sv(nbig) + ")");
+    ck(sim_accum_forgiven(ac) > 0, "the forgiven ticks are counted");
+
+    // FRAME-RATE INDEPENDENCE.  10 seconds of wall time must be 600 ticks at
+    // any frame rate.  This is W4-11's "identical at 30 and 240 fps" property,
+    // proven at the layer that owns it.
+    let a30: object = sim_accum_new();
+    let a60: object = sim_accum_new();
+    let a240: object = sim_accum_new();
+    let t30: i32 = 0; let c30: i32 = 0;
+    while (t30 < 300) { c30 = c30 + sim_accum_advance(a30, 1000.0 / 30.0); t30++; }
+    let t60: i32 = 0; let c60: i32 = 0;
+    while (t60 < 600) { c60 = c60 + sim_accum_advance(a60, 1000.0 / 60.0); t60++; }
+    let t240: i32 = 0; let c240: i32 = 0;
+    while (t240 < 2400) { c240 = c240 + sim_accum_advance(a240, 1000.0 / 240.0); t240++; }
+    ck(c30 == 600, "10 s at 30 fps issues 600 ticks (got " + sv(c30) + ")");
+    ck(c60 == 600, "10 s at 60 fps issues 600 ticks (got " + sv(c60) + ")");
+    ck(c240 == 600, "10 s at 240 fps issues 600 ticks (got " + sv(c240) + ")");
+    print("  30/60/240   " + sv(c30) + " / " + sv(c60) + " / " + sv(c240) + " ticks for the same 10 s");
+
+    // NO DRIFT over a long session: the derived-index invariant.
+    let ad: object = sim_accum_new();
+    let td: i32 = 0; let cd: i32 = 0;
+    while (td < 60000) { cd = cd + sim_accum_advance(ad, g_TICK_MS); td++; }
+    ck(cd == 60000, "60 000 frames issue 60 000 ticks — no drift (got " + sv(cd) + ")");
+    let want_total: f64 = 60000.0 * g_TICK_MS;
+    ck(absf2(sim_accum_total_ms(ad) - want_total) < 0.000001,
+       "the compensated total is within 1e-6 ms of exact after 60 000 frames");
+    print("  drift       0 ticks over 60 000 frames (" + sv(r3(want_total / 1000.0)) + " s)");
+    print("");
+
+    // =====================================================================
+    print("-- 3. COMMANDS: slot order, then seq; queue, drop, hold --");
+    // =====================================================================
+    let wc: object = build_world(4242, 0);
+    let cc: object = cmd_new();
+
+    // A stale seq is rejected rather than rewinding the player.
+    cmd_set(cc, 0, 16, 0.5, 0.0, 1.0, 0.0, 0, WPN_KESTREL, 10);
+    ck(sim_apply_command(wc, 1, cc) == 1, "a fresh command applies");
+    cmd_set(cc, 0, 16, 0.5, 0.0, 1.0, 0.0, 0, WPN_KESTREL, 10);
+    ck(sim_apply_command(wc, 1, cc) == 0, "the SAME seq is refused — the stream stays monotonic");
+    cmd_set(cc, 0, 16, 0.5, 0.0, 1.0, 0.0, 0, WPN_KESTREL, 9);
+    ck(sim_apply_command(wc, 1, cc) == 0, "an EARLIER seq is refused");
+    ck(sim_stat_cmds_stale(wc) == 2, "both refusals are counted");
+
+    // Queue overflow drops the OLDEST and counts it.
+    let q: i32 = 0;
+    while (q < SIM_CMD_QUEUE + 3) {
+        cmd_set(cc, q, 16, 0.0, 1.0, 0.0, 0.0, 0, WPN_KESTREL, 100 + q);
+        sim_queue_command(wc, 2, cc);
+        q++;
+    }
+    ck(sim_stat_cmds_dropped(wc) == 3, "a full queue drops the OLDEST, 3 times, counted (got "
+       + sv(sim_stat_cmds_dropped(wc)) + ")");
+
+    // A player with an empty queue is HELD, not repeated.
+    let wh: object = build_world(7, 0);
+    cmd_set(cc, 0, 16, 0.0, 0.0, 0.0, 0.0, BTN_FIRE, WPN_KESTREL, 1);
+    sim_queue_command(wh, 1, cc);
+    sim_step(wh, 0);
+    let shots_after_one: i32 = sim_stat_shots(wh);
+    let hs: i32 = 1;
+    while (hs < 12) { sim_step(wh, hs); hs++; }
+    ck(sim_stat_shots(wh) == shots_after_one,
+       "a dropped packet does NOT keep the trigger held (shots " + sv(shots_after_one)
+       + " -> " + sv(sim_stat_shots(wh)) + ")");
+    ck(sim_stat_cmds_missing(wh) >= 11, "every missing command is counted");
+    let wst_h: array = sim_weapon_state(wh);
+    ck(wpn_cur(wst_h, 0) == WPN_KESTREL,
+       "a held (empty) command does not restow the weapon — GDD §8's Kestrel stays in your hands");
+    print("");
+
+    // =====================================================================
+    print("-- 4. DETERMINISM: same seed -> identical, other seed -> different --");
+    // =====================================================================
+    let TICKS: i32 = 400;
+    let wa: object = run_scenario(20260729, TICKS, 0, 5);
+    let wb: object = run_scenario(20260729, TICKS, 0, 5);
+    let wz: object = run_scenario(20260730, TICKS, 0, 5);
+    let ha: u64 = sim_hash(wa);
+    let hb: u64 = sim_hash(wb);
+    let hz: u64 = sim_hash(wz);
+    ck(ha == hb, "same seed + same command sequence -> BIT-IDENTICAL state hash");
+    ck(ha != hz, "a different seed produces a different hash — the check is not vacuous");
+    ck(sim_pos_hash(wa) == sim_pos_hash(wb), "the per-tick position hash agrees too");
+    ck(sim_pos_hash(wa) != sim_pos_hash(wz), "and differs on a different seed");
+    print("  hash(seed A) " + sv(ha));
+    print("  hash(seed B) " + sv(hz));
+
+    // The scenario has to have actually DONE something, or the hash is a hash
+    // of nothing.  These are the ten stages, each with a witness.
+    ck(sim_stat_cmds_applied(wa) > 600, "stage a applied commands for both players (" + sv(sim_stat_cmds_applied(wa)) + ")");
+    ck(sim_stat_cmds_missing(wa) > 0, "stage a exercised the HOLD path (" + sv(sim_stat_cmds_missing(wa)) + ")");
+    let ps1: array<f64> = sim_predicted(wa, 1);
+    ck(absf2(move_px(ps1)) + absf2(move_pz(ps1)) > 0.5, "stage b moved the player");
+    ck(sim_stat_shots(wa) > 0, "stage c fired the weapon (" + sv(sim_stat_shots(wa)) + " shots)");
+    ck(sim_stat_ai_attacks(wa) >= 0, "stage e/f ran the AI (" + sv(sim_stat_ai_attacks(wa)) + " contact hits)");
+    ck(sim_stat_deaths(wa) > 0, "stage f reaped corpses (" + sv(sim_stat_deaths(wa)) + ")");
+    ck(sim_stat_loot_rolls(wa) == sim_stat_deaths(wa), "stage f rolled loot for every death");
+    ck(sim_stat_lanterns(wa) == 1, "stage g completed the " + sv(g_LANTERN_CHANNEL_S) + " s lantern channel exactly once");
+    ck(sim_stat_pickups(wa) >= 0, "stage g swept pickups");
+    ck(sim_tier(wa) >= 0, "stage h published the shade tier (" + sv(sim_tier(wa)) + ")");
+    ck(world_check(wa) == 0, "the world is still consistent after " + sv(TICKS) + " ticks");
+    let pr1: array = sim_progression(wa, 1);
+    ck(prog_xp_total(pr1) >= g_XP_LANTERN,
+       "lighting the lantern awarded the GDD §8 +" + sv(g_XP_LANTERN) + " XP (total " + sv(prog_xp_total(pr1)) + ")");
+    print("  witnesses   shots=" + sv(sim_stat_shots(wa)) + " deaths=" + sv(sim_stat_deaths(wa))
+        + " lanterns=" + sv(sim_stat_lanterns(wa)) + " xp=" + sv(prog_xp_total(pr1)));
+    print("");
+
+    // =====================================================================
+    print("-- 5. THE STAGE ORDER IS LOAD-BEARING: reorder two, get a new hash --");
+    // =====================================================================
+    // BUILD_PLAN W4-9: "the stage order is asserted by a test that reorders two
+    // stages and expects a different hash."  Because the order is DATA this
+    // test drives the real dispatcher, not a copy of it.
+    // The pair is (a) commands and (b) movement.  Their dependency is the least
+    // ambiguous in the whole graph — movement integrates THE COMMAND — so a
+    // swap is guaranteed to change the trajectory rather than merely being
+    // likely to.  (Movement <-> weapons, the more obvious pair, is NOT a good
+    // test here: a Kestrel kills a Wisp in one shot at every range in this
+    // scenario, so firing from a 7 cm different origin lands on the same
+    // outcome and the hashes legitimately tie.  A test that can tie is not a
+    // test.)
+    let wr: object = build_world(20260729, 0);
+    sim_stage_swap(wr, 0, 1);          // commands <-> movement
+    ck(sim_stage_at(wr, 0) == SIM_STAGE_MOVEMENT, "the swap took effect");
+    ck(sim_stage_at(wr, 1) == SIM_STAGE_COMMANDS, "and it is symmetric");
+    ck(sim_stat_swaps(wr) == 1, "the swap is COUNTED, so a shipping build that used it is visible");
+    let cr: object = cmd_new();
+    let tr: i32 = 0;
+    while (tr < TICKS) {
+        script_cmd(cr, wr, 20260729, 1, tr);
+        sim_queue_command(wr, 1, cr);
+        if (tr % 5 != 0) {
+            script_cmd(cr, wr, 20260729, 2, tr);
+            sim_queue_command(wr, 2, cr);
+        }
+        sim_step(wr, tr);
+        tr++;
+    }
+    let hr: u64 = sim_hash(wr);
+    ck(hr != ha, "swapping two stages CHANGES the outcome — the order is API");
+    sim_stage_order_reset(wr);
+    ck(sim_stage_at(wr, 0) == SIM_STAGE_COMMANDS, "the documented order can be restored");
+    print("  reordered   " + sv(hr) + "  (vs " + sv(ha) + ")");
+    print("");
+
+    // =====================================================================
+    print("-- 6. REPLAY: zero cosmetics, and the SAME state hash --");
+    // =====================================================================
+    // ARCHITECTURE §3 / CLAUDE.md §7: replaying 8 commands must produce 0
+    // sounds.  The stronger claim is that skipping stage (j) cannot change the
+    // simulation, which is what makes a replay's hash comparable at all.
+    let wlive: object = run_eight(999, 0);
+    let wrep: object = run_eight(999, 1);
+    ck(world_replaying(wrep) == 1, "the replay world is flagged");
+    ck(sim_fx_total(wlive) > 0, "the LIVE run produced cosmetics (" + sv(sim_fx_total(wlive)) + ")");
+    ck(sim_fx_total(wrep) == 0, "8 replayed commands produce ZERO sounds, particles or shake (got "
+       + sv(sim_fx_total(wrep)) + ")");
+    ck(sim_fx_count(wrep) == 0, "and the effect queue is empty");
+    ck(sim_hash(wlive) == sim_hash(wrep),
+       "the replay reproduces the live state EXACTLY — stage (j) cannot touch the sim");
+
+    // A longer replay, to be sure the equality is not an artifact of 8 ticks.
+    let wlive2: object = run_scenario(31337, 300, 0, 4);
+    let wrep2: object = run_scenario(31337, 300, 1, 4);
+    ck(sim_hash(wlive2) == sim_hash(wrep2), "300 replayed ticks reproduce the live state exactly");
+    ck(sim_fx_total(wrep2) == 0, "and still produce zero cosmetics over 300 ticks");
+    ck(sim_fx_total(wlive2) > 0, "while the live run of the same 300 ticks did not");
+    print("  cosmetics   live=" + sv(sim_fx_total(wlive2)) + "  replay=" + sv(sim_fx_total(wrep2)));
+    print("");
+
+    // =====================================================================
+    print("-- 7. THE SNAPSHOT: wire layout, delta, round trip --");
+    // =====================================================================
+    ck(SNAP_HDR_B == 13, "the snapshot header is 13 bytes");
+    ck(SNAP_OFF_COUNT == 0, "count at offset 0");
+    ck(SNAP_OFF_NREM == 2, "removed-count at offset 2");
+    ck(SNAP_OFF_TICK == 4, "tick at offset 4");
+    ck(SNAP_OFF_VIEWER == 8, "viewer id at offset 8");
+    ck(SNAP_OFF_MODE == 12, "mode at offset 12");
+    ck(SNAP_REC_MIN_B == 5, "an unchanged entity costs 5 bytes: id + mask");
+    ck(SNAP_REC_MAX_B == 30, "a fully changed entity costs 30 bytes");
+    ck(SNAP_F_ALL == 63, "six field bits");
+    ck(SNAP_CAP == 256, "the snapshot cap mirrors g_MAX_RENDER_ENTS");
+
+    let ws: object = run_scenario(55, 120, 0, 0);
+    let sA: object = snapshot_new_cap(SNAP_CAP);
+    let sB: object = snapshot_new_cap(SNAP_CAP);
+    let sD: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_set_radius(sA, 0.0);
+    snapshot_set_radius(sB, 0.0);
+    snapshot_set_radius(sD, 0.0);
+
+    let vslot: i32 = world_slot_of(ws, sim_player_id(ws, 1));
+    let nfull: i32 = snapshot_write(sA, ws, vslot, sD);      // sD is empty -> full
+    ck(snapshot_mode(sA) == SNAP_MODE_FULL, "a snapshot against an empty baseline is FULL");
+    ck(snapshot_count(sA) > 0, "the full snapshot carries entities (" + sv(snapshot_count(sA)) + ")");
+    ck(snapshot_check(sA) == 0, "the full snapshot is structurally sound");
+    ck(nfull == snapshot_size(sA), "snapshot_write returns the same byte count snapshot_size reports");
+    ck(snapshot_viewer(sA) == sim_player_id(ws, 1), "the snapshot names its viewer");
+    ck(snapshot_tick(sA) == ws.tick, "and its tick");
+    let want_full: i32 = SNAP_HDR_B + snapshot_count(sA) * SNAP_REC_MAX_B;
+    ck(nfull == want_full, "a full snapshot is exactly HDR + n*30 bytes (" + sv(nfull)
+       + " vs " + sv(want_full) + ")");
+
+    // ROUND TRIP.  Decode into a third snapshot and compare bit for bit.
+    let sR: object = snapshot_new_cap(SNAP_CAP);
+    ck(snapshot_read(sR, sA, sD) == snapshot_count(sA), "the full snapshot decodes");
+    ck(snapshot_hash(sR) == snapshot_hash(sA), "decode == encode, BIT-IDENTICAL (full)");
+
+    let ida = snapshot_field_id(sA);
+    let idr = snapshot_field_id(sR);
+    let pxa = snapshot_field_px(sA);
+    let pxr = snapshot_field_px(sR);
+    let pya = snapshot_field_py(sA);
+    let pyr = snapshot_field_py(sR);
+    let ywa = snapshot_field_yaw(sA);
+    let ywr = snapshot_field_yaw(sR);
+    let hpa = snapshot_field_hp(sA);
+    let hpr = snapshot_field_hp(sR);
+    let same: i32 = 1;
+    let si: i32 = 0;
+    let ns: i32 = snapshot_count(sA);
+    while (si < ns) {
+        if (ida[si] != idr[si]) { same = 0; }
+        if (pxa[si] != pxr[si]) { same = 0; }
+        if (pya[si] != pyr[si]) { same = 0; }
+        if (ywa[si] != ywr[si]) { same = 0; }
+        if (hpa[si] != hpr[si]) { same = 0; }
+        si++;
+    }
+    ck(same == 1, "every decoded field equals the encoded one with NO epsilon");
+
+    // DELTA.  Advance one tick and re-write against sA.
+    snapshot_copy(sD, sA);
+    let cq: object = cmd_new();
+    script_cmd(cq, ws, 55, 1, 121);
+    sim_queue_command(ws, 1, cq);
+    sim_step(ws, 121);
+    let ndelta: i32 = snapshot_write(sB, ws, vslot, sD);
+    ck(snapshot_mode(sB) == SNAP_MODE_DELTA, "a snapshot against a populated baseline is a DELTA");
+    ck(ndelta < nfull, "the delta is smaller than the full snapshot ("
+       + sv(ndelta) + " vs " + sv(nfull) + " bytes)");
+    let sR2: object = snapshot_new_cap(SNAP_CAP);
+    ck(snapshot_read(sR2, sB, sD) == snapshot_count(sB), "the delta decodes against the baseline");
+    ck(snapshot_hash(sR2) == snapshot_hash(sB), "decode == encode, BIT-IDENTICAL (delta)");
+    print("  bytes       full=" + sv(nfull) + "  delta=" + sv(ndelta)
+        + "  (" + sv(snapshot_count(sA)) + " entities)");
+
+    // INTEREST MANAGEMENT — the reason `snapshot_write` always takes a viewer.
+    let sN: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_set_radius(sN, 3.0);
+    let sE: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_write(sN, ws, vslot, sE);
+    ck(snapshot_count(sN) < snapshot_count(sA), "a 3 m interest radius culls entities ("
+       + sv(snapshot_count(sN)) + " vs " + sv(snapshot_count(sA)) + ")");
+    ck(snapshot_index_of(sN, sim_player_id(ws, 1)) >= 0, "the viewer is NEVER culled from its own snapshot");
+
+    // Cosmetics never replicate.
+    let cslot: i32 = world_spawn(ws, KIND_COSMETIC, 0);
+    let nbefore: i32 = snapshot_count(sA);
+    let sC: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_set_radius(sC, 0.0);
+    let sE2: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_write(sC, ws, vslot, sE2);
+    ck(snapshot_index_of(sC, world_id_of(ws, cslot)) == -1,
+       "a KIND_COSMETIC entity is never replicated (EF_NO_REPLICATE)");
+    print("");
+
+    // =====================================================================
+    print("-- 8. THE SEAM: two snapshots in, one interpolated frame out --");
+    // =====================================================================
+    // The renderer must never be locked to the tick rate.  `render_snapshot`
+    // keeps tick n-1 and tick n and blends; these assertions prove the two
+    // endpoints reproduce the raw tick states EXACTLY, which is the property
+    // that makes any alpha in between meaningful.
+    let wi: object = build_world(6060, 0);
+    let rs: object = rsnap_new_cap(256);
+    rsnap_set_viewer(rs, sim_player_id(wi, 1));
+    rsnap_set_cull_radius(rs, 0.0);
+    let ci: object = cmd_new();
+
+    // Walk forward for 40 ticks first.  An interpolation test between two
+    // IDENTICAL states passes for the wrong reason — 0.5*a + 0.5*a == a for any
+    // blender, including a broken one — so the player has to be genuinely
+    // moving when the endpoints are compared.
+    let ti: i32 = 0;
+    while (ti < 42) {
+        cmd_set(ci, ti, i32(g_TICK_MS), 0.0, 1.0, 0.7, 0.0, 0, WPN_KESTREL, ti + 1);
+        sim_queue_command(wi, 1, ci);
+        sim_step(wi, ti);
+        rsnap_build(rs, wi, 0.0);
+        ti++;
+    }
+    let pid1: i32 = sim_player_id(wi, 1);
+    let row_prev: i32 = rsnap_index_of(rs, pid1);
+    ck(row_prev >= 0, "the viewer is in the render snapshot");
+    let rx = rsnap_field_x(rs);
+    let rz = rsnap_field_z(rs);
+    let x_at_prev: f64 = rx[row_prev];
+    let z_at_prev: f64 = rz[row_prev];
+
+    // Capture the world's tick-n state, then rebuild at alpha = 1.
+    let vslot2: i32 = world_slot_of(wi, pid1);
+    let wpx2 = wi.px;
+    let wpz2 = wi.pz;
+    let x_at_cur: f64 = wpx2[vslot2];
+    let z_at_cur: f64 = wpz2[vslot2];
+
+    rsnap_build(rs, wi, 1.0);
+    let row1: i32 = rsnap_index_of(rs, pid1);
+    let rx1 = rsnap_field_x(rs);
+    let rz1 = rsnap_field_z(rs);
+    ck(rx1[row1] == x_at_cur, "alpha = 1 reproduces tick n EXACTLY (no arithmetic)");
+    ck(rz1[row1] == z_at_cur, "in z too");
+
+    rsnap_build(rs, wi, 0.0);
+    let row2: i32 = rsnap_index_of(rs, pid1);
+    let rx2 = rsnap_field_x(rs);
+    ck(rx2[row2] == x_at_prev, "alpha = 0 reproduces tick n-1 EXACTLY");
+
+    ck(absf2(x_at_cur - x_at_prev) > 0.01,
+       "the two ticks are genuinely different — the interpolation test is not vacuous ("
+       + sv(r3(x_at_prev)) + " -> " + sv(r3(x_at_cur)) + ")");
+    rsnap_build(rs, wi, 0.5);
+    let row3: i32 = rsnap_index_of(rs, pid1);
+    let rx3 = rsnap_field_x(rs);
+    let mid: f64 = 0.5 * x_at_prev + 0.5 * x_at_cur;
+    ck(absf2(rx3[row3] - mid) < 0.000000001, "alpha = 0.5 is the midpoint — the frame is not tick-locked");
+    ck(rx3[row3] != x_at_prev, "and the midpoint is neither endpoint");
+    ck(rx3[row3] != x_at_cur, "in either direction");
+    ck(rsnap_cur_tick(rs) == wi.tick, "the render snapshot knows which tick it is showing");
+    ck(rsnap_prev_tick(rs) == wi.tick - 1, "and which one it is coming from");
+
+    // THE RENDERER NEVER WRITES THE SIM.
+    let h_before: u64 = sim_hash(wi);
+    let ab: i32 = 0;
+    while (ab < 20) {
+        rsnap_build(rs, wi, f64(ab) * 0.05);
+        ab++;
+    }
+    ck(sim_hash(wi) == h_before,
+       "twenty render builds at twenty alphas do not change one bit of the sim");
+    print("  interp      alpha 0 / 0.5 / 1 exact at both endpoints, "
+        + sv(r3(x_at_prev)) + " -> " + sv(r3(x_at_cur)));
+
+    // AND THE v2 PATH: a DECODED sim snapshot drives the identical builder.
+    let sNet: object = snapshot_new_cap(SNAP_CAP);
+    let sNetB: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_set_radius(sNet, 0.0);
+    snapshot_set_radius(sNetB, 0.0);
+    let rs2: object = rsnap_new_cap(256);
+    rsnap_set_viewer(rs2, pid1);
+    rsnap_set_cull_radius(rs2, 0.0);
+    snapshot_write(sNet, wi, vslot2, sNetB);
+    rsnap_build_from_net(rs2, sNet, 1.0);
+    let row4: i32 = rsnap_index_of(rs2, pid1);
+    ck(row4 >= 0, "rsnap_build_from_net accepts a src/sim snapshot unmodified — the v2 seam is one call");
+    let rx4 = rsnap_field_x(rs2);
+    ck(absf2(rx4[row4] - snap_dq_pos(snap_q_pos(x_at_cur))) < 0.000000001,
+       "and it lands on the WIRE-QUANTISED position, which is what the client will really see");
+    print("");
+
+    // =====================================================================
+    print("-- 9. LONG RUN: 10 000 ticks, no drift, no corruption --");
+    // =====================================================================
+    let wl: object = run_scenario(2468, 10000, 0, 7);
+    ck(sim_steps(wl) == 10000, "10 000 fixed ticks executed");
+    ck(world_check(wl) == 0, "the world is consistent after 10 000 ticks");
+    ck(world_count(wl) <= 256, "the entity count never exceeded the world cap");
+    let wl2: object = run_scenario(2468, 10000, 0, 7);
+    ck(sim_hash(wl) == sim_hash(wl2), "10 000 ticks reproduce bit-for-bit");
+    print("  10k ticks   hash " + sv(sim_hash(wl)) + "  entities " + sv(world_count(wl))
+        + "  deaths " + sv(sim_stat_deaths(wl)));
+    print("");
+
+    // =====================================================================
+    print("-- 10. BUDGET: sim_step against the 2.0 ms/frame sim budget --");
+    // =====================================================================
+    // RULE T: __clock() (CPU time) + minimum-of-7.  This box permanently shares
+    // ~17 of 24 cores with a llama-server; the guard is ~2x the LOADED number
+    // and both numbers are in the assertion text.
+    let ITERS: i32 = 2000;
+
+    // The scripted commands are RECORDED FIRST, into preallocated objects, and
+    // the timed loop only queues and steps.  Otherwise the measurement would
+    // include this probe's nearest-shade scan, which is harness cost and not
+    // sim cost.  The recorded stream is exactly what the live scenario
+    // produced, and the world evolves identically from it, so the timed run is
+    // the same simulation — that is what determinism buys.
+    let tape: array = [];
+    let tp: i32 = 0;
+    while (tp < ITERS) { tape.push(cmd_new()); tp++; }
+    let wrec: object = build_world(80808, 0);
+    perf_fill(wrec);
+    let rt: i32 = 0;
+    while (rt < ITERS) {
+        script_cmd(tape[rt], wrec, 80808, 1, rt);
+        sim_queue_command(wrec, 1, tape[rt]);
+        sim_step(wrec, rt);
+        rt++;
+    }
+    let live_agents: i32 = perf_agents(wrec);
+
+    let best_ms: f64 = 1000000000.0;
+    let worst_ms: f64 = 0.0;
+    let trial: i32 = 0;
+    while (trial < g_PS_TRIALS) {
+        // A fresh world per trial, built OUTSIDE the clock: the tick loop
+        // advances state, so a shared world would measure a different scenario
+        // on every trial.
+        let wp: object = build_world(80808, 0);
+        perf_fill(wp);
+        let c0: f64 = __clock();
+        let bi: i32 = 0;
+        while (bi < ITERS) {
+            sim_queue_command(wp, 1, tape[bi]);
+            sim_step(wp, bi);
+            bi++;
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0;
+        if (ms < best_ms) { best_ms = ms; }
+        if (ms > worst_ms) { worst_ms = ms; }
+        trial++;
+    }
+    let per_ms: f64 = best_ms / f64(ITERS);
+    let per_us: f64 = per_ms * 1000.0;
+    let share: f64 = per_ms * 100.0 / g_BUDGET_SIM_MS;
+    let guard: f64 = g_PS_STEP_US_GUARD;
+    if (comp == 0) { guard = g_PS_STEP_US_GUARD_INTERP; }
+    // The measured world holds MORE than the director's alive cap: this probe
+    // hand-spawns to the cap and the director then fills its own roster on top,
+    // because a hand-spawned body is not on its roster.  That makes the number
+    // below a conservative over-estimate of the shipping load, not a cap
+    // violation -- which is the safe direction for a budget claim.
+    print("  agents      " + sv(live_agents) + " AI alive at the end of the measured run"
+        + "  (>= the " + sv(g_DIR_ALIVE_CAP) + " design cap, so this is a conservative load)");
+    ck(live_agents >= g_DIR_ALIVE_CAP,
+       "the budget was measured at or above the " + sv(g_DIR_ALIVE_CAP) + "-agent design cap (got "
+       + sv(live_agents) + ")");
+    print("  sim_step    " + sv(r3(per_us)) + " us/tick   (spread " + sv(r3(worst_ms / best_ms)) + "x)");
+    print("  budget      " + sv(r3(share)) + " % of the " + sv(g_BUDGET_SIM_MS) + " ms sim budget");
+    print("  headroom    " + sv(r3(g_BUDGET_SIM_MS - per_ms)) + " ms/tick  ("
+        + sv(r3(g_BUDGET_SIM_MS / per_ms)) + "x)");
+    ck(per_ms < g_BUDGET_SIM_MS,
+       "sim_step (" + sv(r3(per_us)) + " us) must fit the " + sv(g_BUDGET_SIM_MS) + " ms sim budget");
+    ck(per_us <= guard,
+       "sim_step " + sv(r3(per_us)) + " us/tick must stay under the " + sv(guard)
+       + " us regression guard (guard is ~2x the loaded measurement, not an idle-box certification)");
+
+    // The snapshot's own share.  It runs at the SNAPSHOT rate (20 Hz on the
+    // wire), not the tick rate, but it is measured against the tick budget
+    // because in v1 loopback it can run every tick.
+    let wsb: object = run_scenario(1212, 200, 0, 0);
+    let sb1: object = snapshot_new_cap(SNAP_CAP);
+    let sb0: object = snapshot_new_cap(SNAP_CAP);
+    snapshot_set_radius(sb1, 0.0);
+    snapshot_set_radius(sb0, 0.0);
+    let vsb: i32 = world_slot_of(wsb, sim_player_id(wsb, 1));
+    snapshot_write(sb0, wsb, vsb, sb1);
+    let SITER: i32 = 20000;
+    let sbest: f64 = 1000000000.0;
+    let st2: i32 = 0;
+    while (st2 < g_PS_TRIALS) {
+        let d0: f64 = __clock();
+        let sj: i32 = 0;
+        while (sj < SITER) { snapshot_write(sb1, wsb, vsb, sb0); sj++; }
+        let d1: f64 = __clock();
+        let sms: f64 = (d1 - d0) * 1000.0;
+        if (sms < sbest) { sbest = sms; }
+        st2++;
+    }
+    let sper_us: f64 = sbest / f64(SITER) * 1000.0;
+    let sguard: f64 = g_PS_SNAP_US_GUARD;
+    if (comp == 0) { sguard = g_PS_SNAP_US_GUARD_INTERP; }
+    print("  snapshot    " + sv(r3(sper_us)) + " us/write at " + sv(snapshot_count(sb0)) + " entities");
+    ck(sper_us <= sguard,
+       "snapshot_write " + sv(r3(sper_us)) + " us must stay under the " + sv(sguard)
+       + " us regression guard (~2x the loaded measurement)");
+    ck(sper_us * 0.001 < g_BUDGET_SIM_MS * 0.1,
+       "snapshot_write (" + sv(r3(sper_us)) + " us) stays under 10 % of the 2.0 ms sim budget");
+    print("");
+
+    // =====================================================================
+    print("-- 11. THE WALLS --");
+    // =====================================================================
+    // These are structural claims the SCRIPTS enforce; asserted here too so a
+    // developer who never runs CI still trips over them.
+    ck(g_TICK_DT == 0.016666666666666666, "TICK_DT is the compile-time 1/60, not a measured delta");
+    ck(g_TICK_MS == 16.666666666666668, "TICK_MS agrees with it");
+    ck(SIM_MAX_TICKS_PER_FRAME * i32(g_TICK_MS) <= i32(g_FRAME_CLAMP_MS),
+       "the tick ceiling is consistent with the 250 ms frame clamp");
+    ck(SIM_INTERACT_R_M > 0.0, "the interaction reach is positive and sim-owned (not a GDD number)");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("=========================================================");
+    let want_n: i32 = g_PS_EXPECT_ASSERTS;
+    print(" assertions  " + sv(g_ok) + " / " + sv(g_n) + " passed");
+    let count_ok: i32 = 0;
+    if (g_n == want_n) { count_ok = 1; }
+    if (count_ok == 0) {
+        print("  FAIL assertion COUNT: ran " + sv(g_n) + ", expected " + sv(want_n)
+            + " — a section stopped running");
+    }
+    if (g_ok == g_n) {
+        if (count_ok == 1) {
+            print(" RESULT      PASS");
+            print("=========================================================");
+            return;
+        }
+    }
+    print(" RESULT      FAIL");
+    print("=========================================================");
+    exit(1);
+}
+
+main();

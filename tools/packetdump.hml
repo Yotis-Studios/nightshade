@@ -1,0 +1,1228 @@
+// packetdump.hml — the wire-protocol reference dump and byte-layout gate. W4-13.
+//
+// Run COMPILED. Headless, and it links NO SDL: it imports src/net/{protocol,
+// packing,quantize}.hml and @stdlib only.
+//
+//     hemlockc -O1 tools/packetdump.hml -o /tmp/pd && /tmp/pd
+//     nm /tmp/pd | grep -c SDL_          # must be 0
+//
+// Modes:
+//     (none)        reference + dump + verify   (the CI gate; exits 1 on failure)
+//     --reference   just the protocol shapes, for a human writing server code
+//     --dump        just the hexdump + decode of one real S_SNAPSHOT
+//     --verify      just the assertions
+//     --negative    just the "a one-byte layout change must fail" proof
+//     --help
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS ASSERTS, AND THE ONE THING IT DELIBERATELY DOES NOT
+// ---------------------------------------------------------------------------
+// BUILD_PLAN W4-13 says "asserting every field's byte offset". There are two
+// kinds of offset in a gn.hml packet and only one of them is a contract:
+//
+//   * ELEMENT offsets inside the packet are NOT fixed and MUST NOT be asserted.
+//     gn.hml's `determine_type` picks the smallest type that fits the VALUE, so
+//     "element 0: u32 server_tick" is two bytes on the wire at tick 5 and five
+//     bytes at tick 70000. protocol.hml's own header says this in capitals.
+//     Section E asserts that this is true — it builds the same message at two
+//     tick values and shows the later elements move — precisely so that nobody
+//     "fixes" the dump by pinning them.
+//
+//   * The byte layout INSIDE each blob IS the contract, and every field of
+//     every stride is asserted here, empirically, against the REAL writers:
+//     one field is set to a sentinel whose every byte is non-zero, the record
+//     is built by `proto_write_snapshot` / `proto_write_input` /
+//     `proto_write_events`, and the dump asserts that the sentinel's bytes are
+//     exactly at the documented offset and that every other byte is zero. That
+//     catches a wrong offset, a wrong width and a wrong endianness with one
+//     test, and it cannot pass by restating the constant it is checking.
+//
+// Section D then flips every single byte of every stride, one at a time, and
+// requires the decode to change. 80 bytes, 80 detections: no padding, no dead
+// byte, nothing the wire carries that the decoder ignores.
+//
+// Section G is BUILD_PLAN's "a deliberate one-byte protocol change that must
+// fail the dump": a mutant writer that puts px_q at +5 instead of +4 — one
+// byte — is fed to the same offset checker that passes the real one, and the
+// checker must reject it.
+//
+// ---------------------------------------------------------------------------
+// DESIGN ANCHORS ARE PINNED WITH LITERALS
+// ---------------------------------------------------------------------------
+// CLAUDE.md: "assert the design, not the digits — but pin design ANCHORS to the
+// doc with a literal." So `ENT_STRIDE == 20` is written as the literal 20 from
+// NETWORKING §11.3, not as `ENT_STRIDE == ENT_STRIDE`. Editing packing.hml's
+// constant turns this file red, which is the entire point of the file.
+
+import { exit } from "@stdlib/process";
+import { TAU } from "@stdlib/math";
+
+import {
+    NET_C_HELLO, NET_C_PING, NET_C_READY, NET_C_ACK_SNAPSHOT, NET_C_INPUT,
+    NET_C_CHAT, NET_C_ACTION,
+    NET_S_WELCOME, NET_S_PONG, NET_S_DISCONNECT, NET_S_SNAPSHOT,
+    NET_S_SNAPSHOT_DELTA, NET_S_EVENT, NET_S_PLAYER_JOIN, NET_S_PLAYER_LEAVE,
+    NET_S_CHUNK,
+    EV_HIT, EV_KILL, EV_DAMAGE_TAKEN, EV_SPAWN, EV_DESPAWN, EV_PICKUP,
+    EV_RELOAD_DONE, EV_WEAPON_SWITCH, EV_DOOR, EV_BLOCK_PLACED,
+    EV_BLOCK_BROKEN, EV_XP, EV_LEVELUP, EV_SOUND,
+    EF_TEAM_MASK, EF_CROUCH, EF_ADS, EF_FIRING, EF_DEAD, EF_HITFLASH,
+    EF_DISSOLVE,
+    MAX_CMDS_PER_PACKET, MAX_PAYLOAD,
+    WT_U8, WT_U16, WT_U32, WT_S8, WT_S16, WT_S32, WT_F32, WT_F64,
+    WT_STRING, WT_BUFFER, WT_UNDEF, WT_COUNT,
+    ENT_STRIDE, CMD_STRIDE, EV_STRIDE,
+    proto_msg, proto_msg_reset, proto_net_id, proto_count, proto_get, proto_add,
+    proto_audit, proto_audit_gameplay, proto_wtype, proto_build, proto_load,
+    proto_parse_frame, proto_blob_count,
+    proto_refused, proto_oversize, proto_malformed, proto_diag_reset,
+    cmdq_new, cmdq_reset, cmdq_count, cmdq_push,
+    proto_write_input, proto_read_input,
+    netents_new, netents_reset, netents_count, netents_push_q, netents_push,
+    netents_x, netents_y, netents_z, netents_yaw, netents_pitch,
+    netlocal_new, netlocal_set, netlocal_x, netlocal_y, netlocal_z,
+    netlocal_vx, netlocal_vy, netlocal_vz,
+    proto_write_snapshot, proto_read_snapshot,
+    netevs_new, netevs_reset, netevs_count, netevs_push_q, netevs_push,
+    netevs_x, netevs_y, netevs_z,
+    proto_write_events, proto_read_events
+} from "../src/net/protocol.hml";
+
+import {
+    PACK_MAX_BLOB, ENTS_PER_BLOB, CMDS_PER_BLOB, EVS_PER_BLOB, LOCAL_STRIDE,
+    pack_new, pack_reset, pack_flush, pack_pos, pack_ovf, pack_bad,
+    pack_u8, pack_i8, pack_u16, pack_i16, pack_u32, pack_i32,
+    unpack_new, unpack_u8, unpack_i8, unpack_u16, unpack_i16, unpack_u32,
+    unpack_i32, unpack_ent_blob, unpack_cmd_blob, unpack_ev_blob,
+    pack_bulk_bad, pack_bulk_bad_reset
+} from "../src/net/packing.hml";
+
+import {
+    POS_SCALE, POS_INV, ANG_SCALE, ANG_INV, ANG8_SCALE, ANG8_INV,
+    VEL_SCALE, VEL_INV, EVPOS_SCALE, EVPOS_INV,
+    POS_MAX, POS16_MAX, VEL_MAX, EVPOS_MAX,
+    q_pos, dq_pos, q_pos16, dq_pos16, q_ang, dq_ang, q_ang8, dq_ang8,
+    q_vel, dq_vel, q_evpos, dq_evpos, q_clamp_count, q_clamp_reset
+} from "../src/net/quantize.hml";
+
+// ===========================================================================
+//  0. HARNESS
+// ===========================================================================
+
+// Every assertion below is unconditional. This is the count.
+let g_EXPECTED_ASSERTIONS = 103;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(p_label: string, p_cond: bool) {
+    g_n = g_n + 1;
+    if (p_cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${p_label}`); }
+}
+fn note(p_s: string) { g_notes.push(p_s); }
+
+let g_HEXD: array = ["0", "1", "2", "3", "4", "5", "6", "7",
+                     "8", "9", "a", "b", "c", "d", "e", "f"];
+
+fn hex2(p_v: i32): string {
+    let v: i32 = p_v & 255;
+    let s: string = `${g_HEXD[(v >> 4) & 15]}${g_HEXD[v & 15]}`;
+    let out: string = s;
+    return out;
+}
+
+fn hex4(p_v: i32): string {
+    let v: i32 = p_v;
+    let s: string = `${hex2((v >> 8) & 255)}${hex2(v & 255)}`;
+    let out: string = s;
+    return out;
+}
+
+fn pad(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = `${s} `; }
+    let out: string = s;
+    return out;
+}
+
+fn padl(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = ` ${s}`; }
+    let out: string = s;
+    return out;
+}
+
+// 16 bytes to a line, offset gutter, printable-ASCII column. `p_indent` is
+// prefixed to every line so a dump can sit inside a section.
+fn hexdump(p_buf, p_indent: string) {
+    let b = p_buf;
+    if (b == null) { print(`${p_indent}(null)`); return; }
+    let n: i32 = b.length;
+    let off: i32 = 0;
+    while (off < n) {
+        let hx: string = "";
+        let asc: string = "";
+        let k: i32 = 0;
+        while (k < 16) {
+            if (off + k < n) {
+                let v: i32 = i32(b.read_u8(off + k));
+                hx = `${hx}${hex2(v)} `;
+                if (v >= 32 && v < 127) { asc = `${asc}${char_of(v)}`; }
+                else { asc = `${asc}.`; }
+            } else {
+                hx = `${hx}   `;
+                asc = `${asc} `;
+            }
+            if (k == 7) { hx = `${hx} `; }
+            k++;
+        }
+        print(`${p_indent}${hex4(off)}  ${hx} |${asc}|`);
+        off = off + 16;
+    }
+}
+
+// A tiny printable-ASCII table. `from_bytes` would pull a string import into a
+// hot-ish loop for no gain; 95 entries indexed directly is simpler and exact.
+let g_ASC: array = [];
+fn asc_init() {
+    let s: string = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let i: i32 = 0;
+    while (i < s.length) { g_ASC.push(s.slice(i, i + 1)); i++; }
+}
+asc_init();
+
+fn char_of(p_v: i32): string {
+    let v: i32 = p_v - 32;
+    if (v < 0 || v >= g_ASC.length) { let d: string = "."; return d; }
+    let out: string = g_ASC[v];
+    return out;
+}
+
+fn f6(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: f64 = x * 1000000.0 + 0.5;
+    let whole: i64 = i64(scaled / 1000000.0);
+    let frac: i64 = i64(scaled) - whole * 1000000;
+    let fs: string = `${frac}`;
+    while (fs.length < 6) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    let out: string = s;
+    return out;
+}
+
+fn absf(p_a: f64): f64 { let a: f64 = p_a; if (a < 0.0) { a = 0.0 - a; } let o: f64 = a; return o; }
+
+// ===========================================================================
+//  0.1  THE FIELD TABLES — NETWORKING §11.2/§11.3/§11.5, transcribed once.
+//
+//  Flat i32 arrays, stride 3: [byte offset, byte width, signedness]. The names
+//  ride in a parallel string array. This IS the documented layout; every
+//  assertion in sections C, D and G reads it, and the reference dump in
+//  section A prints it, so the printed reference and the gate can never drift.
+// ===========================================================================
+
+let g_SIGNED: i32 = 1;
+let g_UNSIGNED: i32 = 0;
+
+// entity record, 20 bytes (S_SNAPSHOT §11.3)
+let g_ENT_OFF: array<i32> = [0, 4, 0,  4, 4, 1,  8, 4, 1,  12, 2, 1,
+                             14, 2, 0,  16, 1, 0,  17, 1, 0,  18, 1, 0,  19, 1, 0];
+let g_ENT_NAME: array = ["entity_id", "px_q", "pz_q", "py_q", "yaw_q",
+                         "pitch_q", "anim", "hp_pct", "flags"];
+
+// command record, 20 bytes (C_INPUT §11.2)
+let g_CMD_OFF: array<i32> = [0, 4, 0,  4, 4, 0,  8, 1, 1,  9, 1, 1,
+                             10, 2, 0,  12, 2, 0,  14, 4, 0,  18, 1, 0,  19, 1, 0];
+let g_CMD_NAME: array = ["tick", "seq", "move_x", "move_y", "yaw_q",
+                         "pitch_q", "buttons", "weapon_sel", "dt_ms"];
+
+// event record, 16 bytes (S_EVENT §11.5)
+let g_EV_OFF: array<i32> = [0, 1, 0,  1, 1, 0,  2, 4, 0,  6, 4, 0,
+                            10, 2, 1,  12, 2, 1,  14, 2, 1];
+let g_EV_NAME: array = ["type", "sub", "actor_id", "target_id",
+                        "x_q", "y_q", "z_q"];
+
+// local-player authoritative block, 24 bytes (S_SNAPSHOT §11.3, owner only)
+let g_LOC_OFF: array<i32> = [0, 4, 1,  4, 4, 1,  8, 4, 1,  12, 2, 1,
+                             14, 2, 1,  16, 2, 1,  18, 1, 0,  19, 1, 0,
+                             20, 1, 0,  21, 1, 0,  22, 2, 0];
+let g_LOC_NAME: array = ["px_q", "py_q", "pz_q", "vx_q", "vy_q", "vz_q",
+                         "hp", "armor", "move_state", "weapon", "ammo_mag"];
+
+// Sentinel whose every byte is non-zero, so a width error is as visible as an
+// offset error. Signed 1-byte fields take 0xa5 = -91 so the sign path is used.
+fn sentinel(p_width: i32, p_signed: i32): i32 {
+    let w: i32 = p_width;
+    if (w == 4) { let a: i32 = 287454020; return a; }        // 0x11223344
+    if (w == 2) { let b: i32 = 4660; return b; }             // 0x1234
+    if (p_signed == 1) { let c: i32 = -91; return c; }       // 0xa5
+    let d: i32 = 165;                                        // 0xa5
+    return d;
+}
+
+// Read `w` bytes little-endian at `off`, honouring signedness.
+fn read_at(p_buf, p_off: i32, p_w: i32, p_signed: i32): i32 {
+    let b = p_buf;
+    let off: i32 = p_off;
+    let w: i32 = p_w;
+    if (w == 4) {
+        if (p_signed == 1) { let a: i32 = b.read_i32_le(off); return a; }
+        let a2: i32 = i32(b.read_u32_le(off));
+        return a2;
+    }
+    if (w == 2) {
+        if (p_signed == 1) { let c: i32 = i32(b.read_i16_le(off)); return c; }
+        let c2: i32 = i32(b.read_u16_le(off));
+        return c2;
+    }
+    if (p_signed == 1) { let e: i32 = i32(b.read_i8(off)); return e; }
+    let e2: i32 = i32(b.read_u8(off));
+    return e2;
+}
+
+// The shared offset checker. Returns the number of fields of `p_tab` that are
+// EXACTLY where the table says, with the sentinel intact and every byte outside
+// the field zero. Section C runs it on the real writers; section G runs the
+// identical function on a mutant writer, which is what makes G a real test.
+fn check_offsets(p_blob, p_tab: array<i32>, p_field: i32): i32 {
+    let b = p_blob;
+    let tab: array<i32> = p_tab;
+    let off: i32 = tab[p_field * 3];
+    let w: i32 = tab[p_field * 3 + 1];
+    let sg: i32 = tab[p_field * 3 + 2];
+    let want: i32 = sentinel(w, sg);
+    if (b == null) { let z: i32 = 0; return z; }
+    if (read_at(b, off, w, sg) != want) { let z2: i32 = 0; return z2; }
+    // every byte of the field must be non-zero (proves the WIDTH)
+    let k: i32 = 0;
+    while (k < w) {
+        if (i32(b.read_u8(off + k)) == 0) { let z3: i32 = 0; return z3; }
+        k++;
+    }
+    // every byte outside the field must be zero (proves the POSITION)
+    let n: i32 = b.length;
+    let j: i32 = 0;
+    while (j < n) {
+        if (j < off || j >= off + w) {
+            if (i32(b.read_u8(j)) != 0) { let z4: i32 = 0; return z4; }
+        }
+        j++;
+    }
+    let good: i32 = 1;
+    return good;
+}
+
+// ===========================================================================
+//  0.2  BUILDERS — one record, one field set, through the REAL writer.
+// ===========================================================================
+
+let g_m: object = proto_msg(0);
+let g_pk = pack_new(240);
+let g_lpk = pack_new(24);
+let g_ents: object = netents_new(64);
+let g_cmds: object = cmdq_new(16);
+let g_evs: object = netevs_new(64);
+let g_loc: object = netlocal_new();
+
+fn ent_field_blob(p_field: i32) {
+    let f: i32 = p_field;
+    let w: i32 = g_ENT_OFF[f * 3 + 1];
+    let sg: i32 = g_ENT_OFF[f * 3 + 2];
+    let v: i32 = sentinel(w, sg);
+    let a: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    a[f] = v;
+    netents_reset(g_ents);
+    g_ents.tick = 0; g_ents.acked_seq = 0; g_ents.time_ms = 0;
+    netents_push_q(g_ents, a[0], a[1], a[3], a[2], a[4], a[5], a[6], a[7], a[8]);
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, null, 0);
+    let out = g_m.data[4];
+    return out;
+}
+
+fn cmd_field_blob(p_field: i32) {
+    let f: i32 = p_field;
+    let w: i32 = g_CMD_OFF[f * 3 + 1];
+    let sg: i32 = g_CMD_OFF[f * 3 + 2];
+    let v: i32 = sentinel(w, sg);
+    let a: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    a[f] = v;
+    cmdq_reset(g_cmds);
+    cmdq_push(g_cmds, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    proto_write_input(g_m, g_pk, g_cmds);
+    let out = g_m.data[1];
+    return out;
+}
+
+fn ev_field_blob(p_field: i32) {
+    let f: i32 = p_field;
+    let w: i32 = g_EV_OFF[f * 3 + 1];
+    let sg: i32 = g_EV_OFF[f * 3 + 2];
+    let v: i32 = sentinel(w, sg);
+    let a: array<i32> = [0, 0, 0, 0, 0, 0, 0];
+    a[f] = v;
+    netevs_reset(g_evs);
+    g_evs.tick = 0;
+    netevs_push_q(g_evs, a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    proto_write_events(g_m, g_pk, g_evs);
+    let out = g_m.data[2];
+    return out;
+}
+
+fn loc_field_blob(p_field: i32) {
+    let f: i32 = p_field;
+    let w: i32 = g_LOC_OFF[f * 3 + 1];
+    let sg: i32 = g_LOC_OFF[f * 3 + 2];
+    let v: i32 = sentinel(w, sg);
+    let a: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    a[f] = v;
+    g_loc.px_q = a[0]; g_loc.py_q = a[1]; g_loc.pz_q = a[2];
+    g_loc.vx_q = a[3]; g_loc.vy_q = a[4]; g_loc.vz_q = a[5];
+    g_loc.hp = a[6]; g_loc.armor = a[7]; g_loc.move_state = a[8];
+    g_loc.weapon = a[9]; g_loc.ammo_mag = a[10];
+    netents_reset(g_ents);
+    g_ents.tick = 0; g_ents.acked_seq = 0; g_ents.time_ms = 0;
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, g_loc, 0);
+    let out = g_m.data[4];
+    return out;
+}
+
+// ===========================================================================
+//  0.3  THE REPRESENTATIVE SNAPSHOT — NETWORKING §11.3's budget case.
+//       12 players + 20 nearby entities = 32 entities -> 3 blobs + local.
+// ===========================================================================
+
+let g_SNAP_ENTS: i32 = 32;
+let g_snap_m: object = proto_msg(0);
+// A staging area of its OWN, never touched by sections C/D/F — otherwise the
+// round-trip comparison in section E would be against whatever the last
+// offset probe left behind, and it would fail for a reason that is not a bug.
+let g_snap_ents: object = netents_new(64);
+let g_snap_loc = netlocal_new();
+
+fn build_reference_snapshot() {
+    netents_reset(g_snap_ents);
+    g_snap_ents.tick = 41230;
+    g_snap_ents.acked_seq = 907;
+    g_snap_ents.time_ms = 687451;
+    let i: i32 = 0;
+    while (i < g_SNAP_ENTS) {
+        // Deterministic, spread over the interest radius, angles all round the
+        // circle, a mix of flags. No RNG: a dump must be diffable.
+        let fx: f64 = f64(i) * 3.7 - 40.0;
+        let fz: f64 = f64((i * 7) % 23) * 2.9 - 30.0;
+        let fy: f64 = 1.0 + f64(i % 5) * 0.35;
+        let yaw: f64 = f64(i) * 0.19634954084936207;      // TAU/32
+        let pitch: f64 = f64((i % 7) - 3) * 0.12;
+        let anim: i32 = i % 6;
+        let hp: i32 = 100 - (i * 3) % 101;
+        let fl: i32 = (i % 3) | ((i % 2) * EF_ADS);
+        if (i % 5 == 0) { fl = fl | EF_FIRING; }
+        netents_push_q(g_snap_ents, 4096 + i,
+                       q_pos(fx), q_pos16(fy), q_pos(fz),
+                       q_ang(yaw), q_ang8(pitch), anim, hp, fl);
+        i++;
+    }
+    netlocal_set(g_snap_loc, 12.5, 1.75, -8.25, 3.5, -0.5, 1.25,
+                 87, 25, 2, 1, 17);
+    proto_write_snapshot(g_snap_m, g_pk, g_lpk, g_snap_ents, g_snap_loc, 0);
+}
+
+// ===========================================================================
+//  A. THE REFERENCE — the shapes a server implementer needs.
+// ===========================================================================
+
+fn print_stride_table(p_title: string, p_tab: array<i32>, p_names: array,
+                      p_stride: i32) {
+    print(`  ${p_title}   stride ${p_stride} bytes, little-endian`);
+    print("    off  w  sign  field");
+    let n: i32 = p_names.length;
+    let i: i32 = 0;
+    let covered: i32 = 0;
+    while (i < n) {
+        let off: i32 = p_tab[i * 3];
+        let w: i32 = p_tab[i * 3 + 1];
+        let sg: i32 = p_tab[i * 3 + 2];
+        let s: string = "u";
+        if (sg == 1) { s = "i"; }
+        let c_off: string = padl(`+${off}`, 4);
+        let c_w: string = padl(`${w}`, 2);
+        let c_t: string = pad(`${s}${w * 8}`, 4);
+        print(`    ${c_off} ${c_w}  ${c_t}  ${p_names[i]}`);
+        covered = covered + w;
+        i++;
+    }
+    print(`    ---- ${covered} of ${p_stride} bytes accounted for, 0 padding`);
+    print("");
+}
+
+fn section_reference() {
+    print("===========================================================================");
+    print(" A. WIRE-PROTOCOL REFERENCE — src/net/, as built");
+    print("===========================================================================");
+    print("");
+    print(" FRAMING (protocol.hml, byte-for-byte gn.hml's gm_convert):");
+    print("    frame   := packet+                       (one WS frame, many packets)");
+    print("    packet  := [u16 payload_size LE][u16 net_id LE][element...]");
+    print("    element := [u8 type][payload]            payload_size COUNTS the net_id");
+    print("");
+    print(" ⚠ THE ELEMENT TYPE IS CHOSEN BY VALUE, NOT BY DECLARATION.");
+    print("   gn.hml picks the smallest type that fits, so element byte offsets");
+    print("   inside a packet MOVE with the values. Never assert them. Assert the");
+    print("   element ORDER and the byte layout INSIDE each blob — section E");
+    print("   demonstrates the movement so this cannot be forgotten.");
+    print("");
+    print(" ELEMENT TYPE IDS (gn.hml's numbering; do not renumber):");
+    print(`    u8=${WT_U8}  u16=${WT_U16}  u32=${WT_U32}  i8=${WT_S8}  i16=${WT_S16}  i32=${WT_S32}`);
+    print(`    f16=6 (DECODED, NEVER EMITTED — gn.hml's writer and parser disagree)`);
+    print(`    f32=${WT_F32}  f64=${WT_F64}  string=${WT_STRING}  buffer=${WT_BUFFER}  undef=${WT_UNDEF}  count=${WT_COUNT}`);
+    print("");
+    print(" MESSAGE CATALOGUE (NETWORKING §10.1; 1xx input, 11xx state, 12xx events):");
+    print(`    C->S control    C_HELLO=${NET_C_HELLO}  C_PING=${NET_C_PING}  C_READY=${NET_C_READY}  C_ACK_SNAPSHOT=${NET_C_ACK_SNAPSHOT} (v2)`);
+    print(`    C->S gameplay   C_INPUT=${NET_C_INPUT}`);
+    print(`    C->S reliable   C_CHAT=${NET_C_CHAT}  C_ACTION=${NET_C_ACTION}`);
+    print(`    S->C control    S_WELCOME=${NET_S_WELCOME}  S_PONG=${NET_S_PONG}  S_DISCONNECT=${NET_S_DISCONNECT}`);
+    print(`    S->C snapshots  S_SNAPSHOT=${NET_S_SNAPSHOT}  S_SNAPSHOT_DELTA=${NET_S_SNAPSHOT_DELTA} (v2, do not build in v1)`);
+    print(`    S->C events     S_EVENT=${NET_S_EVENT}  S_PLAYER_JOIN=${NET_S_PLAYER_JOIN}  S_PLAYER_LEAVE=${NET_S_PLAYER_LEAVE}`);
+    print(`    S->C streaming  S_CHUNK=${NET_S_CHUNK}`);
+    print("");
+    print(" MESSAGE SHAPES — element order is the contract:");
+    print("");
+    print(`   C_INPUT (${NET_C_INPUT})`);
+    print(`     element 0 : u8      n commands, 1..${MAX_CMDS_PER_PACKET}`);
+    print(`     element 1 : buffer  n * ${CMD_STRIDE} bytes, oldest first (max ${MAX_CMDS_PER_PACKET * CMD_STRIDE} B)`);
+    print("");
+    print(`   S_SNAPSHOT (${NET_S_SNAPSHOT})`);
+    print("     element 0 : u32     server_tick");
+    print("     element 1 : u32     last_acked_seq   (this client's last processed seq)");
+    print("     element 2 : u16     server_time_ms & 0xFFFF");
+    print("     element 3 : u16     entity_count");
+    print(`     element 4+: buffer  <= ${ENTS_PER_BLOB * ENT_STRIDE} B, ${ENTS_PER_BLOB} entities each, ceil(count/${ENTS_PER_BLOB}) of them`);
+    print(`     last      : buffer  ${LOCAL_STRIDE} B local-player block, OWNER ONLY (omitted, never nulled)`);
+    print("");
+    print(`   S_EVENT (${NET_S_EVENT})`);
+    print("     element 0 : u32     server_tick");
+    print("     element 1 : u8      n_events");
+    print(`     element 2+: buffer  <= ${EVS_PER_BLOB * EV_STRIDE} B, ${EVS_PER_BLOB} events each`);
+    print("");
+    print(" BLOB LAYOUTS — THIS is the fixed part:");
+    print("");
+    print_stride_table("C_INPUT command", g_CMD_OFF, g_CMD_NAME, CMD_STRIDE);
+    print_stride_table("S_SNAPSHOT entity", g_ENT_OFF, g_ENT_NAME, ENT_STRIDE);
+    print_stride_table("S_SNAPSHOT local", g_LOC_OFF, g_LOC_NAME, LOCAL_STRIDE);
+    print_stride_table("S_EVENT event", g_EV_OFF, g_EV_NAME, EV_STRIDE);
+    print(" ENTITY FLAG BITS (+19 of the entity stride; integers, never bools):");
+    print(`    team=${EF_TEAM_MASK} (mask, bits 0-1)  crouch=${EF_CROUCH}  ads=${EF_ADS}  firing=${EF_FIRING}`);
+    print(`    dead=${EF_DEAD}  hitflash=${EF_HITFLASH}  dissolve=${EF_DISSOLVE}`);
+    print("");
+    print(" EVENT TYPES (+0 of the event stride):");
+    print(`    HIT=${EV_HIT} KILL=${EV_KILL} DAMAGE_TAKEN=${EV_DAMAGE_TAKEN} SPAWN=${EV_SPAWN} DESPAWN=${EV_DESPAWN} PICKUP=${EV_PICKUP}`);
+    print(`    RELOAD_DONE=${EV_RELOAD_DONE} WEAPON_SWITCH=${EV_WEAPON_SWITCH} DOOR=${EV_DOOR} BLOCK_PLACED=${EV_BLOCK_PLACED}`);
+    print(`    BLOCK_BROKEN=${EV_BLOCK_BROKEN} XP=${EV_XP} LEVELUP=${EV_LEVELUP} SOUND=${EV_SOUND}`);
+    print("");
+    print(" QUANTIZATION (quantize.hml) — the authority quantizes ITS OWN state to");
+    print(" these grids before it sends, or reconciliation fires forever:");
+    print(`    position   x/z  q = round(v * ${POS_SCALE})            i32   ${f6(1.0 / POS_SCALE * 1000.0)} mm, +-${POS_MAX} m`);
+    print(`    position   y    q = round(v * ${POS_SCALE})            i16   ${f6(1.0 / POS_SCALE * 1000.0)} mm, +-${POS16_MAX} m`);
+    print(`    yaw             q = a * ${ANG_SCALE} & 65535   u16   ${f6(TAU / 65536.0 * 57.29577951308232)} deg`);
+    print(`    pitch (remote)  q = a * ${ANG8_SCALE} & 255      u8    ${f6(TAU / 256.0 * 57.29577951308232)} deg`);
+    print(`    velocity        q = round(v * ${VEL_SCALE})            i16   ${f6(1.0 / VEL_SCALE)} m/s, +-${VEL_MAX} m/s`);
+    print(`    event position  q = round(v * ${EVPOS_SCALE})             i16   ${f6(1.0 / EVPOS_SCALE * 1000.0)} mm, +-${EVPOS_MAX} m (viewer-relative)`);
+    print("");
+    print(" HARD CAPS:");
+    print(`    buffer element    <= ${PACK_MAX_BLOB} B   (gn.hml u8 length prefix)`);
+    print(`    packet payload    <= ${MAX_PAYLOAD} B (gn.hml u16 size field)`);
+    print(`    commands/packet   <= ${MAX_CMDS_PER_PACKET}`);
+    print(`    entities/blob     =  ${ENTS_PER_BLOB}   (${ENTS_PER_BLOB * ENT_STRIDE} B)`);
+    print(`    commands/blob     =  ${CMDS_PER_BLOB}   (${CMDS_PER_BLOB * CMD_STRIDE} B)`);
+    print(`    events/blob       =  ${EVS_PER_BLOB}   (${EVS_PER_BLOB * EV_STRIDE} B)`);
+    print("");
+    print(" REFUSED ON THE WIRE, ALWAYS (NETWORKING §3.1/§3.2/§3.7/§3.9):");
+    print("    bool    gn.hml THROWS in build()          -> refused + counted");
+    print("    null    silently TRUNCATES the packet     -> refused + counted");
+    print("    f32/f64 for gameplay state                -> proto_audit_gameplay");
+    print("    string  loses a trailing 0x00 byte        -> proto_audit_gameplay");
+    print("");
+}
+
+// ===========================================================================
+//  B. THE DUMP — one real S_SNAPSHOT, hexdumped and decoded.
+// ===========================================================================
+
+let g_frame_bytes = null;
+
+fn section_dump() {
+    print("===========================================================================");
+    print(" B. ONE S_SNAPSHOT — hexdump and decode");
+    print("===========================================================================");
+    print("");
+    let nb: i32 = proto_blob_count(g_SNAP_ENTS);
+    print(` built by proto_write_snapshot: ${g_SNAP_ENTS} entities -> ${nb} blob(s) + local block`);
+    print(` message: net_id=${proto_net_id(g_snap_m)}  elements=${proto_count(g_snap_m)}`);
+    print("");
+    print(" ELEMENTS, IN ORDER:");
+    print(`    [0] u32  server_tick      = ${g_snap_m.data[0]}`);
+    print(`    [1] u32  last_acked_seq   = ${g_snap_m.data[1]}`);
+    print(`    [2] u16  server_time_ms   = ${g_snap_m.data[2]}   (687451 & 0xFFFF)`);
+    print(`    [3] u16  entity_count     = ${g_snap_m.data[3]}`);
+    let bi: i32 = 0;
+    while (bi < nb) {
+        let blob = g_snap_m.data[4 + bi];
+        let cnt: i32 = blob.length / ENT_STRIDE;
+        print(`    [${4 + bi}] buf  entity blob ${bi}    = ${blob.length} B  (${cnt} x ${ENT_STRIDE})`);
+        bi++;
+    }
+    let lb = g_snap_m.data[4 + nb];
+    print(`    [${4 + nb}] buf  local block       = ${lb.length} B  (owner only)`);
+    print("");
+
+    g_frame_bytes = proto_build(g_snap_m);
+    print(` THE FRAME ON THE WIRE: ${g_frame_bytes.length} bytes`);
+    print(`    [0..1] u16 payload_size = ${g_frame_bytes.read_u16_le(0)}   (counts the net_id)`);
+    print(`    [2..3] u16 net_id       = ${g_frame_bytes.read_u16_le(2)}   (S_SNAPSHOT)`);
+    print("");
+    print(" HEXDUMP — first 128 bytes of the frame (header + elements 0..3 + blob 0):");
+    hexdump(g_frame_bytes.read_bytes(0, 128), "    ");
+    print("");
+    print(" HEXDUMP — entity blob 0, all 240 bytes, 12 records of 20:");
+    hexdump(g_snap_m.data[4], "    ");
+    print("");
+    print(" HEXDUMP — the 24-byte local-player block:");
+    hexdump(lb, "    ");
+    print("");
+
+    print(" DECODE — blob 0, record by record, field by field:");
+    print("   idx    id      px_q    pz_q   py_q  yaw_q pit anim  hp  flg      x       y       z      yaw");
+    let dec: object = netents_new(64);
+    let dl = netlocal_new();
+    proto_read_snapshot(g_snap_m, dec, dl);
+    let k: i32 = 0;
+    while (k < 12) {
+        let c_k: string = padl(`${k}`, 3);
+        let c_id: string = padl(`${dec.id[k]}`, 7);
+        let c_px: string = padl(`${dec.px_q[k]}`, 9);
+        let c_pz: string = padl(`${dec.pz_q[k]}`, 7);
+        let c_py: string = padl(`${dec.py_q[k]}`, 6);
+        let c_yw: string = padl(`${dec.yaw_q[k]}`, 6);
+        let c_pt: string = padl(`${dec.pitch_q[k]}`, 3);
+        let c_an: string = padl(`${dec.anim[k]}`, 4);
+        let c_hp: string = padl(`${dec.hp_pct[k]}`, 3);
+        let c_fl: string = padl(`${dec.flags[k]}`, 4);
+        let c_x: string = padl(f6(netents_x(dec, k)), 10);
+        let c_y: string = padl(f6(netents_y(dec, k)), 8);
+        let c_z: string = padl(f6(netents_z(dec, k)), 9);
+        let c_ya: string = padl(f6(netents_yaw(dec, k)), 9);
+        print(`   ${c_k} ${c_id} ${c_px} ${c_pz} ${c_py} ${c_yw} ${c_pt} ${c_an} ${c_hp} ${c_fl} ${c_x} ${c_y} ${c_z} ${c_ya}`);
+        k++;
+    }
+    print(`   ... ${g_SNAP_ENTS - 12} more in blobs 1..${nb - 1}`);
+    print("");
+    print(" DECODE — the local-player block:");
+    print(`    pos   ${f6(netlocal_x(dl))}, ${f6(netlocal_y(dl))}, ${f6(netlocal_z(dl))}   (sent 12.5, 1.75, -8.25)`);
+    print(`    vel   ${f6(netlocal_vx(dl))}, ${f6(netlocal_vy(dl))}, ${f6(netlocal_vz(dl))}   (sent 3.5, -0.5, 1.25)`);
+    print(`    hp=${dl.hp}  armor=${dl.armor}  move_state=${dl.move_state}  weapon=${dl.weapon}  ammo_mag=${dl.ammo_mag}`);
+    print("");
+    let bw: f64 = f64(g_frame_bytes.length) * 20.0 / 1024.0;
+    print(` BUDGET: ${g_frame_bytes.length} B/snapshot at 20 Hz = ${f6(bw)} KB/s down per client`);
+    print(`         NETWORKING §11.3 projects ~690 B and 13.8 KB/s for this exact case.`);
+    print("");
+}
+
+// ===========================================================================
+//  C. EVERY FIELD IS AT ITS DOCUMENTED OFFSET
+// ===========================================================================
+
+fn section_offsets() {
+    print("--- C. field offsets, against the real writers ---");
+    let i: i32 = 0;
+    while (i < g_ENT_NAME.length) {
+        let b = ent_field_blob(i);
+        ok(`ENT +${g_ENT_OFF[i * 3]} w${g_ENT_OFF[i * 3 + 1]} ${g_ENT_NAME[i]}`,
+           check_offsets(b, g_ENT_OFF, i) == 1);
+        i++;
+    }
+    let j: i32 = 0;
+    while (j < g_CMD_NAME.length) {
+        let b2 = cmd_field_blob(j);
+        ok(`CMD +${g_CMD_OFF[j * 3]} w${g_CMD_OFF[j * 3 + 1]} ${g_CMD_NAME[j]}`,
+           check_offsets(b2, g_CMD_OFF, j) == 1);
+        j++;
+    }
+    let k: i32 = 0;
+    while (k < g_EV_NAME.length) {
+        let b3 = ev_field_blob(k);
+        ok(`EV  +${g_EV_OFF[k * 3]} w${g_EV_OFF[k * 3 + 1]} ${g_EV_NAME[k]}`,
+           check_offsets(b3, g_EV_OFF, k) == 1);
+        k++;
+    }
+    let l: i32 = 0;
+    while (l < g_LOC_NAME.length) {
+        let b4 = loc_field_blob(l);
+        ok(`LOC +${g_LOC_OFF[l * 3]} w${g_LOC_OFF[l * 3 + 1]} ${g_LOC_NAME[l]}`,
+           check_offsets(b4, g_LOC_OFF, l) == 1);
+        l++;
+    }
+    print(`  ${g_ENT_NAME.length + g_CMD_NAME.length + g_EV_NAME.length + g_LOC_NAME.length} fields checked: sentinel at the documented offset, correct width, every other byte zero.`);
+    note(`C: 36 field offsets verified empirically against proto_write_{snapshot,input,events}`);
+}
+
+// ===========================================================================
+//  D. EVERY BYTE OF EVERY STRIDE IS LOAD-BEARING
+//
+//  Flip ONE byte of a record and the field table must notice. 80 bytes across
+//  the four strides, 80 detections required. That is a stronger claim than
+//  "the offsets are right": it says every byte the wire carries is covered by
+//  exactly one DOCUMENTED field — no padding, no gap, nothing the reference in
+//  section A fails to describe. A byte that could be flipped without changing
+//  any documented field would be a byte the protocol pays for and no one reads.
+//
+//  The signature is read straight out of the blob through the SAME field table
+//  section A prints, using signed reads throughout so the comparison is over
+//  bit patterns and never over a narrowing conversion.
+// ===========================================================================
+
+// Bit-pattern read: signed at every width, so a 0xFF..-flipped u32 is compared,
+// not rejected. (See the note at the end of this file about unpack_ent_blob.)
+fn read_bits(p_buf, p_off: i32, p_w: i32): i32 {
+    let b = p_buf;
+    let off: i32 = p_off;
+    let w: i32 = p_w;
+    if (w == 4) { let a: i32 = b.read_i32_le(off); return a; }
+    if (w == 2) { let c: i32 = i32(b.read_i16_le(off)); return c; }
+    let e: i32 = i32(b.read_i8(off));
+    return e;
+}
+
+fn blob_signature(p_blob, p_tab: array<i32>, p_nf: i32): string {
+    let tab: array<i32> = p_tab;
+    let n: i32 = p_nf;
+    let s: string = "";
+    let i: i32 = 0;
+    while (i < n) {
+        let v: i32 = read_bits(p_blob, tab[i * 3], tab[i * 3 + 1]);
+        s = `${s}|${v}`;
+        i++;
+    }
+    let out: string = s;
+    return out;
+}
+
+// Returns how many of the `stride` bytes, flipped one at a time, change at
+// least one documented field.
+fn flip_scan(p_blob, p_tab: array<i32>, p_nf: i32, p_stride: i32): i32 {
+    let base = p_blob;
+    let stride: i32 = p_stride;
+    let refsig: string = blob_signature(base, p_tab, p_nf);
+    let hits: i32 = 0;
+    let i: i32 = 0;
+    while (i < stride) {
+        let mut = base.read_bytes(0, stride);
+        mut.write_u8(i, i32(mut.read_u8(i)) ^ 255);
+        if (blob_signature(mut, p_tab, p_nf) != refsig) { hits++; }
+        i++;
+    }
+    let out: i32 = hits;
+    return out;
+}
+
+fn ent_rec_signature(p_e: object, p_i: i32): string {
+    let e: object = p_e;
+    let i: i32 = p_i;
+    let s: string = `${e.id[i]}|${e.px_q[i]}|${e.pz_q[i]}|${e.py_q[i]}|${e.yaw_q[i]}|${e.pitch_q[i]}|${e.anim[i]}|${e.hp_pct[i]}|${e.flags[i]}`;
+    let out: string = s;
+    return out;
+}
+
+fn cmd_rec_signature(p_q: object, p_i: i32): string {
+    let q: object = p_q;
+    let i: i32 = p_i;
+    let s: string = `${q.tick[i]}|${q.seq[i]}|${q.move_x[i]}|${q.move_y[i]}|${q.yaw_q[i]}|${q.pitch_q[i]}|${q.buttons[i]}|${q.weapon_sel[i]}|${q.dt_ms[i]}`;
+    let out: string = s;
+    return out;
+}
+
+fn ev_rec_signature(p_v: object, p_i: i32): string {
+    let v: object = p_v;
+    let i: i32 = p_i;
+    let s: string = `${v.type[i]}|${v.sub[i]}|${v.actor[i]}|${v.target[i]}|${v.x_q[i]}|${v.y_q[i]}|${v.z_q[i]}`;
+    let out: string = s;
+    return out;
+}
+
+fn section_loadbearing() {
+    print("--- D. every byte of every stride is load-bearing ---");
+
+    // -- entity, 20 bytes ---------------------------------------------------
+    netents_reset(g_ents);
+    netents_push_q(g_ents, 123456789, 987654, 4321, -654321, 33333, 200, 5, 77,
+                   EF_ADS | EF_FIRING | 2);
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, null, 0);
+    let ehits: i32 = flip_scan(g_m.data[4], g_ENT_OFF, g_ENT_NAME.length, ENT_STRIDE);
+    print(`  entity stride : ${ehits}/${ENT_STRIDE} bytes are covered by a documented field`);
+    ok("ENT stride: all 20 bytes load-bearing (no padding, no undocumented byte)",
+       ehits == ENT_STRIDE && ENT_STRIDE == 20);
+
+    // -- command, 20 bytes --------------------------------------------------
+    cmdq_reset(g_cmds);
+    cmdq_push(g_cmds, 918273, 44556, -77, 99, 61234, 30001, 2128394904, 4, 17);
+    proto_write_input(g_m, g_pk, g_cmds);
+    let chits: i32 = flip_scan(g_m.data[1], g_CMD_OFF, g_CMD_NAME.length, CMD_STRIDE);
+    print(`  command stride: ${chits}/${CMD_STRIDE} bytes are covered by a documented field`);
+    ok("CMD stride: all 20 bytes load-bearing", chits == CMD_STRIDE && CMD_STRIDE == 20);
+
+    // -- event, 16 bytes ----------------------------------------------------
+    netevs_reset(g_evs);
+    netevs_push_q(g_evs, EV_KILL, 3, 771122, 334455, -1234, 567, -890);
+    proto_write_events(g_m, g_pk, g_evs);
+    let vhits: i32 = flip_scan(g_m.data[2], g_EV_OFF, g_EV_NAME.length, EV_STRIDE);
+    print(`  event stride  : ${vhits}/${EV_STRIDE} bytes are covered by a documented field`);
+    ok("EV stride: all 16 bytes load-bearing", vhits == EV_STRIDE && EV_STRIDE == 16);
+
+    // -- local block, 24 bytes ---------------------------------------------
+    netents_reset(g_ents);
+    netlocal_set(g_loc, 33.25, 5.5, -19.75, 7.25, -2.5, 0.75, 91, 40, 3, 2, 29);
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, g_loc, 0);
+    let lhits: i32 = flip_scan(g_m.data[4], g_LOC_OFF, g_LOC_NAME.length, LOCAL_STRIDE);
+    print(`  local stride  : ${lhits}/${LOCAL_STRIDE} bytes are covered by a documented field`);
+    ok("LOCAL stride: all 24 bytes load-bearing", lhits == LOCAL_STRIDE && LOCAL_STRIDE == 24);
+
+    // The decoders must agree with the field table, not merely be sensitive to
+    // it: one full record, written by the real writer and read by the real
+    // reader, must reproduce every value that went in.
+    cmdq_reset(g_cmds);
+    cmdq_push(g_cmds, 918273, 44556, -77, 99, 61234, 30001, 2128394904, 4, 17);
+    proto_write_input(g_m, g_pk, g_cmds);
+    let cq: object = cmdq_new(4);
+    unpack_cmd_blob(g_m.data[1], cq, 1);
+    ok("the real reader reproduces the real writer's command record exactly",
+       cmd_rec_signature(cq, 0) == cmd_rec_signature(g_cmds, 0));
+    netevs_reset(g_evs);
+    netevs_push_q(g_evs, EV_KILL, 3, 771122, 334455, -1234, 567, -890);
+    proto_write_events(g_m, g_pk, g_evs);
+    let vq: object = netevs_new(4);
+    unpack_ev_blob(g_m.data[2], vq, 1);
+    ok("the real reader reproduces the real writer's event record exactly",
+       ev_rec_signature(vq, 0) == ev_rec_signature(g_evs, 0));
+
+    note("D: 80 of 80 stride bytes proven load-bearing (20 ENT + 20 CMD + 16 EV + 24 LOCAL)");
+}
+// ===========================================================================
+//  E. ELEMENT ORDER, NET IDS, AND THE ROUND TRIP
+// ===========================================================================
+
+fn section_shapes() {
+    print("--- E. element order, net_ids, round trip ---");
+
+    // -- the design anchors, as literals from NETWORKING §10.1/§11.* --------
+    ok("net_id C_INPUT == 100 (NETWORKING §11.2)", NET_C_INPUT == 100);
+    ok("net_id S_SNAPSHOT == 1100 (§11.3)", NET_S_SNAPSHOT == 1100);
+    ok("net_id S_SNAPSHOT_DELTA == 1101, reserved and unbuilt in v1 (§11.4)",
+       NET_S_SNAPSHOT_DELTA == 1101);
+    ok("net_id S_EVENT == 1200 (§11.5)", NET_S_EVENT == 1200);
+    ok("ENT_STRIDE == 20 (§11.3)", ENT_STRIDE == 20);
+    ok("CMD_STRIDE == 20 (§11.2)", CMD_STRIDE == 20);
+    ok("EV_STRIDE == 16 (§11.5)", EV_STRIDE == 16);
+    ok("LOCAL_STRIDE == 24 (§11.3)", LOCAL_STRIDE == 24);
+    ok("ENTS_PER_BLOB == 12, 12*20 = 240 <= 255 (§3.7)",
+       ENTS_PER_BLOB == 12 && ENTS_PER_BLOB * ENT_STRIDE == 240);
+    ok("EVS_PER_BLOB == 15, 15*16 = 240 <= 255 (§3.7)",
+       EVS_PER_BLOB == 15 && EVS_PER_BLOB * EV_STRIDE == 240);
+    ok("PACK_MAX_BLOB == 255 (gn.hml u8 length prefix, §3.7)", PACK_MAX_BLOB == 255);
+    ok("MAX_CMDS_PER_PACKET == 8 (§11.2 'n is 1..8')", MAX_CMDS_PER_PACKET == 8);
+    ok("MAX_PAYLOAD == 65535 (gn.hml u16 size field)", MAX_PAYLOAD == 65535);
+
+    // -- blob arithmetic ----------------------------------------------------
+    ok("proto_blob_count: 0->0 1->1 12->1 13->2 32->3",
+       proto_blob_count(0) == 0 && proto_blob_count(1) == 1
+       && proto_blob_count(12) == 1 && proto_blob_count(13) == 2
+       && proto_blob_count(32) == 3);
+
+    // -- S_SNAPSHOT element order ------------------------------------------
+    let nb: i32 = proto_blob_count(g_SNAP_ENTS);
+    ok("S_SNAPSHOT net_id on the message", proto_net_id(g_snap_m) == NET_S_SNAPSHOT);
+    ok(`S_SNAPSHOT element count == 4 + ${nb} blobs + 1 local`,
+       proto_count(g_snap_m) == 4 + nb + 1);
+    ok("S_SNAPSHOT element 0 = server_tick", i32(g_snap_m.data[0]) == 41230);
+    ok("S_SNAPSHOT element 1 = last_acked_seq", i32(g_snap_m.data[1]) == 907);
+    ok("S_SNAPSHOT element 2 = server_time_ms & 0xFFFF",
+       i32(g_snap_m.data[2]) == (687451 & 65535));
+    ok("S_SNAPSHOT element 3 = entity_count", i32(g_snap_m.data[3]) == g_SNAP_ENTS);
+    ok("S_SNAPSHOT blobs 0..1 are full 240 B, blob 2 carries the remaining 8",
+       g_snap_m.data[4].length == 240 && g_snap_m.data[5].length == 240
+       && g_snap_m.data[6].length == 8 * ENT_STRIDE);
+    ok("S_SNAPSHOT last element is the 24 B local block",
+       g_snap_m.data[4 + nb].length == LOCAL_STRIDE);
+    ok("no blob exceeds the 255 B element cap",
+       g_snap_m.data[4].length <= PACK_MAX_BLOB
+       && g_snap_m.data[5].length <= PACK_MAX_BLOB
+       && g_snap_m.data[6].length <= PACK_MAX_BLOB);
+
+    // -- nothing unwireable got in -----------------------------------------
+    ok("S_SNAPSHOT carries no bool and no null", proto_audit(g_snap_m) == 0);
+    ok("S_SNAPSHOT carries no float and no string either (gameplay audit)",
+       proto_audit_gameplay(g_snap_m) == 0);
+
+    // -- the framed round trip ---------------------------------------------
+    let frame = proto_build(g_snap_m);
+    ok("proto_build produced a frame", frame != null);
+    ok("frame header: [u16 payload_size][u16 net_id], size counts the net_id",
+       i32(frame.read_u16_le(0)) == frame.length - 2
+       && i32(frame.read_u16_le(2)) == NET_S_SNAPSHOT);
+    let msgs: array = [];
+    let got: i32 = proto_parse_frame(frame, msgs);
+    ok("proto_parse_frame yields exactly one packet", got == 1);
+    let rt: object = msgs[0];
+    ok("round-tripped net_id survives", proto_net_id(rt) == NET_S_SNAPSHOT);
+    ok("round-tripped element count survives", proto_count(rt) == proto_count(g_snap_m));
+
+    let dec: object = netents_new(64);
+    let dl = netlocal_new();
+    let n: i32 = proto_read_snapshot(rt, dec, dl);
+    ok("proto_read_snapshot recovers every entity", n == g_SNAP_ENTS);
+    // field-for-field, all 32, bit-identical against the pre-send staging area
+    let same: i32 = 1;
+    let i: i32 = 0;
+    while (i < g_SNAP_ENTS) {
+        if (ent_rec_signature(dec, i) != ent_rec_signature(g_snap_ents, i)) { same = 0; }
+        i++;
+    }
+    ok("all 32 entity records are bit-identical after the round trip", same == 1);
+    ok("header fields survive: tick, acked_seq, time_ms",
+       dec.tick == 41230 && dec.acked_seq == 907 && dec.time_ms == (687451 & 65535));
+    ok("local block survives bit-identically",
+       dl.px_q == g_snap_loc.px_q && dl.py_q == g_snap_loc.py_q
+       && dl.pz_q == g_snap_loc.pz_q && dl.vx_q == g_snap_loc.vx_q
+       && dl.vy_q == g_snap_loc.vy_q && dl.vz_q == g_snap_loc.vz_q
+       && dl.hp == g_snap_loc.hp && dl.armor == g_snap_loc.armor
+       && dl.move_state == g_snap_loc.move_state && dl.weapon == g_snap_loc.weapon
+       && dl.ammo_mag == g_snap_loc.ammo_mag);
+
+    // -- the budget --------------------------------------------------------
+    let want: i32 = 2 + 2 + nb * (2 + 240) - (4 * ENT_STRIDE) + (2 + LOCAL_STRIDE);
+    print(`  frame for 32 entities + local block: ${frame.length} B  (NETWORKING §11.3 projects ~690 B)`);
+    ok("32-entity snapshot fits NETWORKING §11.3's ~690 B projection (600..760 B)",
+       frame.length >= 600 && frame.length <= 760);
+    let kbs: f64 = f64(frame.length) * 20.0 / 1024.0;
+    print(`  at 20 Hz that is ${f6(kbs)} KB/s down per client (§11.3 projects 13.8)`);
+    ok("20 Hz downstream lands within 12..16 KB/s of §11.3's 13.8", kbs >= 12.0 && kbs <= 16.0);
+
+    // -- C_INPUT -----------------------------------------------------------
+    cmdq_reset(g_cmds);
+    let c: i32 = 0;
+    while (c < 8) {
+        cmdq_push(g_cmds, 1000 + c, 5000 + c, c - 4, 3 - c,
+                  q_ang(f64(c) * 0.7), q_ang(f64(c) * 0.11), 1 << c, c % 3, 16 + (c % 2));
+        c++;
+    }
+    let ne: i32 = proto_write_input(g_m, g_pk, g_cmds);
+    ok("C_INPUT is exactly two elements: u8 n, then the blob", ne == 2);
+    ok("C_INPUT net_id and n", proto_net_id(g_m) == NET_C_INPUT && i32(g_m.data[0]) == 8);
+    ok("C_INPUT blob is n * 20 = 160 B, under the 255 B cap",
+       g_m.data[1].length == 8 * CMD_STRIDE && g_m.data[1].length <= PACK_MAX_BLOB);
+    let cf = proto_build(g_m);
+    let cmsgs: array = [];
+    proto_parse_frame(cf, cmsgs);
+    let cq: object = cmdq_new(16);
+    let cn: i32 = proto_read_input(cmsgs[0], cq);
+    ok("C_INPUT round-trips 8 commands", cn == 8);
+    let csame: i32 = 1;
+    let ci2: i32 = 0;
+    while (ci2 < 8) {
+        if (cmd_rec_signature(cq, ci2) != cmd_rec_signature(g_cmds, ci2)) { csame = 0; }
+        ci2++;
+    }
+    ok("all 8 command records are bit-identical after the round trip", csame == 1);
+    // the 1..8 cap is a protocol rule, not a suggestion
+    cmdq_reset(g_cmds);
+    let c2: i32 = 0;
+    while (c2 < 16) { cmdq_push(g_cmds, c2, c2, 0, 0, 0, 0, 0, 0, 16); c2++; }
+    proto_write_input(g_m, g_pk, g_cmds);
+    ok("C_INPUT clamps a 16-deep queue to the documented 8",
+       i32(g_m.data[0]) == 8 && g_m.data[1].length == 8 * CMD_STRIDE);
+
+    // -- S_EVENT -----------------------------------------------------------
+    netevs_reset(g_evs);
+    g_evs.tick = 5150;
+    let e: i32 = 0;
+    while (e < 20) {
+        netevs_push(g_evs, (e % 14) + 1, e, 700 + e, 800 + e,
+                    f64(e) * 1.5 - 10.0, f64(e % 4) * 0.5, f64(e) * -0.75 + 3.0);
+        e++;
+    }
+    let en: i32 = proto_write_events(g_m, g_pk, g_evs);
+    ok("S_EVENT element order: tick, n, then ceil(20/15) = 2 blobs", en == 2 + 2);
+    ok("S_EVENT net_id, tick and n",
+       proto_net_id(g_m) == NET_S_EVENT && i32(g_m.data[0]) == 5150
+       && i32(g_m.data[1]) == 20);
+    ok("S_EVENT blob 0 is a full 240 B, blob 1 carries the remaining 5",
+       g_m.data[2].length == 240 && g_m.data[3].length == 5 * EV_STRIDE);
+    let ef = proto_build(g_m);
+    let emsgs: array = [];
+    proto_parse_frame(ef, emsgs);
+    let ev2: object = netevs_new(64);
+    let evn: i32 = proto_read_events(emsgs[0], ev2);
+    ok("S_EVENT round-trips 20 events", evn == 20);
+    let esame: i32 = 1;
+    let ei2: i32 = 0;
+    while (ei2 < 20) {
+        if (ev_rec_signature(ev2, ei2) != ev_rec_signature(g_evs, ei2)) { esame = 0; }
+        ei2++;
+    }
+    ok("all 20 event records are bit-identical after the round trip", esame == 1);
+
+    // -- THE ELEMENT OFFSETS ARE NOT FIXED, AND THAT IS THE CONTRACT --------
+    // Same message, two tick values. gn.hml sizes an element by its VALUE, so
+    // element 1 starts at a different byte in the two frames. If this ever
+    // stops being true, protocol.hml stopped reproducing gn.hml's codec.
+    netents_reset(g_ents);
+    g_ents.acked_seq = 7; g_ents.time_ms = 9;
+    g_ents.tick = 5;
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, null, 0);
+    let small = proto_build(g_m);
+    g_ents.tick = 70000;
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, null, 0);
+    let big = proto_build(g_m);
+    print(`  same message, tick=5 -> ${small.length} B frame; tick=70000 -> ${big.length} B frame`);
+    ok("element BYTE offsets move with the value (gn.hml sizes by value) — so the dump asserts blob layout, never element offsets",
+       big.length > small.length
+       && i32(small.read_u8(4)) == WT_U8 && i32(big.read_u8(4)) == WT_U32);
+
+    // -- the refusal gates -------------------------------------------------
+    proto_diag_reset();
+    let bm: object = proto_msg(NET_S_SNAPSHOT);
+    ok("proto_add refuses a bool (gn.hml build() THROWS on one)",
+       proto_add(bm, true) == -1 && proto_count(bm) == 0);
+    ok("proto_add refuses a null (it silently TRUNCATES the packet)",
+       proto_add(bm, null) == -1 && proto_count(bm) == 0);
+    ok("both refusals were counted, not swallowed", proto_refused() == 2);
+    proto_diag_reset();
+
+    // -- quantization is the simulation's grid, not a networking detail -----
+    ok("POS_SCALE == 256.0 and dq(q(v)) is exact on the grid (§11.1)",
+       POS_SCALE == 256.0 && dq_pos(q_pos(12.5)) == 12.5
+       && absf(dq_pos(q_pos(3.14159)) - 3.14159) <= 1.0 / 512.0);
+    ok("ANG_SCALE == 65536/TAU and q_ang wraps into [0,65535] (§11.1)",
+       absf(ANG_SCALE - 65536.0 / TAU) < 0.000001
+       && q_ang(0.0) == 0 && q_ang(TAU) == 0 && q_ang(-0.001) >= 0
+       && q_ang(-0.001) <= 65535);
+    ok("VEL_SCALE == 128.0, EVPOS_SCALE == 16.0 (§11.1/§11.5)",
+       VEL_SCALE == 128.0 && EVPOS_SCALE == 16.0
+       && dq_vel(q_vel(3.5)) == 3.5 && dq_evpos(q_evpos(2.0)) == 2.0);
+    q_clamp_reset();
+    let hi: i32 = q_pos16(9999.0);
+    let lo: i32 = q_pos16(-9999.0);
+    ok("q_pos16 clamps y to +-127.99 m so it always fits i16, and COUNTS the clamp",
+       q_pos16(127.0) <= 32767 && q_pos16(-127.0) >= -32768
+       && hi == q_pos16(POS16_MAX) && lo == q_pos16(0.0 - POS16_MAX)
+       && hi <= 32767 && lo >= -32768 && q_clamp_count() == 2);
+    ok("hp_pct is 0..100 percent, never exact hp — exact hp is owner-only (§11.3)",
+       g_snap_m.data[3] == 32 && dec.hp_pct[0] <= 100 && dl.hp == 87);
+}
+
+// ===========================================================================
+//  F. THE DELIBERATE ONE-BYTE LAYOUT CHANGE MUST FAIL THE DUMP
+// ===========================================================================
+
+// A mutant entity writer: byte-for-byte the real `pack_ent_blob`, except px_q
+// sits at +5 instead of +4 and pz_q at +9 instead of +8. That is a ONE-BYTE
+// layout change and nothing else. It is fed to the SAME `check_offsets` that
+// passes the real writer.
+fn mutant_ent_blob(p_field: i32) {
+    let f: i32 = p_field;
+    let w: i32 = g_ENT_OFF[f * 3 + 1];
+    let sg: i32 = g_ENT_OFF[f * 3 + 2];
+    let v: i32 = sentinel(w, sg);
+    let a: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    a[f] = v;
+    let b = buffer(ENT_STRIDE);
+    let z: i32 = 0;
+    while (z < ENT_STRIDE) { b.write_u8(z, 0); z++; }
+    b.write_u32_le(0, a[0]);
+    b.write_i32_le(5, a[1]);          // +5, not +4   <-- THE ONE-BYTE CHANGE
+    b.write_i32_le(9, a[2]);          // +9, not +8
+    b.write_i16_le(13, a[3]);
+    b.write_u16_le(15, a[4]);
+    b.write_u8(17, a[5] & 255);
+    b.write_u8(18, a[6] & 255);
+    b.write_u8(19, a[7] & 255);
+    // flags is pushed off the end of the record entirely — which is what a
+    // one-byte insertion does to the last field, and why it must be caught.
+    let out = b;
+    return out;
+}
+
+fn section_negative() {
+    print("--- F. a deliberate one-byte layout change must FAIL the dump ---");
+    let real_ok: i32 = 0;
+    let mut_ok: i32 = 0;
+    let i: i32 = 0;
+    while (i < g_ENT_NAME.length) {
+        if (check_offsets(ent_field_blob(i), g_ENT_OFF, i) == 1) { real_ok++; }
+        if (check_offsets(mutant_ent_blob(i), g_ENT_OFF, i) == 1) { mut_ok++; }
+        i++;
+    }
+    print(`  real writer   : ${real_ok}/${g_ENT_NAME.length} fields at the documented offset`);
+    print(`  mutant writer : ${mut_ok}/${g_ENT_NAME.length}  (px_q moved +4 -> +5, one byte)`);
+    ok("the real writer passes the offset checker 9/9", real_ok == 9);
+    ok("the SAME checker rejects a one-byte layout change (8 of 9 fields move)",
+       mut_ok < real_ok && mut_ok <= 1);
+
+    // The second half of the same proof, on the wire rather than in the table:
+    // shift one byte and the decoded record changes, so a silent layout drift
+    // between a client and a server is impossible to miss.
+    netents_reset(g_ents);
+    netents_push_q(g_ents, 7, 100000, -2500, 900, 12345, 200, 3, 55, EF_DEAD);
+    proto_write_snapshot(g_m, g_pk, g_lpk, g_ents, null, 0);
+    let good = g_m.data[4];
+    let shifted = buffer(ENT_STRIDE);
+    shifted.write_u8(0, i32(good.read_u8(0)));
+    let k: i32 = 1;
+    while (k < ENT_STRIDE) { shifted.write_u8(k, i32(good.read_u8(k - 1))); k++; }
+    let d1: object = netents_new(4);
+    let d2: object = netents_new(4);
+    unpack_ent_blob(good, d1, 1);
+    unpack_ent_blob(shifted, d2, 1);
+    print(`  intact  : ${ent_rec_signature(d1, 0)}`);
+    print(`  shifted : ${ent_rec_signature(d2, 0)}`);
+    ok("a one-byte shift of the whole record decodes differently",
+       ent_rec_signature(d1, 0) != ent_rec_signature(d2, 0));
+
+    // And a short blob is refused rather than read out of bounds.
+    let short = good.read_bytes(0, ENT_STRIDE - 1);
+    let d3: object = netents_new(4);
+    ok("a record one byte short is REFUSED (-1), never partially decoded",
+       unpack_ent_blob(short, d3, 1) == -1 && netents_count(d3) == 0);
+
+    note("F: a one-byte layout change fails the offset checker and changes the decode");
+}
+
+// ===========================================================================
+//  MAIN
+// ===========================================================================
+
+fn running_interpreted(): bool {
+    if (args.length < 1) { return false; }
+    let a0: string = args[0];
+    let out: bool = a0.ends_with(".hml");
+    return out;
+}
+
+fn usage() {
+    print("packetdump.hml — the wire-protocol reference dump and byte-layout gate (W4-13)");
+    print("");
+    print("  hemlockc -O1 tools/packetdump.hml -o /tmp/pd && /tmp/pd [mode]");
+    print("");
+    print("  (none)       reference + dump + verify; exits 1 on any failure  [CI gate]");
+    print("  --reference  the protocol shapes only, for someone writing server code");
+    print("  --dump       hexdump + decode of one representative S_SNAPSHOT");
+    print("  --verify     the assertions only");
+    print("  --negative   the 'one-byte layout change must fail' proof only");
+    print("  --help");
+}
+
+fn main() {
+    if (running_interpreted()) {
+        print("NOTE: running interpreted. hemlockc is ground truth (CLAUDE.md §2);");
+        print("      build it before trusting a result:");
+        print("      hemlockc -O1 tools/packetdump.hml -o /tmp/pd && /tmp/pd");
+        print("");
+    }
+
+    let want_ref: i32 = 1;
+    let want_dump: i32 = 1;
+    let want_ver: i32 = 1;
+    let want_neg: i32 = 1;
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--help" || a == "-h") { usage(); exit(0); }
+        else if (a == "--reference") { want_dump = 0; want_ver = 0; want_neg = 0; }
+        else if (a == "--dump") { want_ref = 0; want_ver = 0; want_neg = 0; }
+        else if (a == "--verify") { want_ref = 0; want_dump = 0; }
+        else if (a == "--negative") { want_ref = 0; want_dump = 0; want_ver = 0; }
+        else { print(`packetdump: unknown option '${a}'`); usage(); exit(2); }
+        i++;
+    }
+
+    build_reference_snapshot();
+
+    if (want_ref == 1) { section_reference(); }
+    if (want_dump == 1) { section_dump(); }
+
+    if (want_ver == 1 || want_neg == 1) {
+        print("===========================================================================");
+        print(" VERIFY");
+        print("===========================================================================");
+        print("");
+    }
+    if (want_ver == 1) {
+        section_offsets();
+        print("");
+        section_loadbearing();
+        print("");
+        section_shapes();
+        print("");
+    }
+    if (want_neg == 1) {
+        section_negative();
+        print("");
+    }
+
+    // A partial mode cannot claim the full count; only the full run gates CI.
+    if (want_ver == 0 || want_neg == 0) {
+        if (g_n > 0) { print(`partial run: ${g_pass}/${g_n} (no gate — run with no arguments for the CI gate)`); }
+        if (g_pass != g_n) { exit(1); }
+        exit(0);
+    }
+
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    print(`  diagnostics: refused=${proto_refused()} oversize=${proto_oversize()} malformed=${proto_malformed()} bulk_bad=${pack_bulk_bad()} q_clamps=${q_clamp_count()} (2 deliberate, from the clamp test)`);
+    ok("no element was ever refused, oversized or malformed in a legal build",
+       proto_refused() == 0 && proto_oversize() == 0 && proto_malformed() == 0
+       && pack_bulk_bad() == 0);
+    print("");
+
+    if (g_n != g_EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${g_EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+main();
+
+// ===========================================================================
+//  FOUND WHILE WRITING THIS, IN A FILE W4-13 DOES NOT OWN — REPORTED, NOT FIXED
+// ---------------------------------------------------------------------------
+//  `packing.hml`'s `unpack_ent_blob` and `unpack_cmd_blob` narrow the u32
+//  fields with `i32(b.read_u32_le(off))`. Hemlock THROWS on that conversion
+//  once the value passes 2^31, so a wire-legal `entity_id`, `tick`, `seq`,
+//  `actor_id`, `target_id` or `buttons` with bit 31 set aborts the decoder
+//  instead of returning a value — and a throw leaks ~192 B of heap locals
+//  (CLAUDE.md §1 rule 7).
+//
+//  Reproduce: put 0xF85BCD15 in an entity_id, pack it, unpack it.
+//     "Uncaught exception: Value 4166765845 out of range for i32"
+//
+//  It is not reachable from anything v1 sends — ids are small, ticks are
+//  small, and `buttons` uses the low bits — which is why this is a report and
+//  not a red assertion. It IS reachable from a hostile or buggy peer, and the
+//  net layer's whole contract elsewhere is "never throw, return -1 and count"
+//  (`pack_take`, `unpack_take`, `proto_load` all do exactly that). Section D
+//  therefore reads records through the documented field table with signed
+//  reads rather than through the decoders, so the layout gate does not depend
+//  on the defect being fixed first.
+//
+//  Owner of `src/net/packing.hml`: the fix is to keep the u32 fields as i64 in
+//  the SoA, or to read them with `read_i32_le` and let the bit pattern ride.
+// ===========================================================================

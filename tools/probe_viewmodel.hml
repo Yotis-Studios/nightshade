@@ -1,0 +1,1032 @@
+// probe_viewmodel.hml — verification program for W4-10 (src/render/viewmodel.hml).
+//
+// Run COMPILED. Headless — no window, no display, no SDL call is ever made.
+//     hemlockc -O1 tools/probe_viewmodel.hml -o /tmp/probe_vm && /tmp/probe_vm
+//
+// Prints one line per measurement, then `PASS n/n`, and exits 1 unless every
+// assertion held AND the assertion count is the expected one, so a skipped
+// branch cannot shrink numerator and denominator together and still read green.
+//
+//   W4-10 acceptance                                     asserted in section
+//   the rest pose is still world_render's frozen matrix    [1]
+//   ART_BIBLE 8.5 / GAME_DESIGN 2.4+7.5 numbers            [2]
+//   fire kick: shape, per-weapon amplitude, every shot     [3]
+//   reload: three stages, mag card, floor clack, latch     [4]
+//   ADS transition + sprint pose                           [5]
+//   animation is frame-rate independent                    [6]
+//   THE LANTERN NEVER LOSES A FACE                         [7]
+//   never crosses the crosshair, screen footprint, anchor  [8]
+//   visual kick provably never moves the bullet            [9]  (source scan
+//                                                                + hash, with a
+//                                                                negative control)
+//   <= 140 triangles, and a real emit into a real batch    [10]
+//   determinism: same drive -> bit-identical               [11]
+//   cost (RULE T: __clock CPU time, min of 7)              [12]
+//
+// TWO THINGS TO KNOW BEFORE READING THE OUTPUT:
+//
+//   * RUN IT COMPILED. Interpreted it reports 55/57: everything correctness- and
+//     determinism-related is bit-identical between the two backends (same state
+//     fingerprint, same 114/116 emit counts, same footprint, same cap-box
+//     counts), and the only two red lines are section [12]'s microsecond
+//     regression guards, which are calibrated for the compiled build the game
+//     ships as. CLAUDE.md §2: hemlockc is ground truth.
+//   * NEVER REUSE A LOCAL NAME FOR TWO TYPES IN ONE FUNCTION, even in disjoint
+//     blocks — HEMLOCK_ISSUES.md H-11. This probe was written with `let a: f64`
+//     in section [2] and `for (let a = 0; ...)` in section [7]; compiled, the
+//     f64 was silently truncated to i32 and the idle sway measured 1 px instead
+//     of 2, with no diagnostic. Interpreted it was correct. H-11 is live.
+//
+// SECTION 7 IS THE ONE THAT MATTERS MOST. `meshgen.hml`'s `mg_vm_shell` deletes
+// the three box faces the eye cannot see, so the shipped lantern has normals in
+// only three directions (-X 32 tris, -Y 32, +Z 58, and nothing else). If a pose
+// rotation flips one of those past the eye, that face stops being drawn and the
+// lantern develops a hole — which is exactly the "unrecognisable slab" class of
+// bug the view-space fix ended. So this probe does not reason about the pose;
+// it PROJECTS ALL 122 TRIANGLES OF THE REAL MESH through the REAL projection at
+// every pose in the module's whole cap box, and counts how many survive the
+// renderer's own backface rule. 122 every time, or red. Section 7 also contains
+// a NEGATIVE CONTROL just outside the caps, so the test cannot pass vacuously.
+
+import { exit } from "@stdlib/process";
+import { sin, cos, sqrt, tan, exp, log, floor } from "@stdlib/math";
+import { read_file } from "@stdlib/fs";
+import { lines } from "@stdlib/strings";
+
+import { mesh_tri_count, mesh_vert_count, mesh_vert_pos, mesh_vert_rgb }
+       from "../../wobbleweed/src/mesh.hml";
+import { batch_new, batch_reset, batch_count, LAYER_WORLD }
+       from "../../wobbleweed/src/batch.hml";
+import { emit_set_viewport, emit_set_near, emit_set_backface, emit_set_lighting,
+         emit_set_mvp, EMIT_BF_CCW }
+       from "../../wobbleweed/src/emit.hml";
+import { mesh_set_viewport, mesh_set_near, mesh_set_cull, MESH_CULL_NEG }
+       from "../../wobbleweed/src/mesh.hml";
+
+import { meshgen_build_all, meshgen_mesh, meshgen_tris, MESH_LANTERN_VM }
+       from "../src/art/meshgen.hml";
+
+import { view_new, view_set_viewport, view_set_fog_far, view_apply_camera,
+         view_snap_fov, view_build, view_project, view_mvp, view_fov }
+       from "../src/render/view.hml";
+
+import {
+    vm_new, vm_reset, vm_bind_mesh, vm_bind_mag, vm_set_rest, vm_set_pivot,
+    vm_set_eye_height, vm_set_motion, vm_read_weapon, vm_events, vm_fire,
+    vm_drop_mag, vm_step, vm_build_matrix, vm_model, vm_emit,
+    vm_state, vm_field, vm_reload_stage, vm_kick, vm_ads, vm_sprint,
+    vm_off_right, vm_off_down, vm_off_fwd, vm_rot_x, vm_rot_y, vm_rot_z,
+    vm_clamps, vm_tris, vm_mag_active, vm_mag_x, vm_mag_y, vm_mag_z,
+    vm_take_clack, vm_take_reload_done, vm_stage_bits, vm_kicks,
+    vm_kick_peak_s, vm_ppm, vm_mesh_tris,
+    g_VM_RIGHT, g_VM_DOWN, g_VM_FWD, g_VM_PPM,
+    g_VM_SWAY_PX, g_VM_SWAY_HZ, g_VM_BOB_PX,
+    g_VM_KICK_RELEASE, g_VM_KICK_ATTACK, g_VM_KICK_BACK_M, g_VM_KICK_PITCH_DEG,
+    g_VM_SPRINT_TILT_DEG, g_VM_SPRINT_DROP_M, g_VM_SPRINT_S,
+    g_VM_ADS_RIGHT_M, g_VM_ADS_DOWN_M, g_VM_ADS_FWD_M,
+    g_VM_STAGE_NONE, g_VM_STAGE_DROP, g_VM_STAGE_INSERT, g_VM_STAGE_SEAT,
+    g_VM_ROT_X_MIN, g_VM_ROT_X_MAX, g_VM_ROT_Y_ABS, g_VM_ROT_Z_ABS,
+    g_VM_OFF_R_MIN, g_VM_OFF_R_MAX, g_VM_OFF_D_MIN, g_VM_OFF_D_MAX,
+    g_VM_OFF_F_MIN, g_VM_OFF_F_MAX, g_VM_DEPTH, g_VM_MAG_LIFE_S,
+    g_VMS_ROT_X, g_VMS_ROT_Y, g_VMS_ROT_Z, g_VMS_OFF_R, g_VMS_OFF_D,
+    g_VMS_OFF_F, g_VMS_FIELDS
+} from "../src/render/viewmodel.hml";
+
+import { WPN_SPARROW, WPN_TINKER, WPN_BELLOWS, WPN_LONGSHADOW, WPN_KESTREL,
+         WPN_EMBERLANCE, WPN_COUNT,
+         WS_FIELDS, WS_CUR, WS_ADS, WS_RELOAD_T, WS_RELOAD_ON, WS_SHOTS,
+         WS_MAG0, WS_RES0,
+         wpn_state_new, wpn_state_reset, wpn_fire, wpn_reload_begin, wpn_step,
+         wpn_can_fire, wpn_hash_all, wpn_state_hash, wpn_reload_time,
+         wpn_recoil_v, wpn_is_shell_reload, wpn_mag }
+       from "../src/sim/weapons.hml";
+import { rng_new, rng_seed, RNG_SPREAD } from "../src/sim/rng.hml";
+import { evbus_new, evbus_push, evbus_count, EV_RELOAD_DONE, EV_WEAPON_SWITCH, EV_HIT }
+       from "../src/sim/combat.hml";
+import { g_TICK_DT, g_RES_W, g_RES_H, g_EYE_STAND, g_SPEED_WALK, g_SPEED_SPRINT }
+       from "../src/core/config.hml";
+
+// Every assertion below is unconditional; this is the count.
+let g_EXPECTED_ASSERTIONS = 61;
+let g_TRIALS = 7;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(label: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${label}`); }
+}
+fn note(s: string) { g_notes.push(s); }
+
+fn f4(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: f64 = floor(x * 10000.0 + 0.5);
+    let whole: i32 = i32(scaled / 10000.0);
+    let frac: i32 = i32(scaled) - whole * 10000;
+    let fs: string = `${frac}`;
+    while (fs.length < 4) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    let out: string = s;
+    return out;
+}
+fn absf2(p_a: f64): f64 { let a: f64 = p_a; if (a < 0.0) { a = 0.0 - a; } let o: f64 = a; return o; }
+
+// ===========================================================================
+//  SHARED FIXTURES
+// ===========================================================================
+let g_mesh = null;
+let g_view = null;
+let g_o: array = [0.0, 0.0, 0.0, 0.0];
+
+// the rest matrix world_render.hml ships today, verbatim
+let g_FROZEN: array<f64> = [
+    -1.0, 0.0,  0.0, 0.26,
+     0.0, 1.0,  0.0, 0.0 - 0.34,
+     0.0, 0.0, -1.0, 0.0 - 1.05,
+     0.0, 0.0,  0.0, 1.0
+];
+
+fn setup() {
+    meshgen_build_all();
+    g_mesh = meshgen_mesh(MESH_LANTERN_VM);
+    g_view = view_new();
+    view_set_viewport(g_view, f64(g_RES_W), f64(g_RES_H));
+    view_set_fog_far(g_view, 72.0);
+    // camera at the origin, looking down -Z: the view matrix is the identity,
+    // so view_project consumes VIEW-SPACE points directly and the projection is
+    // the same `proj` world_render hands the viewmodel at stage 15.
+    view_apply_camera(g_view, 0.0, 0.0, 0.0, 0.0, 0.0);
+    view_snap_fov(g_view);
+    view_build(g_view, 0.0, 0);
+}
+
+// transform mesh vertex `vi` by the viewmodel's model matrix
+fn mx(p_m: array<f64>, p_vi: i32, p_ch: i32): f64 {
+    let m: array<f64> = p_m;
+    let x: f64 = mesh_vert_pos(g_mesh, p_vi, 0);
+    let y: f64 = mesh_vert_pos(g_mesh, p_vi, 1);
+    let z: f64 = mesh_vert_pos(g_mesh, p_vi, 2);
+    if (p_ch == 0) { let o: f64 = m[0]*x + m[1]*y + m[2]*z + m[3];  return o; }
+    if (p_ch == 1) { let o: f64 = m[4]*x + m[5]*y + m[6]*z + m[7];  return o; }
+    let o: f64 = m[8]*x + m[9]*y + m[10]*z + m[11];
+    return o;
+}
+
+// How many of the mesh's triangles survive the renderer's backface rule under
+// this model matrix. `MESH_CULL_NEG` drops screen signed area <= 0.
+fn drawn_tris(p_m: array<f64>): i32 {
+    let m: array<f64> = p_m;
+    let nt: i32 = mesh_tri_count(g_mesh);
+    let live: i32 = 0;
+    for (let t = 0; t < nt; t++) {
+        view_project(g_view, mx(m, t*3, 0), mx(m, t*3, 1), mx(m, t*3, 2), g_o);
+        let ax: f64 = g_o[0]; let ay: f64 = g_o[1];
+        view_project(g_view, mx(m, t*3+1, 0), mx(m, t*3+1, 1), mx(m, t*3+1, 2), g_o);
+        let bx: f64 = g_o[0]; let by: f64 = g_o[1];
+        view_project(g_view, mx(m, t*3+2, 0), mx(m, t*3+2, 1), mx(m, t*3+2, 2), g_o);
+        let cx: f64 = g_o[0]; let cy: f64 = g_o[1];
+        let ar: f64 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if (ar > 0.0) { live = live + 1; }
+    }
+    let out: i32 = live;
+    return out;
+}
+
+// screen bbox of the whole mesh under this model matrix -> into g_bb
+let g_bb: array<f64> = [0.0, 0.0, 0.0, 0.0];
+fn screen_bbox(p_m: array<f64>) {
+    let m: array<f64> = p_m;
+    let nv: i32 = mesh_vert_count(g_mesh);
+    let x0: f64 = 1.0e9; let x1: f64 = 0.0 - 1.0e9;
+    let y0: f64 = 1.0e9; let y1: f64 = 0.0 - 1.0e9;
+    for (let i = 0; i < nv; i++) {
+        view_project(g_view, mx(m, i, 0), mx(m, i, 1), mx(m, i, 2), g_o);
+        if (g_o[0] < x0) { x0 = g_o[0]; }
+        if (g_o[0] > x1) { x1 = g_o[0]; }
+        if (g_o[1] < y0) { y0 = g_o[1]; }
+        if (g_o[1] > y1) { y1 = g_o[1]; }
+    }
+    g_bb[0] = x0; g_bb[1] = y0; g_bb[2] = x1; g_bb[3] = y1;
+}
+
+// Build a model matrix straight from six pose numbers, bypassing vm_step, so
+// section 7 can walk the CAP BOX itself rather than only the poses the current
+// animation happens to reach.
+fn pose_matrix(p_vm, p_rx: f64, p_ry: f64, p_rz: f64,
+               p_dr: f64, p_dd: f64, p_df: f64): array<f64> {
+    let s: array<f64> = vm_state(p_vm);
+    s[g_VMS_ROT_X] = p_rx; s[g_VMS_ROT_Y] = p_ry; s[g_VMS_ROT_Z] = p_rz;
+    s[g_VMS_OFF_R] = p_dr; s[g_VMS_OFF_D] = p_dd; s[g_VMS_OFF_F] = p_df;
+    vm_build_matrix(p_vm);
+    let out: array<f64> = vm_model(p_vm);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE SCRIPTED SESSION — a real weapon state, stepped by the real sim, read by
+// the viewmodel every frame. One tick per frame at 60 Hz, which is what the
+// game does when it is keeping up.
+//
+// mode: 0 = walk, 1 = sprint, 2 = ads, 3 = firing, 4 = reloading
+// ---------------------------------------------------------------------------
+let g_wst: array = [];
+let g_rng: array = [];
+let g_out: array = [0.0, 0.0];
+
+fn session_reset(p_w: i32) {
+    g_wst = wpn_state_new(1);
+    wpn_state_reset(g_wst, 0, p_w);
+    g_rng = rng_new();
+}
+
+// One frame: advance the sim one tick, then the viewmodel one frame.
+// Returns 1 if a shot left the barrel.
+fn session_frame(p_vm, p_tick: i32, p_mode: i32, p_dt: f64): i32 {
+    let ads: i32 = 0;
+    let sprint: i32 = 0;
+    let fired: i32 = 0;
+    if (p_mode == 1) { sprint = 1; }
+    if (p_mode == 2) { ads = 1; }
+    if (p_mode == 3) {
+        rng_seed(g_rng, 4242, RNG_SPREAD, p_tick, 1);
+        fired = wpn_fire(g_wst, 0, g_rng, g_out);
+    }
+    if (p_mode == 4) { wpn_reload_begin(g_wst, 0); }
+    wpn_step(g_wst, 0, ads, sprint);
+
+    let speed: f64 = g_SPEED_WALK;
+    if (sprint == 1) { speed = g_SPEED_SPRINT; }
+    if (p_mode == 3) { speed = 0.0; }
+    let dist: f64 = f64(p_tick) * speed * g_TICK_DT;
+    vm_set_motion(p_vm, speed, 1, sprint, dist);
+    vm_read_weapon(p_vm, g_wst, 0);
+    vm_step(p_vm, p_dt);
+    let out: i32 = fired;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    setup();
+    print("== probe_viewmodel — W4-10, src/render/viewmodel.hml ==");
+    print(`   lantern mesh: ${mesh_tri_count(g_mesh)} tris, ${mesh_vert_count(g_mesh)} verts`);
+    print(`   projection:   fov ${f4(view_fov(g_view))} deg vertical, ${g_RES_W}x${g_RES_H}`);
+
+    let vm = vm_new();
+    vm_bind_mesh(vm, g_mesh);
+
+    // =======================================================================
+    print("");
+    print("[1] the rest pose is still world_render.hml's frozen matrix");
+    // -----------------------------------------------------------------------
+    // The whole reason the lantern survives every pitch is that it is drawn in
+    // VIEW SPACE under sixteen constants with no view term. Animating it must
+    // not disturb that: at rest, the matrix this module produces has to BE
+    // those sixteen constants, exactly, not approximately.
+    let m0: array<f64> = vm_model(vm);
+    let same: i32 = 1;
+    for (let i = 0; i < 16; i++) { if (m0[i] != g_FROZEN[i]) { same = 0; } }
+    ok("vm_new's model matrix is world_render's g_vm_model, all 16 elements exactly", same == 1);
+
+    // and it stays that way after a step with no drive at all
+    vm_set_motion(vm, 0.0, 1, 0, 0.0);
+    vm_step(vm, 0.0);
+    let m1: array<f64> = vm_model(vm);
+    let same2: i32 = 1;
+    for (let i = 0; i < 16; i++) { if (m1[i] != g_FROZEN[i]) { same2 = 0; } }
+    ok("a stationary, unfired, hip-fire viewmodel at t=0 is bit-identical to the rest pose",
+       same2 == 1);
+
+    ok("the rest offsets are world_render's 0.26 / 0.34 / 1.05",
+       g_VM_RIGHT == 0.26 && g_VM_DOWN == 0.34 && g_VM_FWD == 1.05);
+    ok("the viewmodel depth constant is ARCHITECTURE 2.3 invariant 4's 0.05", g_VM_DEPTH == 0.05);
+
+    ok("the rest pose draws every triangle of the mesh (nothing is culled to begin with)",
+       drawn_tris(m0) == mesh_tri_count(g_mesh));
+
+    // =======================================================================
+    print("");
+    print("[2] the document numbers — ART_BIBLE 8.5 and GAME_DESIGN 2.4 / 7.5");
+    // -----------------------------------------------------------------------
+    ok("ART_BIBLE 8.5 idle sway is +/-2 px at 0.4 Hz", g_VM_SWAY_PX == 2.0 && g_VM_SWAY_HZ == 0.4);
+    ok("ART_BIBLE 8.5 footstep bob is 1 px", g_VM_BOB_PX == 1.0);
+    ok("ART_BIBLE 8.5 sprint is 35 deg and 0.1 m", g_VM_SPRINT_TILT_DEG == 35.0 && g_VM_SPRINT_DROP_M == 0.1);
+    ok("GAME_DESIGN 2.4/7.5 kick is 0.02 m and 1.6 deg per mult, decaying at 14/s",
+       g_VM_KICK_BACK_M == 0.02 && g_VM_KICK_PITCH_DEG == 1.6 && g_VM_KICK_RELEASE == 14.0);
+
+    print(`  derived px/metre at the viewmodel plane: ${f4(g_VM_PPM)}`);
+    note(`g_VM_PPM = ${f4(g_VM_PPM)} px/m (meshgen solved 163.2 by hand; this is derived from the projection)`);
+    ok("px/metre is derived from the real projection, not typed in (163.2 +/- 0.2)",
+       absf2(g_VM_PPM - 163.2) < 0.2);
+
+    // Measured sway amplitude and period, in PIXELS and seconds. 0.4 Hz means a
+    // 2.5 s period, so the lateral peak is at 0.625 s and the trough at 1.875 s.
+    // Landing ON those instants is a much sharper test of the frequency than
+    // hunting for a maximum on a 60 Hz sampling grid, which never lands exactly
+    // on the crest and picks a different period's sample every run.
+    vm_reset(vm);
+    vm_set_motion(vm, 0.0, 1, 0, 0.0);
+    for (let f = 0; f < 5; f++) { vm_step(vm, 0.125); }        // t = 0.625 s
+    let sway_peak: f64 = vm_off_right(vm) * g_VM_PPM;
+    for (let f = 0; f < 10; f++) { vm_step(vm, 0.125); }       // t = 1.875 s
+    let sway_trough: f64 = vm_off_right(vm) * g_VM_PPM;
+    for (let f = 0; f < 10; f++) { vm_step(vm, 0.125); }       // t = 3.125 s
+    let sway_peak2: f64 = vm_off_right(vm) * g_VM_PPM;
+    print(`  idle sway at t=0.625 s: ${f4(sway_peak)} px; t=1.875 s: ${f4(sway_trough)} px; t=3.125 s: ${f4(sway_peak2)} px`);
+    ok("the measured idle sway peaks at 2 px (ART_BIBLE 8.5), not at a number nobody wrote down",
+       sway_peak > 1.999 && sway_peak < 2.001);
+    ok("the measured sway period is 2.5 s, i.e. 0.4 Hz (ART_BIBLE 8.5): +A, -A, +A at the quarter marks",
+       absf2(sway_trough + sway_peak) < 1.0e-9 && absf2(sway_peak2 - sway_peak) < 1.0e-9);
+
+    // Measured footstep bob, in PIXELS, at a full sprint.
+    vm_reset(vm);
+    let bob_max: f64 = 0.0;
+    let base_d: f64 = 0.0;
+    for (let f = 0; f < 240; f++) {
+        let dist: f64 = f64(f) * g_SPEED_SPRINT * g_TICK_DT;
+        vm_set_motion(vm, g_SPEED_SPRINT, 1, 0, dist);
+        vm_step(vm, g_TICK_DT);
+        // isolate the bob from the sway by subtracting a sway-only run below
+        let dn: f64 = vm_off_down(vm);
+        if (absf2(dn) > bob_max) { bob_max = absf2(dn); }
+    }
+    let bob_px: f64 = bob_max * g_VM_PPM;
+    print(`  footstep bob + sway peak ${f4(bob_px)} px vertical at full sprint`);
+    note(`vertical excursion at sprint (bob 1 px + sway 1 px) measures ${f4(bob_px)} px`);
+    ok("the vertical bob stays at the 1-2 px ART_BIBLE 8.5 scale — never a bouncing sprite",
+       bob_px > 0.5 && bob_px < 2.6);
+
+    // =======================================================================
+    print("");
+    print("[3] the fire kick — GAME_DESIGN 7.5, every shot, every weapon");
+    // -----------------------------------------------------------------------
+    // shape: a difference of exponentials, so it RISES over ~2 frames
+    ok("the kick attack rate is 4x the release rate (that is what puts the peak at 2 frames)",
+       g_VM_KICK_ATTACK == 4.0 * g_VM_KICK_RELEASE);
+    let tp: f64 = vm_kick_peak_s();
+    let tp_frames: f64 = tp * 60.0;
+    print(`  kick envelope peaks at ${f4(tp * 1000.0)} ms = ${f4(tp_frames)} frames at 60 fps`);
+    note(`kick peak at ${f4(tp_frames)} frames — ART_BIBLE 8.5 asks for "over 2 frames"`);
+    ok("the kick reaches its peak over 2 frames (ART_BIBLE 8.5), measured 1.90..2.10",
+       tp_frames > 1.90 && tp_frames < 2.10);
+
+    // the kick starts at zero, rises, then decays — never a step function
+    vm_reset(vm);
+    vm_fire(vm, 1.0);
+    let k_prev: f64 = vm_kick(vm);
+    let rose: i32 = 0;
+    let fell: i32 = 0;
+    let k_peak: f64 = 0.0;
+    for (let f = 0; f < 60; f++) {
+        vm_step(vm, g_TICK_DT);
+        let k: f64 = vm_kick(vm);
+        if (k > k_peak) { k_peak = k; }
+        if (k > k_prev) { rose = 1; }
+        if (rose == 1 && k < k_prev) { fell = 1; }
+        k_prev = k;
+    }
+    ok("a shot's kick starts at 0, rises, and returns — it is an envelope, not a step",
+       vm_kick_peak_s() > 0.0 && rose == 1 && fell == 1);
+    ok("the envelope is normalised: a mult of 1.0 peaks at 1.0 (+/-1 %)",
+       k_peak > 0.99 && k_peak < 1.01);
+
+    // per-weapon amplitude, straight off the sim's recoil table
+    let max_back: f64 = 0.0;
+    let max_pitch: f64 = 0.0;
+    let all_moved: i32 = 1;
+    let w = 0;
+    while (w < WPN_COUNT) {
+        vm_reset(vm);
+        let mult: f64 = wpn_recoil_v(w, 0);
+        vm_fire(vm, mult);
+        let pk: f64 = 0.0;
+        for (let f = 0; f < 12; f++) {
+            vm_step(vm, g_TICK_DT);
+            if (vm_kick(vm) > pk) { pk = vm_kick(vm); }
+        }
+        let back: f64 = pk * g_VM_KICK_BACK_M;
+        let pitch: f64 = pk * g_VM_KICK_PITCH_DEG;
+        print(`  weapon ${w}: rc_v ${f4(mult)} deg -> back ${f4(back)} m, pitch ${f4(pitch)} deg`);
+        if (back > max_back) { max_back = back; }
+        if (pitch > max_pitch) { max_pitch = pitch; }
+        if (back <= 0.0) { all_moved = 0; }
+        w = w + 1;
+    }
+    note(`heaviest weapon kick: ${f4(max_back)} m back, ${f4(max_pitch)} deg pitch (ART_BIBLE 8.5 says 0.06 m / 4 deg)`);
+    ok("GAME_DESIGN 2.5: EVERY weapon's shot produces a non-zero viewmodel kick", all_moved == 1);
+    ok("the heaviest weapon lands on ART_BIBLE 8.5's 0.06 m back (measured 0.05..0.07)",
+       max_back > 0.05 && max_back < 0.07);
+    ok("the heaviest weapon lands on ART_BIBLE 8.5's 4 deg pitch (measured 3.5..5.0)",
+       max_pitch > 3.5 && max_pitch < 5.0);
+    ok("the lightest weapon is far below that — a Sparrow round nudges, it does not throw",
+       wpn_recoil_v(WPN_SPARROW, 0) * g_VM_KICK_PITCH_DEG < 1.2);
+
+    // every shot the SIM fires reaches the viewmodel, with no polling loss
+    session_reset(WPN_SPARROW);
+    vm_reset(vm);
+    vm_read_weapon(vm, g_wst, 0);     // bind before play: the first read latches
+    let sim_shots: i32 = 0;
+    for (let t = 0; t < 180; t++) {
+        sim_shots = sim_shots + session_frame(vm, t, 3, g_TICK_DT);
+    }
+    print(`  180 ticks of held trigger: sim fired ${sim_shots}, viewmodel kicked ${vm_kicks(vm)}`);
+    ok("GAME_DESIGN 2.5: the viewmodel kicks exactly once per shot the sim fired, never fewer",
+       vm_kicks(vm) == sim_shots && sim_shots > 20);
+
+    // =======================================================================
+    print("");
+    print("[4] the reload — GAME_DESIGN 7.11, three stages and a falling magazine");
+    // -----------------------------------------------------------------------
+    let all_three: i32 = 1;
+    let mag_ok: i32 = 1;
+    let done_ok: i32 = 1;
+    let clack_ok: i32 = 1;
+    let ordered: i32 = 1;
+    w = 0;
+    while (w < WPN_COUNT) {
+        session_reset(w);
+        vm_reset(vm);
+        // empty the magazine so the reload is the EMPTY one (the long variant)
+        g_wst[WS_MAG0 + w] = 0.0;
+        let total: f64 = wpn_reload_time(w, 1);
+        let frames: i32 = i32(total * 60.0) + 30;
+        // a shell loader reloads ONE round per cycle and re-arms itself, so a
+        // full magazine takes mag x the per-shell time
+        if (wpn_is_shell_reload(w) == 1) { frames = i32(total * 60.0) * wpn_mag(w) + 60; }
+        wpn_reload_begin(g_wst, 0);
+        let saw_mag: i32 = 0;
+        let clacks: i32 = 0;
+        let dones: i32 = 0;
+        let last_stage: i32 = 0;
+        for (let t = 0; t < frames; t++) {
+            wpn_step(g_wst, 0, 0, 0);
+            vm_set_motion(vm, 0.0, 1, 0, 0.0);
+            vm_read_weapon(vm, g_wst, 0);
+            vm_step(vm, g_TICK_DT);
+            let st: i32 = vm_reload_stage(vm);
+            if (st != 0) {
+                // stages only ever advance, except that a shell loader starts a
+                // fresh drop/insert/seat for each round it feeds
+                if (st < last_stage && st != g_VM_STAGE_DROP) { ordered = 0; }
+                last_stage = st;
+            }
+            if (vm_mag_active(vm) == 1) { saw_mag = 1; }
+            clacks = clacks + vm_take_clack(vm);
+            dones = dones + vm_take_reload_done(vm);
+        }
+        let bits: i32 = vm_stage_bits(vm);
+        if (bits != 7) { all_three = 0; }
+        if (dones != 1) { done_ok = 0; }
+        // a shell loader has no magazine to drop, and must not fake one
+        if (wpn_is_shell_reload(w) == 1) {
+            if (saw_mag != 0) { mag_ok = 0; }
+            if (clacks != 0) { clack_ok = 0; }
+        } else {
+            if (saw_mag != 1) { mag_ok = 0; }
+            if (clacks != 1) { clack_ok = 0; }
+        }
+        print(`  weapon ${w}: reload ${f4(total)} s, stages bitmask ${bits}, mag ${saw_mag}, clacks ${clacks}, done ${dones}`);
+        w = w + 1;
+    }
+    ok("GAME_DESIGN 7.11: every weapon's reload shows all three stages (drop, insert, seat)",
+       all_three == 1);
+    ok("the three stages arrive in order and never run backwards", ordered == 1);
+    ok("a magazine card falls on every magazine reload, and on no shell reload", mag_ok == 1);
+    ok("the falling magazine clacks on the floor exactly once (GAME_DESIGN 7.11)", clack_ok == 1);
+    ok("a completed reload latches exactly one reload-done beat for the audio layer", done_ok == 1);
+
+    // the reload beat is also reachable from the EVENT BUS, for the v2 client
+    // that sees events and not the server's weapon-state array
+    vm_reset(vm);
+    let before_kicks: i32 = vm_kicks(vm);
+    ok("vm_reload_stage reports NONE while the weapon is idle",
+       vm_reload_stage(vm) == g_VM_STAGE_NONE && before_kicks == 0);
+
+    // THE SIM'S OWN EVENTS, consumed — not a parallel event system invented here.
+    let bus: object = evbus_new();
+    evbus_push(bus, 10, EV_HIT,           0, 1, 2, 0, 0, 0);
+    evbus_push(bus, 11, EV_RELOAD_DONE,   0, 1, 0, 0, 0, 0);
+    evbus_push(bus, 12, EV_WEAPON_SWITCH, 3, 1, 0, 0, 0, 0);
+    let used1: i32 = vm_events(vm, bus, 12);
+    let used2: i32 = vm_events(vm, bus, 12);
+    print(`  event bus: ${evbus_count(bus)} events, viewmodel consumed ${used1} then ${used2} on a second pass`);
+    ok("vm_events consumes the SIM's EV_RELOAD_DONE and EV_WEAPON_SWITCH and latches the reload beat",
+       used1 == 2 && vm_take_reload_done(vm) == 1 && vm_kicks(vm) == 1);
+    ok("vm_events is idempotent — replaying the same bus consumes nothing twice", used2 == 0);
+    // EV_HIT is deliberately NOT consumed: the 2.5 hit contract belongs to
+    // hud.hml, entity_render.hml, fx.hml and audio. A viewmodel hit response
+    // would be a SIXTH feedback signal nobody specified.
+    ok("vm_events ignores EV_HIT — the viewmodel does not invent a sixth 2.5 signal",
+       used1 == 2);
+
+    ok("the exported surface agrees with itself (vm_ppm, vm_mesh_tris)",
+       vm_ppm() == g_VM_PPM && vm_mesh_tris(vm) == mesh_tri_count(g_mesh));
+
+    // the magazine is ballistic and expires
+    vm_reset(vm);
+    vm_set_eye_height(vm, g_EYE_STAND);
+    vm_drop_mag(vm);
+    let y_start: f64 = vm_mag_y(vm);
+    let fell_far: i32 = 0;
+    for (let f = 0; f < 120; f++) {
+        vm_set_motion(vm, 0.0, 1, 0, 0.0);
+        vm_step(vm, g_TICK_DT);
+        if (vm_mag_y(vm) < y_start - 0.5) { fell_far = 1; }
+    }
+    ok("the magazine falls under gravity and expires — it is never a permanent sprite",
+       fell_far == 1 && vm_mag_active(vm) == 0);
+
+    // =======================================================================
+    print("");
+    print("[5] ADS and sprint");
+    // -----------------------------------------------------------------------
+    // The ADS fraction is the SIM's, tick-quantized, never re-lerped here: the
+    // client and the server must agree on when you are aimed.
+    session_reset(WPN_LONGSHADOW);
+    vm_reset(vm);
+    let ads_matches: i32 = 1;
+    let ads_reached: i32 = 0;
+    for (let t = 0; t < 60; t++) {
+        session_frame(vm, t, 2, g_TICK_DT);
+        if (absf2(vm_ads(vm) - g_wst[WS_ADS]) > 1.0e-12) { ads_matches = 0; }
+        if (vm_ads(vm) >= 1.0) { ads_reached = 1; }
+    }
+    ok("the ADS transition is the sim's own WS_ADS fraction, bit-for-bit, never a second lerp",
+       ads_matches == 1 && ads_reached == 1);
+    // and the aimed pose tucks the lantern AWAY, because ART_BIBLE 8.5 forbids
+    // it crossing the crosshair
+    ok("aiming moves the lantern right, down and further away — never toward the crosshair",
+       g_VM_ADS_RIGHT_M > 0.0 && g_VM_ADS_DOWN_M > 0.0 && g_VM_ADS_FWD_M > 0.0);
+
+    // sprint reaches its pose in 6 frames
+    vm_reset(vm);
+    let six: i32 = i32(g_VM_SPRINT_S * 60.0 + 0.5);
+    for (let f = 0; f < six; f++) {
+        vm_set_motion(vm, g_SPEED_SPRINT, 1, 1, 0.0);
+        vm_step(vm, g_TICK_DT);
+    }
+    let sb: f64 = vm_sprint(vm);
+    print(`  sprint blend after ${six} frames: ${f4(sb)}`);
+    ok("ART_BIBLE 8.5: the sprint pose is 95 % arrived after 6 frames (measured 0.93..0.97)",
+       sb > 0.93 && sb < 0.97);
+    // and it uses the SAFE rotation direction (see section 7)
+    ok("the sprint tilt rotates the lantern toward the player, the direction with 80 deg of room",
+       vm_rot_x(vm) > 0.0);
+
+    // =======================================================================
+    print("");
+    print("[6] the animation is frame-rate independent");
+    // -----------------------------------------------------------------------
+    // Same 0.5 s of wall time, three different frame rates, same events at the
+    // same absolute times. Every quantity here is either a function of an
+    // accumulated clock or an exp(-k*dt) accumulator, so the poses must agree.
+    let rates: array<f64> = [30.0, 60.0, 240.0];
+    let poses: array<f64> = [];
+    for (let ri = 0; ri < 3; ri++) {
+        vm_reset(vm);
+        vm_set_motion(vm, g_SPEED_WALK, 1, 0, 0.0);
+        vm_fire(vm, 2.9);
+        let dt: f64 = 1.0 / rates[ri];
+        let steps: i32 = i32(0.5 * rates[ri] + 0.5);
+        for (let f = 0; f < steps; f++) {
+            vm_set_motion(vm, g_SPEED_WALK, 1, 0, 1.0);
+            vm_step(vm, dt);
+        }
+        poses.push(vm_off_right(vm));
+        poses.push(vm_off_down(vm));
+        poses.push(vm_off_fwd(vm));
+        poses.push(vm_rot_x(vm));
+    }
+    let fri_max: f64 = 0.0;
+    for (let i = 0; i < 4; i++) {
+        let d60: f64 = absf2(poses[i] - poses[4 + i]);
+        let d240: f64 = absf2(poses[i] - poses[8 + i]);
+        if (d60 > fri_max) { fri_max = d60; }
+        if (d240 > fri_max) { fri_max = d240; }
+    }
+    print(`  30 / 60 / 240 fps after 0.5 s: max pose disagreement ${f4(fri_max * 1000.0)} mm`);
+    note(`frame-rate independence: 30 vs 60 vs 240 fps agree to ${fri_max} m`);
+    ok("30, 60 and 240 fps reach the same pose after the same wall time (< 1e-9)",
+       fri_max < 1.0e-9);
+
+    // and a frame split in two is the same as one frame
+    vm_reset(vm); vm_fire(vm, 2.9);
+    vm_set_motion(vm, 0.0, 1, 0, 0.0); vm_step(vm, 0.05);
+    let one: f64 = vm_rot_x(vm);
+    vm_reset(vm); vm_fire(vm, 2.9);
+    vm_set_motion(vm, 0.0, 1, 0, 0.0); vm_step(vm, 0.02); vm_step(vm, 0.03);
+    let two: f64 = vm_rot_x(vm);
+    ok("splitting a frame in two reproduces the same pose (exp(-ka)exp(-kb) == exp(-k(a+b)))",
+       absf2(one - two) < 1.0e-12);
+
+    // =======================================================================
+    print("");
+    print("[7] THE LANTERN NEVER LOSES A FACE — the real mesh, the real projection");
+    // -----------------------------------------------------------------------
+    let nt: i32 = mesh_tri_count(g_mesh);
+    // (a) the whole cap box
+    let box_min: i32 = nt;
+    let box_poses: i32 = 0;
+    for (let qa = 0; qa < 5; qa++) {
+        let rx: f64 = g_VM_ROT_X_MIN + (g_VM_ROT_X_MAX - g_VM_ROT_X_MIN) * f64(qa) / 4.0;
+        for (let qb = 0; qb < 3; qb++) {
+            let ry: f64 = (0.0 - g_VM_ROT_Y_ABS) + g_VM_ROT_Y_ABS * f64(qb);
+            for (let qc = 0; qc < 3; qc++) {
+                let rz: f64 = (0.0 - g_VM_ROT_Z_ABS) + g_VM_ROT_Z_ABS * f64(qc);
+                for (let qd = 0; qd < 3; qd++) {
+                    let dr: f64 = g_VM_OFF_R_MIN + (g_VM_OFF_R_MAX - g_VM_OFF_R_MIN) * f64(qd) / 2.0;
+                    for (let qe = 0; qe < 3; qe++) {
+                        let dd: f64 = g_VM_OFF_D_MIN + (g_VM_OFF_D_MAX - g_VM_OFF_D_MIN) * f64(qe) / 2.0;
+                        for (let qg = 0; qg < 3; qg++) {
+                            let df: f64 = g_VM_OFF_F_MIN + (g_VM_OFF_F_MAX - g_VM_OFF_F_MIN) * f64(qg) / 2.0;
+                            let live: i32 = drawn_tris(pose_matrix(vm, rx, ry, rz, dr, dd, df));
+                            if (live < box_min) { box_min = live; }
+                            box_poses = box_poses + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    print(`  cap box: ${box_poses} poses sampled, worst drawn-triangle count ${box_min} of ${nt}`);
+    note(`the cap box is safe at ${box_poses} sampled poses — a future retune inside the caps cannot break the lantern`);
+    ok("every pose in the module's whole cap box draws all 122 triangles of the lantern",
+       box_min == nt);
+
+    // (b) the NEGATIVE CONTROL — this test must be able to fail
+    let bad1: i32 = drawn_tris(pose_matrix(vm, 0.0 - 0.12, 0.0, 0.0, 0.0, 0.0, 0.0));
+    let bad2: i32 = drawn_tris(pose_matrix(vm, 0.0, 0.0 - 0.30, 0.0, 0.0, 0.0, 0.0));
+    let bad3: i32 = drawn_tris(pose_matrix(vm, 0.0, 0.0, 0.0 - 0.25, 0.0, 0.0, 0.0));
+    print(`  outside the caps: rot X -7 deg -> ${bad1}, rot Y -17 deg -> ${bad2}, rot Z -14 deg -> ${bad3}`);
+    note(`the caps are load-bearing: -7 deg of rot X already costs ${nt - bad1} triangles of the lantern`);
+    ok("NEGATIVE CONTROL: just outside the caps the lantern DOES lose faces, so [7a] is not vacuous",
+       bad1 < nt && bad2 < nt && bad3 < nt);
+
+    // (c) the real drive: a full scripted session, every frame checked
+    let sess_min: i32 = nt;
+    let sess_frames: i32 = 0;
+    let clamps_before: i32 = 0;
+    w = 0;
+    while (w < WPN_COUNT) {
+        session_reset(w);
+        vm_reset(vm);
+        for (let t = 0; t < 260; t++) {
+            let mode: i32 = 0;
+            if (t >= 40 && t < 90) { mode = 1; }        // sprint
+            if (t >= 90 && t < 140) { mode = 2; }       // ads
+            if (t >= 140 && t < 200) { mode = 3; }      // fire
+            if (t == 200) { mode = 4; }                 // reload
+            session_frame(vm, t, mode, g_TICK_DT);
+            let live: i32 = drawn_tris(vm_model(vm));
+            if (live < sess_min) { sess_min = live; }
+            sess_frames = sess_frames + 1;
+        }
+        clamps_before = clamps_before + vm_clamps(vm);
+        w = w + 1;
+    }
+    print(`  scripted session: ${sess_frames} frames over 6 weapons, worst drawn count ${sess_min} of ${nt}`);
+    ok("across a full walk/sprint/aim/fire/reload session on all six weapons, nothing is ever culled",
+       sess_min == nt);
+    ok("the cap-box clamp NEVER bites under the real drive — it is a net, not part of the animation",
+       clamps_before == 0);
+
+    // =======================================================================
+    print("");
+    print("[8] screen rules — crosshair, footprint, and the >220 anchor");
+    // -----------------------------------------------------------------------
+    // The crosshair is a 12 px cross at (160, 120); treat a 24x24 box around it
+    // as untouchable (ART_BIBLE 8.5: "never crossing the crosshair").
+    screen_bbox(vm_model(vm));
+    let rest_h: f64 = 0.0;
+    // rest footprint first
+    vm_reset(vm); vm_set_motion(vm, 0.0, 1, 0, 0.0); vm_step(vm, 0.0);
+    screen_bbox(vm_model(vm));
+    rest_h = g_bb[3] - g_bb[1];
+    print(`  rest footprint: x ${f4(g_bb[0])}..${f4(g_bb[2])}, y ${f4(g_bb[1])}..${f4(g_bb[3])} -> ${f4(rest_h)} px = ${f4(rest_h / 2.4)} % of screen height`);
+    note(`the SHIPPED lantern mesh is ${f4(rest_h / 2.4)} % of screen height AT REST — ART_BIBLE 8.5 caps it at 38 %. Pre-existing, in meshgen.hml slot 28, not introduced here.`);
+
+    let min_x: f64 = 1.0e9;
+    let max_h: f64 = 0.0;
+    let off_screen: i32 = 0;
+    w = 0;
+    while (w < WPN_COUNT) {
+        session_reset(w);
+        vm_reset(vm);
+        for (let t = 0; t < 260; t++) {
+            let mode: i32 = 0;
+            if (t >= 40 && t < 90) { mode = 1; }
+            if (t >= 90 && t < 140) { mode = 2; }
+            if (t >= 140 && t < 200) { mode = 3; }
+            if (t == 200) { mode = 4; }
+            session_frame(vm, t, mode, g_TICK_DT);
+            screen_bbox(vm_model(vm));
+            if (g_bb[0] < min_x) { min_x = g_bb[0]; }
+            let h: f64 = g_bb[3] - g_bb[1];
+            if (h > max_h) { max_h = h; }
+            if (g_bb[0] < 0.0 || g_bb[2] > f64(g_RES_W)) { off_screen = 1; }
+            if (g_bb[1] < 0.0 || g_bb[3] > f64(g_RES_H)) { off_screen = 1; }
+        }
+        w = w + 1;
+    }
+    print(`  animated: nearest approach to the crosshair x=${f4(min_x)} (crosshair box ends at 172)`);
+    print(`  animated: largest footprint ${f4(max_h)} px = ${f4(max_h / 2.4)} % of screen height`);
+    note(`animated footprint peaks at ${f4(max_h / 2.4)} % of screen height, vs ${f4(rest_h / 2.4)} % at rest`);
+    ok("ART_BIBLE 8.5: the lantern never crosses the crosshair — it stays right of x=172, always",
+       min_x > 172.0);
+    ok("the animation grows the footprint by at most 3 px — GAME_DESIGN's kick pulls it toward the eye",
+       max_h <= rest_h + 3.0);
+    ok("the lantern is never clipped off the edge of the frame at any pose", off_screen == 0);
+
+    // the >220 anchor: the flame's own vertices. meshgen writes them after the
+    // bake specifically so the frame always has something above luminance 220;
+    // if a pose ever put them off screen or on a culled triangle, the anchor
+    // would be gone and CLAUDE.md 8 would be violated by a viewmodel change.
+    let nv: i32 = mesh_vert_count(g_mesh);
+    let hot: i32 = 0;
+    for (let i = 0; i < nv; i++) {
+        let r: i32 = mesh_vert_rgb(g_mesh, i, 0);
+        let g2: i32 = mesh_vert_rgb(g_mesh, i, 1);
+        let b2: i32 = mesh_vert_rgb(g_mesh, i, 2);
+        let lum: f64 = 0.299 * f64(r) + 0.587 * f64(g2) + 0.114 * f64(b2);
+        if (lum >= 233.0) { hot = hot + 1; }
+    }
+    print(`  the flame contributes ${hot} vertices at or above vertex luminance 233 (-> >220 on screen)`);
+    let hot_on: i32 = 1;
+    w = 0;
+    while (w < 3) {
+        vm_reset(vm);
+        for (let t = 0; t < 120; t++) {
+            let mode: i32 = 0;
+            if (w == 1) { mode = 1; }
+            if (w == 2) { mode = 3; session_reset(WPN_BELLOWS); }
+            let spf: i32 = 0;
+            if (w == 1) { spf = 1; }
+            vm_set_motion(vm, g_SPEED_SPRINT, 1, spf, f64(t) * 0.1);
+            if (w == 2) { vm_fire(vm, 2.9); }
+            vm_step(vm, g_TICK_DT);
+            let m: array<f64> = vm_model(vm);
+            for (let i = 0; i < nv; i++) {
+                let r: i32 = mesh_vert_rgb(g_mesh, i, 0);
+                let g3: i32 = mesh_vert_rgb(g_mesh, i, 1);
+                let b3: i32 = mesh_vert_rgb(g_mesh, i, 2);
+                let lum: f64 = 0.299 * f64(r) + 0.587 * f64(g3) + 0.114 * f64(b3);
+                if (lum < 233.0) { continue; }
+                view_project(g_view, mx(m, i, 0), mx(m, i, 1), mx(m, i, 2), g_o);
+                if (g_o[0] < 0.0 || g_o[0] > f64(g_RES_W)) { hot_on = 0; }
+                if (g_o[1] < 0.0 || g_o[1] > f64(g_RES_H)) { hot_on = 0; }
+            }
+        }
+        w = w + 1;
+    }
+    ok("CLAUDE.md 8: the flame — the frame's only genuine >220 anchor — is on screen at every pose",
+       hot > 0 && hot_on == 1);
+
+    // =======================================================================
+    print("");
+    print("[9] the visual kick provably never moves the bullet");
+    // -----------------------------------------------------------------------
+    // (a) SOURCE SCAN. The weapon-state array reaches this module as `wst` and
+    //     `p_wst`, and it is only ever indexed. A single assignment into it
+    //     would make the viewmodel authoritative, which is the mistake
+    //     GAME_DESIGN 2.4 spells out in capitals.
+    let src: string = read_file("src/render/viewmodel.hml");
+    let ls: array = lines(src);
+    let writes: i32 = 0;
+    let scanned: i32 = 0;
+    for (let i = 0; i < ls.length; i++) {
+        let ln: string = ls[i];
+        scanned = scanned + 1;
+        // strip comments
+        let cut: i32 = ln.find("//");
+        if (cut >= 0) { ln = ln.slice(0, cut); }
+        let br: i32 = ln.find("wst[");
+        if (br < 0) { continue; }
+        let tail: string = ln.slice(br, ln.length);
+        let close: i32 = tail.find("]");
+        if (close < 0) { continue; }
+        let after: string = tail.slice(close + 1, tail.length).trim();
+        // an assignment is `] =` — the `=` must be the FIRST thing after the
+        // subscript, and must not be the `==` of a comparison. Anything else on
+        // the line (`if (wst[i] > 0.0) { swt = 1.0; }`) is a read.
+        if (after.length < 1) { continue; }
+        if (after.slice(0, 1) != "=") { continue; }
+        if (after.length > 1) {
+            if (after.slice(1, 2) == "=") { continue; }
+        }
+        writes = writes + 1;
+    }
+    print(`  scanned ${scanned} source lines: ${writes} assignments into the weapon-state array`);
+    ok("SOURCE SCAN: viewmodel.hml never assigns into the weapon-state array it is handed",
+       scanned > 400 && writes == 0);
+
+    // (b) LIVE HASH, with a negative control. Run the identical 400-tick sim
+    //     twice — once with the viewmodel attached, once without — and compare
+    //     the weapon-state hash the replay gate itself compares.
+    session_reset(WPN_SPARROW);
+    let vm2 = vm_new();
+    vm_bind_mesh(vm2, g_mesh);
+    for (let t = 0; t < 400; t++) {
+        let mode: i32 = 3;
+        if (t == 150) { mode = 4; }
+        if (t > 150 && t < 260) { mode = 0; }
+        session_frame(vm2, t, mode, g_TICK_DT);
+    }
+    let h_with: i32 = wpn_hash_all(g_wst, 1);
+    let ads_with: f64 = g_wst[WS_ADS];
+
+    session_reset(WPN_SPARROW);
+    for (let t = 0; t < 400; t++) {
+        let mode: i32 = 3;
+        if (t == 150) { mode = 4; }
+        if (t > 150 && t < 260) { mode = 0; }
+        let fired: i32 = 0;
+        if (mode == 3) {
+            rng_seed(g_rng, 4242, RNG_SPREAD, t, 1);
+            wpn_fire(g_wst, 0, g_rng, g_out);
+        }
+        if (mode == 4) { wpn_reload_begin(g_wst, 0); }
+        wpn_step(g_wst, 0, 0, 0);
+    }
+    let h_without: i32 = wpn_hash_all(g_wst, 1);
+    print(`  weapon-state hash with the viewmodel ${h_with}, without it ${h_without}`);
+    ok("400 ticks of firing and reloading produce the SAME weapon-state hash with and without the viewmodel",
+       h_with == h_without);
+
+    // negative control: the hash is not a constant that would match anything
+    wpn_state_reset(g_wst, 0, WPN_LONGSHADOW);
+    ok("NEGATIVE CONTROL: the hash does change when the weapon state really changes",
+       wpn_hash_all(g_wst, 1) != h_without);
+
+    // =======================================================================
+    print("");
+    print("[10] budget — triangles, and a real emit into a real batch");
+    // -----------------------------------------------------------------------
+    let lantern_tris: i32 = mesh_tri_count(g_mesh);
+    print(`  lantern ${lantern_tris} tris + magazine card 2 = ${lantern_tris + 2} peak`);
+    note(`viewmodel peak cost ${lantern_tris + 2} triangles (task budget 140, BUILD_PLAN cap 260)`);
+    ok("the viewmodel's peak triangle count is within the 140-triangle task budget",
+       lantern_tris + 2 <= 140);
+    ok("and within BUILD_PLAN W4-10's 260-triangle cap", lantern_tris + 2 <= 260);
+
+    // a real emit through the real batch/emit/mesh path
+    mesh_set_viewport(f64(g_RES_W), f64(g_RES_H));
+    mesh_set_near(0.15);
+    mesh_set_cull(MESH_CULL_NEG);
+    emit_set_viewport(f64(g_RES_W), f64(g_RES_H), 640.0);
+    emit_set_near(0.15);
+    emit_set_backface(EMIT_BF_CCW);
+    emit_set_lighting(0);
+    let bw = batch_new(512, 80.0, LAYER_WORLD);
+    let proj: array<f64> = view_mvp(g_view);
+
+    vm_reset(vm);
+    vm_set_motion(vm, 0.0, 1, 0, 0.0);
+    vm_step(vm, 0.0);
+    batch_reset(bw);
+    let n_rest: i32 = vm_emit(vm, bw, null, proj, proj);
+    print(`  vm_emit at rest wrote ${n_rest} of ${lantern_tris} triangles (batch holds ${batch_count(bw)})`);
+    note(`vm_emit writes ${n_rest} of the mesh's ${lantern_tris} triangles at rest: emit.hml PIXEL-SNAPS x/y before its backface test, so ${lantern_tris - n_rest} sub-pixel slivers collapse to zero area (mesh_rej_backface 8, rej_near 0, rej_guard 0). The rest matrix is bit-identical to world_render's, so the shipped build emits the same 114 today.`);
+    ok("vm_emit at rest writes the lantern and nothing else, and the batch agrees",
+       n_rest > 100 && n_rest <= lantern_tris && batch_count(bw) == n_rest);
+
+    // with the magazine bound and falling, exactly two more — measured as a
+    // DELTA at the identical pose, so a sliver landing differently cannot move it
+    let vm3 = vm_new();
+    vm_bind_mesh(vm3, g_mesh);
+    vm_drop_mag(vm3);
+    vm_step(vm3, g_TICK_DT);
+    batch_reset(bw);
+    let n_unbound: i32 = vm_emit(vm3, bw, null, proj, proj);
+    vm_bind_mag(vm3, 0.1, 0.1, 0.2, 0.2, (150 << 16) | (140 << 8) | 120);
+    batch_reset(bw);
+    let n_mag: i32 = vm_emit(vm3, bw, null, proj, proj);
+    print(`  same pose, magazine unbound ${n_unbound} tris -> bound ${n_mag} tris`);
+    ok("the falling magazine costs exactly 2 triangles, and its winding survives the backface rule",
+       n_mag - n_unbound == 2);
+    ok("an unbound magazine card is not emitted — the module never invents an atlas cell",
+       n_unbound == n_rest);
+
+    // and a viewmodel with no mesh bound is a no-op, not a crash
+    let vm4 = vm_new();
+    batch_reset(bw);
+    ok("a viewmodel with no mesh bound emits nothing and does not fault",
+       vm_emit(vm4, bw, null, proj, proj) == 0 && vm_tris(vm4) == 0);
+
+    // =======================================================================
+    print("");
+    print("[11] determinism — the same drive is bit-identical");
+    // -----------------------------------------------------------------------
+    // The viewmodel draws no random numbers and reads no clock; it is a pure
+    // function of (dt sequence, motion, weapon state). Two instances driven
+    // identically must agree in every one of their state fields.
+    let va = vm_new(); let vb = vm_new();
+    vm_bind_mesh(va, g_mesh); vm_bind_mesh(vb, g_mesh);
+    session_reset(WPN_KESTREL);
+    for (let t = 0; t < 300; t++) {
+        let mode: i32 = 0;
+        if (t >= 60 && t < 120) { mode = 3; }
+        if (t == 120) { mode = 4; }
+        if (t >= 200 && t < 240) { mode = 1; }
+        session_frame(va, t, mode, g_TICK_DT);
+    }
+    session_reset(WPN_KESTREL);
+    for (let t = 0; t < 300; t++) {
+        let mode: i32 = 0;
+        if (t >= 60 && t < 120) { mode = 3; }
+        if (t == 120) { mode = 4; }
+        if (t >= 200 && t < 240) { mode = 1; }
+        session_frame(vb, t, mode, g_TICK_DT);
+    }
+    let sa: array<f64> = vm_state(va);
+    let sbv: array<f64> = vm_state(vb);
+    let identical: i32 = 1;
+    for (let i = 0; i < g_VMS_FIELDS; i++) { if (sa[i] != sbv[i]) { identical = 0; } }
+    ok("two viewmodels driven by the same sim reach bit-identical state in all 37 fields",
+       identical == 1);
+
+    // a DIFFERENT drive must differ, or the test above proves nothing
+    let vc = vm_new();
+    vm_bind_mesh(vc, g_mesh);
+    session_reset(WPN_BELLOWS);
+    for (let t = 0; t < 300; t++) {
+        let mode: i32 = 0;
+        if (t >= 60 && t < 120) { mode = 3; }
+        if (t == 120) { mode = 4; }
+        session_frame(vc, t, mode, g_TICK_DT);
+    }
+    let sc: array<f64> = vm_state(vc);
+    let differs: i32 = 0;
+    for (let i = 0; i < g_VMS_FIELDS; i++) { if (sa[i] != sc[i]) { differs = 1; } }
+    ok("NEGATIVE CONTROL: a different weapon and a different drive produce different state",
+       differs == 1);
+
+    // the fingerprint compiled == interpreted comparison reads
+    let fp: f64 = 0.0;
+    for (let i = 0; i < g_VMS_FIELDS; i++) { fp = fp * 1.0000001 + sa[i]; }
+    print(`  state fingerprint after the scripted Kestrel session: ${fp}`);
+    note(`state fingerprint ${fp} — the same number under \`hemlock\` proves compiled == interpreted`);
+    ok("the fingerprint is a real number, printed for the interpreter comparison",
+       fp == fp && absf2(fp) > 0.0);
+
+    // =======================================================================
+    print("");
+    print("[12] cost (RULE T: __clock CPU time, min of 7 batches)");
+    // -----------------------------------------------------------------------
+    let reps: i32 = 200000;
+    let best: f64 = 1.0e30;
+    for (let tr = 0; tr < g_TRIALS; tr++) {
+        let t0: f64 = __clock();
+        for (let i = 0; i < reps; i++) {
+            vm_set_motion(vm, 4.4, 1, 0, f64(i) * 0.01);
+            vm_step(vm, g_TICK_DT);
+        }
+        let t1: f64 = __clock();
+        let el: f64 = (t1 - t0) * 1000000.0 / f64(reps);
+        if (el < best) { best = el; }
+    }
+    print(`  vm_set_motion + vm_step: ${f4(best)} us/frame`);
+    note(`vm_step costs ${f4(best)} us/frame == ${f4(best / 166.7)} % of the 16.67 ms frame`);
+    // REGRESSION GUARD, not a budget line (CLAUDE.md 1.2 / RULE T). This box
+    // permanently shares ~17 of 24 cores with llama-server; the guard sits at
+    // roughly 2x the loaded reading and catches anything that turns this
+    // once-per-frame call into a per-vertex-shaped cost.
+    ok("vm_step stays under the 6.0 us/frame regression guard", best < 6.0);
+
+    let ebest: f64 = 1.0e30;
+    for (let tr = 0; tr < g_TRIALS; tr++) {
+        let t0: f64 = __clock();
+        for (let i = 0; i < 20000; i++) {
+            batch_reset(bw);
+            vm_emit(vm, bw, null, proj, proj);
+        }
+        let t1: f64 = __clock();
+        let el: f64 = (t1 - t0) * 1000000.0 / 20000.0;
+        if (el < ebest) { ebest = el; }
+    }
+    print(`  vm_emit (${lantern_tris + 2} tris through the real emit path): ${f4(ebest)} us/frame`);
+    note(`vm_emit costs ${f4(ebest)} us/frame for ${lantern_tris + 2} triangles`);
+    ok("vm_emit stays under the 200 us/frame regression guard", ebest < 200.0);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    if (g_n != g_EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${g_EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+main();

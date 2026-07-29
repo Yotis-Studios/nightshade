@@ -1,0 +1,1083 @@
+// =============================================================================
+//  server.hml — THE AUTHORITATIVE HOST.                              W4-11.
+// =============================================================================
+//
+//  v1 is single-player. This file is still a SERVER, and that is the whole
+//  point (NETWORKING §5): a client and a server in one process, talking over
+//  an in-memory transport, so that the day a socket appears nothing above it
+//  has to change. Nothing in here knows a window exists.
+//
+//      server_new(seed, transport)         build the world, run the boot script
+//      server_tick(sv, tick)               ONE fixed tick: drain -> step -> publish
+//      server_apply_command(sv, ps, cmd)   the direct path (tools, tests)
+//      server_snapshot(sv)                 THE PACKET. Bytes. What a client reads.
+//      server_local(sv)                    THE OWNER BLOCK. hp/ammo/xp/beats/fx.
+//
+//  -----------------------------------------------------------------------------
+//  THE TWO THINGS THAT LEAVE THIS FILE, AND WHY THERE ARE EXACTLY TWO
+//  -----------------------------------------------------------------------------
+//  1. `server_snapshot(sv)` is a `src/sim/snapshot.hml` snapshot: a real 13-byte
+//     header and one quantised record per entity, written by the real writer.
+//     `client.hml` decodes it with the real reader. That round trip is not
+//     ceremony — it is the only reason the v2 client is a decode call instead of
+//     a rewrite, and it is what keeps the client structurally unable to read
+//     `world.*`. (BUILD_PLAN W4-11: "the renderer never reads world.*".)
+//
+//  2. `server_local(sv)` is the OWNER BLOCK — the per-player state that is not
+//     in the entity stream because only one client may ever see it: hp, the
+//     magazine, xp, the lantern channel, the wave state, and this tick's
+//     cosmetic queue. NETWORKING calls it the local block and reserves it in
+//     the protocol; here it is a struct, and in v2 it is `S_SNAPSHOT`'s owner
+//     section. One struct, filled in one place, read in one place.
+//
+//  There is deliberately no third channel. If the client needs something new it
+//  goes in one of those two, which is what stops "just read the world for this
+//  one thing" from happening the first time it is convenient.
+//
+//  -----------------------------------------------------------------------------
+//  THE SCRIPT — GAME_DESIGN §8, "the first 60 seconds", is IN THIS FILE
+//  -----------------------------------------------------------------------------
+//  The sequence is authoritative, so it is server-side, so it is deterministic
+//  from the seed and the tick and nothing else. Every beat below is either a
+//  literal from GAME_DESIGN §8 or a constant from `core/config.hml`; the times
+//  are TICK offsets from the session start, because a wall clock cannot be
+//  replayed. `tools/probe_game.hml` runs the whole minute headless and asserts
+//  the beats land, which is only possible because no beat is frame-driven.
+//
+//      0:00  black, a bell, "The lamps went out on a Tuesday."   (client card)
+//      0:03  the camera stands up (0.8 s) and control is yours    (client)
+//      0:06  the unlit lantern is 40 m ahead, downhill            SPAWNED AT t0
+//      0:10  three Wisps drift up over the crest                  tick t0+600
+//      0:18  a Mote rises from behind a rock                      tick t0+1080
+//      0:24  you reach the post: HOLD [E] - LIGHT THE LANTERN     (client prompt)
+//      0:27  the 2.5 s channel                                    sim stage (g)
+//      0:30  LIGHT. +350 XP, LEVEL 2, the unlock card             sim + client
+//      0:33  the dusk horn, and four Husks come up the hill       HERE, on the lit edge
+//      0:36  wave 1, tier 1                                       director_begin
+//      0:56  WAVE 1 CLEARED, 0.4 s of silence, ember rain         director event
+//      0:58  a path of lit lanterns, downhill and to the left     HERE, on the clear edge
+//
+//  "It's going to get their attention" is not flavour text: the horn and the
+//  hold are triggered by the LANTERN, not by the clock. `director.hml`'s own
+//  header says `director_begin` is called by the lantern channel completing;
+//  W5-6 will own that call, and until it exists the integrator owns it. If the
+//  player never lights it, the day cycle's own horn edge still arms the
+//  director and night still comes. The world does not wait.
+//
+//  -----------------------------------------------------------------------------
+//  WHAT THIS FILE MAY NOT DO
+//  -----------------------------------------------------------------------------
+//  No SDL, no wobbleweed, no renderer, no `__clock()`. It is not walled by
+//  `ci_imports.sh` (src/game may import everything) — it is walled by taste,
+//  and by the fact that `tools/probe_game.hml` links it headless and asserts
+//  `nm | grep -c SDL_ == 0`. The clock lives in `main.hml`; the arithmetic that
+//  turns milliseconds into ticks lives in `sim.hml`'s accumulator; this file
+//  only ever sees an integer tick number.
+// =============================================================================
+
+import { sqrt, sin, cos, floor } from "@stdlib/math";
+
+import { g_TICK_DT, g_TICK_MS, g_MAX_ENTS, g_HP_MAX, g_CHUNK_M,
+         g_LANTERN_CHANNEL_S, g_XP_LANTERN, g_RESPAWN_S, g_LANTERN_R_T1,
+         g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK,
+         g_DAY_TICKS, g_PHASE_DAY_END, g_TICK_HZ,
+         g_WORLD_SEED_DEFAULT, g_RING_RADIUS, g_WICKLINE_M
+       } from "../core/config.hml";
+
+import { clampi, clampf, clamp01 } from "../core/mathx.hml";
+
+import { world_spawn, world_slot_of, world_id_of, world_count,
+         world_despawn_id,
+         KIND_AI, KIND_LANTERN, KIND_PICKUP,
+         EF_VISIBLE, EF_DEAD, SLOT_NONE, ID_NONE
+       } from "../sim/world.hml";
+
+import { chunk_store_new_cap, chunk_set_source, chunk_pin_ring,
+         chunk_height_at, CHUNK_H_MISS } from "../sim/chunk.hml";
+
+import { worldgen_chunk_at, worldgen_shade_tier } from "../sim/worldgen.hml";
+
+import { cmd_new, cmd_copy, cmd_wire_ok, cmd_yaw, cmd_pitch, cmd_btn,
+         BTN_FIRE, BTN_USE, BTN_RELOAD } from "../sim/command.hml";
+
+import { move_px, move_py, move_pz, move_eye_y, move_grounded,
+         PS_VX, PS_VZ, PS_STEP_DIST, PS_EYE, PS_PY } from "../sim/movement.hml";
+
+import { wpn_cur, wpn_ammo, wpn_reserve_ammo, WPN_KESTREL, WS_FIELDS,
+         WS_RELOAD_T, WS_RELOAD_ON, WS_ADS, WS_RC_V, WS_SHOTS,
+         WS_RES0, WS_MAG0
+       } from "../sim/weapons.hml";
+
+import { prog_level, prog_xp_total, prog_xp_into, prog_xp_needed,
+         prog_last_levels } from "../sim/progression.hml";
+
+import { ai_agent_count, ai_spawn } from "../sim/ai.hml";
+
+import { director_begin, director_wave_state, director_wave, director_tier,
+         director_events, director_alive, director_hold_active,
+         director_wave_budget, director_wave_spawned,
+         DIR_IDLE, DIR_DONE, DIR_EV_HORN, DIR_EV_WAVE_START,
+         DIR_EV_WAVE_CLEAR, DIR_EV_HOLD_DONE, DIR_EV_HOLD_START
+       } from "../sim/director.hml";
+
+import { sim_new_cap, sim_set_chunks, sim_add_player, sim_respawn_player,
+         sim_queue_command, sim_step, sim_player_id, sim_player_dead,
+         sim_predicted, sim_progression, sim_weapon_state, sim_chunks,
+         sim_director, sim_ai, sim_phase, sim_day_t, sim_tier, sim_hash,
+         sim_fx_count, sim_fx_kind, sim_fx_a, sim_fx_b,
+         sim_fx_x, sim_fx_y, sim_fx_z,
+         sim_stat_shots, sim_stat_reloads, sim_stat_deaths,
+         sim_stat_lanterns, sim_stat_spawns, sim_stat_cmds_applied,
+         sim_stat_cmds_stale, sim_stat_cmds_bad,
+         SIM_LANTERN_UNLIT, SIM_LANTERN_LIT, SIM_INTERACT_R_M,
+         SIM_FX_CAP, SIM_MISS
+       } from "../sim/sim.hml";
+
+import { snapshot_new_cap, snapshot_write, snapshot_size, snapshot_count,
+         snapshot_set_radius, snapshot_reset, snapshot_hash,
+         SNAP_CAP } from "../sim/snapshot.hml";
+
+import { transport_poll_commands, transport_set_tick, transport_latency_ms
+       } from "../net/transport.hml";
+
+import { cmdq_new, cmdq_reset, cmdq_count } from "../net/protocol.hml";
+
+// ===========================================================================
+//  1.  CONSTANTS — the script, and the shape of the owner block
+// ===========================================================================
+
+// The player slot this file drives. v1 has one; the sim has four, and the
+// command pipeline is written in slot order for exactly that reason.
+export let SV_PSLOT: i32 = 1;
+
+// The beats of GAME_DESIGN §8, as integers. The CLIENT decides what a beat
+// LOOKS like; the server decides when it happens. Neither can drift, because
+// the id is the only thing that crosses.
+export let SV_BEAT_WAKE: i32    = 0;   // 0:00 black, a bell, the line
+export let SV_BEAT_STAND: i32   = 1;   // 0:03 the camera stands up; control
+export let SV_BEAT_SEEK: i32    = 2;   // 0:06 the lantern is the brightest thing
+export let SV_BEAT_WISPS: i32   = 3;   // 0:10 three Wisps, one shot each
+export let SV_BEAT_MOTE: i32    = 4;   // 0:18 a Mote, two shots, learn reload
+export let SV_BEAT_REACH: i32   = 5;   // 0:24 HOLD [E]
+export let SV_BEAT_CHANNEL: i32 = 6;   // 0:27 the music stops
+export let SV_BEAT_LIT: i32     = 7;   // 0:30 LIGHT
+export let SV_BEAT_HORN: i32    = 8;   // 0:33 the horn, four Husks
+export let SV_BEAT_WAVE: i32    = 9;   // 0:36 wave 1
+export let SV_BEAT_CLEAR: i32   = 10;  // 0:56 silence, ember rain
+export let SV_BEAT_PATH: i32    = 11;  // 0:58 the path of lit lanterns
+export let SV_BEAT_COUNT: i32   = 12;
+
+// Tick offsets from the session start. GAME_DESIGN §8's own numbers x 60 Hz.
+// These are the only schedule constants in the project and they belong here:
+// they are the SCRIPT, not the systems, and no other file may invent one.
+export let SV_T_STAND: i32   = 180;    // 0:03
+export let SV_T_WISPS: i32   = 600;    // 0:10
+export let SV_T_MOTE: i32    = 1080;   // 0:18
+export let SV_T_HORN_LAG: i32 = 180;   // 0:30 lit -> 0:33 horn.  Three seconds.
+export let SV_T_PATH_LAG: i32 = 120;   // 0:56 clear -> 0:58 path.  Two seconds.
+
+// GAME_DESIGN §8: "Three Wisps drift up", "A Mote rises", "Four Husks come up
+// the hill". Literals, from the document, asserted by the probe against these
+// names — not against a config knob that could be retuned without noticing.
+export let SV_N_WISPS: i32 = 3;
+export let SV_N_MOTES: i32 = 1;
+export let SV_N_HUSKS: i32 = 4;
+
+// GAME_DESIGN §8 at 0:06: "40 m ahead, downhill".
+export let SV_LANTERN_M: f64 = 40.0;
+
+// GAME_DESIGN §8 at 0:03: "the ammo counter reads 6 / 12".
+export let SV_START_RESERVE: i32 = 12;
+
+// GAME_DESIGN §8 at 0:58: "a path of small lit lanterns ... leading downhill
+// and to the left, into fog". Five posts on the Wick Line spacing, bearing
+// 40 degrees left of the lantern's bearing.
+export let SV_PATH_N: i32 = 5;
+export let SV_PATH_STEP_M: f64 = 22.0;
+export let SV_PATH_TURN_DEG: f64 = 40.0;
+
+// The session starts here in the 16-minute day so that the dusk horn's own
+// edge (T-2:00, which is the start of DUSK) lands at 0:33 -- the GDD's beat.
+// A player who ignores the lantern still gets the horn on schedule.
+export let SV_T0_DAY: i32 = i32(g_PHASE_DAY_END * f64(g_DAY_TICKS)) - 1980;
+
+// The world entity model ids the client maps to meshes. KIND_AI carries the
+// enemy class in `model` (ai.hml sets `model[slot] = class`), so lanterns and
+// pickups need ids that cannot collide with a class. 90/120 are what
+// `probe_sim.hml` already uses for the same two kinds.
+export let SV_MODEL_LANTERN: i32 = 90;
+export let SV_MODEL_PICKUP: i32  = 120;
+
+// The cosmetic queue the owner block carries. One frame can be several ticks,
+// and the client drains once per tick, so this only has to hold ONE tick's
+// worth -- which sim.hml already caps at SIM_FX_CAP.
+export let SV_FX_CAP: i32 = SIM_FX_CAP;
+
+export let SV_MISS: i32 = -1;
+
+// ===========================================================================
+//  2.  THE HEIGHTFIELD ADAPTER
+// ---------------------------------------------------------------------------
+//  `chunk.hml` takes an INJECTED source (ARCHITECTURE §5.4b) so the store can
+//  be tested without a generator. The boot path owns the adapter; this is the
+//  boot path.
+// ===========================================================================
+
+fn sv_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                   p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let out: i32 = worldgen_chunk_at(p_seed, p_cx, p_cz,
+                                     p_hbuf, p_hoff, p_abuf, p_aoff);
+    return out;
+}
+
+// 256 resident chunks, not 64. The store is sampled by TWO consumers: the sim
+// (a 5x5 pinned ring) and the RENDERER (main.hml's `ground_h`, out to the fog
+// wall, plus the apron's normal taps). One heightfield, two readers -- see
+// main.hml's `ground_h` for why that is not negotiable. 64 slots thrashed.
+export fn server_chunks_new(p_seed: i32): object {
+    let cs: object = chunk_store_new_cap(256, 256, p_seed);
+    chunk_set_source(cs, sv_chunk_source);
+    let out: object = cs;
+    return out;
+}
+
+fn sv_ground(p_cs: object, p_x: f64, p_z: f64): f64 {
+    let h: f64 = chunk_height_at(p_cs, p_x, p_z);
+    if (h <= CHUNK_H_MISS) { h = 0.0; }
+    let out: f64 = h;
+    return out;
+}
+
+// ===========================================================================
+//  3.  THE OWNER BLOCK
+// ---------------------------------------------------------------------------
+//  Everything one client is allowed to know that is not in the entity stream.
+//  Preallocated once; `server_tick` only ever assigns into it.
+// ===========================================================================
+
+fn zeros_i(p_n: i32): array<i32> {
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+fn sv_local_new(): object {
+    let l: object = {
+        tick: -1,
+        // ---- the body ----------------------------------------------------
+        id: ID_NONE,
+        hp: 0,
+        hp_max: 0,
+        dead: 0,
+        respawn_t: 0.0,
+        px: 0.0, py: 0.0, pz: 0.0,
+        eye: 0.0,
+        eye_abs: 0.0,
+        speed: 0.0,
+        grounded: 0,
+        step_dist: 0.0,
+        // ---- the weapon (GAME_DESIGN §8: the ammo counter reads 6 / 12) ---
+        weapon: 0,
+        ammo: 0,
+        reserve: 0,
+        reload_t: 0.0,
+        reload_stage: 0,
+        ads: 0.0,
+        rc_v: 0.0,
+        shots: 0,
+        // ---- progression --------------------------------------------------
+        level: 1,
+        xp_total: 0,
+        xp_into: 0,
+        xp_need: 1,
+        levelups: 0,
+        // ---- the world ----------------------------------------------------
+        phase: 0,
+        day_t: 0.0,
+        tier: 0,
+        alive: 0,
+        wave_state: 0,
+        wave: 0,
+        wave_budget: 0,
+        wave_spawned: 0,
+        dir_events: 0,
+        // ---- the lantern --------------------------------------------------
+        lantern_id: ID_NONE,
+        lantern_x: 0.0, lantern_y: 0.0, lantern_z: 0.0,
+        lantern_lit: 0,
+        lantern_dist: 0.0,
+        chan01: 0.0,
+        in_reach: 0,
+        // ---- the script ---------------------------------------------------
+        beat: SV_BEAT_WAKE,
+        beat_tick: 0,
+        session_tick: 0,
+        // ---- this tick's cosmetics ----------------------------------------
+        fx_n: 0,
+        fx_kind: zeros_i(SV_FX_CAP),
+        fx_a: zeros_i(SV_FX_CAP),
+        fx_b: zeros_i(SV_FX_CAP),
+        fx_x: zeros_f(SV_FX_CAP),
+        fx_y: zeros_f(SV_FX_CAP),
+        fx_z: zeros_f(SV_FX_CAP)
+    };
+    let out: object = l;
+    return out;
+}
+
+// ===========================================================================
+//  4.  CONSTRUCTION
+// ===========================================================================
+
+// `p_transport` may be null: a probe that wants the direct
+// `server_apply_command` path does not need a wire. Everything else is
+// identical either way, which is the property that makes the loopback
+// transport a real test instead of a decoration.
+export fn server_new(p_seed: i32, p_transport): object {
+    let seed: i32 = p_seed;
+
+    let w: object = sim_new_cap(g_MAX_ENTS, 2, seed);
+    let cs: object = server_chunks_new(seed);
+    sim_set_chunks(w, cs);
+
+    let snap: object = snapshot_new_cap(SNAP_CAP);
+    let base: object = snapshot_new_cap(SNAP_CAP);
+
+    let sv: object = {
+        ver: 1,
+        seed: seed,
+        world: w,
+        cs: cs,
+        net: p_transport,
+        rxq: cmdq_new(16),
+        rxcmd: cmd_new(),
+        snap: snap,
+        base: base,
+        local: sv_local_new(),
+        pslot: SV_PSLOT,
+
+        // the session clock: TICK numbers, never milliseconds
+        t0: SV_T0_DAY,
+        tick: SV_T0_DAY - 1,
+        session: 0,
+
+        // the script
+        beat: SV_BEAT_WAKE,
+        beat_tick: 0,
+        wisps_at: SV_T_WISPS,
+        mote_at: SV_T_MOTE,
+        wisps_done: 0,
+        mote_done: 0,
+        horn_at: SV_MISS,
+        husks_done: 0,
+        path_at: SV_MISS,
+        path_done: 0,
+        hold_begun: 0,
+
+        // the lantern of GAME_DESIGN §8
+        lantern_id: ID_NONE,
+        lantern_x: 0.0,
+        lantern_y: 0.0,
+        lantern_z: 0.0,
+        lantern_lit: 0,
+        lantern_lit_tick: SV_MISS,
+
+        // where the player woke up, and which way they were looking
+        spawn_x: 0.0,
+        spawn_z: 0.0,
+        spawn_yaw: 0.0,
+        respawn_t: 0.0,
+
+        // counters
+        supply_t: 0.0,
+        supplied: 0,
+        ticks: 0,
+        cmds_in: 0,
+        bytes_out: 0,
+        snap_bytes: 0,
+        path_lit: 0,
+        deaths: 0
+    };
+
+    server_boot(sv);
+    let out: object = sv;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE OPENING SCENE.
+// ---------------------------------------------------------------------------
+// GAME_DESIGN §8 at 0:06: "40 m ahead, DOWNHILL, an unlit lantern on a post is
+// the only vertical thing on the horizon". Downhill is not decoration — it is
+// what makes "you crest the slope" at 0:10 true. So the spawn bearing is chosen
+// by SAMPLING the terrain: of sixteen bearings, take the one whose 40 m point
+// drops the most. If the ground is flat the fallback is the first bearing, and
+// the beat degrades to "40 m ahead" rather than failing.
+//
+// The spawn itself sits ~270 m from the origin, which is one full SHADE TIER
+// out of town (`g_SHADE_TIER_M` = 200 m). That is not scenery either: the
+// director refuses to run a hold at tier 0 — "a lit lantern's radius is tier 0
+// and tier 0 has no dark in it" — and the lantern is lit at 0:30, three
+// seconds BEFORE the dusk phase bonus arrives. Spawning in town would make
+// `director_begin` a no-op and the 0:36 wave would never come.
+export fn server_boot(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let cs: object = sv.cs;
+
+    // WHERE YOU WAKE UP, AND WHY IT IS SEARCHED FOR RATHER THAN TYPED.
+    //
+    // `director_begin` REFUSES at tier 0 -- "a lit lantern's radius is tier 0
+    // and tier 0 has no dark in it" -- and GAME_DESIGN §8 lights the lantern at
+    // 0:30, three seconds BEFORE dusk adds its phase bonus. So the spawn must
+    // be somewhere `worldgen_shade_tier(seed, cx, cz, 0) >= 1` on its own.
+    // `worldgen_shade_tier` is `floor(d/200) + jitter`, and the jitter can be
+    // negative, so a hardcoded 270 m coordinate is tier 1 for some seeds and
+    // tier 0 for others -- which would silently turn the 0:36 wave into
+    // nothing on a seed nobody tested. Search instead: sixteen bearings on
+    // three rings, first tier >= 1 wins, deterministic in the seed.
+    let sx: f64 = -191.0;
+    let sz: f64 = -191.0;
+    let found: i32 = 0;
+    let ring: i32 = 0;
+    while (ring < 3 && found == 0) {
+        let rr: f64 = 280.0 + f64(ring) * 120.0;
+        let b: i32 = 0;
+        while (b < 16 && found == 0) {
+            let ang: f64 = f64(b) * 0.39269908169872414;
+            let tx: f64 = sin(ang) * rr;
+            let tz: f64 = 0.0 - cos(ang) * rr;
+            let tcx: i32 = i32(floor(tx / g_CHUNK_M));
+            let tcz: i32 = i32(floor(tz / g_CHUNK_M));
+            if (worldgen_shade_tier(p_sv.seed, tcx, tcz, 0) >= 1) {
+                sx = tx;
+                sz = tz;
+                found = 1;
+            }
+            b++;
+        }
+        ring++;
+    }
+    chunk_pin_ring(cs, i32(floor(sx / g_CHUNK_M)), i32(floor(sz / g_CHUNK_M)),
+                   g_RING_RADIUS + 1);
+
+    // Which way is downhill at 40 m?
+    let best_yaw: f64 = 0.0;
+    let best_drop: f64 = -1.0e30;
+    let h0: f64 = sv_ground(cs, sx, sz);
+    let k: i32 = 0;
+    while (k < 16) {
+        let a: f64 = f64(k) * 0.39269908169872414;      // 2pi / 16
+        let tx: f64 = sx + sin(a) * SV_LANTERN_M;
+        let tz: f64 = sz - cos(a) * SV_LANTERN_M;
+        let drop: f64 = h0 - sv_ground(cs, tx, tz);
+        if (drop > best_drop) { best_drop = drop; best_yaw = a; }
+        k++;
+    }
+
+    sv.spawn_x = sx;
+    sv.spawn_z = sz;
+    sv.spawn_yaw = best_yaw;
+
+    sim_add_player(w, sv.pslot, sx, sz);
+
+    // GAME_DESIGN §8 at 0:03: "the ammo counter reads 6 / 12", and at 0:36:
+    // "You have a revolver and 12 rounds. You WILL run out." The running out is
+    // the beat -- it is what makes you melee something and win with 30 HP.
+    // `weapons.hml`'s table gives the Kestrel a 48-round reserve, which is the
+    // right STEADY-STATE number and the wrong OPENING one, so the opening
+    // loadout is set here: the authority owns what a player spawns with, and
+    // `wpn_state_reset` has already run. The literal is the GDD's.
+    let wst: array = sim_weapon_state(w);
+    wst[(sv.pslot - 1) * WS_FIELDS + WS_RES0 + WPN_KESTREL] = f64(SV_START_RESERVE);
+
+    let lx: f64 = sx + sin(best_yaw) * SV_LANTERN_M;
+    let lz: f64 = sz - cos(best_yaw) * SV_LANTERN_M;
+    sv.lantern_id = sv_spawn_lantern(sv, lx, lz, SIM_LANTERN_UNLIT);
+    sv.lantern_x = lx;
+    sv.lantern_z = lz;
+    sv.lantern_y = sv_ground(cs, lx, lz);
+
+    snapshot_set_radius(sv.snap, 0.0);      // v1 has one viewer; cull nothing
+    snapshot_reset(sv.base);
+
+    let out: i32 = 1;
+    return out;
+}
+
+fn sv_spawn_lantern(p_sv: object, p_x: f64, p_z: f64, p_lit: i32): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let slot: i32 = world_spawn(w, KIND_LANTERN, 0);
+    if (slot == SLOT_NONE) { let full: i32 = ID_NONE; return full; }
+    let px = w.px; let py = w.py; let pz = w.pz;
+    let anim = w.anim; let flags = w.flags; let model = w.model;
+    px[slot] = p_x;
+    py[slot] = sv_ground(sv.cs, p_x, p_z);
+    pz[slot] = p_z;
+    anim[slot] = p_lit;
+    model[slot] = SV_MODEL_LANTERN;
+    flags[slot] = flags[slot] | EF_VISIBLE;
+    let out: i32 = world_id_of(w, slot);
+    return out;
+}
+
+// ===========================================================================
+//  5.  THE SCRIPT
+// ---------------------------------------------------------------------------
+//  Pure function of (session tick, world state). No wall clock, no frame count.
+// ===========================================================================
+
+// Spawn `n` bodies of one class on an arc around a point, at a fixed radius.
+// The arc is deterministic: no rng draw, because these are AUTHORED spawns and
+// an authored spawn that moves with the seed is an authored spawn nobody can
+// test. The director's spawns are the random ones and they have their own
+// seeded stream.
+fn sv_spawn_arc(p_sv: object, p_class: i32, p_n: i32,
+                p_cx: f64, p_cz: f64, p_yaw: f64, p_r: f64, p_spread: f64): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let ai: object = sim_ai(w);
+    let n: i32 = p_n;
+    let made: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let f: f64 = 0.0;
+        if (n > 1) { f = f64(i) / f64(n - 1) - 0.5; }
+        let a: f64 = p_yaw + f * p_spread;
+        let x: f64 = p_cx + sin(a) * p_r;
+        let z: f64 = p_cz - cos(a) * p_r;
+        let y: f64 = sv_ground(sv.cs, x, z);
+        // Face the spawn back down its own bearing, at the player.
+        let yw: f64 = a + 3.141592653589793;
+        if (ai_spawn(ai, w, p_class, x, y, z, yw) != ID_NONE) { made++; }
+        i++;
+    }
+    let out: i32 = made;
+    return out;
+}
+
+fn sv_set_beat(p_sv: object, p_beat: i32) {
+    let sv: object = p_sv;
+    let b: i32 = p_beat;
+    if (b <= sv.beat) { return; }
+    sv.beat = b;
+    sv.beat_tick = sv.session;
+}
+
+// The one place the script runs. Called once per tick, AFTER `sim_step`, so
+// every trigger sees the state the tick actually produced.
+fn sv_script(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let s: i32 = sv.session;
+
+    // ---- the timed openers ------------------------------------------------
+    if (s >= SV_T_STAND) { sv_set_beat(sv, SV_BEAT_STAND); }
+    if (s >= SV_T_STAND + 120) { sv_set_beat(sv, SV_BEAT_SEEK); }
+
+    if (sv.wisps_done == 0 && s >= sv.wisps_at) {
+        // GAME_DESIGN §8 at 0:10: "You crest the slope. Three Wisps drift up."
+        // They come from BEYOND the lantern, so cresting the slope is what
+        // reveals them.
+        sv_spawn_arc(sv, g_ENEMY_WISP, SV_N_WISPS,
+                     sv.lantern_x, sv.lantern_z, sv.spawn_yaw, 11.0, 1.1);
+        sv.wisps_done = 1;
+        sv_set_beat(sv, SV_BEAT_WISPS);
+    }
+    if (sv.mote_done == 0 && s >= sv.mote_at) {
+        // 0:18: "A Mote rises from behind a rock." Off to one side, close.
+        sv_spawn_arc(sv, g_ENEMY_MOTE, SV_N_MOTES,
+                     sv.lantern_x, sv.lantern_z,
+                     sv.spawn_yaw - 1.35, 9.0, 0.0);
+        sv.mote_done = 1;
+        sv_set_beat(sv, SV_BEAT_MOTE);
+    }
+
+    // ---- the lantern -------------------------------------------------------
+    let lid: i32 = sv.lantern_id;
+    if (lid != ID_NONE && sv.lantern_lit == 0) {
+        let lslot: i32 = world_slot_of(w, lid);
+        if (lslot != SLOT_NONE) {
+            let anim = w.anim;
+            if (anim[lslot] == SIM_LANTERN_LIT) {
+                sv.lantern_lit = 1;
+                sv.lantern_lit_tick = s;
+                sv.horn_at = s + SV_T_HORN_LAG;
+                sv_set_beat(sv, SV_BEAT_LIT);
+            }
+        }
+    }
+
+    // ---- 0:33 the horn, and four Husks come up the hill --------------------
+    // GAME_DESIGN §8: "It's going to get their attention." The hold is started
+    // by the LANTERN, which is what `director.hml`'s header says
+    // `director_begin` is for; W5-6 will own this call.
+    if (sv.horn_at != SV_MISS && sv.husks_done == 0 && s >= sv.horn_at) {
+        let px: f64 = sv.local.px;
+        let pz: f64 = sv.local.pz;
+        sv_spawn_arc(sv, g_ENEMY_HUSK, SV_N_HUSKS,
+                     px, pz, sv.spawn_yaw + 3.141592653589793, 34.0, 1.0);
+        sv.husks_done = 1;
+        sv_set_beat(sv, SV_BEAT_HORN);
+    }
+    if (sv.hold_begun == 0 && sv.lantern_lit == 1 &&
+        s >= sv.lantern_lit_tick + SV_T_HORN_LAG + 180) {
+        // 0:36. Tier 0 refuses (director.hml), and that refusal is REPORTED
+        // rather than swallowed: `sv.hold_begun` stays 0 and the owner block's
+        // wave state stays IDLE, which the HUD shows.
+        if (director_begin(sim_director(w), sv.tick) == 1) {
+            sv.hold_begun = 1;
+            sv_set_beat(sv, SV_BEAT_WAVE);
+        }
+    }
+
+    // ---- 0:56 the wave clears; 0:58 the path lights ------------------------
+    let de: i32 = director_events(sim_director(w));
+    if ((de & DIR_EV_WAVE_CLEAR) != 0) {
+        sv_set_beat(sv, SV_BEAT_CLEAR);
+        if (sv.path_at == SV_MISS) { sv.path_at = s + SV_T_PATH_LAG; }
+    }
+    if (sv.path_at != SV_MISS && sv.path_done == 0 && s >= sv.path_at) {
+        sv.path_lit = sv_light_the_path(sv);
+        sv.path_done = 1;
+        sv_set_beat(sv, SV_BEAT_PATH);
+    }
+
+    let out: i32 = sv.beat;
+    return out;
+}
+
+// GAME_DESIGN §8 at 0:58: "A path of small lit lanterns fades in, leading
+// downhill and to the left, into fog." Five posts, already lit, on the Wick
+// Line spacing (`g_WICKLINE_M` is the link distance; the posts sit well inside
+// it so the line is unbroken when W5-6 computes it for real).
+fn sv_light_the_path(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let turn: f64 = SV_PATH_TURN_DEG * 0.017453292519943295;
+    let a: f64 = sv.spawn_yaw - turn;              // left of the bearing you walked
+    let x: f64 = sv.lantern_x;
+    let z: f64 = sv.lantern_z;
+    let made: i32 = 0;
+    let i: i32 = 0;
+    while (i < SV_PATH_N) {
+        x = x + sin(a) * SV_PATH_STEP_M;
+        z = z - cos(a) * SV_PATH_STEP_M;
+        a = a - turn * 0.25;                       // it curves away, into fog
+        if (sv_spawn_lantern(sv, x, z, SIM_LANTERN_LIT) != ID_NONE) { made++; }
+        i++;
+    }
+    let out: i32 = made;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE LIT LANTERN TOPS YOU UP.  This is what makes the hold survivable.
+// ---------------------------------------------------------------------------
+// GAME_DESIGN's lantern is not a checkpoint, it is a supply: BUILD_PLAN W5-6
+// lists "respawn and ammo top-up" among `lantern.hml`'s duties, and §2.6's
+// whole thesis is "you are at a lantern or you are prey".
+//
+// It is implemented HERE, now, because without it the first sixty seconds do
+// not close. MEASURED, `tools/probe_game.hml` §E with a perfect-aim bot: 18
+// rounds (6 + 12), 18 shots fired, 4 reloads, 20 hostiles still standing when
+// the wave-1 budget (tier 1 wave 0 = 105 points) had spent itself. The GDD's
+// answer at 0:36 is "You will run out. You will MELEE something" — and melee
+// is not implemented anywhere in `src/sim/**`: `BTN_MELEE` exists in
+// `command.hml`, `DMG_MELEE` exists in `combat.hml`, and nothing reads either.
+// REPORTED, not patched: a melee swing is a weapon rule and belongs in
+// `weapons.hml` + `sim.hml` stage (c), not in the integrator, because a rule
+// applied outside `sim_step` would not survive a replay.
+//
+// So the survivable version of the beat is the one the design already had: the
+// light gives you rounds. One round every `SV_SUPPLY_S` while you stand inside
+// a lit lantern's tier-1 radius, up to the opening reserve and no further.
+// When `lantern.hml` lands, this moves there and this function is deleted.
+export let SV_SUPPLY_S: f64 = 0.8;
+
+fn sv_lantern_supply(p_sv: object) {
+    let sv: object = p_sv;
+    if (sv.lantern_lit == 0) { return; }
+    let l: object = sv.local;
+    if (l.dead == 1) { sv.supply_t = 0.0; return; }
+
+    let dx: f64 = sv.lantern_x - l.px;
+    let dz: f64 = sv.lantern_z - l.pz;
+    if (dx * dx + dz * dz > g_LANTERN_R_T1 * g_LANTERN_R_T1) {
+        sv.supply_t = 0.0;
+        return;
+    }
+
+    let w: object = sv.world;
+    let wst: array = sim_weapon_state(w);
+    let off: i32 = (sv.pslot - 1) * WS_FIELDS;
+    let cur: i32 = wpn_cur(wst, off);
+    if (cur < 0) { return; }
+    let have: i32 = i32(wst[off + WS_RES0 + cur]);
+    if (have >= SV_START_RESERVE) { sv.supply_t = 0.0; return; }
+
+    sv.supply_t = sv.supply_t + g_TICK_DT;
+    if (sv.supply_t >= SV_SUPPLY_S) {
+        sv.supply_t = sv.supply_t - SV_SUPPLY_S;
+        wst[off + WS_RES0 + cur] = f64(have + 1);
+        sv.supplied = sv.supplied + 1;
+    }
+}
+
+// ===========================================================================
+//  6.  COMMANDS
+// ===========================================================================
+
+// The direct path. `sim_queue_command` COPIES, so the caller's command is
+// never aliased.
+export fn server_apply_command(p_sv: object, p_pslot: i32, p_cmd: object): i32 {
+    let sv: object = p_sv;
+    let out: i32 = sim_queue_command(sv.world, p_pslot, p_cmd);
+    if (out == 1) { sv.cmds_in = sv.cmds_in + 1; }
+    return out;
+}
+
+// The wire path. The transport hands back the nine integers exactly as the
+// client quantised them; rebuilding the command by assignment (rather than
+// through `cmd_set`) is deliberate — `cmd_set` QUANTISES, and quantising an
+// already-quantised axis is how a wire value silently changes in transit.
+fn sv_drain_transport(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let t = sv.net;
+    if (t == null) { let none: i32 = 0; return none; }
+
+    let q: object = sv.rxq;
+    cmdq_reset(q);
+    transport_poll_commands(t, q);
+    let n: i32 = cmdq_count(q);
+    if (n < 1) { let zero: i32 = 0; return zero; }
+
+    let c: object = sv.rxcmd;
+    let qt = q.tick;   let qs = q.seq;
+    let qx = q.move_x; let qy = q.move_y;
+    let qa = q.yaw_q;  let qp = q.pitch_q;
+    let qb = q.buttons; let qw = q.weapon_sel; let qd = q.dt_ms;
+
+    let got: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        c.tick = qt[i];
+        c.seq = qs[i];
+        c.move_x = qx[i];
+        c.move_y = qy[i];
+        c.yaw_q = qa[i];
+        c.pitch_q = qp[i];
+        c.buttons = qb[i];
+        c.weapon_sel = qw[i];
+        c.dt_ms = qd[i];
+        if (sim_queue_command(sv.world, sv.pslot, c) == 1) { got++; }
+        i++;
+    }
+    sv.cmds_in = sv.cmds_in + got;
+    let out: i32 = got;
+    return out;
+}
+
+// ===========================================================================
+//  7.  THE TICK
+// ---------------------------------------------------------------------------
+//  ARCHITECTURE §3's inner loop, server half:
+//
+//      transport_send_command(net, cmd)     <- the client, before this
+//      server_tick(sv, tick)                <- HERE
+//      client_apply(cl, tick)               <- the client, after this
+//
+//  Order inside: advance the wire clock, drain, step, script, publish. The
+//  wire clock advances FIRST so that a command posted for delivery on this
+//  tick is delivered on this tick and not one late; `transport.hml` gates
+//  delivery on `now_ms`, and `now_ms` is a tick boundary by construction.
+// ===========================================================================
+
+export fn server_tick(p_sv: object, p_tick: i32): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let tick: i32 = p_tick;
+
+    sv.tick = tick;
+    sv.session = tick - sv.t0;
+
+    let t = sv.net;
+    if (t != null) { transport_set_tick(t, tick, g_TICK_MS); }
+    sv_drain_transport(sv);
+
+    sim_step(w, tick);
+
+    // Death and the 4-second respawn. `sim_respawn_player` is the PRIMITIVE
+    // and sim.hml's header says the TIMER is game policy and belongs to W4-11.
+    // This is W4-11.
+    if (sim_player_dead(w, sv.pslot) == 1) {
+        if (sv.respawn_t <= 0.0) {
+            sv.respawn_t = g_RESPAWN_S;
+            sv.deaths = sv.deaths + 1;
+        } else {
+            sv.respawn_t = sv.respawn_t - g_TICK_DT;
+            if (sv.respawn_t <= 0.0) {
+                // A lit lantern is where you come back. BUILD_PLAN W5-6 lists
+                // "respawn and ammo top-up" as the lantern's, and it is the
+                // reason lighting one is worth 2.5 s of standing still. Until
+                // the lantern lives in its own module, the authority owns it.
+                let rx: f64 = sv.spawn_x;
+                let rz: f64 = sv.spawn_z;
+                if (sv.lantern_lit == 1) {
+                    rx = sv.lantern_x;
+                    rz = sv.lantern_z;
+                }
+                sim_respawn_player(w, sv.pslot, rx, rz);
+                sv.respawn_t = 0.0;
+            }
+        }
+    } else {
+        sv.respawn_t = 0.0;
+    }
+
+    sv_script(sv);
+    sv_lantern_supply(sv);
+    sv_publish(sv);
+
+    sv.ticks = sv.ticks + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PUBLISH — the two things that leave this file, filled in one place.
+// ---------------------------------------------------------------------------
+fn sv_publish(p_sv: object) {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let l: object = sv.local;
+    let k: i32 = sv.pslot - 1;
+
+    l.tick = sv.tick;
+    l.session_tick = sv.session;
+    l.beat = sv.beat;
+    l.beat_tick = sv.beat_tick;
+
+    // ---- the body ---------------------------------------------------------
+    let id: i32 = sim_player_id(w, sv.pslot);
+    l.id = id;
+    let ps: array<f64> = sim_predicted(w, sv.pslot);
+    l.px = move_px(ps);
+    l.py = move_py(ps);
+    l.pz = move_pz(ps);
+    // `rsnap_set_eye_height` wants the OFFSET above the feet, and
+    // `move_eye_y` returns the ABSOLUTE eye height (`PS_PY + PS_EYE`). Publish
+    // both, named for what they are: adding the absolute one to the feet is a
+    // camera thirty metres in the air and it looks exactly like a fog bug.
+    l.eye = ps[PS_EYE];
+    l.eye_abs = move_eye_y(ps);
+    l.grounded = move_grounded(ps);
+    l.step_dist = ps[PS_STEP_DIST];
+    let vx: f64 = ps[PS_VX];
+    let vz: f64 = ps[PS_VZ];
+    l.speed = sqrt(vx * vx + vz * vz);
+
+    let slot: i32 = SLOT_NONE;
+    if (id != ID_NONE) { slot = world_slot_of(w, id); }
+    if (slot != SLOT_NONE) {
+        let hp = w.hp;
+        let hpm = w.hp_max;
+        l.hp = hp[slot];
+        l.hp_max = hpm[slot];
+    }
+    l.dead = sim_player_dead(w, sv.pslot);
+    l.respawn_t = sv.respawn_t;
+
+    // ---- the weapon -------------------------------------------------------
+    let wst: array = sim_weapon_state(w);
+    let off: i32 = k * WS_FIELDS;
+    let cur: i32 = wpn_cur(wst, off);
+    l.weapon = cur;
+    l.ammo = wpn_ammo(wst, off, cur);
+    l.reserve = wpn_reserve_ammo(wst, off, cur);
+    l.reload_t = wst[off + WS_RELOAD_T];
+    l.reload_stage = i32(wst[off + WS_RELOAD_ON]);
+    l.ads = wst[off + WS_ADS];
+    l.rc_v = wst[off + WS_RC_V];
+    l.shots = i32(wst[off + WS_SHOTS]);
+
+    // ---- progression ------------------------------------------------------
+    let pr: array = sim_progression(w, sv.pslot);
+    l.level = prog_level(pr);
+    l.xp_total = prog_xp_total(pr);
+    l.xp_into = prog_xp_into(pr);
+    l.xp_need = prog_xp_needed(pr);
+    l.levelups = prog_last_levels(pr);
+
+    // ---- the world --------------------------------------------------------
+    l.phase = sim_phase(w);
+    l.day_t = sim_day_t(w);
+    l.tier = sim_tier(w);
+    let d: object = sim_director(w);
+    l.wave_state = director_wave_state(d);
+    l.wave = director_wave(d);
+    l.wave_budget = director_wave_budget(d);
+    l.wave_spawned = director_wave_spawned(d);
+    l.dir_events = director_events(d);
+    l.alive = director_alive(d);
+
+    // ---- the lantern ------------------------------------------------------
+    l.lantern_id = sv.lantern_id;
+    l.lantern_x = sv.lantern_x;
+    l.lantern_y = sv.lantern_y;
+    l.lantern_z = sv.lantern_z;
+    l.lantern_lit = sv.lantern_lit;
+    let dx: f64 = sv.lantern_x - l.px;
+    let dz: f64 = sv.lantern_z - l.pz;
+    let dy: f64 = sv.lantern_y - l.py;
+    let dist: f64 = sqrt(dx * dx + dy * dy + dz * dz);
+    l.lantern_dist = dist;
+    let reach: i32 = 0;
+    if (dist <= SIM_INTERACT_R_M && sv.lantern_lit == 0) { reach = 1; }
+    l.in_reach = reach;
+    if (reach == 1) { sv_set_beat(sv, SV_BEAT_REACH); }
+
+    // The channel is sim state; the client only ever sees the FRACTION, which
+    // is what the ring on the HUD is.
+    let s: object = w.sim;
+    let chan = s.chan_t;
+    let c01: f64 = clamp01(chan[k] / g_LANTERN_CHANNEL_S);
+    l.chan01 = c01;
+    if (c01 > 0.0) { sv_set_beat(sv, SV_BEAT_CHANNEL); }
+    l.beat = sv.beat;
+    l.beat_tick = sv.beat_tick;
+
+    // ---- this tick's cosmetics -------------------------------------------
+    let n: i32 = sim_fx_count(w);
+    if (n > SV_FX_CAP) { n = SV_FX_CAP; }
+    let fk = l.fx_kind; let fa = l.fx_a; let fb = l.fx_b;
+    let fx = l.fx_x; let fy = l.fx_y; let fz = l.fx_z;
+    let i: i32 = 0;
+    while (i < n) {
+        fk[i] = sim_fx_kind(w, i);
+        fa[i] = sim_fx_a(w, i);
+        fb[i] = sim_fx_b(w, i);
+        fx[i] = sim_fx_x(w, i);
+        fy[i] = sim_fx_y(w, i);
+        fz[i] = sim_fx_z(w, i);
+        i++;
+    }
+    l.fx_n = n;
+
+    // ---- THE PACKET -------------------------------------------------------
+    // A full write every tick. v1 has one viewer on a loopback and a delta
+    // needs the client's acknowledged baseline to be tracked, which is v2's
+    // job (`snapshot_copy` promotes it, and the field is already here). The
+    // bytes are real either way, and `client.hml` decodes them with the real
+    // decoder.
+    let bytes: i32 = snapshot_write(sv.snap, w, sv.pslot, sv.base);
+    sv.snap_bytes = bytes;
+    sv.bytes_out = sv.bytes_out + bytes;
+}
+
+// ===========================================================================
+//  8.  READERS
+// ===========================================================================
+
+// THE PACKET. In v2 this is what `transport_send_snapshot` puts on the wire.
+export fn server_snapshot(p_sv: object): object {
+    let sv: object = p_sv;
+    let out: object = sv.snap;
+    return out;
+}
+
+// THE OWNER BLOCK.
+export fn server_local(p_sv: object): object {
+    let sv: object = p_sv;
+    let out: object = sv.local;
+    return out;
+}
+
+// THE WORLD. Loopback only, and named so that its one legitimate caller
+// (`main.hml`, for the sim-side hash and the headless probe) is visible in a
+// grep. `client.hml` does not call it and must never call it: the client's
+// whole claim is that it reads the packet and the owner block and nothing
+// else, and that claim is what makes v2 a decode call.
+export fn server_world(p_sv: object): object {
+    let sv: object = p_sv;
+    let out: object = sv.world;
+    return out;
+}
+
+export fn server_chunks(p_sv: object): object {
+    let sv: object = p_sv;
+    let out: object = sv.cs;
+    return out;
+}
+
+export fn server_seed(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.seed; return o; }
+export fn server_t0(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.t0; return o; }
+export fn server_tick_now(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.tick; return o; }
+export fn server_session(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.session; return o; }
+export fn server_beat(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.beat; return o; }
+export fn server_beat_tick(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.beat_tick; return o; }
+export fn server_ticks(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.ticks; return o; }
+export fn server_cmds_in(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.cmds_in; return o; }
+export fn server_snap_bytes(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.snap_bytes; return o; }
+export fn server_bytes_out(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.bytes_out; return o; }
+export fn server_lantern_id(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.lantern_id; return o; }
+export fn server_lantern_lit(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.lantern_lit; return o; }
+export fn server_lantern_x(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.lantern_x; return o; }
+export fn server_lantern_z(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.lantern_z; return o; }
+export fn server_spawn_x(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.spawn_x; return o; }
+export fn server_spawn_z(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.spawn_z; return o; }
+export fn server_spawn_yaw(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.spawn_yaw; return o; }
+export fn server_path_lit(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.path_lit; return o; }
+export fn server_hold_begun(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.hold_begun; return o; }
+export fn server_deaths(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.deaths; return o; }
+export fn server_supplied(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.supplied; return o; }
+
+export fn server_hash(p_sv: object): u64 {
+    let sv: object = p_sv;
+    let out: u64 = sim_hash(sv.world);
+    return out;
+}
+
+export fn server_enemies_alive(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let out: i32 = ai_agent_count(sim_ai(sv.world));
+    return out;
+}
+
+// The shade tier the player is standing in, without stepping the sim. The HUD
+// shows it and the probe asserts it is >= 1 at spawn — see `server_boot`.
+export fn server_tier_at(p_sv: object, p_x: f64, p_z: f64, p_bonus: i32): i32 {
+    let sv: object = p_sv;
+    let cx: i32 = i32(floor(p_x / g_CHUNK_M));
+    let cz: i32 = i32(floor(p_z / g_CHUNK_M));
+    let out: i32 = worldgen_shade_tier(sv.seed, cx, cz, p_bonus);
+    return out;
+}
+
+export fn server_beat_name(p_b: i32): string {
+    let b: i32 = p_b;
+    if (b == SV_BEAT_WAKE) { let s: string = "WAKE"; return s; }
+    if (b == SV_BEAT_STAND) { let s: string = "STAND"; return s; }
+    if (b == SV_BEAT_SEEK) { let s: string = "SEEK"; return s; }
+    if (b == SV_BEAT_WISPS) { let s: string = "WISPS"; return s; }
+    if (b == SV_BEAT_MOTE) { let s: string = "MOTE"; return s; }
+    if (b == SV_BEAT_REACH) { let s: string = "REACH"; return s; }
+    if (b == SV_BEAT_CHANNEL) { let s: string = "CHANNEL"; return s; }
+    if (b == SV_BEAT_LIT) { let s: string = "LIT"; return s; }
+    if (b == SV_BEAT_HORN) { let s: string = "HORN"; return s; }
+    if (b == SV_BEAT_WAVE) { let s: string = "WAVE"; return s; }
+    if (b == SV_BEAT_CLEAR) { let s: string = "CLEAR"; return s; }
+    if (b == SV_BEAT_PATH) { let s: string = "PATH"; return s; }
+    let s2: string = "?";
+    return s2;
+}

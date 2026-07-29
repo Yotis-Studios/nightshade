@@ -528,3 +528,40 @@ name whose types differ and emit a diagnostic.
 ### Severity
 
 🔴 Silent wrong answer, compiled-only, no diagnostic, and the two declarations can be far apart.
+
+### Addendum (2026-07-29, W4-9, `src/sim/snapshot.hml`) — the same bug can also fail LOUDLY
+
+H-11 does not always corrupt silently. If the earlier block-scoped `f64` is used in an
+*arithmetic* expression, the retype makes `hemlockc` emit an i32 overflow check against a C
+`double` and the build dies in the C compiler instead:
+
+```hemlock
+fn f(p_on: i32): f64 {
+    let acc: f64 = 0.0;
+    if (p_on == 1) {
+        let r: f64 = 2.5;
+        acc = r * r;             // <-- becomes an i32 multiply on a `double`
+    }
+    let r: i32 = 0;              // same name, function scope, i32 — DECLARED LATER
+    while (r < 3) { r++; }
+    let out: f64 = acc + f64(r);
+    return out;
+}
+fn main() { print(f(1)); }
+main();
+```
+
+```
+hemlockc --check repro.hml        ->  no errors
+hemlock  repro.hml                ->  9.25            (interpreter: correct)
+hemlockc -O1 repro.hml -o /tmp/r  ->  /tmp/hemlock_*.c: error: argument 1 in call to function
+                                      '__builtin_mul_overflow' does not have integral type
+                                      C compilation failed with status 1
+```
+
+Two things worth recording. **(a)** This symptom is strictly better than the silent truncation
+W2-8 hit — the build stops — so if you meet it, the fix is H-11's workaround (rename), not a
+hunt through the C. **(b)** `hemlockc --check` passes on a program `hemlockc -O1` cannot build,
+which is the same diagnostic gap as H-4: `--check` is not a build. Criterion A of the six is
+genuinely weaker than criterion B, and a task that stops at `--check` has verified less than it
+thinks.

@@ -1,0 +1,982 @@
+// =============================================================================
+//  snapshot.hml — the authoritative world state, serialised for ONE VIEWER.
+//                                                                    W4-9.
+// =============================================================================
+//
+//  ARCHITECTURE §5.4:
+//      `snapshot_write(world, viewer_slot, baseline)` / `snapshot_read`.
+//      **Always takes a viewer** so interest management has a home.
+//
+//  THIS IS NOT `render_snapshot.hml`.  Two different objects, two different
+//  jobs, and confusing them is the single most likely way to break the v2 seam:
+//
+//    src/sim/snapshot.hml      (this file)   the SERVER's view of the world,
+//        quantised to the wire grid, delta-encoded against a baseline, and
+//        interest-managed for one viewer.  It is what a packet CONTAINS.
+//        It lives under src/sim because the authority produces it and because
+//        `src/render/**` may not import `src/net/**`.
+//
+//    src/render/render_snapshot.hml          the RENDERER's view: two decoded
+//        states plus an alpha, linearly blended, in render flag space.  It is
+//        what a frame DRAWS.
+//
+//  The two meet at exactly one point, and it is deliberate: the object this
+//  file produces carries the field names `rsnap_ingest` reads —
+//  `count, tick, id, px, py, pz, yaw, pitch, model, anim, tint, flags` —
+//  which are field-for-field `rsnap_netframe_new`'s.  So in v2:
+//
+//      snapshot_read(frame, decoded_packet, baseline);      // this file
+//      rsnap_build_from_net(g_rsnap, frame, alpha);         // render_snapshot
+//
+//  is the whole client ingest path, and it is proven in v1 by the probe rather
+//  than discovered in v2 by a rewrite.
+//
+// -----------------------------------------------------------------------------
+//  WHY EVERYTHING IS QUANTISED BEFORE IT IS STORED
+// -----------------------------------------------------------------------------
+//  `snapshot_write` writes the DEQUANTISED value back into its own arrays, not
+//  the raw f64 it read from the world.  That is not sloppiness, it is the point:
+//
+//    * the number the client will see is then the number the server recorded,
+//      so a desync cannot hide inside the rounding (the same argument
+//      `combat.hml` makes for quantising event positions at push time);
+//    * `snapshot_read(dst, src, baseline)` can be asserted BIT-IDENTICAL to
+//      `snapshot_write`'s output — a round-trip test with no epsilon in it;
+//    * a v2 predicting client compares its own predicted position against the
+//      server's on the same grid, so the reconciliation threshold is about
+//      prediction error and not about f64 formatting.
+//
+//  Positions ride the 1/16 m grid (`SNAP_POS_Q_PER_M`), angles ride
+//  `command.hml`'s 65536-step grid through `q_ang`/`dq_ang`.  There is exactly
+//  ONE angle quantiser in this project and it is command.hml's; a second one
+//  would be a divergence with a six-month fuse.
+//
+// -----------------------------------------------------------------------------
+//  THE WIRE FORM
+// -----------------------------------------------------------------------------
+//      offset  size  field
+//      0       2     u16   count          entities in this snapshot
+//      2       2     u16   n_removed      ids present in the baseline, gone now
+//      4       4     i32   tick
+//      8       4     i32   viewer_id
+//      12      1     u8    mode           SNAP_MODE_FULL / SNAP_MODE_DELTA
+//      13      4*n   i32   removed ids
+//      then, per entity, in world slot order:
+//              4     i32   id
+//              1     u8    mask           SNAP_F_* bits; SNAP_F_NEW => all set
+//        POS  12     i32   x, y, z        1/16 m
+//        ANG   4     u16   yaw, pitch
+//        MDL   2     u8    model, anim
+//        TNT   4     i32   tint           packed RGB
+//        FLG   1     u8    flags
+//        HP    2     u16   hp
+//
+//  A record is 5 bytes when nothing about an entity changed and 30 when
+//  everything did.  `snapshot_size` reports the exact byte count of the last
+//  write, so the delta's value is measurable rather than asserted.
+//
+//  Removals are carried even though the decoder does not need them to
+//  RECONSTRUCT — every present entity appears in the record list, so the set is
+//  already implied.  They are on the wire because the client needs a despawn
+//  EVENT (dissolve, sound, killfeed), and deriving one from a set difference at
+//  the far end is how a corpse silently disappears instead of dissolving.
+//
+// -----------------------------------------------------------------------------
+//  THE IMPORT WALL
+// -----------------------------------------------------------------------------
+//  `src/sim/**` may import `@stdlib/math`, other `src/sim/**` and `src/core/**`.
+//  This file imports `src/core/config.hml` (caps and the stream radius),
+//  `src/sim/world.hml` (the SoA field names and the EF_* bits) and
+//  `src/sim/command.hml` (the ONE angle quantiser).  Nothing else, and no
+//  wall clock (`ci_imports.sh` R8).
+// =============================================================================
+
+import { g_MAX_RENDER_ENTS, g_STREAM_IN_M } from "../core/config.hml";
+
+import { EF_NO_REPLICATE, KIND_COSMETIC, ID_NONE, SLOT_NONE,
+         world_id_of } from "./world.hml";
+
+import { q_ang, dq_ang } from "./command.hml";
+
+// ---------------------------------------------------------------------------
+// CAPACITY AND GRID
+// ---------------------------------------------------------------------------
+// Mirrors `g_MAX_RENDER_ENTS` (256): a snapshot that carried more entities than
+// the renderer can draw would spend bandwidth on rows the client discards.
+export let SNAP_CAP = g_MAX_RENDER_ENTS;
+
+// The wire position grid.  1/16 m = 6.25 cm, the same grid `combat.hml`
+// quantises event positions onto (`EV_Q_PER_M`).  Two grids would put a hit
+// spark 3 cm off the body it came from.
+export let SNAP_POS_Q_PER_M = 16.0;
+export let SNAP_POS_Q_INV   = 0.0625;
+
+// Default interest radius.  `g_STREAM_IN_M` (72 m) is the distance at which the
+// world itself streams in, and replicating an entity the client cannot possibly
+// have terrain for is pure waste.  0 disables the cull.
+export let SNAP_RADIUS_DEFAULT = g_STREAM_IN_M;
+
+export let SNAP_MISS = -1;
+
+// ---------------------------------------------------------------------------
+// THE WIRE LAYOUT — every one of these is asserted by the probe
+// ---------------------------------------------------------------------------
+export let SNAP_HDR_B      = 13;
+export let SNAP_REM_B      = 4;
+export let SNAP_REC_MIN_B  = 5;     // id + mask, nothing changed
+export let SNAP_REC_MAX_B  = 30;    // id + mask + every field
+
+export let SNAP_OFF_COUNT  = 0;
+export let SNAP_OFF_NREM   = 2;
+export let SNAP_OFF_TICK   = 4;
+export let SNAP_OFF_VIEWER = 8;
+export let SNAP_OFF_MODE   = 12;
+
+export let SNAP_MODE_FULL  = 0;
+export let SNAP_MODE_DELTA = 1;
+
+// Change-mask bits.
+export let SNAP_F_POS   = 1;
+export let SNAP_F_ANG   = 2;
+export let SNAP_F_MODEL = 4;
+export let SNAP_F_TINT  = 8;
+export let SNAP_F_FLAGS = 16;
+export let SNAP_F_HP    = 32;
+export let SNAP_F_NEW   = 64;    // not in the baseline: every field is present
+export let SNAP_F_ALL   = 63;
+
+let SNAP_PI  = 3.141592653589793;
+let SNAP_TAU = 6.283185307179586;
+
+// Identity, so `snapshot_write` can refuse to delta a snapshot against ITSELF.
+// Hemlock has no reference-equality operator (`a == b` on two arrays raises
+// "Cannot perform numeric operation on non-numeric types"), so identity is a
+// small integer handed out at construction.  It is never hashed, never written
+// to the wire, and never read by anything but the aliasing guard.
+let g_snap_uid: i32 = 0;
+
+// ---------------------------------------------------------------------------
+// ALLOCATION — all of it, here, once
+// ---------------------------------------------------------------------------
+
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// A snapshot sized for the shipping cap.
+export fn snapshot_new(): object {
+    let out: object = snapshot_new_cap(SNAP_CAP);
+    return out;
+}
+
+// A snapshot holding at most `p_cap` entities.  The byte buffer is sized for
+// the worst case — every entity new, every entity removed — so `snapshot_write`
+// can never overflow it and never needs to allocate.
+export fn snapshot_new_cap(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let nbytes: i32 = SNAP_HDR_B + cap * SNAP_REM_B + cap * SNAP_REC_MAX_B;
+
+    g_snap_uid = g_snap_uid + 1;
+    let s: object = {
+        cap: cap,
+        uid: g_snap_uid,
+        // ---- the decoded state.  THESE NAMES ARE `rsnap_ingest`'s. --------
+        count: 0,
+        tick: -1,
+        id: zeros_i(cap),
+        px: zeros_f(cap),
+        py: zeros_f(cap),
+        pz: zeros_f(cap),
+        yaw: zeros_f(cap),
+        pitch: zeros_f(cap),
+        model: zeros_i(cap),
+        anim: zeros_i(cap),
+        tint: zeros_i(cap),
+        flags: zeros_i(cap),
+        // ---- carried for the HUD; not part of the render ingest -----------
+        hp: zeros_i(cap),
+        kind: zeros_i(cap),
+
+        // ---- the quantised integers, kept so a delta compares integers ----
+        qx: zeros_i(cap),
+        qy: zeros_i(cap),
+        qz: zeros_i(cap),
+        qyaw: zeros_i(cap),
+        qpitch: zeros_i(cap),
+
+        // ---- the wire form ------------------------------------------------
+        buf: buffer(nbytes),
+        bytes: 0,
+        mode: SNAP_MODE_FULL,
+        viewer_id: ID_NONE,
+        removed: zeros_i(cap),
+        n_removed: 0,
+
+        // ---- interest management ------------------------------------------
+        radius: SNAP_RADIUS_DEFAULT,
+
+        // ---- counters. Every drop is visible. -----------------------------
+        writes: 0,
+        reads: 0,
+        dropped: 0,      // over cap
+        culled: 0,       // outside the interest radius
+        skipped: 0,      // EF_NO_REPLICATE / cosmetic
+        bytes_total: 0,
+        full_records: 0,
+        delta_records: 0
+    };
+    let out: object = s;
+    return out;
+}
+
+// Empty it without freeing anything.  A reset snapshot is a legal baseline: it
+// has no entities, so every record in the next write is SNAP_F_NEW.
+export fn snapshot_reset(p_s: object) {
+    let s: object = p_s;
+    s.count = 0;
+    s.tick = -1;
+    s.bytes = 0;
+    s.mode = SNAP_MODE_FULL;
+    s.n_removed = 0;
+    s.viewer_id = ID_NONE;
+}
+
+// The interest radius in metres.  0 replicates the whole world, which is what
+// a headless determinism test and `tools/replay.hml` want.
+export fn snapshot_set_radius(p_s: object, p_r: f64) {
+    let s: object = p_s;
+    let r: f64 = p_r;
+    if (r < 0.0) { r = 0.0; }
+    s.radius = r;
+}
+
+export fn snapshot_uid(p_s: object): i32 { let s: object = p_s; let out: i32 = s.uid; return out; }
+export fn snapshot_radius(p_s: object): f64 { let s: object = p_s; let out: f64 = s.radius; return out; }
+export fn snapshot_count(p_s: object): i32 { let s: object = p_s; let out: i32 = s.count; return out; }
+export fn snapshot_cap(p_s: object): i32 { let s: object = p_s; let out: i32 = s.cap; return out; }
+export fn snapshot_tick(p_s: object): i32 { let s: object = p_s; let out: i32 = s.tick; return out; }
+export fn snapshot_viewer(p_s: object): i32 { let s: object = p_s; let out: i32 = s.viewer_id; return out; }
+export fn snapshot_mode(p_s: object): i32 { let s: object = p_s; let out: i32 = s.mode; return out; }
+export fn snapshot_removed_count(p_s: object): i32 { let s: object = p_s; let out: i32 = s.n_removed; return out; }
+export fn snapshot_dropped(p_s: object): i32 { let s: object = p_s; let out: i32 = s.dropped; return out; }
+export fn snapshot_culled(p_s: object): i32 { let s: object = p_s; let out: i32 = s.culled; return out; }
+export fn snapshot_skipped(p_s: object): i32 { let s: object = p_s; let out: i32 = s.skipped; return out; }
+export fn snapshot_writes(p_s: object): i32 { let s: object = p_s; let out: i32 = s.writes; return out; }
+export fn snapshot_reads(p_s: object): i32 { let s: object = p_s; let out: i32 = s.reads; return out; }
+export fn snapshot_full_records(p_s: object): i32 { let s: object = p_s; let out: i32 = s.full_records; return out; }
+export fn snapshot_delta_records(p_s: object): i32 { let s: object = p_s; let out: i32 = s.delta_records; return out; }
+export fn snapshot_bytes_total(p_s: object): i32 { let s: object = p_s; let out: i32 = s.bytes_total; return out; }
+export fn snapshot_buffer(p_s: object): buffer { let s: object = p_s; let b = s.buf; return b; }
+
+export fn snapshot_removed_id(p_s: object, p_i: i32): i32 {
+    let s: object = p_s;
+    let i: i32 = p_i;
+    if (i < 0 || i >= s.n_removed) { let bad: i32 = ID_NONE; return bad; }
+    let a = s.removed;
+    let out: i32 = a[i];
+    return out;
+}
+
+// Bytes the LAST write produced.  ARCHITECTURE §5.4 names this `snapshot_size`.
+export fn snapshot_size(p_s: object): i32 {
+    let s: object = p_s;
+    let out: i32 = s.bytes;
+    return out;
+}
+
+// The field arrays, for a caller that wants to walk them without re-reading
+// object fields per entity.  Hoist once per snapshot, never per entity.
+export fn snapshot_field_id(p_s: object): array<i32> { let s: object = p_s; let a = s.id; return a; }
+export fn snapshot_field_px(p_s: object): array<f64> { let s: object = p_s; let a = s.px; return a; }
+export fn snapshot_field_py(p_s: object): array<f64> { let s: object = p_s; let a = s.py; return a; }
+export fn snapshot_field_pz(p_s: object): array<f64> { let s: object = p_s; let a = s.pz; return a; }
+export fn snapshot_field_yaw(p_s: object): array<f64> { let s: object = p_s; let a = s.yaw; return a; }
+export fn snapshot_field_pitch(p_s: object): array<f64> { let s: object = p_s; let a = s.pitch; return a; }
+export fn snapshot_field_model(p_s: object): array<i32> { let s: object = p_s; let a = s.model; return a; }
+export fn snapshot_field_anim(p_s: object): array<i32> { let s: object = p_s; let a = s.anim; return a; }
+export fn snapshot_field_tint(p_s: object): array<i32> { let s: object = p_s; let a = s.tint; return a; }
+export fn snapshot_field_flags(p_s: object): array<i32> { let s: object = p_s; let a = s.flags; return a; }
+export fn snapshot_field_hp(p_s: object): array<i32> { let s: object = p_s; let a = s.hp; return a; }
+export fn snapshot_field_kind(p_s: object): array<i32> { let s: object = p_s; let a = s.kind; return a; }
+
+// Row of `p_id`, or SNAP_MISS.  Linear; a snapshot is at most 256 rows and this
+// is not a per-frame call.
+export fn snapshot_index_of(p_s: object, p_id: i32): i32 {
+    let s: object = p_s;
+    let want: i32 = p_id;
+    let ids = s.id;
+    let n: i32 = s.count;
+    let i: i32 = 0;
+    while (i < n) {
+        if (ids[i] == want) { let hit: i32 = i; return hit; }
+        i++;
+    }
+    let miss: i32 = SNAP_MISS;
+    return miss;
+}
+
+// ---------------------------------------------------------------------------
+// QUANTISATION
+// ---------------------------------------------------------------------------
+// Positions ROUND, never truncate, so that q(dq(q(v))) == q(v).  `q_ang` rounds
+// for the same reason and NETWORKING §11.1's pseudo-code is wrong about it in
+// the same way (command.hml says so too).
+export fn snap_q_pos(p_v: f64): i32 {
+    let v: f64 = p_v * SNAP_POS_Q_PER_M;
+    // 2^31/16 m is 134 217 km.  Anything past it is a bug upstream, and i32()
+    // TRAPS on overflow in Hemlock — so clamp rather than trap.
+    if (v > 2147483000.0) { v = 2147483000.0; }
+    if (v < -2147483000.0) { v = -2147483000.0; }
+    let q: i32 = 0;
+    if (v >= 0.0) { q = i32(v + 0.5); }
+    if (v < 0.0)  { q = i32(v - 0.5); }
+    let out: i32 = q;
+    return out;
+}
+
+export fn snap_dq_pos(p_q: i32): f64 {
+    let out: f64 = f64(p_q) * SNAP_POS_Q_INV;
+    return out;
+}
+
+// Pitch comes back in (-PI, PI], which is what the sim and the renderer both
+// use.  Yaw stays in [0, TAU), which is what `world.hml` stores.
+export fn snap_dq_pitch(p_q: i32): f64 {
+    let a: f64 = dq_ang(p_q);
+    if (a > SNAP_PI) { a = a - SNAP_TAU; }
+    let out: f64 = a;
+    return out;
+}
+
+fn clamp_u8(p_v: i32): i32 {
+    let v: i32 = p_v;
+    if (v < 0) { v = 0; }
+    if (v > 255) { v = 255; }
+    let out: i32 = v;
+    return out;
+}
+
+fn clamp_u16(p_v: i32): i32 {
+    let v: i32 = p_v;
+    if (v < 0) { v = 0; }
+    if (v > 65535) { v = 65535; }
+    let out: i32 = v;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// BASELINE LOOKUP
+// ---------------------------------------------------------------------------
+// Entities almost never reorder between two ticks, so the scan starts at the
+// row the caller is already on and wraps.  That makes the common case one
+// compare and the worst case a full linear pass, with no table to allocate,
+// invalidate or get wrong.  At 256 rows the worst case is 256 compares at
+// 20 Hz — 0.3 us — and the correctness argument fits in this paragraph.
+fn base_row(p_b: object, p_id: i32, p_hint: i32): i32 {
+    let b: object = p_b;
+    let want: i32 = p_id;
+    let n: i32 = b.count;
+    if (n <= 0) { let none: i32 = SNAP_MISS; return none; }
+    let ids = b.id;
+    let h: i32 = p_hint;
+    if (h < 0 || h >= n) { h = 0; }
+    if (ids[h] == want) { let fast: i32 = h; return fast; }
+    let i: i32 = 0;
+    while (i < n) {
+        if (ids[i] == want) { let hit: i32 = i; return hit; }
+        i++;
+    }
+    let miss: i32 = SNAP_MISS;
+    return miss;
+}
+
+// ---------------------------------------------------------------------------
+// WRITE
+// ---------------------------------------------------------------------------
+// Gather the replicated state of `p_w` for the viewer in slot `p_viewer_slot`,
+// quantise it, and encode a delta against `p_baseline`.
+//
+//   p_viewer_slot   SLOT_NONE (-1) means "no viewer": no interest cull, and
+//                   the viewer id on the wire is ID_NONE.  That is the mode
+//                   `tools/replay.hml` and the determinism probe run in,
+//                   because a cull would make the recorded state depend on
+//                   where the camera happened to be.
+//   p_baseline      a previously written snapshot, or a reset one.  Passing
+//                   the SAME object as `p_s` is refused (it would compare a
+//                   row against itself mid-overwrite) and produces a full
+//                   snapshot instead.
+//
+// Returns the byte count, which `snapshot_size` also reports.
+//
+// Entities are emitted in WORLD SLOT ORDER.  That order is a property of the
+// world's sparse set, which is a pure function of the spawn/despawn sequence,
+// so two runs of the same command stream emit byte-identical snapshots — which
+// is the property `tools/replay.hml` leans on.
+export fn snapshot_write(p_s: object, p_w: object, p_viewer_slot: i32,
+                         p_baseline: object): i32 {
+    let s: object = p_s;
+    let w: object = p_w;
+    let cap: i32 = s.cap;
+
+    // ---- the baseline, and whether it is usable ---------------------------
+    let base: object = p_baseline;
+    let delta: i32 = 1;
+    if (base.cap == cap) {
+        if (base.count == s.count) {
+            // Same shape is not the same object; the identity test below is
+            // what actually matters.  Kept explicit so the reader sees that
+            // aliasing was considered.
+            delta = 1;
+        }
+    }
+    let bn: i32 = base.count;
+    if (bn < 0) { bn = 0; }
+    if (base.tick < 0) { delta = 0; }
+
+    // Self-baselining is refused: the arrays would be half overwritten by the
+    // time the second half compared against them, which produces a snapshot
+    // that decodes to a state that never existed.  Fall back to a full write.
+    if (base.uid == s.uid) { delta = 0; bn = 0; }
+
+    // ---- the viewer -------------------------------------------------------
+    let vslot: i32 = p_viewer_slot;
+    let viewer_id: i32 = ID_NONE;
+    let vx: f64 = 0.0;
+    let vy: f64 = 0.0;
+    let vz: f64 = 0.0;
+    let cull: i32 = 0;
+    let r2: f64 = 0.0;
+
+    let wcount: i32 = w.count;
+    let wpx = w.px;
+    let wpy = w.py;
+    let wpz = w.pz;
+    let wyaw = w.yaw;
+    let wpit = w.pitch;
+    let wmdl = w.model;
+    let wanm = w.anim;
+    let wtnt = w.tint;
+    let wflg = w.flags;
+    let whp = w.hp;
+    let wknd = w.kind;
+
+    if (vslot >= 0 && vslot < wcount) {
+        viewer_id = world_id_of(w, vslot);
+        vx = wpx[vslot];
+        vy = wpy[vslot];
+        vz = wpz[vslot];
+        // NOTE the name: `rad`, not `r`.  hemlockc v2.9.1 hoists `let`s to
+        // function scope, so an inner `let r: f64` and the outer `let r: i32`
+        // of the removal loop below become ONE variable and the backend emits
+        // an i32 overflow check for `r * r`.  Distinct names, distinct types.
+        let rad: f64 = s.radius;
+        if (rad > 0.0) { cull = 1; r2 = rad * rad; }
+    }
+
+    // ---- gather ------------------------------------------------------------
+    let oid = s.id;
+    let opx = s.px;
+    let opy = s.py;
+    let opz = s.pz;
+    let oyw = s.yaw;
+    let opt = s.pitch;
+    let omd = s.model;
+    let oan = s.anim;
+    let otn = s.tint;
+    let ofl = s.flags;
+    let ohp = s.hp;
+    let okd = s.kind;
+    let oqx = s.qx;
+    let oqy = s.qy;
+    let oqz = s.qz;
+    let oqa = s.qyaw;
+    let oqp = s.qpitch;
+
+    let wids = w.id;
+
+    let n: i32 = 0;
+    let i: i32 = 0;
+    let mx: f64 = 0.0;
+    let my: f64 = 0.0;
+    let mz: f64 = 0.0;
+    let d: f64 = 0.0;
+    while (i < wcount) {
+        let fl: i32 = wflg[i];
+        let kd: i32 = wknd[i];
+        let eid: i32 = wids[i];
+        if ((fl & EF_NO_REPLICATE) != 0 || kd == KIND_COSMETIC || eid == ID_NONE) {
+            s.skipped = s.skipped + 1;
+        } else {
+            let keep: i32 = 1;
+            if (cull == 1 && eid != viewer_id) {
+                mx = wpx[i] - vx;
+                my = wpy[i] - vy;
+                mz = wpz[i] - vz;
+                d = mx * mx + my * my + mz * mz;
+                if (d > r2) { keep = 0; }
+            }
+            if (keep == 0) {
+                s.culled = s.culled + 1;
+            } else if (n >= cap) {
+                s.dropped = s.dropped + 1;
+            } else {
+                let qx: i32 = snap_q_pos(wpx[i]);
+                let qy: i32 = snap_q_pos(wpy[i]);
+                let qz: i32 = snap_q_pos(wpz[i]);
+                let qa: i32 = q_ang(wyaw[i]);
+                let qp: i32 = q_ang(wpit[i]);
+                oid[n] = eid;
+                oqx[n] = qx;
+                oqy[n] = qy;
+                oqz[n] = qz;
+                oqa[n] = qa;
+                oqp[n] = qp;
+                opx[n] = snap_dq_pos(qx);
+                opy[n] = snap_dq_pos(qy);
+                opz[n] = snap_dq_pos(qz);
+                oyw[n] = dq_ang(qa);
+                opt[n] = snap_dq_pitch(qp);
+                omd[n] = clamp_u8(wmdl[i]);
+                oan[n] = clamp_u8(wanm[i]);
+                otn[n] = wtnt[i] & 16777215;
+                ofl[n] = wflg[i] & 255;
+                ohp[n] = clamp_u16(whp[i]);
+                okd[n] = kd;
+                n++;
+            }
+        }
+        i++;
+    }
+
+    s.count = n;
+    s.tick = w.tick;
+    s.viewer_id = viewer_id;
+    s.mode = SNAP_MODE_FULL;
+    if (delta == 1) { s.mode = SNAP_MODE_DELTA; }
+
+    // ---- removals ----------------------------------------------------------
+    let rem = s.removed;
+    let nrem: i32 = 0;
+    if (delta == 1) {
+        let bids = base.id;
+        let k: i32 = 0;
+        while (k < bn) {
+            let bidk: i32 = bids[k];
+            let still: i32 = 0;
+            let j: i32 = 0;
+            while (j < n) {
+                if (oid[j] == bidk) { still = 1; j = n; } else { j++; }
+            }
+            if (still == 0) {
+                if (nrem < cap) { rem[nrem] = bidk; nrem++; }
+            }
+            k++;
+        }
+    }
+    s.n_removed = nrem;
+
+    // ---- encode ------------------------------------------------------------
+    let buf = s.buf;
+    buf.write_u16_le(SNAP_OFF_COUNT, n);
+    buf.write_u16_le(SNAP_OFF_NREM, nrem);
+    buf.write_i32_le(SNAP_OFF_TICK, s.tick);
+    buf.write_i32_le(SNAP_OFF_VIEWER, viewer_id);
+    buf.write_u8(SNAP_OFF_MODE, s.mode);
+    let off: i32 = SNAP_HDR_B;
+
+    let r: i32 = 0;
+    while (r < nrem) {
+        buf.write_i32_le(off, rem[r]);
+        off = off + SNAP_REM_B;
+        r++;
+    }
+
+    let bpx = base.qx;
+    let bpy = base.qy;
+    let bpz = base.qz;
+    let bya = base.qyaw;
+    let bpt = base.qpitch;
+    let bmd = base.model;
+    let ban = base.anim;
+    let btn = base.tint;
+    let bfl = base.flags;
+    let bhp = base.hp;
+
+    let hint: i32 = 0;
+    let full: i32 = 0;
+    let part: i32 = 0;
+    let e: i32 = 0;
+    while (e < n) {
+        let eid: i32 = oid[e];
+        let mask: i32 = SNAP_F_NEW | SNAP_F_ALL;
+        let b: i32 = SNAP_MISS;
+        if (delta == 1) {
+            b = base_row(base, eid, hint);
+            if (b >= 0) {
+                hint = b + 1;
+                mask = 0;
+                if (bpx[b] != oqx[e] || bpy[b] != oqy[e] || bpz[b] != oqz[e]) { mask = mask | SNAP_F_POS; }
+                if (bya[b] != oqa[e] || bpt[b] != oqp[e]) { mask = mask | SNAP_F_ANG; }
+                if (bmd[b] != omd[e] || ban[b] != oan[e]) { mask = mask | SNAP_F_MODEL; }
+                if (btn[b] != otn[e]) { mask = mask | SNAP_F_TINT; }
+                if (bfl[b] != ofl[e]) { mask = mask | SNAP_F_FLAGS; }
+                if (bhp[b] != ohp[e]) { mask = mask | SNAP_F_HP; }
+            }
+        }
+        if (b < 0) { full++; } else { part++; }
+
+        buf.write_i32_le(off, eid);
+        buf.write_u8(off + 4, mask);
+        off = off + 5;
+        if ((mask & SNAP_F_POS) != 0) {
+            buf.write_i32_le(off, oqx[e]);
+            buf.write_i32_le(off + 4, oqy[e]);
+            buf.write_i32_le(off + 8, oqz[e]);
+            off = off + 12;
+        }
+        if ((mask & SNAP_F_ANG) != 0) {
+            buf.write_u16_le(off, oqa[e]);
+            buf.write_u16_le(off + 2, oqp[e]);
+            off = off + 4;
+        }
+        if ((mask & SNAP_F_MODEL) != 0) {
+            buf.write_u8(off, omd[e]);
+            buf.write_u8(off + 1, oan[e]);
+            off = off + 2;
+        }
+        if ((mask & SNAP_F_TINT) != 0) {
+            buf.write_i32_le(off, otn[e]);
+            off = off + 4;
+        }
+        if ((mask & SNAP_F_FLAGS) != 0) {
+            buf.write_u8(off, ofl[e]);
+            off = off + 1;
+        }
+        if ((mask & SNAP_F_HP) != 0) {
+            buf.write_u16_le(off, ohp[e]);
+            off = off + 2;
+        }
+        e++;
+    }
+
+    s.bytes = off;
+    s.bytes_total = s.bytes_total + off;
+    s.writes = s.writes + 1;
+    s.full_records = s.full_records + full;
+    s.delta_records = s.delta_records + part;
+    let out: i32 = off;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// READ
+// ---------------------------------------------------------------------------
+// Decode `p_src`'s wire bytes into `p_dst`, resolving deltas against
+// `p_baseline`.  `p_dst` and `p_baseline` must be different objects.
+//
+// The decoded arrays are asserted BIT-IDENTICAL to the writer's by the probe:
+// same ids in the same order, same f64 bits in every position and angle, same
+// discrete fields.  That is the whole claim this file makes, and it is the
+// claim the v2 client depends on.
+//
+// Returns the entity count, or SNAP_MISS if the buffer does not decode.
+export fn snapshot_read(p_dst: object, p_src: object, p_baseline: object): i32 {
+    let dst: object = p_dst;
+    let src: object = p_src;
+    let base: object = p_baseline;
+    let cap: i32 = dst.cap;
+
+    let buf = src.buf;
+    let nbytes: i32 = src.bytes;
+    if (nbytes < SNAP_HDR_B) { let bad: i32 = SNAP_MISS; return bad; }
+
+    let n: i32 = i32(buf.read_u16_le(SNAP_OFF_COUNT));
+    let nrem: i32 = i32(buf.read_u16_le(SNAP_OFF_NREM));
+    let tick: i32 = buf.read_i32_le(SNAP_OFF_TICK);
+    let viewer: i32 = buf.read_i32_le(SNAP_OFF_VIEWER);
+    let mode: i32 = i32(buf.read_u8(SNAP_OFF_MODE));
+    if (n > cap) { let over: i32 = SNAP_MISS; return over; }
+
+    let off: i32 = SNAP_HDR_B;
+    let rem = dst.removed;
+    let r: i32 = 0;
+    while (r < nrem) {
+        if (off + SNAP_REM_B > nbytes) { let trunc: i32 = SNAP_MISS; return trunc; }
+        if (r < cap) { rem[r] = buf.read_i32_le(off); }
+        off = off + SNAP_REM_B;
+        r++;
+    }
+    dst.n_removed = nrem;
+
+    let oid = dst.id;
+    let opx = dst.px;
+    let opy = dst.py;
+    let opz = dst.pz;
+    let oyw = dst.yaw;
+    let opt = dst.pitch;
+    let omd = dst.model;
+    let oan = dst.anim;
+    let otn = dst.tint;
+    let ofl = dst.flags;
+    let ohp = dst.hp;
+    let okd = dst.kind;
+    let oqx = dst.qx;
+    let oqy = dst.qy;
+    let oqz = dst.qz;
+    let oqa = dst.qyaw;
+    let oqp = dst.qpitch;
+
+    let bpx = base.qx;
+    let bpy = base.qy;
+    let bpz = base.qz;
+    let bya = base.qyaw;
+    let bpt = base.qpitch;
+    let bmd = base.model;
+    let ban = base.anim;
+    let btn = base.tint;
+    let bfl = base.flags;
+    let bhp = base.hp;
+    let bkd = base.kind;
+
+    let hint: i32 = 0;
+    let e: i32 = 0;
+    while (e < n) {
+        if (off + 5 > nbytes) { let trunc2: i32 = SNAP_MISS; return trunc2; }
+        let eid: i32 = buf.read_i32_le(off);
+        let mask: i32 = i32(buf.read_u8(off + 4));
+        off = off + 5;
+
+        // Start from the baseline row, then overwrite what the mask carries.
+        let qx: i32 = 0;
+        let qy: i32 = 0;
+        let qz: i32 = 0;
+        let qa: i32 = 0;
+        let qp: i32 = 0;
+        let mdl: i32 = 0;
+        let anm: i32 = 0;
+        let tnt: i32 = 0;
+        let flg: i32 = 0;
+        let hpv: i32 = 0;
+        let kdv: i32 = 0;
+        if ((mask & SNAP_F_NEW) == 0) {
+            let b: i32 = base_row(base, eid, hint);
+            if (b < 0) { let lost: i32 = SNAP_MISS; return lost; }
+            hint = b + 1;
+            qx = bpx[b]; qy = bpy[b]; qz = bpz[b];
+            qa = bya[b]; qp = bpt[b];
+            mdl = bmd[b]; anm = ban[b]; tnt = btn[b];
+            flg = bfl[b]; hpv = bhp[b]; kdv = bkd[b];
+        }
+
+        if ((mask & SNAP_F_POS) != 0) {
+            if (off + 12 > nbytes) { let t3: i32 = SNAP_MISS; return t3; }
+            qx = buf.read_i32_le(off);
+            qy = buf.read_i32_le(off + 4);
+            qz = buf.read_i32_le(off + 8);
+            off = off + 12;
+        }
+        if ((mask & SNAP_F_ANG) != 0) {
+            if (off + 4 > nbytes) { let t4: i32 = SNAP_MISS; return t4; }
+            qa = i32(buf.read_u16_le(off));
+            qp = i32(buf.read_u16_le(off + 2));
+            off = off + 4;
+        }
+        if ((mask & SNAP_F_MODEL) != 0) {
+            if (off + 2 > nbytes) { let t5: i32 = SNAP_MISS; return t5; }
+            mdl = i32(buf.read_u8(off));
+            anm = i32(buf.read_u8(off + 1));
+            off = off + 2;
+        }
+        if ((mask & SNAP_F_TINT) != 0) {
+            if (off + 4 > nbytes) { let t6: i32 = SNAP_MISS; return t6; }
+            tnt = buf.read_i32_le(off);
+            off = off + 4;
+        }
+        if ((mask & SNAP_F_FLAGS) != 0) {
+            if (off + 1 > nbytes) { let t7: i32 = SNAP_MISS; return t7; }
+            flg = i32(buf.read_u8(off));
+            off = off + 1;
+        }
+        if ((mask & SNAP_F_HP) != 0) {
+            if (off + 2 > nbytes) { let t8: i32 = SNAP_MISS; return t8; }
+            hpv = i32(buf.read_u16_le(off));
+            off = off + 2;
+        }
+
+        oid[e] = eid;
+        oqx[e] = qx; oqy[e] = qy; oqz[e] = qz;
+        oqa[e] = qa; oqp[e] = qp;
+        opx[e] = snap_dq_pos(qx);
+        opy[e] = snap_dq_pos(qy);
+        opz[e] = snap_dq_pos(qz);
+        oyw[e] = dq_ang(qa);
+        opt[e] = snap_dq_pitch(qp);
+        omd[e] = mdl;
+        oan[e] = anm;
+        otn[e] = tnt;
+        ofl[e] = flg;
+        ohp[e] = hpv;
+        okd[e] = kdv;
+        e++;
+    }
+
+    dst.count = n;
+    dst.tick = tick;
+    dst.viewer_id = viewer;
+    dst.mode = mode;
+    dst.bytes = nbytes;
+    dst.reads = dst.reads + 1;
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// COPY — promote the snapshot just written to "the new baseline"
+// ---------------------------------------------------------------------------
+// The server keeps one snapshot per client plus the acknowledged baseline; the
+// client keeps the last decoded frame.  Both need this, and neither may
+// allocate to get it.
+export fn snapshot_copy(p_dst: object, p_src: object): i32 {
+    let dst: object = p_dst;
+    let src: object = p_src;
+    let n: i32 = src.count;
+    if (n > dst.cap) { let over: i32 = SNAP_MISS; return over; }
+
+    let sid = src.id;   let did = dst.id;
+    let spx = src.px;   let dpx = dst.px;
+    let spy = src.py;   let dpy = dst.py;
+    let spz = src.pz;   let dpz = dst.pz;
+    let syw = src.yaw;  let dyw = dst.yaw;
+    let spt = src.pitch; let dpt = dst.pitch;
+    let smd = src.model; let dmd = dst.model;
+    let san = src.anim;  let dan = dst.anim;
+    let stn = src.tint;  let dtn = dst.tint;
+    let sfl = src.flags; let dfl = dst.flags;
+    let shp = src.hp;    let dhp = dst.hp;
+    let skd = src.kind;  let dkd = dst.kind;
+    let sqx = src.qx;    let dqx = dst.qx;
+    let sqy = src.qy;    let dqy = dst.qy;
+    let sqz = src.qz;    let dqz = dst.qz;
+    let sqa = src.qyaw;  let dqa = dst.qyaw;
+    let sqp = src.qpitch; let dqp = dst.qpitch;
+
+    let i: i32 = 0;
+    while (i < n) {
+        did[i] = sid[i];
+        dpx[i] = spx[i]; dpy[i] = spy[i]; dpz[i] = spz[i];
+        dyw[i] = syw[i]; dpt[i] = spt[i];
+        dmd[i] = smd[i]; dan[i] = san[i]; dtn[i] = stn[i];
+        dfl[i] = sfl[i]; dhp[i] = shp[i]; dkd[i] = skd[i];
+        dqx[i] = sqx[i]; dqy[i] = sqy[i]; dqz[i] = sqz[i];
+        dqa[i] = sqa[i]; dqp[i] = sqp[i];
+        i++;
+    }
+    dst.count = n;
+    dst.tick = src.tick;
+    dst.viewer_id = src.viewer_id;
+    dst.mode = src.mode;
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// HASH
+// ---------------------------------------------------------------------------
+// Folds the QUANTISED integers, not the f64s, because the quantised integers
+// are what the wire carries — a hash over the f64s would be sensitive to bits
+// that never leave the server.  u64 throughout: `i32` `*` and `+` TRAP on
+// overflow in Hemlock (CLAUDE.md A13).
+fn mixh(p_h: u64, p_v: i32): u64 {
+    let k: i32 = p_v;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    let h: u64 = (p_h ^ u) * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+export fn snapshot_hash(p_s: object): u64 {
+    let s: object = p_s;
+    let n: i32 = s.count;
+    let h: u64 = 14695981039346656037;
+    h = mixh(h, n);
+    h = mixh(h, s.tick);
+    h = mixh(h, s.viewer_id);
+    let ids = s.id;
+    let qx = s.qx;
+    let qy = s.qy;
+    let qz = s.qz;
+    let qa = s.qyaw;
+    let qp = s.qpitch;
+    let md = s.model;
+    let an = s.anim;
+    let tn = s.tint;
+    let fl = s.flags;
+    let hp = s.hp;
+    let i: i32 = 0;
+    while (i < n) {
+        h = mixh(h, ids[i]);
+        h = mixh(h, qx[i]);
+        h = mixh(h, qy[i]);
+        h = mixh(h, qz[i]);
+        h = mixh(h, qa[i]);
+        h = mixh(h, qp[i]);
+        h = mixh(h, md[i]);
+        h = mixh(h, an[i]);
+        h = mixh(h, tn[i]);
+        h = mixh(h, fl[i]);
+        h = mixh(h, hp[i]);
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// Structural check: ids unique, count in range, every row inside its field
+// domain.  0 = consistent, else a bit per broken invariant.  Tools and CI only.
+export fn snapshot_check(p_s: object): i32 {
+    let s: object = p_s;
+    let bad: i32 = 0;
+    let n: i32 = s.count;
+    let cap: i32 = s.cap;
+    if (n < 0 || n > cap) { bad = bad | 1; return bad; }
+    let ids = s.id;
+    let md = s.model;
+    let an = s.anim;
+    let tn = s.tint;
+    let fl = s.flags;
+    let hp = s.hp;
+    let i: i32 = 0;
+    while (i < n) {
+        if (ids[i] == ID_NONE) { bad = bad | 2; }
+        if (md[i] < 0 || md[i] > 255) { bad = bad | 4; }
+        if (an[i] < 0 || an[i] > 255) { bad = bad | 4; }
+        if (tn[i] < 0 || tn[i] > 16777215) { bad = bad | 8; }
+        if (fl[i] < 0 || fl[i] > 255) { bad = bad | 16; }
+        if (hp[i] < 0 || hp[i] > 65535) { bad = bad | 32; }
+        let j: i32 = i + 1;
+        while (j < n) {
+            if (ids[j] == ids[i]) { bad = bad | 64; j = n; } else { j++; }
+        }
+        i++;
+    }
+    if (s.bytes > SNAP_HDR_B + cap * SNAP_REM_B + cap * SNAP_REC_MAX_B) { bad = bad | 128; }
+    let out: i32 = bad;
+    return out;
+}

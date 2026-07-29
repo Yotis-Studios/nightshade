@@ -1,0 +1,990 @@
+// ===========================================================================
+//  viewmodel.hml — the held lantern, driven by REAL weapon state.      W4-10
+// ===========================================================================
+//
+//  ARCHITECTURE §4 stage 15, §5.6.  Owned by W4-10.  Client-only, cosmetic,
+//  and structurally incapable of touching the simulation: every sim value it
+//  reads arrives as a PARAMETER it never writes back.
+//
+//  ---------------------------------------------------------------------------
+//  WHAT THIS FILE IS FOR, IN ONE PARAGRAPH
+//  ---------------------------------------------------------------------------
+//  `world_render.hml` already draws the lantern, in VIEW SPACE, under a
+//  CONSTANT sixteen-element model matrix (see its `g_vm_model` header).  That
+//  constancy is the fix for the old "unrecognisable slab below -40 degrees"
+//  bug and it is not negotiable: the lantern must never receive the camera's
+//  own rotation.  This module keeps that property exactly — it still emits
+//  under `proj` alone, still with no view term — and adds a small, bounded
+//  animation on top of the frozen rest pose.  `vm_model()` returns the same
+//  sixteen numbers world_render already uses when the lantern is at rest.
+//
+//  ---------------------------------------------------------------------------
+//  🛑 THE FACE-SET INVARIANT — the one thing that can un-fix the lantern
+//  ---------------------------------------------------------------------------
+//  `meshgen.hml`'s `mg_vm_shell` DELETES, at build time, the three box faces
+//  the eye cannot see from the rest pose.  Measured on the shipped mesh (122
+//  triangles, 366 vertices, one vertex trio per triangle):
+//
+//      +X   0      -X  32      +Y   0      -Y  32      +Z  58      -Z   0
+//
+//  There is no back side.  If a pose rotation ever flips one of those three
+//  normals past the eye direction, that whole face stops being drawn and the
+//  lantern develops a hole — the exact "collapses / goes black" failure the
+//  view-space fix was written to end.  So the animation is not free to rotate
+//  wherever it likes.  Measured breaking angles (drawn-triangle count over the
+//  real mesh, real projection, pivot at the fist):
+//
+//      rot X   safe  0 .. +80 deg      breaks at -4 deg  and at +90 deg
+//      rot Y   safe -10 .. +60 deg     breaks at -15 deg and at +70 deg
+//      rot Z   safe  -7 .. +60 deg     breaks at  -8 deg and at +70 deg
+//
+//  ...and those are the ONE-AXIS-AT-A-TIME numbers.  The margins shrink when
+//  the offsets move too: at the corner (off_d -0.03 m, off_f -0.08 m) rot Z
+//  breaks at -5 deg, not -8.  That is why the caps below are not simply the
+//  single-axis figures, and why the probe walks the whole six-dimensional box
+//  rather than each axis alone — the first cut of this file used +/-4 deg of
+//  roll and lost two triangles at exactly that corner.
+//
+//  Note how ASYMMETRIC that is.  +X (top tips back toward the player) has 80
+//  degrees of room; -X has FOUR.  That is why the fire kick and the sprint
+//  tilt both rotate the lantern TOWARD the player and never away from them —
+//  which is also what a lamp hanging from a fist actually does.
+//
+//  The caps below are set inside those measurements with margin, they are
+//  CLAMPED at runtime (`g_VMS_CLAMPS` counts every time the clamp bites), and
+//  `tools/probe_viewmodel.hml` proves two separate things:
+//    (a) the whole CAP BOX is safe — 122/122 triangles drawn at every corner
+//        and interior sample, so a future retune inside the caps cannot break
+//        the lantern either;
+//    (b) the clamp NEVER BITES under the real drive, so (a) is a safety net
+//        and not a load-bearing part of the animation.
+//
+//  ---------------------------------------------------------------------------
+//  WHERE EVERY NUMBER COMES FROM
+//  ---------------------------------------------------------------------------
+//  ART_BIBLE 8.5   idle sway +/-2 px at 0.4 Hz; 1 px footstep bob; fire kick
+//                  "back 0.06 m, up 4 deg over 2 frames, return over 5";
+//                  sprint "rotate 35 deg and drop 0.1 m over 6 frames";
+//                  "never more than 38 % of screen height, never crossing the
+//                  crosshair".
+//  GAME_DESIGN 2.4 / 7.5   "viewmodel translates back 0.02 m x mult, pitches up
+//                  1.6 deg x mult, decays at 14/s.  Never let visual kick move
+//                  the actual bullet."   (config.hml g_KICK_BACK_M /
+//                  g_KICK_PITCH_DEG / g_KICK_DECAY — imported, not retyped.)
+//  GAME_DESIGN 7.11  reload is "3-stage animated viewmodel (drop / insert /
+//                  seat), magazine billboard falls with gravity + a floor
+//                  clack".
+//
+//  THE TWO DOCUMENTS AGREE ONCE YOU KNOW WHAT `mult` IS.  §2.4 scales the kick
+//  by a per-shot `mult` it never defines.  The only per-shot scalar the design
+//  actually publishes is the weapon's own vertical recoil, in degrees, from the
+//  §2.4 recoil patterns — and `src/sim/weapons.hml` already holds that table.
+//  Feed it in and the two specs land on top of each other:
+//
+//      weapon        rc_v deg   back = 0.02*mult   pitch = 1.6*mult
+//      Sparrow s1      0.62        0.0124 m           0.99 deg
+//      Kestrel         1.35        0.0270 m           2.16 deg
+//      Emberlance      1.80        0.0360 m           2.88 deg
+//      Bellows         2.40        0.0480 m           3.84 deg
+//      Longshadow      2.90        0.0580 m           4.64 deg   <- ART_BIBLE
+//                                                                   "0.06 m, 4 deg"
+//
+//  So ART_BIBLE 8.5's kick is the HEAVY end of GAME_DESIGN 2.4's kick, and a
+//  Sparrow round nudges the lamp by a pixel instead of throwing it.  That is
+//  the whole reason to read the sim table instead of hardcoding one amplitude.
+//
+//  ---------------------------------------------------------------------------
+//  FRAME-RATE INDEPENDENCE IS STRUCTURAL, NOT TUNED
+//  ---------------------------------------------------------------------------
+//  Every animated quantity here is either
+//    * a pure function of an accumulated clock  (sway, bob, reload, mag drop),
+//      or
+//    * an exponential accumulator stepped by `exp(-k*dt)`  (kick, sprint,
+//      swap blend),
+//  and `exp(-k*a) * exp(-k*b) == exp(-k*(a+b))`, so splitting a frame in two
+//  reproduces the same pose.  Nothing here is a semi-implicit spring and
+//  nothing here counts frames.  The probe drives the same 0.5 s at 30, 60 and
+//  240 Hz and asserts the poses agree to 1e-9.
+//
+//  The fire kick needs an ATTACK as well as a decay ("up over 2 frames"), and
+//  a spring would have cost the property above, so it is a DIFFERENCE OF TWO
+//  EXPONENTIALS:  env(t) = e^(-R t) - e^(-A t), with A = 4R.  Peak at
+//  ln(4)/(3R) = 33.0 ms = 1.98 frames at 60 fps — ART_BIBLE's "over 2 frames",
+//  arrived at from GAME_DESIGN's release rate rather than typed in.
+//
+//  ---------------------------------------------------------------------------
+//  THE SIM IS READ, NEVER WRITTEN
+//  ---------------------------------------------------------------------------
+//  `vm_read_weapon(vm, wst, off)` takes the weapon-state array by reference and
+//  indexes it with the WS_* constants.  It performs no assignment into it.
+//  The probe proves that the harder way: it runs the identical 400-tick weapon
+//  sim twice, once with this module attached and once without, and asserts
+//  `wpn_hash_all` — the very fingerprint the replay determinism gate compares —
+//  is the same number both times.  The visual kick provably cannot move the
+//  bullet.
+// ===========================================================================
+
+import { sin, cos, exp, log, tan } from "@stdlib/math";
+
+import { batch_reserve, batch_vbuf, batch_commit }
+       from "../../../wobbleweed/src/batch.hml";
+import { emit_set_mvp, emit_quad_world }
+       from "../../../wobbleweed/src/emit.hml";
+import { mesh_set_mvp, mesh_emit, mesh_tri_count }
+       from "../../../wobbleweed/src/mesh.hml";
+
+import { clampf, clamp01, smooth01 } from "../core/mathx.hml";
+import { g_RES_H, g_FOV_HIP, g_EYE_STAND,
+         g_KICK_BACK_M, g_KICK_PITCH_DEG, g_KICK_DECAY,
+         g_PARTICLE_GRAVITY,
+         g_SPEED_WALK, g_SPEED_SPRINT, g_STEP_INTERVAL_WALK_S }
+       from "../core/config.hml";
+
+import { WS_CUR, WS_RELOAD_T, WS_RELOAD_ON, WS_ADS, WS_SWAP_T, WS_SHOTS,
+         WS_SHOT_IDX,
+         wpn_reload_time, wpn_recoil_v, WPN_NONE }
+       from "../sim/weapons.hml";
+import { EV_RELOAD_DONE, EV_WEAPON_SWITCH,
+         evbus_count, evbus_type, evbus_tick }
+       from "../sim/combat.hml";
+
+// ===========================================================================
+//  1.  GEOMETRY OF THE REST POSE — frozen, and identical to world_render's
+// ===========================================================================
+// These three are the ONLY place this module is allowed to agree with
+// `world_render.hml` by value rather than by call: they are the constants that
+// were byte-verified ("0 differing pixels of 76800 at pitch 0") when the
+// viewmodel moved into view space.  `vm_set_rest` exists so a caller that ever
+// moves them can move both together.
+export let g_VM_RIGHT: f64 = 0.26;      // metres right of the eye
+export let g_VM_DOWN: f64  = 0.34;      // metres below the eye
+export let g_VM_FWD: f64   = 1.05;      // metres in front of the eye
+
+// The pivot the lantern swings about, in VIEW SPACE: the fist.  Measured off
+// the shipped mesh — its topmost vertex is local y = +0.332, which under the
+// rest transform is view y = -0.008, and the hand sits at view x = +0.453.
+// A lamp hangs BELOW the hand, so rotating about the hand is what makes the
+// swing read as a swing instead of as a sprite being scaled.
+export let g_VM_PIVOT_X: f64 = 0.453;
+export let g_VM_PIVOT_Y: f64 = 0.0 - 0.008;
+export let g_VM_PIVOT_Z: f64 = 0.0 - 1.05;
+
+// Screen pixels per metre AT THE VIEWMODEL PLANE.  Derived, never typed:
+// f = (H/2) / tan(fov_v/2) = 171.36 px at 70 deg vertical over 240 rows, and
+// the lantern sits at 1.05 m, so 163.2 px/m.  ART_BIBLE 8.5 specifies the sway
+// and the bob in PIXELS, so this is how a pixel becomes a metre.
+export let g_VM_PPM: f64 =
+    (f64(g_RES_H) * 0.5 / tan(g_FOV_HIP * 0.008726646259971648)) / g_VM_FWD;
+
+// ===========================================================================
+//  2.  THE ANIMATION CONSTANTS — every one carries its document
+// ===========================================================================
+
+// -- idle sway.  ART_BIBLE 8.5: "+/- 2 px at 0.4 Hz".  The vertical component
+//    runs at half rate so the two together trace a slow lissajous rather than a
+//    metronome; a held lamp is never still and never periodic-looking.
+export let g_VM_SWAY_PX: f64 = 2.0;
+export let g_VM_SWAY_HZ: f64 = 0.4;
+
+// -- footstep bob.  ART_BIBLE 8.5: "1 px vertical bob synced to footsteps".
+//    The phase comes from the SIM's own footstep odometer (PS_STEP_DIST), so
+//    the bob and the footstep SOUND cannot drift apart.  A lantern hangs, so it
+//    LAGS the step by a quarter cycle (meshgen.hml's held-object note) and its
+//    lateral term runs at half rate — that is what reads as swing.
+export let g_VM_BOB_PX: f64 = 1.0;
+export let g_VM_BOB_LAG: f64 = 1.5707963267948966;   // quarter cycle
+export let g_VM_STEP_M: f64 = g_SPEED_WALK * g_STEP_INTERVAL_WALK_S;   // 1.848 m
+
+// -- fire kick.  Amplitudes and release rate are config.hml's, which are
+//    GAME_DESIGN 2.4/7.5's.  The attack is 4x the release, which puts the peak
+//    at ln(4)/(3R) = 33.0 ms = 1.98 frames — ART_BIBLE 8.5's "over 2 frames".
+export let g_VM_KICK_RELEASE: f64 = g_KICK_DECAY;             // 14 /s
+export let g_VM_KICK_ATTACK: f64  = 4.0 * g_KICK_DECAY;       // 56 /s
+export let g_VM_KICK_BACK_M: f64  = g_KICK_BACK_M;            // 0.02 m per deg
+export let g_VM_KICK_PITCH_DEG: f64 = g_KICK_PITCH_DEG;       // 1.6 deg per deg
+
+// -- sprint.  ART_BIBLE 8.5: "rotate the weapon 35 deg and drop it 0.1 m, over
+//    6 frames".  35 deg is spent on rot X in the SAFE direction (see the
+//    face-set invariant above): the lamp tips back toward the player as they
+//    run, which is both what the measurement allows and what a swinging lamp
+//    does.  "Over 6 frames" is 0.1 s; an exponential with rate 3/0.1 = 30 /s
+//    is at 95 % after exactly that long, and is frame-rate independent.
+export let g_VM_SPRINT_TILT_DEG: f64 = 35.0;
+export let g_VM_SPRINT_DROP_M: f64 = 0.1;
+export let g_VM_SPRINT_S: f64 = 0.1;                          // 6 frames @ 60
+export let g_VM_SPRINT_RATE: f64 = 3.0 / 0.1;                 // 30 /s -> 95 %
+
+// -- ADS.  ART_BIBLE 8.5's hard rule is "never crossing the crosshair", so on
+//    a LANTERN viewmodel aiming cannot bring the object to centre — it TUCKS
+//    it: further right, lower, and further away (which shrinks it), and it
+//    holds much steadier.  Declared here rather than smuggled: the GDD gives
+//    ADS *timing* per weapon (g_wpn_ads_s, which is what drives the blend) and
+//    no ADS *pose*, because it was written for a gun.
+export let g_VM_ADS_RIGHT_M: f64 = 0.06;
+export let g_VM_ADS_DOWN_M: f64  = 0.08;
+export let g_VM_ADS_FWD_M: f64   = 0.10;
+export let g_VM_ADS_SWAY: f64    = 0.35;    // sway multiplier while aimed
+export let g_VM_ADS_BOB: f64     = 0.50;
+
+// -- reload.  GAME_DESIGN 7.11 names three stages and does not apportion them.
+//    DECLARED, not smuggled: drop 28 %, insert 44 %, seat 28 % of the weapon's
+//    own reload time (which comes from the sim, per weapon, empty or not).
+export let g_VM_STAGE_NONE: i32   = 0;
+export let g_VM_STAGE_DROP: i32   = 1;
+export let g_VM_STAGE_INSERT: i32 = 2;
+export let g_VM_STAGE_SEAT: i32   = 3;
+export let g_VM_REL_DROP_END: f64   = 0.28;
+export let g_VM_REL_INSERT_END: f64 = 0.72;
+export let g_VM_REL_DIP_M: f64 = 0.075;     // how far the lamp gets out of the way
+export let g_VM_REL_TILT_DEG: f64 = 9.0;
+export let g_VM_REL_SEAT_KICK: f64 = 0.55;  // the seat beat, in kick-mult units
+
+// -- weapon swap: a dip while the hands are busy.  Same shape as the reload
+//    dip, driven by WS_SWAP_T.
+export let g_VM_SWAP_DIP_M: f64 = 0.055;
+export let g_VM_SWAP_RATE: f64 = 22.0;
+
+// -- the falling magazine (GAME_DESIGN 7.11).  Ballistic in VIEW SPACE, closed
+//    form, so it is frame-rate independent like everything else.  It is two
+//    triangles and it is only emitted once a caller has bound a UV rect —
+//    `src/render/**` may not import `src/art/**` (ARCHITECTURE 5.6b), so the
+//    atlas cell has to arrive as four numbers.
+export let g_VM_MAG_LIFE_S: f64 = 0.85;
+export let g_VM_MAG_W: f64 = 0.045;
+export let g_VM_MAG_H: f64 = 0.105;
+export let g_VM_MAG_SPIN: f64 = 7.0;        // rad/s tumble
+
+// -- THE CAP BOX.  Inside the measured breaking angles at the top of the file,
+//    with margin.  Clamped at runtime; the probe proves the whole box is safe.
+//
+//    The Y and Z caps are +/-2 deg and not the +/-7 the single-axis sweep
+//    allows, because the breaking angle SHRINKS when the offsets move too: at
+//    the corner (off_d -0.03, off_f -0.08) the lantern loses two triangles at
+//    rot Z -5 deg, not -8. The first cut of this file used +/-4 deg and the
+//    probe caught exactly that — 120 of 122 at one corner of the box. The
+//    animation only ever asks for 0.63 deg of yaw and 0.98 deg of roll, so
+//    +/-2 leaves the drive 2x of room and the break 2.5x.
+//
+//    rot X runs to 55 deg because sprint (35) + a Longshadow kick (4.6) + the
+//    reload tilt (9) can legitimately coincide; the mesh is measured safe to
+//    +80 in that direction.
+export let g_VM_ROT_X_MIN: f64 = 0.0;
+export let g_VM_ROT_X_MAX: f64 = 0.9599310885968813;    // +55 deg  (breaks +90)
+export let g_VM_ROT_Y_ABS: f64 = 0.03490658503988659;   // +/- 2 deg
+export let g_VM_ROT_Z_ABS: f64 = 0.03490658503988659;   // +/- 2 deg (breaks -5)
+export let g_VM_OFF_R_MIN: f64 = 0.0 - 0.03;
+export let g_VM_OFF_R_MAX: f64 = 0.10;
+export let g_VM_OFF_D_MIN: f64 = 0.0 - 0.03;
+export let g_VM_OFF_D_MAX: f64 = 0.20;
+export let g_VM_OFF_F_MIN: f64 = 0.0 - 0.08;
+export let g_VM_OFF_F_MAX: f64 = 0.14;
+
+// The renderer's own numbers, restated as exports so a caller does not have to
+// reach into config for them (ARCHITECTURE 2.3 invariant 4, ART_BIBLE 6.6).
+export let g_VM_DEPTH: f64 = 0.05;
+export let g_VM_FOG: f64 = 0.0;
+
+let g_VM_DEG: f64 = 0.017453292519943295;
+let g_VM_TAU: f64 = 6.283185307179586;
+
+// env(t) = e^(-R t) - e^(-A t) peaks at t* = ln(A/R)/(A-R) and this is 1/peak,
+// so the kick's amplitude is exactly `mult * g_VM_KICK_BACK_M` at the peak and
+// the two-exponential shaping costs nothing in calibration.
+let g_VM_KICK_TPEAK: f64 =
+    log(g_VM_KICK_ATTACK / g_VM_KICK_RELEASE) / (g_VM_KICK_ATTACK - g_VM_KICK_RELEASE);
+let g_VM_KICK_NORM: f64 =
+    1.0 / (exp(0.0 - g_VM_KICK_RELEASE * g_VM_KICK_TPEAK)
+           - exp(0.0 - g_VM_KICK_ATTACK * g_VM_KICK_TPEAK));
+
+// ===========================================================================
+//  3.  STATE LAYOUT — one flat array<f64>, the sim's own idiom
+// ===========================================================================
+// Flat and typed so it hashes, snapshots and diffs like every other state in
+// the project, and so nothing in here can accidentally become a closure.
+export let g_VMS_T        = 0;    // client animation clock, s
+export let g_VMS_STEPPH   = 1;    // footstep phase, radians
+export let g_VMS_SPEED01  = 2;    // horizontal speed / sprint speed, smoothed
+export let g_VMS_KA       = 3;    // kick attack accumulator
+export let g_VMS_KR       = 4;    // kick release accumulator
+export let g_VMS_ADS      = 5;    // 0..1, straight from the sim
+export let g_VMS_SPRINT   = 6;    // 0..1 blend
+export let g_VMS_SPRINTT  = 7;    // 0/1 target
+export let g_VMS_RELP     = 8;    // reload progress 0..1 (0 when idle)
+export let g_VMS_RELK     = 9;    // reload kind, 0 none / 1 tac / 2 empty / 3 shell
+export let g_VMS_STAGE    = 10;   // g_VM_STAGE_*
+export let g_VMS_SWAP     = 11;   // 0..1 blend
+export let g_VMS_SWAPT    = 12;   // 0/1 target
+export let g_VMS_SHOTS    = 13;   // last seen lifetime shot counter
+export let g_VMS_WPN      = 14;   // last seen weapon id
+export let g_VMS_MULT     = 15;   // last shot's recoil, degrees
+export let g_VMS_FIRED    = 16;   // shots consumed by the last vm_read_weapon
+export let g_VMS_MAGON    = 17;
+export let g_VMS_MAGT     = 18;
+export let g_VMS_MAGX     = 19;
+export let g_VMS_MAGY     = 20;
+export let g_VMS_MAGZ     = 21;
+export let g_VMS_MAGVX    = 22;
+export let g_VMS_MAGVY    = 23;
+export let g_VMS_MAGVZ    = 24;
+export let g_VMS_CLACK    = 25;   // latch: the mag hit the floor (caller drains)
+export let g_VMS_RELDONE  = 26;   // latch: a reload completed (caller drains)
+export let g_VMS_OFF_R    = 27;   // the composed pose, metres
+export let g_VMS_OFF_D    = 28;
+export let g_VMS_OFF_F    = 29;
+export let g_VMS_ROT_X    = 30;   // the composed pose, radians (view axes)
+export let g_VMS_ROT_Y    = 31;
+export let g_VMS_ROT_Z    = 32;
+export let g_VMS_CLAMPS   = 33;   // times the cap box bit — must stay 0
+export let g_VMS_TRIS     = 34;   // triangles written by the last vm_emit
+export let g_VMS_STAGEBITS = 35;  // stages seen in the current reload, bit 0..2
+export let g_VMS_KICKS    = 36;   // lifetime kick impulses applied
+export let g_VMS_FIELDS   = 37;
+
+// ===========================================================================
+//  4.  CONSTRUCTION
+// ===========================================================================
+
+export fn vm_new(): object {
+    let s: array<f64> = [];
+    let i = 0;
+    while (i < g_VMS_FIELDS) { s.push(0.0); i = i + 1; }
+    let vm: object = {
+        s: s,
+        // the retained view-space model matrix, rest pose, exactly the sixteen
+        // numbers world_render.hml uses today
+        m: [-1.0, 0.0,  0.0, g_VM_RIGHT,
+             0.0, 1.0,  0.0, 0.0 - g_VM_DOWN,
+             0.0, 0.0, -1.0, 0.0 - g_VM_FWD,
+             0.0, 0.0,  0.0, 1.0],
+        dep: [0.0, 0.0],
+        mesh: null,
+        rest_r: g_VM_RIGHT, rest_d: g_VM_DOWN, rest_f: g_VM_FWD,
+        piv_x: g_VM_PIVOT_X, piv_y: g_VM_PIVOT_Y, piv_z: g_VM_PIVOT_Z,
+        eye_h: g_EYE_STAND,
+        mag_u0: 0.0, mag_v0: 0.0, mag_u1: 0.0, mag_v1: 0.0, mag_rgb: 0,
+        mag_bound: 0,
+        ev_seen: -1
+    };
+    let st: array<f64> = vm.s;
+    st[g_VMS_WPN] = f64(WPN_NONE);
+    st[g_VMS_SHOTS] = 0.0 - 1.0;
+    vm_build_matrix(vm);
+    let out: object = vm;
+    return out;
+}
+
+export fn vm_reset(p_vm: object) {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let i = 0;
+    while (i < g_VMS_FIELDS) { s[i] = 0.0; i = i + 1; }
+    s[g_VMS_WPN] = f64(WPN_NONE);
+    s[g_VMS_SHOTS] = 0.0 - 1.0;
+    vm.ev_seen = -1;
+    vm_build_matrix(vm);
+}
+
+// The lantern mesh handle (meshgen slot 28).  Bound, never imported:
+// `src/render/**` may not import `src/art/**` (ARCHITECTURE 5.6b).
+export fn vm_bind_mesh(p_vm: object, p_mesh) {
+    let vm: object = p_vm;
+    vm.mesh = p_mesh;
+}
+
+// The magazine card's atlas rect and tint.  Until this is called the card is
+// not emitted at all and the viewmodel costs exactly the lantern's triangles.
+export fn vm_bind_mag(p_vm: object, p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
+                      p_rgb: i32) {
+    let vm: object = p_vm;
+    vm.mag_u0 = p_u0; vm.mag_v0 = p_v0;
+    vm.mag_u1 = p_u1; vm.mag_v1 = p_v1;
+    vm.mag_rgb = p_rgb;
+    let ok: i32 = 0;
+    if (p_u1 > p_u0) { if (p_v1 > p_v0) { ok = 1; } }
+    vm.mag_bound = ok;
+}
+
+export fn vm_set_rest(p_vm: object, p_right: f64, p_down: f64, p_fwd: f64) {
+    let vm: object = p_vm;
+    vm.rest_r = p_right; vm.rest_d = p_down; vm.rest_f = p_fwd;
+}
+
+export fn vm_set_pivot(p_vm: object, p_x: f64, p_y: f64, p_z: f64) {
+    let vm: object = p_vm;
+    vm.piv_x = p_x; vm.piv_y = p_y; vm.piv_z = p_z;
+}
+
+// Eye height above the floor, used only to decide when the dropped magazine
+// clacks.  Comes from the sim's stance (PS_EYE); defaults to standing.
+export fn vm_set_eye_height(p_vm: object, p_h: f64) {
+    let vm: object = p_vm;
+    vm.eye_h = p_h;
+}
+
+// ===========================================================================
+//  5.  DRIVE — movement
+// ===========================================================================
+// `p_speed` metres/second horizontal, `p_step_dist` is movement.hml's
+// PS_STEP_DIST (ground distance since the last footstep) so the bob is locked
+// to the same odometer that fires the footstep sound.  `p_grounded` kills the
+// bob in the air; there are no footsteps in the air.
+export fn vm_set_motion(p_vm: object, p_speed: f64, p_grounded: i32,
+                        p_sprint: i32, p_step_dist: f64) {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let sp: f64 = clamp01(p_speed / g_SPEED_SPRINT);
+    if (p_grounded == 0) { sp = 0.0; }
+    s[g_VMS_SPEED01] = sp;
+    let d: f64 = p_step_dist / g_VM_STEP_M;
+    if (d < 0.0) { d = 0.0; }
+    s[g_VMS_STEPPH] = d * g_VM_TAU;
+    let tgt: f64 = 0.0;
+    if (p_sprint != 0) { tgt = 1.0; }
+    s[g_VMS_SPRINTT] = tgt;
+}
+
+// ===========================================================================
+//  6.  DRIVE — the weapon, straight out of src/sim/weapons.hml
+// ===========================================================================
+// READ ONLY.  `p_wst` is indexed and never assigned.  Returns the number of
+// shots that left the barrel since the previous call, which is also the number
+// of kick impulses added.
+export fn vm_read_weapon(p_vm: object, p_wst: array, p_off: i32): i32 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let wst: array = p_wst;
+    let o: i32 = p_off;
+
+    // (`wid`, not `w`: `w` is in ci_unbox.sh's hot-local vocabulary.)
+    let wid: i32 = i32(wst[o + WS_CUR]);
+    let shots: f64 = wst[o + WS_SHOTS];
+    let idx: i32 = i32(wst[o + WS_SHOT_IDX]);
+
+    // ADS fraction — already 0..1 and already frame-rate independent, because
+    // the sim advanced it by a fixed tick over the weapon's own g_wpn_ads_s.
+    s[g_VMS_ADS] = clamp01(wst[o + WS_ADS]);
+
+    // Shots.  The first observation only latches: a viewmodel created mid-game
+    // must not fire off a thousand kicks for a thousand historical rounds.
+    let fired: i32 = 0;
+    let prev: f64 = s[g_VMS_SHOTS];
+    if (prev < 0.0) {
+        s[g_VMS_SHOTS] = shots;
+    } else {
+        let df: f64 = shots - prev;
+        if (df > 0.0) {
+            fired = i32(df);
+            if (fired > 8) { fired = 8; }      // a stall must not become a slam
+            let k = 0;
+            while (k < fired) {
+                // the k-th newest shot used pattern index idx-1-(fired-1-k)
+                let pi: i32 = idx - 1 - (fired - 1 - k);
+                if (pi < 0) { pi = 0; }
+                vm_fire(vm, wpn_recoil_v(wid, pi));
+                k = k + 1;
+            }
+            s[g_VMS_SHOTS] = shots;
+        }
+    }
+    s[g_VMS_FIRED] = f64(fired);
+
+    // Reload.  Progress is derived from the weapon's OWN duration, so a
+    // Longshadow's 2.85 s empty reload and a Bellows' 0.55 s shell both fill
+    // 0..1 and both get all three stages.
+    let rt: f64 = wst[o + WS_RELOAD_T];
+    let kind: f64 = wst[o + WS_RELOAD_ON];
+    let pk: f64 = s[g_VMS_RELK];
+    if (kind > 0.0) {
+        if (pk <= 0.0) {
+            // a reload just began
+            s[g_VMS_STAGEBITS] = 0.0;
+            if (kind != 3.0) { vm_drop_mag(vm); }
+        }
+        let empty: i32 = 0;
+        if (kind == 2.0) { empty = 1; }
+        let total: f64 = wpn_reload_time(wid, empty);
+        let p: f64 = 0.0;
+        if (total > 0.0) { p = 1.0 - rt / total; }
+        s[g_VMS_RELP] = clamp01(p);
+    } else {
+        if (pk > 0.0) {
+            // a reload just finished: the seat beat and the latch
+            s[g_VMS_RELDONE] = 1.0;
+            vm_fire(vm, g_VM_REL_SEAT_KICK);
+        }
+        s[g_VMS_RELP] = 0.0;
+    }
+    s[g_VMS_RELK] = kind;
+
+    // Swap: the hands are busy, the lamp dips.
+    let swt: f64 = 0.0;
+    if (wst[o + WS_SWAP_T] > 0.0) { swt = 1.0; }
+    s[g_VMS_SWAPT] = swt;
+
+    // A weapon change resets the shot latch — the counter is per-slot, not
+    // per-weapon, but the pattern index is not.
+    s[g_VMS_WPN] = f64(wid);
+
+    let out: i32 = fired;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The event bus, for the v2 path where the client sees EVENTS and not the
+// server's weapon-state array (NETWORKING 11.5).  Idempotent: an event is
+// consumed once, by tick.  Returns how many it consumed.
+//
+// It deliberately consumes only EV_RELOAD_DONE and EV_WEAPON_SWITCH.  The
+// other 2.5 feedback signals — hitmarker, enemy flash, damage number, impact
+// billboard, audio blip — belong to hud.hml, entity_render.hml, fx.hml and
+// audio.  A viewmodel that invented its own hit response would be a SIXTH
+// signal nobody specified, and 2.5 is a contract, not a floor.
+// ---------------------------------------------------------------------------
+export fn vm_events(p_vm: object, p_bus: object, p_tick: i32): i32 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let seen: i32 = vm.ev_seen;
+    let n: i32 = evbus_count(p_bus);
+    let used: i32 = 0;
+    let hi: i32 = seen;
+    let i = 0;
+    while (i < n) {
+        let t: i32 = evbus_tick(p_bus, i);
+        if (t > seen) {
+            if (t > hi) { hi = t; }
+            let ty: i32 = evbus_type(p_bus, i);
+            if (ty == EV_RELOAD_DONE) {
+                s[g_VMS_RELDONE] = 1.0;
+                vm_fire(vm, g_VM_REL_SEAT_KICK);
+                used = used + 1;
+            } else if (ty == EV_WEAPON_SWITCH) {
+                s[g_VMS_SWAPT] = 1.0;
+                used = used + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (p_tick > hi) { hi = p_tick; }
+    vm.ev_seen = hi;
+    let out: i32 = used;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// One kick impulse.  `p_mult` is the shot's vertical recoil in DEGREES — the
+// sim's own g_rc_v entry — which is what makes a Sparrow round nudge the lamp
+// and a Longshadow round throw it.  Seeding both accumulators equally is what
+// gives the difference-of-exponentials a zero start and a 2-frame rise.
+// ---------------------------------------------------------------------------
+export fn vm_fire(p_vm: object, p_mult: f64) {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let m: f64 = p_mult;
+    if (m < 0.0) { m = 0.0 - m; }
+    s[g_VMS_KA] = s[g_VMS_KA] + m;
+    s[g_VMS_KR] = s[g_VMS_KR] + m;
+    s[g_VMS_MULT] = m;
+    s[g_VMS_KICKS] = s[g_VMS_KICKS] + 1.0;
+}
+
+// Launch the spent magazine.  View space: it starts just below and left of the
+// lantern (where the unseen gun is) and falls away from the camera.
+export fn vm_drop_mag(p_vm: object) {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    s[g_VMS_MAGON] = 1.0;
+    s[g_VMS_MAGT] = 0.0;
+    s[g_VMS_MAGX] = 0.12;
+    s[g_VMS_MAGY] = 0.0 - 0.40;
+    s[g_VMS_MAGZ] = 0.0 - 0.80;
+    s[g_VMS_MAGVX] = 0.0 - 0.10;
+    s[g_VMS_MAGVY] = 0.0 - 0.35;
+    s[g_VMS_MAGVZ] = 0.0 - 0.25;
+}
+
+// ===========================================================================
+//  7.  STEP — the whole animation, once per FRAME (not per tick)
+// ===========================================================================
+export fn vm_step(p_vm: object, p_dt: f64) {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let dt: f64 = p_dt;
+    if (dt < 0.0) { dt = 0.0; }
+    if (dt > 0.25) { dt = 0.25; }               // the same spiral clamp as main
+    let t: f64 = s[g_VMS_T] + dt;
+    s[g_VMS_T] = t;
+
+    // --- 1. the two exponential accumulators ------------------------------
+    // exp(-k*a)*exp(-k*b) == exp(-k*(a+b)):  splitting a frame reproduces the
+    // pose.  This is the whole frame-rate-independence argument.
+    s[g_VMS_KA] = s[g_VMS_KA] * exp(0.0 - g_VM_KICK_ATTACK * dt);
+    s[g_VMS_KR] = s[g_VMS_KR] * exp(0.0 - g_VM_KICK_RELEASE * dt);
+    let kick: f64 = (s[g_VMS_KR] - s[g_VMS_KA]) * g_VM_KICK_NORM;
+    if (kick < 0.0) { kick = 0.0; }
+
+    // --- 2. stance blends --------------------------------------------------
+    let ks: f64 = 1.0 - exp(0.0 - g_VM_SPRINT_RATE * dt);
+    s[g_VMS_SPRINT] = s[g_VMS_SPRINT] + (s[g_VMS_SPRINTT] - s[g_VMS_SPRINT]) * ks;
+    let kw: f64 = 1.0 - exp(0.0 - g_VM_SWAP_RATE * dt);
+    s[g_VMS_SWAP] = s[g_VMS_SWAP] + (s[g_VMS_SWAPT] - s[g_VMS_SWAP]) * kw;
+
+    let sprint: f64 = clamp01(s[g_VMS_SPRINT]);
+    // Sprint and ADS are mutually exclusive poses; multiplying rather than
+    // adding is what keeps the two from stacking into a pose neither spec asked
+    // for (and out of the cap box).
+    let ads: f64 = clamp01(s[g_VMS_ADS]) * (1.0 - sprint);
+
+    // --- 3. idle sway, ART_BIBLE 8.5 ---------------------------------------
+    let sway_a: f64 = g_VM_SWAY_PX / g_VM_PPM * (1.0 + (g_VM_ADS_SWAY - 1.0) * ads);
+    let ph: f64 = t * g_VM_TAU * g_VM_SWAY_HZ;
+    // Both terms are zero at t = 0, which is what lets the probe assert that a
+    // freshly-stepped viewmodel reproduces world_render's frozen sixteen
+    // constants EXACTLY. Half rate on the vertical makes it a figure-eight
+    // rather than a metronome.
+    let sway_r: f64 = sin(ph) * sway_a;
+    let sway_d: f64 = sin(ph * 0.5) * sway_a * 0.5;
+
+    // --- 4. footstep bob, phase from the SIM's odometer --------------------
+    let bob_a: f64 = g_VM_BOB_PX / g_VM_PPM * (1.0 + (g_VM_ADS_BOB - 1.0) * ads);
+    let sp: f64 = clamp01(s[g_VMS_SPEED01]);
+    let amp: f64 = smooth01(sp);                 // ease in; the first step never snaps
+    let bp: f64 = s[g_VMS_STEPPH] - g_VM_BOB_LAG;
+    let bob_d: f64 = cos(bp) * bob_a * amp;
+    let bob_r: f64 = sin(bp * 0.5) * bob_a * 0.6 * amp;
+
+    // --- 5. reload, three stages -------------------------------------------
+    let relp: f64 = s[g_VMS_RELP];
+    let stage: i32 = g_VM_STAGE_NONE;
+    let rel_dip: f64 = 0.0;
+    let rel_tilt: f64 = 0.0;
+    if (s[g_VMS_RELK] > 0.0) {
+        if (relp < g_VM_REL_DROP_END) {
+            stage = g_VM_STAGE_DROP;
+            rel_dip = smooth01(relp / g_VM_REL_DROP_END);
+        } else if (relp < g_VM_REL_INSERT_END) {
+            stage = g_VM_STAGE_INSERT;
+            rel_dip = 1.0;
+        } else {
+            stage = g_VM_STAGE_SEAT;
+            let u: f64 = (relp - g_VM_REL_INSERT_END) / (1.0 - g_VM_REL_INSERT_END);
+            rel_dip = 1.0 - smooth01(clamp01(u));
+        }
+        rel_tilt = rel_dip * g_VM_REL_TILT_DEG * g_VM_DEG;
+        rel_dip = rel_dip * g_VM_REL_DIP_M;
+        // record which stages this reload actually showed: the probe asserts
+        // all three appear, every reload, for every weapon
+        let bit: i32 = 1;
+        if (stage == g_VM_STAGE_INSERT) { bit = 2; }
+        if (stage == g_VM_STAGE_SEAT) { bit = 4; }
+        let have: i32 = i32(s[g_VMS_STAGEBITS]);
+        s[g_VMS_STAGEBITS] = f64(have | bit);
+    }
+    s[g_VMS_STAGE] = f64(stage);
+
+    // --- 6. the falling magazine, closed form ------------------------------
+    if (s[g_VMS_MAGON] > 0.0) {
+        let mt: f64 = s[g_VMS_MAGT] + dt;
+        s[g_VMS_MAGT] = mt;
+        let y0: f64 = 0.0 - 0.40;
+        let y: f64 = y0 + s[g_VMS_MAGVY] * mt - 0.5 * g_PARTICLE_GRAVITY * mt * mt;
+        s[g_VMS_MAGY] = y;
+        s[g_VMS_MAGX] = 0.12 + s[g_VMS_MAGVX] * mt;
+        s[g_VMS_MAGZ] = 0.0 - 0.80 + s[g_VMS_MAGVZ] * mt;
+        // The floor is `eye_h` below the eye — 1.62 m standing, which puts the
+        // card at screen y ~ 384 on a 240-row frame, i.e. long gone. So the
+        // clack ALSO retires the card: one latch per drop, and no invisible
+        // sprite still being integrated.
+        let floor_y: f64 = 0.0 - vm.eye_h;
+        if (y <= floor_y) {
+            s[g_VMS_CLACK] = 1.0;
+            s[g_VMS_MAGON] = 0.0;
+        }
+        if (mt >= g_VM_MAG_LIFE_S) { s[g_VMS_MAGON] = 0.0; }
+    }
+
+    // --- 7. compose ---------------------------------------------------------
+    let off_r: f64 = sway_r + bob_r
+                   + ads * g_VM_ADS_RIGHT_M;
+    let off_d: f64 = sway_d + bob_d
+                   + ads * g_VM_ADS_DOWN_M
+                   + sprint * g_VM_SPRINT_DROP_M
+                   + rel_dip
+                   + s[g_VMS_SWAP] * g_VM_SWAP_DIP_M;
+    let off_f: f64 = ads * g_VM_ADS_FWD_M
+                   - kick * g_VM_KICK_BACK_M;
+    let rot_x: f64 = kick * g_VM_KICK_PITCH_DEG * g_VM_DEG
+                   + sprint * g_VM_SPRINT_TILT_DEG * g_VM_DEG
+                   + rel_tilt;
+    let rot_y: f64 = sway_r * 0.9;               // a whisper of yaw with the sway
+    let rot_z: f64 = 0.0 - sway_r * 1.4;         // and of roll, so it is not a slide
+
+    // --- 8. THE CAP BOX -----------------------------------------------------
+    // A safety net, not part of the animation.  Every bite is counted and the
+    // probe asserts the count stays at zero under the real drive.
+    let bit_r: f64 = clampf(off_r, g_VM_OFF_R_MIN, g_VM_OFF_R_MAX);
+    let bit_d: f64 = clampf(off_d, g_VM_OFF_D_MIN, g_VM_OFF_D_MAX);
+    let bit_f: f64 = clampf(off_f, g_VM_OFF_F_MIN, g_VM_OFF_F_MAX);
+    let bit_x: f64 = clampf(rot_x, g_VM_ROT_X_MIN, g_VM_ROT_X_MAX);
+    let bit_y: f64 = clampf(rot_y, 0.0 - g_VM_ROT_Y_ABS, g_VM_ROT_Y_ABS);
+    let bit_z: f64 = clampf(rot_z, 0.0 - g_VM_ROT_Z_ABS, g_VM_ROT_Z_ABS);
+    if (bit_r != off_r) { s[g_VMS_CLAMPS] = s[g_VMS_CLAMPS] + 1.0; }
+    if (bit_d != off_d) { s[g_VMS_CLAMPS] = s[g_VMS_CLAMPS] + 1.0; }
+    if (bit_f != off_f) { s[g_VMS_CLAMPS] = s[g_VMS_CLAMPS] + 1.0; }
+    if (bit_x != rot_x) { s[g_VMS_CLAMPS] = s[g_VMS_CLAMPS] + 1.0; }
+    if (bit_y != rot_y) { s[g_VMS_CLAMPS] = s[g_VMS_CLAMPS] + 1.0; }
+    if (bit_z != rot_z) { s[g_VMS_CLAMPS] = s[g_VMS_CLAMPS] + 1.0; }
+
+    s[g_VMS_OFF_R] = bit_r;
+    s[g_VMS_OFF_D] = bit_d;
+    s[g_VMS_OFF_F] = bit_f;
+    s[g_VMS_ROT_X] = bit_x;
+    s[g_VMS_ROT_Y] = bit_y;
+    s[g_VMS_ROT_Z] = bit_z;
+
+    vm_build_matrix(vm);
+}
+
+// ===========================================================================
+//  8.  THE MODEL MATRIX — view space, and still no view term
+// ===========================================================================
+//   v = P + R * (B*p + o_rest - P) + d
+//     B = diag(-1, 1, -1)   the frozen basis map (world_render's g_vm_model)
+//     P                     the pivot, view space (the fist)
+//     R = Rx(ax) Ry(ay) Rz(az)   about the VIEW axes
+//     d = (dr, -dd, -df)    the animated offset
+// so  M3 = R*B  and  M_t = P + d + R*(o_rest - P).
+// At rest R is the identity and d is zero, and M is byte-for-byte the sixteen
+// constants world_render.hml already ships.
+export fn vm_build_matrix(p_vm: object) {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let m: array<f64> = vm.m;
+
+    let ca: f64 = cos(s[g_VMS_ROT_X]); let sa: f64 = sin(s[g_VMS_ROT_X]);
+    let cb: f64 = cos(s[g_VMS_ROT_Y]); let sb: f64 = sin(s[g_VMS_ROT_Y]);
+    let cc: f64 = cos(s[g_VMS_ROT_Z]); let sc: f64 = sin(s[g_VMS_ROT_Z]);
+
+    let r00: f64 = cb * cc;
+    let r01: f64 = 0.0 - cb * sc;
+    let r02: f64 = sb;
+    let r10: f64 = sa * sb * cc + ca * sc;
+    let r11: f64 = 0.0 - sa * sb * sc + ca * cc;
+    let r12: f64 = 0.0 - sa * cb;
+    let r20: f64 = 0.0 - ca * sb * cc + sa * sc;
+    let r21: f64 = ca * sb * sc + sa * cc;
+    let r22: f64 = ca * cb;
+
+    m[0] = 0.0 - r00;  m[1] = r01;  m[2]  = 0.0 - r02;
+    m[4] = 0.0 - r10;  m[5] = r11;  m[6]  = 0.0 - r12;
+    m[8] = 0.0 - r20;  m[9] = r21;  m[10] = 0.0 - r22;
+
+    let px: f64 = vm.piv_x; let py: f64 = vm.piv_y; let pz: f64 = vm.piv_z;
+    let qx: f64 = vm.rest_r - px;
+    let qy: f64 = (0.0 - vm.rest_d) - py;
+    let qz: f64 = (0.0 - vm.rest_f) - pz;
+
+    m[3]  = px + s[g_VMS_OFF_R] + r00 * qx + r01 * qy + r02 * qz;
+    m[7]  = py - s[g_VMS_OFF_D] + r10 * qx + r11 * qy + r12 * qz;
+    m[11] = pz - s[g_VMS_OFF_F] + r20 * qx + r21 * qy + r22 * qz;
+
+    m[12] = 0.0; m[13] = 0.0; m[14] = 0.0; m[15] = 1.0;
+}
+
+export fn vm_model(p_vm: object): array<f64> {
+    let vm: object = p_vm;
+    let out: array<f64> = vm.m;
+    return out;
+}
+
+// ===========================================================================
+//  9.  EMIT — ARCHITECTURE §4 stage 15
+// ===========================================================================
+// `p_proj` is the PROJECTION ALONE (world_render's g_proj): the view matrix is
+// the camera's own rotation and it is the one transform a first-person held
+// object must not receive.  `p_restore` is the caller's world MVP, put back
+// before returning so stage 16 onward is untouched.
+//
+// Returns the number of triangles written.
+export fn vm_emit(p_vm: object, p_batch, p_tex, p_proj, p_restore): i32 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    if (vm.mesh == null) { s[g_VMS_TRIS] = 0.0; let z: i32 = 0; return z; }
+
+    mesh_set_mvp(p_proj);
+    let n: i32 = mesh_emit(vm.mesh, p_batch, p_tex, vm.m, 255, 255, 255, 255);
+    mesh_set_mvp(p_restore);
+
+    // the spent magazine: two triangles, view space, only once bound
+    if (s[g_VMS_MAGON] > 0.0) {
+        if (vm.mag_bound != 0) {
+            n = n + vm_emit_mag(vm, p_batch, p_tex, p_proj, p_restore);
+        }
+    }
+    s[g_VMS_TRIS] = f64(n);
+    let out: i32 = n;
+    return out;
+}
+
+// The card is axis-aligned in VIEW space and tumbles in the view XY plane, so
+// it always faces the camera without a billboard basis.  Wound A(top-left),
+// B(top-right), C(bottom-right), D(bottom-left) so its screen signed area is
+// positive — the same sign as every drawn triangle of the lantern under
+// EMIT_BF_CCW.
+fn vm_emit_mag(p_vm: object, p_batch, p_tex, p_proj, p_restore): i32 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let ang: f64 = s[g_VMS_MAGT] * g_VM_MAG_SPIN;
+    // (`cs`/`sn`, not `cx`/`sx`: `sx` is in ci_unbox.sh's hot-local vocabulary
+    // and a cold function tripping that warning trains people to ignore it.)
+    let cs: f64 = cos(ang); let sn: f64 = sin(ang);
+    let hw: f64 = g_VM_MAG_W * 0.5;
+    let hh: f64 = g_VM_MAG_H * 0.5;
+    let ox: f64 = s[g_VMS_MAGX]; let oy: f64 = s[g_VMS_MAGY]; let oz: f64 = s[g_VMS_MAGZ];
+
+    // corner offsets, rotated in the view XY plane
+    let ax: f64 = ox + (0.0 - hw) * cs - hh * sn;
+    let ay: f64 = oy + (0.0 - hw) * sn + hh * cs;
+    let bx: f64 = ox + hw * cs - hh * sn;
+    let by: f64 = oy + hw * sn + hh * cs;
+    let ccx: f64 = ox + hw * cs + hh * sn;
+    let ccy: f64 = oy + hw * sn - hh * cs;
+    let dx: f64 = ox + (0.0 - hw) * cs + hh * sn;
+    let dy: f64 = oy + (0.0 - hw) * sn - hh * cs;
+
+    let dep: array<f64> = vm.dep;
+    let cur: i32 = batch_reserve(p_batch, 2);
+    if (cur < 0) { let z: i32 = 0; return z; }
+    emit_set_mvp(p_proj);
+    let n: i32 = emit_quad_world(batch_vbuf(p_batch), cur, dep, 0,
+                                 ax, ay, oz, bx, by, oz, ccx, ccy, oz, dx, dy, oz,
+                                 vm.mag_u0, vm.mag_v0, vm.mag_u1, vm.mag_v0,
+                                 vm.mag_u1, vm.mag_v1, vm.mag_u0, vm.mag_v1,
+                                 0.0, 0.0, 1.0, vm.mag_rgb);
+    emit_set_mvp(p_restore);
+    p_batch.n = p_batch.n - (2 - n);
+    let k = 0;
+    while (k < n) {
+        batch_commit(p_batch, cur + k * 60, p_tex, dep[k]);
+        k = k + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 10.  READERS
+// ===========================================================================
+export fn vm_state(p_vm: object): array<f64> {
+    let vm: object = p_vm;
+    let out: array<f64> = vm.s;
+    return out;
+}
+export fn vm_field(p_vm: object, p_i: i32): f64 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let out: f64 = s[p_i];
+    return out;
+}
+export fn vm_reload_stage(p_vm: object): i32 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let out: i32 = i32(s[g_VMS_STAGE]);
+    return out;
+}
+export fn vm_kick(p_vm: object): f64 {
+    let vm: object = p_vm;
+    let s: array<f64> = vm.s;
+    let k: f64 = (s[g_VMS_KR] - s[g_VMS_KA]) * g_VM_KICK_NORM;
+    if (k < 0.0) { k = 0.0; }
+    let out: f64 = k;
+    return out;
+}
+export fn vm_ads(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_ADS]; return out;
+}
+export fn vm_sprint(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_SPRINT]; return out;
+}
+export fn vm_off_right(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_OFF_R]; return out;
+}
+export fn vm_off_down(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_OFF_D]; return out;
+}
+export fn vm_off_fwd(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_OFF_F]; return out;
+}
+export fn vm_rot_x(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_ROT_X]; return out;
+}
+export fn vm_rot_y(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_ROT_Y]; return out;
+}
+export fn vm_rot_z(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_ROT_Z]; return out;
+}
+export fn vm_clamps(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = i32(s[g_VMS_CLAMPS]); return out;
+}
+export fn vm_tris(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = i32(s[g_VMS_TRIS]); return out;
+}
+export fn vm_mag_active(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = 0;
+    if (s[g_VMS_MAGON] > 0.0) { out = 1; }
+    return out;
+}
+export fn vm_mag_x(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_MAGX]; return out;
+}
+export fn vm_mag_y(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_MAGY]; return out;
+}
+export fn vm_mag_z(p_vm: object): f64 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: f64 = s[g_VMS_MAGZ]; return out;
+}
+// The two latches the audio layer drains: the floor clack (GAME_DESIGN 7.11)
+// and the reload-complete beat.  Draining is how a cosmetic event survives a
+// frame in which the sim ran zero times or five times.
+export fn vm_take_clack(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = 0;
+    if (s[g_VMS_CLACK] > 0.0) { out = 1; s[g_VMS_CLACK] = 0.0; }
+    return out;
+}
+export fn vm_take_reload_done(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = 0;
+    if (s[g_VMS_RELDONE] > 0.0) { out = 1; s[g_VMS_RELDONE] = 0.0; }
+    return out;
+}
+export fn vm_stage_bits(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = i32(s[g_VMS_STAGEBITS]); return out;
+}
+export fn vm_kicks(p_vm: object): i32 {
+    let vm: object = p_vm; let s: array<f64> = vm.s;
+    let out: i32 = i32(s[g_VMS_KICKS]); return out;
+}
+export fn vm_kick_peak_s(): f64 { let out: f64 = g_VM_KICK_TPEAK; return out; }
+export fn vm_ppm(): f64 { let out: f64 = g_VM_PPM; return out; }
+export fn vm_mesh_tris(p_vm: object): i32 {
+    let vm: object = p_vm;
+    if (vm.mesh == null) { let z: i32 = 0; return z; }
+    let out: i32 = mesh_tri_count(vm.mesh);
+    return out;
+}
