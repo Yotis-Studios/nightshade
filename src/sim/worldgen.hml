@@ -1,0 +1,668 @@
+// worldgen.hml — the world, as a pure function of a seed.            W3-1.
+//
+// ===========================================================================
+// WHAT THIS FILE IS
+// ===========================================================================
+// A HEIGHTFIELD generator, not a voxel generator.  Everything the world is
+// made of is a function of (seed, world x, world z):
+//
+//     worldgen_height(seed, wx, wz) -> metres          the terrain
+//     worldgen_temp / worldgen_moist                   the two biome fields
+//     worldgen_biome(seed, wx, wz)  -> WG_BIOME_*      biome selection
+//     worldgen_shade_tier(seed, cx, cz, phase) -> 0..5 the danger gradient
+//     worldgen_poi_roll(seed, cx, cz)          -> WG_POI_*
+//     worldgen_chunk(seed, cx, cz, heights, biomes)    the batched form
+//
+// There is no state.  There is no I/O.  There is no wall clock.  There are no
+// mutable top-level variables — every `export let` below is a constant, and
+// every constant a hot loop needs is re-stated as a function-local literal so
+// that no top-level slot is read per sample (CLAUDE.md §1 rule 3).
+//
+// It imports `src/core/mathx.hml` and NOTHING else — not even `@stdlib/math`
+// (mathx is a leaf that calls the `__floor` / `__sqrt` builtins directly, and
+// this file does the same).  No SDL, no wobbleweed, no `@stdlib/random`, no
+// `@stdlib/time`.  This module is part of the future dedicated server and must
+// link headless.  The `src/core/config.hml` constants it mirrors are asserted
+// equal by `probe_worldgen` §A rather than imported, so that no top-level slot
+// from another module is read 567 times per chunk.
+//
+// ===========================================================================
+// DETERMINISM
+// ===========================================================================
+// Every random decision goes through `mathx.vnoise` / `mathx.xhash2`, whose
+// mixing is entirely in `u64` (CLAUDE.md A13 — i32/i64 `* + -` TRAP on
+// overflow; u64 wraps).  The only arithmetic here is f64 and small-magnitude
+// i32, so the same (seed, cx, cz) produces bit-identical output on the
+// interpreter and the compiler.  `probe_worldgen` pins that with checksums
+// over 1 000 000 samples and is run BOTH ways.
+//
+// >>> SEED DERIVATION IS `^`, NEVER `+`. <<<
+// `vnoise(..., seed + 31)` THROWS "Integer overflow: i32 addition" when the
+// world seed is near 2^31.  (That is also a latent bug in `mathx.fbm2`, which
+// derives its octave seeds with `+31` / `+97`; reported, not fixed — this file
+// does not own mathx.hml.)  Every octave seed below is `seed ^ <odd constant>`,
+// which cannot overflow and which `xhash2`'s avalanche decorrelates.
+//
+// ===========================================================================
+// THE HEIGHT FIELD — 3 octaves of value noise on a 4 m grid
+// ===========================================================================
+//   h(x,z) = BASE + 2*AMP * ( (n96 - .5)*.48*relief
+//                           + (n32 - .5)*.30
+//                           + (n12 - .5)*.22 )
+//
+// `relief` is a smooth function of the temperature/moisture fields, in
+// [0.40, 1.70].  It scales ONLY the 96 m octave, which is what gives each
+// biome its terrain character (Ironpine's big cold ridges, the Fen's smooth
+// flats) WITHOUT introducing a discontinuity at a biome boundary — biome is a
+// hard classification of (t, m), but `relief` is continuous in (t, m), so the
+// height field stays C0 across every biome edge.  The 32 m and 12 m octaves
+// are never scaled: a "flat" biome still has to have local relief, because a
+// flat horizon is an anti-goal (CLAUDE.md §9.5) and a chunk with no undulation
+// renders as cardboard.
+//
+// The finest cell is 12 m against a 4 m sample grid — 3 samples per cell — so
+// the stored heightfield actually resolves the octave it is carrying.  An 8 m
+// finest cell measures a higher per-chunk range but aliases against the grid,
+// which would put the collision surface and the visible surface in different
+// places.
+//
+// MEASURED per-chunk relief (max - min over a chunk's 81 samples), 8 seeds
+// including both i32 extremes, 51x51 chunks each = 20 808 chunks:
+//     worst chunk 3.58 m   mean 10.3 m   chunks below 3.0 m: 0
+// The acceptance bar is +/-1.5 m (a 3.0 m range).  See `probe_worldgen` §D,
+// which re-measures it every run.  This is an EMPIRICAL floor over 20 808
+// chunks, not a proof: value noise cannot guarantee a lower bound on the range
+// of any particular window, and this file does not pretend otherwise.
+//
+// ===========================================================================
+// CHUNK BUFFER LAYOUT (the contract with `chunk.hml`, W3-2)
+// ===========================================================================
+// `worldgen_chunk(seed, cx, cz, heights, biomes)` writes 9x9 = 81 samples,
+// ROW-MAJOR with x fastest:   index = j * 9 + i,  i along +X, j along +Z
+//   sample (i, j) is at world (cx*32 + i*4, cz*32 + j*4)
+//   `heights` : u16 LITTLE-ENDIAN centimetres at byte offset index*2.
+//               Read it back with `heights.read_u16_le(index * 2)`.
+//               Needs >= 162 bytes.  Heights are clamped to [0, 65535] cm;
+//               the generator's own range is ~[8 m, 56 m] so the clamp never
+//               fires in practice.
+//   `biomes`  : u8 WG_BIOME_* at byte offset index.  Needs >= 81 bytes.
+// Row j = 8 of chunk (cx, cz) and row j = 0 of chunk (cx, cz+1) are the SAME
+// world coordinates and therefore the same bytes — that is what makes the
+// chunk grid C0-continuous with no seam and no stitching pass.
+//
+// ===========================================================================
+// COST, MEASURED (hemlockc -O1, __clock min-of-7, this box is never idle)
+// ===========================================================================
+// 7 `vnoise` per sample x 81 samples = 567 lattice evaluations per chunk.
+//     worldgen_chunk   0.67 - 0.70 ms/chunk   compiled -O1, loaded
+//                      3.90 - 3.96 ms/chunk   interpreted
+//     worldgen_height  8.1 - 9.2 us/point     compiled -O1, loaded
+// The acceptance bar and `g_BUDGET_CHUNKGEN_MS` are both 2.0 ms, so a chunk
+// costs ~34 % of its per-frame allowance and a 5x5 ring can be built inside 25
+// frames without ever exceeding it.  There is no idle number for this box
+// (CLAUDE.md §1.2); `probe_worldgen` §G re-measures and prints it every run and
+// scales its bound by an empty-loop calibration so the same assertion holds
+// interpreted.
+//
+// The batched path exists because a sample needs a height AND a biome, and
+// both need the temperature and moisture fields.  Calling worldgen_height()
+// then worldgen_biome() per sample evaluates them twice: 11 vnoise instead of
+// 7.  Measured ratio 0.648 (probe §G3), i.e. the batch is 1.54x cheaper.
+// ===========================================================================
+
+import { clamp01, clampi, floori, vnoise, xhash2 } from "../core/mathx.hml";
+
+// ---------------------------------------------------------------------------
+// CONSTANTS.
+// These are the module's public vocabulary.  `probe_worldgen` §A asserts every
+// one of them against its `src/core/config.hml` counterpart, so the two files
+// cannot drift.  Hot loops below re-state them as literals: reading a
+// top-level slot 567 times per chunk is the CLAUDE.md rule-3 tax for nothing.
+// ---------------------------------------------------------------------------
+
+export let WG_CHUNK_N        = 9;        // height samples per chunk edge
+export let WG_CHUNK_SAMPLES  = 81;       // WG_CHUNK_N * WG_CHUNK_N
+export let WG_CHUNK_M        = 32.0;     // chunk edge, metres
+export let WG_GRID_M         = 4.0;      // heightfield cell, metres
+export let WG_HEIGHT_STRIDE  = 2;        // bytes per stored height (u16 LE)
+export let WG_HEIGHT_SCALE_CM = 100.0;   // metres -> centimetres
+
+// The field's shape.  BASE is chosen so the generator never produces a
+// negative height (it bottoms out near 8 m), because the store is UNSIGNED.
+export let WG_BASE_M         = 32.0;
+export let WG_AMP_M          = 18.0;     // +/- peak of the unit-relief field
+export let WG_CELL0_M        = 96.0;     // coarse octave, relief-scaled
+export let WG_CELL1_M        = 32.0;     // mid octave
+export let WG_CELL2_M        = 12.0;     // fine octave, 3 samples per cell
+export let WG_TEMP_CELL_M    = 512.0;
+export let WG_MOIST_CELL_M   = 448.0;
+
+// Biomes.  GDD §4.3 order; this is the on-disk and on-the-wire encoding.
+// NOTE (reported to the orchestrator): `src/art/biome.hml` (Wave 4) is
+// specified to export `BIOME_HOLLOWFIELD..BIOME_DEEPSHADE` too, and it may not
+// import `src/sim/**`.  These are `WG_`-prefixed so the two cannot collide;
+// the indices belong in `src/core/config.hml` where BOTH may read them.
+export let WG_BIOME_HOLLOWFIELD = 0;
+export let WG_BIOME_ASHWOOD     = 1;
+export let WG_BIOME_CHALKDOWNS  = 2;
+export let WG_BIOME_FEN         = 3;
+export let WG_BIOME_IRONPINE    = 4;
+export let WG_BIOME_DEEPSHADE   = 5;
+export let WG_BIOME_COUNT       = 6;
+
+// POIs.  GDD §4.4 frequency table.
+export let WG_POI_NONE     = 0;
+export let WG_POI_LANTERN  = 1;
+export let WG_POI_RUIN     = 2;
+export let WG_POI_CARAVAN  = 3;
+export let WG_POI_SHRINE   = 4;
+export let WG_POI_BURROW   = 5;
+export let WG_POI_COUNT    = 6;
+
+// The shade tier ladder (GDD §4.2).
+export let WG_TIER_MAX     = 5;
+export let WG_TIER_M       = 200.0;      // metres from town per tier
+
+// Ember Hollow.  GDD §5: "a small walled town at world origin", a 40x40 m
+// plot, and "the town is a tier-0 island and the only guaranteed one at world
+// start".  Two radii, both deliberate:
+//   TIER_R   forces tier 0 — the guarantee above, at every phase, every seed.
+//   BIOME_R  forces Hollowfield — you always start in the starting biome.
+// Height is NOT flattened here.  Levelling the town plot is `hubgen.hml`'s job
+// (Wave 4); a worldgen that flattens 2 chunks would fail its own undulation
+// criterion in exactly the place the player spends the most time looking.
+export let WG_TOWN_TIER_R_M  = 64.0;
+export let WG_TOWN_BIOME_R_M = 96.0;
+
+// Lantern posts.  GDD §4.4 asks for "1 per ~4 chunks, guaranteed 1 within
+// 120 m of anywhere".  A per-chunk probability roll delivers the first and
+// CANNOT deliver the second, so lanterns are placed structurally instead:
+// exactly one per 2x2-chunk block (= 4 chunks), positioned inside the middle
+// half of the block.  The worst case is then a block corner to the far corner
+// of the middle half: sqrt(48^2 + 48^2) = 67.9 m, which is the guarantee.
+// Everything else still rolls per chunk.
+export let WG_LANTERN_BLOCK_C  = 2;      // chunks per block edge
+export let WG_LANTERN_INSET_M  = 16.0;   // keep-out from the block edge
+export let WG_LANTERN_MAX_D_M  = 67.9;   // proven bound on distance to nearest
+
+// ---------------------------------------------------------------------------
+// OCTAVE SEED SALTS.  Written inline as `seed ^ <constant>` at every call site
+// rather than through a helper: A9b measures a Hemlock call at ~10 ns PER
+// ARGUMENT, and this would be seven two-argument calls per sample — 567 calls
+// and ~11 us per chunk to save writing an XOR seven times.  XOR, never `+`
+// (see the header: `+` traps at the i32 extremes).
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// THE BIOME FIELDS
+// ===========================================================================
+// Two low-frequency fields, two octaves each so the borders are irregular
+// rather than circular.  Both land in [0, 1) with a standard deviation near
+// 0.147, so every threshold below is expressed relative to 0.5.
+
+export fn worldgen_temp(p_seed: i32, p_wx: f64, p_wz: f64): f64 {
+    let x: f64 = p_wx;
+    let z: f64 = p_wz;
+    let s: i32 = p_seed;
+    let a: f64 = vnoise(x, z, 512.0, 0, s ^ 774863155);
+    let b: f64 = vnoise(x, z, 171.0, 0, s ^ 2087834729);
+    let out: f64 = a * 0.72 + b * 0.28;
+    return out;
+}
+
+export fn worldgen_moist(p_seed: i32, p_wx: f64, p_wz: f64): f64 {
+    let x: f64 = p_wx;
+    let z: f64 = p_wz;
+    let s: i32 = p_seed;
+    let a: f64 = vnoise(x, z, 448.0, 0, s ^ 1315423911);
+    let b: f64 = vnoise(x, z, 149.0, 0, s ^ 950706376);
+    let out: f64 = a * 0.72 + b * 0.28;
+    return out;
+}
+
+// Terrain character in [0.40, 1.70], continuous in (t, m): cold is rugged,
+// wet is smooth.  Scales the 96 m octave only.
+export fn worldgen_relief_tm(p_t: f64, p_m: f64): f64 {
+    let t: f64 = p_t;
+    let m: f64 = p_m;
+    let r: f64 = clamp01(0.5 + (0.5 - t) * 1.10 - (m - 0.5) * 0.70);
+    let out: f64 = 0.40 + 1.30 * r;
+    return out;
+}
+
+export fn worldgen_relief(p_seed: i32, p_wx: f64, p_wz: f64): f64 {
+    let t: f64 = worldgen_temp(p_seed, p_wx, p_wz);
+    let m: f64 = worldgen_moist(p_seed, p_wx, p_wz);
+    let out: f64 = worldgen_relief_tm(t, m);
+    return out;
+}
+
+// ===========================================================================
+// HEIGHT
+// ===========================================================================
+
+// The height field given a relief that the caller has already computed.  This
+// is the one place the formula exists; `worldgen_height` and `worldgen_chunk`
+// both route through it, so the batched path cannot drift from the point
+// query.  `probe_worldgen` §E asserts they agree sample for sample.
+export fn worldgen_height_rel(p_seed: i32, p_wx: f64, p_wz: f64, p_relief: f64): f64 {
+    let x: f64 = p_wx;
+    let z: f64 = p_wz;
+    let s: i32 = p_seed;
+    let rel: f64 = p_relief;
+    let n0: f64 = vnoise(x, z, 96.0, 0, s);
+    let n1: f64 = vnoise(x, z, 32.0, 0, s ^ 1013904223);
+    let n2: f64 = vnoise(x, z, 12.0, 0, s ^ 1597334677);
+    let acc: f64 = (n0 - 0.5) * 0.48 * rel + (n1 - 0.5) * 0.30 + (n2 - 0.5) * 0.22;
+    let out: f64 = 32.0 + 36.0 * acc;
+    return out;
+}
+
+// Terrain height in METRES at any world point.  7 `vnoise` calls.
+export fn worldgen_height(p_seed: i32, p_wx: f64, p_wz: f64): f64 {
+    let s: i32 = p_seed;
+    let x: f64 = p_wx;
+    let z: f64 = p_wz;
+    let rel: f64 = worldgen_relief(s, x, z);
+    let out: f64 = worldgen_height_rel(s, x, z, rel);
+    return out;
+}
+
+// The stored form: unsigned centimetres, rounded half-up, clamped to u16.
+export fn worldgen_height_cm(p_seed: i32, p_wx: f64, p_wz: f64): i32 {
+    let h: f64 = worldgen_height(p_seed, p_wx, p_wz);
+    let out: i32 = clampi(floori(h * 100.0 + 0.5), 0, 65535);
+    return out;
+}
+
+// ===========================================================================
+// BIOME
+// ===========================================================================
+// Classification of (temperature, moisture) plus two overrides:
+//   - the town disc is always the starting biome
+//   - Deepshade only exists beyond a distance threshold that is itself a
+//     function of (t, m), so the "shade line" is an irregular front rather
+//     than a drawn circle.  Cold, dry ground goes dark soonest.
+// GDD §4.3 look/terrain in comments so the thresholds can be argued about.
+export fn worldgen_biome_tmd(p_t: f64, p_m: f64, p_d: f64): i32 {
+    let t: f64 = p_t;
+    let m: f64 = p_m;
+    let d: f64 = p_d;
+
+    if (d < 96.0) {
+        let town: i32 = 0;                       // WG_BIOME_HOLLOWFIELD
+        return town;
+    }
+    // Deepshade — permanent night, alien plateaus, endgame.
+    let dthr: f64 = 640.0 + 520.0 * (t + m) * 0.5;
+    if (d >= dthr) {
+        if (t < 0.45) {
+            if (m < 0.45) {
+                let deep: i32 = 5;               // WG_BIOME_DEEPSHADE
+                return deep;
+            }
+        }
+    }
+    // The Fen — black water, reeds, mist.  Warm and wet.
+    if (m > 0.615) {
+        if (t > 0.44) {
+            let fen: i32 = 3;
+            return fen;
+        }
+    }
+    // Ironpine — steep dark conifer slopes.  Cold.
+    if (t < 0.425) {
+        let iron: i32 = 4;
+        return iron;
+    }
+    // Chalk Downs — pale open hills, standing stones.  Warm and dry.
+    if (t > 0.585) {
+        if (m < 0.475) {
+            let chalk: i32 = 2;
+            return chalk;
+        }
+    }
+    // Ashwood — dead white birch, thick grey fog.  Damp.
+    if (m > 0.535) {
+        let ash: i32 = 1;
+        return ash;
+    }
+    // Hollowfield — warm gold grass, gentle rolling.  The default.
+    let hollow: i32 = 0;
+    return hollow;
+}
+
+export fn worldgen_biome(p_seed: i32, p_wx: f64, p_wz: f64): i32 {
+    let s: i32 = p_seed;
+    let x: f64 = p_wx;
+    let z: f64 = p_wz;
+    let t: f64 = worldgen_temp(s, x, z);
+    let m: f64 = worldgen_moist(s, x, z);
+    // Declared-then-assigned on purpose: `let d: f64 = <call>` compiles to
+    // `HmlValue d = hml_convert_to_type(...)` and stays BOXED, while
+    // `let d: f64 = 0.0; d = <call>` compiles to a native `double`.
+    // Verified with `hemlockc -c --emit-c`; `ci_unbox.sh` watches this name.
+    let d: f64 = 0.0;
+    d = __sqrt(x * x + z * z);
+    let out: i32 = worldgen_biome_tmd(t, m, d);
+    return out;
+}
+
+// ===========================================================================
+// SHADE TIER  (GDD §4.2)
+// ===========================================================================
+//   base_tier(d) = clamp(floor(d / 200), 0, 5)
+//   tier = clamp(base + noise_tier(chunk) + phase_bonus, 0, 5)
+//   noise_tier in {-1, 0, 0, +1}, hashed per chunk
+// Tier is a CHUNK property, evaluated at the chunk centre, because it drives
+// fog distance and sky tint — those must not change halfway across a chunk.
+
+// {-1, 0, 0, +1} — the pockets of "too deep, too soon".
+export fn worldgen_tier_jitter(p_seed: i32, p_cx: i32, p_cz: i32): i32 {
+    let h: u64 = xhash2(p_cx, p_cz, p_seed ^ 1735287159);
+    let q: i32 = i32(h & 3);
+    let out: i32 = 0;
+    if (q == 0) { out = -1; }
+    if (q == 3) { out = 1; }
+    return out;
+}
+
+// Distance from town (the origin) to the CENTRE of chunk (cx, cz), in metres.
+export fn worldgen_chunk_dist(p_cx: i32, p_cz: i32): f64 {
+    let x: f64 = f64(p_cx) * 32.0 + 16.0;
+    let z: f64 = f64(p_cz) * 32.0 + 16.0;
+    let out: f64 = __sqrt(x * x + z * z);
+    return out;
+}
+
+// `p_phase_bonus`: 0 day, +1 dusk, +2 night — `daycycle.hml` (W3-12) supplies
+// it.  Lantern-forced tier 0 is a RUNTIME override and lives in lantern.hml;
+// the only tier-0 island worldgen knows about is the town.
+export fn worldgen_shade_tier(p_seed: i32, p_cx: i32, p_cz: i32, p_phase_bonus: i32): i32 {
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let d: f64 = 0.0;                            // declared-then-assigned: unboxes
+    d = worldgen_chunk_dist(cx, cz);
+    if (d < 64.0) {
+        let town: i32 = 0;                       // the guaranteed tier-0 island
+        return town;
+    }
+    let base: i32 = floori(d * 0.005);           // d / 200
+    let j: i32 = worldgen_tier_jitter(p_seed, cx, cz);
+    let out: i32 = clampi(base + j + p_phase_bonus, 0, 5);
+    return out;
+}
+
+// ===========================================================================
+// POINTS OF INTEREST  (GDD §4.4)
+// ===========================================================================
+// Lanterns are structural (one per 2x2-chunk block, see the constants above);
+// everything else is a per-chunk hash roll.  The four rolled frequencies are
+// divided by 0.75 because the roll only reaches the 3-in-4 chunks that are not
+// lantern anchors — which makes the WORLD-WIDE frequency come out at the GDD's
+// 1-in-6 / 1-in-10 / 1-in-14 / 1-in-20 rather than 25 % short of it.
+// `probe_worldgen` §F measures all five over 250 000 chunks.
+
+// Floor-division by the block size, correct for negative chunk coords.
+export fn worldgen_block_of(p_c: i32): i32 {
+    let out: i32 = floori(f64(p_c) * 0.5);
+    return out;
+}
+
+// The lantern of block (bx, bz), in world metres.  Constrained to the middle
+// half of the 64 m block, which is what bounds the walk to the nearest one.
+export fn worldgen_lantern_x(p_seed: i32, p_bx: i32, p_bz: i32): f64 {
+    let h: u64 = xhash2(p_bx, p_bz, p_seed ^ 464775923);
+    let u: f64 = f64(h & 65535) * 0.0000152587890625;   // /65536, in [0,1)
+    let out: f64 = f64(p_bx) * 64.0 + 16.0 + 32.0 * u;
+    return out;
+}
+
+export fn worldgen_lantern_z(p_seed: i32, p_bx: i32, p_bz: i32): f64 {
+    let h: u64 = xhash2(p_bx, p_bz, p_seed ^ 1103515245);
+    let u: f64 = f64(h & 65535) * 0.0000152587890625;
+    let out: f64 = f64(p_bz) * 64.0 + 16.0 + 32.0 * u;
+    return out;
+}
+
+// 1 if this chunk is the lantern anchor of its block.
+export fn worldgen_is_lantern_chunk(p_seed: i32, p_cx: i32, p_cz: i32): i32 {
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let bx: i32 = worldgen_block_of(cx);
+    let bz: i32 = worldgen_block_of(cz);
+    let lx: f64 = worldgen_lantern_x(p_seed, bx, bz);
+    let lz: f64 = worldgen_lantern_z(p_seed, bx, bz);
+    let ax: i32 = floori(lx * 0.03125);          // / 32 -> chunk x
+    let az: i32 = floori(lz * 0.03125);
+    let out: i32 = 0;
+    if (ax == cx) {
+        if (az == cz) { out = 1; }
+    }
+    return out;
+}
+
+export fn worldgen_poi_roll(p_seed: i32, p_cx: i32, p_cz: i32): i32 {
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    if (worldgen_is_lantern_chunk(p_seed, cx, cz) == 1) {
+        let lan: i32 = 1;                        // WG_POI_LANTERN
+        return lan;
+    }
+    let h: u64 = xhash2(cx, cz, p_seed ^ 1911520717);
+    let u: f64 = f64(h) * 2.3283064365386963e-10;         // [0,1)
+    if (u < 0.222222222222) { let r: i32 = 2; return r; }  // ruin,    1 in 6
+    if (u < 0.355555555555) { let c: i32 = 3; return c; }  // caravan, 1 in 10
+    if (u < 0.450793650793) { let s: i32 = 4; return s; }  // shrine,  1 in 14
+    if (u < 0.517460317460) { let b: i32 = 5; return b; }  // burrow,  1 in 20
+    let none: i32 = 0;
+    return none;
+}
+
+// Where the POI stands, in world metres.  For a lantern that is the block
+// position; for a rolled POI it is a hashed point kept 6 m clear of the chunk
+// edge so its footprint cannot straddle two chunks.  For WG_POI_NONE it is the
+// chunk centre, which is a harmless answer rather than a trap value.
+export fn worldgen_poi_x(p_seed: i32, p_cx: i32, p_cz: i32): f64 {
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    if (worldgen_is_lantern_chunk(p_seed, cx, cz) == 1) {
+        let bx: i32 = worldgen_block_of(cx);
+        let bz: i32 = worldgen_block_of(cz);
+        let lx: f64 = worldgen_lantern_x(p_seed, bx, bz);
+        return lx;
+    }
+    if (worldgen_poi_roll(p_seed, cx, cz) == 0) {
+        let mid: f64 = f64(cx) * 32.0 + 16.0;
+        return mid;
+    }
+    let h: u64 = xhash2(cx, cz, p_seed ^ 2027808477);
+    let u: f64 = f64(h & 65535) * 0.0000152587890625;
+    let out: f64 = f64(cx) * 32.0 + 6.0 + 20.0 * u;
+    return out;
+}
+
+export fn worldgen_poi_z(p_seed: i32, p_cx: i32, p_cz: i32): f64 {
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    if (worldgen_is_lantern_chunk(p_seed, cx, cz) == 1) {
+        let bx: i32 = worldgen_block_of(cx);
+        let bz: i32 = worldgen_block_of(cz);
+        let lz: f64 = worldgen_lantern_z(p_seed, bx, bz);
+        return lz;
+    }
+    if (worldgen_poi_roll(p_seed, cx, cz) == 0) {
+        let mid: f64 = f64(cz) * 32.0 + 16.0;
+        return mid;
+    }
+    let h: u64 = xhash2(cx, cz, p_seed ^ 1442695041);
+    let u: f64 = f64(h & 65535) * 0.0000152587890625;
+    let out: f64 = f64(cz) * 32.0 + 6.0 + 20.0 * u;
+    return out;
+}
+
+// ===========================================================================
+// THE BATCHED FORM — one chunk into caller-owned buffers
+// ===========================================================================
+// THE hot function in this file: 81 samples x 7 vnoise.  No allocation, no
+// object literal, no closure, no `defer`, no `try`, no template string.  The
+// two field evaluations are inlined rather than called so that `t` and `m` are
+// computed ONCE per sample and shared by the height, the relief and the biome
+// — calling worldgen_height() and worldgen_biome() per sample would evaluate
+// them twice, at +57 % cost.
+//
+// Returns the number of samples written (WG_CHUNK_SAMPLES), or 0 if either
+// buffer is too small — never a partial write, never a throw.
+export fn worldgen_chunk(p_seed: i32, p_cx: i32, p_cz: i32,
+                         p_heights: buffer, p_biomes: buffer): i32 {
+    let hb: buffer = p_heights;
+    let bb: buffer = p_biomes;
+    if (hb.length < 162) { let bad: i32 = 0; return bad; }
+    if (bb.length < 81) { let bad2: i32 = 0; return bad2; }
+    let n: i32 = wg_fill(p_seed, p_cx, p_cz, hb, 0, bb, 0, 0);
+    return n;
+}
+
+// The generator core.  Private: every public entry point routes through this
+// one loop, so there is exactly one copy of the field evaluation in the file.
+//   p_hoff / p_aoff : BYTE offsets into the two buffers
+//   p_light         : 1 to also write 81 neutral baked-light bytes after the
+//                     81 biome bytes (see worldgen_chunk_at)
+fn wg_fill(p_seed: i32, p_cx: i32, p_cz: i32,
+           p_hb: buffer, p_hoff: i32, p_bb: buffer, p_aoff: i32, p_light: i32): i32 {
+    let hb: buffer = p_hb;
+    let bb: buffer = p_bb;
+    let hoff: i32 = p_hoff;
+    let aoff: i32 = p_aoff;
+
+    let s: i32 = p_seed;
+    let s0: i32 = s;
+    let s1: i32 = s ^ 1013904223;
+    let s2: i32 = s ^ 1597334677;
+    let st0: i32 = s ^ 774863155;
+    let st1: i32 = s ^ 2087834729;
+    let sm0: i32 = s ^ 1315423911;
+    let sm1: i32 = s ^ 950706376;
+
+    let ox: f64 = f64(p_cx) * 32.0;
+    let oz: f64 = f64(p_cz) * 32.0;
+
+    let j = 0;
+    while (j < 9) {
+        let wz: f64 = oz + f64(j) * 4.0;
+        let row: i32 = j * 9;
+        let i = 0;
+        while (i < 9) {
+            let wx: f64 = ox + f64(i) * 4.0;
+
+            let ta: f64 = vnoise(wx, wz, 512.0, 0, st0);
+            let tb: f64 = vnoise(wx, wz, 171.0, 0, st1);
+            let t: f64 = ta * 0.72 + tb * 0.28;
+            let ma: f64 = vnoise(wx, wz, 448.0, 0, sm0);
+            let mb: f64 = vnoise(wx, wz, 149.0, 0, sm1);
+            let m: f64 = ma * 0.72 + mb * 0.28;
+
+            // relief — hand-inlined worldgen_relief_tm (A9)
+            let rr: f64 = 0.5 + (0.5 - t) * 1.10 - (m - 0.5) * 0.70;
+            if (rr < 0.0) { rr = 0.0; }
+            if (rr > 1.0) { rr = 1.0; }
+            let rel: f64 = 0.40 + 1.30 * rr;
+
+            let n0: f64 = vnoise(wx, wz, 96.0, 0, s0);
+            let n1: f64 = vnoise(wx, wz, 32.0, 0, s1);
+            let n2: f64 = vnoise(wx, wz, 12.0, 0, s2);
+            let acc: f64 = (n0 - 0.5) * 0.48 * rel + (n1 - 0.5) * 0.30 + (n2 - 0.5) * 0.22;
+            let h: f64 = 32.0 + 36.0 * acc;
+
+            let cm: i32 = floori(h * 100.0 + 0.5);
+            if (cm < 0) { cm = 0; }
+            if (cm > 65535) { cm = 65535; }
+
+            let d: f64 = 0.0;                    // declared-then-assigned: unboxes
+            d = __sqrt(wx * wx + wz * wz);
+            let b: i32 = worldgen_biome_tmd(t, m, d);
+
+            let idx: i32 = row + i;
+            let o: i32 = hoff + idx * 2;
+            hb[o] = cm & 255;
+            hb[o + 1] = (cm >> 8) & 255;
+            bb[aoff + idx] = b;
+
+            i++;
+        }
+        j++;
+    }
+    if (p_light == 1) {
+        let k = 0;
+        while (k < 81) { bb[aoff + 81 + k] = 255; k++; }
+    }
+    let out: i32 = 81;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE `chunk.hml` SOURCE ADAPTER
+// ---------------------------------------------------------------------------
+// `src/sim/chunk.hml` (W3-2) takes its terrain from an INJECTED source rather
+// than importing this file, and documents the contract as
+//
+//     fn source(hbuf, hoff, abuf, aoff, cx, cz, seed): i32
+//
+// writing 81 u16-LE centimetre heights at `hoff`, 81 biome bytes at `aoff`,
+// 81 baked-light bytes at `aoff + 81`, and returning one opaque META word.
+// This is that function, with the arguments in worldgen's own (seed, cx, cz)
+// order; the boot path's adapter is a one-line reorder.
+//
+// TWO THINGS TO KNOW.
+//  * **worldgen does not bake light.**  Light depends on the sun angle and the
+//    time of day, neither of which is a property of the world.  The 81 light
+//    bytes are filled with 255 — "fully lit" — so that a chunk whose bake has
+//    not run yet renders FLAT BRIGHT and obviously unfinished, rather than
+//    black, which would look exactly like night and hide the bug.  `chunk.hml`
+//    already owns `chunk_set_light` for the real bake to write back through.
+//  * The META word packs the chunk's discrete decisions, none of which vary
+//    per sample:  bits 0-2 POI kind, bits 3-5 shade tier at phase 0,
+//    bits 6-7 tier jitter + 1.  Decode with worldgen_meta_*.
+// Returns -1 if either buffer is too small at the given offset.
+export fn worldgen_chunk_at(p_seed: i32, p_cx: i32, p_cz: i32,
+                            p_heights: buffer, p_hoff: i32,
+                            p_attrs: buffer, p_aoff: i32): i32 {
+    let hb: buffer = p_heights;
+    let bb: buffer = p_attrs;
+    if (p_hoff < 0 || p_aoff < 0) { let bad: i32 = -1; return bad; }
+    if (hb.length < p_hoff + 162) { let bad2: i32 = -1; return bad2; }
+    if (bb.length < p_aoff + 162) { let bad3: i32 = -1; return bad3; }
+    wg_fill(p_seed, p_cx, p_cz, hb, p_hoff, bb, p_aoff, 1);
+    let poi: i32 = worldgen_poi_roll(p_seed, p_cx, p_cz);
+    let tier: i32 = worldgen_shade_tier(p_seed, p_cx, p_cz, 0);
+    let jit: i32 = worldgen_tier_jitter(p_seed, p_cx, p_cz) + 1;
+    let out: i32 = poi | (tier << 3) | (jit << 6);
+    return out;
+}
+
+export fn worldgen_meta_poi(p_meta: i32): i32 {
+    let out: i32 = p_meta & 7;
+    return out;
+}
+
+export fn worldgen_meta_tier(p_meta: i32): i32 {
+    let out: i32 = (p_meta >> 3) & 7;
+    return out;
+}
+
+export fn worldgen_meta_jitter(p_meta: i32): i32 {
+    let out: i32 = ((p_meta >> 6) & 3) - 1;
+    return out;
+}
+
+// Read a height back out of a `worldgen_chunk` buffer, in metres.  Provided so
+// nothing downstream has to re-derive the u16-little-endian-centimetres
+// layout by hand.
+export fn worldgen_chunk_height_m(p_heights: buffer, p_i: i32, p_j: i32): f64 {
+    let hb: buffer = p_heights;
+    let o: i32 = (p_j * 9 + p_i) * 2;
+    let lo: i32 = hb[o];
+    let hi: i32 = hb[o + 1];
+    let out: f64 = f64(lo + hi * 256) * 0.01;
+    return out;
+}

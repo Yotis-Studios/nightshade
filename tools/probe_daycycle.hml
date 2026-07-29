@@ -1,0 +1,896 @@
+// probe_daycycle.hml — W3-12 acceptance probe for src/sim/daycycle.hml.
+//
+// Run it FROM THE NIGHTSHADE REPO ROOT, both ways:
+//     hemlockc -O1 tools/probe_daycycle.hml -o /tmp/pdc && /tmp/pdc
+//     hemlock  tools/probe_daycycle.hml
+//
+// It exits 1 on any failure AND on an assertion-count mismatch — a probe that
+// silently stops running half its checks is worse than no probe.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS PROBE REFUSES TO DO
+// ---------------------------------------------------------------------------
+// It does not assert that the Dusk phase starts at tick 32 400. That number is
+// a CONSEQUENCE of two things `config.hml` owns — the phase fractions and the
+// day length — and the project has already been burned once by probes that
+// froze consequences as constants (four lightning assertions encoding exact RGB
+// triples, all stale at the same moment, silently). So every assertion below is
+// on a RELATIONSHIP:
+//
+//     the four phase ranges tile the day exactly, in order, with no gap
+//     each boundary tick is the first tick of its phase and the last of the one before
+//     the horn gives exactly g_DUSK_HORN_LEAD_S seconds of warning before night
+//     the tier bonus never decreases as the light goes away
+//     daycycle and tod.hml classify all 57 600 ticks identically
+//
+// Re-tune the day to 20 minutes or move the horn and these keep passing —
+// exactly as long as the design still holds. Break the design and they fail at
+// the point where it broke.
+//
+// The one place a literal appears is D6's headline numbers (16 minutes; Dawn 2
+// / Day 7 / Dusk 2 / Night 5), because those ARE the design, written in
+// ARCHITECTURE.md and BUILD_PLAN.md, and something has to hold the line on
+// them. They are asserted in MINUTES against the derivation, not in ticks.
+
+import { exit } from "@stdlib/process";
+import { read_file, is_dir } from "@stdlib/fs";
+
+import {
+    PHASE_DAWN, PHASE_DAY, PHASE_DUSK, PHASE_NIGHT, PHASE_COUNT, PHASE_NONE,
+    DAY_TICKS, DAY_SECONDS, DAY_MINUTES,
+    PHASE_TICK_DAWN, PHASE_TICK_DAY, PHASE_TICK_DUSK, PHASE_TICK_NIGHT,
+    HORN_TICK, HORN_LEAD_TICKS,
+    TIER_BONUS_DAWN, TIER_BONUS_DAY, TIER_BONUS_DUSK, TIER_BONUS_NIGHT,
+    TIER_BONUS_MAX,
+    day_tick_of, day_number, day_frac, day_seconds,
+    day_phase, day_phase_of_frac, day_phase_start_tick, day_phase_end_tick,
+    day_phase_len, day_phase_t, day_is_night,
+    day_tier_bonus, day_tier_bonus_of_phase,
+    day_horn_tick, day_is_horn_tick, day_horn_edge,
+    day_phase_edge, day_ticks_until, day_next_phase_tick
+} from "../src/sim/daycycle.hml";
+
+// The file that OWNS the numbers. Asserted against, never re-typed: if
+// config.hml moves a phase boundary this probe re-derives and still passes; if
+// daycycle.hml stops deriving, it fails.
+import {
+    g_DAY_MINUTES, g_DAY_SECONDS, g_DAY_TICKS, g_TICK_HZ,
+    g_PHASE_DAWN_END, g_PHASE_DAY_END, g_PHASE_DUSK_END,
+    g_DUSK_HORN_LEAD_S, g_TIER_PHASE_DUSK, g_TIER_PHASE_NIGHT,
+    g_SHADE_TIER_MAX
+} from "../src/core/config.hml";
+
+// The ART side of the same clock. daycycle.hml may not import this (the import
+// wall) — but the probe is a tool and is not walled, so this is the only place
+// the two halves of the day cycle can be checked against each other. If they
+// ever disagree the player is standing in Dusk light during the Day phase.
+import {
+    tod_t_from_tick, tod_phase, tod_phase_start, tod_phase_t, tod_is_night,
+    TOD_PHASE_DAWN, TOD_PHASE_DAY, TOD_PHASE_DUSK, TOD_PHASE_NIGHT,
+    TOD_PHASE_COUNT, TOD_DAY_TICKS, TOD_DAY_SECONDS
+} from "../src/art/tod.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 96;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+fn approx(p_a: f64, p_b: f64, p_eps: f64): bool {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let out: bool = d <= p_eps;
+    return out;
+}
+
+// Two's-complement widen; `u64(v)` throws on a negative and `v + 2147483647`
+// would TRAP on overflow (i32 + traps in Hemlock), so route negatives via f64.
+fn mixi(p_h: u64, p_v: i32): u64 {
+    let h: u64 = p_h;
+    let v: u64 = 0;
+    if (p_v >= 0) { v = u64(p_v); } else { v = u64(f64(p_v) + 4294967296.0); }
+    let out: u64 = (h ^ v) * 1099511628211;
+    return out;
+}
+
+fn phase_name(p_p: i32): string {
+    let p: i32 = p_p;
+    if (p == PHASE_DAWN) { return "DAWN"; }
+    if (p == PHASE_DAY) { return "DAY"; }
+    if (p == PHASE_DUSK) { return "DUSK"; }
+    if (p == PHASE_NIGHT) { return "NIGHT"; }
+    return "NONE";
+}
+
+// ===========================================================================
+// A.  THE DERIVATION — every boundary comes from config.hml, not from here
+// ===========================================================================
+fn section_derivation() {
+    print("A. Derivation from config.hml");
+
+    // A1 — the day length is the design length, derived. D6: 16 minutes at
+    // 60 Hz. The BUILD_PLAN's "exactly 57 600 ticks" is this product, so assert
+    // the product and let the number be its consequence.
+    let derived: i32 = i32(g_DAY_MINUTES * 60.0 * f64(g_TICK_HZ) + 0.5);
+    print(`   A1  DAY_TICKS = ${DAY_TICKS}  (derived ${g_DAY_MINUTES} min x 60 s x ${g_TICK_HZ} Hz = ${derived})`);
+    ck(DAY_TICKS == derived, "A1 DAY_TICKS = day_minutes * 60 * tick_hz",
+       `DAY_TICKS ${DAY_TICKS}, derived ${derived}`);
+
+    // A2 — and it is the number the plan names. This is a DESIGN digit (D6),
+    // not a tuning digit: if it moves, the plan moved.
+    ck(DAY_TICKS == 57600, "A2 a full day is exactly 57 600 ticks (BUILD_PLAN W3-12)",
+       `${DAY_TICKS}`);
+    ck(DAY_TICKS == g_DAY_TICKS, "A3 DAY_TICKS mirrors g_DAY_TICKS", `${DAY_TICKS} vs ${g_DAY_TICKS}`);
+    ck(approx(DAY_SECONDS, g_DAY_SECONDS, 0.0), "A4 DAY_SECONDS mirrors g_DAY_SECONDS", `${DAY_SECONDS}`);
+    ck(approx(DAY_SECONDS, f64(DAY_TICKS) / f64(g_TICK_HZ), 1e-9),
+       "A5 DAY_SECONDS = DAY_TICKS / tick_hz", `${DAY_SECONDS}`);
+    ck(approx(DAY_MINUTES, g_DAY_MINUTES, 0.0), "A6 DAY_MINUTES mirrors g_DAY_MINUTES", `${DAY_MINUTES}`);
+
+    // A7..A10 — each boundary tick is the config fraction times the day,
+    // rounded. Not one of 0 / 7200 / 32400 / 39600 is typed here.
+    let b_day: i32 = i32(g_PHASE_DAWN_END * f64(DAY_TICKS) + 0.5);
+    let b_dusk: i32 = i32(g_PHASE_DAY_END * f64(DAY_TICKS) + 0.5);
+    let b_night: i32 = i32(g_PHASE_DUSK_END * f64(DAY_TICKS) + 0.5);
+    print(`   A7  boundaries: DAWN@${PHASE_TICK_DAWN} DAY@${PHASE_TICK_DAY} DUSK@${PHASE_TICK_DUSK} NIGHT@${PHASE_TICK_NIGHT}`);
+    ck(PHASE_TICK_DAWN == 0, "A7 the day starts at Dawn, tick 0", `${PHASE_TICK_DAWN}`);
+    ck(PHASE_TICK_DAY == b_day, "A8 Day starts at g_PHASE_DAWN_END * DAY_TICKS", `${PHASE_TICK_DAY} vs ${b_day}`);
+    ck(PHASE_TICK_DUSK == b_dusk, "A9 Dusk starts at g_PHASE_DAY_END * DAY_TICKS", `${PHASE_TICK_DUSK} vs ${b_dusk}`);
+    ck(PHASE_TICK_NIGHT == b_night, "A10 Night starts at g_PHASE_DUSK_END * DAY_TICKS", `${PHASE_TICK_NIGHT} vs ${b_night}`);
+
+    // A11 — the boundaries are EXACT: converting each back to a fraction
+    // reproduces the config fraction bit-for-bit. This is the criterion
+    // "phase boundaries land on exact tick counts" stated as a round trip.
+    let e1: bool = f64(PHASE_TICK_DAY) / f64(DAY_TICKS) == g_PHASE_DAWN_END;
+    let e2: bool = f64(PHASE_TICK_DUSK) / f64(DAY_TICKS) == g_PHASE_DAY_END;
+    let e3: bool = f64(PHASE_TICK_NIGHT) / f64(DAY_TICKS) == g_PHASE_DUSK_END;
+    ck(e1 && e2 && e3, "A11 every boundary tick round-trips to its config fraction exactly",
+       `${f64(PHASE_TICK_DAY) / f64(DAY_TICKS)} ${f64(PHASE_TICK_DUSK) / f64(DAY_TICKS)} ${f64(PHASE_TICK_NIGHT) / f64(DAY_TICKS)}`);
+
+    // A12..A15 — the four phase lengths ARE Dawn 2 / Day 7 / Dusk 2 / Night 5
+    // minutes. Expressed in minutes, so a change of tick rate cannot break it.
+    let mps: f64 = 60.0 * f64(g_TICK_HZ);          // ticks per minute
+    let m0: f64 = f64(day_phase_len(PHASE_DAWN)) / mps;
+    let m1: f64 = f64(day_phase_len(PHASE_DAY)) / mps;
+    let m2: f64 = f64(day_phase_len(PHASE_DUSK)) / mps;
+    let m3: f64 = f64(day_phase_len(PHASE_NIGHT)) / mps;
+    print(`   A12 phase minutes: Dawn ${m0}  Day ${m1}  Dusk ${m2}  Night ${m3}`);
+    ck(approx(m0, 2.0, 1e-9), "A12 Dawn is 2 minutes (D6)", `${m0}`);
+    ck(approx(m1, 7.0, 1e-9), "A13 Day is 7 minutes (D6)", `${m1}`);
+    ck(approx(m2, 2.0, 1e-9), "A14 Dusk is 2 minutes (D6)", `${m2}`);
+    ck(approx(m3, 5.0, 1e-9), "A15 Night is 5 minutes (D6)", `${m3}`);
+
+    // A16 — and they sum to the day with nothing left over.
+    let sum: i32 = 0;
+    let p = 0;
+    while (p < PHASE_COUNT) { sum = sum + day_phase_len(p); p = p + 1; }
+    ck(sum == DAY_TICKS, "A16 the four phase lengths sum to exactly one day", `${sum} vs ${DAY_TICKS}`);
+
+    // A17 — the ranges TILE the day: start(DAWN)=0, end(p)=start(p+1),
+    // end(NIGHT)=DAY_TICKS. No gap, no overlap, strictly increasing.
+    let tiled: i32 = 1;
+    if (day_phase_start_tick(PHASE_DAWN) != 0) { tiled = 0; }
+    if (day_phase_end_tick(PHASE_NIGHT) != DAY_TICKS) { tiled = 0; }
+    let q = 0;
+    while (q < PHASE_COUNT - 1) {
+        if (day_phase_end_tick(q) != day_phase_start_tick(q + 1)) { tiled = 0; }
+        if (day_phase_start_tick(q) >= day_phase_start_tick(q + 1)) { tiled = 0; }
+        if (day_phase_len(q) <= 0) { tiled = 0; }
+        q = q + 1;
+    }
+    if (day_phase_len(PHASE_NIGHT) <= 0) { tiled = 0; }
+    ck(tiled == 1, "A17 the four phase ranges tile the day, in order, with no gap", `tiled=${tiled}`);
+
+    // A18 — the phase ids are the clock order (daycycle relies on phase+1).
+    ck(PHASE_DAWN == 0 && PHASE_DAY == 1 && PHASE_DUSK == 2 && PHASE_NIGHT == 3 && PHASE_COUNT == 4,
+       "A18 phase ids are in clock order 0..3", `${PHASE_DAWN}${PHASE_DAY}${PHASE_DUSK}${PHASE_NIGHT}`);
+    ck(PHASE_NONE < 0, "A19 PHASE_NONE is not a valid phase", `${PHASE_NONE}`);
+}
+
+// ===========================================================================
+// B.  THE FULL-DAY SWEEP — all 57 600 ticks, every invariant at once
+// ===========================================================================
+fn section_sweep() {
+    print("B. Full-day sweep (57 600 ticks)");
+
+    let bad_range: i32 = 0;      // phase's own range does not contain the tick
+    let bad_mono: i32 = 0;       // phase went backwards inside the day
+    let bad_frac: i32 = 0;       // day_frac not in [0,1) or not increasing
+    let bad_pt: i32 = 0;         // day_phase_t not in [0,1) or not increasing
+    let bad_night: i32 = 0;      // day_is_night disagrees with the phase
+    let bad_sec: i32 = 0;
+    let transitions: i32 = 0;
+    let prev_p: i32 = day_phase(0);
+    let prev_f: f64 = -1.0;
+    let prev_pt: f64 = -1.0;
+    let tr0: i32 = -1;
+    let tr1: i32 = -1;
+    let tr2: i32 = -1;
+
+    let n = 0;
+    while (n < DAY_TICKS) {
+        let p: i32 = day_phase(n);
+        if (n < day_phase_start_tick(p)) { bad_range = bad_range + 1; }
+        if (n >= day_phase_end_tick(p)) { bad_range = bad_range + 1; }
+        if (p < prev_p) { bad_mono = bad_mono + 1; }
+        if (p != prev_p) {
+            if (transitions == 0) { tr0 = n; }
+            if (transitions == 1) { tr1 = n; }
+            if (transitions == 2) { tr2 = n; }
+            transitions = transitions + 1;
+        }
+
+        let f: f64 = day_frac(n);
+        if (f < 0.0) { bad_frac = bad_frac + 1; }
+        if (f >= 1.0) { bad_frac = bad_frac + 1; }
+        if (f <= prev_f) { bad_frac = bad_frac + 1; }
+
+        let pt: f64 = day_phase_t(n);
+        if (pt < 0.0) { bad_pt = bad_pt + 1; }
+        if (pt >= 1.0) { bad_pt = bad_pt + 1; }
+        if (p == prev_p) {
+            if (pt <= prev_pt) { bad_pt = bad_pt + 1; }
+        } else {
+            if (pt != 0.0) { bad_pt = bad_pt + 1; }
+        }
+
+        let isn: i32 = day_is_night(n);
+        let want_n: i32 = 0;
+        if (p == PHASE_NIGHT) { want_n = 1; }
+        if (isn != want_n) { bad_night = bad_night + 1; }
+
+        let s: f64 = day_seconds(n);
+        if (s < 0.0) { bad_sec = bad_sec + 1; }
+        if (s >= DAY_SECONDS) { bad_sec = bad_sec + 1; }
+
+        prev_p = p;
+        prev_f = f;
+        prev_pt = pt;
+        n = n + 1;
+    }
+
+    print(`   B   transitions=${transitions} at ${tr0}/${tr1}/${tr2}; range=${bad_range} mono=${bad_mono} frac=${bad_frac} phase_t=${bad_pt} night=${bad_night} sec=${bad_sec}`);
+    ck(bad_range == 0, "B1 every tick lies inside its own phase's half-open range", `${bad_range} violations`);
+    ck(bad_mono == 0, "B2 the phase never goes backwards inside a day", `${bad_mono} violations`);
+    ck(transitions == 3, "B3 exactly three phase changes inside one day", `${transitions}`);
+    ck(tr0 == day_phase_start_tick(PHASE_DAY), "B4 the 1st change lands on Day's start tick", `${tr0}`);
+    ck(tr1 == day_phase_start_tick(PHASE_DUSK), "B5 the 2nd change lands on Dusk's start tick", `${tr1}`);
+    ck(tr2 == day_phase_start_tick(PHASE_NIGHT), "B6 the 3rd change lands on Night's start tick", `${tr2}`);
+    ck(bad_frac == 0, "B7 day_frac is strictly increasing over [0,1) across the day", `${bad_frac} violations`);
+    ck(bad_pt == 0, "B8 day_phase_t restarts at exactly 0.0 and rises to <1 in every phase", `${bad_pt} violations`);
+    ck(bad_night == 0, "B9 day_is_night is 1 exactly during Night", `${bad_night} violations`);
+    ck(bad_sec == 0, "B10 day_seconds stays in [0, DAY_SECONDS)", `${bad_sec} violations`);
+
+    // B11 — the boundary is SHARP in both directions: the tick before a phase
+    // start belongs to the previous phase, the start tick to the new one.
+    let sharp: i32 = 1;
+    let p = 1;
+    while (p < PHASE_COUNT) {
+        let s: i32 = day_phase_start_tick(p);
+        if (day_phase(s) != p) { sharp = 0; }
+        if (day_phase(s - 1) != p - 1) { sharp = 0; }
+        if (day_phase_t(s) != 0.0) { sharp = 0; }
+        p = p + 1;
+    }
+    if (day_phase(0) != PHASE_DAWN) { sharp = 0; }
+    if (day_phase(DAY_TICKS - 1) != PHASE_NIGHT) { sharp = 0; }
+    if (day_phase(DAY_TICKS) != PHASE_DAWN) { sharp = 0; }
+    ck(sharp == 1, "B11 each boundary tick is the first of its phase and the last of the one before", `sharp=${sharp}`);
+
+    // B12 — last tick of each phase has phase_t = (len-1)/len, never 1.0.
+    let lastok: i32 = 1;
+    let q = 0;
+    while (q < PHASE_COUNT) {
+        let e: i32 = day_phase_end_tick(q) - 1;
+        let want: f64 = f64(day_phase_len(q) - 1) / f64(day_phase_len(q));
+        if (approx(day_phase_t(e), want, 1e-12) == false) { lastok = 0; }
+        q = q + 1;
+    }
+    ck(lastok == 1, "B12 phase_t on the last tick of a phase is (len-1)/len, never 1.0", `lastok=${lastok}`);
+
+    // B13/B14 — day_frac and the anchors. frac(0) is exactly 0; the boundary
+    // fractions are exactly the config fractions (already A11) and the fraction
+    // at the last tick is one tick short of 1.
+    ck(day_frac(0) == 0.0, "B13 day_frac(0) is exactly 0", `${day_frac(0)}`);
+    ck(approx(day_frac(DAY_TICKS - 1), 1.0 - 1.0 / f64(DAY_TICKS), 1e-12),
+       "B14 day_frac of the last tick is one tick short of 1.0", `${day_frac(DAY_TICKS - 1)}`);
+}
+
+// ===========================================================================
+// C.  WRAPPING, DAY NUMBERS AND NEGATIVE TICKS
+// ===========================================================================
+fn section_wrap() {
+    print("C. Wrapping, day numbers, negative ticks");
+
+    // C1 — the clock is periodic with period DAY_TICKS, in both directions and
+    // for every function that takes a tick. Nothing integrates, so there is no
+    // drift to accumulate: this is exact, not approximate.
+    let bad: i32 = 0;
+    let samples = [0, 1, 7199, 7200, 32399, 32400, 39599, 39600, 57599];
+    let k = -3;
+    while (k <= 3) {
+        let i = 0;
+        while (i < samples.length) {
+            let n: i32 = samples[i];
+            let t: i32 = n + k * DAY_TICKS;
+            if (day_tick_of(t) != n) { bad = bad + 1; }
+            if (day_phase(t) != day_phase(n)) { bad = bad + 1; }
+            if (day_frac(t) != day_frac(n)) { bad = bad + 1; }
+            if (day_tier_bonus(t) != day_tier_bonus(n)) { bad = bad + 1; }
+            if (day_is_night(t) != day_is_night(n)) { bad = bad + 1; }
+            if (day_phase_t(t) != day_phase_t(n)) { bad = bad + 1; }
+            if (day_number(t) != k) { bad = bad + 1; }
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    ck(bad == 0, "C1 every tick function is exactly periodic with period DAY_TICKS, both directions",
+       `${bad} violations`);
+
+    // C2 — day_tick_of never leaves [0, DAY_TICKS), including for negatives.
+    let outr: i32 = 0;
+    let t = -DAY_TICKS - 5;
+    while (t < DAY_TICKS + 5) {
+        let n: i32 = day_tick_of(t);
+        if (n < 0) { outr = outr + 1; }
+        if (n >= DAY_TICKS) { outr = outr + 1; }
+        if (day_number(t) * DAY_TICKS + n != t) { outr = outr + 1; }
+        t = t + 7;
+    }
+    ck(outr == 0, "C2 day_number*DAY_TICKS + day_tick_of reconstructs any tick, negatives included",
+       `${outr} violations`);
+
+    // C3 — day_ticks_until / day_next_phase_tick.
+    let uok: i32 = 1;
+    let p = 0;
+    while (p < PHASE_COUNT) {
+        let s: i32 = day_phase_start_tick(p);
+        if (day_ticks_until(s, p) != 0) { uok = 0; }
+        if (day_ticks_until(s + 1, p) != DAY_TICKS - 1) { uok = 0; }
+        if (day_next_phase_tick(s, p) != s) { uok = 0; }
+        // from anywhere, landing on the target's start tick is the definition
+        let probe: i32 = 12345 + p * 777;
+        let nt: i32 = day_next_phase_tick(probe, p);
+        if (day_tick_of(nt) != s) { uok = 0; }
+        if (nt < probe) { uok = 0; }
+        if (nt - probe >= DAY_TICKS) { uok = 0; }
+        p = p + 1;
+    }
+    ck(uok == 1, "C3 day_next_phase_tick always lands on that phase's start tick, within one day",
+       `uok=${uok}`);
+
+    // C4 — the f64 entry point agrees with the integer one at every tick. It
+    // exists for scrubbed fractions; if the two ever disagreed, the debug tools
+    // would show a phase the sim is not in.
+    let dis: i32 = 0;
+    let n = 0;
+    while (n < DAY_TICKS) {
+        if (day_phase_of_frac(day_frac(n)) != day_phase(n)) { dis = dis + 1; }
+        n = n + 1;
+    }
+    ck(dis == 0, "C4 day_phase_of_frac agrees with day_phase at all 57 600 ticks", `${dis} disagreements`);
+
+    // C5 — and it wraps too.
+    let wok: i32 = 1;
+    if (day_phase_of_frac(2.7) != day_phase_of_frac(0.7)) { wok = 0; }
+    if (day_phase_of_frac(-0.3) != day_phase_of_frac(0.7)) { wok = 0; }
+    if (day_phase_of_frac(0.0) != PHASE_DAWN) { wok = 0; }
+    ck(wok == 1, "C5 day_phase_of_frac wraps outside [0,1)", `wok=${wok}`);
+}
+
+// ===========================================================================
+// D.  THE SHADE-TIER PHASE BONUS
+// ===========================================================================
+fn section_tier() {
+    print("D. Shade-tier phase bonus");
+
+    // D1 — the design: the phase can only ever make the world DEEPER, never
+    // shallower, and it gets monotonically worse as the light goes.
+    let b0: i32 = day_tier_bonus_of_phase(PHASE_DAWN);
+    let b1: i32 = day_tier_bonus_of_phase(PHASE_DAY);
+    let b2: i32 = day_tier_bonus_of_phase(PHASE_DUSK);
+    let b3: i32 = day_tier_bonus_of_phase(PHASE_NIGHT);
+    print(`   D   bonus: Dawn ${b0}  Day ${b1}  Dusk ${b2}  Night ${b3}`);
+    ck(b0 >= 0 && b1 >= 0 && b2 >= 0 && b3 >= 0,
+       "D1 the phase bonus never makes the world shallower", `${b0}/${b1}/${b2}/${b3}`);
+    ck(b1 <= b2 && b2 <= b3, "D2 the bonus rises monotonically Day -> Dusk -> Night", `${b1}/${b2}/${b3}`);
+    ck(b3 > b1, "D3 night is strictly deeper than day", `${b3} vs ${b1}`);
+    ck(b0 == 0 && b1 == 0, "D4 nothing is added while the sun is up", `${b0}/${b1}`);
+    ck(b2 == g_TIER_PHASE_DUSK, "D5 the dusk bonus is config's g_TIER_PHASE_DUSK", `${b2} vs ${g_TIER_PHASE_DUSK}`);
+    ck(b3 == g_TIER_PHASE_NIGHT, "D6 the night bonus is config's g_TIER_PHASE_NIGHT", `${b3} vs ${g_TIER_PHASE_NIGHT}`);
+    ck(b3 < g_SHADE_TIER_MAX, "D7 the bonus alone cannot reach the deepest tier — distance must contribute",
+       `${b3} vs max ${g_SHADE_TIER_MAX}`);
+    ck(TIER_BONUS_DAWN == b0 && TIER_BONUS_DAY == b1 && TIER_BONUS_DUSK == b2 && TIER_BONUS_NIGHT == b3,
+       "D8 the exported bonus constants match the function", `${TIER_BONUS_DAWN}/${TIER_BONUS_DAY}/${TIER_BONUS_DUSK}/${TIER_BONUS_NIGHT}`);
+    ck(TIER_BONUS_MAX == g_SHADE_TIER_MAX, "D9 TIER_BONUS_MAX mirrors the tier ladder's top", `${TIER_BONUS_MAX}`);
+
+    // D10 — the tick form and the phase form agree everywhere, and the bonus is
+    // never larger than the ladder it feeds.
+    let dis: i32 = 0;
+    let over: i32 = 0;
+    let n = 0;
+    while (n < DAY_TICKS) {
+        let b: i32 = day_tier_bonus(n);
+        if (b != day_tier_bonus_of_phase(day_phase(n))) { dis = dis + 1; }
+        if (b > TIER_BONUS_MAX) { over = over + 1; }
+        n = n + 1;
+    }
+    ck(dis == 0, "D10 day_tier_bonus = day_tier_bonus_of_phase(day_phase) at all 57 600 ticks", `${dis}`);
+    ck(over == 0, "D11 the bonus never exceeds the tier ladder", `${over}`);
+}
+
+// ===========================================================================
+// E.  THE DUSK HORN — three full days, asserting the event log
+// ===========================================================================
+fn section_horn() {
+    print("E. The dusk horn (3 full days = 172 800 ticks)");
+
+    // E1/E2 — WHERE the horn sits, as relationships. The config authors a LEAD
+    // TIME ("two long notes at T-2:00"); the horn is nightfall minus that lead.
+    // Because Dusk is itself exactly that long, it coincides with the Day->Dusk
+    // boundary: the horn IS the sound of dusk starting.
+    let lead: i32 = i32(g_DUSK_HORN_LEAD_S * f64(g_TICK_HZ) + 0.5);
+    print(`   E   horn tick ${HORN_TICK}; lead ${HORN_LEAD_TICKS} ticks = ${g_DUSK_HORN_LEAD_S} s before night at ${PHASE_TICK_NIGHT}`);
+    ck(HORN_LEAD_TICKS == lead, "E1 HORN_LEAD_TICKS is g_DUSK_HORN_LEAD_S in ticks", `${HORN_LEAD_TICKS} vs ${lead}`);
+    ck(PHASE_TICK_NIGHT - HORN_TICK == HORN_LEAD_TICKS,
+       "E2 the horn gives exactly the authored lead of warning before nightfall",
+       `${PHASE_TICK_NIGHT - HORN_TICK} vs ${HORN_LEAD_TICKS}`);
+    ck(HORN_TICK == day_phase_start_tick(PHASE_DUSK),
+       "E3 the horn lands on the Day->Dusk boundary (dusk is exactly the lead time long)",
+       `${HORN_TICK} vs ${day_phase_start_tick(PHASE_DUSK)}`);
+    ck(day_phase(HORN_TICK) == PHASE_DUSK, "E4 the horn sounds in Dusk, not in Day", phase_name(day_phase(HORN_TICK)));
+    ck(day_horn_tick() == HORN_TICK, "E5 day_horn_tick() returns HORN_TICK", `${day_horn_tick()}`);
+    ck(HORN_TICK > 0 && HORN_TICK < DAY_TICKS, "E6 the horn tick lies inside the day", `${HORN_TICK}`);
+
+    // ---- the 3-day run: advance one tick at a time and log every event -----
+    let days: i32 = 3;
+    let total: i32 = DAY_TICKS * days;
+    let horns: i32 = 0;
+    let flags: i32 = 0;          // day_is_horn_tick hits
+    let mismatch: i32 = 0;       // edge vs is_horn_tick
+    let h0: i32 = -1;
+    let h1: i32 = -1;
+    let h2: i32 = -1;
+    let extra: i32 = 0;          // a horn edge > 1 on a single-tick advance
+    let not_dusk: i32 = 0;       // a horn that did not land at dusk's start
+    let phase_edges: i32 = 0;
+    let ec0: i32 = 0;
+    let ec1: i32 = 0;
+    let ec2: i32 = 0;
+    let ec3: i32 = 0;
+    let log: string = "";
+    let logh: u64 = 14695981039346656037;
+
+    let t = 0;
+    while (t < total) {
+        let e: i32 = day_horn_edge(t - 1, t);
+        if (e > 1) { extra = extra + 1; }
+        if (e > 0) {
+            if (horns == 0) { h0 = t; }
+            if (horns == 1) { h1 = t; }
+            if (horns == 2) { h2 = t; }
+            horns = horns + e;
+            if (day_tick_of(t) != day_phase_start_tick(PHASE_DUSK)) { not_dusk = not_dusk + 1; }
+            log = `${log}|d${day_number(t)}:HORN@${day_tick_of(t)}`;
+            logh = mixi(mixi(logh, 1), t);
+        }
+        if (day_is_horn_tick(t) == 1) { flags = flags + 1; }
+        if (day_is_horn_tick(t) != e) { mismatch = mismatch + 1; }
+
+        let pe: i32 = day_phase_edge(t - 1, t);
+        if (pe != PHASE_NONE) {
+            phase_edges = phase_edges + 1;
+            if (pe == PHASE_DAWN) { ec0 = ec0 + 1; }
+            if (pe == PHASE_DAY) { ec1 = ec1 + 1; }
+            if (pe == PHASE_DUSK) { ec2 = ec2 + 1; }
+            if (pe == PHASE_NIGHT) { ec3 = ec3 + 1; }
+            log = `${log}|d${day_number(t)}:${phase_name(pe)}@${day_tick_of(t)}`;
+            logh = mixi(mixi(logh, 2 + pe), t);
+        }
+        t = t + 1;
+    }
+
+    print(`   E   ${days} days: horns=${horns} at ${h0}/${h1}/${h2}; phase edges=${phase_edges} (dawn ${ec0}, day ${ec1}, dusk ${ec2}, night ${ec3})`);
+    print(`   E   event log: ${log}`);
+
+    ck(horns == days, "E7 the dusk horn fires exactly once per day, over 3 days", `${horns} horns in ${days} days`);
+    ck(extra == 0, "E8 a one-tick advance never reports more than one horn", `${extra}`);
+    ck(not_dusk == 0, "E9 every horn landed on the Day->Dusk boundary", `${not_dusk} strays`);
+    ck(h0 == HORN_TICK && h1 == HORN_TICK + DAY_TICKS && h2 == HORN_TICK + 2 * DAY_TICKS,
+       "E10 the horns are one day apart, on the day's horn tick", `${h0}/${h1}/${h2}`);
+    ck(flags == days, "E11 day_is_horn_tick fires exactly once per day", `${flags}`);
+    ck(mismatch == 0, "E12 day_is_horn_tick and the one-tick edge agree on all 172 800 ticks", `${mismatch}`);
+    ck(phase_edges == days * PHASE_COUNT, "E13 four phase changes per day, over 3 days", `${phase_edges}`);
+    ck(ec0 == days && ec1 == days && ec2 == days && ec3 == days,
+       "E14 each of the four phases is entered exactly once per day", `${ec0}/${ec1}/${ec2}/${ec3}`);
+
+    // E15 — the SKIP form. Sleeping jumps the clock; an edge COUNT is the only
+    // thing that survives that, which is why the horn is not a latched flag.
+    ck(day_horn_edge(-1, total - 1) == days, "E15 one call spanning 3 days counts 3 horns (the sleep skip)",
+       `${day_horn_edge(-1, total - 1)}`);
+    ck(day_horn_edge(0, DAY_TICKS * 7) == 7, "E16 a 7-day skip counts 7 horns", `${day_horn_edge(0, DAY_TICKS * 7)}`);
+    ck(day_horn_edge(HORN_TICK, HORN_TICK + DAY_TICKS) == 1,
+       "E17 the interval is half-open: (horn, horn+day] is exactly one horn",
+       `${day_horn_edge(HORN_TICK, HORN_TICK + DAY_TICKS)}`);
+    ck(day_horn_edge(HORN_TICK - 1, HORN_TICK) == 1, "E18 the edge fires on the horn tick itself", "");
+    ck(day_horn_edge(HORN_TICK, HORN_TICK) == 0, "E19 an empty interval fires nothing", "");
+    ck(day_horn_edge(0, HORN_TICK - 1) == 0, "E20 no horn before the first horn tick", "");
+    ck(day_horn_edge(total, 0) == 0, "E21 a backwards interval never fires a negative count", `${day_horn_edge(total, 0)}`);
+
+    // E22 — REPLAY. The whole point of DESIGN 2: re-running the same interval
+    // produces a bit-identical event log. A latched flag would produce an empty
+    // one the second time, and replay.hml would diverge.
+    let logh2: u64 = 14695981039346656037;
+    let log2: string = "";
+    let t2 = 0;
+    while (t2 < total) {
+        let e: i32 = day_horn_edge(t2 - 1, t2);
+        if (e > 0) { log2 = `${log2}|d${day_number(t2)}:HORN@${day_tick_of(t2)}`; logh2 = mixi(mixi(logh2, 1), t2); }
+        let pe: i32 = day_phase_edge(t2 - 1, t2);
+        if (pe != PHASE_NONE) { log2 = `${log2}|d${day_number(t2)}:${phase_name(pe)}@${day_tick_of(t2)}`; logh2 = mixi(mixi(logh2, 2 + pe), t2); }
+        t2 = t2 + 1;
+    }
+    ck(log2 == log, "E22 replaying the same 3 days reproduces the identical event log", "logs differ");
+    ck(logh2 == logh, "E23 and the identical log hash", `${logh} vs ${logh2}`);
+
+    // E24 — REWIND. Re-running a single day from the middle, backwards, gives
+    // the same per-tick answers: nothing here is path-dependent.
+    let rew: i32 = 0;
+    let r = DAY_TICKS - 1;
+    while (r >= 0) {
+        if (day_horn_edge(r - 1, r) != day_is_horn_tick(r)) { rew = rew + 1; }
+        r = r - 1;
+    }
+    ck(rew == 0, "E24 walking a day backwards gives the same per-tick horn answers", `${rew}`);
+}
+
+// ===========================================================================
+// F.  PURITY — no history, no order dependence, no module state
+// ===========================================================================
+fn section_purity() {
+    print("F. Purity");
+
+    // F1 — evaluate the whole day in a scrambled order and compare against the
+    // sequential answers. Any hidden state would show up here.
+    let seq: u64 = 14695981039346656037;
+    let n = 0;
+    while (n < DAY_TICKS) {
+        seq = mixi(seq, day_phase(n));
+        seq = mixi(seq, day_tier_bonus(n));
+        seq = mixi(seq, day_is_night(n));
+        seq = mixi(seq, day_is_horn_tick(n));
+        n = n + 1;
+    }
+    // 40507 is coprime with 57600, so i -> (i*40507) mod 57600 is a permutation.
+    // Accumulated in permuted order into a per-tick table, then folded back in
+    // tick order — same answers, wildly different call order.
+    let tab = [];
+    let z = 0;
+    while (z < DAY_TICKS) { tab.push(0); z = z + 1; }
+    let i = 0;
+    while (i < DAY_TICKS) {
+        let idx: i32 = i32((u64(i) * 40507) % u64(DAY_TICKS));
+        tab[idx] = (day_phase(idx) * 8) + (day_tier_bonus(idx) * 2) + day_is_night(idx);
+        i = i + 1;
+    }
+    let shuf: u64 = 14695981039346656037;
+    let m = 0;
+    while (m < DAY_TICKS) {
+        let v: i32 = tab[m];
+        shuf = mixi(shuf, v / 8);
+        shuf = mixi(shuf, (v % 8) / 2);
+        shuf = mixi(shuf, v % 2);
+        shuf = mixi(shuf, day_is_horn_tick(m));
+        m = m + 1;
+    }
+    ck(shuf == seq, "F1 scrambled call order gives identical answers (no hidden state)", `${seq} vs ${shuf}`);
+
+    // F2 — a second identical sweep gives the identical checksum.
+    let seq2: u64 = 14695981039346656037;
+    let k = 0;
+    while (k < DAY_TICKS) {
+        seq2 = mixi(seq2, day_phase(k));
+        seq2 = mixi(seq2, day_tier_bonus(k));
+        seq2 = mixi(seq2, day_is_night(k));
+        seq2 = mixi(seq2, day_is_horn_tick(k));
+        k = k + 1;
+    }
+    ck(seq2 == seq, "F2 re-running the sweep gives the identical checksum", `${seq} vs ${seq2}`);
+    print(`   F   day checksum = ${seq}`);
+}
+
+// ===========================================================================
+// G.  daycycle.hml AGREES WITH art/tod.hml AT EVERY TICK
+// ===========================================================================
+// The sim decides when it is dusk; the art decides what dusk looks like. They
+// read the same config fractions but they are separate implementations behind
+// the import wall, and nothing else in the build can compare them. If they ever
+// drift the player stands in one phase's light during another phase's rules.
+fn section_tod_agreement() {
+    print("G. Agreement with src/art/tod.hml");
+
+    ck(DAY_TICKS == TOD_DAY_TICKS, "G1 both halves use the same day length in ticks", `${DAY_TICKS} vs ${TOD_DAY_TICKS}`);
+    ck(DAY_SECONDS == TOD_DAY_SECONDS, "G2 and the same day length in seconds", `${DAY_SECONDS} vs ${TOD_DAY_SECONDS}`);
+    ck(PHASE_COUNT == TOD_PHASE_COUNT, "G3 and the same number of phases", `${PHASE_COUNT} vs ${TOD_PHASE_COUNT}`);
+    ck(PHASE_DAWN == TOD_PHASE_DAWN && PHASE_DAY == TOD_PHASE_DAY
+       && PHASE_DUSK == TOD_PHASE_DUSK && PHASE_NIGHT == TOD_PHASE_NIGHT,
+       "G4 the phase ids are numbered identically on both sides", "enum drift");
+
+    let bad_frac: i32 = 0;
+    let bad_phase: i32 = 0;
+    let bad_night: i32 = 0;
+    let bad_pt: i32 = 0;
+    let n = 0;
+    while (n < DAY_TICKS) {
+        let f: f64 = day_frac(n);
+        if (f != tod_t_from_tick(n)) { bad_frac = bad_frac + 1; }
+        if (day_phase(n) != tod_phase(f)) { bad_phase = bad_phase + 1; }
+        if (day_is_night(n) != tod_is_night(f)) { bad_night = bad_night + 1; }
+        if (approx(day_phase_t(n), tod_phase_t(f), 1e-9) == false) { bad_pt = bad_pt + 1; }
+        n = n + 1;
+    }
+    print(`   G   57 600 ticks compared: frac=${bad_frac} phase=${bad_phase} night=${bad_night} phase_t=${bad_pt}`);
+    ck(bad_frac == 0, "G5 day_frac == tod_t_from_tick at every tick of the day", `${bad_frac}`);
+    ck(bad_phase == 0, "G6 day_phase == tod_phase at every tick of the day", `${bad_phase}`);
+    ck(bad_night == 0, "G7 day_is_night == tod_is_night at every tick of the day", `${bad_night}`);
+    ck(bad_pt == 0, "G8 day_phase_t == tod_phase_t at every tick of the day", `${bad_pt}`);
+
+    let bad_start: i32 = 0;
+    let p = 0;
+    while (p < PHASE_COUNT) {
+        if (approx(f64(day_phase_start_tick(p)) / f64(DAY_TICKS), tod_phase_start(p), 1e-12) == false) {
+            bad_start = bad_start + 1;
+        }
+        p = p + 1;
+    }
+    ck(bad_start == 0, "G9 every phase start agrees with tod_phase_start", `${bad_start}`);
+}
+
+// ===========================================================================
+// H.  THE SOURCE ITSELF — the import wall and the "no globals" criterion
+// ===========================================================================
+fn section_source() {
+    print("H. Source scan of src/sim/daycycle.hml");
+
+    let src = read_file("src/sim/daycycle.hml");
+    let lines = src.split("\n");
+
+    // Only CODE lines are scanned; the file's header comment discusses SDL and
+    // wall clocks at length and that is documentation, not a violation.
+    let banned = ["@stdlib/random", "@stdlib/time", "@stdlib/fs", "@stdlib/process",
+                  "@stdlib/net", "@stdlib/os", "wobbleweed", "gn.hml", "sdl.hml",
+                  "SDL_", "__clock", "ticks(", "now(", "src/art", "src/render", "src/net"];
+    let hits: string = "";
+    let imports: i32 = 0;
+    let bad_import: string = "";
+    let toplevel_lets: i32 = 0;
+    let nonconst: string = "";
+    let assigns: string = "";
+
+    let l = 0;
+    while (l < lines.length) {
+        let raw = lines[l];
+        let code = raw.split("//")[0];
+
+        let b = 0;
+        while (b < banned.length) {
+            if (code.contains(banned[b])) { hits = `${hits} ${l}:${banned[b]}`; }
+            b = b + 1;
+        }
+
+        if (code.contains("from \"")) {
+            imports = imports + 1;
+            if (code.contains("\"../core/config.hml\"") == false) { bad_import = `${bad_import} ${l}:${code}`; }
+        }
+
+        // Top-level declarations start at column 0. Everything inside a function
+        // is indented, so this finds exactly the module-scope bindings.
+        if (code.starts_with("export let ") || code.starts_with("let ")) {
+            toplevel_lets = toplevel_lets + 1;
+            let rest = code.split("let ")[1];
+            let nm = rest.split(":")[0].split("=")[0].trim();
+            // ARCHITECTURE.md §5 names these constants in ALL_CAPS; ci_imports.sh
+            // R3 documents that relaxation. Anything else at module scope would
+            // be state.
+            if (nm.upper() != nm) { nonconst = `${nonconst} ${l}:${nm}`; }
+        }
+        // A module-scope constant is only ever assigned by its declaration. An
+        // assignment to an ALL_CAPS name anywhere else is mutable module state —
+        // exactly what BUILD_PLAN W3-12's "no globals" forbids.
+        if (code.starts_with("export let ") == false) {
+            if (code.starts_with("let ") == false) {
+                let tr = code.trim();
+                if (tr.length > 0) {
+                    if (tr.starts_with("let ") == false) {
+                        let c0 = tr.split(" ")[0];
+                        if (c0.length > 1) {
+                            if (c0.upper() == c0) {
+                                if (tr.contains("=")) {
+                                    if (tr.contains("==") == false) { assigns = `${assigns} ${l}:${tr}`; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        l = l + 1;
+    }
+
+    print(`   H   ${lines.length} lines, ${imports} import line(s), ${toplevel_lets} module-scope constants`);
+    ck(hits == "", "H1 no wall clock, no SDL, no wobbleweed, no art/render/net symbol in sim CODE", `${hits}`);
+    ck(imports >= 1, "H2 the module imports config.hml (it must not re-type the numbers)", `${imports}`);
+    ck(bad_import == "", "H3 config.hml is the ONLY import (the sim import wall)", `${bad_import}`);
+    ck(toplevel_lets > 10, "H4 the module-scope constants are present to scan", `${toplevel_lets}`);
+    ck(nonconst == "", "H5 every module-scope binding is an ALL_CAPS constant, not state", `${nonconst}`);
+    ck(assigns == "", "H6 no module-scope name is ever assigned outside its declaration (no globals)", `${assigns}`);
+
+    // H7 — a scanner that cannot fail is not a scanner. This probe's own source
+    // contains a real `@stdlib/fs` import line; the same code must see it.
+    let selftext = read_file("tools/probe_daycycle.hml");
+    let sl = selftext.split("\n");
+    let seen: i32 = 0;
+    let s = 0;
+    while (s < sl.length) {
+        if (sl[s].split("//")[0].contains("@stdlib/fs")) { seen = 1; }
+        s = s + 1;
+    }
+    ck(seen == 1, "H7 the scanner detects a real banned-symbol line in this probe's own source", "scanner blind");
+}
+
+// ===========================================================================
+// I.  PERFORMANCE  (RULE T: __clock CPU time, min of 7, bound at ~2x loaded)
+// ===========================================================================
+fn section_perf() {
+    print("I. Performance (RULE T: __clock CPU time, min of 7 trials)");
+
+    let TRIALS = 7;
+
+    // Backend + load calibration. Every bound below is scaled by it, turning
+    // absolute bounds into ratio bounds (CLAUDE.md §1.2) so the same assertions
+    // run compiled and interpreted, loaded or idle.
+    let NC = 2000000;
+    let bestc: f64 = 1000000.0;
+    let calsink: i32 = 0;
+    let tc = 0;
+    while (tc < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < NC) { calsink = calsink ^ i; i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < bestc) { bestc = dt; }
+        tc = tc + 1;
+    }
+    let cal: f64 = bestc * 1000000000.0 / f64(NC);
+    let scale: f64 = cal / 12.5;
+    if (scale < 1.0) { scale = 1.0; }
+    print(`   I0  empty-loop calibration ${cal} ns/iter -> bound scale x${scale}   sink=${calsink}`);
+
+    // I1 — day_phase, the one everything calls.
+    let N1 = 2000000;
+    let best1: f64 = 1000000.0;
+    let sink1: i32 = 0;
+    let t1 = 0;
+    while (t1 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N1) { sink1 = sink1 + day_phase(i); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best1) { best1 = dt; }
+        t1 = t1 + 1;
+    }
+    let ns1: f64 = best1 * 1000000000.0 / f64(N1);
+    print(`   I1  day_phase        ${ns1} ns/call  (min of ${TRIALS}, ${N1})   sink=${sink1}`);
+
+    // I2 — day_horn_edge, called once per tick from the sim step.
+    let N2 = 2000000;
+    let best2: f64 = 1000000.0;
+    let sink2: i32 = 0;
+    let t2 = 0;
+    while (t2 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N2) { sink2 = sink2 + day_horn_edge(i - 1, i); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best2) { best2 = dt; }
+        t2 = t2 + 1;
+    }
+    let ns2: f64 = best2 * 1000000000.0 / f64(N2);
+    print(`   I2  day_horn_edge    ${ns2} ns/call  (min of ${TRIALS}, ${N2})   sink=${sink2}`);
+
+    // I3 — day_tier_bonus, the one worldgen calls per chunk.
+    let N3 = 2000000;
+    let best3: f64 = 1000000.0;
+    let sink3: i32 = 0;
+    let t3 = 0;
+    while (t3 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N3) { sink3 = sink3 + day_tier_bonus(i); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best3) { best3 = dt; }
+        t3 = t3 + 1;
+    }
+    let ns3: f64 = best3 * 1000000000.0 / f64(N3);
+    print(`   I3  day_tier_bonus   ${ns3} ns/call  (min of ${TRIALS}, ${N3})   sink=${sink3}`);
+
+    // The bounds are REGRESSION GUARDS at ~2x the loaded measurement (RULE T),
+    // scaled by the calibration. Both numbers are in the assertion text.
+    ck(ns1 < 110.0 * scale, "I1 day_phase <= 110 ns/call x scale (measured 42-45 ns at load 2, 87 ns under a 16-thread load; both /scale = 42-52)", `${ns1} ns`);
+    ck(ns2 < 250.0 * scale, "I2 day_horn_edge <= 250 ns/call x scale (measured 98-105 ns at load 2, 200 ns under a 16-thread load; both /scale = 96-120)", `${ns2} ns`);
+    ck(ns3 < 180.0 * scale, "I3 day_tier_bonus <= 180 ns/call x scale (measured 66-71 ns at load 2, 140 ns under a 16-thread load; both /scale = 66-84)", `${ns3} ns`);
+
+    // I4 — THE BUDGET ASSERTION. The whole clock runs O(1) per tick. Even at a
+    // generous 20 calls per tick it must be invisible against the 2.0 ms sim
+    // budget (config g_BUDGET_SIM_MS) — assert it as a FRACTION of that budget,
+    // which is the ratio form that survives contention.
+    // Normalised by the same calibration as every other bound, so the identical
+    // assertion holds compiled AND interpreted (the interpreter is ~22x slower;
+    // an un-normalised absolute-millisecond claim would be a compiled-only
+    // assertion pretending to be a general one).
+    let per_tick_ms: f64 = (ns1 + ns2 + ns3) * 20.0 / (scale * 1000000.0);
+    let pct: f64 = per_tick_ms * 100.0 / 2.0;
+    print(`   I4  20 clock calls/tick = ${per_tick_ms} ms (scale-normalised) = ${pct} % of the 2.0 ms sim budget`);
+    ck(pct < 1.0, "I4 20 day-cycle calls per tick cost < 1 % of the sim budget (measured 0.20 % compiled at load 2, 0.26 % under a 16-thread load, 0.17 % interpreted)", `${pct} %`);
+
+    // I5 — the ratio that survives everything: a clock call must not cost more
+    // than a handful of empty loop iterations.
+    let ratio: f64 = ns1 / cal;
+    print(`   I5  day_phase / empty-loop iteration = ${ratio}`);
+    ck(ratio < 9.0, "I5 day_phase costs < 9 empty-loop iterations (measured 3.0-3.4 at load 2, 4.2 under a 16-thread load)", `${ratio}`);
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_daycycle  —  W3-12  (src/sim/daycycle.hml)");
+    print("");
+
+    if (is_dir("src/sim") != true) {
+        print("FAIL  run this from the nightshade repo root: src/sim/ not found from here");
+        exit(1);
+    }
+
+    section_derivation();
+    print("");
+    section_sweep();
+    print("");
+    section_wrap();
+    print("");
+    section_tier();
+    print("");
+    section_horn();
+    print("");
+    section_purity();
+    print("");
+    section_tod_agreement();
+    print("");
+    section_source();
+    print("");
+    section_perf();
+    print("");
+
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

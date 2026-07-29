@@ -1,0 +1,609 @@
+// view.hml — the camera: basis, FOV, recoil_view, screen shake, and the MVP.
+// W3-5.  Stage 8 of the frame graph (ARCHITECTURE.md §4).
+//
+// One `View` handle, built once, mutated in place, read by:
+//     emit_set_mvp(view_mvp(v))          stage 9
+//     frustum_from_mvp(g_frustum, view_mvp(v))   stage 10
+//     target_set_shake(t, view_shake_x(v), view_shake_y(v))   stage 26
+//
+// ---------------------------------------------------------------------------
+// THE INTERFACE IS FOR AN INTERACTIVE CALLER FIRST
+// ---------------------------------------------------------------------------
+// The walkaround drives this directly off relative mouse motion, so the API is
+// a *mutable camera*, not a matrix factory:
+//
+//     let v = view_new();
+//     view_set_viewport(v, 320.0, 240.0);
+//     view_set_fog_far(v, 72.0);
+//     ... every frame ...
+//     view_look_mouse(v, input_mouse_dx(in), input_mouse_dy(in), view_sens_scale(v));
+//     view_set_eye(v, px, py + eye_h, pz);
+//     view_set_fov_mode(v, VIEW_ADS or VIEW_HIP or VIEW_SPRINT);
+//     view_build(v, frame_seconds, tick);
+//
+// A scripted caller (shot.hml, benchframe) uses `view_apply_camera` +
+// `view_snap_fov` instead and gets the same matrices with no lerp tail.
+//
+// ---------------------------------------------------------------------------
+// THE TWO ANGLE PAIRS — READ THIS BEFORE USING ANY ANGLE FROM THIS FILE
+// ---------------------------------------------------------------------------
+// There are two, they are not interchangeable, and the whole point of W3-5 is
+// that they never get confused:
+//
+//   AIM     `view_aim_yaw` / `view_aim_pitch` / `view_aim_forward_x|y|z`
+//           Exactly what the caller last set.  Authoritative.  This is the pair
+//           that goes into `cmd_set(...)` and therefore into the sim, and it is
+//           bit-identical to the value handed in — no kick, no shake, no lerp,
+//           no smoothing is ever mixed into it.  A bullet uses this.
+//
+//   RENDER  `view_render_yaw` / `view_render_pitch` / `view_render_roll`
+//           AIM + `recoil_view` + roll kick.  CLIENT-ONLY COSMETICS.  It exists
+//           only to build the MVP.  It must never reach a command, a hitscan, a
+//           projectile, or anything the server would also compute.
+//
+// `recoil_view` (`view_kick`) is the client's *visual* muzzle climb.  The
+// authoritative recoil that actually moves the shot cone is `recoil_aim`, which
+// lives in the sim (frame graph 3c) and reaches this file only through
+// `view_set_angles` like any other aim change.  Structurally the leak is
+// impossible in the other direction too: this file lives in `src/render/**` and
+// the import wall (CLAUDE.md §3, ci_imports R1) forbids `src/sim/**` from
+// importing anything here.  `tools/probe_view.hml` §4 asserts all of it — both
+// as a source scan and as a live `cmd_hash` comparison with a negative control.
+//
+// ---------------------------------------------------------------------------
+// WHY EVERY TIME-DEPENDENT TERM IS EXPONENTIAL OR LINEAR
+// ---------------------------------------------------------------------------
+// The sim is fixed-step but the *frame* is not, and the FOV lerp, the recoil
+// decay and the shake decay all run on frame time.  A naive `x += (t-x)*0.2`
+// gives a different answer at 30 fps than at 240 fps — the classic bug this
+// task's acceptance criterion exists to catch.  So:
+//
+//     FOV and recoil use   x' = t + (x - t) * exp(-dt / tau)
+//     trauma uses          x' = max(0, x - dt * rate)
+//
+// `exp(-a)*exp(-b) == exp(-(a+b))` and `dt` sums, so N small steps and one big
+// step covering the same wall time land on the same number to the last bit that
+// floating point allows.  There is deliberately no "snap when close" epsilon:
+// it would be the one term whose result depended on the step size.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS *NOT* IN THE MVP
+// ---------------------------------------------------------------------------
+// Screen shake.  It is a whole-image translation applied at present time by
+// `target_set_shake` / `target_present`, in target pixels, quantized to the
+// 320x240 grid — which is both cheaper and more PS1 than shaking the camera.
+// Keeping it out of the MVP also keeps frustum culling stable while the screen
+// is shaking, so a shake can never pop a chunk in or out of existence.
+// `probe_view` §5 asserts the MVP is bit-identical at trauma 0 and trauma 1.
+//
+// ---------------------------------------------------------------------------
+// CONVENTIONS
+// ---------------------------------------------------------------------------
+// * Right-handed, +Y up, camera looks down -Z in view space.  At yaw = pitch = 0
+//   it looks along world -Z.  Yaw increases turning right (clockwise from
+//   above); pitch increases looking up.  Identical to `mat_look_dir`.
+// * Row-major 4x4, flat `array<f64>` of 16 — the layout `emit_set_mvp` and
+//   `frustum_from_mvp` already read.
+// * Clip `w` == the distance along the aim-forward axis, in metres.  That is
+//   the painter-sort key of ARCHITECTURE §2.3 (larger = farther), which is why
+//   the perspective fold below keeps row 3 as exactly `-view_row2`.
+// * The far plane is DERIVED: `fog_far * g_FAR_PLANE_SCALE` (1.06).  Never a
+//   hardcoded 200.  `fog_far` itself is clamped to `g_FOG_FAR_CAP` (72 m) here
+//   as well as in tod.hml, because fog distance IS the triangle budget.
+//
+// RULE R1: this file is game-side.  It holds no colour and touches no engine
+// state; wobbleweed learns nothing from it.  Its only engine dependency is
+// `mat_look_dir` in vec.hml, which is deliberately generic.
+//
+// Cost: one `view_build` per frame.  Measured 2.7 us quiet / 4.2 us under
+// 16-way contention (probe_view §8) — 0.025 % of the 16.67 ms frame at worst,
+// and it does not touch the triangle budget at all.  Not a hot function by the
+// §4 definition (it runs once, not >1000 times), so it is
+// written for clarity, and the object handle that §2.2 of ARCHITECTURE
+// explicitly sanctions for "setup-time math (camera, matrices)" is used.
+
+import { sin, cos, tan, exp } from "@stdlib/math";
+import { mat_look_dir, v3 } from "../../../wobbleweed/src/vec.hml";
+import { clampf, h01_3 } from "../core/mathx.hml";
+import {
+    g_FOV_HIP, g_FOV_ADS, g_FOV_SPRINT, g_FOV_LERP_S,
+    g_PITCH_CLAMP_DEG, g_MOUSE_SENS_RAD, g_ADS_SENS_MULT,
+    g_NEAR_PLANE, g_FAR_PLANE_SCALE, g_FOG_FAR_CAP,
+    g_SHAKE_MAX_PX, g_SHAKE_FIRE_S, g_KICK_DECAY, g_KICK_PITCH_DEG,
+    g_ASPECT, g_RES_W, g_RES_H
+} from "../core/config.hml";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// FOV modes.  The mode picks the *target*; the lerp is in view_build.
+export let g_VIEW_HIP: i32 = 0;
+export let g_VIEW_ADS: i32 = 1;
+export let g_VIEW_SPRINT: i32 = 2;
+export let g_VIEW_FOV_MODES: i32 = 3;
+
+// pi, and the wrap range for yaw.
+export let g_VIEW_PI: f64 = 3.141592653589793;
+export let g_VIEW_TAU: f64 = 6.283185307179586;
+export let g_VIEW_DEG: f64 = 0.017453292519943295;   // pi/180
+
+// The AIM pitch clamp: config's +/-85 deg (GDD).  The player never aims past it.
+export let g_VIEW_PITCH_CLAMP: f64 = g_PITCH_CLAMP_DEG * 0.017453292519943295;
+
+// The RENDER pitch clamp: +/-89.9 deg.  recoil_view is allowed to push the
+// picture past the aim clamp — that is what a muzzle climb looks like — but not
+// to the pole.  `mat_look_dir` is exact at +/-90 (it builds the basis from the
+// angles, so nothing degenerates), but a straight-up camera has no horizon and
+// no readable yaw, so the clamp is an art decision, not a math one.
+export let g_VIEW_PITCH_HARD: f64 = 1.5690509975429023;   // 89.9 deg in radians
+
+// FOV lerp: `g_FOV_LERP_S` (0.15 s) is the *transition*, not the time constant.
+// tau = transition/3 puts the lerp 1 - e^-3 = 95.02 % of the way at 0.15 s and
+// 99.75 % at 0.30 s, which reads as "instant but not a cut" at 60 fps.
+export let g_VIEW_FOV_TAU: f64 = g_FOV_LERP_S / 3.0;
+
+// Screen shake.  `trauma` is 0..1 and decays LINEARLY at this rate, so a shake
+// of trauma T lasts exactly T / rate seconds.  The rate is chosen so that the
+// per-shot shake below lasts exactly `g_SHAKE_FIRE_S` (0.08 s).
+export let g_VIEW_TRAUMA_RATE: f64 = 2.0;                 // trauma units / second
+export let g_VIEW_TRAUMA_FIRE: f64 = g_SHAKE_FIRE_S * 2.0;
+
+// Amplitude is trauma^2 * g_SHAKE_MAX_PX (4 px).  Squaring is what makes a
+// small shake feel small — linear trauma reads as constant vibration.
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+// A View handle.  One per camera; the game has exactly one.  Everything is
+// preallocated: `view_build` writes into `mvp` and `vm` and mutates scalars,
+// and the only per-frame allocation left is the 16-element array `mat_look_dir`
+// returns (~0.2 us, once per frame, immediately released).
+export fn view_new(): object {
+    let v: object = {
+        // matrices (retained, overwritten in place)
+        mvp: [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0],
+        vm:  [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0],
+        eyev: v3(0.0, 0.0, 0.0),        // scratch for mat_look_dir; never escapes
+        // eye
+        ex: 0.0, ey: 0.0, ez: 0.0,
+        // AIM — authoritative, sim-facing, never contaminated
+        aim_yaw: 0.0, aim_pitch: 0.0,
+        fwx: 0.0, fwy: 0.0, fwz: -1.0,
+        // recoil_view — CLIENT ONLY
+        rc_yaw: 0.0, rc_pitch: 0.0, rc_roll: 0.0,
+        roll_set: 0.0,
+        // RENDER angles = aim + recoil (filled by view_build)
+        yaw: 0.0, pitch: 0.0, roll: 0.0,
+        // projection
+        fov: g_FOV_HIP, fov_t: g_FOV_HIP, fov_mode: 0, fov_tau: g_VIEW_FOV_TAU,
+        aspect: g_ASPECT, vw: f64(g_RES_W), vh: f64(g_RES_H),
+        near: g_NEAR_PLANE, fog_far: g_FOG_FAR_CAP,
+        far: g_FOG_FAR_CAP * g_FAR_PLANE_SCALE,
+        // shake
+        trauma: 0.0, shake_x: 0.0, shake_y: 0.0,
+        // determinism
+        seed: 1, tick: 0, frames: 0
+    };
+    // Fill the matrices immediately: a caller that reads view_mvp before its
+    // first view_build gets a valid camera, not sixteen zeros.
+    view_build(v, 0.0, 0);
+    let out: object = v;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Setters — the interactive surface
+// ---------------------------------------------------------------------------
+
+// (`wpx` / `hpx` rather than `w` / `h`: `w` is in ci_unbox.sh's hot-local
+// vocabulary, and a cold setter tripping that warning trains people to ignore
+// the one place it matters.)
+export fn view_set_viewport(p_v: object, p_w: f64, p_h: f64) {
+    let v: object = p_v;
+    let wpx: f64 = p_w;
+    let hpx: f64 = p_h;
+    if (wpx < 1.0) { wpx = 1.0; }
+    if (hpx < 1.0) { hpx = 1.0; }
+    v.vw = wpx;
+    v.vh = hpx;
+    v.aspect = wpx / hpx;
+}
+
+export fn view_set_aspect(p_v: object, p_a: f64) {
+    let v: object = p_v;
+    let a: f64 = p_a;
+    if (a < 0.01) { a = 0.01; }
+    v.aspect = a;
+}
+
+// The far plane is derived here and nowhere else.
+export fn view_set_fog_far(p_v: object, p_far: f64) {
+    let v: object = p_v;
+    let ff: f64 = clampf(p_far, 1.0, g_FOG_FAR_CAP);
+    v.fog_far = ff;
+    v.far = ff * g_FAR_PLANE_SCALE;
+}
+
+export fn view_set_near(p_v: object, p_near: f64) {
+    let v: object = p_v;
+    v.near = clampf(p_near, 0.01, 1.0);
+}
+
+export fn view_set_eye(p_v: object, p_x: f64, p_y: f64, p_z: f64) {
+    let v: object = p_v;
+    v.ex = p_x;
+    v.ey = p_y;
+    v.ez = p_z;
+}
+
+// Wrap an angle into (-pi, pi].  Cold; a subtraction loop is exact enough here
+// (each 2*pi subtraction perturbs sin/cos by <= 1 ulp) and never divides.
+fn wrap_pi(p_a: f64): f64 {
+    let a: f64 = p_a;
+    while (a > g_VIEW_PI) { a = a - g_VIEW_TAU; }
+    while (a <= 0.0 - g_VIEW_PI) { a = a + g_VIEW_TAU; }
+    let out: f64 = a;
+    return out;
+}
+
+export fn view_wrap_pi(p_a: f64): f64 {
+    let out: f64 = wrap_pi(p_a);
+    return out;
+}
+
+// ABSOLUTE aim.  Yaw wraps, pitch clamps to +/-85 deg.  This is the pair the
+// sim owns; `view_build` never touches it.
+export fn view_set_angles(p_v: object, p_yaw: f64, p_pitch: f64) {
+    let v: object = p_v;
+    v.aim_yaw = wrap_pi(p_yaw);
+    v.aim_pitch = clampf(p_pitch, 0.0 - g_VIEW_PITCH_CLAMP, g_VIEW_PITCH_CLAMP);
+}
+
+// RELATIVE aim, in radians.  The mouse-look entry point for anything that has
+// already converted counts to radians.
+export fn view_look(p_v: object, p_dyaw: f64, p_dpitch: f64) {
+    let v: object = p_v;
+    view_set_angles(v, v.aim_yaw + p_dyaw, v.aim_pitch + p_dpitch);
+}
+
+// RELATIVE aim, in raw SDL relative-mouse counts.  This is the one the
+// walkaround calls.  +dx turns right; +dy is DOWN on screen and lowers the aim,
+// so the sign flip lives here and nowhere else.  `p_sens` is a multiplier on
+// `g_MOUSE_SENS_RAD` — pass `view_sens_scale(v)` to get the ADS slowdown free.
+export fn view_look_mouse(p_v: object, p_dx: f64, p_dy: f64, p_sens: f64) {
+    let v: object = p_v;
+    let s: f64 = g_MOUSE_SENS_RAD * p_sens;
+    view_set_angles(v, v.aim_yaw + p_dx * s, v.aim_pitch - p_dy * s);
+}
+
+// The sensitivity multiplier the current FOV mode implies: ADS is slower.
+export fn view_sens_scale(p_v: object): f64 {
+    let v: object = p_v;
+    let s: f64 = 1.0;
+    if (v.fov_mode == g_VIEW_ADS) { s = g_ADS_SENS_MULT; }
+    let out: f64 = s;
+    return out;
+}
+
+// Bridge from RenderSnapshot's cam_x/y/z + cam_yaw/cam_pitch (ARCHITECTURE
+// §3.1).  W3-7 calls this, then `view_build`.  Note cam_roll is NOT taken here:
+// roll is client-only kick, and it arrives through `view_kick` / `view_set_roll`.
+export fn view_apply_camera(p_v: object, p_x: f64, p_y: f64, p_z: f64,
+                            p_yaw: f64, p_pitch: f64) {
+    let v: object = p_v;
+    view_set_eye(v, p_x, p_y, p_z);
+    view_set_angles(v, p_yaw, p_pitch);
+}
+
+// ---------------------------------------------------------------------------
+// FOV
+// ---------------------------------------------------------------------------
+
+export fn view_fov_for_mode(p_mode: i32): f64 {
+    let m: i32 = p_mode;
+    let d: f64 = g_FOV_HIP;
+    if (m == g_VIEW_ADS) { d = g_FOV_ADS; }
+    else if (m == g_VIEW_SPRINT) { d = g_FOV_SPRINT; }
+    let out: f64 = d;
+    return out;
+}
+
+export fn view_set_fov_mode(p_v: object, p_mode: i32) {
+    let v: object = p_v;
+    let m: i32 = p_mode;
+    if (m < 0 || m >= g_VIEW_FOV_MODES) { m = g_VIEW_HIP; }
+    v.fov_mode = m;
+    v.fov_t = view_fov_for_mode(m);
+}
+
+// Free-form target, for a caller that carries its own FOV (a snapshot's
+// cam_fov, a settings slider, a scripted scene).  Does not change fov_mode.
+export fn view_set_fov_target(p_v: object, p_deg: f64) {
+    let v: object = p_v;
+    v.fov_t = clampf(p_deg, 20.0, 140.0);
+}
+
+// Teleport the FOV to its target — scene setup, respawn, `shot.hml`.  A lerp
+// tail in a one-frame render is a bug, not a nicety.
+export fn view_snap_fov(p_v: object) {
+    let v: object = p_v;
+    v.fov = v.fov_t;
+}
+
+// ---------------------------------------------------------------------------
+// recoil_view  —  CLIENT ONLY.  See the header.
+// ---------------------------------------------------------------------------
+// Adds a visual kick, in radians.  Positive pitch kicks the picture UP.  It
+// decays at `g_KICK_DECAY` (14/s) inside view_build and is summed into the
+// RENDER angles only.  Nothing here writes an AIM field; that is the invariant.
+export fn view_kick(p_v: object, p_dpitch: f64, p_dyaw: f64, p_droll: f64) {
+    let v: object = p_v;
+    v.rc_pitch = v.rc_pitch + p_dpitch;
+    v.rc_yaw = v.rc_yaw + p_dyaw;
+    v.rc_roll = v.rc_roll + p_droll;
+}
+
+// The standard per-shot kick: config's g_KICK_PITCH_DEG, with a yaw/roll
+// component scaled by the caller's -1..1 lateral bias (a weapon's own pattern).
+export fn view_kick_fire(p_v: object, p_scale: f64, p_lateral: f64) {
+    let v: object = p_v;
+    let k: f64 = g_KICK_PITCH_DEG * g_VIEW_DEG * p_scale;
+    view_kick(v, k, k * 0.35 * p_lateral, k * 0.5 * p_lateral);
+}
+
+export fn view_clear_kick(p_v: object) {
+    let v: object = p_v;
+    v.rc_pitch = 0.0;
+    v.rc_yaw = 0.0;
+    v.rc_roll = 0.0;
+}
+
+// Static roll, for a scripted scene or a lean.  Also client-only.
+export fn view_set_roll(p_v: object, p_roll: f64) {
+    let v: object = p_v;
+    v.roll_set = p_roll;
+}
+
+// ---------------------------------------------------------------------------
+// Screen shake
+// ---------------------------------------------------------------------------
+// Trauma is additive and saturates at 1.0.  The offset is a pure function of
+// (tick, seed, trauma) — no RNG state, nothing to desync, and a replay at the
+// same tick with the same seed shakes identically.
+export fn view_shake(p_v: object, p_amount: f64) {
+    let v: object = p_v;
+    let t: f64 = v.trauma + p_amount;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    v.trauma = t;
+}
+
+// The per-shot shake: lasts exactly g_SHAKE_FIRE_S.
+export fn view_shake_fire(p_v: object) {
+    let v: object = p_v;
+    view_shake(v, g_VIEW_TRAUMA_FIRE);
+}
+
+export fn view_clear_shake(p_v: object) {
+    let v: object = p_v;
+    v.trauma = 0.0;
+    v.shake_x = 0.0;
+    v.shake_y = 0.0;
+}
+
+// The shake stream's seed.  Set it once from the world seed.
+export fn view_set_seed(p_v: object, p_seed: i32) {
+    let v: object = p_v;
+    v.seed = p_seed;
+}
+
+// ---------------------------------------------------------------------------
+// view_build — stage 8.  Once per frame.
+// ---------------------------------------------------------------------------
+// `p_dt` is FRAME seconds (not TICK_DT — the FOV lerp and the kick decay are
+// presentation, and presentation runs on frame time).  `p_tick` is the sim tick
+// the frame is presenting; it and the seed are the only inputs to the shake.
+export fn view_build(p_v: object, p_dt: f64, p_tick: i32) {
+    let v: object = p_v;
+    let dt: f64 = p_dt;
+    if (dt < 0.0) { dt = 0.0; }
+    if (dt > 0.25) { dt = 0.25; }        // the same 250 ms clamp as the game loop
+    let tick: i32 = p_tick;
+    v.tick = tick;
+    v.frames = v.frames + 1;
+
+    // --- 1. FOV lerp (frame-rate independent; see the header) ---------------
+    let ft: f64 = v.fov_t;
+    let fk: f64 = exp((0.0 - dt) / v.fov_tau);
+    v.fov = ft + (v.fov - ft) * fk;
+
+    // --- 2. recoil_view decay (client-only) ---------------------------------
+    let rk: f64 = exp((0.0 - g_KICK_DECAY) * dt);
+    v.rc_pitch = v.rc_pitch * rk;
+    v.rc_yaw = v.rc_yaw * rk;
+    v.rc_roll = v.rc_roll * rk;
+
+    // --- 3. trauma decay + the deterministic shake sample -------------------
+    let tr: f64 = v.trauma - dt * g_VIEW_TRAUMA_RATE;
+    if (tr < 0.0) { tr = 0.0; }
+    v.trauma = tr;
+    if (tr <= 0.0) {
+        v.shake_x = 0.0;
+        v.shake_y = 0.0;
+    } else {
+        let sd: i32 = v.seed;
+        let amp: f64 = g_SHAKE_MAX_PX * tr * tr;
+        v.shake_x = amp * (2.0 * h01_3(tick, 0, 0, sd) - 1.0);
+        v.shake_y = amp * (2.0 * h01_3(tick, 1, 0, sd) - 1.0);
+    }
+
+    // --- 4. AIM basis (recoil-free; this is what a bullet uses) -------------
+    let ay: f64 = v.aim_yaw;
+    let ap: f64 = v.aim_pitch;
+    let cap: f64 = cos(ap);
+    v.fwx = sin(ay) * cap;
+    v.fwy = sin(ap);
+    v.fwz = 0.0 - cos(ay) * cap;
+
+    // --- 5. RENDER angles = AIM + recoil_view -------------------------------
+    let ry: f64 = wrap_pi(ay + v.rc_yaw);
+    let rp: f64 = clampf(ap + v.rc_pitch, 0.0 - g_VIEW_PITCH_HARD, g_VIEW_PITCH_HARD);
+    let rr: f64 = v.roll_set + v.rc_roll;
+    v.yaw = ry;
+    v.pitch = rp;
+    v.roll = rr;
+
+    // --- 6. the view matrix, with roll ---------------------------------------
+    // mat_look_dir gives rows [right | up | -forward | 0 0 0 1] and is exact at
+    // every pitch, poles included.  Roll is a pre-multiply by Rz(-roll), which
+    // touches rows 0 and 1 only:  row0' = c*row0 + s*row1, row1' = c*row1 - s*row0.
+    let ev: object = v.eyev;
+    ev.x = v.ex;
+    ev.y = v.ey;
+    ev.z = v.ez;
+    let lm: array = mat_look_dir(ev, ry, rp);
+    let vm: array = v.vm;
+    let cr: f64 = cos(rr);
+    let sr: f64 = sin(rr);
+    let i: i32 = 0;
+    while (i < 4) {
+        let r0: f64 = lm[i];
+        let r1: f64 = lm[4 + i];
+        vm[i] = cr * r0 + sr * r1;
+        vm[4 + i] = cr * r1 - sr * r0;
+        vm[8 + i] = lm[8 + i];
+        vm[12 + i] = lm[12 + i];
+        i = i + 1;
+    }
+
+    // --- 7. MVP = P * V, folded ---------------------------------------------
+    // P is [fx 0 0 0 | 0 fy 0 0 | 0 0 pa pb | 0 0 -1 0] and V's last row is
+    // (0,0,0,1), so the product is four scalar row scalings plus one add.  Doing
+    // it by hand instead of mat_mul saves two 16-element allocations per frame
+    // and, more importantly, makes row 3 EXACTLY -V.row2 — which is what makes
+    // clip w equal the distance along forward in metres, the painter key of
+    // ARCHITECTURE §2.3.
+    let near: f64 = v.near;
+    let far: f64 = v.far;
+    let fy: f64 = 1.0 / tan(v.fov * g_VIEW_DEG * 0.5);
+    let fx: f64 = fy / v.aspect;
+    let nf: f64 = 1.0 / (near - far);
+    let pa: f64 = (far + near) * nf;
+    let pb: f64 = 2.0 * far * near * nf;
+    let mv: array = v.mvp;
+    let j: i32 = 0;
+    while (j < 4) {
+        let v2: f64 = vm[8 + j];
+        mv[j] = fx * vm[j];
+        mv[4 + j] = fy * vm[4 + j];
+        mv[8 + j] = pa * v2;
+        mv[12 + j] = 0.0 - v2;
+        j = j + 1;
+    }
+    mv[11] = mv[11] + pb;
+}
+
+// ---------------------------------------------------------------------------
+// Readers
+// ---------------------------------------------------------------------------
+
+// The 16-element row-major MVP.  Hand it straight to `emit_set_mvp` and
+// `frustum_from_mvp`.  It is the View's own retained array — read it, do not
+// keep it past the next `view_build`, and never write into it.
+export fn view_mvp(p_v: object): array {
+    let v: object = p_v;
+    let out: array = v.mvp;
+    return out;
+}
+
+// The view matrix alone (world -> view), same retained-array contract.
+export fn view_matrix(p_v: object): array {
+    let v: object = p_v;
+    let out: array = v.vm;
+    return out;
+}
+
+export fn view_mvp_at(p_v: object, p_i: i32): f64 {
+    let v: object = p_v;
+    let m: array = v.mvp;
+    let out: f64 = m[p_i];
+    return out;
+}
+
+// A FRESH {x,y,z}.  Cold — tools and setup.  Per-frame callers use the scalars.
+export fn view_eye(p_v: object): object {
+    let v: object = p_v;
+    let out: object = v3(v.ex, v.ey, v.ez);
+    return out;
+}
+
+export fn view_eye_x(p_v: object): f64 { let v: object = p_v; let out: f64 = v.ex; return out; }
+export fn view_eye_y(p_v: object): f64 { let v: object = p_v; let out: f64 = v.ey; return out; }
+export fn view_eye_z(p_v: object): f64 { let v: object = p_v; let out: f64 = v.ez; return out; }
+
+// --- AIM.  Sim-facing.  Recoil-free by construction. ------------------------
+export fn view_aim_yaw(p_v: object): f64 { let v: object = p_v; let out: f64 = v.aim_yaw; return out; }
+export fn view_aim_pitch(p_v: object): f64 { let v: object = p_v; let out: f64 = v.aim_pitch; return out; }
+export fn view_aim_forward_x(p_v: object): f64 { let v: object = p_v; let out: f64 = v.fwx; return out; }
+export fn view_aim_forward_y(p_v: object): f64 { let v: object = p_v; let out: f64 = v.fwy; return out; }
+export fn view_aim_forward_z(p_v: object): f64 { let v: object = p_v; let out: f64 = v.fwz; return out; }
+
+// --- RENDER.  Client-only cosmetics.  Never build a command from these. -----
+export fn view_render_yaw(p_v: object): f64 { let v: object = p_v; let out: f64 = v.yaw; return out; }
+export fn view_render_pitch(p_v: object): f64 { let v: object = p_v; let out: f64 = v.pitch; return out; }
+export fn view_render_roll(p_v: object): f64 { let v: object = p_v; let out: f64 = v.roll; return out; }
+export fn view_kick_pitch(p_v: object): f64 { let v: object = p_v; let out: f64 = v.rc_pitch; return out; }
+export fn view_kick_yaw(p_v: object): f64 { let v: object = p_v; let out: f64 = v.rc_yaw; return out; }
+export fn view_kick_roll(p_v: object): f64 { let v: object = p_v; let out: f64 = v.rc_roll; return out; }
+
+export fn view_fov(p_v: object): f64 { let v: object = p_v; let out: f64 = v.fov; return out; }
+export fn view_fov_target(p_v: object): f64 { let v: object = p_v; let out: f64 = v.fov_t; return out; }
+export fn view_fov_mode(p_v: object): i32 { let v: object = p_v; let out: i32 = v.fov_mode; return out; }
+export fn view_aspect(p_v: object): f64 { let v: object = p_v; let out: f64 = v.aspect; return out; }
+export fn view_near(p_v: object): f64 { let v: object = p_v; let out: f64 = v.near; return out; }
+export fn view_far(p_v: object): f64 { let v: object = p_v; let out: f64 = v.far; return out; }
+export fn view_fog_far(p_v: object): f64 { let v: object = p_v; let out: f64 = v.fog_far; return out; }
+
+// Shake, in TARGET pixels.  Feed straight to `target_set_shake`, which rounds
+// to the 320x240 grid.  Never in the MVP.
+export fn view_shake_x(p_v: object): f64 { let v: object = p_v; let out: f64 = v.shake_x; return out; }
+export fn view_shake_y(p_v: object): f64 { let v: object = p_v; let out: f64 = v.shake_y; return out; }
+export fn view_trauma(p_v: object): f64 { let v: object = p_v; let out: f64 = v.trauma; return out; }
+export fn view_tick(p_v: object): i32 { let v: object = p_v; let out: i32 = v.tick; return out; }
+
+// ---------------------------------------------------------------------------
+// Projection — cold.  For tools, probes, the HUD's world-space markers and any
+// caller that needs one point, not a mesh.  The hot path is emit.hml.
+// ---------------------------------------------------------------------------
+// Writes [screen_x, screen_y, w, ndc_z] into `p_out` (length >= 4) and returns
+// 1 if the point is in front of the near plane, else 0 (and `p_out` holds the
+// clip-space values, unprojected).  `w` is metres along forward — the depth key.
+export fn view_project(p_v: object, p_x: f64, p_y: f64, p_z: f64, p_out: array): i32 {
+    let v: object = p_v;
+    let m: array = v.mvp;
+    let x: f64 = p_x;
+    let y: f64 = p_y;
+    let z: f64 = p_z;
+    let cx: f64 = m[0] * x + m[1] * y + m[2] * z + m[3];
+    let cy: f64 = m[4] * x + m[5] * y + m[6] * z + m[7];
+    let cz: f64 = m[8] * x + m[9] * y + m[10] * z + m[11];
+    let cw: f64 = m[12] * x + m[13] * y + m[14] * z + m[15];
+    let o: array = p_out;
+    if (cw <= v.near) {
+        o[0] = cx;
+        o[1] = cy;
+        o[2] = cw;
+        o[3] = cz;
+        let miss: i32 = 0;
+        return miss;
+    }
+    let inv: f64 = 1.0 / cw;
+    o[0] = (cx * inv * 0.5 + 0.5) * v.vw;
+    o[1] = (0.5 - cy * inv * 0.5) * v.vh;
+    o[2] = cw;
+    o[3] = cz * inv;
+    let hit: i32 = 1;
+    return hit;
+}

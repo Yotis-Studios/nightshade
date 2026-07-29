@@ -1,0 +1,1239 @@
+// probe_worldgen.hml — W3-1 acceptance probe for src/sim/worldgen.hml.
+//
+// Run it FROM THE NIGHTSHADE REPO ROOT, and BOTH ways — the golden checksums
+// in §B are only meaningful because the same program runs on both backends:
+//     hemlockc -O1 tools/probe_worldgen.hml -o /tmp/pwg && /tmp/pwg
+//     hemlock  tools/probe_worldgen.hml
+//
+// It exits 1 on any failure AND on an assertion-count mismatch.
+//
+// Optional:
+//     /tmp/pwg --heightmap docs/shots/worldgen_heightmap.png
+//         dumps a 9x9-chunk (288 x 288 m) region: height as a shaded ramp,
+//         biome as a tint, chunk grid, POI markers.  Diagnostic, not art.
+//     /tmp/pwg --sweep 25
+//         half-extent (in chunks) of the §D undulation sweep.  Default 20
+//         (41x41 = 1681 chunks per seed).  The module header cites a wider
+//         offline run; --sweep is how you reproduce it.
+//
+// ---------------------------------------------------------------------------
+// WHY THERE ARE SO FEW MAGIC NUMBERS IN HERE
+// ---------------------------------------------------------------------------
+// Four lightning assertions in this repo once encoded exact RGB triples, the
+// design legitimately changed, and all four went stale at once.  Everything
+// below that CAN be a property is a property: "every biome occurs", "tier rises
+// with distance", "the batched path equals the point query", "no chunk is a
+// rug".  The only literal constants asserted are (a) the §A mirrors of
+// config.hml, whose whole job is to be equal to something else, and (b) the §B
+// checksums, whose whole job is to change loudly when the world changes.
+
+import { exit } from "@stdlib/process";
+import { list_dir, read_file, is_dir } from "@stdlib/fs";
+// `args` is a language builtin, not a module export (tools/shot.hml uses it
+// the same way).  Importing it from @stdlib/process is a build error.
+
+import { write_png } from "../../wobbleweed/src/png.hml";
+
+import { g_CHUNK_N, g_CHUNK_M, g_CHUNK_GRID_M, g_CHUNK_QUADS,
+         g_WGEN_OCTAVES, g_WGEN_CELL_M, g_WGEN_AMPLITUDE_M,
+         g_WGEN_TEMP_CELL_M, g_WGEN_MOIST_CELL_M,
+         g_SHADE_TIER_MAX, g_SHADE_TIER_M, g_BIOME_COUNT,
+         g_HEIGHT_SCALE_CM, g_HEIGHT_MAX_M, g_HORIZON_UNDULATION_M,
+         g_BUDGET_CHUNKGEN_MS, g_WORLD_SEED_DEFAULT
+       } from "../src/core/config.hml";
+
+import { worldgen_height, worldgen_height_cm, worldgen_height_rel,
+         worldgen_temp, worldgen_moist, worldgen_relief, worldgen_relief_tm,
+         worldgen_biome, worldgen_biome_tmd,
+         worldgen_shade_tier, worldgen_tier_jitter, worldgen_chunk_dist,
+         worldgen_poi_roll, worldgen_poi_x, worldgen_poi_z,
+         worldgen_block_of, worldgen_lantern_x, worldgen_lantern_z,
+         worldgen_is_lantern_chunk,
+         worldgen_chunk, worldgen_chunk_at, worldgen_chunk_height_m,
+         worldgen_meta_poi, worldgen_meta_tier, worldgen_meta_jitter,
+         WG_CHUNK_N, WG_CHUNK_SAMPLES, WG_CHUNK_M, WG_GRID_M,
+         WG_HEIGHT_STRIDE, WG_HEIGHT_SCALE_CM,
+         WG_BASE_M, WG_AMP_M, WG_CELL0_M, WG_CELL1_M, WG_CELL2_M,
+         WG_TEMP_CELL_M, WG_MOIST_CELL_M,
+         WG_BIOME_HOLLOWFIELD, WG_BIOME_ASHWOOD, WG_BIOME_CHALKDOWNS,
+         WG_BIOME_FEN, WG_BIOME_IRONPINE, WG_BIOME_DEEPSHADE, WG_BIOME_COUNT,
+         WG_POI_NONE, WG_POI_LANTERN, WG_POI_RUIN, WG_POI_CARAVAN,
+         WG_POI_SHRINE, WG_POI_BURROW, WG_POI_COUNT,
+         WG_TIER_MAX, WG_TIER_M, WG_TOWN_TIER_R_M, WG_TOWN_BIOME_R_M,
+         WG_LANTERN_BLOCK_C, WG_LANTERN_INSET_M, WG_LANTERN_MAX_D_M
+       } from "../src/sim/worldgen.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump it deliberately, never to make red go green
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 87;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+let g_sweep_half = 20;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+fn acc_mix(p_h: u64, p_v: u64): u64 {
+    let h: u64 = p_h;
+    let out: u64 = (h ^ p_v) * 1099511628211;
+    return out;
+}
+
+fn u64_lo31(p_h: u64): i32 {
+    let out: i32 = i32((p_h >> 33) & 2147483647);
+    return out;
+}
+
+// f64 -> a 31-bit fingerprint that is EXACT: heights are metres with ~1e-13
+// precision, so scaling by 2^20 and flooring pins every bit that matters
+// without inviting a last-place rounding difference between backends.
+fn hfp(p_v: f64): u64 {
+    let s: f64 = __floor(p_v * 1048576.0 + 0.5) + 2147483648.0;
+    let out: u64 = u64(s) & 4294967295;
+    return out;
+}
+
+fn absf2(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = -a; }
+    let out: f64 = a;
+    return out;
+}
+
+// ===========================================================================
+// A.  THE CONFIG MIRROR
+// ===========================================================================
+// worldgen.hml deliberately does NOT import config.hml — it restates every
+// tunable as a local literal so no cross-module top-level slot is read 567
+// times per chunk.  That is only safe if something asserts the two agree.
+// This is that something.
+fn section_mirror() {
+    print("A. config.hml mirror (worldgen restates these as literals)");
+
+    ck(WG_CHUNK_N == g_CHUNK_N, "A1 WG_CHUNK_N == g_CHUNK_N", `${WG_CHUNK_N} vs ${g_CHUNK_N}`);
+    ck(WG_CHUNK_SAMPLES == g_CHUNK_N * g_CHUNK_N, "A2 samples == N*N",
+       `${WG_CHUNK_SAMPLES} vs ${g_CHUNK_N * g_CHUNK_N}`);
+    ck(WG_CHUNK_M == g_CHUNK_M, "A3 WG_CHUNK_M == g_CHUNK_M", `${WG_CHUNK_M} vs ${g_CHUNK_M}`);
+    ck(WG_GRID_M == g_CHUNK_GRID_M, "A4 WG_GRID_M == g_CHUNK_GRID_M", `${WG_GRID_M} vs ${g_CHUNK_GRID_M}`);
+    ck(WG_CHUNK_M == WG_GRID_M * f64(g_CHUNK_QUADS), "A5 chunk == quads * grid",
+       `${WG_CHUNK_M} vs ${WG_GRID_M * f64(g_CHUNK_QUADS)}`);
+    ck(WG_AMP_M == g_WGEN_AMPLITUDE_M, "A6 WG_AMP_M == g_WGEN_AMPLITUDE_M",
+       `${WG_AMP_M} vs ${g_WGEN_AMPLITUDE_M}`);
+    ck(WG_CELL0_M == g_WGEN_CELL_M, "A7 coarse octave == g_WGEN_CELL_M",
+       `${WG_CELL0_M} vs ${g_WGEN_CELL_M}`);
+    ck(WG_TEMP_CELL_M == g_WGEN_TEMP_CELL_M, "A8 temp cell == config",
+       `${WG_TEMP_CELL_M} vs ${g_WGEN_TEMP_CELL_M}`);
+    ck(WG_MOIST_CELL_M == g_WGEN_MOIST_CELL_M, "A9 moist cell == config",
+       `${WG_MOIST_CELL_M} vs ${g_WGEN_MOIST_CELL_M}`);
+    ck(g_WGEN_OCTAVES == 3, "A10 three height octaves as specified", `${g_WGEN_OCTAVES}`);
+    ck(WG_CELL0_M > WG_CELL1_M && WG_CELL1_M > WG_CELL2_M,
+       "A11 octave cells strictly decrease", `${WG_CELL0_M}/${WG_CELL1_M}/${WG_CELL2_M}`);
+    ck(WG_CELL2_M >= WG_GRID_M * 2.0,
+       "A11b finest octave is resolved by the 4 m sample grid (>= 2 samples/cell)",
+       `cell ${WG_CELL2_M} vs grid ${WG_GRID_M}`);
+    ck(WG_TIER_MAX == g_SHADE_TIER_MAX, "A12 tier max == config", `${WG_TIER_MAX}`);
+    ck(WG_TIER_M == g_SHADE_TIER_M, "A13 metres per tier == config", `${WG_TIER_M}`);
+    ck(WG_BIOME_COUNT == g_BIOME_COUNT, "A14 biome count == config", `${WG_BIOME_COUNT}`);
+    ck(WG_HEIGHT_SCALE_CM == g_HEIGHT_SCALE_CM, "A15 cm scale == config", `${WG_HEIGHT_SCALE_CM}`);
+    ck(WG_HEIGHT_STRIDE == 2, "A16 height stride is u16", `${WG_HEIGHT_STRIDE}`);
+    ck(WG_POI_COUNT == 6 && WG_POI_BURROW == 5, "A17 POI enum is dense 0..5",
+       `${WG_POI_COUNT}/${WG_POI_BURROW}`);
+    ck(WG_BIOME_DEEPSHADE == WG_BIOME_COUNT - 1, "A18 biome enum is dense 0..5",
+       `${WG_BIOME_DEEPSHADE}`);
+    // GDD 4.4: "guaranteed 1 lantern within 120 m of anywhere".
+    ck(WG_LANTERN_MAX_D_M < 120.0, "A19 lantern bound clears the GDD 120 m promise",
+       `${WG_LANTERN_MAX_D_M} m`);
+    ck(WG_LANTERN_INSET_M * 2.0 < WG_CHUNK_M * f64(WG_LANTERN_BLOCK_C),
+       "A20 lantern inset leaves a placeable region", `${WG_LANTERN_INSET_M}`);
+    ck(WG_TOWN_BIOME_R_M > WG_TOWN_TIER_R_M, "A21 town biome disc contains the tier island",
+       `${WG_TOWN_BIOME_R_M} vs ${WG_TOWN_TIER_R_M}`);
+}
+
+// ===========================================================================
+// B.  PURITY AND CROSS-BACKEND DETERMINISM
+// ===========================================================================
+fn section_determinism() {
+    print("B. Purity and determinism (run me interpreted too)");
+
+    // B1 — the same (seed, cx, cz) 1 000 000 times.  A pure function has no
+    // memory; this is the assertion that catches one that grew some.
+    let want_poi: i32 = worldgen_poi_roll(g_WORLD_SEED_DEFAULT, 5, -9);
+    let drift: i32 = 0;
+    let i = 0;
+    while (i < 1000000) {
+        if (worldgen_poi_roll(g_WORLD_SEED_DEFAULT, 5, -9) != want_poi) { drift = drift + 1; }
+        i = i + 1;
+    }
+    print(`   B1  1 000 000 identical poi_roll calls, drift = ${drift}`);
+    ck(drift == 0, "B1 worldgen_poi_roll is pure over 1 M repeats", `${drift} divergent`);
+
+    // B2 — the same for the height field, which is the expensive one.
+    let want_h: f64 = worldgen_height(g_WORLD_SEED_DEFAULT, 137.0, -84.0);
+    let drift2: i32 = 0;
+    let k = 0;
+    while (k < 200000) {
+        if (worldgen_height(g_WORLD_SEED_DEFAULT, 137.0, -84.0) != want_h) { drift2 = drift2 + 1; }
+        k = k + 1;
+    }
+    print(`   B2  200 000 identical worldgen_height calls, drift = ${drift2}, h = ${want_h}`);
+    ck(drift2 == 0, "B2 worldgen_height is pure over 200 k repeats", `${drift2} divergent`);
+
+    // B3 — THE FIELD CHECKSUM.  32 000 distinct points on an irrational walk
+    // so the sample set is not aligned to any lattice in the generator.  This
+    // number changing means THE WORLD CHANGED; if that was on purpose, update
+    // it in the same commit as the change and say so.
+    let h3: u64 = 14695981039346656037;
+    let n3 = 32000;
+    let a = 0;
+    while (a < n3) {
+        let wx: f64 = f64(a) * 7.31 - 1200.0;
+        let wz: f64 = f64(a) * 3.17 - 800.0;
+        h3 = acc_mix(h3, hfp(worldgen_height(g_WORLD_SEED_DEFAULT, wx, wz)));
+        a = a + 1;
+    }
+    let ck3: i32 = u64_lo31(h3);
+    print(`   B3  height-field checksum over ${n3} points = ${ck3}`);
+    ck(ck3 == 69586655, "B3 height field checksum (both backends)", `got ${ck3}, golden 69586655`);
+
+    // B4 — the BATCHED path's bytes, which is what chunk.hml will actually
+    // store.  Covers the u16 packing, the row order and the biome byte.
+    let hb = buffer(162);
+    let bb = buffer(81);
+    let h4: u64 = 14695981039346656037;
+    let c = 0;
+    while (c < 200) {
+        let cx: i32 = (c % 20) - 10;
+        let cz: i32 = (c / 20) - 5;
+        let n: i32 = worldgen_chunk(g_WORLD_SEED_DEFAULT, cx, cz, hb, bb);
+        let q = 0;
+        while (q < 162) { h4 = acc_mix(h4, u64(hb[q])); q = q + 1; }
+        let r = 0;
+        while (r < 81) { h4 = acc_mix(h4, u64(bb[r])); r = r + 1; }
+        c = c + 1;
+    }
+    let ck4: i32 = u64_lo31(h4);
+    print(`   B4  chunk-buffer checksum over 200 chunks = ${ck4}`);
+    ck(ck4 == 1771128936, "B4 chunk byte checksum (both backends)", `got ${ck4}, golden 1771128936`);
+
+    // B5 — the discrete decisions: biome, tier and POI over 40 000 chunks.
+    let h5: u64 = 14695981039346656037;
+    let cz5 = -100;
+    while (cz5 < 100) {
+        let cx5 = -100;
+        while (cx5 < 100) {
+            h5 = acc_mix(h5, u64(worldgen_poi_roll(g_WORLD_SEED_DEFAULT, cx5, cz5)));
+            h5 = acc_mix(h5, u64(worldgen_shade_tier(g_WORLD_SEED_DEFAULT, cx5, cz5, 0)));
+            cx5 = cx5 + 1;
+        }
+        cz5 = cz5 + 1;
+    }
+    let ck5: i32 = u64_lo31(h5);
+    print(`   B5  poi+tier checksum over 40 000 chunks = ${ck5}`);
+    ck(ck5 == 2129219837, "B5 poi+tier checksum (both backends)", `got ${ck5}, golden 2129219837`);
+
+    // B6 — writing into a DIRTY buffer must not leak the previous contents.
+    let hb2 = buffer(162);
+    let bb2 = buffer(81);
+    let d6 = 0;
+    while (d6 < 162) { hb2[d6] = 255; d6 = d6 + 1; }
+    let e6 = 0;
+    while (e6 < 81) { bb2[e6] = 200; e6 = e6 + 1; }
+    worldgen_chunk(g_WORLD_SEED_DEFAULT, 3, -7, hb, bb);
+    worldgen_chunk(g_WORLD_SEED_DEFAULT, 3, -7, hb2, bb2);
+    let diff6: i32 = 0;
+    let f6 = 0;
+    while (f6 < 162) { if (hb[f6] != hb2[f6]) { diff6 = diff6 + 1; } f6 = f6 + 1; }
+    let g6 = 0;
+    while (g6 < 81) { if (bb[g6] != bb2[g6]) { diff6 = diff6 + 1; } g6 = g6 + 1; }
+    ck(diff6 == 0, "B6 a dirty output buffer is fully overwritten", `${diff6} bytes differ`);
+
+    // B7 — the i32 extremes.  `vnoise(..., seed + 31)` THROWS at seed 2^31-1,
+    // which is why every octave seed in worldgen.hml is derived with `^`.
+    let hx1: f64 = worldgen_height(2147483647, 12.0, -34.0);
+    let hx2: f64 = worldgen_height(-2147483648, 12.0, -34.0);
+    let hx3: f64 = worldgen_height(0, 12.0, -34.0);
+    ck(hx1 != hx2 && hx2 != hx3 && hx1 != hx3,
+       "B7 extreme i32 seeds generate and differ", `${hx1} ${hx2} ${hx3}`);
+
+    // B8 — deeply negative chunk coordinates (the world is infinite both ways)
+    let nb = worldgen_chunk(g_WORLD_SEED_DEFAULT, -1000000, -1000000, hb, bb);
+    let t8: i32 = worldgen_shade_tier(g_WORLD_SEED_DEFAULT, -1000000, -1000000, 2);
+    let p8: i32 = worldgen_poi_roll(g_WORLD_SEED_DEFAULT, -1000000, -1000000);
+    ck(nb == WG_CHUNK_SAMPLES && t8 >= 0 && t8 <= 5 && p8 >= 0 && p8 < WG_POI_COUNT,
+       "B8 chunk (-1e6, -1e6) generates without overflow", `n=${nb} tier=${t8} poi=${p8}`);
+}
+
+// ===========================================================================
+// C.  CHUNK EDGES ARE C0-CONTINUOUS WITH THEIR NEIGHBOURS
+// ===========================================================================
+// The whole point of "height is a function of world coordinates" is that a
+// shared edge is shared BYTES, not two numbers that happen to be close.  This
+// section asserts bit equality, not a tolerance — a tolerance here would hide
+// exactly the seam it exists to catch.
+fn section_edges() {
+    print("C. Chunk edge continuity");
+
+    let ha = buffer(162);
+    let ba = buffer(81);
+    let hbf = buffer(162);
+    let bbf = buffer(81);
+
+    let bad_e: i32 = 0;
+    let bad_n: i32 = 0;
+    let bad_be: i32 = 0;
+    let bad_bn: i32 = 0;
+    let bad_c: i32 = 0;
+    let pairs: i32 = 0;
+
+    let cz = -6;
+    while (cz <= 6) {
+        let cx = -6;
+        while (cx <= 6) {
+            worldgen_chunk(g_WORLD_SEED_DEFAULT, cx, cz, ha, ba);
+            // east neighbour: my column i = 8 is its column i = 0
+            worldgen_chunk(g_WORLD_SEED_DEFAULT, cx + 1, cz, hbf, bbf);
+            let j = 0;
+            while (j < 9) {
+                let mine: i32 = (j * 9 + 8) * 2;
+                let theirs: i32 = (j * 9 + 0) * 2;
+                if (ha[mine] != hbf[theirs]) { bad_e = bad_e + 1; }
+                if (ha[mine + 1] != hbf[theirs + 1]) { bad_e = bad_e + 1; }
+                if (ba[j * 9 + 8] != bbf[j * 9 + 0]) { bad_be = bad_be + 1; }
+                j = j + 1;
+            }
+            // north neighbour: my row j = 8 is its row j = 0
+            worldgen_chunk(g_WORLD_SEED_DEFAULT, cx, cz + 1, hbf, bbf);
+            let i2 = 0;
+            while (i2 < 9) {
+                let mine2: i32 = (8 * 9 + i2) * 2;
+                let theirs2: i32 = (0 * 9 + i2) * 2;
+                if (ha[mine2] != hbf[theirs2]) { bad_n = bad_n + 1; }
+                if (ha[mine2 + 1] != hbf[theirs2 + 1]) { bad_n = bad_n + 1; }
+                if (ba[8 * 9 + i2] != bbf[0 * 9 + i2]) { bad_bn = bad_bn + 1; }
+                i2 = i2 + 1;
+            }
+            // diagonal neighbour: my (8,8) is its (0,0)
+            worldgen_chunk(g_WORLD_SEED_DEFAULT, cx + 1, cz + 1, hbf, bbf);
+            if (ha[(8 * 9 + 8) * 2] != hbf[0]) { bad_c = bad_c + 1; }
+            if (ha[(8 * 9 + 8) * 2 + 1] != hbf[1]) { bad_c = bad_c + 1; }
+            pairs = pairs + 1;
+            cx = cx + 1;
+        }
+        cz = cz + 1;
+    }
+    print(`   C   ${pairs} chunks x 3 neighbours checked`);
+    ck(bad_e == 0, "C1 east edge heights are bit-identical", `${bad_e} mismatched bytes`);
+    ck(bad_n == 0, "C2 north edge heights are bit-identical", `${bad_n} mismatched bytes`);
+    ck(bad_be == 0, "C3 east edge biomes are identical", `${bad_be}`);
+    ck(bad_bn == 0, "C4 north edge biomes are identical", `${bad_bn}`);
+    ck(bad_c == 0, "C5 diagonal corner sample is identical", `${bad_c}`);
+
+    // C6 — the underlying reason: the field is a function of WORLD position
+    // only.  Same metre, same answer, however you got there.
+    let h1: f64 = worldgen_height(g_WORLD_SEED_DEFAULT, 32.0, -64.0);
+    let h2: f64 = worldgen_height(g_WORLD_SEED_DEFAULT, 0.0 + 32.0, -64.0 + 0.0);
+    let b1: i32 = worldgen_biome(g_WORLD_SEED_DEFAULT, 32.0, -64.0);
+    let b2: i32 = worldgen_biome(g_WORLD_SEED_DEFAULT, 32.0, -64.0);
+    ck(h1 == h2 && b1 == b2, "C6 the field depends on world position alone", `${h1} ${h2}`);
+
+    // C7/C8 — the shape of the ground BETWEEN samples.  Two different things
+    // matter and they want two different assertions:
+    //   C7  the field is bounded — there is no wall, no discontinuity, nothing
+    //       the collision capsule can fall through.
+    //   C8  the world is mostly WALKABLE.  A landscape where every step is a
+    //       climb is as bad as a rug; steep ground has to be the exception
+    //       (and Ironpine's cliffs are a designed exception, GDD §4.3).
+    let worst: f64 = 0.0;
+    let sum7: f64 = 0.0;
+    let cliff: i32 = 0;
+    let nstep: i32 = 0;
+    let z7 = 0;
+    while (z7 < 400) {
+        let x7 = 0;
+        while (x7 < 400) {
+            let wx: f64 = f64(x7) * 4.0 - 800.0;
+            let wz: f64 = f64(z7) * 4.0 - 800.0;
+            let a7: f64 = worldgen_height(g_WORLD_SEED_DEFAULT, wx, wz);
+            let b7: f64 = worldgen_height(g_WORLD_SEED_DEFAULT, wx + 4.0, wz);
+            let d7: f64 = absf2(b7 - a7);
+            if (d7 > worst) { worst = d7; }
+            if (d7 > 2.8) { cliff = cliff + 1; }        // steeper than 35 degrees
+            sum7 = sum7 + d7;
+            nstep = nstep + 1;
+            x7 = x7 + 1;
+        }
+        z7 = z7 + 1;
+    }
+    let meanstep: f64 = sum7 / f64(nstep);
+    let clifff: f64 = f64(cliff) / f64(nstep);
+    print(`   C7  4 m steps over ${nstep} samples: mean ${meanstep} m, worst ${worst} m, ${clifff * 100.0} % steeper than 35 deg`);
+    ck(worst < 8.0, "C7 the height field is bounded — no wall, no discontinuity", `${worst} m`);
+    ck(meanstep < 1.6, "C8 the average ground is walkable (< 21 degrees over 4 m)",
+       `${meanstep} m per 4 m`);
+    ck(clifff < 0.05, "C9 cliffs are a rare feature, not the landscape",
+       `${clifff * 100.0} % steeper than 35 deg`);
+}
+
+// ===========================================================================
+// D.  THE TERRAIN IS NOT A RUG
+// ===========================================================================
+// CLAUDE.md §9.4/§9.5: flat-lit cardboard terrain and a ruler-flat horizon are
+// the two failure modes that make a 3D world read as a toy.  The build plan's
+// bar is +/-1.5 m of undulation over any 32 m chunk, i.e. a 3.0 m range.
+fn section_relief() {
+    print("D. Undulation (the flat-horizon anti-goal)");
+
+    let hb = buffer(162);
+    let bb = buffer(81);
+    let half: i32 = g_sweep_half;
+    let seeds = [g_WORLD_SEED_DEFAULT, 20260728];
+
+    let minrange: f64 = 100000.0;
+    let sumrange: f64 = 0.0;
+    let below: i32 = 0;
+    let nch: i32 = 0;
+    let gmin: f64 = 100000.0;
+    let gmax: f64 = -100000.0;
+    let clamp_lo: i32 = 0;
+    let clamp_hi: i32 = 0;
+
+    let s = 0;
+    while (s < seeds.length) {
+        let seed: i32 = seeds[s];
+        let cz = -half;
+        while (cz <= half) {
+            let cx = -half;
+            while (cx <= half) {
+                worldgen_chunk(seed, cx, cz, hb, bb);
+                let lo: f64 = 100000.0;
+                let hi: f64 = -100000.0;
+                let q = 0;
+                while (q < 81) {
+                    let cm: i32 = hb[q * 2] + hb[q * 2 + 1] * 256;
+                    if (cm <= 0) { clamp_lo = clamp_lo + 1; }
+                    if (cm >= 65535) { clamp_hi = clamp_hi + 1; }
+                    let h: f64 = f64(cm) * 0.01;
+                    if (h < lo) { lo = h; }
+                    if (h > hi) { hi = h; }
+                    q = q + 1;
+                }
+                let rg: f64 = hi - lo;
+                if (rg < minrange) { minrange = rg; }
+                if (rg < 3.0) { below = below + 1; }
+                sumrange = sumrange + rg;
+                if (lo < gmin) { gmin = lo; }
+                if (hi > gmax) { gmax = hi; }
+                nch = nch + 1;
+                cx = cx + 1;
+            }
+            cz = cz + 1;
+        }
+        s = s + 1;
+    }
+    let mean: f64 = sumrange / f64(nch);
+    print(`   D   ${nch} chunks over ${seeds.length} seeds, half-extent ${half} chunks`);
+    print(`       per-chunk range: min ${minrange} m   mean ${mean} m   below 3 m: ${below}`);
+    print(`       world height span: ${gmin} .. ${gmax} m`);
+
+    let bar: f64 = g_HORIZON_UNDULATION_M * 2.0;      // +/-1.5 m -> a 3.0 m range
+    ck(minrange >= bar, "D1 EVERY chunk undulates by at least +/-1.5 m",
+       `worst chunk ${minrange} m, bar ${bar} m`);
+    ck(below == 0, "D2 no chunk in the sweep is a rug", `${below} of ${nch}`);
+    ck(mean >= 2.0 * bar, "D3 the typical chunk is well clear of the bar, not sitting on it",
+       `mean ${mean} m vs ${2.0 * bar} m`);
+    ck(gmin > 0.0, "D4 the u16 store never clamps at the bottom", `min ${gmin} m, ${clamp_lo} clamps`);
+    ck(gmax < g_HEIGHT_MAX_M, "D5 heights stay inside the u16 centimetre store",
+       `max ${gmax} m vs ${g_HEIGHT_MAX_M} m, ${clamp_hi} clamps`);
+    ck(gmax - gmin >= 25.0, "D6 the world has real elevation, not just texture",
+       `span ${gmax - gmin} m`);
+
+    // D7 — the stored centimetre form is the rounded metre form, not a
+    // truncation.  Truncation biases the whole world 5 mm down and, worse,
+    // makes worldgen_height and the stored grid disagree by a half-unit.
+    let bad7: i32 = 0;
+    let t7 = 0;
+    while (t7 < 4000) {
+        let wx: f64 = f64(t7) * 2.71 - 500.0;
+        let wz: f64 = f64(t7) * 1.41 - 300.0;
+        let hm: f64 = worldgen_height(g_WORLD_SEED_DEFAULT, wx, wz);
+        let cm: i32 = worldgen_height_cm(g_WORLD_SEED_DEFAULT, wx, wz);
+        if (absf2(f64(cm) - hm * 100.0) > 0.5000001) { bad7 = bad7 + 1; }
+        t7 = t7 + 1;
+    }
+    ck(bad7 == 0, "D7 height_cm rounds (never truncates) the metre field", `${bad7} of 4000`);
+
+    // D8 — relief actually varies: if `relief` were constant the biome terrain
+    // characters would all be the same landscape wearing different textures.
+    let rlo: f64 = 100.0;
+    let rhi: f64 = -100.0;
+    let r8 = 0;
+    while (r8 < 20000) {
+        let wx: f64 = f64(r8) * 5.33 - 1000.0;
+        let wz: f64 = f64(r8) * 2.07 - 900.0;
+        let r: f64 = worldgen_relief(g_WORLD_SEED_DEFAULT, wx, wz);
+        if (r < rlo) { rlo = r; }
+        if (r > rhi) { rhi = r; }
+        r8 = r8 + 1;
+    }
+    print(`   D8  relief observed range ${rlo} .. ${rhi}`);
+    ck(rhi / rlo >= 2.0, "D8 rugged ground is at least 2x the relief of smooth ground",
+       `${rlo} .. ${rhi}`);
+    // D9 — and it is CONTINUOUS, which is what stops a biome edge being a cliff
+    let jump: f64 = 0.0;
+    let r9 = 0;
+    while (r9 < 20000) {
+        let wx: f64 = f64(r9) * 0.5 - 400.0;
+        let a9: f64 = worldgen_relief(g_WORLD_SEED_DEFAULT, wx, 17.0);
+        let b9: f64 = worldgen_relief(g_WORLD_SEED_DEFAULT, wx + 0.5, 17.0);
+        let d9: f64 = absf2(b9 - a9);
+        if (d9 > jump) { jump = d9; }
+        r9 = r9 + 1;
+    }
+    ck(jump < 0.05, "D9 relief is continuous — biome edges are not cliffs",
+       `worst 0.5 m step ${jump}`);
+}
+
+// ===========================================================================
+// E.  THE BATCHED PATH EQUALS THE POINT QUERY
+// ===========================================================================
+// worldgen_chunk inlines the field evaluation so `t` and `m` are shared between
+// the height, the relief and the biome.  That is a duplicate of the formula,
+// and a duplicate is a drift waiting to happen.  This section is the leash.
+fn section_batch_equals_point() {
+    print("E. Batched chunk == point query");
+
+    let hb = buffer(162);
+    let bb = buffer(81);
+    let bad_h: i32 = 0;
+    let bad_b: i32 = 0;
+    let bad_n: i32 = 0;
+    let checked: i32 = 0;
+
+    let c = 0;
+    while (c < 12) {
+        let cx: i32 = (c % 4) * 7 - 11;
+        let cz: i32 = (c / 4) * 9 - 13;
+        let n: i32 = worldgen_chunk(g_WORLD_SEED_DEFAULT, cx, cz, hb, bb);
+        if (n != WG_CHUNK_SAMPLES) { bad_n = bad_n + 1; }
+        let j = 0;
+        while (j < 9) {
+            let i = 0;
+            while (i < 9) {
+                let wx: f64 = f64(cx) * 32.0 + f64(i) * 4.0;
+                let wz: f64 = f64(cz) * 32.0 + f64(j) * 4.0;
+                let stored: f64 = worldgen_chunk_height_m(hb, i, j);
+                let point: i32 = worldgen_height_cm(g_WORLD_SEED_DEFAULT, wx, wz);
+                if (stored != f64(point) * 0.01) { bad_h = bad_h + 1; }
+                if (bb[j * 9 + i] != worldgen_biome(g_WORLD_SEED_DEFAULT, wx, wz)) { bad_b = bad_b + 1; }
+                checked = checked + 1;
+                i = i + 1;
+            }
+            j = j + 1;
+        }
+        c = c + 1;
+    }
+    print(`   E   ${checked} samples over 12 chunks`);
+    ck(bad_h == 0, "E1 batched heights equal worldgen_height_cm exactly", `${bad_h} of ${checked}`);
+    ck(bad_b == 0, "E2 batched biomes equal worldgen_biome exactly", `${bad_b} of ${checked}`);
+    ck(bad_n == 0, "E3 worldgen_chunk returns the sample count", `${bad_n} bad returns`);
+
+    // E4 — a short buffer is refused, not half-filled and not thrown from.
+    let tiny = buffer(16);
+    let tinyb = buffer(4);
+    let g = 0;
+    while (g < 16) { tiny[g] = 7; g = g + 1; }
+    let r1: i32 = worldgen_chunk(g_WORLD_SEED_DEFAULT, 0, 0, tiny, bb);
+    let r2: i32 = worldgen_chunk(g_WORLD_SEED_DEFAULT, 0, 0, hb, tinyb);
+    let untouched: i32 = 1;
+    let g2 = 0;
+    while (g2 < 16) { if (tiny[g2] != 7) { untouched = 0; } g2 = g2 + 1; }
+    ck(r1 == 0 && r2 == 0 && untouched == 1,
+       "E4 an undersized buffer is refused with no partial write", `${r1} ${r2} ${untouched}`);
+
+    // E5 — worldgen_height_rel is the single definition of the formula
+    let wx5: f64 = 211.0;
+    let wz5: f64 = -73.0;
+    let rel5: f64 = worldgen_relief(g_WORLD_SEED_DEFAULT, wx5, wz5);
+    ck(worldgen_height_rel(g_WORLD_SEED_DEFAULT, wx5, wz5, rel5)
+       == worldgen_height(g_WORLD_SEED_DEFAULT, wx5, wz5),
+       "E5 height_rel(relief) == height", "formula duplicated");
+    // E6 — relief_tm is the single definition of the relief curve
+    let t6: f64 = worldgen_temp(g_WORLD_SEED_DEFAULT, wx5, wz5);
+    let m6: f64 = worldgen_moist(g_WORLD_SEED_DEFAULT, wx5, wz5);
+    ck(worldgen_relief_tm(t6, m6) == rel5, "E6 relief_tm(t,m) == relief(x,z)", "curve duplicated");
+
+    // ---- the chunk.hml source adapter (W3-2's injected-source contract) ----
+    // E7..E11 exist because `chunk.hml` deliberately does NOT import this file:
+    // it takes an injected source instead, so nothing but a test can prove the
+    // two agree.  Offsets are the whole point of that contract — chunk.hml
+    // packs many chunks into one arena — so they get their own assertions.
+    let arenaH = buffer(162 * 3);
+    let arenaA = buffer(162 * 3);
+    let g3 = 0;
+    while (g3 < 162 * 3) { arenaH[g3] = 17; arenaA[g3] = 17; g3 = g3 + 1; }
+    worldgen_chunk(g_WORLD_SEED_DEFAULT, -4, 9, hb, bb);
+    let meta: i32 = worldgen_chunk_at(g_WORLD_SEED_DEFAULT, -4, 9, arenaH, 162, arenaA, 162);
+
+    let dh: i32 = 0;
+    let db: i32 = 0;
+    let dl: i32 = 0;
+    let spill: i32 = 0;
+    let q7 = 0;
+    while (q7 < 162) {
+        if (arenaH[162 + q7] != hb[q7]) { dh = dh + 1; }
+        q7 = q7 + 1;
+    }
+    let q8 = 0;
+    while (q8 < 81) {
+        if (arenaA[162 + q8] != bb[q8]) { db = db + 1; }
+        if (arenaA[162 + 81 + q8] != 255) { dl = dl + 1; }
+        q8 = q8 + 1;
+    }
+    let q9 = 0;
+    while (q9 < 162) {
+        if (arenaH[q9] != 17) { spill = spill + 1; }
+        if (arenaA[q9] != 17) { spill = spill + 1; }
+        if (arenaH[324 + q9] != 17) { spill = spill + 1; }
+        if (arenaA[324 + q9] != 17) { spill = spill + 1; }
+        q9 = q9 + 1;
+    }
+    ck(dh == 0, "E7 worldgen_chunk_at writes the same heights at any offset", `${dh} bytes`);
+    ck(db == 0, "E8 worldgen_chunk_at writes the same biomes at any offset", `${db} bytes`);
+    ck(dl == 0, "E9 the 81 light bytes are seeded 'fully lit', not left as zeros", `${dl} bytes`);
+    ck(spill == 0, "E10 nothing is written outside the addressed 162-byte window",
+       `${spill} bytes`);
+    ck(worldgen_meta_poi(meta) == worldgen_poi_roll(g_WORLD_SEED_DEFAULT, -4, 9)
+       && worldgen_meta_tier(meta) == worldgen_shade_tier(g_WORLD_SEED_DEFAULT, -4, 9, 0)
+       && worldgen_meta_jitter(meta) == worldgen_tier_jitter(g_WORLD_SEED_DEFAULT, -4, 9),
+       "E11 the META word round-trips poi, tier and jitter", `meta ${meta}`);
+    // E12 — a bad offset is refused rather than corrupting a neighbour's chunk
+    let r12: i32 = worldgen_chunk_at(g_WORLD_SEED_DEFAULT, 0, 0, arenaH, 400, arenaA, 162);
+    let r13: i32 = worldgen_chunk_at(g_WORLD_SEED_DEFAULT, 0, 0, arenaH, -1, arenaA, 0);
+    ck(r12 == -1 && r13 == -1, "E12 an out-of-range offset returns -1, never a partial write",
+       `${r12} ${r13}`);
+}
+
+// ===========================================================================
+// F.  BIOME, TIER, POI — the design, asserted as design
+// ===========================================================================
+fn section_world_rules() {
+    print("F. Biome / shade tier / POI");
+
+    // ---- biome ------------------------------------------------------------
+    let cnt = [0, 0, 0, 0, 0, 0];
+    let n: i32 = 0;
+    let oob: i32 = 0;
+    let deep_near: i32 = 0;
+    let z = -100;
+    while (z <= 100) {
+        let x = -100;
+        while (x <= 100) {
+            let wx: f64 = f64(x) * 16.0;
+            let wz: f64 = f64(z) * 16.0;
+            let b: i32 = worldgen_biome(g_WORLD_SEED_DEFAULT, wx, wz);
+            if (b < 0 || b >= WG_BIOME_COUNT) { oob = oob + 1; }
+            else { cnt[b] = cnt[b] + 1; }
+            if (b == WG_BIOME_DEEPSHADE) {
+                if (__sqrt(wx * wx + wz * wz) < 600.0) { deep_near = deep_near + 1; }
+            }
+            n = n + 1;
+            x = x + 1;
+        }
+        z = z + 1;
+    }
+    let lo_share: f64 = 1.0;
+    let hi_share: f64 = 0.0;
+    let missing: i32 = 0;
+    let b2 = 0;
+    while (b2 < 6) {
+        let f: f64 = f64(cnt[b2]) / f64(n);
+        if (cnt[b2] == 0) { missing = missing + 1; }
+        if (f < lo_share) { lo_share = f; }
+        if (f > hi_share) { hi_share = f; }
+        print(`   F   biome ${b2}: ${f * 100.0} %`);
+        b2 = b2 + 1;
+    }
+    ck(oob == 0, "F1 every biome index is in range", `${oob} out of range`);
+    ck(missing == 0, "F2 all six biomes exist in a 3.2 km square", `${missing} missing`);
+    ck(lo_share >= 0.05, "F3 no biome is vestigial (>= 5 % of the world)", `${lo_share * 100.0} %`);
+    ck(hi_share <= 0.45, "F4 no biome swallows the world (<= 45 %)", `${hi_share * 100.0} %`);
+    ck(deep_near == 0, "F5 Deepshade never appears near town (< 600 m)", `${deep_near} samples`);
+
+    // F6 — you always start in the starting biome, whatever the seed
+    let bad6: i32 = 0;
+    let s6 = 0;
+    while (s6 < 64) {
+        let sd: i32 = s6 * 7919 - 100000;
+        if (worldgen_biome(sd, 0.0, 0.0) != WG_BIOME_HOLLOWFIELD) { bad6 = bad6 + 1; }
+        if (worldgen_biome(sd, 40.0, -40.0) != WG_BIOME_HOLLOWFIELD) { bad6 = bad6 + 1; }
+        s6 = s6 + 1;
+    }
+    ck(bad6 == 0, "F6 the town disc is Hollowfield for every seed", `${bad6} of 128`);
+
+    // ---- shade tier -------------------------------------------------------
+    let bad_range: i32 = 0;
+    let bad_phase: i32 = 0;
+    let z7 = -60;
+    while (z7 <= 60) {
+        let x7 = -60;
+        while (x7 <= 60) {
+            let t0: i32 = worldgen_shade_tier(g_WORLD_SEED_DEFAULT, x7, z7, 0);
+            let t1: i32 = worldgen_shade_tier(g_WORLD_SEED_DEFAULT, x7, z7, 1);
+            let t2: i32 = worldgen_shade_tier(g_WORLD_SEED_DEFAULT, x7, z7, 2);
+            if (t0 < 0 || t0 > WG_TIER_MAX) { bad_range = bad_range + 1; }
+            if (t1 < t0 || t2 < t1) { bad_phase = bad_phase + 1; }
+            if (t2 > t0 + 2) { bad_phase = bad_phase + 1; }
+            x7 = x7 + 1;
+        }
+        z7 = z7 + 1;
+    }
+    ck(bad_range == 0, "F7 tier is always within 0..TIER_MAX", `${bad_range}`);
+    ck(bad_phase == 0, "F8 night never makes the world safer, and adds at most 2 tiers",
+       `${bad_phase}`);
+
+    // F9 — the town is the guaranteed tier-0 island (GDD §5), at every phase
+    let bad9: i32 = 0;
+    let s9 = 0;
+    while (s9 < 32) {
+        let sd: i32 = s9 * 104729 - 1000000;
+        let p = 0;
+        while (p <= 2) {
+            if (worldgen_shade_tier(sd, 0, 0, p) != 0) { bad9 = bad9 + 1; }
+            if (worldgen_shade_tier(sd, -1, -1, p) != 0) { bad9 = bad9 + 1; }
+            p = p + 1;
+        }
+        s9 = s9 + 1;
+    }
+    ck(bad9 == 0, "F9 the town chunks are tier 0 at every phase, every seed", `${bad9} of 192`);
+
+    // F10 — danger rises with distance.  Mean tier per 200 m ring, monotone.
+    let prev: f64 = -1.0;
+    let mono: i32 = 1;
+    let far_ok: i32 = 1;
+    let r = 0;
+    while (r < 7) {
+        let d: f64 = f64(r) * 200.0 + 150.0;
+        let sum: i32 = 0;
+        let cn: i32 = 0;
+        let a = 0;
+        while (a < 96) {
+            let ang: f64 = f64(a) * 0.0654498;
+            let cx: i32 = i32(__floor(d * __cos(ang) / 32.0));
+            let cz: i32 = i32(__floor(d * __sin(ang) / 32.0));
+            let t: i32 = worldgen_shade_tier(g_WORLD_SEED_DEFAULT, cx, cz, 0);
+            sum = sum + t;
+            cn = cn + 1;
+            if (d > 1100.0) { if (t < 4) { far_ok = 0; } }
+            a = a + 1;
+        }
+        let mn: f64 = f64(sum) / f64(cn);
+        print(`   F10 ring d=${d} m : mean tier ${mn}`);
+        if (mn <= prev) { mono = 0; }
+        prev = mn;
+        r = r + 1;
+    }
+    ck(mono == 1, "F10 mean tier rises strictly with distance from town", "not monotone");
+    ck(far_ok == 1, "F11 beyond 1100 m the world is tier 4+ even at noon", "found a soft spot");
+
+    // F12 — the jitter is the GDD's {-1,0,0,+1}
+    let cm12: i32 = 0;
+    let c012: i32 = 0;
+    let cp12: i32 = 0;
+    let bad12: i32 = 0;
+    let z12 = -150;
+    while (z12 <= 150) {
+        let x12 = -150;
+        while (x12 <= 150) {
+            let j: i32 = worldgen_tier_jitter(g_WORLD_SEED_DEFAULT, x12, z12);
+            if (j == -1) { cm12 = cm12 + 1; }
+            else if (j == 0) { c012 = c012 + 1; }
+            else if (j == 1) { cp12 = cp12 + 1; }
+            else { bad12 = bad12 + 1; }
+            x12 = x12 + 1;
+        }
+        z12 = z12 + 1;
+    }
+    let n12: f64 = f64(cm12 + c012 + cp12);
+    print(`   F12 jitter -1/0/+1 = ${f64(cm12) / n12} / ${f64(c012) / n12} / ${f64(cp12) / n12}`);
+    ck(bad12 == 0, "F12 tier jitter only ever yields -1, 0 or +1", `${bad12}`);
+    ck(absf2(f64(cm12) / n12 - 0.25) < 0.01 && absf2(f64(c012) / n12 - 0.50) < 0.01
+       && absf2(f64(cp12) / n12 - 0.25) < 0.01,
+       "F13 jitter is the GDD's 1/4 : 1/2 : 1/4", `${f64(cm12) / n12} ${f64(c012) / n12}`);
+
+    // ---- POI --------------------------------------------------------------
+    let pc = [0, 0, 0, 0, 0, 0];
+    let np: i32 = 0;
+    let oobp: i32 = 0;
+    let outside: i32 = 0;
+    let zp = -250;
+    while (zp <= 250) {
+        let xp = -250;
+        while (xp <= 250) {
+            let p: i32 = worldgen_poi_roll(g_WORLD_SEED_DEFAULT, xp, zp);
+            if (p < 0 || p >= WG_POI_COUNT) { oobp = oobp + 1; }
+            else { pc[p] = pc[p] + 1; }
+            np = np + 1;
+            xp = xp + 1;
+        }
+        zp = zp + 1;
+    }
+    print(`   F   POI over ${np} chunks:`);
+    let names = ["none", "lantern", "ruin", "caravan", "shrine", "burrow"];
+    let want = [0.0, 4.0, 6.0, 10.0, 14.0, 20.0];
+    let worst_rel: f64 = 0.0;
+    let k = 1;
+    while (k < 6) {
+        let per: f64 = f64(np) / f64(pc[k]);
+        let rel: f64 = absf2(per - want[k]) / want[k];
+        if (rel > worst_rel) { worst_rel = rel; }
+        print(`       ${names[k]}: 1 per ${per} chunks (GDD 1 per ${want[k]})`);
+        k = k + 1;
+    }
+    ck(oobp == 0, "F14 every POI roll is a legal kind", `${oobp}`);
+    // GDD §4.4 authored the frequencies; this asserts the TABLE, not a digit.
+    ck(worst_rel < 0.05, "F15 all five POI frequencies match the GDD table within 5 %",
+       `worst ${worst_rel * 100.0} %`);
+
+    // F16 — exactly one lantern anchor per 2x2 chunk block, two seeds
+    let badblk: i32 = 0;
+    let nblk: i32 = 0;
+    let s16 = 0;
+    while (s16 < 2) {
+        let sd: i32 = g_WORLD_SEED_DEFAULT;
+        if (s16 == 1) { sd = -424242; }
+        let bz = -30;
+        while (bz <= 30) {
+            let bx = -30;
+            while (bx <= 30) {
+                let c: i32 = 0;
+                let j = 0;
+                while (j < 2) {
+                    let i = 0;
+                    while (i < 2) {
+                        c = c + worldgen_is_lantern_chunk(sd, bx * 2 + i, bz * 2 + j);
+                        i = i + 1;
+                    }
+                    j = j + 1;
+                }
+                if (c != 1) { badblk = badblk + 1; }
+                nblk = nblk + 1;
+                bx = bx + 1;
+            }
+            bz = bz + 1;
+        }
+        s16 = s16 + 1;
+    }
+    ck(badblk == 0, "F16 exactly one lantern per 2x2-chunk block", `${badblk} of ${nblk} blocks`);
+
+    // F17 — the GDD promise: a lantern within 120 m of ANYWHERE.  Sampled on a
+    // grid deliberately offset from every lattice in the generator.
+    let worstd: f64 = 0.0;
+    let z17 = 0;
+    while (z17 < 160) {
+        let x17 = 0;
+        while (x17 < 160) {
+            let px: f64 = f64(x17) * 3.13 - 250.0;
+            let pz: f64 = f64(z17) * 3.17 - 250.0;
+            let bx0: i32 = worldgen_block_of(i32(__floor(px / 32.0)));
+            let bz0: i32 = worldgen_block_of(i32(__floor(pz / 32.0)));
+            let best: f64 = 1000000.0;
+            let dz = -1;
+            while (dz <= 1) {
+                let dx = -1;
+                while (dx <= 1) {
+                    let lx: f64 = worldgen_lantern_x(g_WORLD_SEED_DEFAULT, bx0 + dx, bz0 + dz);
+                    let lz: f64 = worldgen_lantern_z(g_WORLD_SEED_DEFAULT, bx0 + dx, bz0 + dz);
+                    let dd: f64 = __sqrt((lx - px) * (lx - px) + (lz - pz) * (lz - pz));
+                    if (dd < best) { best = dd; }
+                    dx = dx + 1;
+                }
+                dz = dz + 1;
+            }
+            if (best > worstd) { worstd = best; }
+            x17 = x17 + 1;
+        }
+        z17 = z17 + 1;
+    }
+    print(`   F17 worst distance to the nearest lantern: ${worstd} m`);
+    ck(worstd < 120.0, "F17 a lantern is within 120 m of anywhere (GDD 4.4)", `${worstd} m`);
+    ck(worstd <= WG_LANTERN_MAX_D_M, "F18 and it beats the module's own stated bound",
+       `${worstd} vs ${WG_LANTERN_MAX_D_M}`);
+
+    // F19 — a rolled POI stands inside its own chunk, clear of the edge
+    let badpos: i32 = 0;
+    let nrolled: i32 = 0;
+    let z19 = -40;
+    while (z19 <= 40) {
+        let x19 = -40;
+        while (x19 <= 40) {
+            let p: i32 = worldgen_poi_roll(g_WORLD_SEED_DEFAULT, x19, z19);
+            if (p != WG_POI_NONE) {
+                if (p != WG_POI_LANTERN) {
+                    let px: f64 = worldgen_poi_x(g_WORLD_SEED_DEFAULT, x19, z19);
+                    let pz: f64 = worldgen_poi_z(g_WORLD_SEED_DEFAULT, x19, z19);
+                    let lx: f64 = f64(x19) * 32.0;
+                    let lz: f64 = f64(z19) * 32.0;
+                    if (px < lx + 4.0 || px > lx + 28.0) { badpos = badpos + 1; }
+                    if (pz < lz + 4.0 || pz > lz + 28.0) { badpos = badpos + 1; }
+                    nrolled = nrolled + 1;
+                }
+            }
+            x19 = x19 + 1;
+        }
+        z19 = z19 + 1;
+    }
+    ck(badpos == 0, "F19 a rolled POI sits inside its chunk, 4 m clear of the edge",
+       `${badpos} of ${nrolled}`);
+    // F20 — a lantern chunk's POI position IS the block's lantern
+    let bad20: i32 = 0;
+    let n20: i32 = 0;
+    let z20 = -20;
+    while (z20 <= 20) {
+        let x20 = -20;
+        while (x20 <= 20) {
+            if (worldgen_is_lantern_chunk(g_WORLD_SEED_DEFAULT, x20, z20) == 1) {
+                let bx: i32 = worldgen_block_of(x20);
+                let bz: i32 = worldgen_block_of(z20);
+                if (worldgen_poi_x(g_WORLD_SEED_DEFAULT, x20, z20)
+                    != worldgen_lantern_x(g_WORLD_SEED_DEFAULT, bx, bz)) { bad20 = bad20 + 1; }
+                if (worldgen_poi_roll(g_WORLD_SEED_DEFAULT, x20, z20) != WG_POI_LANTERN) {
+                    bad20 = bad20 + 1;
+                }
+                n20 = n20 + 1;
+            }
+            x20 = x20 + 1;
+        }
+        z20 = z20 + 1;
+    }
+    ck(bad20 == 0 && n20 > 300, "F20 a lantern chunk reports the block lantern's position",
+       `${bad20} bad, ${n20} lantern chunks`);
+}
+
+// ===========================================================================
+// G.  PERFORMANCE  (RULE T: __clock CPU time, min of 7, bound at ~2x loaded)
+// ===========================================================================
+fn section_perf() {
+    print("G. Performance (RULE T: __clock CPU time, min of 7 trials)");
+
+    let TRIALS = 7;
+    let hb = buffer(162);
+    let bb = buffer(81);
+
+    // G0 — backend + load calibration.  Turns the absolute bounds below into
+    // ratio bounds, which is what survives a box that is never idle, and lets
+    // the identical assertions run compiled AND interpreted.
+    let NC = 2000000;
+    let bestc: f64 = 1000000.0;
+    let calsink: i32 = 0;
+    let tc = 0;
+    while (tc < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < NC) { calsink = calsink ^ i; i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < bestc) { bestc = dt; }
+        tc = tc + 1;
+    }
+    let cal: f64 = bestc * 1000000000.0 / f64(NC);
+    let scale: f64 = cal / 12.5;
+    if (scale < 1.0) { scale = 1.0; }
+    print(`   G0  empty-loop calibration ${cal} ns/iter -> bound scale x${scale}   sink=${calsink}`);
+
+    // G1 — one chunk.  The build-plan bar is 2.0 ms; g_BUDGET_CHUNKGEN_MS is
+    // the same number as an amortised per-frame allowance.
+    let N1 = 200;
+    let best1: f64 = 1000000.0;
+    let sink1: i32 = 0;
+    let t = 0;
+    while (t < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N1) { sink1 = sink1 + worldgen_chunk(g_WORLD_SEED_DEFAULT, i, i * 3, hb, bb); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best1) { best1 = dt; }
+        t = t + 1;
+    }
+    let ms1: f64 = best1 * 1000.0 / f64(N1);
+    print(`   G1  worldgen_chunk  ${ms1} ms/chunk  (min of ${TRIALS}, ${N1} chunks)  sink=${sink1}`);
+    // MEASURED compiled -O1 on this box with llama-server holding ~17 of 24
+    // cores; there is no idle number because this machine is never idle
+    // (CLAUDE.md §1.2).  The loaded figure is printed above every run.  The
+    // bound is the ACCEPTANCE bar (2.0 ms), scaled by G0 so the interpreter —
+    // which is ~5x slower and is not what ships — does not false-fail it.
+    ck(ms1 < 2.0 * scale, "G1 a chunk generates in under 2.0 ms x scale (see printed loaded value)",
+       `${ms1} ms, scale ${scale}`);
+    ck(2.0 <= g_BUDGET_CHUNKGEN_MS, "G2 the 2.0 ms bar is config's chunkgen budget",
+       `${g_BUDGET_CHUNKGEN_MS}`);
+
+    // G3 — the RATIO assertion, which survives contention because both terms
+    // inflate together.  A chunk sample produces a HEIGHT AND A BIOME, so the
+    // honest comparison is against `worldgen_height` + `worldgen_biome`, which
+    // evaluates the temperature and moisture fields twice (11 vnoise) where
+    // the batched path evaluates them once (7).  Expect ~7/11 = 0.64.  If this
+    // ratio drifts to 1.0 the sharing has been lost and every chunk got 57 %
+    // more expensive without anyone noticing.
+    let N3 = 20000;
+    let best3: f64 = 1000000.0;
+    let sink3: f64 = 0.0;
+    let sinkb: i32 = 0;
+    let t3 = 0;
+    while (t3 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N3) {
+            let wx: f64 = f64(i) * 0.37;
+            let wz: f64 = f64(i) * 1.13;
+            sink3 = sink3 + worldgen_height(g_WORLD_SEED_DEFAULT, wx, wz);
+            sinkb = sinkb + worldgen_biome(g_WORLD_SEED_DEFAULT, wx, wz);
+            i = i + 1;
+        }
+        let dt: f64 = __clock() - t0;
+        if (dt < best3) { best3 = dt; }
+        t3 = t3 + 1;
+    }
+    let us3: f64 = best3 * 1000000.0 / f64(N3);
+    let ratio: f64 = (ms1 * 1000.0) / (us3 * 81.0);
+    print(`   G3  height+biome ${us3} us/point -> batch/point ratio ${ratio}  sink=${sink3} ${sinkb}`);
+    ck(ratio < 0.80, "G3 the batched path shares the biome fields with the height",
+       `ratio ${ratio}`);
+}
+
+// ===========================================================================
+// H.  THE IMPORT WALL
+// ===========================================================================
+fn section_wall() {
+    print("H. Import wall for src/sim/worldgen.hml");
+
+    let txt = read_file("src/sim/worldgen.hml");
+    let banned = ["@stdlib/random", "@stdlib/time", "@stdlib/process", "@stdlib/fs",
+                  "@stdlib/net", "@stdlib/http", "@stdlib/os", "wobbleweed",
+                  "gn.hml", "sdl.hml", "SDL_", "__clock", "ticks(", "print("];
+    let hits = "";
+    let imports = 0;
+    let bad_import = "";
+    let ls = txt.split("\n");
+    let l = 0;
+    while (l < ls.length) {
+        let code = ls[l].split("//")[0];
+        let b = 0;
+        while (b < banned.length) {
+            if (code.contains(banned[b])) { hits = `${hits} ${l}:${banned[b]}`; }
+            b = b + 1;
+        }
+        if (code.contains("from \"")) {
+            imports = imports + 1;
+            if (code.contains("../core/") != true) { bad_import = `${bad_import} ${l}`; }
+        }
+        l = l + 1;
+    }
+    ck(hits == "", "H1 no banned import or symbol in worldgen CODE", `${hits}`);
+    ck(imports == 1 && bad_import == "", "H2 worldgen imports exactly one module, from src/core",
+       `${imports} imports,${bad_import}`);
+    // H3 — the scanner is not blind (a check that cannot fail is not a check)
+    let selftext = read_file("tools/probe_worldgen.hml");
+    let selfhit: i32 = 0;
+    let sl = selftext.split("\n");
+    let si = 0;
+    while (si < sl.length) {
+        if (sl[si].split("//")[0].contains("@stdlib/fs")) { selfhit = 1; }
+        si = si + 1;
+    }
+    ck(selfhit == 1, "H3 the scanner detects a real import line", "scanner blind");
+    // H4 — no mutable top-level state (purity, CLAUDE.md §7)
+    let muts = 0;
+    let m = 0;
+    while (m < ls.length) {
+        let code2 = ls[m].split("//")[0];
+        if (code2.contains("let g_")) { muts = muts + 1; }
+        m = m + 1;
+    }
+    ck(muts == 0, "H4 worldgen holds no mutable top-level state", `${muts} g_ globals`);
+}
+
+// ===========================================================================
+// THE HEIGHTMAP DUMP  (--heightmap <path>)
+// ===========================================================================
+// A 9x9-chunk region, 1 px per metre: shaded height, biome tint, chunk grid,
+// POI markers.  A DIAGNOSTIC image — it is deliberately not styled like the
+// game, so nobody can mistake it for art (CLAUDE.md §9.7).
+fn dump_heightmap(p_path: string, p_seed: i32) {
+    let n = 288;                                   // 9 chunks x 32 m
+    let img = buffer(n * n * 3);
+    let x0: f64 = -144.0;
+    let z0: f64 = -144.0;
+
+    // biome tint table, deliberately garish debug hues (not palette colours)
+    let tr = [210, 170, 235, 110, 130, 190];
+    let tg = [200, 190, 230, 170, 180, 110];
+    let tb = [120, 200, 195, 175, 130, 240];
+
+    let lo: f64 = 100000.0;
+    let hi: f64 = -100000.0;
+    let hgt = buffer(n * n * 2);
+    let bio = buffer(n * n);
+    let j = 0;
+    while (j < n) {
+        let i = 0;
+        while (i < n) {
+            let wx: f64 = x0 + f64(i);
+            let wz: f64 = z0 + f64(j);
+            let h: f64 = worldgen_height(p_seed, wx, wz);
+            if (h < lo) { lo = h; }
+            if (h > hi) { hi = h; }
+            let cm: i32 = i32(__floor(h * 100.0 + 0.5));
+            hgt[(j * n + i) * 2] = cm & 255;
+            hgt[(j * n + i) * 2 + 1] = (cm >> 8) & 255;
+            bio[j * n + i] = worldgen_biome(p_seed, wx, wz);
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+
+    let span: f64 = hi - lo;
+    if (span < 0.001) { span = 0.001; }
+    let j2 = 0;
+    while (j2 < n) {
+        let i2 = 0;
+        while (i2 < n) {
+            let idx: i32 = j2 * n + i2;
+            let h: f64 = f64(hgt[idx * 2] + hgt[idx * 2 + 1] * 256) * 0.01;
+            let tt: f64 = (h - lo) / span;
+            // a cheap lambert from the height gradient, so ridges read
+            let il: i32 = i2 - 1;
+            if (il < 0) { il = 0; }
+            let jl: i32 = j2 - 1;
+            if (jl < 0) { jl = 0; }
+            let hl: f64 = f64(hgt[(j2 * n + il) * 2] + hgt[(j2 * n + il) * 2 + 1] * 256) * 0.01;
+            let hu: f64 = f64(hgt[(jl * n + i2) * 2] + hgt[(jl * n + i2) * 2 + 1] * 256) * 0.01;
+            let sh: f64 = 0.72 + 0.20 * (h - hl) + 0.14 * (h - hu);
+            if (sh < 0.25) { sh = 0.25; }
+            if (sh > 1.35) { sh = 1.35; }
+            let b: i32 = bio[idx];
+            let v: f64 = (0.30 + 0.70 * tt) * sh;
+            let rr: i32 = i32(f64(tr[b]) * v);
+            let gg: i32 = i32(f64(tg[b]) * v);
+            let bbv: i32 = i32(f64(tb[b]) * v);
+            // 4 m contour ticks + chunk grid
+            let wxi: i32 = i2 - 144;
+            let wzi: i32 = j2 - 144;
+            if (((wxi % 32) + 32) % 32 == 0 || ((wzi % 32) + 32) % 32 == 0) {
+                rr = 40; gg = 40; bbv = 48;
+            }
+            if (rr > 255) { rr = 255; }
+            if (gg > 255) { gg = 255; }
+            if (bbv > 255) { bbv = 255; }
+            img[idx * 3] = rr;
+            img[idx * 3 + 1] = gg;
+            img[idx * 3 + 2] = bbv;
+            i2 = i2 + 1;
+        }
+        j2 = j2 + 1;
+    }
+
+    // POI markers: a 5x5 cross, white for lanterns, black for everything else
+    let cz = -5;
+    while (cz <= 4) {
+        let cx = -5;
+        while (cx <= 4) {
+            let p: i32 = worldgen_poi_roll(p_seed, cx, cz);
+            if (p != 0) {
+                let px: f64 = worldgen_poi_x(p_seed, cx, cz);
+                let pz: f64 = worldgen_poi_z(p_seed, cx, cz);
+                let mi: i32 = i32(__floor(px - x0));
+                let mj: i32 = i32(__floor(pz - z0));
+                let cval: i32 = 20;
+                if (p == 1) { cval = 250; }
+                let k = -2;
+                while (k <= 2) {
+                    let ax: i32 = mi + k;
+                    let ay: i32 = mj;
+                    if (ax >= 0 && ax < n && ay >= 0 && ay < n) {
+                        img[(ay * n + ax) * 3] = cval;
+                        img[(ay * n + ax) * 3 + 1] = cval;
+                        img[(ay * n + ax) * 3 + 2] = cval;
+                    }
+                    let bx2: i32 = mi;
+                    let by2: i32 = mj + k;
+                    if (bx2 >= 0 && bx2 < n && by2 >= 0 && by2 < n) {
+                        img[(by2 * n + bx2) * 3] = cval;
+                        img[(by2 * n + bx2) * 3 + 1] = cval;
+                        img[(by2 * n + bx2) * 3 + 2] = cval;
+                    }
+                    k = k + 1;
+                }
+            }
+            cx = cx + 1;
+        }
+        cz = cz + 1;
+    }
+
+    write_png(p_path, img, n, n);
+    print(`   heightmap: ${p_path}  (9x9 chunks, ${n}x${n} px, height ${lo} .. ${hi} m, seed ${p_seed})`);
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_worldgen  —  W3-1  (src/sim/worldgen.hml)");
+    print("");
+
+    if (is_dir("src/sim") != true) {
+        print("FAIL  run this from the nightshade repo root: src/sim/ not found from here");
+        exit(1);
+    }
+
+    let hm = "";
+    let seed: i32 = g_WORLD_SEED_DEFAULT;
+    let i = 0;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--heightmap" && i + 1 < args.length) { i = i + 1; hm = args[i]; }
+        else if (a == "--sweep" && i + 1 < args.length) {
+            i = i + 1;
+            let v: i32 = i32(args[i].to_number());
+            if (v >= 2 && v <= 200) { g_sweep_half = v; }
+        }
+        i = i + 1;
+    }
+
+    section_mirror();
+    print("");
+    section_determinism();
+    print("");
+    section_edges();
+    print("");
+    section_relief();
+    print("");
+    section_batch_equals_point();
+    print("");
+    section_world_rules();
+    print("");
+    section_perf();
+    print("");
+    section_wall();
+    print("");
+
+    if (hm != "") { dump_heightmap(hm, seed); print(""); }
+
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

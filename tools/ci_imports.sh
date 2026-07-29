@@ -371,9 +371,16 @@ RULE_FAIL[R7]=0
 REAL_FG="$NS_ROOT/src/render/world_render.hml"
 SHOT="$NS_ROOT/tools/shot.hml"
 if [ -f "$REAL_FG" ] && [ -f "$SHOT" ]; then
-    if grep -qE '^[[:space:]]*(export[[:space:]]+)?fn[[:space:]]+frame_render[[:space:]]*\(' "$SHOT"; then
-        err R7 "tools/shot.hml defines its own frame_render, but src/render/world_render.hml exists. The harness MUST import the real frame graph (W3-7) or it will silently drift from the game."
-    fi
+    # Check EVERY tool, not just shot.hml. Gate 3a planted `fn frame_render` in
+    # tools/walk.hml and this rule did not catch it -- the rule was written when
+    # shot.hml was the only consumer, and a second one appeared the very next
+    # wave. A rule that names one file protects one file.
+    for t in "$NS_ROOT"/tools/*.hml; do
+        [ -e "$t" ] || continue
+        if grep -qE '^[[:space:]]*(export[[:space:]]+)?fn[[:space:]]+frame_render[[:space:]]*\(' "$t"; then
+            err R7 "$(basename "$t") defines its own frame_render, but src/render/world_render.hml exists. Every consumer MUST import the real frame graph or it will silently drift from the game."
+        fi
+    done
     if ! grep -qE 'from[[:space:]]+"\.\./src/render/world_render\.hml"' "$SHOT"; then
         err R7 "tools/shot.hml does not import src/render/world_render.hml. It must render through the REAL frame path, never a parallel one."
     fi

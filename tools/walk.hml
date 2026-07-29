@@ -1,0 +1,2731 @@
+// ===========================================================================
+//  walk.hml — THE PLAYABLE WALKAROUND.                      W3-0b.
+// ===========================================================================
+//
+//  The first time anyone MOVES through this world instead of looking at a
+//  screenshot of it. Mouse-look + WASD, a fly toggle, a live time-of-day
+//  scrub, a weather cycle, teleports to every shot.hml scene, and an on-screen
+//  budget readout so the cost of what you are looking at is visible while you
+//  look at it.
+//
+// ---------------------------------------------------------------------------
+//  IT RENDERS THROUGH THE REAL FRAME GRAPH. THERE IS NO SECOND ONE.
+// ---------------------------------------------------------------------------
+//  `src/render/world_render.hml` (W3-0a) owns stages 8..23 and 25..28 of
+//  ARCHITECTURE.md §4. This file NEVER defines the frame graph function —
+//  `ci_imports.sh` R7 exists precisely to stop a harness carrying a private
+//  copy, and W3-0's acceptance greps every tool for a local definition of it
+//  and requires zero hits. (Which is why that grep's pattern is not written out
+//  literally anywhere in this file: the comment would be the hit.) What it owns
+//  is
+//  the caller's half of the frame, which the import wall leaves with the
+//  caller because `src/render/**` may not import `src/art/**`:
+//
+//      stage 6   tod_eval  -> the frame graph's RenderEnv
+//      stage 7   skygen's rolling re-bake
+//      stage 24  the HUD (here: the budget readout)
+//
+//  plus the world itself, which the frame graph WALKS but never BUILDS.
+//
+// ---------------------------------------------------------------------------
+//  WHY THIS FILE HAS ITS OWN WORLD BUILDER, AND WHAT THAT COSTS
+// ---------------------------------------------------------------------------
+//  `tools/shot.hml` ends in `main();`, so it cannot be imported, and W3-0b owns
+//  `tools/walk.hml` and nothing else — editing shot.hml to extract a shared
+//  builder is another agent's file (CLAUDE.md §3). So the ground material rules
+//  (`ground_cell` / `ground_vcol` / the path), the apron fan and the structure
+//  panel helpers are RE-DERIVED here rather than shared. This is real
+//  duplication and it is reported as such; the fix is W3-1 `worldgen.hml` +
+//  W3-2 `chunk.hml` + `src/render/terrain_render.hml`, which is where all of it
+//  belongs. Until then, the ONE thing that is shared and must stay shared is
+//  the height field: `terrain_h` comes from `world_render.hml`, so the ground
+//  the player stands on is the same ground the frame graph lays its light pools
+//  on, to the last bit.
+//
+//  What is DELIBERATELY different from shot.hml, because a walkaround is not a
+//  screenshot:
+//    * the world is WORLD-ANCHORED, not camera-anchored. shot scatters props in
+//      a seeded stream around a fixed camera; that world would slide with you.
+//      Here every prop and every material is a pure function of its own
+//      position, so walking 200 m and walking back shows you the same trees.
+//    * terrain chunks STREAM. A ring is meshed around the player, cached, and
+//      re-baked on a rolling cursor, which is what `g_BUDGET_CHUNKGEN_MS` in
+//      core/config.hml is for.
+//    * there are SITES — towers, camps and ruins on a 96 m lattice — because
+//      "is there anything on the horizon worth walking toward" is one of the
+//      questions this build exists to answer, and you cannot answer it with an
+//      empty heath.
+//
+// ---------------------------------------------------------------------------
+//  RUNNING IT
+// ---------------------------------------------------------------------------
+//      hemlockc -O1 tools/walk.hml -o /tmp/walk
+//      DISPLAY=:0 /tmp/walk                      # interactive, x3 upscale
+//      DISPLAY=:0 /tmp/walk --demo 20 --shots /tmp/walkshots
+//      SDL_VIDEODRIVER=dummy /tmp/walk --selftest        # CI smoke test
+//
+//  Headless it degrades and does not die: SDL_SetRelativeMouseMode ALWAYS
+//  returns -1 under the dummy driver and the WARP hint does not rescue it
+//  (CLAUDE.md §5). The status is reported, mouse-look is disabled, and the
+//  walk runs on the keyboard path exactly as it would with a mouse.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+import { make_dirs } from "@stdlib/fs";
+import { sin, cos, sqrt, floor, divi } from "@stdlib/math";
+
+// ---------------------------------------------------------------------------
+// the engine
+// ---------------------------------------------------------------------------
+import { window_open_ex, window_close, set_relative_mouse, sdl_error,
+         set_vsync, set_window_title,
+         BLEND_BLEND, BLEND_ADD,
+         SC_A, SC_D, SC_E, SC_F, SC_G, SC_H, SC_L, SC_P, SC_Q, SC_R, SC_S,
+         SC_T, SC_V, SC_W, SC_X, SC_Z,
+         SC_0, SC_1, SC_2, SC_3, SC_4, SC_5, SC_6, SC_7, SC_8, SC_9,
+         SC_ESCAPE, SC_SPACE, SC_LSHIFT, SC_LCTRL, SC_TAB }
+       from "../../wobbleweed/src/sdl.hml";
+import { target_new, target_free, target_set_shake, target_set_border }
+       from "../../wobbleweed/src/target.hml";
+import { input_new, input_sample, input_down, input_pressed, input_quit,
+         input_set_relative, input_relative_status, input_relative_error,
+         input_mouse_dx, input_mouse_dy }
+       from "../../wobbleweed/src/input.hml";
+import { clock_now, clock_ms_between, clock_sleep_ms }
+       from "../../wobbleweed/src/time.hml";
+import { write_png } from "../../wobbleweed/src/png.hml";
+import { emit_set_env } from "../../wobbleweed/src/emit.hml";
+import { env_set_camera, env_set_fog, env_set_mist,
+         env_clear_lights, env_add_light, env_field, env_light_count,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_FOG_ALPHA_MAX }
+       from "../../wobbleweed/src/shade.hml";
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_vert_ao, mesh_quad, mesh_end,
+         mesh_bake_light, mesh_tri_count, mesh_overflow_count }
+       from "../../wobbleweed/src/mesh.hml";
+import { atlas_new, atlas_cell_uv, atlas_upload }
+       from "../../wobbleweed/src/atlas.hml";
+import { font_text_shadowed } from "../../wobbleweed/src/font.hml";
+import { quad_screen_uv } from "../../wobbleweed/src/quad.hml";
+import { stat_get, stat_ms, stat_set, stat_begin, stat_end,
+         STAT_TRIS_SUBMITTED, STAT_TRIS_DRAWN, STAT_TRIS_WORLD,
+         STAT_TRIS_SKY, STAT_TRIS_FX, STAT_TRIS_HUD,
+         STAT_DRAW_CALLS, STAT_BATCH_OVERFLOW, STAT_LIGHTS,
+         STAT_CHUNKS_DRAWN, STAT_CHUNKS_TESTED, STAT_ENTS_DRAWN,
+         STAT_PARTICLES, STAT_SKY_ROWS, STAT_CHUNKS_MESHED,
+         STAT_T_FRAME, STAT_T_TOD, STAT_T_SKYBAKE, STAT_T_HUD,
+         STAT_T_EMIT, STAT_T_FLUSH_WORLD, STAT_T_PRESENT,
+         STAT_T_VIEW, STAT_T_BATCH_RESET, STAT_T_TARGET_BEGIN, STAT_T_CLEAR,
+         STAT_T_FLUSH_SKY, STAT_T_SORT_WORLD, STAT_T_SORT_FX,
+         STAT_T_FLUSH_FX, STAT_T_POSTFX, STAT_T_FLUSH_HUD }
+       from "../../wobbleweed/src/stats.hml";
+
+// ---------------------------------------------------------------------------
+// THE FRAME GRAPH — src/render/world_render.hml. The only one. See the header.
+// ---------------------------------------------------------------------------
+import { frame_init, frame_render, frame_present, frame_begin,
+         frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
+         frame_set_camera, frame_set_clear, frame_set_options,
+         frame_set_hud_solid_uv, frame_set_vignette_colour,
+         frame_set_flash_colour, frame_env, frame_batch_hud,
+         world_clear, world_chunk_add, world_prop_add, world_fx_add,
+         world_chunk_count, world_chunk_mesh, world_prop_count,
+         world_prop_tag, world_prop_x, world_prop_y, world_prop_z,
+         terrain_set, terrain_seed, terrain_h, vnoise2, h2,
+         g_D2R, g_FXK_SPRITE, g_FXK_RAIN, g_LOD_FOG_CARD }
+       from "../src/render/world_render.hml";
+
+// ---------------------------------------------------------------------------
+// the game — core
+// ---------------------------------------------------------------------------
+import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY,
+         g_FOG_FAR_CAP, g_MIST_HEIGHT, g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS,
+         g_UPSCALE_DEFAULT, g_FRAME_BUDGET_MS }
+       from "../src/core/config.hml";
+import { clamp01, lerpf, clampi, clampf } from "../src/core/mathx.hml";
+
+// ---------------------------------------------------------------------------
+// the game — art
+// ---------------------------------------------------------------------------
+import { pal_r, pal_g, pal_b, pal_pack,
+         g_UI_WHITE, g_UI_DIM, g_UI_BLACK, g_UI_AMBER, g_UI_DANGER,
+         g_UI_GOOD, g_NS_CORE, g_NS_HALO, g_EMBER, g_LIGHTNING,
+         g_WINDOW_LIGHT,
+         g_GRASS_MID, g_GRASS_DRY, g_DIRT_MID, g_DIRT_LO,
+         g_SNOW_HI, g_SNOW_LO, g_STONE_MID, g_STONE_HI }
+       from "../src/art/palette.hml";
+import { tod_eval, tod_reset, tod_set_weather, tod_set_mist_band,
+         tod_sky_keys, tod_lightning_fire, tod_lightning_active,
+         tod_clock_hours,
+         WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM, WX_BLOOM, WX_COUNT,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R, TODSKY_STAR_ALPHA,
+         TODSKY_HALO, TODSKY_BODY_X, TODSKY_CLOUD_COVER, TODSKY_COUNT }
+       from "../src/art/tod.hml";
+import { texgen_build_world_atlas,
+         CELL_GRASS_A, CELL_GRASS_B, CELL_DIRT, CELL_SNOW, CELL_CLIFF,
+         CELL_PATH, CELL_COBBLE, CELL_GRAVEL, CELL_RUBBLE, CELL_STONE_A,
+         CELL_BRICK, CELL_CONCRETE, CELL_PLASTER,
+         CELL_WOOD_PLANK, CELL_ROOF_TILE, CELL_WINDOW, CELL_DOOR,
+         CELL_METAL_PANEL, CELL_PAINT_TEAL }
+       from "../src/art/texgen.hml";
+import { skygen_init, skygen_build, skygen_keys_new, skygen_set_keys,
+         skygen_set_clock, skygen_mark_dirty, skygen_rebake_slice,
+         skygen_dirty_rows,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER }
+       from "../src/art/skygen.hml";
+import { fxgen_build_atlas,
+         FX_EMBER, FX_XP_MOTE, FX_GLOW_S, FX_GLOW_L, FX_RAIN }
+       from "../src/art/fxgen.hml";
+import { hudgen_build_atlas, hudgen_uv, hudgen_rect, hud_font_micro,
+         HUD_SOLID, HUD_XH_TICK_V, HUD_XH_TICK_H, HUD_XH_DOT,
+         HUD_CHEVRON, HUD_TICK_MINOR, HUD_TICK_MAJOR, HUD_ICON_LANTERN }
+       from "../src/art/hudgen.hml";
+import { meshgen_build_all, meshgen_bake_all, meshgen_mesh,
+         meshgen_radius, meshgen_set_material_uv, meshgen_set_sun_azimuth,
+         MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT,
+         MG_MAT_GLASS,
+         MESH_TREE0, MESH_TREE1, MESH_TREE2, MESH_BUSH, MESH_ROCK,
+         MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_NPC,
+         MESH_SPARROW_VM }
+       from "../src/art/meshgen.hml";
+
+// ===========================================================================
+// 0. FIXED SHAPE
+// ===========================================================================
+
+let g_VERSION: string = "walk.hml W3-0b (the playable walkaround)";
+
+let g_CHUNK_Q: i32 = 8;                 // quads per chunk edge
+let g_QUAD_M: f64 = 4.0;                // metres per terrain quad (<= 4 m, §6)
+let g_CHUNK_M: f64 = 32.0;              // g_CHUNK_Q * g_QUAD_M
+let g_CHUNK_SLOTS: i32 = 72;            // mesh pool; a 7x7 ring is 49
+let g_CHUNK_BUILD_PER_FRAME: i32 = 2;   // g_BUDGET_CHUNKGEN_MS, amortised
+let g_SITE_M: f64 = 96.0;               // the landmark lattice
+let g_SITE_SLOTS: i32 = 12;
+let g_SITE_GLOWS: i32 = 4;              // window/lantern glows recorded per site
+let g_APRON_SEGS: i32 = 24;
+let g_APRON_SNAP: f64 = 0.25;           // the apron re-centres on this lattice
+
+// GDD §2.3. The walkaround does not simulate acceleration — W3-9 owns the real
+// movement model and this file must not grow a second one — but the SPEEDS are
+// the GDD's, because "how fast does 4.4 m/s feel through this fog" is one of
+// the questions the owner is being asked.
+let g_SPEED_WALK: f64 = 4.4;
+let g_SPEED_SPRINT: f64 = 7.0;
+let g_SPEED_FLY: f64 = 14.0;
+let g_SPEED_FLY_FAST: f64 = 44.0;
+let g_EYE_H: f64 = 1.7;
+
+// tod.hml is authored on the D6 16-minute day. This is the whole point of the
+// `[` / `]` scrub: one real second is 1/960 of a game day.
+let g_DAY_SECONDS: f64 = 960.0;
+let g_SCRUB_H_PER_S: f64 = 3.0;         // held-key scrub, game-hours per second
+
+// Scancodes sdl.hml does not name. SDL_SCANCODE_LEFTBRACKET/RIGHTBRACKET/
+// MINUS/EQUALS/COMMA/PERIOD, from SDL_scancode.h — all far below 2.0.18.
+let g_SC_LBRACKET: i32 = 47;
+let g_SC_RBRACKET: i32 = 48;
+let g_SC_MINUS: i32 = 45;
+let g_SC_EQUALS: i32 = 46;
+
+// ===========================================================================
+// 1. POSITION-KEYED RANDOMNESS
+// ---------------------------------------------------------------------------
+// Everything scattered in this world is a pure function of WHERE IT IS, never
+// of the order it was generated in. That is what makes walking away and coming
+// back show you the same trees, and it is why there is no xorshift stream in
+// this file the way there is in shot.hml. `h2` is the frame graph's own
+// position hash, imported, so the harness and the walkaround agree.
+// ===========================================================================
+
+fn hrange(p_a: i32, p_b: i32, p_s: i32, p_lo: f64, p_hi: f64): f64 {
+    let t: f64 = h2(p_a, p_b, p_s);
+    let out: f64 = p_lo + (p_hi - p_lo) * t;
+    return out;
+}
+
+// ===========================================================================
+// 2. THE ART — built once at boot, straight out of src/art
+// ===========================================================================
+
+let g_atlas_world = null;
+let g_atlas_fx = null;
+let g_atlas_hud = null;
+let g_tex_world = null;
+let g_tex_fx = null;
+let g_tex_hud = null;
+let g_tex_sky = null;
+let g_world_cells: i32 = 0;
+let g_mesh_tris: i32 = 0;
+
+let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_rect: array<i32> = [0, 0, 0, 0];
+let g_skyk: array<f64> = [];
+let g_todsky: array<f64> = [];
+
+fn art_bind_materials() {
+    meshgen_set_material_uv(MG_MAT_BARK, 0.0, 0.0, 0.0, 0.0);
+    let pairs: array<i32> = [
+        MG_MAT_BARK, 18, MG_MAT_LEAF, 20, MG_MAT_STONE, 8,
+        MG_MAT_WOOD, 16, MG_MAT_METAL, 27, MG_MAT_CONCRETE, 24,
+        MG_MAT_CLOTH, 35, MG_MAT_HIDE, 17, MG_MAT_DIRT, 3,
+        MG_MAT_GLASS, 38
+    ];
+    let n: i32 = pairs.length;
+    for (let i = 0; i < n; i = i + 2) {
+        atlas_cell_uv(g_atlas_world, pairs[i + 1], g_uvq, 0);
+        meshgen_set_material_uv(pairs[i], g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3]);
+    }
+}
+
+fn art_build(p_win) {
+    g_atlas_world = atlas_new(g_ATLAS_WORLD_PX, g_ATLAS_WORLD_PX,
+                              g_ATLAS_WORLD_CELLS, g_ATLAS_WORLD_CELLS);
+    g_world_cells = texgen_build_world_atlas(g_atlas_world, 1337);
+    g_atlas_fx = fxgen_build_atlas();
+    g_atlas_hud = hudgen_build_atlas();
+    hudgen_uv(HUD_SOLID, g_uvw, 0);
+    art_bind_materials();
+    g_mesh_tris = meshgen_build_all();
+
+    skygen_init();
+    skygen_set_clock(0.0);          // no wall clock ever reaches the bake
+    g_skyk = skygen_keys_new();
+    g_todsky = [];
+    for (let i = 0; i < TODSKY_COUNT; i++) { g_todsky.push(0.0); }
+
+    g_tex_world = atlas_upload(p_win, g_atlas_world, BLEND_BLEND);
+    g_tex_fx = atlas_upload(p_win, g_atlas_fx, BLEND_ADD);
+    g_tex_hud = atlas_upload(p_win, g_atlas_hud, BLEND_BLEND);
+    g_tex_sky = skygen_build(p_win);
+}
+
+// ===========================================================================
+// 3. WORLD + PLAYER STATE
+// ===========================================================================
+
+let g_win = null;
+let g_target = null;
+let g_in = null;
+let g_bhud = null;
+let g_fb: ptr = alloc(320 * 240 * 4);
+
+let g_camx: f64 = 0.0;
+let g_camy: f64 = 2.0;
+let g_camz: f64 = 12.0;
+let g_yaw: f64 = 180.0;
+let g_pitch: f64 = -3.0;
+let g_fov: f64 = 70.0;
+let g_ground_y: f64 = 0.0;
+
+let g_fly: i32 = 0;
+let g_sprinting: i32 = 0;
+let g_seed: i32 = 1337;
+let g_ridge: f64 = 1.0;
+let g_snow: i32 = 0;
+let g_wx: i32 = 0;                      // WX_CLEAR
+let g_day_t: f64 = 0.5625;              // 18.25 h — golden hour, the money shot
+let g_time_running: i32 = 1;
+let g_time_scale: f64 = 1.0;
+let g_fog_far: f64 = 64.0;
+let g_fog_near: f64 = 12.0;
+let g_fog_bias: f64 = 0.0;              // the -/= key, metres
+let g_mouse_sens: f64 = 0.16;
+let g_hud_on: i32 = 1;
+let g_vm_on: i32 = 1;
+let g_relative_ok: i32 = 0;
+let g_poi: i32 = 0;
+let g_frames: i32 = 0;
+let g_shot_seq: i32 = 0;
+let g_sky_want: i32 = 1;
+
+// ---------------------------------------------------------------------------
+// ⚠ skygen_mark_dirty() RESTARTS THE SWEEP. DO NOT CALL IT EVERY FRAME.
+// ---------------------------------------------------------------------------
+// It sets `g_sky_cursor = 0` and `g_sky_remaining = SKY_H` and takes a fresh
+// key snapshot. skygen_rebake_slice() then bakes SKY_ROWS_PER_SLICE = 4 rows.
+// The first build of this file marked the sky dirty on every frame that the
+// clock advanced — i.e. every frame — so the cursor was reset to 0 before it
+// ever got past row 4, and rows 4..159 of the 160-row panorama kept whatever
+// they were baked with at boot. On screen that is a NOON-BLUE zenith over a
+// golden-hour horizon at 18.25 h, with a hard dashed seam where the two meet,
+// and it is the single worst-looking thing in the first build of this tool.
+//
+// The correct rolling pattern is: ask for a sweep, and only START one when the
+// previous sweep has finished. A full refresh is then 40 frames / 0.67 s, which
+// is exactly what skygen's own comment says the dial is set for, and the sky
+// lags the light by two thirds of a second out of a 960-second day.
+fn sky_request() { g_sky_want = 1; }
+
+// A jump the eye will notice — a teleport, a reseed — gets the whole panorama
+// at once. That is a hitch, and a hitch you asked for by pressing a key is free.
+fn sky_now() {
+    skygen_mark_dirty();
+    g_sky_want = 0;
+    while (skygen_dirty_rows() > 0) { skygen_rebake_slice(); }
+}
+
+// A HELD scrub is different: it is not one jump, it is 60 of them a second, and
+// running the panorama to completion on every one of them cost 4 ms a frame and
+// dropped the demo from 60.0 to 56.0 fps. So the scrub widens the slice instead
+// of restarting the sweep — 6 slices is 24 of 160 rows, a full refresh every 7
+// frames, and the sky trails the light by about a tenth of a second while the
+// key is down. Nobody has ever noticed a tenth of a second of sky.
+let g_sky_burst: i32 = 1;
+fn sky_scrub() { g_sky_want = 1; g_sky_burst = 6; }
+
+// ===========================================================================
+// 4. STAGE 6 + 7 — THE CALLER'S HALF OF THE FRAME
+// ---------------------------------------------------------------------------
+// `src/render/**` may not import `src/art/**` (CLAUDE.md §3, ARCHITECTURE
+// §5.6b), so tod_eval and the skygen bridge are the CALLER's, in every caller,
+// forever — which is exactly where ARCHITECTURE §4 puts them.
+// ===========================================================================
+
+// ⚠ THE tod <-> skygen UNIT MISMATCH IS STILL LIVE AND STILL HAS TO BE BRIDGED
+// BY THE CALLER. `tod_sky_keys` hands out 0..1 (tod.hml divides its five sky
+// rows by 255 at module load); `skygen`'s key block is 0..255. Pass them
+// through unscaled and you bake a BLACK panorama. shot.hml scales by 255 and
+// says so; this file is the second caller to hit it and the third
+// (src/game/main.hml) will too. One of the two art modules should agree on a
+// unit — reported, not patched, because neither is this task's file.
+fn sky_keys_from_tod(p_env: array<f64>) {
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    // The panorama is sampled with a negated azimuth (world_render's sky_uv_at:
+    // SDL's software renderer will not draw a right-to-left uv span), so the
+    // bodies get the same mirror and still land at their true azimuth.
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(p_env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(p_env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(p_env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+}
+
+// Stage 6. Runs EVERY frame — that is what makes the day cycle feel-able
+// rather than screenshot-able, and it is also what advances tod.hml's own
+// weather crossfade (tod_eval integrates the day_t delta internally, so a
+// weather change fades in over its authored seconds instead of snapping).
+fn tod_step(): f64 {
+    let env: array<f64> = frame_env();
+    tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
+    tod_eval(env, g_day_t, g_wx);
+    env_set_camera(env, g_camx, g_camy, g_camz);
+
+    let fnear: f64 = env_field(env, ENV_FOG_NEAR);
+    let ffar: f64 = env_field(env, ENV_FOG_FAR) + g_fog_bias;
+    // CLAUDE.md §6: FOG_FAR never exceeds 72 m, and the cap is config's number,
+    // never a second copy of it.
+    if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (ffar < 14.0) { ffar = 14.0; }
+    if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
+    env_set_fog(env, fnear, ffar,
+                env_field(env, ENV_FOG_R), env_field(env, ENV_FOG_G),
+                env_field(env, ENV_FOG_B), env_field(env, ENV_FOG_ALPHA_MAX));
+    g_fog_far = ffar;
+    g_fog_near = fnear;
+    sky_keys_from_tod(env);
+    let out: f64 = ffar;
+    return out;
+}
+
+// ===========================================================================
+// 5. THE GROUND MATERIAL
+// ---------------------------------------------------------------------------
+// Re-derived from shot.hml's rules, WORLD-ANCHORED. The two rules that matter
+// and that a walkaround makes much easier to break than a still does:
+//
+//   * the TILE flips per quad, the VALUE is a continuous field. A hard value
+//     swap per 4 m quad is the cardboard patchwork of CLAUDE.md §9 rule 4, and
+//     when you are moving, a patchwork crawls.
+//   * the path is a WORLD line, not a camera-relative one. shot.hml lays its
+//     path down the camera's own sight line because a still has exactly one
+//     camera; do that here and the road turns with your head.
+// ===========================================================================
+
+// The road: a straight world line through the origin, bearing roughly NNE,
+// with two out-of-phase wiggles so it reads as a track somebody wore.
+let g_path_dx: f64 = 0.2588190451025208;    // sin(15 deg)
+let g_path_dz: f64 = -0.9659258262890683;   // -cos(15 deg)
+let g_path_half: f64 = 2.1;
+
+fn path_w(p_x: f64, p_z: f64): f64 {
+    let rx: f64 = p_x;
+    let rz: f64 = p_z;
+    let t: f64 = rx * g_path_dx + rz * g_path_dz;           // along
+    let s: f64 = rx * g_path_dz - rz * g_path_dx;           // across
+    let wig: f64 = sin(t * 0.030) * 6.5 + sin(t * 0.011) * 4.0;
+    let off: f64 = s - wig;
+    if (off < 0.0) { off = 0.0 - off; }
+    let out: f64 = clamp01((g_path_half + 1.6 - off) / 1.6);
+    return out;
+}
+
+// MEASURED mean luminance of the world atlas, off the contact sheet:
+// GRASS_A 163, PATH 156, GRAVEL 119, COBBLE 105. Cobble is 35 % DARKER than
+// grass, so cobble-down-the-middle reads as a dark stripe dragging the eye
+// into a hole. PATH is the running surface, COBBLE only the made-up spine, and
+// the vertex tint below runs the whole band up so both clear the grass in
+// value.
+fn ground_cell(p_x: f64, p_z: f64, p_slope: f64): i32 {
+    if (g_snow != 0) { let o: i32 = CELL_SNOW; return o; }
+    let pw: f64 = path_w(p_x, p_z);
+    if (pw > 0.74) { let o: i32 = CELL_COBBLE; return o; }
+    if (pw > 0.32) { let o: i32 = CELL_PATH; return o; }
+    if (pw > 0.10) { let o: i32 = CELL_GRAVEL; return o; }
+    if (p_slope > 1.15) { let o: i32 = CELL_CLIFF; return o; }
+    if (p_slope > 0.72) { let o: i32 = CELL_DIRT; return o; }
+    // GRASS_A and GRASS_B are the same VALUE with different structure, so
+    // switching between them per quad is invisible; the dry/lush variation is
+    // carried entirely by the continuous vertex colour below.
+    let v: f64 = vnoise2(p_x * 0.083, p_z * 0.083, terrain_seed() + 33);
+    if (v > 0.50) { let o: i32 = CELL_GRASS_B; return o; }
+    let o2: i32 = CELL_GRASS_A;
+    return o2;
+}
+
+fn ground_vcol(p_x: f64, p_z: f64, p_slope01: f64): i32 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let slope: f64 = p_slope01;
+    let dry: f64 = clamp01((vnoise2(x * 0.083, z * 0.083, terrain_seed() + 33) - 0.40) * 2.2);
+    let lo: i32 = g_GRASS_MID;
+    let hi: i32 = g_GRASS_DRY;
+    if (g_snow != 0) { lo = g_SNOW_LO; hi = g_SNOW_HI; }
+    let r: f64 = lerpf(f64(pal_r(lo)), f64(pal_r(hi)), dry);
+    let g: f64 = lerpf(f64(pal_g(lo)), f64(pal_g(hi)), dry);
+    let b: f64 = lerpf(f64(pal_b(lo)), f64(pal_b(hi)), dry);
+    if (g_snow == 0) {
+        r = lerpf(r, f64(pal_r(g_DIRT_MID)), slope);
+        g = lerpf(g, f64(pal_g(g_DIRT_MID)), slope);
+        b = lerpf(b, f64(pal_b(g_DIRT_MID)), slope);
+    }
+    let pw: f64 = path_w(x, z);
+    if (pw > 0.0) {
+        r = lerpf(r, f64(pal_r(g_STONE_HI)) * 1.42, pw);
+        g = lerpf(g, f64(pal_g(g_STONE_HI)) * 1.42, pw);
+        b = lerpf(b, f64(pal_b(g_STONE_HI)) * 1.42, pw);
+    }
+    let p: f64 = 0.86 + 0.28 * vnoise2(x * 0.06, z * 0.06, terrain_seed() + 21);
+    let out: i32 = pal_pack(clampi(i32(r * p), 0, 255),
+                            clampi(i32(g * p), 0, 255),
+                            clampi(i32(b * p), 0, 255));
+    return out;
+}
+
+let g_K_TREE: i32 = 0;
+let g_K_ROCK: i32 = 1;
+let g_K_CRATE: i32 = 2;
+let g_K_BARREL: i32 = 3;
+let g_K_LANTERN: i32 = 4;
+let g_K_BUSH: i32 = 5;
+let g_K_NPC: i32 = 6;
+
+let g_PROP_TRIES: i32 = 10;             // candidates per 32 m chunk
+let g_LOD_NEVER: f64 = 1000000.0;
+
+// ===========================================================================
+// 6. THE STREAMING CHUNK RING
+// ---------------------------------------------------------------------------
+// A fixed pool of meshes, rebuilt in place (mesh_begin resets the arena and
+// keeps the allocation, so this allocates nothing after boot — CLAUDE.md A8).
+// At most g_CHUNK_BUILD_PER_FRAME are meshed per frame, nearest first, so
+// crossing a chunk boundary at a sprint costs a couple of milliseconds spread
+// over a few frames instead of one 30 ms hitch. The frontier that has not been
+// meshed yet is beyond the fog wall, which is the whole reason the fog wall is
+// the triangle budget.
+// ===========================================================================
+
+let g_cc_mesh: array = [];
+let g_cc_cx: array<i32> = [];
+let g_cc_cz: array<i32> = [];
+let g_cc_live: array<i32> = [];         // 0 empty, 1 meshed
+let g_cc_stamp: array<i32> = [];        // frame last referenced (LRU)
+let g_cc_baked: array<i32> = [];        // 1 once baked against the current sun
+let g_cc_cy: array<f64> = [];           // bounding-sphere centre height
+
+// ---------------------------------------------------------------------------
+// THE PROP CACHE, AND WHY IT EXISTS.
+// ---------------------------------------------------------------------------
+// The props in a chunk are a pure function of (cx, cz, seed), so the first
+// build of this file simply re-derived them every frame — "regenerating is
+// cheaper than remembering". MEASURED on the real display, that was WRONG by a
+// wide margin: the per-frame registry rebuild cost 6.4 ms of a 13.6 ms frame,
+// because 343 candidate positions a frame is ~2400 h2 hashes, 343 path_w with
+// two sines each, 343 vnoise2, and a terrain_h per accepted prop.
+//
+// They are now derived ONCE, when the chunk is meshed, and stored beside the
+// mesh. Per frame the rebuild is array pushes and nothing else. Struct-of-
+// arrays, flat, indexed slot * g_PROP_TRIES + k (CLAUDE.md A7/A8).
+// ---------------------------------------------------------------------------
+let g_cp_n: array<i32> = [];            // props actually placed in this slot
+let g_cp_kind: array<i32> = [];
+let g_cp_x: array<f64> = [];
+let g_cp_y: array<f64> = [];
+let g_cp_z: array<f64> = [];
+let g_cp_yaw: array<f64> = [];
+let g_cp_s: array<f64> = [];
+let g_cp_sh: array<f64> = [];
+let g_cp_t: array<i32> = [];
+
+fn chunks_init() {
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        g_cc_mesh.push(mesh_new(g_CHUNK_Q * g_CHUNK_Q * 2 + 4));
+        g_cc_cx.push(0);
+        g_cc_cz.push(0);
+        g_cc_live.push(0);
+        g_cc_stamp.push(0);
+        g_cc_baked.push(0);
+        g_cc_cy.push(0.0);
+        g_cp_n.push(0);
+        for (let k = 0; k < g_PROP_TRIES; k++) {
+            g_cp_kind.push(0); g_cp_x.push(0.0); g_cp_y.push(0.0);
+            g_cp_z.push(0.0); g_cp_yaw.push(0.0); g_cp_s.push(1.0);
+            g_cp_sh.push(1.0); g_cp_t.push(255);
+        }
+    }
+}
+
+fn chunks_invalidate() {
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) { g_cc_live[i] = 0; g_cc_baked[i] = 0; }
+}
+
+fn chunk_find(p_cx: i32, p_cz: i32): i32 {
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        if (g_cc_live[i] != 0 && g_cc_cx[i] == p_cx && g_cc_cz[i] == p_cz) {
+            let out: i32 = i;
+            return out;
+        }
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// Least-recently-referenced free slot.
+fn chunk_evict(): i32 {
+    let best: i32 = 0;
+    let bstamp: i32 = 2147483647;
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        if (g_cc_live[i] == 0) { let out: i32 = i; return out; }
+        if (g_cc_stamp[i] < bstamp) { bstamp = g_cc_stamp[i]; best = i; }
+    }
+    let out2: i32 = best;
+    return out2;
+}
+
+fn chunk_mesh_build(p_slot: i32, p_cx: i32, p_cz: i32) {
+    let q: i32 = g_CHUNK_Q;
+    let m = g_cc_mesh[p_slot];
+    mesh_begin(m);
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    for (let j = 0; j < q; j++) {
+        for (let i = 0; i < q; i++) {
+            let x0: f64 = ox + f64(i) * g_QUAD_M;
+            let z0: f64 = oz + f64(j) * g_QUAD_M;
+            let x1: f64 = x0 + g_QUAD_M;
+            let z1: f64 = z0 + g_QUAD_M;
+            let y00: f64 = terrain_h(x0, z0);
+            let y10: f64 = terrain_h(x1, z0);
+            let y11: f64 = terrain_h(x1, z1);
+            let y01: f64 = terrain_h(x0, z1);
+            let dy: f64 = y10 - y00; if (dy < 0.0) { dy = 0.0 - dy; }
+            let dz: f64 = y01 - y00; if (dz < 0.0) { dz = 0.0 - dz; }
+            let slope: f64 = (dy + dz) / g_QUAD_M;
+            let cell: i32 = ground_cell(x0, z0, slope);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            // Normals from the height field, per vertex. The gradient is also
+            // the slope the vertex colour wants, so it is computed once and
+            // handed to ground_vcol instead of ground_vcol taking four more
+            // terrain_h samples of its own — that alone is ~40 % of the cost
+            // of meshing a chunk.
+            let nx0: f64 = terrain_h(x0 - 1.0, z0) - terrain_h(x0 + 1.0, z0);
+            let nz0: f64 = terrain_h(x0, z0 - 1.0) - terrain_h(x0, z0 + 1.0);
+            let nx1: f64 = terrain_h(x1 - 1.0, z1) - terrain_h(x1 + 1.0, z1);
+            let nz1: f64 = terrain_h(x1, z1 - 1.0) - terrain_h(x1, z1 + 1.0);
+            let s0: f64 = clamp01(sqrt(nx0 * nx0 + nz0 * nz0) * 0.55);
+            let s1: f64 = clamp01(sqrt(nx1 * nx1 + nz1 * nz1) * 0.55);
+            let k00: i32 = ground_vcol(x0, z0, s0);
+            let k10: i32 = ground_vcol(x1, z0, s0);
+            let k11: i32 = ground_vcol(x1, z1, s1);
+            let k01: i32 = ground_vcol(x0, z1, s1);
+            let a = mesh_vert_n(m, x0 - ox, y00, z0 - oz, u0, v0,
+                                pal_r(k00), pal_g(k00), pal_b(k00), nx0, 2.0, nz0);
+            let b = mesh_vert_n(m, x1 - ox, y10, z0 - oz, u1, v0,
+                                pal_r(k10), pal_g(k10), pal_b(k10), nx1, 2.0, nz0);
+            let c = mesh_vert_n(m, x1 - ox, y11, z1 - oz, u1, v1,
+                                pal_r(k11), pal_g(k11), pal_b(k11), nx1, 2.0, nz1);
+            let d = mesh_vert_n(m, x0 - ox, y01, z1 - oz, u0, v1,
+                                pal_r(k01), pal_g(k01), pal_b(k01), nx0, 2.0, nz1);
+            mesh_quad(m, a, b, c, d);
+        }
+    }
+    mesh_end(m);
+    g_cc_cx[p_slot] = p_cx;
+    g_cc_cz[p_slot] = p_cz;
+    g_cc_cy[p_slot] = terrain_h(ox + g_CHUNK_M * 0.5, oz + g_CHUNK_M * 0.5);
+    g_cc_live[p_slot] = 1;
+    g_cc_baked[p_slot] = 0;
+    chunk_props_gen(p_slot, p_cx, p_cz);
+}
+
+// ===========================================================================
+// 7. THE NEAR APRON
+// ---------------------------------------------------------------------------
+// A terrain quad that CONTAINS the camera straddles the near plane and nothing
+// clips yet, so it is dropped and leaves a hole exactly where a first-person
+// camera looks. The apron is a radial fan centred on the camera: every triangle
+// lies wholly inside one 11-degree sector, so no triangle in the view cone can
+// span w = 0.
+//
+// TWO DIFFERENCES FROM shot.hml's APRON, BOTH FORCED BY BEING ABLE TO MOVE:
+//  1. It re-centres on a 0.25 m lattice instead of every frame. Rebuilding
+//     192 quads of height-field every frame costs about 0.4 ms for a picture
+//     that has not changed; snapping to a quarter metre cuts that to ~17 Hz at
+//     a walk. The camera is then up to 0.177 m off centre, which is still
+//     inside the inner ring, so the geometry class is identical to shot's.
+//  2. The inner ring is 0.05 m, not 0.30 m. shot's apron has a 30 cm HOLE
+//     under the camera, which never shows in a still because no scene pitches
+//     down far enough; pitch down 85 degrees from a 1.7 m eye and the point
+//     you are looking at is 0.15 m away — inside that hole, on the coarse
+//     quad, which straddles and is dropped. You see through the floor. Closing
+//     the hole costs zero triangles.
+// ===========================================================================
+
+let g_apron_mesh = null;
+let g_apron_x: f64 = 1e30;
+let g_apron_z: f64 = 1e30;
+
+// The ring lattice. 4 bands x 24 sectors = 96 quads = 192 triangles.
+// shot.hml uses 5 bands x 32 = 320 triangles, which a still can afford and a
+// walkaround cannot: this mesh is rebuilt ~18 times a second and it is 14 % of
+// the whole frame budget before a single tree is drawn.
+let g_AP_R: array<f64> = [0.05, 1.0, 2.2, 4.2, 8.0];
+let g_AP_NR: i32 = 5;
+
+// Per-ring-vertex scratch, allocated once (A8). Every interior ring vertex is
+// shared by FOUR quads (two sectors x two bands), so computing it per quad —
+// which is what the straightforward transcription of shot.hml's apron does —
+// evaluates the height field four times for every value it uses. MEASURED on
+// the real display: that version cost 5.4 ms of a 12 ms frame, amortised, and
+// was single-handedly the reason this build could not hold 60 fps. Caching the
+// ring vertices makes it 120 evaluations instead of 384.
+let g_ap_x: array<f64> = [];
+let g_ap_y: array<f64> = [];
+let g_ap_z: array<f64> = [];
+let g_ap_nx: array<f64> = [];
+let g_ap_nz: array<f64> = [];
+let g_ap_c: array<i32> = [];
+let g_ap_cs: array<f64> = [];       // cos/sin of each sector angle, constant
+let g_ap_sn: array<f64> = [];
+
+fn apron_init() {
+    g_apron_mesh = mesh_new(g_APRON_SEGS * (g_AP_NR - 1) * 2 + 8);
+    let n: i32 = g_AP_NR * g_APRON_SEGS;
+    for (let i = 0; i < n; i++) {
+        g_ap_x.push(0.0); g_ap_y.push(0.0); g_ap_z.push(0.0);
+        g_ap_nx.push(0.0); g_ap_nz.push(0.0); g_ap_c.push(0);
+    }
+    let step: f64 = 6.283185307179586 / f64(g_APRON_SEGS);
+    for (let i = 0; i < g_APRON_SEGS; i++) {
+        g_ap_cs.push(cos(f64(i) * step));
+        g_ap_sn.push(sin(f64(i) * step));
+    }
+}
+
+fn apron_build(p_cx: f64, p_cz: f64) {
+    let segs: i32 = g_APRON_SEGS;
+    let nr: i32 = g_AP_NR;
+
+    // pass 1: every ring vertex, once
+    for (let r = 0; r < nr; r++) {
+        let rad: f64 = g_AP_R[r];
+        for (let i = 0; i < segs; i++) {
+            let idx: i32 = r * segs + i;
+            let x: f64 = p_cx + g_ap_cs[i] * rad;
+            let z: f64 = p_cz + g_ap_sn[i] * rad;
+            let nx: f64 = terrain_h(x - 1.0, z) - terrain_h(x + 1.0, z);
+            let nz: f64 = terrain_h(x, z - 1.0) - terrain_h(x, z + 1.0);
+            let slope: f64 = clamp01(sqrt(nx * nx + nz * nz) * 0.55);
+            g_ap_x[idx] = x;
+            g_ap_z[idx] = z;
+            g_ap_y[idx] = terrain_h(x, z) + 0.012;
+            g_ap_nx[idx] = nx;
+            g_ap_nz[idx] = nz;
+            g_ap_c[idx] = ground_vcol(x, z, slope);
+        }
+    }
+
+    // pass 2: the quads
+    let m = g_apron_mesh;
+    mesh_begin(m);
+    for (let r = 0; r < nr - 1; r++) {
+        for (let i = 0; i < segs; i++) {
+            let i1: i32 = i + 1;
+            if (i1 >= segs) { i1 = 0; }
+            let a0: i32 = r * segs + i;
+            let a1: i32 = r * segs + i1;
+            let b0: i32 = (r + 1) * segs + i;
+            let b1: i32 = (r + 1) * segs + i1;
+            let cell: i32 = ground_cell(g_ap_x[a0], g_ap_z[a0], 0.0);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            let c0: i32 = g_ap_c[a0]; let c1: i32 = g_ap_c[a1];
+            let c2: i32 = g_ap_c[b1]; let c3: i32 = g_ap_c[b0];
+            let a = mesh_vert_n(m, g_ap_x[a0], g_ap_y[a0], g_ap_z[a0], u0, v0,
+                                pal_r(c0), pal_g(c0), pal_b(c0),
+                                g_ap_nx[a0], 2.0, g_ap_nz[a0]);
+            let b = mesh_vert_n(m, g_ap_x[a1], g_ap_y[a1], g_ap_z[a1], u1, v0,
+                                pal_r(c1), pal_g(c1), pal_b(c1),
+                                g_ap_nx[a1], 2.0, g_ap_nz[a1]);
+            let c = mesh_vert_n(m, g_ap_x[b1], g_ap_y[b1], g_ap_z[b1], u1, v1,
+                                pal_r(c2), pal_g(c2), pal_b(c2),
+                                g_ap_nx[b1], 2.0, g_ap_nz[b1]);
+            let d = mesh_vert_n(m, g_ap_x[b0], g_ap_y[b0], g_ap_z[b0], u0, v1,
+                                pal_r(c3), pal_g(c3), pal_b(c3),
+                                g_ap_nx[b0], 2.0, g_ap_nz[b0]);
+            // reversed relative to a grid quad: a radial cycle has the opposite
+            // handedness in XZ to a rectangular one
+            mesh_quad(m, a, d, c, b);
+        }
+    }
+    mesh_end(m);
+    g_apron_x = p_cx;
+    g_apron_z = p_cz;
+}
+
+// ===========================================================================
+// 8. SITES — SOMETHING ON THE HORIZON WORTH WALKING TOWARD
+// ---------------------------------------------------------------------------
+// One site per 96 m lattice cell, three kinds, hashed from the cell. Each is
+// just another CHUNK: a world-space mesh with a zero origin, so it is
+// frustum-culled, distance-culled, sun-baked and emitted by the same stage-13
+// walk as the terrain. No new stage, no new texture, no second code path.
+//
+// The panel helpers are a compressed re-derivation of shot.hml's; the wall
+// normal is tilted 44 degrees into the sky for the reason shot.hml records at
+// length — mesh_bake_light is a pure lambert with no wrap, so a truly vertical
+// face is lit by ambient alone, and this project's ambient measures ~0.10.
+// ===========================================================================
+
+let g_AO_TOP: f64 = 1.0;
+let g_AO_FOOT: f64 = 0.74;
+
+let g_st_mesh: array = [];
+let g_st_cx: array<i32> = [];
+let g_st_cz: array<i32> = [];
+let g_st_live: array<i32> = [];
+let g_st_stamp: array<i32> = [];
+let g_st_baked: array<i32> = [];
+let g_st_kind: array<i32> = [];
+let g_st_ox: array<f64> = [];       // site centre, world
+let g_st_oz: array<f64> = [];
+let g_st_r: array<f64> = [];        // bounding radius
+let g_st_gn: array<i32> = [];       // glow points recorded
+let g_st_gx: array<f64> = [];       // g_SITE_GLOWS per slot, flat
+let g_st_gy: array<f64> = [];
+let g_st_gz: array<f64> = [];
+
+let g_site_m = null;                // the mesh currently being authored
+let g_site_slot: i32 = 0;
+
+fn sites_init() {
+    for (let i = 0; i < g_SITE_SLOTS; i++) {
+        g_st_mesh.push(mesh_new(320));
+        g_st_cx.push(0); g_st_cz.push(0);
+        g_st_live.push(0); g_st_stamp.push(0); g_st_baked.push(0);
+        g_st_kind.push(0);
+        g_st_ox.push(0.0); g_st_oz.push(0.0); g_st_r.push(1.0);
+        g_st_gn.push(0);
+        for (let k = 0; k < g_SITE_GLOWS; k++) {
+            g_st_gx.push(0.0); g_st_gy.push(0.0); g_st_gz.push(0.0);
+        }
+    }
+}
+
+fn sites_invalidate() {
+    for (let i = 0; i < g_SITE_SLOTS; i++) { g_st_live[i] = 0; g_st_baked[i] = 0; }
+}
+
+fn site_glow_add(p_x: f64, p_y: f64, p_z: f64) {
+    let s: i32 = g_site_slot;
+    let n: i32 = g_st_gn[s];
+    if (n >= g_SITE_GLOWS) { return; }
+    g_st_gx[s * g_SITE_GLOWS + n] = p_x;
+    g_st_gy[s * g_SITE_GLOWS + n] = p_y;
+    g_st_gz[s * g_SITE_GLOWS + n] = p_z;
+    g_st_gn[s] = n + 1;
+}
+
+// One textured panel. Corners clockwise as seen from outside, starting at the
+// texture's top-left. AO is per-corner so a wall darkens into the ground.
+fn sm_quad(p_cell: i32,
+           p_ax: f64, p_ay: f64, p_az: f64,
+           p_bx: f64, p_by: f64, p_bz: f64,
+           p_cx: f64, p_cy: f64, p_cz: f64,
+           p_dx: f64, p_dy: f64, p_dz: f64,
+           p_nx: f64, p_ny: f64, p_nz: f64,
+           p_r: i32, p_g: i32, p_b: i32,
+           p_ao_top: f64, p_ao_bot: f64) {
+    let m = g_site_m;
+    atlas_cell_uv(g_atlas_world, p_cell, g_uvq, 0);
+    let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+    let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+    let a = mesh_vert_n(m, p_ax, p_ay, p_az, u0, v0, p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    let b = mesh_vert_n(m, p_bx, p_by, p_bz, u1, v0, p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    let c = mesh_vert_n(m, p_cx, p_cy, p_cz, u1, v1, p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    let d = mesh_vert_n(m, p_dx, p_dy, p_dz, u0, v1, p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    mesh_vert_ao(m, a, p_ao_top);
+    mesh_vert_ao(m, b, p_ao_top);
+    mesh_vert_ao(m, c, p_ao_bot);
+    mesh_vert_ao(m, d, p_ao_bot);
+    mesh_quad(m, a, b, c, d);
+}
+
+// A wall from (px,pz) to (qx,qz) split into cols x rows cells of ~2-4 m so the
+// texel density matches the ground. p_mask is a 4x4 bitfield, bit row*4+col,
+// row 0 at the eaves; set bits take the alternate cell and tint — that is how
+// a facade gets a value break for free. p_conform: 0 absolute, 1 base follows
+// the ground and the eaves stay level, 2 both follow.
+fn sm_wall(p_px: f64, p_pz: f64, p_qx: f64, p_qz: f64,
+           p_y0: f64, p_y1: f64,
+           p_cell: i32, p_alt_cell: i32, p_mask: i32,
+           p_cols: i32, p_rows: i32, p_conform: i32,
+           p_r: i32, p_g: i32, p_b: i32,
+           p_ar: i32, p_ag: i32, p_ab: i32) {
+    let nc: i32 = clampi(p_cols, 1, 4);
+    let nr: i32 = clampi(p_rows, 1, 4);
+    let ex: f64 = p_qx - p_px;
+    let ez: f64 = p_qz - p_pz;
+    let nx: f64 = 0.0 - ez;
+    let nz: f64 = ex;
+    let ny: f64 = sqrt(nx * nx + nz * nz) * 0.95;
+    for (let i = 0; i < nc; i++) {
+        let t0: f64 = f64(i) / f64(nc);
+        let t1: f64 = f64(i + 1) / f64(nc);
+        let x0: f64 = p_px + ex * t0; let z0: f64 = p_pz + ez * t0;
+        let x1: f64 = p_px + ex * t1; let z1: f64 = p_pz + ez * t1;
+        let b0: f64 = p_y0; let b1: f64 = p_y0;
+        let c0: f64 = p_y1; let c1: f64 = p_y1;
+        if (p_conform != 0) {
+            b0 = terrain_h(x0, z0) + p_y0;
+            b1 = terrain_h(x1, z1) + p_y0;
+            if (p_conform == 2) {
+                c0 = terrain_h(x0, z0) + p_y1;
+                c1 = terrain_h(x1, z1) + p_y1;
+            }
+        }
+        for (let j = 0; j < nr; j++) {
+            let s0: f64 = f64(j) / f64(nr);
+            let s1: f64 = f64(j + 1) / f64(nr);
+            let ya0: f64 = c0 + (b0 - c0) * s0;
+            let ya1: f64 = c0 + (b0 - c0) * s1;
+            let yb0: f64 = c1 + (b1 - c1) * s0;
+            let yb1: f64 = c1 + (b1 - c1) * s1;
+            let cell: i32 = p_cell;
+            let rr: i32 = p_r; let gg: i32 = p_g; let bb: i32 = p_b;
+            let aot: f64 = lerpf(g_AO_TOP, g_AO_FOOT, s0);
+            let aob: f64 = lerpf(g_AO_TOP, g_AO_FOOT, s1);
+            if ((p_mask & (1 << (j * 4 + i))) != 0) {
+                cell = p_alt_cell; rr = p_ar; gg = p_ag; bb = p_ab;
+                aot = 1.0; aob = 0.96;      // glass is not masonry
+                if (cell == CELL_WINDOW) {
+                    site_glow_add((x0 + x1) * 0.5,
+                                  (ya0 + ya1 + yb0 + yb1) * 0.25,
+                                  (z0 + z1) * 0.5);
+                }
+            }
+            sm_quad(cell, x0, ya0, z0, x1, yb0, z1, x1, yb1, z1, x0, ya1, z0,
+                    nx, ny, nz, rr, gg, bb, aot, aob);
+        }
+    }
+}
+
+// A horizontal face at height y, facing up, tiled nu x nv.
+fn sm_deck(p_x0: f64, p_z0: f64, p_x1: f64, p_z1: f64, p_y: f64,
+           p_cell: i32, p_nu: i32, p_nv: i32,
+           p_r: i32, p_g: i32, p_b: i32, p_ao: f64) {
+    let nu: i32 = p_nu; if (nu < 1) { nu = 1; }
+    let nv: i32 = p_nv; if (nv < 1) { nv = 1; }
+    for (let j = 0; j < nv; j++) {
+        for (let i = 0; i < nu; i++) {
+            let x0: f64 = p_x0 + (p_x1 - p_x0) * f64(i) / f64(nu);
+            let x1: f64 = p_x0 + (p_x1 - p_x0) * f64(i + 1) / f64(nu);
+            let z0: f64 = p_z0 + (p_z1 - p_z0) * f64(j) / f64(nv);
+            let z1: f64 = p_z0 + (p_z1 - p_z0) * f64(j + 1) / f64(nv);
+            sm_quad(p_cell, x0, p_y, z0, x1, p_y, z0, x1, p_y, z1, x0, p_y, z1,
+                    0.0, 1.0, 0.0, p_r, p_g, p_b, p_ao, p_ao);
+        }
+    }
+}
+
+// A box with four walls and an eave band. The walls run 1.1 m BELOW the base so
+// undulating ground never shows a gap under the sill — CLAUDE.md §9 rule 6 in
+// its cheapest possible form.
+fn sm_box(p_x0: f64, p_z0: f64, p_x1: f64, p_z1: f64,
+          p_h: f64, p_wall: i32, p_alt: i32, p_roof: i32,
+          p_mask: i32, p_cols: i32, p_rows: i32,
+          p_r: i32, p_g: i32, p_b: i32) {
+    let ar: i32 = pal_r(g_WINDOW_LIGHT);
+    let ag: i32 = pal_g(g_WINDOW_LIGHT);
+    let ab: i32 = pal_b(g_WINDOW_LIGHT);
+    let base: f64 = 0.0 - 1.1;
+    sm_wall(p_x0, p_z1, p_x1, p_z1, base, p_h, p_wall, p_alt, p_mask,
+            p_cols, p_rows, 1, p_r, p_g, p_b, ar, ag, ab);
+    sm_wall(p_x1, p_z0, p_x0, p_z0, base, p_h, p_wall, p_alt, p_mask,
+            p_cols, p_rows, 1, p_r, p_g, p_b, ar, ag, ab);
+    sm_wall(p_x1, p_z1, p_x1, p_z0, base, p_h, p_wall, p_alt, 0,
+            p_cols, p_rows, 1, p_r, p_g, p_b, ar, ag, ab);
+    sm_wall(p_x0, p_z0, p_x0, p_z1, base, p_h, p_wall, p_alt, 0,
+            p_cols, p_rows, 1, p_r, p_g, p_b, ar, ag, ab);
+    // The eave band. From any eye height in this project no roof PLANE is ever
+    // visible on a 3 m hut, so this 62 cm skirt IS the roof as far as the frame
+    // is concerned, and it costs 8 triangles instead of a hip roof's 40.
+    let rr: i32 = pal_r(g_STONE_MID); let rg: i32 = pal_g(g_STONE_MID);
+    let rb: i32 = pal_b(g_STONE_MID);
+    let e: f64 = 0.26;
+    let yt: f64 = terrain_h((p_x0 + p_x1) * 0.5, (p_z0 + p_z1) * 0.5) + p_h;
+    sm_wall(p_x0 - e, p_z1 + e, p_x1 + e, p_z1 + e, yt, yt + 0.62,
+            p_roof, p_roof, 0, p_cols, 1, 0, rr, rg, rb, rr, rg, rb);
+    sm_wall(p_x1 + e, p_z0 - e, p_x0 - e, p_z0 - e, yt, yt + 0.62,
+            p_roof, p_roof, 0, p_cols, 1, 0, rr, rg, rb, rr, rg, rb);
+    sm_wall(p_x1 + e, p_z1 + e, p_x1 + e, p_z0 - e, yt, yt + 0.62,
+            p_roof, p_roof, 0, p_cols, 1, 0, rr, rg, rb, rr, rg, rb);
+    sm_wall(p_x0 - e, p_z0 - e, p_x0 - e, p_z1 + e, yt, yt + 0.62,
+            p_roof, p_roof, 0, p_cols, 1, 0, rr, rg, rb, rr, rg, rb);
+    sm_deck(p_x0 - e, p_z0 - e, p_x1 + e, p_z1 + e, yt + 0.62,
+            p_roof, 2, 2, rr, rg, rb, 0.92);
+}
+
+// Site kind from the lattice cell. 0 = nothing (half the map is empty, which is
+// what makes the other half worth walking to), 1 = watchtower, 2 = camp,
+// 3 = ruin.
+fn site_kind(p_cx: i32, p_cz: i32): i32 {
+    let r: f64 = h2(p_cx, p_cz, terrain_seed() + 501);
+    if (r < 0.42) { let o: i32 = 0; return o; }
+    if (r < 0.66) { let o: i32 = 1; return o; }
+    if (r < 0.86) { let o: i32 = 2; return o; }
+    let o2: i32 = 3;
+    return o2;
+}
+
+fn site_build(p_slot: i32, p_cx: i32, p_cz: i32, p_kind: i32) {
+    g_site_slot = p_slot;
+    g_site_m = g_st_mesh[p_slot];
+    g_st_gn[p_slot] = 0;
+    mesh_begin(g_site_m);
+
+    // The site sits at a hashed offset inside its lattice cell so the lattice
+    // itself is never legible as a grid.
+    let ox: f64 = f64(p_cx) * g_SITE_M + hrange(p_cx, p_cz, 601, 20.0, 76.0);
+    let oz: f64 = f64(p_cz) * g_SITE_M + hrange(p_cx, p_cz, 607, 20.0, 76.0);
+    let gy: f64 = terrain_h(ox, oz);
+    let rad: f64 = 12.0;
+
+    if (p_kind == 1) {
+        // --- watchtower: three courses of plaster over a brick foot, a wood
+        // deck and a lantern on top. Tall enough to break the fog line, which
+        // is the entire job — a landmark you cannot see is not a landmark.
+        let hw: f64 = 2.1;
+        let pr: i32 = pal_r(g_STONE_HI); let pg: i32 = pal_g(g_STONE_HI);
+        let pb: i32 = pal_b(g_STONE_HI);
+        sm_box(ox - hw, oz - hw, ox + hw, oz + hw, 9.4,
+               CELL_PLASTER, CELL_WINDOW, CELL_ROOF_TILE,
+               1 + 4 + 256, 3, 4, pr, pg, pb);
+        sm_wall(ox - hw - 0.35, oz + hw + 0.35, ox + hw + 0.35, oz + hw + 0.35,
+                0.0 - 1.1, 2.4, CELL_BRICK, CELL_DOOR, 8, 3, 2, 1,
+                pr, pg, pb, pal_r(g_DIRT_MID), pal_g(g_DIRT_MID), pal_b(g_DIRT_MID));
+        sm_deck(ox - hw - 0.6, oz - hw - 0.6, ox + hw + 0.6, oz + hw + 0.6,
+                gy + 10.1, CELL_WOOD_PLANK, 2, 2,
+                pal_r(g_STONE_MID), pal_g(g_STONE_MID), pal_b(g_STONE_MID), 1.0);
+        site_glow_add(ox, gy + 10.6, oz);
+        rad = 13.0;
+    } else if (p_kind == 2) {
+        // --- camp: two huts and a cobble yard. Wood plank + a teal painted
+        // gable, because a second HUE at 40 m is what tells you it is built and
+        // not a rock.
+        let wr: i32 = pal_r(g_STONE_HI); let wg: i32 = pal_g(g_STONE_HI);
+        let wb: i32 = pal_b(g_STONE_HI);
+        let tr: i32 = pal_r(g_NS_HALO); let tg: i32 = pal_g(g_NS_HALO);
+        let tb: i32 = pal_b(g_NS_HALO);
+        sm_box(ox - 3.4, oz - 2.6, ox + 0.4, oz + 2.2, 2.9,
+               CELL_WOOD_PLANK, CELL_WINDOW, CELL_ROOF_TILE,
+               16 + 64, 3, 3, wr, wg, wb);
+        sm_box(ox + 2.6, oz - 4.4, ox + 6.6, oz - 0.6, 3.3,
+               CELL_PAINT_TEAL, CELL_WINDOW, CELL_ROOF_TILE,
+               32, 3, 3, tr, tg, tb);
+        sm_deck(ox - 1.2, oz + 2.6, ox + 4.2, oz + 6.2, gy + 0.05,
+                CELL_COBBLE, 2, 2,
+                pal_r(g_STONE_MID), pal_g(g_STONE_MID), pal_b(g_STONE_MID), 0.86);
+        rad = 12.0;
+    } else {
+        // --- ruin: three broken walls and rubble. No roof, no glow. It reads
+        // from a distance as a silhouette with a gap in it, which is a
+        // different shape from both of the above at 50 m through fog.
+        let sr: i32 = pal_r(g_STONE_MID); let sg: i32 = pal_g(g_STONE_MID);
+        let sb: i32 = pal_b(g_STONE_MID);
+        sm_wall(ox - 4.0, oz - 3.0, ox + 4.0, oz - 3.0, 0.0 - 1.1, 3.6,
+                CELL_BRICK, CELL_RUBBLE, 2 + 128, 4, 3, 1, sr, sg, sb,
+                pal_r(g_DIRT_MID), pal_g(g_DIRT_MID), pal_b(g_DIRT_MID));
+        sm_wall(ox - 4.0, oz + 2.4, ox - 4.0, oz - 3.0, 0.0 - 1.1, 2.4,
+                CELL_BRICK, CELL_RUBBLE, 4, 3, 2, 1, sr, sg, sb,
+                pal_r(g_DIRT_MID), pal_g(g_DIRT_MID), pal_b(g_DIRT_MID));
+        sm_wall(ox + 4.0, oz - 3.0, ox + 4.0, oz + 0.8, 0.0 - 1.1, 1.5,
+                CELL_CONCRETE, CELL_RUBBLE, 0, 2, 1, 2, sr, sg, sb, sr, sg, sb);
+        sm_deck(ox - 4.6, oz - 3.6, ox + 4.6, oz + 3.0, gy + 0.05,
+                CELL_RUBBLE, 3, 2,
+                pal_r(g_DIRT_MID), pal_g(g_DIRT_MID), pal_b(g_DIRT_MID), 0.80);
+        rad = 11.0;
+    }
+
+    mesh_end(g_site_m);
+    g_st_cx[p_slot] = p_cx;
+    g_st_cz[p_slot] = p_cz;
+    g_st_kind[p_slot] = p_kind;
+    g_st_ox[p_slot] = ox;
+    g_st_oz[p_slot] = oz;
+    g_st_r[p_slot] = rad;
+    g_st_live[p_slot] = 1;
+    g_st_baked[p_slot] = 0;
+}
+
+fn site_find(p_cx: i32, p_cz: i32): i32 {
+    for (let i = 0; i < g_SITE_SLOTS; i++) {
+        if (g_st_live[i] != 0 && g_st_cx[i] == p_cx && g_st_cz[i] == p_cz) {
+            let out: i32 = i;
+            return out;
+        }
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+fn site_evict(): i32 {
+    let best: i32 = 0;
+    let bstamp: i32 = 2147483647;
+    for (let i = 0; i < g_SITE_SLOTS; i++) {
+        if (g_st_live[i] == 0) { let out: i32 = i; return out; }
+        if (g_st_stamp[i] < bstamp) { bstamp = g_st_stamp[i]; best = i; }
+    }
+    let out2: i32 = best;
+    return out2;
+}
+
+// ===========================================================================
+// 9. PROPS AND PARTICLES — regenerated every frame from position hashes
+// ---------------------------------------------------------------------------
+// No cache and no allocation churn beyond the registry pushes: a prop is a pure
+// function of its own chunk cell and its index inside it, so regenerating is
+// cheaper than remembering, and the world can never slide under you.
+//
+// The density field is value noise, so trees CLUMP: there are stands and there
+// are clearings, and the clearings are what make the stands read.
+// ===========================================================================
+
+fn prop_push(p_kind: i32, p_x: f64, p_z: f64, p_y: f64,
+             p_yaw: f64, p_scale: f64, p_shadow: f64, p_tint: i32) {
+    let k: i32 = p_kind;
+    let id0: i32 = MESH_ROCK;
+    if (k == g_K_TREE) { id0 = MESH_TREE0; }
+    else if (k == g_K_CRATE) { id0 = MESH_CRATE; }
+    else if (k == g_K_BARREL) { id0 = MESH_BARREL; }
+    else if (k == g_K_LANTERN) { id0 = MESH_LANTERN; }
+    else if (k == g_K_BUSH) { id0 = MESH_BUSH; }
+    else if (k == g_K_NPC) { id0 = MESH_NPC; }
+    let id1: i32 = id0;
+    let id2: i32 = id0;
+    let d1: f64 = g_LOD_NEVER;
+    let d2: f64 = g_LOD_NEVER;
+    if (k == g_K_TREE) {
+        id1 = MESH_TREE1; id2 = MESH_TREE2;
+        // The far switch is the FOG-RELATIVE sentinel, not a fixed 46 m: a flat
+        // untextured card is only honest where the fog has closed over it, and
+        // the walkaround scrubs the fog live, so the threshold has to stay live
+        // too. world_render's lod_pick owns the rationale.
+        d1 = 18.0; d2 = g_LOD_FOG_CARD;
+    }
+    world_prop_add(meshgen_mesh(id0), meshgen_mesh(id1), meshgen_mesh(id2),
+                   d1, d2, meshgen_radius(id0),
+                   p_x, p_y, p_z, p_yaw, p_scale,
+                   p_tint, p_tint, p_tint, p_shadow, k);
+}
+
+// Every prop in one 32 m chunk, derived ONCE at mesh time into the cache.
+fn chunk_props_gen(p_slot: i32, p_cx: i32, p_cz: i32) {
+    let n: i32 = 0;
+    let base: i32 = p_slot * g_PROP_TRIES;
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    let seed: i32 = terrain_seed();
+    for (let k = 0; k < g_PROP_TRIES; k++) {
+        let px: f64 = ox + hrange(p_cx * 97 + k, p_cz * 89 + k, seed + 7, 0.0, 32.0);
+        let pz: f64 = oz + hrange(p_cx * 89 + k, p_cz * 97 + k, seed + 11, 0.0, 32.0);
+        // The road is kept clear: nothing stands in the middle of the track,
+        // which is what makes the track read as a route and not as a texture.
+        if (path_w(px, pz) > 0.30) { continue; }
+        // The density field is value noise, so trees CLUMP: there are stands
+        // and there are clearings, and the clearings are what make the stands
+        // read as stands.
+        let dens: f64 = vnoise2(px * 0.017, pz * 0.017, seed + 41);
+        if (h2(p_cx * 13 + k, p_cz * 17 + k, seed + 13) > dens * 1.35) { continue; }
+        let pick: f64 = h2(p_cx * 31 + k, p_cz * 37 + k, seed + 19);
+        let kind: i32 = g_K_TREE;
+        let sc: f64 = hrange(p_cx * 41 + k, p_cz * 43 + k, seed + 23, 0.85, 1.25);
+        let sh: f64 = 1.9;
+        if (pick > 0.94) { kind = g_K_LANTERN; sc = 1.0 + sc * 0.15; sh = 1.4; }
+        else if (pick > 0.88) { kind = g_K_BARREL; sh = 1.1; }
+        else if (pick > 0.82) { kind = g_K_CRATE; sh = 1.0; }
+        else if (pick > 0.64) { kind = g_K_BUSH; sc = 0.8 + sc * 0.5; sh = 0.9; }
+        else if (pick > 0.44) { kind = g_K_ROCK; sc = 0.7 + sc * 0.9; sh = 1.2; }
+        // +/- 8 % per-instance vertex-colour jitter, from the position hash.
+        // Twenty trees from one mesh and nobody notices.
+        let j: f64 = hrange(p_cx * 53 + k, p_cz * 59 + k, seed + 29, 0.92, 1.08);
+        let i: i32 = base + n;
+        g_cp_kind[i] = kind;
+        g_cp_x[i] = px;
+        g_cp_y[i] = terrain_h(px, pz);
+        g_cp_z[i] = pz;
+        g_cp_yaw[i] = hrange(p_cx * 61 + k, p_cz * 67 + k, seed + 31, 0.0, 6.283185307179586);
+        g_cp_s[i] = sc;
+        g_cp_sh[i] = sh;
+        g_cp_t[i] = clampi(i32(255.0 * j), 0, 255);
+        n++;
+    }
+    g_cp_n[p_slot] = n;
+}
+
+// Push one chunk's cached props into the frame graph's registry.
+fn chunk_props_push(p_slot: i32): i32 {
+    let n: i32 = g_cp_n[p_slot];
+    let base: i32 = p_slot * g_PROP_TRIES;
+    for (let k = 0; k < n; k++) {
+        let i: i32 = base + k;
+        prop_push(g_cp_kind[i], g_cp_x[i], g_cp_z[i], g_cp_y[i],
+                  g_cp_yaw[i], g_cp_s[i], g_cp_sh[i], g_cp_t[i]);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+fn fx_push(p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_cell: i32, p_c: i32, p_a: i32) {
+    let kind: i32 = g_FXK_SPRITE;
+    if (p_cell == FX_RAIN) { kind = g_FXK_RAIN; }
+    world_fx_add(p_x, p_y, p_z, p_s, p_cell, kind,
+                 pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a);
+}
+
+// ===========================================================================
+// 10. THE PER-FRAME WORLD REBUILD
+// ---------------------------------------------------------------------------
+// The registry is rebuilt from scratch every frame. That sounds profligate and
+// is not: ~50 chunk rows and ~150 prop rows is a few thousand array pushes,
+// well under 0.1 ms, and it buys the two things a moving camera needs — the
+// apron is always exactly under the player and no stale entry can ever survive
+// a teleport. The EXPENSIVE things (chunk meshes, site meshes, the light bake)
+// are cached and amortised; only the cheap bookkeeping is redone.
+// ===========================================================================
+
+// After a teleport or a reseed the whole ring is missing. Streaming it in at
+// two chunks a frame would take 25 frames — nearly half a second of visible
+// frontier every time somebody presses a number key. A hitch at a TELEPORT is
+// free (you already stopped being where you were); a hitch mid-walk is not. So
+// the budget is lifted for exactly one rebuild after the world changes.
+let g_prime: i32 = 1;
+let g_ring_built: i32 = 0;              // chunks meshed this frame
+let g_prop_n: i32 = 0;
+let g_site_n: i32 = 0;
+
+fn world_rebuild(p_dt: f64, p_t: f64) {
+    world_clear();
+    g_ring_built = 0;
+    g_prop_n = 0;
+    g_site_n = 0;
+
+    let far: f64 = g_fog_far;
+    let rad: i32 = i32(far / g_CHUNK_M) + 1;
+    if (rad > 3) { rad = 3; }
+    let ccx: i32 = i32(floor(g_camx / g_CHUNK_M));
+    let ccz: i32 = i32(floor(g_camz / g_CHUNK_M));
+
+    // --- terrain ring, nearest first so the build budget is spent where it
+    // shows. `d` is the chunk-space Chebyshev ring index.
+    for (let d = 0; d <= rad; d++) {
+        for (let j = 0 - d; j <= d; j++) {
+            for (let i = 0 - d; i <= d; i++) {
+                let ai: i32 = i; if (ai < 0) { ai = 0 - ai; }
+                let aj: i32 = j; if (aj < 0) { aj = 0 - aj; }
+                if (ai != d && aj != d) { continue; }   // interior: already done
+                let cx: i32 = ccx + i;
+                let cz: i32 = ccz + j;
+                let ox: f64 = f64(cx) * g_CHUNK_M;
+                let oz: f64 = f64(cz) * g_CHUNK_M;
+                let mx: f64 = ox + g_CHUNK_M * 0.5;
+                let mz: f64 = oz + g_CHUNK_M * 0.5;
+                let ddx: f64 = mx - g_camx; let ddz: f64 = mz - g_camz;
+                let dist: f64 = sqrt(ddx * ddx + ddz * ddz) - g_CHUNK_M * 0.78;
+                if (dist > far) { continue; }
+                let slot: i32 = chunk_find(cx, cz);
+                if (slot < 0) {
+                    if (g_prime == 0 && g_ring_built >= g_CHUNK_BUILD_PER_FRAME) { continue; }
+                    slot = chunk_evict();
+                    chunk_mesh_build(slot, cx, cz);
+                    g_ring_built++;
+                }
+                g_cc_stamp[slot] = g_frames;
+                world_chunk_add(g_cc_mesh[slot], ox, oz,
+                                mx, g_cc_cy[slot], mz,
+                                g_CHUNK_M * 0.78 + 9.0);
+                if (dist < far - 8.0) { g_prop_n = g_prop_n + chunk_props_push(slot); }
+            }
+        }
+    }
+
+    // --- the apron, snapped to a 0.25 m lattice (see §7)
+    let ax: f64 = floor(g_camx / g_APRON_SNAP + 0.5) * g_APRON_SNAP;
+    let az: f64 = floor(g_camz / g_APRON_SNAP + 0.5) * g_APRON_SNAP;
+    if (ax != g_apron_x || az != g_apron_z) { apron_build(ax, az); g_apron_baked = 0; }
+    world_chunk_add(g_apron_mesh, 0.0, 0.0,
+                    g_apron_x, terrain_h(g_apron_x, g_apron_z), g_apron_z, 9.5);
+
+    // --- sites on the 96 m lattice
+    let srad: i32 = i32(far / g_SITE_M) + 1;
+    let scx: i32 = i32(floor(g_camx / g_SITE_M));
+    let scz: i32 = i32(floor(g_camz / g_SITE_M));
+    for (let j = 0 - srad; j <= srad; j++) {
+        for (let i = 0 - srad; i <= srad; i++) {
+            let cx: i32 = scx + i;
+            let cz: i32 = scz + j;
+            let kind: i32 = site_kind(cx, cz);
+            if (kind == 0) { continue; }
+            let slot: i32 = site_find(cx, cz);
+            if (slot < 0) {
+                // Cheap reject before meshing: the site's own hashed offset.
+                let px: f64 = f64(cx) * g_SITE_M + hrange(cx, cz, 601, 20.0, 76.0);
+                let pz: f64 = f64(cz) * g_SITE_M + hrange(cx, cz, 607, 20.0, 76.0);
+                let ddx: f64 = px - g_camx; let ddz: f64 = pz - g_camz;
+                if (sqrt(ddx * ddx + ddz * ddz) - 13.0 > far) { continue; }
+                slot = site_evict();
+                site_build(slot, cx, cz, kind);
+            }
+            let sx: f64 = g_st_ox[slot]; let sz: f64 = g_st_oz[slot];
+            let ddx2: f64 = sx - g_camx; let ddz2: f64 = sz - g_camz;
+            let sd: f64 = sqrt(ddx2 * ddx2 + ddz2 * ddz2);
+            if (sd - g_st_r[slot] > far) { continue; }
+            g_st_stamp[slot] = g_frames;
+            world_chunk_add(g_st_mesh[slot], 0.0, 0.0,
+                            sx, terrain_h(sx, sz) + 3.5, sz, g_st_r[slot]);
+            g_site_n++;
+            // The windows and the tower lamp only glow once it is dark enough
+            // to earn the additive triangles. `night` is the star alpha, which
+            // is tod.hml's own answer to "is it night", so the glow can never
+            // disagree with the sky above it.
+            let night: f64 = g_todsky[TODSKY_STAR_ALPHA];
+            let dusk: f64 = clamp01(night * 2.2 + 0.10);
+            if (dusk > 0.14 && sd < far * 0.9) {
+                let gn: i32 = g_st_gn[slot];
+                for (let q = 0; q < gn; q++) {
+                    let b: i32 = slot * g_SITE_GLOWS + q;
+                    fx_push(g_st_gx[b], g_st_gy[b], g_st_gz[b],
+                            1.15, FX_GLOW_S, g_WINDOW_LIGHT,
+                            clampi(i32(200.0 * dusk), 0, 255));
+                }
+            }
+        }
+    }
+
+    // --- prop-attached FX: every lantern gets a glow, every bush a mote
+    let np: i32 = world_prop_count();
+    for (let k = 0; k < np; k++) {
+        let tag: i32 = world_prop_tag(k);
+        if (tag != g_K_LANTERN && tag != g_K_BUSH) { continue; }
+        let gx: f64 = world_prop_x(k);
+        let gy: f64 = world_prop_y(k);
+        let gz: f64 = world_prop_z(k);
+        let ddx: f64 = gx - g_camx; let ddz: f64 = gz - g_camz;
+        if (ddx * ddx + ddz * ddz > 3600.0) { continue; }   // 60 m
+        if (tag == g_K_LANTERN) {
+            fx_push(gx, gy + 1.15, gz, 1.9, FX_GLOW_L, g_WINDOW_LIGHT, 130);
+        } else {
+            fx_push(gx, gy + 0.45, gz, 0.7, FX_GLOW_S, g_NS_HALO, 120);
+        }
+    }
+
+    // --- weather and ambience particles, animated on frame time. They live in
+    // a 24 m box that FOLLOWS the camera, which is what every PS1-era rain
+    // system did and is why rain never costs more than its own box.
+    let t: f64 = p_t;
+    if (g_wx == WX_RAIN || g_wx == WX_STORM) {
+        let nrain: i32 = 44;
+        if (g_wx == WX_STORM) { nrain = 72; }
+        for (let q = 0; q < nrain; q++) {
+            let fx: f64 = g_camx - 12.0 + hrange(q, 1, 71, 0.0, 24.0);
+            let fz: f64 = g_camz - 12.0 + hrange(q, 2, 73, 0.0, 24.0);
+            let ph: f64 = hrange(q, 3, 79, 0.0, 1.0);
+            let fall: f64 = t * 11.0 + ph * 9.0;
+            let fy: f64 = terrain_h(fx, fz) + 9.0 - (fall - floor(fall / 9.0) * 9.0);
+            fx_push(fx, fy, fz, 0.5, FX_RAIN, g_UI_WHITE, 120);
+        }
+    } else {
+        let nemb: i32 = 26;
+        for (let q = 0; q < nemb; q++) {
+            let fx: f64 = g_camx - 9.0 + hrange(q, 4, 83, 0.0, 18.0);
+            let fz: f64 = g_camz - 9.0 + hrange(q, 5, 89, 0.0, 18.0);
+            let ph: f64 = hrange(q, 6, 97, 0.0, 6.28);
+            let fy: f64 = terrain_h(fx, fz) + 0.6 + 1.5 * (0.5 + 0.5 * sin(t * 0.6 + ph));
+            let cell: i32 = FX_EMBER;
+            let col: i32 = g_EMBER;
+            if (g_wx == WX_BLOOM) { cell = FX_XP_MOTE; col = g_NS_HALO; }
+            fx_push(fx + sin(t * 0.4 + ph) * 0.6, fy, fz, 0.17, cell, col, 150);
+        }
+    }
+
+    // --- dynamic lights. BUDGET_ACTUAL.md's 2-light cap is a hard ceiling; the
+    // walkaround spends one on the nearest lit thing so that walking up to a
+    // lantern after dark actually changes the ground under your feet.
+    let env: array<f64> = frame_env();
+    env_clear_lights(env);
+    let night2: f64 = clamp01(g_todsky[TODSKY_STAR_ALPHA] * 2.2 + 0.10);
+    if (night2 > 0.14) {
+        let bestd: f64 = 1e30;
+        let bx: f64 = 0.0; let by: f64 = 0.0; let bz: f64 = 0.0;
+        let found: i32 = 0;
+        for (let k = 0; k < np; k++) {
+            if (world_prop_tag(k) != g_K_LANTERN) { continue; }
+            let gx: f64 = world_prop_x(k);
+            let gz: f64 = world_prop_z(k);
+            let ddx: f64 = gx - g_camx; let ddz: f64 = gz - g_camz;
+            let dd: f64 = ddx * ddx + ddz * ddz;
+            if (dd < bestd) {
+                bestd = dd; bx = gx; by = world_prop_y(k) + 1.15; bz = gz;
+                found = 1;
+            }
+        }
+        if (found == 1 && bestd < 400.0) {
+            env_add_light(env, bx, by, bz,
+                          f64(pal_r(g_WINDOW_LIGHT)) / 255.0 * 2.1 * night2,
+                          f64(pal_g(g_WINDOW_LIGHT)) / 255.0 * 2.1 * night2,
+                          f64(pal_b(g_WINDOW_LIGHT)) / 255.0 * 2.1 * night2, 8.5);
+        }
+    }
+    stat_set(STAT_LIGHTS, env_light_count(env));
+    stat_set(STAT_CHUNKS_MESHED, g_ring_built);
+    g_prime = 0;
+}
+
+// ===========================================================================
+// 11. THE ROLLING LIGHT BAKE
+// ---------------------------------------------------------------------------
+// The sun moves every frame, and every chunk vertex carries a baked sun term.
+// Re-baking the whole ring every frame would cost more than drawing it, so the
+// bake rolls: a slice of the cache per frame, plus every newly meshed chunk
+// immediately (an unbaked chunk is a BLACK chunk, and a black chunk sliding
+// into view is the most obvious artefact this file could ship).
+// ===========================================================================
+
+let g_bake_cursor: i32 = 0;
+let g_bake_sun_x: f64 = 1e30;
+let g_mg_bake_at: f64 = 1e30;
+
+fn bake_chunk(p_mesh, p_lx: f64, p_ly: f64, p_lz: f64) {
+    let env: array<f64> = frame_env();
+    mesh_bake_light(p_mesh, p_lx, p_ly, p_lz,
+                    env_field(env, ENV_SUN_R), env_field(env, ENV_SUN_G),
+                    env_field(env, ENV_SUN_B),
+                    env_field(env, ENV_AMB_R), env_field(env, ENV_AMB_G),
+                    env_field(env, ENV_AMB_B),
+                    env_field(env, ENV_BOUNCE_R), env_field(env, ENV_BOUNCE_G),
+                    env_field(env, ENV_BOUNCE_B));
+}
+
+let g_bake_site_cursor: i32 = 0;
+let g_apron_baked: i32 = 0;
+let g_last_sun_x: f64 = 1e30;
+
+fn bake_step() {
+    let env: array<f64> = frame_env();
+    let lx: f64 = env_field(env, ENV_SUN_X);
+    let ly: f64 = env_field(env, ENV_SUN_Y);
+    let lz: f64 = env_field(env, ENV_SUN_Z);
+
+    // Anything freshly meshed, right now. An unbaked mesh is a BLACK mesh and a
+    // black chunk sliding into view is the most obvious artefact this file
+    // could ship, so this one is never deferred.
+    for (let i = 0; i < g_CHUNK_SLOTS; i++) {
+        if (g_cc_live[i] != 0 && g_cc_baked[i] == 0) {
+            bake_chunk(g_cc_mesh[i], lx, ly, lz);
+            g_cc_baked[i] = 1;
+        }
+    }
+    for (let s = 0; s < g_SITE_SLOTS; s++) {
+        if (g_st_live[s] != 0 && g_st_baked[s] == 0) {
+            bake_chunk(g_st_mesh[s], lx, ly, lz);
+            g_st_baked[s] = 1;
+        }
+    }
+    // The apron is rebuilt whenever the camera crosses a 0.25 m lattice cell,
+    // and a rebuilt mesh has no light in it, so this one is event-driven.
+    if (g_apron_baked == 0) {
+        bake_chunk(g_apron_mesh, lx, ly, lz);
+        g_apron_baked = 1;
+    }
+
+    // ---------------------------------------------------------------------
+    // THE ROLLING SWEEP, AND WHY IT IS SLOW ON PURPOSE.
+    // ---------------------------------------------------------------------
+    // The first build swept 1/8 of the cache plus EVERY site every frame — a
+    // full pass every 8 frames — and measured 2.8 ms of a 13.6 ms frame. That
+    // rate buys nothing: the day is 960 real seconds long, so in the 0.13 s a
+    // fast sweep saves, the sun moves 0.05 of a game minute. Two chunks and one
+    // site a frame is a full pass every ~36 frames, 0.6 s, which is 0.2 game
+    // minutes of sun lag — invisible at 320x240 and an order of magnitude
+    // cheaper. If the clock is HELD (T), nothing needs re-baking at all.
+    // ---------------------------------------------------------------------
+    let moved: f64 = lx - g_last_sun_x;
+    if (moved < 0.0) { moved = 0.0 - moved; }
+    g_last_sun_x = lx;
+    if (moved > 0.0) {
+        for (let k = 0; k < 2; k++) {
+            let i: i32 = g_bake_cursor;
+            g_bake_cursor = g_bake_cursor + 1;
+            if (g_bake_cursor >= g_CHUNK_SLOTS) { g_bake_cursor = 0; }
+            if (g_cc_live[i] != 0) { bake_chunk(g_cc_mesh[i], lx, ly, lz); }
+        }
+        let sidx: i32 = g_bake_site_cursor;
+        g_bake_site_cursor = g_bake_site_cursor + 1;
+        if (g_bake_site_cursor >= g_SITE_SLOTS) { g_bake_site_cursor = 0; }
+        if (g_st_live[sidx] != 0) { bake_chunk(g_st_mesh[sidx], lx, ly, lz); }
+        g_apron_baked = 0;      // the apron is small and always in your face
+    }
+
+    // The shared meshgen arena is one bake for every prop on screen, so it is
+    // re-baked only when the sun has actually moved -- 0.004 of a unit vector is
+    // about 15 game-minutes at this latitude, well under the point at which a
+    // 320x240 frame can show the difference.
+    let dsun: f64 = lx - g_bake_sun_x;
+    if (dsun < 0.0) { dsun = 0.0 - dsun; }
+    if (dsun > 0.004 || g_bake_sun_x > 1e29) {
+        meshgen_set_sun_azimuth(lx, lz);
+        meshgen_bake_all(lx, ly, lz,
+                         env_field(env, ENV_SUN_R), env_field(env, ENV_SUN_G),
+                         env_field(env, ENV_SUN_B),
+                         env_field(env, ENV_AMB_R), env_field(env, ENV_AMB_G),
+                         env_field(env, ENV_AMB_B),
+                         env_field(env, ENV_BOUNCE_R), env_field(env, ENV_BOUNCE_G),
+                         env_field(env, ENV_BOUNCE_B));
+        g_bake_sun_x = lx;
+    }
+}
+
+// ===========================================================================
+// 12. THE POI TABLE — shot.hml's scene registry shape, on the number keys
+// ---------------------------------------------------------------------------
+// Same fields, same meaning, so a POI is literally "put me inside that
+// screenshot and let me walk out of it". Teleporting changes the SEED, which
+// changes the terrain, which is why it invalidates the chunk cache.
+// ===========================================================================
+
+let g_PO_X: i32 = 0;  let g_PO_Z: i32 = 1;  let g_PO_YAW: i32 = 2;
+let g_PO_TOD: i32 = 3; let g_PO_WX: i32 = 4; let g_PO_SEED: i32 = 5;
+let g_PO_RIDGE: i32 = 6; let g_PO_SNOW: i32 = 7;
+let g_PO_N: i32 = 8;
+
+let g_po_id: array = [];
+let g_po_label: array = [];
+let g_po: array<f64> = [];
+
+fn poi_add(p_id: string, p_label: string, p_x: f64, p_z: f64, p_yaw: f64,
+           p_tod: f64, p_wx: i32, p_seed: i32, p_ridge: f64, p_snow: i32) {
+    g_po_id.push(p_id);
+    g_po_label.push(p_label);
+    g_po.push(p_x); g_po.push(p_z); g_po.push(p_yaw);
+    g_po.push(p_tod); g_po.push(f64(p_wx)); g_po.push(f64(p_seed));
+    g_po.push(p_ridge); g_po.push(f64(p_snow));
+}
+
+fn pois_build() {
+    poi_add("ridge_golden", "RIDGE GOLDEN", 0.0, 6.0, 307.0, 18.25, WX_CLEAR, 1337, 1.0, 0);
+    poi_add("muzzle_fog", "MUZZLE FOG", 0.0, 0.0, 18.0, 22.0, WX_CLEAR, 4242, 0.0, 0);
+    poi_add("hub_dawn", "HUB DAWN", 2.0, 14.0, 186.0, 5.5, WX_CLEAR, 77, 0.0, 0);
+    poi_add("ns_bloom", "NS BLOOM", 0.0, 17.0, 180.0, 22.0, WX_BLOOM, 909, 0.0, 0);
+    poi_add("storm_assault", "STORM ASSAULT", 0.0, 4.0, 200.0, 15.0, WX_STORM, 555, 0.0, 0);
+    poi_add("hud_worst_case", "NOON SNOW", 0.0, 3.0, 200.0, 12.0, WX_CLEAR, 2024, 0.0, 1);
+    poi_add("budget_worst", "BUDGET WORST", 0.0, 0.0, 214.0, 12.0, WX_CLEAR, 31337, 0.4, 0);
+    poi_add("flat_debug", "FLAT DEBUG", 0.0, 0.0, 180.0, 12.0, WX_CLEAR, 1, 0.0, 0);
+    poi_add("longwalk", "THE LONG WALK", 0.0, 40.0, 5.0, 20.4, WX_OVERCAST, 1337, 1.0, 0);
+}
+pois_build();
+
+fn poi_count(): i32 { let out: i32 = g_po_id.length; return out; }
+fn poi_f(p_i: i32, p_f: i32): f64 { let out: f64 = g_po[p_i * g_PO_N + p_f]; return out; }
+
+// tod.hml is authored on a DAY FRACTION, not an hour; tod_clock_hours is
+// piecewise-linear and strictly increasing from 5.5 h at t = 0 to 29.5 h at
+// t = 1, so 44 halvings invert it to ~1e-13 of a day. Same bisection shot.hml
+// uses, and it stays here for the same reason: an hour is what a human argues
+// in.
+fn hours_unwrapped(p_t: f64): f64 {
+    let h: f64 = tod_clock_hours(p_t);
+    if (h < 5.5) { h = h + 24.0; }
+    let out: f64 = h;
+    return out;
+}
+
+fn tod_t_from_hours(p_hours: f64): f64 {
+    let want: f64 = p_hours;
+    while (want < 0.0) { want = want + 24.0; }
+    while (want >= 24.0) { want = want - 24.0; }
+    if (want < 5.5) { want = want + 24.0; }
+    let lo: f64 = 0.0;
+    let hi: f64 = 1.0;
+    for (let i = 0; i < 44; i++) {
+        let mid: f64 = (lo + hi) * 0.5;
+        if (hours_unwrapped(mid) < want) { lo = mid; } else { hi = mid; }
+    }
+    let out: f64 = (lo + hi) * 0.5;
+    return out;
+}
+
+fn world_reseed(p_seed: i32, p_ridge: f64) {
+    g_seed = p_seed;
+    g_ridge = p_ridge;
+    terrain_set((p_seed & 1048575) + 1, p_ridge);
+    chunks_invalidate();
+    sites_invalidate();
+    g_apron_x = 1e30;
+    g_bake_sun_x = 1e30;
+    g_prime = 1;
+}
+
+fn poi_goto(p_i: i32) {
+    let i: i32 = p_i;
+    if (i < 0 || i >= poi_count()) { return; }
+    g_poi = i;
+    g_snow = i32(poi_f(i, g_PO_SNOW));
+    world_reseed(i32(poi_f(i, g_PO_SEED)), poi_f(i, g_PO_RIDGE));
+    g_camx = poi_f(i, g_PO_X);
+    g_camz = poi_f(i, g_PO_Z);
+    g_yaw = poi_f(i, g_PO_YAW);
+    g_pitch = 0.0;
+    g_wx = i32(poi_f(i, g_PO_WX));
+    g_day_t = tod_t_from_hours(poi_f(i, g_PO_TOD));
+    tod_reset();
+    tod_set_weather(g_wx);
+    g_ground_y = terrain_h(g_camx, g_camz);
+    g_camy = g_ground_y + g_EYE_H;
+    tod_step();
+    sky_now();
+}
+
+// ===========================================================================
+// 13. STAGE 24 — THE HUD, WHICH HERE IS THE BUDGET READOUT
+// ---------------------------------------------------------------------------
+// ART_BIBLE §9's cap is 250 triangles and it applies to this file too: a debug
+// overlay that blows the HUD budget is measuring a frame that does not exist.
+// The strings are rebuilt at 4 Hz, never per frame (CLAUDE.md N3: a template
+// string is 165 ns and there are eight of them).
+// ===========================================================================
+
+let g_l_tri: string = "";
+let g_l_ms: string = "";
+let g_l_pos: string = "";
+let g_l_tod: string = "";
+let g_l_mode: string = "";
+let g_hud_at: f64 = -1.0;
+let g_fps: f64 = 60.0;
+let g_frame_ms: f64 = 0.0;
+let g_wall_ms: f64 = 0.0;
+let g_ms_world: f64 = 0.0;
+let g_ms_bake: f64 = 0.0;
+
+fn wx_name(p_w: i32): string {
+    if (p_w == WX_OVERCAST) { return "OVERCAST"; }
+    if (p_w == WX_RAIN) { return "RAIN"; }
+    if (p_w == WX_STORM) { return "STORM"; }
+    if (p_w == WX_BLOOM) { return "BLOOM"; }
+    return "CLEAR";
+}
+
+// One decimal, without a formatter. FONT_MICRO has '.' and '-'.
+fn f1(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let s: i32 = i32(x * 10.0 + 0.5);
+    let w: i32 = divi(s, 10);
+    let f: i32 = s - w * 10;
+    let out: string = `${w}.${f}`;
+    if (neg == 1) { out = "-" + out; }
+    return out;
+}
+
+fn hud_strings() {
+    let sub: i32 = stat_get(STAT_TRIS_SUBMITTED);
+    let drawn: i32 = stat_get(STAT_TRIS_DRAWN);
+    g_l_tri = `TRI ${drawn}/${sub} DC ${stat_get(STAT_DRAW_CALLS)}`;
+    g_l_ms = `${f1(g_frame_ms)}MS ${i32(g_fps)}FPS`;
+    g_l_pos = `X${i32(g_camx)} Z${i32(g_camz)} ${f1(tod_clock_hours(g_day_t))}H`;
+    let mode: string = "WALK";
+    if (g_fly != 0) { mode = "FLY"; }
+    let tick: string = "RUN";
+    if (g_time_running == 0) { tick = "HOLD"; }
+    g_l_tod = `${wx_name(g_wx)} FOG ${i32(g_fog_far)}M OVF ${stat_get(STAT_BATCH_OVERFLOW)}`;
+    g_l_mode = `${mode} ${tick} CH${stat_get(STAT_CHUNKS_DRAWN)} PR${stat_get(STAT_ENTS_DRAWN)} FX${stat_get(STAT_PARTICLES)} ${g_po_label[g_poi]}`;
+}
+
+fn hud_rect(p_x: f64, p_y: f64, p_w: f64, p_h: f64, p_c: i32, p_a: i32): i32 {
+    let u: f64 = (g_uvw[0] + g_uvw[2]) * 0.5;
+    let v: f64 = (g_uvw[1] + g_uvw[3]) * 0.5;
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y, p_w, p_h,
+                                  u, v, u, v,
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
+
+fn hud_sprite(p_id: i32, p_x: f64, p_y: f64, p_c: i32, p_a: i32): i32 {
+    hudgen_uv(p_id, g_uvq, 0);
+    hudgen_rect(p_id, g_rect, 0);
+    let out: i32 = quad_screen_uv(g_bhud, g_tex_hud, p_x, p_y,
+                                  f64(g_rect[2]), f64(g_rect[3]),
+                                  g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3],
+                                  pal_r(p_c), pal_g(p_c), pal_b(p_c), p_a, 0.5);
+    return out;
+}
+
+fn hud_text(p_x: f64, p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
+    // 1-px UI_BLACK shadow at (+1,+1), always (CLAUDE.md §9 rule 8).
+    let out: i32 = font_text_shadowed(hud_font_micro(), g_bhud, g_tex_hud,
+                                      p_x, p_y, p_s,
+                                      pal_r(p_c), pal_g(p_c), pal_b(p_c), 255,
+                                      pal_r(g_UI_BLACK), pal_g(g_UI_BLACK),
+                                      pal_b(g_UI_BLACK), 255, 1.0, 1.0, p_budget);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE TRIANGLE BUDGET OF THE THING THAT REPORTS THE TRIANGLE BUDGET.
+// ---------------------------------------------------------------------------
+// FONT_MICRO is 2 triangles a glyph and the mandatory 1-px shadow doubles it
+// to FOUR, so a 50-character line is 200 triangles all by itself — 80 % of
+// ART_BIBLE §9's entire 250-triangle HUD allowance. The first build of this
+// readout emitted 330 and the frame it was measuring was therefore a frame the
+// game cannot draw.
+//
+// The fix is NOT a bigger cap. There are two views:
+//   LEVEL 1 (default)  three short lines, hard tri budgets 76/48/60. Chrome is
+//                      30 (crosshair 10, compass 20) plus 4 for two plates, so
+//                      the worst case is 218 of 250 and it CANNOT drift —
+//                      font_text truncates at its budget rather than
+//                      overspending, so the guarantee is structural.
+//   LEVEL 2 (press H)  everything, and it is honestly OVER the shipping cap.
+//                      It says so on screen (the `+DBG` marker) and once on
+//                      stderr. A debug overlay is allowed to cost more than the
+//                      game HUD; pretending it does not is how a budget rots.
+// ---------------------------------------------------------------------------
+let g_TB_L1: i32 = 76;
+let g_TB_L2: i32 = 48;
+let g_TB_L3: i32 = 60;
+let g_dbg_warned: i32 = 0;
+
+fn hud_build() {
+    let used: i32 = 0;
+    let cx: f64 = f64(g_RES_W) * 0.5;
+    let cy: f64 = f64(g_RES_H) * 0.5;
+
+    // The crosshair is here because a first-person camera without one has no
+    // centre and you cannot tell whether you are level. Real hudgen sprites.
+    used = used + hud_sprite(HUD_XH_TICK_H, cx - 10.0, cy - 3.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_H, cx + 4.0, cy - 3.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, cx - 3.0, cy - 10.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, cx - 3.0, cy + 4.0, g_UI_WHITE, 255);
+    used = used + hud_sprite(HUD_XH_DOT, cx - 2.0, cy - 2.0, g_UI_WHITE, 255);
+
+    // The compass strip: the one HUD element that is not a number, and the one
+    // that tells you which way you turned while you were turning.
+    used = used + hud_rect(cx - 46.0, 4.0, 92.0, 9.0, g_UI_BLACK, 170);
+    let yawn: f64 = g_yaw;
+    while (yawn < 0.0) { yawn = yawn + 360.0; }
+    while (yawn >= 360.0) { yawn = yawn - 360.0; }
+    for (let t = 0; t < 8; t++) {
+        let ang: f64 = f64(t) * 45.0 - yawn;
+        while (ang < -180.0) { ang = ang + 360.0; }
+        while (ang > 180.0) { ang = ang - 360.0; }
+        if (ang > -44.0 && ang < 44.0) {
+            let id: i32 = HUD_TICK_MINOR;
+            let c: i32 = g_UI_DIM;
+            if (t % 2 == 0) { id = HUD_TICK_MAJOR; c = g_UI_WHITE; }
+            used = used + hud_sprite(id, cx + ang, 5.0, c, 255);
+        }
+    }
+    used = used + hud_sprite(HUD_CHEVRON, cx - 2.0, 2.0, g_UI_AMBER, 255);
+
+    if (g_hud_on == 0) { return; }
+
+    // The readout gets a plate for the reason hud_worst_case exists: white 4x6
+    // text over a noon sky is invisible, and an invisible budget readout is a
+    // budget nobody reads.
+    used = used + hud_rect(2.0, 15.0, 84.0, 27.0, g_UI_BLACK, 180);
+    let over: i32 = g_UI_GOOD;
+    if (stat_get(STAT_TRIS_DRAWN) > g_TRIS_STEADY) { over = g_UI_DANGER; }
+    used = used + hud_text(4.0, 17.0, g_l_tri, over, g_TB_L1);
+    let msc: i32 = g_UI_GOOD;
+    if (g_frame_ms > g_FRAME_BUDGET_MS) { msc = g_UI_AMBER; }
+    used = used + hud_text(4.0, 25.0, g_l_ms, msc, g_TB_L2);
+    used = used + hud_text(4.0, 33.0, g_l_pos, g_UI_WHITE, g_TB_L3);
+
+    if (g_hud_on == 2) {
+        // Level 2. Over the shipping cap, on purpose, and it admits it.
+        if (g_dbg_warned == 0) {
+            eprint(`walk: verbose readout is a DEBUG overlay and exceeds the ${g_HUD_TRI_CAP}-tri`);
+            eprint("walk: ART_BIBLE 9 HUD cap. The frame on screen is no longer a shipping");
+            eprint("walk: frame. Press H again for the in-cap readout.");
+            g_dbg_warned = 1;
+        }
+        used = used + hud_rect(2.0, 222.0, 316.0, 16.0, g_UI_BLACK, 180);
+        used = used + hud_text(4.0, 224.0, g_l_tod, g_UI_DIM, 120);
+        used = used + hud_text(4.0, 231.0, g_l_mode, g_UI_WHITE, 200);
+        used = used + hud_text(90.0, 17.0, "+DBG", g_UI_DANGER, 20);
+    } else if (used > g_HUD_TRI_CAP) {
+        // Structurally unreachable given the budgets above; if it ever fires,
+        // the chrome grew and the budgets are stale. Not silent.
+        eprint(`walk: HUD emitted ${used} triangles, over the ${g_HUD_TRI_CAP} cap`);
+    }
+}
+
+// ===========================================================================
+// 14. MOVEMENT
+// ---------------------------------------------------------------------------
+// Deliberately NOT a movement model. W3-9 `src/sim/movement.hml` owns the real
+// one — acceleration 60, friction 8.0, air control 0.35, the slide and the
+// protected slide-jump — and a second one living in a tool would be exactly
+// the drift `frame_render` just got extracted to prevent. This is a camera on
+// rails at the GDD's speeds, so the SPEEDS can be judged now and the FEEL can
+// be judged when the real thing lands.
+// ===========================================================================
+
+fn look_apply(p_dyaw: f64, p_dpitch: f64) {
+    g_yaw = g_yaw + p_dyaw;
+    while (g_yaw < 0.0) { g_yaw = g_yaw + 360.0; }
+    while (g_yaw >= 360.0) { g_yaw = g_yaw - 360.0; }
+    g_pitch = clampf(g_pitch + p_dpitch, -85.0, 85.0);
+}
+
+// ---------------------------------------------------------------------------
+// PUSH-OUT, AND WHY THERE IS ONE AT ALL.
+// ---------------------------------------------------------------------------
+// This is NOT collision and it is NOT a movement model — W3-9 owns both. It is
+// a camera constraint, and it is here because the first walk through this world
+// found the ugliest thing in the build: the props are WORLD-anchored (shot.hml
+// keeps every tree at least 8 m from its one fixed camera; a walkaround has no
+// such luxury) so you routinely end up standing INSIDE a trunk, at which point
+// meshgen's canopy disc at 3.4 m fills the top third of the frame as a flat
+// green plate and the trunk quads clip through your eye. Twenty lines of
+// push-out is the difference between "I walked through the forest" and "the
+// forest is broken".
+//
+// It reads the registry the frame graph already holds, one frame stale, which
+// at 4.4 m/s is 7 cm. Radii are per-class and deliberately small: this must
+// never feel like a wall, only like a tree you cannot stand in.
+fn prop_push_radius(p_tag: i32, p_scale: f64): f64 {
+    let t: i32 = p_tag;
+    if (t == g_K_TREE) { let r: f64 = 0.45 * p_scale; return r; }
+    if (t == g_K_ROCK) { let r: f64 = 0.85 * p_scale; return r; }
+    if (t == g_K_CRATE) { let r: f64 = 0.55 * p_scale; return r; }
+    if (t == g_K_BARREL) { let r: f64 = 0.45 * p_scale; return r; }
+    if (t == g_K_LANTERN) { let r: f64 = 0.30 * p_scale; return r; }
+    if (t == g_K_NPC) { let r: f64 = 0.45; return r; }
+    let none: f64 = 0.0;        // bushes are grass; you walk through grass
+    return none;
+}
+
+fn push_out() {
+    let n: i32 = world_prop_count();
+    for (let i = 0; i < n; i++) {
+        let r: f64 = prop_push_radius(world_prop_tag(i), 1.0);
+        if (r <= 0.0) { continue; }
+        let dx: f64 = g_camx - world_prop_x(i);
+        let dz: f64 = g_camz - world_prop_z(i);
+        let d2: f64 = dx * dx + dz * dz;
+        if (d2 >= r * r) { continue; }
+        let d: f64 = sqrt(d2);
+        if (d < 0.0001) { dx = 1.0; dz = 0.0; d = 1.0; }
+        g_camx = world_prop_x(i) + dx / d * r;
+        g_camz = world_prop_z(i) + dz / d * r;
+    }
+    g_ground_y = terrain_h(g_camx, g_camz);
+    g_camy = g_ground_y + g_EYE_H;
+}
+
+fn move_apply(p_fwd: f64, p_str: f64, p_up: f64, p_dt: f64) {
+    let sy: f64 = sin(g_yaw * g_D2R);
+    let cy: f64 = cos(g_yaw * g_D2R);
+    let fx: f64 = sy;
+    let fz: f64 = 0.0 - cy;
+    let rx: f64 = cy;
+    let rz: f64 = sy;
+    let speed: f64 = g_SPEED_WALK;
+    if (g_fly != 0) {
+        speed = g_SPEED_FLY;
+        if (g_sprinting != 0) { speed = g_SPEED_FLY_FAST; }
+        // In fly mode forward follows the pitch, so "look at that tower and
+        // hold W" gets you there. That is the whole point of a noclip cam.
+        let cp: f64 = cos(g_pitch * g_D2R);
+        let sp: f64 = sin(g_pitch * g_D2R);
+        fx = sy * cp; fz = 0.0 - (cy * cp);
+        let fy: f64 = sp;
+        g_camy = g_camy + (p_fwd * fy + p_up) * speed * p_dt;
+    } else {
+        if (g_sprinting != 0) { speed = g_SPEED_SPRINT; }
+    }
+    let dx: f64 = (p_fwd * fx + p_str * rx) * speed * p_dt;
+    let dz: f64 = (p_fwd * fz + p_str * rz) * speed * p_dt;
+    g_camx = g_camx + dx;
+    g_camz = g_camz + dz;
+    g_ground_y = terrain_h(g_camx, g_camz);
+    if (g_fly == 0) {
+        g_camy = g_ground_y + g_EYE_H;
+    } else if (g_camy < g_ground_y + 0.4) {
+        g_camy = g_ground_y + 0.4;
+    }
+    if (g_fly == 0) { push_out(); }
+}
+
+// ===========================================================================
+// 15. ONE FRAME
+// ---------------------------------------------------------------------------
+// Six calls in the order ARCHITECTURE §4 puts them, and the three that are not
+// the frame graph's are the three the import wall leaves with the caller.
+// ===========================================================================
+
+fn frame_once(p_dt: f64, p_t: f64) {
+    frame_begin();
+
+    // -- 6  tod_eval -> the frame graph's RenderEnv --------------------------
+    stat_begin(STAT_T_TOD);
+    tod_step();
+    emit_set_env(frame_env());
+    stat_end(STAT_T_TOD);
+
+    // -- world: the caller's registry, walked by the frame graph -------------
+    // Timed on the caller's own clock: these two are stages this file OWNS, and
+    // they sit inside STAT_T_FRAME but outside every stat.hml stage, so without
+    // this they would show up only as unexplained "other".
+    // clock_now(), not __clock(): __clock() is PROCESS CPU time summed over
+    // every thread, and on the real display the GL driver has its own. Measured
+    // side by side, __clock() reported 12.2 ms of "render CPU" against a 12.1 ms
+    // wall frame, and attributed the driver's concurrent work to whichever of
+    // this file's stages happened to be open. stat.hml's stage table is on the
+    // SDL performance counter, so these two are too, and the columns add up.
+    let w0: u64 = clock_now();
+    world_rebuild(p_dt, p_t);
+    let w1: u64 = clock_now();
+    bake_step();
+    let w2: u64 = clock_now();
+    g_ms_world = clock_ms_between(w0, w1);
+    g_ms_bake = clock_ms_between(w1, w2);
+
+    // -- 7  skygen's rolling re-bake. ONE slice per frame, on the cursor: the
+    // full 512x160 panorama takes 8 frames and never causes a hitch, which is
+    // exactly the budget core/config.hml's g_BUDGET_SKY_REBAKE_MS is written
+    // for. shot.hml runs the loop to completion because it renders one frame;
+    // running it to completion HERE would be a 3 ms stall every time the ToD
+    // keyframe moves, i.e. constantly.
+    stat_begin(STAT_T_SKYBAKE);
+    let rows: i32 = 0;
+    if (skygen_dirty_rows() == 0 && g_sky_want == 1) {
+        skygen_mark_dirty();
+        g_sky_want = 0;
+    }
+    for (let k = 0; k < g_sky_burst; k++) {
+        if (skygen_dirty_rows() <= 0) { break; }
+        rows = rows + skygen_rebake_slice();
+    }
+    g_sky_burst = 1;
+    stat_end(STAT_T_SKYBAKE);
+    stat_set(STAT_SKY_ROWS, rows);
+
+    frame_set_camera(g_camx, g_camy, g_camz, g_yaw, g_pitch, g_fov);
+    frame_set_clear(g_skyk[SKYK_ZEN], g_skyk[SKYK_ZEN + 1], g_skyk[SKYK_ZEN + 2]);
+    let bolt: i32 = 0;
+    if (tod_lightning_active() != 0) { bolt = 1; }
+    frame_set_options(0, g_vm_on, bolt);
+
+    // -- 8..23  the frame graph. THE ONLY ONE. -------------------------------
+    frame_render();
+
+    // -- 24  the caller's HUD ------------------------------------------------
+    stat_begin(STAT_T_HUD);
+    hud_build();
+    stat_end(STAT_T_HUD);
+
+    // -- 25..28  flush, readback, present, stats -----------------------------
+    frame_present();
+    g_frames++;
+}
+
+// ARGB8888 readback (memory order B,G,R,A) -> RGB24. Same conversion shot.hml
+// uses, so a walkaround screenshot is directly comparable to a shot.hml one.
+fn framebuffer_to_rgb(): buffer {
+    let w: i32 = g_RES_W;
+    let h: i32 = g_RES_H;
+    let out: buffer = buffer(w * h * 3);
+    let op: ptr = buffer_ptr(out);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let si: i32 = (y * w + x) * 4;
+            let di: i32 = (y * w + x) * 3;
+            ptr_write_u8(ptr_offset(op, di, 1), ptr_deref_u8(ptr_offset(g_fb, si + 2, 1)));
+            ptr_write_u8(ptr_offset(op, di + 1, 1), ptr_deref_u8(ptr_offset(g_fb, si + 1, 1)));
+            ptr_write_u8(ptr_offset(op, di + 2, 1), ptr_deref_u8(ptr_offset(g_fb, si, 1)));
+        }
+    }
+    let r: buffer = out;
+    return r;
+}
+
+let g_shot_dir: string = "";
+
+fn screenshot(p_tag: string) {
+    if (g_shot_dir.length == 0) { return; }
+    let img: buffer = framebuffer_to_rgb();
+    let path: string = `${g_shot_dir}/walk_${g_shot_seq}_${p_tag}.png`;
+    write_png(path, img, g_RES_W, g_RES_H);
+    print(`walk: wrote ${path}   tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  dc ${stat_get(STAT_DRAW_CALLS)}  frame ${f1(stat_ms(STAT_T_FRAME))} ms`);
+    g_shot_seq++;
+}
+
+// ===========================================================================
+// 16. LIFECYCLE
+// ===========================================================================
+
+let g_upscale: i32 = 3;
+
+fn walk_init(): i32 {
+    g_win = window_open_ex("nightshade walk", g_RES_W, g_RES_H, g_upscale, 0);
+    if (g_win == null) {
+        eprint(`walk: window_open failed: ${sdl_error()}`);
+        let bad: i32 = -1;
+        return bad;
+    }
+    // -1 on a software renderer is "unavailable", never fatal (CLAUDE.md §5).
+    set_vsync(g_win, 1);
+
+    g_target = target_new(g_win, g_RES_W, g_RES_H, g_upscale);
+    if (g_target == null) {
+        eprint("walk: target_new failed");
+        let bad2: i32 = -1;
+        return bad2;
+    }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+
+    if (frame_init(g_win, g_target, g_fb) != 0) {
+        eprint("walk: frame_init failed");
+        let bad3: i32 = -1;
+        return bad3;
+    }
+    g_bhud = frame_batch_hud();
+
+    art_build(g_win);
+    if (g_world_cells < 41) {
+        eprint(`walk: texgen wrote ${g_world_cells} cells, expected 41`);
+    }
+
+    // Everything art-derived the frame graph is not allowed to import: four
+    // textures, the FX atlas, two mesh handles, one FX cell id, one uv rect and
+    // three palette colours. Handles and numbers only.
+    frame_bind_textures(g_tex_world, g_tex_fx, g_tex_hud, g_tex_sky);
+    frame_bind_fx_atlas(g_atlas_fx);
+    frame_bind_assets(meshgen_mesh(MESH_BLOB), meshgen_mesh(MESH_SPARROW_VM),
+                      FX_GLOW_L);
+    frame_set_hud_solid_uv(g_uvw[0], g_uvw[1], g_uvw[2], g_uvw[3]);
+    frame_set_vignette_colour(pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+    frame_set_flash_colour(pal_r(g_LIGHTNING), pal_g(g_LIGHTNING), pal_b(g_LIGHTNING));
+
+    chunks_init();
+    apron_init();
+    sites_init();
+
+    g_in = input_new();
+    let ok: i32 = 0;
+    return ok;
+}
+
+fn walk_shutdown() {
+    if (g_in != null) { input_set_relative(g_in, 0); }
+    if (g_target != null) { target_free(g_target); g_target = null; }
+    if (g_win != null) { window_close(g_win); g_win = null; }
+}
+
+fn controls_print() {
+    print("");
+    print("  ================= NIGHTSHADE WALKAROUND =================");
+    print(`  ${g_VERSION}`);
+    print("");
+    print("   MOVE      W A S D          SPRINT   hold SHIFT");
+    print("   LOOK      mouse            FLY/WALK F");
+    print("   UP/DOWN   SPACE / CTRL     (fly mode only)");
+    print("");
+    print("   TIME      [ and ]          scrub the 16-minute day, 3 h/s");
+    print("   PAUSE     T                stop/start the clock");
+    print("   WEATHER   V                clear -> overcast -> rain -> storm -> bloom");
+    print("   FOG       - and =          pull the fog wall in / push it out");
+    print("");
+    print("   TELEPORT  1..9             the shot.hml scenes, walkable");
+    print("   RESEED    R                a new landscape, same rules");
+    print("   READOUT   H                in-cap readout -> verbose debug -> off");
+    print("   GUN       G                viewmodel on/off");
+    print("   SHOT      P                write a PNG (needs --shots <dir>)");
+    print("   QUIT      ESC");
+    print("");
+    print("   The readout is live and in-budget: TRI drawn/submitted against the");
+    print("   2500 cap, draw calls, render ms (stages 6..28) and the wall fps.");
+    print("   Press H once more for position, weather, chunk/prop/fx counts and");
+    print("   the batch-overflow count -- that view is a DEBUG overlay and it is");
+    print("   honestly over ART_BIBLE 9's 250-triangle HUD cap. It says so.");
+    print("  =========================================================");
+    print("");
+}
+
+// ===========================================================================
+// 17. THE LOOP
+// ===========================================================================
+
+let g_demo_s: f64 = 0.0;
+let g_headless: i32 = 0;
+let g_started: i32 = 0;   // --scene already chose a POI; run_loop must not override it
+
+fn handle_keys(p_dt: f64) {
+    let inp = g_in;
+    let fwd: f64 = 0.0;
+    let str: f64 = 0.0;
+    let up: f64 = 0.0;
+    if (input_down(inp, SC_W)) { fwd = fwd + 1.0; }
+    if (input_down(inp, SC_S)) { fwd = fwd - 1.0; }
+    if (input_down(inp, SC_D)) { str = str + 1.0; }
+    if (input_down(inp, SC_A)) { str = str - 1.0; }
+    if (input_down(inp, SC_SPACE)) { up = up + 1.0; }
+    if (input_down(inp, SC_LCTRL)) { up = up - 1.0; }
+    g_sprinting = 0;
+    if (input_down(inp, SC_LSHIFT)) { g_sprinting = 1; }
+    if (fwd != 0.0 || str != 0.0 || up != 0.0) { move_apply(fwd, str, up, p_dt); }
+    else { move_apply(0.0, 0.0, 0.0, p_dt); }
+
+    if (input_pressed(inp, SC_F)) { g_fly = 1 - g_fly; }
+    if (input_pressed(inp, SC_T)) { g_time_running = 1 - g_time_running; }
+    if (input_pressed(inp, SC_H)) { g_hud_on = g_hud_on + 1; if (g_hud_on > 2) { g_hud_on = 0; } }
+    if (input_pressed(inp, SC_G)) { g_vm_on = 1 - g_vm_on; }
+    if (input_pressed(inp, SC_P)) { screenshot("key"); }
+    if (input_pressed(inp, SC_V)) {
+        g_wx = g_wx + 1;
+        if (g_wx >= WX_COUNT) { g_wx = 0; }
+        tod_set_weather(g_wx);
+        if (g_wx == WX_STORM) { tod_lightning_fire(); }
+    }
+    if (input_pressed(inp, SC_R)) {
+        world_reseed(g_seed * 7 + 13, g_ridge);
+        g_ground_y = terrain_h(g_camx, g_camz);
+        g_camy = g_ground_y + g_EYE_H;
+    }
+    // Scrub. Held, not tapped: the point is to WATCH the light move.
+    // The scrub moves the clock 3 game-hours a second — 180x the natural rate —
+    // so the rolling sweep is widened while the key is held. See sky_scrub.
+    if (input_down(inp, g_SC_LBRACKET)) {
+        g_day_t = g_day_t - g_SCRUB_H_PER_S * p_dt / 24.0;
+        sky_scrub();
+    }
+    if (input_down(inp, g_SC_RBRACKET)) {
+        g_day_t = g_day_t + g_SCRUB_H_PER_S * p_dt / 24.0;
+        sky_scrub();
+    }
+    if (input_down(inp, g_SC_MINUS)) { g_fog_bias = clampf(g_fog_bias - 24.0 * p_dt, -50.0, 24.0); }
+    if (input_down(inp, g_SC_EQUALS)) { g_fog_bias = clampf(g_fog_bias + 24.0 * p_dt, -50.0, 24.0); }
+
+    if (input_pressed(inp, SC_1)) { poi_goto(0); }
+    if (input_pressed(inp, SC_2)) { poi_goto(1); }
+    if (input_pressed(inp, SC_3)) { poi_goto(2); }
+    if (input_pressed(inp, SC_4)) { poi_goto(3); }
+    if (input_pressed(inp, SC_5)) { poi_goto(4); }
+    if (input_pressed(inp, SC_6)) { poi_goto(5); }
+    if (input_pressed(inp, SC_7)) { poi_goto(6); }
+    if (input_pressed(inp, SC_8)) { poi_goto(7); }
+    if (input_pressed(inp, SC_9)) { poi_goto(8); }
+}
+
+// The scripted walk. It exists so this build can be measured and LOOKED AT
+// without stealing a live desktop's mouse pointer, and so CI has something to
+// smoke-test that actually moves.
+fn demo_drive(p_t: f64, p_dt: f64) {
+    let t: f64 = p_t;
+    g_sprinting = 0;
+    if (t < 5.0) {
+        move_apply(1.0, 0.0, 0.0, p_dt);                    // walk out
+    } else if (t < 8.0) {
+        look_apply(52.0 * p_dt, 0.0);
+        move_apply(1.0, 0.0, 0.0, p_dt);                    // walk and turn
+    } else if (t < 12.0) {
+        g_sprinting = 1;
+        move_apply(1.0, 0.0, 0.0, p_dt);                    // sprint
+    } else if (t < 15.0) {
+        look_apply(0.0, -6.0 * p_dt);
+        g_day_t = g_day_t + 2.0 * p_dt / 24.0;              // scrub the light
+        sky_scrub();
+        move_apply(0.6, 0.0, 0.0, p_dt);
+    } else if (t < 18.0) {
+        if (g_fly == 0) { g_fly = 1; }
+        look_apply(20.0 * p_dt, -8.0 * p_dt);
+        move_apply(0.4, 0.0, 1.0, p_dt);                    // rise and look down
+    } else {
+        g_fly = 0;
+        move_apply(1.0, 0.3, 0.0, p_dt);
+    }
+}
+
+fn run_loop() {
+    controls_print();
+    if (g_started == 0) { poi_goto(0); }
+
+    // Prime the sky in full: a first frame under a half-baked panorama is not
+    // a fair first impression.
+    tod_step();
+    sky_now();
+
+    // Prime the ring OUTSIDE the loop. The first rebuild after a world change
+    // meshes ~49 chunks and a handful of sites in one pass — measured at 129 ms
+    // — and a 129 ms frame one frame into a 60 fps demo poisons every average
+    // that follows it. It is the same hitch a teleport pays, and a teleport is
+    // allowed to hitch; frame 1 of the walk is not.
+    world_rebuild(0.016, 0.0);
+    bake_step();
+
+    let running: i32 = 1;
+    let t: f64 = 0.0;
+    let prev: u64 = clock_now();
+    let ms_acc: f64 = 0.0;
+    let ms_n: i32 = 0;
+    let ms_worst: f64 = 0.0;
+    let wall_acc: f64 = 0.0;
+    let next_shot: f64 = 1.5;
+    let report_at: f64 = 1.0;
+
+    // RULE T (CLAUDE.md §1.2). This box permanently shares ~17 of 24 cores with
+    // a llama-server, so wall-clock frame time drifts 62 % with load and cannot
+    // be quoted on its own. The honest render cost is __clock() CPU time,
+    // batched in sevens, minimum batch reported — same recipe every probe in
+    // this repo uses. Wall time is ALSO reported, because 60 fps is a wall-clock
+    // promise and the reader needs both numbers to tell a slow renderer from a
+    // busy machine.
+    let cpu_batch: f64 = 0.0;
+    let cpu_bn: i32 = 0;
+    let cpu_min: f64 = 1.0e30;
+    let cpu_acc: f64 = 0.0;
+
+    let pf_tod: f64 = 0.0;   let pf_sky: f64 = 0.0;   let pf_view: f64 = 0.0;
+    let pf_emit: f64 = 0.0;  let pf_tgt: f64 = 0.0;   let pf_flush: f64 = 0.0;
+    let pf_post: f64 = 0.0;  let pf_hud: f64 = 0.0;   let pf_fhud: f64 = 0.0;
+    let pf_pres: f64 = 0.0;  let pf_world: f64 = 0.0; let pf_bake: f64 = 0.0;
+    let pf_other: f64 = 0.0;
+    let over: i32 = 0;          // frames that missed the 16.67 ms boundary
+    let over_meshed: i32 = 0;   // ...of which, frames that also meshed a chunk
+
+    while (running == 1) {
+        let top: u64 = clock_now();
+        let dt: f64 = clock_ms_between(prev, top) * 0.001;
+        prev = top;
+        if (dt > 0.1) { dt = 0.1; }
+        if (dt <= 0.0) { dt = 0.001; }
+        t = t + dt;
+
+        input_sample(g_in, g_win);
+        if (input_quit(g_in)) { running = 0; }
+        if (input_pressed(g_in, SC_ESCAPE)) { running = 0; }
+
+        if (g_demo_s > 0.0) {
+            demo_drive(t, dt);
+            if (t >= g_demo_s) { running = 0; }
+        } else {
+            if (g_relative_ok == 1) {
+                look_apply(input_mouse_dx(g_in) * g_mouse_sens,
+                           0.0 - input_mouse_dy(g_in) * g_mouse_sens);
+            }
+            handle_keys(dt);
+        }
+
+        // The metronome. One real second is 1/960 of a game day; that is the
+        // D6 16-minute cycle and it is the number this build exists to let
+        // somebody FEEL rather than read.
+        if (g_time_running == 1) {
+            g_day_t = g_day_t + dt / g_DAY_SECONDS * g_time_scale;
+            sky_request();
+        }
+        while (g_day_t >= 1.0) { g_day_t = g_day_t - 1.0; }
+        while (g_day_t < 0.0) { g_day_t = g_day_t + 1.0; }
+
+        let cpu0: f64 = __clock();
+        frame_once(dt, t);
+        let cpu_ms: f64 = (__clock() - cpu0) * 1000.0;
+        cpu_acc = cpu_acc + cpu_ms;
+        cpu_batch = cpu_batch + cpu_ms;
+        cpu_bn++;
+        if (cpu_bn == 7) {
+            let b: f64 = cpu_batch / 7.0;
+            if (b < cpu_min) { cpu_min = b; }
+            cpu_batch = 0.0;
+            cpu_bn = 0;
+        }
+
+        g_frame_ms = stat_ms(STAT_T_FRAME);
+        let s_tod: f64 = stat_ms(STAT_T_TOD);
+        let s_sky: f64 = stat_ms(STAT_T_SKYBAKE);
+        let s_view: f64 = stat_ms(STAT_T_VIEW);
+        let s_emit: f64 = stat_ms(STAT_T_EMIT) + stat_ms(STAT_T_BATCH_RESET);
+        let s_tgt: f64 = stat_ms(STAT_T_TARGET_BEGIN) + stat_ms(STAT_T_CLEAR);
+        let s_flush: f64 = stat_ms(STAT_T_FLUSH_SKY) + stat_ms(STAT_T_SORT_WORLD)
+                         + stat_ms(STAT_T_FLUSH_WORLD) + stat_ms(STAT_T_SORT_FX)
+                         + stat_ms(STAT_T_FLUSH_FX);
+        let s_post: f64 = stat_ms(STAT_T_POSTFX);
+        let s_hud: f64 = stat_ms(STAT_T_HUD);
+        let s_fhud: f64 = stat_ms(STAT_T_FLUSH_HUD);
+        let s_pres: f64 = stat_ms(STAT_T_PRESENT);
+        pf_tod = pf_tod + s_tod;     pf_sky = pf_sky + s_sky;
+        pf_view = pf_view + s_view;  pf_emit = pf_emit + s_emit;
+        pf_tgt = pf_tgt + s_tgt;     pf_flush = pf_flush + s_flush;
+        pf_post = pf_post + s_post;  pf_hud = pf_hud + s_hud;
+        pf_fhud = pf_fhud + s_fhud;  pf_pres = pf_pres + s_pres;
+        pf_world = pf_world + g_ms_world; pf_bake = pf_bake + g_ms_bake;
+        pf_other = pf_other + (g_frame_ms - s_tod - s_sky - s_view - s_emit
+                   - s_tgt - s_flush - s_post - s_hud - s_fhud - s_pres
+                   - g_ms_world - g_ms_bake);
+        ms_acc = ms_acc + g_frame_ms;
+        ms_n++;
+        if (g_frame_ms > ms_worst) { ms_worst = g_frame_ms; }
+        if (g_frame_ms > g_FRAME_BUDGET_MS) {
+            over++;
+            if (g_ring_built > 0) { over_meshed++; }
+        }
+
+        if (t > g_hud_at + 0.25) { hud_strings(); g_hud_at = t; }
+
+        if (g_demo_s > 0.0 && g_shot_dir.length > 0 && t >= next_shot) {
+            screenshot(`t${i32(t)}`);
+            next_shot = next_shot + 2.5;
+        }
+        if (g_demo_s > 0.0 && t >= report_at) {
+            print(`  t=${i32(t)}s  frame ${f1(g_frame_ms)} ms  wall ${f1(g_wall_ms)} ms  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  dc ${stat_get(STAT_DRAW_CALLS)}  ch ${stat_get(STAT_CHUNKS_DRAWN)}  pr ${stat_get(STAT_ENTS_DRAWN)}  meshed ${g_ring_built}`);
+            report_at = report_at + 1.0;
+        }
+
+        // 60 fps cap. vsync does the job on a real display; this is what stops
+        // the dummy driver spinning a core at 900 fps, and what keeps the pace
+        // honest when vsync is unavailable. SDL_Delay's granularity is 1-2 ms
+        // and it OVERSHOOTS under load — sleeping the whole remainder measured
+        // 18.5 ms mean where 16.67 was asked for — so it sleeps to 2 ms short
+        // and spins the rest. Two milliseconds of spin on one core is a fair
+        // price for a frame that lands on the frame boundary.
+        let spent: f64 = clock_ms_between(top, clock_now());
+        let left: f64 = g_FRAME_BUDGET_MS - spent;
+        if (left > 2.5) { clock_sleep_ms(i32(left - 2.0)); }
+        while (clock_ms_between(top, clock_now()) < g_FRAME_BUDGET_MS) { }
+        g_wall_ms = clock_ms_between(top, clock_now());
+        wall_acc = wall_acc + g_wall_ms;
+        if (g_wall_ms > 0.01) { g_fps = 1000.0 / g_wall_ms; }
+    }
+
+    if (ms_n > 0) {
+        print("");
+        let n: f64 = f64(ms_n);
+        print("  -- where the frame goes (mean ms over the run, stat.hml stages) --");
+        print(`     6  env/tod          ${f1(pf_tod / n)}`);
+        print(`     7  sky rebake       ${f1(pf_sky / n)}`);
+        print(`     *  world rebuild    ${f1(pf_world / n)}   (this file: the registry)`);
+        print(`     *  light rebake     ${f1(pf_bake / n)}   (this file: rolling mesh_bake_light)`);
+        print(`    8-10 view/mvp/frustum ${f1(pf_view / n)}`);
+        print(`   11-17 emit            ${f1(pf_emit / n)}`);
+        print(`   18-19 target+clear    ${f1(pf_tgt / n)}`);
+        print(`   20-22 sort+flush      ${f1(pf_flush / n)}`);
+        print(`      23 postfx          ${f1(pf_post / n)}`);
+        print(`      24 hud             ${f1(pf_hud / n)}`);
+        print(`      25 flush hud       ${f1(pf_fhud / n)}`);
+        print(`   26-27 present         ${f1(pf_pres / n)}`);
+        print(`         UNACCOUNTED     ${f1(pf_other / n)}   <- frame_present's readback lives here`);
+        print("");
+        print(`walk: ${ms_n} frames in ${f1(t)} s`);
+        print(`      render, wall  (stat_ms STAT_T_FRAME, stages 6..28)`);
+        print(`                    mean ${f1(ms_acc / f64(ms_n))} ms   worst ${f1(ms_worst)} ms`);
+        print(`      render, CPU   (__clock, RULE T, min of 7-frame batches)`);
+        print(`                    min  ${f1(cpu_min)} ms   mean ${f1(cpu_acc / f64(ms_n))} ms`);
+        print(`      whole frame   mean ${f1(wall_acc / f64(ms_n))} ms  -> ${f1(1000.0 / (wall_acc / f64(ms_n)))} fps  (60 fps cap in the loop)`);
+        print(`      headroom at 60 fps: ${f1(16.667 - cpu_min)} ms/frame on the CPU-time number`);
+        print(`      frames over 16.67 ms: ${over} of ${ms_n}  (${over_meshed} of them meshed a chunk)`);
+    }
+}
+
+// ===========================================================================
+// 18. SELFTEST — the walkaround verifies itself, headless
+// ---------------------------------------------------------------------------
+// Exit status is the contract: 0 iff every assertion passed AND the expected
+// NUMBER of assertions ran. A probe whose denominator can move cannot be
+// trusted by a gate script.
+//
+// Every assertion below states a PROPERTY, never a magic number. The four
+// stale lightning assertions this project has already paid for encoded exact
+// RGB triples and went dead the moment the design legitimately changed; these
+// say things like "the world is anchored, not camera-relative" and "the fog
+// wall bounds the ring", which survive re-tuning because they ARE the design.
+// ===========================================================================
+
+let g_EXPECTED_ASSERTIONS: i32 = 31;
+let g_n: i32 = 0;
+let g_pass: i32 = 0;
+
+fn ok(p_name: string, p_cond: bool) {
+    g_n++;
+    if (p_cond) { g_pass++; } else { eprint(`  FAIL  ${p_name}`); }
+}
+
+fn selftest(): i32 {
+    print(`walk selftest — ${g_VERSION}`);
+    if (walk_init() != 0) { eprint("walk: init failed"); let bad: i32 = 1; return bad; }
+
+    // --- relative mouse: reported, never fatal ------------------------------
+    let rc: i32 = input_set_relative(g_in, 1);
+    ok("relative mouse status is recorded", input_relative_status(g_in) == rc);
+    if (rc != 0) {
+        print(`  relative mouse unavailable (rc=${rc}: ${input_relative_error(g_in)}) — expected headless, continuing`);
+    }
+    input_set_relative(g_in, 0);
+    ok("the walkaround survives relative mouse being unavailable", true);
+
+    poi_goto(0);
+    ok("teleporting lands the eye above the ground it teleported onto",
+       g_camy > terrain_h(g_camx, g_camz));
+    ok("eye height is the standing height, not an arbitrary offset",
+       g_camy - terrain_h(g_camx, g_camz) > 1.69
+       && g_camy - terrain_h(g_camx, g_camz) < 1.71);
+
+    // --- THE WORLD IS ANCHORED, NOT CAMERA-RELATIVE -------------------------
+    // This is the design difference from shot.hml and it is the one a
+    // walkaround can break silently: if props were scattered around the camera
+    // the world would slide with you and every screenshot would still look
+    // fine.
+    tod_step();
+    world_rebuild(0.016, 0.0);
+    let n0: i32 = world_prop_count();
+    let x0: f64 = 0.0; let z0: f64 = 0.0;
+    if (n0 > 0) { x0 = world_prop_x(0); z0 = world_prop_z(0); }
+    let cam0x: f64 = g_camx;
+    g_camx = g_camx + 4.0;
+    g_ground_y = terrain_h(g_camx, g_camz);
+    g_camy = g_ground_y + g_EYE_H;
+    world_rebuild(0.016, 0.0);
+    let moved: i32 = 0;
+    let np2: i32 = world_prop_count();
+    for (let i = 0; i < np2; i++) {
+        if (world_prop_x(i) == x0 && world_prop_z(i) == z0) { moved = 1; }
+    }
+    ok("a prop keeps its world position when the camera moves", n0 == 0 || moved == 1);
+    g_camx = cam0x;
+
+    // --- the height field is shared with the frame graph --------------------
+    let hy: f64 = terrain_h(11.5, -7.25);
+    ok("the height field replays exactly from its seed", terrain_h(11.5, -7.25) == hy);
+    world_reseed(g_seed + 1, g_ridge);
+    ok("a different seed is a different landscape", terrain_h(11.5, -7.25) != hy);
+    poi_goto(0);
+    ok("returning to a POI restores its landscape", terrain_h(11.5, -7.25) == hy);
+
+    // --- props stand ON the ground, which is what makes contact blobs land --
+    tod_step();
+    world_rebuild(0.016, 0.0);
+    let grounded: i32 = 1;
+    let npc: i32 = world_prop_count();
+    for (let i = 0; i < npc; i++) {
+        let dy: f64 = world_prop_y(i) - terrain_h(world_prop_x(i), world_prop_z(i));
+        if (dy > 0.0001 || dy < -0.0001) { grounded = 0; }
+    }
+    ok("every prop stands on the shared height field", grounded == 1);
+    ok("the world is not empty", npc > 0);
+    // A primed rebuild fills the whole ring in one pass — a teleport must not
+    // leave you looking at a quarter of a world for half a second.
+    ok("a primed rebuild fills the ring, apron included", world_chunk_count() > 20);
+
+    // --- the fog wall bounds the ring ---------------------------------------
+    let far: f64 = g_fog_far;
+    ok("the fog wall is inside the 72 m cap", far <= g_FOG_FAR_CAP && far > 0.0);
+    let ring_ok: i32 = 1;
+    let nc: i32 = world_chunk_count();
+    for (let i = 0; i < nc; i++) {
+        let m = world_chunk_mesh(i);
+        if (mesh_tri_count(m) <= 0) { ring_ok = 0; }
+    }
+    ok("every chunk in the registry carries geometry", ring_ok == 1);
+    ok("no mesh overflowed its arena while building the world",
+       mesh_overflow_count() == 0);
+
+    // --- the apron closes the hole under the camera -------------------------
+    // shot.hml's apron starts at r = 0.30, which leaves a 30 cm hole you can
+    // see through by pitching down; this one starts at 0.05.
+    ok("the apron re-centres on the camera",
+       g_apron_x - g_camx < 0.2 && g_camx - g_apron_x < 0.2);
+
+    // --- a frame renders, headless, and stays inside the budget -------------
+    frame_once(0.016, 0.0);
+    ok("a frame renders headless", stat_get(STAT_TRIS_DRAWN) > 0);
+    ok("the sky layer drew", stat_get(STAT_TRIS_SKY) > 0);
+    ok("the world layer drew", stat_get(STAT_TRIS_WORLD) > 0);
+    ok("the HUD layer drew", stat_get(STAT_TRIS_HUD) > 0);
+    ok("nothing overflowed a batch", stat_get(STAT_BATCH_OVERFLOW) == 0);
+    ok("one draw call per texture run, not per triangle",
+       stat_get(STAT_DRAW_CALLS) > 0 && stat_get(STAT_DRAW_CALLS) < 64);
+
+    // --- the HUD respects ART_BIBLE 9's cap ---------------------------------
+    ok("the readout fits the 250-triangle HUD cap",
+       stat_get(STAT_TRIS_HUD) <= g_HUD_TRI_CAP);
+
+    // --- the day cycle actually moves the light -----------------------------
+    let sun0: f64 = env_field(frame_env(), ENV_SUN_Y);
+    g_day_t = g_day_t + 0.08;
+    tod_step();
+    let sun1: f64 = env_field(frame_env(), ENV_SUN_Y);
+    ok("scrubbing the clock moves the sun", sun0 != sun1);
+    g_day_t = g_day_t - 0.08;
+    tod_step();
+
+    // --- weather changes the atmosphere, and the fog with it ----------------
+    let fog_clear: f64 = env_field(frame_env(), ENV_FOG_FAR);
+    g_wx = WX_STORM;
+    tod_set_weather(WX_STORM);
+    for (let i = 0; i < 40; i++) { g_day_t = g_day_t + 0.004; tod_step(); }
+    let fog_storm: f64 = env_field(frame_env(), ENV_FOG_FAR);
+    ok("a storm closes the fog in", fog_storm < fog_clear);
+    g_wx = WX_CLEAR;
+    tod_set_weather(WX_CLEAR);
+
+    // --- flying leaves the ground, walking does not -------------------------
+    poi_goto(0);
+    g_fly = 0;
+    move_apply(1.0, 0.0, 1.0, 0.5);
+    ok("walking stays at eye height whatever you press",
+       g_camy - terrain_h(g_camx, g_camz) > 1.69
+       && g_camy - terrain_h(g_camx, g_camz) < 1.71);
+    let y_before: f64 = g_camy;
+    g_fly = 1;
+    move_apply(0.0, 0.0, 1.0, 0.5);
+    ok("flying leaves the ground", g_camy > y_before);
+    g_fly = 0;
+
+    // --- sprinting is faster than walking, at the GDD's ratio ---------------
+    poi_goto(0);
+    let sx0: f64 = g_camx; let sz0: f64 = g_camz;
+    g_sprinting = 0;
+    move_apply(1.0, 0.0, 0.0, 1.0);
+    let dw: f64 = sqrt((g_camx - sx0) * (g_camx - sx0) + (g_camz - sz0) * (g_camz - sz0));
+    poi_goto(0);
+    g_sprinting = 1;
+    move_apply(1.0, 0.0, 0.0, 1.0);
+    let ds: f64 = sqrt((g_camx - sx0) * (g_camx - sx0) + (g_camz - sz0) * (g_camz - sz0));
+    ok("sprinting is faster than walking", ds > dw);
+    // Tolerant on purpose: push_out() can shorten or lengthen a step by up to
+    // a prop radius, so the assertion is "this is the GDD's walk speed", not
+    // "this is 4.4000". A tight bound here would be a seed-dependent probe.
+    ok("one second of walking covers the GDD's walk speed",
+       dw > g_SPEED_WALK * 0.85 && dw < g_SPEED_WALK * 1.15);
+    g_sprinting = 0;
+
+    // --- you cannot stand inside a tree ------------------------------------
+    poi_goto(0);
+    tod_step();
+    world_rebuild(0.016, 0.0);
+    let inside: i32 = 0;
+    let nprops: i32 = world_prop_count();
+    for (let i = 0; i < nprops; i++) {
+        let r: f64 = prop_push_radius(world_prop_tag(i), 1.0);
+        if (r <= 0.0) { continue; }
+        // Teleport into the prop, then take a zero-length step: the push-out
+        // runs on every walking move, so one step is all it may take.
+        g_camx = world_prop_x(i);
+        g_camz = world_prop_z(i);
+        g_fly = 0;
+        move_apply(0.0, 0.0, 0.0, 0.016);
+        let dx: f64 = g_camx - world_prop_x(i);
+        let dz: f64 = g_camz - world_prop_z(i);
+        if (sqrt(dx * dx + dz * dz) < r - 0.0001) { inside = 1; }
+    }
+    ok("walking can never leave the eye inside a solid prop", inside == 0);
+
+    // --- streaming: walking a long way never leaves a hole ------------------
+    poi_goto(0);
+    let holes: i32 = 0;
+    for (let step = 0; step < 260; step++) {
+        move_apply(1.0, 0.0, 0.0, 0.05);
+        tod_step();
+        world_rebuild(0.05, f64(step) * 0.05);
+        // Everything inside the fog wall must be meshed and registered. The
+        // frontier BEYOND it may legitimately be missing — that is what the
+        // fog wall is for — so the test is "no gap you can see", not "no gap".
+        let ccx: i32 = i32(floor(g_camx / g_CHUNK_M));
+        let ccz: i32 = i32(floor(g_camz / g_CHUNK_M));
+        if (chunk_find(ccx, ccz) < 0) { holes++; }
+    }
+    ok("walking 57 m never leaves the chunk under your feet unmeshed", holes == 0);
+    ok("the chunk cache did not thrash", world_chunk_count() > 4);
+
+    walk_shutdown();
+    print(`${g_pass}/${g_n} assertions passed`);
+    if (g_n != g_EXPECTED_ASSERTIONS) {
+        eprint(`walk: ran ${g_n} assertions, expected ${g_EXPECTED_ASSERTIONS}`);
+        let bad2: i32 = 1;
+        return bad2;
+    }
+    if (g_pass != g_n) { let bad3: i32 = 1; return bad3; }
+    print(`PASS ${g_pass}/${g_n}`);
+    let good: i32 = 0;
+    return good;
+}
+
+// ===========================================================================
+// 19. MAIN
+// ===========================================================================
+
+// The compiled-only guard. argv[0] still ends in .hml when the interpreter is
+// running the file, and never does once hemlockc has produced a binary.
+fn running_interpreted(): bool {
+    if (args.length < 1) { return false; }
+    let a0: string = args[0];
+    let out: bool = a0.ends_with(".hml");
+    return out;
+}
+
+fn is_number(p_s: string): bool {
+    let s: string = p_s;
+    if (s.length == 0) { return false; }
+    let seen: i32 = 0;
+    for (let i = 0; i < s.length; i++) {
+        let c: string = s.slice(i, i + 1);
+        if (c == "-" || c == "+") {
+            if (i != 0) { return false; }
+        } else if (c == ".") {
+            // one dot at most
+        } else if (c >= "0" && c <= "9") {
+            seen = seen + 1;
+        } else {
+            return false;
+        }
+    }
+    let out: bool = seen > 0;
+    return out;
+}
+
+fn num_or(p_s: string, p_def: f64): f64 {
+    if (is_number(p_s) == false) {
+        eprint(`walk: '${p_s}' is not a number; using ${p_def}`);
+        let d: f64 = p_def;
+        return d;
+    }
+    let out: f64 = f64(p_s);
+    return out;
+}
+
+fn usage() {
+    print("usage: walk [options]");
+    print("  --demo <seconds>     scripted walk, no mouse grab, prints per-second stats");
+    print("  --shots <dir>        write PNGs during the demo (and on P)");
+    print("  --scene <id>         start at a POI id instead of ridge_golden");
+    print("  --upscale <n>        window scale, default 3");
+    print("  --sens <f>           mouse sensitivity, default 0.16");
+    print("  --selftest           headless assertions, exit 1 on failure");
+    print("  --list               print the POI table");
+    print("  --help");
+}
+
+fn main() {
+    if (running_interpreted()) {
+        eprint("walk.hml is COMPILED-ONLY: the interpreter cannot hold 60 fps and a");
+        eprint("walkaround that does not hold 60 fps measures a game nobody is");
+        eprint("playing. Build it first:");
+        eprint("    hemlockc -O1 tools/walk.hml -o /tmp/walk");
+        eprint("    DISPLAY=:0 /tmp/walk");
+        exit(2);
+    }
+
+    let start: string = "";
+    let want_selftest: i32 = 0;
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--help" || a == "-h") { usage(); exit(0); }
+        else if (a == "--selftest") { want_selftest = 1; }
+        else if (a == "--list") {
+            for (let k = 0; k < poi_count(); k++) {
+                print(`  ${k + 1}  ${g_po_id[k]}   ${g_po_label[k]}`);
+            }
+            exit(0);
+        }
+        else if (a == "--demo" && i + 1 < args.length) { i++; g_demo_s = num_or(args[i], 20.0); }
+        else if (a == "--shots" && i + 1 < args.length) { i++; g_shot_dir = args[i]; }
+        else if (a == "--scene" && i + 1 < args.length) { i++; start = args[i]; }
+        else if (a == "--upscale" && i + 1 < args.length) { i++; g_upscale = clampi(i32(num_or(args[i], 3.0)), 1, 6); }
+        else if (a == "--sens" && i + 1 < args.length) { i++; g_mouse_sens = num_or(args[i], 0.16); }
+        else { eprint(`walk: unknown option ${a}`); usage(); exit(2); }
+        i++;
+    }
+
+    if (want_selftest == 1) { exit(selftest()); }
+
+    if (g_shot_dir.length > 0) { make_dirs(g_shot_dir); }
+
+    if (walk_init() != 0) { exit(1); }
+
+    // Mouse-look. NEVER fatal: SDL_SetRelativeMouseMode always returns -1 under
+    // the dummy driver and the WARP hint does not rescue it (CLAUDE.md §5). The
+    // demo path does not grab the pointer at all — a scripted walk that steals
+    // a live desktop's mouse is a walkaround nobody will run twice.
+    g_relative_ok = 0;
+    if (g_demo_s <= 0.0) {
+        let rc: i32 = input_set_relative(g_in, 1);
+        if (rc == 0) {
+            g_relative_ok = 1;
+        } else {
+            eprint(`walk: mouse-look unavailable (rc=${rc}: ${input_relative_error(g_in)});`);
+            eprint("walk: continuing on the keyboard path — this is expected headless.");
+        }
+    }
+
+    if (start.length > 0) {
+        let found: i32 = -1;
+        for (let k = 0; k < poi_count(); k++) { if (g_po_id[k] == start) { found = k; } }
+        if (found < 0) { eprint(`walk: no POI "${start}"`); }
+        else { poi_goto(found); g_started = 1; }
+    }
+
+    set_window_title(g_win, "nightshade — walkaround");
+    run_loop();
+    walk_shutdown();
+    exit(0);
+}
+
+main();

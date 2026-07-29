@@ -1,0 +1,505 @@
+// ===========================================================================
+// tools/probe_assets.hml — W3-13 verification for `src/game/assets.hml`
+// ===========================================================================
+//
+//   hemlockc -O1 tools/probe_assets.hml -o /tmp/probe_assets
+//   SDL_VIDEODRIVER=dummy /tmp/probe_assets
+//
+// Exits 0 only when every assertion passes AND the number that ran equals
+// EXPECT_ASSERTS. A probe that exits 0 while printing FAIL is worse than none.
+//
+// WHAT IT PROVES
+//   1  the boot runs every stage exactly once, in ARCHITECTURE §6 order
+//   2  it creates EXACTLY FOUR SDL textures and they are four distinct objects
+//   3  each texture behaves like the blend mode it was uploaded with — tested
+//      by COMPOSITING IT ON SCREEN, not by trusting the constant we passed in.
+//      SDL exposes no SDL_GetTextureBlendMode binding, so the only honest test
+//      of "the blend mode is right" is the algebra it produces:
+//          ADD   can only brighten, and a black texel changes nothing
+//          NONE  ignores the background AND the vertex alpha entirely
+//          BLEND composites, so the same texel over two backgrounds differs
+//      Not one of these assertions names an RGB triple; re-tune the art and
+//      they all still hold.
+//   4  a second boot is idempotent: no new textures, identical pointers,
+//      no stage re-run, no content changed
+//   5  a headless boot (win == null) runs the six CPU stages and defers the
+//      upload, then completes when a window arrives
+//   6  the boot fits the 400 ms budget, per-stage, RULE T timing
+//
+// NOTE ON "EXACTLY FOUR TEXTURES". The process also holds this probe's own
+// 320x240 render target, and a windowed build holds SDL's framebuffer texture.
+// Neither is an asset. The invariant W3-13 owns is "asset generation creates
+// four textures and no more", so what is asserted is `assets_texture_created()`
+// — the count of null -> non-null transitions assets.hml itself causes — and
+// that it does not grow on a second boot. The window here is opened with
+// logical=0 so it creates no framebuffer texture of its own.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+import { divi } from "@stdlib/math";
+
+import { window_open_ex, window_close, create_target, set_target, sdl_clear,
+         read_pixels_rect, FMT_ARGB8888, FMT_RGBA32,
+         BLEND_BLEND, BLEND_ADD, BLEND_NONE }
+       from "../../wobbleweed/src/sdl.hml";
+import { atlas_data, atlas_format, atlas_cell_x, atlas_cell_y,
+         atlas_cell_w, atlas_cell_h, atlas_cell_count }
+       from "../../wobbleweed/src/atlas.hml";
+import { batch_new, batch_reset, batch_flush, LAYER_HUD }
+       from "../../wobbleweed/src/batch.hml";
+import { quad_screen_uv } from "../../wobbleweed/src/quad.hml";
+
+import { assets_build, assets_build_stage, assets_reset, assets_atlas,
+         assets_tex, assets_blend, assets_tex_name, assets_texture_created,
+         assets_texture_count, assets_mesh_count, assets_mesh_tris,
+         assets_mesh_tris_total, assets_world_cells, assets_sfx,
+         assets_sfx_count, assets_stage_name, assets_stage_label,
+         assets_stage_ms, assets_stage_done, assets_stages_done,
+         assets_progress, assets_seq, assets_seq_len, assets_total_ms,
+         assets_budget_ms, assets_over_budget, assets_is_built,
+         assets_print_report, assets_report_string, assets_error,
+         assets_expect_w, assets_expect_h, assets_cell_count,
+         assets_material_cell,
+         ASSET_WORLD, ASSET_FX, ASSET_HUD, ASSET_SKY, ASSET_TEX_COUNT,
+         AS_STAGE_WORLD, AS_STAGE_SKY, AS_STAGE_MESH, AS_STAGE_SFX,
+         AS_STAGE_UPLOAD, AS_STAGE_COUNT, AS_OK, AS_ERR_STAGE }
+       from "../src/game/assets.hml";
+import { texgen_cell_generated, texgen_material_count, texgen_cell_name,
+         CELL_GRASS_A } from "../src/art/texgen.hml";
+import { MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT, MG_MAT_GLASS }
+       from "../src/art/meshgen.hml";
+
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_n: i32 = 0;
+let g_expect: i32 = 35;
+
+fn ck(name: string, cond: i32) {
+    g_n++;
+    if (cond == 1) { g_pass++; } else { g_fail++; eprint(`FAIL ${g_n}: ${name}`); }
+}
+fn ck_i(name: string, got: i32, want: i32) {
+    g_n++;
+    if (got == want) { g_pass++; }
+    else { g_fail++; eprint(`FAIL ${g_n}: ${name} — got ${got} want ${want}`); }
+}
+
+// ---------------------------------------------------------------------------
+// screen-composite helper: draw ONE atlas texel, magnified, over a cleared
+// background, and read the centre pixel back.  `out` gets r,g,b.
+// ---------------------------------------------------------------------------
+let g_uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_px: buffer = buffer(4);
+let g_pp: ptr = ptr_null();
+
+// ⚠ The UV rect must span a FULL texel, edge to edge. `atlas_rect_uv(a,x,y,1,1)`
+// applies its half-texel inset and collapses a single texel to a ZERO-WIDTH uv
+// rect, and SDL 2.0.18's software renderer responds to that by drawing the
+// triangles UNTEXTURED — a white quad, silently, with no error. That failure
+// looks exactly like "the blend mode is wrong", so it is worth the four lines
+// of explicit arithmetic here.  (See the W3-13 report; atlas.hml is correct for
+// its intended >= 2-texel case and is not this task's file to change.)
+fn composite(p_win, p_b, p_target, p_atlas, p_tex, p_tx: i32, p_ty: i32,
+             p_bg_r: i32, p_bg_g: i32, p_bg_b: i32, p_alpha: i32,
+             p_out: array<i32>) {
+    sdl_clear(p_win, p_bg_r, p_bg_g, p_bg_b, 255);
+    batch_reset(p_b);
+    let fw: f64 = f64(p_atlas.w);
+    let fh: f64 = f64(p_atlas.h);
+    g_uv[0] = f64(p_tx) / fw;
+    g_uv[1] = f64(p_ty) / fh;
+    g_uv[2] = f64(p_tx + 1) / fw;
+    g_uv[3] = f64(p_ty + 1) / fh;
+    quad_screen_uv(p_b, p_tex, 120.0, 90.0, 40.0, 40.0,
+                   g_uv[0], g_uv[1], g_uv[2], g_uv[3],
+                   255, 255, 255, p_alpha, 0.5);
+    batch_flush(p_win, p_b);
+    // ARGB8888 is B,G,R,A in memory (CLAUDE.md §5).
+    read_pixels_rect(p_win, 140, 110, 1, 1, FMT_ARGB8888, g_pp, 4);
+    p_out[0] = i32(g_px[2]);
+    p_out[1] = i32(g_px[1]);
+    p_out[2] = i32(g_px[0]);
+}
+
+// atlas texel accessors, straight off the CPU buffer (RGBA byte order)
+fn texel(p_atlas, p_x: i32, p_y: i32, p_c: i32): i32 {
+    let d: buffer = atlas_data(p_atlas);
+    let o: i32 = (p_y * p_atlas.w + p_x) * 4 + p_c;
+    let out: i32 = i32(d[o]);
+    return out;
+}
+
+fn same_rgb(p_a: array<i32>, p_b: array<i32>): i32 {
+    if (p_a[0] != p_b[0]) { return 0; }
+    if (p_a[1] != p_b[1]) { return 0; }
+    if (p_a[2] != p_b[2]) { return 0; }
+    return 1;
+}
+
+fn rgbs(p_a: array<i32>): string {
+    let out: string = `(${p_a[0]},${p_a[1]},${p_a[2]})`;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    g_pp = buffer_ptr(g_px);
+
+    // logical=0: the window creates no framebuffer texture of its own, so the
+    // only textures in this process are the four assets plus our render target.
+    let win = window_open_ex("probe_assets", 320, 240, 1, 0);
+    if (win == null) { eprint("no window"); exit(2); }
+
+    // -----------------------------------------------------------------------
+    // 1. THE COLD BOOT
+    // -----------------------------------------------------------------------
+    ck("nothing is built before assets_build",
+       (assets_is_built() == 0 && assets_texture_count() == 0
+        && assets_texture_created() == 0) ? 1 : 0);
+
+    let c0: f64 = __clock();
+    let rc: i32 = assets_build(win);
+    let c1: f64 = __clock();
+    let cold_ms: f64 = (c1 - c0) * 1000.0;
+    ck_i("the cold boot returns AS_OK", rc, AS_OK);
+
+    assets_print_report();
+    print(`cold boot wall-of-stages total = ${assets_total_ms()} ms`);
+    print(`cold boot measured around assets_build = ${cold_ms} ms`);
+
+    // The boot order is a contract (ARCHITECTURE §6), so it is observable.
+    let order_ok: i32 = 1;
+    if (assets_seq_len() != AS_STAGE_COUNT) { order_ok = 0; }
+    else {
+        for (let i = 0; i < AS_STAGE_COUNT; i++) {
+            if (assets_seq(i) != i) { order_ok = 0; }
+        }
+    }
+    ck("every stage ran exactly once, in ARCHITECTURE §6 order", order_ok);
+    ck("assets_is_built and assets_progress agree that the boot finished",
+       (assets_is_built() == 1 && assets_stages_done() == AS_STAGE_COUNT
+        && assets_progress() > 0.999) ? 1 : 0);
+    ck_i("the boot reported no error", assets_error(), 0);
+
+    let cold_total: f64 = assets_total_ms();
+    let cold_stage: array<f64> = [];
+    for (let i = 0; i < AS_STAGE_COUNT; i++) { cold_stage.push(assets_stage_ms(i)); }
+
+    // -----------------------------------------------------------------------
+    // 2. FOUR TEXTURES, NOT FIVE
+    // -----------------------------------------------------------------------
+    ck_i("asset generation created exactly four SDL textures",
+         assets_texture_created(), ASSET_TEX_COUNT);
+    ck_i("all four texture slots hold a live texture",
+         assets_texture_count(), ASSET_TEX_COUNT);
+
+    let distinct: i32 = 1;
+    let live: i32 = 1;
+    for (let i = 0; i < ASSET_TEX_COUNT; i++) {
+        if (assets_tex(i) == ptr_null()) { live = 0; }
+        for (let j = i + 1; j < ASSET_TEX_COUNT; j++) {
+            if (assets_tex(i) == assets_tex(j)) { distinct = 0; }
+        }
+    }
+    ck("the four textures are four distinct live objects",
+       (distinct == 1 && live == 1) ? 1 : 0);
+
+    // A format substitution means SDL made a hidden conversion texture — a
+    // fifth texture by another name, and a CPU copy on every upload.
+    let native: i32 = 1;
+    for (let i = 0; i < ASSET_TEX_COUNT; i++) {
+        if (atlas_format(assets_atlas(i)) != FMT_RGBA32) { native = 0; }
+    }
+    ck("no atlas was format-substituted into a hidden conversion texture", native);
+
+    let dims_ok: i32 = 1;
+    for (let i = 0; i < ASSET_TEX_COUNT; i++) {
+        let a = assets_atlas(i);
+        if (a == null) { dims_ok = 0; }
+        else {
+            if (a.w != assets_expect_w(i)) { dims_ok = 0; }
+            if (a.h != assets_expect_h(i)) { dims_ok = 0; }
+        }
+        print(`  ${assets_tex_name(i)}  ${assets_expect_w(i)}x${assets_expect_h(i)}  blend=${assets_blend(i)}`);
+    }
+    ck("every atlas is the size config.hml says it is", dims_ok);
+
+    ck("the world atlas is a 64-cell grid and texgen filled its material cells",
+       (assets_cell_count(ASSET_WORLD) == 64
+        && assets_world_cells() == texgen_material_count()) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 3. BLEND MODE IS THE MATERIAL MODEL — verified by compositing on screen
+    // -----------------------------------------------------------------------
+    let target = create_target(win, 320, 240);
+    if (target == ptr_null()) { eprint("no render target"); exit(2); }
+    set_target(win, target);
+    let b = batch_new(64, 1.0, LAYER_HUD);
+
+    let got: array<i32> = [0, 0, 0];
+    let got2: array<i32> = [0, 0, 0];
+
+    // Two deliberately unequal, deliberately un-round backgrounds.
+    let bg1r: i32 = 37;  let bg1g: i32 = 61;  let bg1b: i32 = 83;
+    let bg2r: i32 = 211; let bg2g: i32 = 199; let bg2b: i32 = 174;
+
+    let afx = assets_atlas(ASSET_FX);
+    let asky = assets_atlas(ASSET_SKY);
+    let ahud = assets_atlas(ASSET_HUD);
+    let awld = assets_atlas(ASSET_WORLD);
+
+    // --- ADD: the additive identity adds nothing ---------------------------
+    // fxgen floods the atlas with the additive identity (0,0,0,a) and the cell
+    // margins keep it, so texel (0,0) is black by construction — asserted, not
+    // assumed, so a future fxgen that stops doing that fails here loudly.
+    let fx_black: i32 = 0;
+    if (texel(afx, 0, 0, 0) == 0 && texel(afx, 0, 0, 1) == 0
+        && texel(afx, 0, 0, 2) == 0) { fx_black = 1; }
+    composite(win, b, target, afx, assets_tex(ASSET_FX), 0, 0,
+              bg1r, bg1g, bg1b, 255, got);
+    ck("ATLAS_FX is ADDITIVE: a black texel changes the background by nothing",
+       (fx_black == 1 && got[0] == bg1r && got[1] == bg1g && got[2] == bg1b) ? 1 : 0);
+
+    // --- ADD: a mid-bright texel comes out brighter than the texel itself --
+    // This is the assertion that actually SEPARATES add from blend. An opaque
+    // texel under BLEND lands on exactly the texel value; under ADD it lands on
+    // texel + background. Picking a MID texel (not the brightest) keeps the sum
+    // off the 255 ceiling, where the two would agree again.
+    let bx: i32 = 0 - 1;  let by: i32 = 0 - 1;
+    for (let y = 0; y < afx.h; y++) {
+        if (bx < 0) {
+            for (let x = 0; x < afx.w; x++) {
+                if (bx < 0 && texel(afx, x, y, 3) == 255) {
+                    let r0: i32 = texel(afx, x, y, 0);
+                    let g0: i32 = texel(afx, x, y, 1);
+                    let b0: i32 = texel(afx, x, y, 2);
+                    if (r0 > 40 && r0 < 140 && g0 > 40 && g0 < 140
+                        && b0 > 40 && b0 < 140) { bx = x; by = y; }
+                }
+            }
+        }
+    }
+    let brighter: i32 = 0;
+    if (bx >= 0) {
+        composite(win, b, target, afx, assets_tex(ASSET_FX), bx, by,
+                  bg1r, bg1g, bg1b, 255, got);
+        brighter = 1;
+        if (got[0] <= texel(afx, bx, by, 0)) { brighter = 0; }
+        if (got[1] <= texel(afx, bx, by, 1)) { brighter = 0; }
+        if (got[2] <= texel(afx, bx, by, 2)) { brighter = 0; }
+        print(`  FX mid texel (${bx},${by}) = (${texel(afx,bx,by,0)},${texel(afx,bx,by,1)},${texel(afx,bx,by,2)}) over ${bg1r},${bg1g},${bg1b} -> ${rgbs(got)}`);
+    }
+    ck("ATLAS_FX is ADDITIVE: a mid texel comes out brighter than the texel itself (BLEND would come out equal to it)",
+       brighter);
+
+    // --- NONE: the sky ignores its background, and its vertex alpha --------
+    // BLEND_NONE writes srcRGB straight out. That is exactly why the sky is the
+    // frame's floor: nothing behind it and nothing modulating it can show.
+    composite(win, b, target, asky, assets_tex(ASSET_SKY), 10, 10,
+              bg1r, bg1g, bg1b, 255, got);
+    composite(win, b, target, asky, assets_tex(ASSET_SKY), 10, 10,
+              bg2r, bg2g, bg2b, 255, got2);
+    ck("TEX_SKY is BLEND_NONE: the background cannot show through it",
+       same_rgb(got, got2));
+
+    composite(win, b, target, asky, assets_tex(ASSET_SKY), 10, 10,
+              bg1r, bg1g, bg1b, 96, got2);
+    ck("TEX_SKY is BLEND_NONE: a partial vertex alpha cannot fade it either",
+       same_rgb(got, got2));
+    print(`  sky texel (10,10) -> ${rgbs(got)} on both backgrounds and at alpha 96`);
+
+    // --- BLEND: the world composites against whatever is behind it ---------
+    let gx: i32 = atlas_cell_x(awld, CELL_GRASS_A) + divi(atlas_cell_w(awld), 2);
+    let gy: i32 = atlas_cell_y(awld, CELL_GRASS_A) + divi(atlas_cell_h(awld), 2);
+    composite(win, b, target, awld, assets_tex(ASSET_WORLD), gx, gy,
+              bg1r, bg1g, bg1b, 128, got);
+    composite(win, b, target, awld, assets_tex(ASSET_WORLD), gx, gy,
+              bg2r, bg2g, bg2b, 128, got2);
+    ck("ATLAS_WORLD is BLEND: the same texel over two backgrounds differs",
+       (same_rgb(got, got2) == 0) ? 1 : 0);
+
+    // --- BLEND: a zero-alpha HUD texel leaves the frame untouched ----------
+    // Under BLEND_NONE this would stamp a black square over the game; it is
+    // the whole reason the HUD atlas may be mostly empty.
+    let hx: i32 = 0 - 1;  let hy: i32 = 0 - 1;
+    for (let y = 0; y < ahud.h; y++) {
+        if (hx < 0) {
+            for (let x = 0; x < ahud.w; x++) {
+                if (hx < 0 && texel(ahud, x, y, 3) == 0) { hx = x; hy = y; }
+            }
+        }
+    }
+    composite(win, b, target, ahud, assets_tex(ASSET_HUD), hx, hy,
+              bg1r, bg1g, bg1b, 255, got);
+    ck("ATLAS_HUD is BLEND: a zero-alpha texel leaves the background exactly",
+       (hx >= 0 && got[0] == bg1r && got[1] == bg1g && got[2] == bg1b) ? 1 : 0);
+
+    // --- BLEND: an opaque HUD texel at half alpha lands between the two ----
+    let sx: i32 = 0 - 1;  let sy: i32 = 0 - 1;
+    for (let y = 0; y < ahud.h; y++) {
+        if (sx < 0) {
+            for (let x = 0; x < ahud.w; x++) {
+                if (sx < 0 && texel(ahud, x, y, 3) == 255
+                    && texel(ahud, x, y, 0) > 200 && texel(ahud, x, y, 1) > 200
+                    && texel(ahud, x, y, 2) > 200) { sx = x; sy = y; }
+            }
+        }
+    }
+    composite(win, b, target, ahud, assets_tex(ASSET_HUD), sx, sy,
+              bg1r, bg1g, bg1b, 128, got);
+    let between: i32 = 0;
+    if (sx >= 0) {
+        between = 1;
+        if (got[0] <= bg1r || got[0] >= 255) { between = 0; }
+        if (got[1] <= bg1g || got[1] >= 255) { between = 0; }
+        if (got[2] <= bg1b || got[2] >= 255) { between = 0; }
+    }
+    ck("ATLAS_HUD is BLEND: a bright opaque texel at half alpha lands between background and texel",
+       between);
+    print(`  HUD white texel (${sx},${sy}) at alpha 128 over ${bg1r},${bg1g},${bg1b} -> ${rgbs(got)}`);
+
+    set_target(win, null);
+
+    // -----------------------------------------------------------------------
+    // 4. THE CONTENT IS REAL
+    // -----------------------------------------------------------------------
+    let sum: i32 = 0;
+    for (let i = 0; i < assets_mesh_count(); i++) { sum = sum + assets_mesh_tris(i); }
+    ck("the reported mesh total is the sum over every mesh, and is non-zero",
+       (sum == assets_mesh_tris_total() && sum > 0) ? 1 : 0);
+    print(`  ${assets_mesh_count()} meshes, ${assets_mesh_tris_total()} triangles`);
+
+    // meshgen bakes UVs into its arena at build time, so a material bound to a
+    // cell texgen never wrote is an untextured mesh forever.  Distinctness
+    // matters too: two materials on one cell means two materials that cannot be
+    // told apart in the frame.
+    let bind_ok: i32 = 1;
+    let mats: array<i32> = [MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD,
+                            MG_MAT_METAL, MG_MAT_CONCRETE, MG_MAT_CLOTH,
+                            MG_MAT_HIDE, MG_MAT_DIRT, MG_MAT_GLASS];
+    for (let i = 0; i < mats.length; i++) {
+        let c: i32 = assets_material_cell(mats[i]);
+        if (c < 0) { bind_ok = 0; }
+        else { if (texgen_cell_generated(c) != 1) { bind_ok = 0; } }
+        for (let j = i + 1; j < mats.length; j++) {
+            if (assets_material_cell(mats[j]) == c) { bind_ok = 0; }
+        }
+    }
+    ck("every mesh material is bound to a distinct cell texgen actually generated",
+       bind_ok);
+
+    ck("the SFX stage is wired, and honestly reports that W3-14 has not landed",
+       (assets_stage_done(AS_STAGE_SFX) == 1 && assets_sfx_count() == 0
+        && assets_sfx(0) == null) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 5. IDEMPOTENCE
+    // -----------------------------------------------------------------------
+    let t0 = assets_tex(ASSET_WORLD);
+    let t1 = assets_tex(ASSET_FX);
+    let t2 = assets_tex(ASSET_HUD);
+    let t3 = assets_tex(ASSET_SKY);
+    let cells_before: i32 = assets_world_cells();
+    let tris_before: i32 = assets_mesh_tris_total();
+
+    ck_i("a second assets_build returns AS_OK", assets_build(win), AS_OK);
+    ck_i("a second assets_build creates no new texture",
+         assets_texture_created(), ASSET_TEX_COUNT);
+    ck("the four texture pointers are unchanged by the second build",
+       (assets_tex(ASSET_WORLD) == t0 && assets_tex(ASSET_FX) == t1
+        && assets_tex(ASSET_HUD) == t2 && assets_tex(ASSET_SKY) == t3) ? 1 : 0);
+    ck("the second build re-ran no stage and changed no content",
+       (assets_seq_len() == AS_STAGE_COUNT
+        && assets_world_cells() == cells_before
+        && assets_mesh_tris_total() == tris_before
+        && assets_total_ms() == cold_total) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 6. RULE T — the warm-boot regression guard
+    // -----------------------------------------------------------------------
+    // This box permanently shares ~17 of 24 cores with a llama-server, so the
+    // bound is a regression guard at ~2x the loaded measurement, not a
+    // certification of an idle machine (CLAUDE.md §1.2).  __clock() is CPU
+    // time; min-of-7 is the closest this box can get to an unloaded number and
+    // the mean is what it costs under real contention — both are printed.
+    let trials: i32 = 7;
+    let best: f64 = 1.0e9;
+    let acc: f64 = 0.0;
+    for (let t = 0; t < trials; t++) {
+        assets_reset();
+        let a0: f64 = __clock();
+        assets_build(win);
+        let a1: f64 = __clock();
+        let ms: f64 = (a1 - a0) * 1000.0;
+        acc = acc + ms;
+        if (ms < best) { best = ms; }
+    }
+    let mean: f64 = acc / f64(trials);
+    print(`warm boot: min-of-${trials} = ${best} ms, mean = ${mean} ms (CPU time, loaded box)`);
+    print(`per-stage (last warm boot):`);
+    for (let i = 0; i < AS_STAGE_COUNT; i++) {
+        print(`   ${assets_stage_name(i)} = ${assets_stage_ms(i)} ms   [${assets_stage_label(i)}]`);
+    }
+
+    ck_i("seven boot cycles created four textures each time and leaked none",
+         assets_texture_created(), ASSET_TEX_COUNT);
+
+    // The acceptance criterion itself: the COLD boot — the one a player pays
+    // for, including skygen's one-shot lattice and star field — inside 400 ms.
+    ck(`the cold boot fits the ${assets_budget_ms()} ms budget (measured ${cold_total} ms)`,
+       (cold_total <= assets_budget_ms()) ? 1 : 0);
+    ck("assets_over_budget agrees with the arithmetic",
+       (assets_over_budget() == ((assets_total_ms() > assets_budget_ms()) ? 1 : 0)) ? 1 : 0);
+    // Regression guard, RULE T: ~2x the loaded warm measurement.  Measured
+    // 2026-07-28 with llama-server on ~17/24 cores: warm min-of-7 = 133 ms
+    // (the closest this box gets to an idle number), warm mean = 136 ms (what
+    // it costs under real contention), cold = 167 ms including skygen's
+    // one-shot lattice and star field.
+    ck("warm boot min-of-7 <= 270 ms regression guard (min-of-7 133 ms 'idle-equivalent', mean 136 ms loaded)",
+       (best <= 270.0) ? 1 : 0);
+    // The world atlas is the single biggest stage; if it ever stops being the
+    // thing to optimise first, the budget conversation has changed.
+    ck("the world atlas is the most expensive stage, as the budget assumes",
+       (cold_stage[AS_STAGE_WORLD] >= cold_stage[AS_STAGE_SKY]
+        && cold_stage[AS_STAGE_WORLD] >= cold_stage[AS_STAGE_MESH]) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 7. THE HEADLESS / RESUMABLE BOOT
+    // -----------------------------------------------------------------------
+    assets_reset();
+    ck("after assets_reset nothing is built and no texture is held",
+       (assets_is_built() == 0 && assets_texture_count() == 0
+        && assets_texture_created() == 0 && assets_stages_done() == 0) ? 1 : 0);
+
+    assets_build(null);
+    ck("a windowless boot runs every CPU stage and defers only the upload",
+       (assets_stages_done() == AS_STAGE_COUNT - 1
+        && assets_stage_done(AS_STAGE_UPLOAD) == 0
+        && assets_texture_count() == 0
+        && assets_mesh_tris_total() > 0) ? 1 : 0);
+
+    ck_i("finishing that boot with a window returns AS_OK", assets_build(win), AS_OK);
+    ck("finishing it uploads exactly the four textures and nothing more",
+       (assets_is_built() == 1 && assets_texture_created() == ASSET_TEX_COUNT
+        && assets_texture_count() == ASSET_TEX_COUNT) ? 1 : 0);
+
+    // -----------------------------------------------------------------------
+    // 8. THE ERROR PATH
+    // -----------------------------------------------------------------------
+    ck("an out-of-range stage index is rejected, not silently ignored",
+       (assets_build_stage(win, AS_STAGE_COUNT) == AS_ERR_STAGE
+        && assets_build_stage(win, 0 - 1) == AS_ERR_STAGE) ? 1 : 0);
+
+    print(`sidecar: ${assets_report_string()}`);
+
+    window_close(win);
+    print(`probe_assets: ${g_pass}/${g_n} passed, ${g_fail} failed (expected ${g_expect} assertions)`);
+    if (g_n != g_expect) {
+        eprint(`ASSERTION COUNT MISMATCH: ran ${g_n}, contract says ${g_expect}`);
+        exit(1);
+    }
+    if (g_fail != 0) { exit(1); }
+}
+
+main();

@@ -547,8 +547,8 @@ carries the fog's hue — which is what shows as a skyline seam — at the art d
 | `command.hml` | `InputCommand` (9 integers, **no bools, no floats, no nulls**) + button bits + quantize/dequantize. Quantized **at construction** so prediction uses the exact value the server will. Imports **nothing**. **W2-9 signatures:** `cmd_new(): object` · `cmd_set(c, tick, dt_ms, mx: f64, my: f64, yaw_rad: f64, pitch_rad: f64, buttons, weapon, seq)` — takes RADIANS and [-1,1] axes, quantizes and clamps inside · `cmd_copy(dst, src)` · `cmd_yaw(c): f64` [0,TAU) · `cmd_pitch(c): f64` (-PI,PI] · `cmd_move_x/y(c): f64` [-1,1] · `cmd_btn(c, bit): i32` 0/1 · `cmd_wire_ok(c): i32` 0 = legal, else a bit per bad field · `cmd_hash(c): i32` · `q_ang(f64): i32` / `dq_ang(i32): f64` / `q_axis(f64): i32` / `dq_axis(i32): f64`. **`q_ang` ROUNDS, it does not truncate** — NETWORKING.md §11.1's pseudo-code truncates and is therefore not idempotent; `src/net/quantize.hml` (W2-12) must round to match. | `cmd_new, cmd_set, cmd_copy, cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, cmd_btn, cmd_wire_ok, cmd_hash, BTN_FIRE..BTN_INV, BTN_ALL, q_ang, dq_ang, q_axis, dq_axis, CMD_FIELDS, CMD_STRIDE, ANG_STEPS, ANG_SCALE, AXIS_STEPS, CMD_TAU, CMD_PI, CMD_MAX_TICK, CMD_MAX_DT_MS, CMD_MAX_WEAPON` |
 | `world.hml` | The SoA `World`: identity / transform / state / owner-only / server-only groups, sparse-set ids, `world_spawn`/`world_despawn` (swap-with-last), kind-partitioned id ranges. Imports nothing — pure storage. **Signatures (W2-10, as built):** `world_new(): object` (cap = `WORLD_CAP_DEFAULT` 512, mirrors `g_MAX_ENTS`) · `world_new_cap(cap): object` · `world_spawn(w, kind, owner): i32` returns a slot or `SLOT_NONE` (-1); refuses `KIND_PLAYER` · `world_spawn_player(w, pslot): i32` (a player id **is** its slot, 1..64, positional per NETWORKING §7.1) · `world_despawn(w, slot): i32` / `world_despawn_id(w, id): i32` · `world_slot_of(w, id): i32` / `world_id_of(w, slot): i32` / `world_alive(w, id): i32` · `world_check(w): i32` (0 = consistent; tools/CI, O(cap)) · `world_reset(w)` keeps the id allocators, `world_reset_session(w, seed)` rewinds them. Per-entity systems **hoist the field arrays** (`let px = w.px;` — never annotate the hoist, see W2-10 report) rather than calling an accessor. | `world_new, world_new_cap, world_spawn, world_spawn_player, world_despawn, world_despawn_id, world_slot_of, world_id_of, world_alive, world_kind_of, world_owner_of, world_count, world_cap, world_tick, world_set_tick, world_seed, world_set_seed, world_replaying, world_set_replaying, world_check, world_reset, world_reset_session, world_id_class, world_kind_range_base, world_next_id, world_spawn_count, world_despawn_count, world_spawn_fail_count, KIND_NONE/PLAYER/AI/NPC/PROJECTILE/PICKUP/PROP/LANTERN/COSMETIC/COUNT, ID_NONE, ID_PLAYER_BASE, ID_PLAYER_MAX, ID_AI_BASE, ID_AI_MAX, ID_PROJ_BASE, ID_PROJ_MAX, ID_PICKUP_BASE, ID_PICKUP_MAX, ID_COSMETIC_BASE, ID_COSMETIC_MIN, SLOT_NONE, WORLD_CAP_DEFAULT, EF_VISIBLE/DEAD/HIT_FLASH/GROUNDED/INVULN/NO_REPLICATE` |
 | `history.hml` | Transform ring buffer, `HISTORY_TICKS = 32`, flat `px[(slot*32)+ring]`. Called every tick even in v1. Every cell also stores the occupying **id**, because `world_despawn` recycles slots — a slot-only rewind would return the wrong body. **Signatures (W2-10, as built):** `history_new(cap): object` · `history_capture(h, w)` (once per tick, O(live count), 0.024 ms @256) · `history_sample(h, slot, id, tick, out): i32` writes `out[HIST_PX..HIST_PITCH]`, returns 1/0, never allocates · `history_find_slot(h, id, tick): i32` is the O(n) fallback when the slot changed · `history_sample_id(h, id, tick, out): i32` combines the two. | `history_new, history_reset, history_capture, history_sample, history_sample_id, history_find_slot, history_ring_of, history_head_tick, history_count_at, history_depth, history_capture_count, HISTORY_TICKS, HISTORY_MASK, HIST_PX, HIST_PY, HIST_PZ, HIST_YAW, HIST_PITCH, HIST_FIELDS, HIST_MISS` |
-| `chunk.hml` | Chunk storage: `buffer(u16)` heights (cm), `buffer(u8)` biome + baked light, sparse edit overlay, dirty flags, LRU cache. | `chunk_key, chunk_get, chunk_height_at, chunk_normal_at, chunk_set_edit, chunk_evict, CHUNK_N` |
-| `worldgen.hml` | Pure `f(seed, cx, cz) → chunk`. 3-octave value noise height, temperature/moisture biome fields, per-chunk POI hash roll. No I/O, no globals. | `worldgen_chunk, worldgen_height, worldgen_biome, worldgen_poi_roll, worldgen_shade_tier` |
+| `chunk.hml` | Chunk storage: `buffer(u16)` heights (cm), `buffer(u8)` biome + baked light, sparse edit overlay, dirty flags, LRU cache with pins. **Built by W3-2 — exact signatures and the injected-source contract are in §5.4b.** | `chunk_key, chunk_get, chunk_height_at, chunk_normal_at, chunk_set_edit, chunk_evict, CHUNK_N` (full list in §5.4b) |
+| `worldgen.hml` | Pure `f(seed, cx, cz) → chunk`. 3-octave value noise height, temperature/moisture biome fields, per-chunk POI hash roll. No I/O, no globals. **Built by W3-1 — exact signatures and the chunk buffer contract are in §5.4a.** | `worldgen_chunk, worldgen_chunk_height_m, worldgen_height, worldgen_height_cm, worldgen_height_rel, worldgen_temp, worldgen_moist, worldgen_relief, worldgen_relief_tm, worldgen_biome, worldgen_biome_tmd, worldgen_shade_tier, worldgen_tier_jitter, worldgen_chunk_dist, worldgen_poi_roll, worldgen_poi_x, worldgen_poi_z, worldgen_block_of, worldgen_is_lantern_chunk, worldgen_lantern_x, worldgen_lantern_z, WG_*` |
 | `daycycle.hml` | tick → day fraction, phase, shade-tier phase bonus, dusk-horn edge. Pure. | `day_frac, day_phase, day_tier_bonus, day_is_night, PHASE_DAWN..PHASE_NIGHT` |
 | `movement.hml` | The movement model from GDD §2.3: walk/sprint/crouch/ADS, accel/friction/air control, jump, slide, slide-jump, mantle, step-up, fall damage, swept capsule vs heightfield. **`PredictedState` lives here.** | `move_apply, predicted_capture, predicted_restore, PS_FIELDS` |
 | `weapons.hml` | The GDD §2.4 data table as parallel `array`s (never objects), falloff, spread/bloom, recoil arrays, ADS/sprint-to-fire timings. **Amended per D2.** | `wpn_dmg_at, wpn_rpm, wpn_mag, wpn_recoil, wpn_spread, wpn_ads_time, WPN_SPARROW..WPN_EMBERLANCE` |
@@ -566,6 +566,184 @@ carries the fog's hue — which is what shows as a skyline seam — at the art d
 | `snapshot.hml` | `snapshot_write(world, viewer_slot, baseline)` / `snapshot_read`. **Always takes a viewer** so interest management has a home. | `snapshot_write, snapshot_read, snapshot_size` |
 | `sim.hml` | `sim_step(world, tick)` — the fixed system order of §4.3. The order is API. | `sim_step, sim_apply_command, sim_effects` |
 
+#### 5.4a `worldgen.hml` — exact signatures (added by W3-1; `chunk.hml`, `poi.hml`, `daycycle.hml` and the terrain renderer code against these)
+
+Everything is a pure function of `(seed, world position)` or `(seed, chunk coordinate)`. No state,
+no I/O, no wall clock, no mutable top-level variable. The module imports **only** `src/core/mathx.hml`.
+
+```hemlock
+// ---- the fields, at any world point (metres)
+worldgen_height(seed: i32, wx: f64, wz: f64): f64          // terrain height, metres
+worldgen_height_cm(seed: i32, wx: f64, wz: f64): i32       // the stored form, rounded, 0..65535
+worldgen_height_rel(seed, wx, wz, relief: f64): f64        // the formula, given a precomputed relief
+worldgen_temp(seed: i32, wx: f64, wz: f64): f64            // [0,1)
+worldgen_moist(seed: i32, wx: f64, wz: f64): f64           // [0,1)
+worldgen_relief(seed: i32, wx: f64, wz: f64): f64          // [0.40, 1.70], continuous
+worldgen_relief_tm(t: f64, m: f64): f64
+worldgen_biome(seed: i32, wx: f64, wz: f64): i32           // WG_BIOME_*
+worldgen_biome_tmd(t: f64, m: f64, d_from_town: f64): i32
+
+// ---- per chunk
+worldgen_chunk_dist(cx: i32, cz: i32): f64                 // chunk centre to town, metres
+worldgen_shade_tier(seed: i32, cx: i32, cz: i32, phase_bonus: i32): i32   // 0..5
+worldgen_tier_jitter(seed: i32, cx: i32, cz: i32): i32     // -1 | 0 | +1
+worldgen_poi_roll(seed: i32, cx: i32, cz: i32): i32        // WG_POI_*
+worldgen_poi_x(seed: i32, cx: i32, cz: i32): f64           // world metres
+worldgen_poi_z(seed: i32, cx: i32, cz: i32): f64
+worldgen_block_of(c: i32): i32                             // chunk coord -> lantern-block coord
+worldgen_is_lantern_chunk(seed: i32, cx: i32, cz: i32): i32
+worldgen_lantern_x(seed: i32, bx: i32, bz: i32): f64       // BLOCK coords, not chunk coords
+worldgen_lantern_z(seed: i32, bx: i32, bz: i32): f64
+
+// ---- the batched form: one chunk into caller-owned buffers.  W3-2 calls this.
+worldgen_chunk(seed: i32, cx: i32, cz: i32, heights: buffer, biomes: buffer): i32   // -> 81, or 0
+worldgen_chunk_height_m(heights: buffer, i: i32, j: i32): f64
+
+// ---- the `chunk.hml` injected-source adapter (W3-2's documented contract),
+//      with the arguments in worldgen's own (seed, cx, cz) order.
+worldgen_chunk_at(seed, cx, cz, heights: buffer, hoff: i32,
+                  attrs: buffer, aoff: i32): i32        // -> META word, or -1
+worldgen_meta_poi(meta: i32): i32                       // WG_POI_*
+worldgen_meta_tier(meta: i32): i32                      // shade tier at phase 0
+worldgen_meta_jitter(meta: i32): i32                    // -1 | 0 | +1
+```
+
+`worldgen_chunk_at` writes 81 u16-LE heights at `hoff`, 81 biome bytes at `aoff` and 81 **baked-light
+bytes at `aoff + 81` filled with 255**. Worldgen does not bake light — light depends on sun angle and
+time of day, neither of which is a property of the world — so the slot is seeded "fully lit" and an
+un-baked chunk renders flat bright and obviously unfinished rather than black, which would look
+exactly like night and hide the bug. `chunk.hml`'s `chunk_set_light` is where the real bake writes
+back. The META word packs bits 0‑2 POI kind, bits 3‑5 shade tier at phase 0, bits 6‑7 jitter + 1.
+
+**The chunk buffer contract.** `worldgen_chunk` writes `WG_CHUNK_SAMPLES` = 81 samples row-major
+with x fastest, `index = j*9 + i`, sample `(i,j)` at world `(cx*32 + i*4, cz*32 + j*4)`:
+
+| buffer | layout | minimum size |
+|---|---|---|
+| `heights` | **u16 little-endian centimetres** at byte offset `index*2` — identical to `heights.read_u16_le(index*2)` | 162 bytes |
+| `biomes` | `u8` `WG_BIOME_*` at byte offset `index` | 81 bytes |
+
+It returns 81 on success and **0** if either buffer is undersized — never a partial write, never a
+throw. Column `i=8` of chunk `(cx,cz)` and column `i=0` of `(cx+1,cz)` are the same world metres and
+therefore the same bytes: the grid is C0-continuous by construction, with no stitching pass.
+
+**Constants:** `WG_CHUNK_N, WG_CHUNK_SAMPLES, WG_CHUNK_M, WG_GRID_M, WG_HEIGHT_STRIDE,
+WG_HEIGHT_SCALE_CM, WG_BASE_M, WG_AMP_M, WG_CELL0_M, WG_CELL1_M, WG_CELL2_M, WG_TEMP_CELL_M,
+WG_MOIST_CELL_M, WG_BIOME_HOLLOWFIELD..WG_BIOME_DEEPSHADE, WG_BIOME_COUNT,
+WG_POI_NONE/LANTERN/RUIN/CARAVAN/SHRINE/BURROW, WG_POI_COUNT, WG_TIER_MAX, WG_TIER_M,
+WG_TOWN_TIER_R_M, WG_TOWN_BIOME_R_M, WG_LANTERN_BLOCK_C, WG_LANTERN_INSET_M, WG_LANTERN_MAX_D_M`.
+
+> **Why the biome indices are `WG_`-prefixed.** §5.3 gives `src/art/biome.hml` (Wave 4) the exports
+> `BIOME_HOLLOWFIELD..BIOME_DEEPSHADE`, and the import wall forbids `src/art/**` from importing
+> `src/sim/**`. Two unprefixed enums naming the same six things in two directories that cannot see
+> each other is a divergence waiting to happen. **The indices belong in `src/core/config.hml`**,
+> which both zones may import; until someone owns that move, `worldgen.hml` prefixes its copy.
+
+> **Lanterns are structural, not rolled.** GDD §4.4 asks for both "1 per ~4 chunks" *and*
+> "guaranteed 1 within 120 m of anywhere". A probability roll delivers the first and can never
+> deliver the second. `worldgen` places exactly one lantern per **2×2-chunk block**, inside the
+> middle half of the block, which bounds the walk to the nearest lantern at
+> `sqrt(48² + 48²) = 67.9 m`. The other four POIs still roll per chunk, with their probabilities
+> divided by 0.75 so the world-wide frequency lands on the GDD's 1-in-6 / 1-in-10 / 1-in-14 /
+> 1-in-20 rather than 25 % short of it.
+
+#### 5.4b `chunk.hml` — exact signatures (added by W3-2; `chunkmesh.hml`, `terrain_render.hml`, `movement.hml`, `combat.hml`, `build.hml` and the boot path code against these)
+
+One store object owns every loaded chunk. It is allocated **once**, at `chunk_store_new`, and never
+grows: two byte arenas (heights, attributes), one 12-byte-per-entry overlay arena, and a fixed set of
+per-chunk `array<i32>` tables. Measured RSS over a 10 000-frame streaming traversal: **flat, 0 KB
+growth** (`tools/probe_chunk.hml` §9).
+
+```hemlock
+// ---- construction.  cap = hard chunk cap; edit_cap = hard overlay cap.
+chunk_store_new(): object                                  // g_CHUNK_CACHE (64), 4096 edits, g_WORLD_SEED_DEFAULT
+chunk_store_new_cap(cap: i32, edit_cap: i32, seed: i32): object
+chunk_set_source(cs: object, f): i32                       // THE GENERATOR — see the contract below
+chunk_has_source(cs): i32
+chunk_cap(cs): i32 · chunk_resident(cs): i32 · chunk_seed(cs): i32
+chunk_set_seed(cs, seed): i32                              // drops residency, KEEPS edits
+
+// ---- keys and coordinates
+chunk_key(cx: i32, cz: i32): i32                           // 30-bit pack; identity is (cx,cz), not the key
+chunk_sample_index(ix: i32, iz: i32): i32                  // si = iz*9 + ix, -1 if out of range
+chunk_at_m(w: f64): i32                                    // world metres -> chunk coordinate (floor)
+
+// ---- residency.  A slot is stable while pinned or until the next evicting get.
+chunk_get(cs, cx, cz): i32                                 // slot, or SLOT_NONE (-1): no source, or all pinned
+chunk_find(cs, cx, cz): i32                                // lookup WITHOUT loading
+chunk_evict(cs, cx, cz): i32                               // 1 evicted / 0 absent / -1 REFUSED (pinned)
+chunk_evict_lru(cs): i32 · chunk_drop_all(cs): i32
+chunk_pin_ring(cs, ccx, ccz, r): i32                       // unpin all, load+pin (2r+1)^2, return count
+chunk_pin(cs, cx, cz, on): i32 · chunk_pinned(cs, slot): i32
+
+// ---- dirty flags: CDIRTY_HEIGHT | CDIRTY_LIGHT | CDIRTY_MESH (CDIRTY_ALL = 7)
+chunk_dirty(cs, slot): i32 · chunk_mark_dirty(cs, slot, bits): i32 · chunk_clear_dirty(cs, slot, bits): i32
+chunk_meta(cs, slot): i32                                  // the opaque i32 the source returned
+
+// ---- samples.  si = iz*CHUNK_N + ix, 0..80.
+chunk_height_gen(cs, slot, si): i32                        // GENERATED cm, edits excluded
+chunk_height_cm(cs, slot, si): i32                         // EFFECTIVE cm, edit applied
+chunk_biome(cs, slot, si): i32 · chunk_light(cs, slot, si): i32
+chunk_set_light(cs, slot, si, v): i32                      // dirties LIGHT|MESH, not HEIGHT
+
+// ---- the two the sim calls.  Bilinear, inside one chunk, no neighbour fetch.
+chunk_height_at(cs, wx: f64, wz: f64): f64                 // METRES, or CHUNK_H_MISS (-1000000.0)
+chunk_normal_at(cs, wx: f64, wz: f64, out: array<f64>): i32 // out[0..2], analytic gradient of the same patch
+
+// ---- the sparse edit overlay: the world diff, keyed by (cx, cz, si), NEVER baked
+chunk_set_edit(cs, cx, cz, si, cm): i32                    // 1 ok / 0 refused (full or out of range)
+chunk_clear_edit(cs, cx, cz, si): i32 · chunk_edit_get(cs, cx, cz, si): i32   // cm or EDIT_NONE (-1)
+chunk_edit_count(cs): i32 · chunk_edit_cap(cs): i32 · chunk_edit_full_count(cs): i32
+chunk_edits_in(cs, cx, cz): i32 · chunk_clear_edits(cs): i32
+chunk_edits_bytes(cs): i32                                 // 12 + 16*count
+chunk_edits_save(cs, dst: buffer): i32                     // bytes written, -1 if dst too small
+chunk_edits_load(cs, src: buffer): i32                     // edits loaded, -1 on bad magic/version/truncation
+
+// ---- counters and accounting (every refusal is visible)
+chunk_load_count · chunk_evict_count · chunk_hit_count · chunk_miss_count
+chunk_refused_count · chunk_no_source_count · chunk_sample_miss_count
+chunk_height_bytes(cs): i32 · chunk_attr_bytes(cs): i32 · chunk_overlay_bytes(cs): i32
+chunk_table_entries(cs): i32 · chunk_bytes_per_sample(cs): f64      // 2.00, by construction
+```
+
+**Constants:** `CHUNK_N (9), CHUNK_CELLS (8), CHUNK_SAMPLES (81), CHUNK_M (32.0), CHUNK_CELL_M (4.0),
+CHUNK_CM_PER_M (100.0), CHUNK_H_MAX_CM (65535), CHUNK_H_STRIDE_B (162), CHUNK_A_STRIDE_B (162),
+CHUNK_EDIT_ENTRY_B (12), CHUNK_EDIT_CAP_DEFAULT (4096), SLOT_NONE (-1), EDIT_NONE (-1),
+CHUNK_H_MISS (-1000000.0), CDIRTY_NONE/HEIGHT/LIGHT/MESH/ALL, CHUNK_SAVE_MAGIC/VER/HDR_B/REC_B`.
+
+**THE INJECTED-SOURCE CONTRACT.** `chunk.hml` does **not** import `worldgen.hml` — W3-1 and W3-2 were
+built in the same sub-wave, and a content dependency inside a wave is exactly what the
+WAVE-CONSTRUCTION RULE forbids. The store is handed a generator instead:
+
+```hemlock
+fn source(hbuf: buffer, hoff: i32, abuf: buffer, aoff: i32, cx: i32, cz: i32, seed: i32): i32
+//   writes 81 u16 LE centimetre heights at BYTE offset hoff of hbuf, si = iz*9 + ix
+//   writes 81 biome bytes at aoff, then 81 baked-light bytes at aoff + 81
+//   returns one opaque i32, stored verbatim as the chunk's META word
+```
+
+With no source installed, `chunk_get` **refuses** (returns `SLOT_NONE`, increments
+`chunk_no_source_count`). There is deliberately no fallback terrain in the file to accidentally ship.
+
+**The five-line adapter to `worldgen.hml`** belongs to the boot path (W3-13 / `src/game/main.hml`).
+`worldgen_chunk` writes from offset 0 of two dedicated buffers and range-checks their length, so the
+adapter owns two scratch buffers allocated **once** (162 B and 81 B) and `memcpy`s 243 B into the
+arena per chunk load — ~50 ns against a ≥ 100 µs generation, and zero per-frame allocation:
+
+```hemlock
+let g_ws_h: buffer = buffer(162);        // startup, once
+let g_ws_b: buffer = buffer(81);
+fn ns_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                   p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    worldgen_chunk(p_seed, p_cx, p_cz, g_ws_h, g_ws_b);
+    memcpy(ptr_offset(buffer_ptr(p_hbuf), p_hoff, 1), buffer_ptr(g_ws_h), 162);
+    memcpy(ptr_offset(buffer_ptr(p_abuf), p_aoff, 1), buffer_ptr(g_ws_b), 81);
+    // light is baked later by the day cycle / lanterns; the META word carries the POI roll
+    let meta: i32 = worldgen_poi_roll(p_seed, p_cx, p_cz);
+    return meta;
+}
+```
+
 ### 5.5 `nightshade/src/net/` — v1 loopback, v2 gn.hml
 
 | File | Purpose | Exports |
@@ -579,7 +757,7 @@ carries the fog's hue — which is what shows as a skyline seam — at the art d
 
 | File | Purpose | Exports |
 |---|---|---|
-| `render_snapshot.hml` | The `RenderSnapshot` SoA of §3.1 + `snapshot_build(rs, world, alpha)`. In v2 the same function reads network snapshots. | `rsnap_new, rsnap_build, rsnap_build_from_net, rsnap_field_*` |
+| `render_snapshot.hml` | The `RenderSnapshot` SoA of §3.1 + `rsnap_build(rs, world, alpha)`. In v2 the same function reads network snapshots. **§4 stage 4 and §6.3 spell it `snapshot_build`; both names exist and are the same function** (W3-6). Discrete fields (`model/frame/tint/flags`) are sample-and-held at tick n-1 for `alpha < 1` and tick n at `alpha == 1`, so BOTH endpoints reproduce a raw tick state exactly. Entities are matched across ticks by **id**, never by slot. The `rsnap_field_*` arrays must be re-hoisted every frame. | `rsnap_new, rsnap_new_cap, rsnap_reset, rsnap_build, snapshot_build, rsnap_build_from_net, rsnap_netframe_new, rsnap_set_viewer, rsnap_viewer, rsnap_set_eye_height, rsnap_set_cull_radius, rsnap_set_cam, rsnap_set_cam_roll, rsnap_set_cam_fov, rsnap_count, rsnap_cap, rsnap_index_of, rsnap_field_{id,x,y,z,yaw,pitch,model,frame,tint,flags}, rsnap_cam_{x,y,z,yaw,pitch,roll,fov}, rsnap_{alpha,source,builds,rolls,dropped,culled,pops,rehomed,cur_tick,prev_tick}, rsnap_ang_lerp, rsnap_ang_delta, flags_from_sim, RSNAP_CAP, RSF_{VISIBLE,HIT_FLASH,MUZZLE,DISSOLVE,LOCAL,DEAD}, RSNAP_SRC_{SIM,NET}, RSNAP_MISS` |
 | `view.hml` | Camera basis from yaw/pitch (never `mat_look_at`), FOV lerp (70 hip / 58 ADS / 78 sprint), screen shake, `recoil_view` (which **never leaves the client**), the MVP. | `view_new, view_build, view_shake, view_mvp, view_eye` |
 | `chunkmesh.hml` | Chunk → cached flat vertex arena (LOD0 128 tris / LOD1 32 / LOD2 8) with baked per-vertex lighting, AO in creases, biome tint, and low-frequency value patchiness. Rebuilt only when dirty. | `cmesh_build, cmesh_get, cmesh_invalidate, cmesh_budget_step` |
 | `terrain_render.hml` | Ring walk, per-chunk frustum sphere test, LOD selection by distance, skirts, `emit_mesh_buf` per chunk. | `terrain_emit, terrain_stats` |
@@ -588,9 +766,95 @@ carries the fog's hue — which is what shows as a skyline seam — at the art d
 | `fx.hml` | Client-only particle SoA (cap 512, negative ids), tracers, muzzle flashes, impact bursts, ember motes, damage numbers, decals, glow cards. | `fx_new, fx_update, fx_emit, fx_spawn_muzzle, fx_spawn_impact, fx_spawn_tracer, fx_spawn_number, fx_spawn_dissolve` |
 | `hud.hml` | ART_BIBLE §9 verbatim: crosshair with real spread bloom, hitmarker, health, ammo, compass, minimap, killfeed, XP bar, popups, damage vignette, hit-direction arcs, reload bar, interact prompt. ≤ 250 tris, hard-capped. | `hud_new, hud_build, hud_event, hud_set_tri_cap` |
 | `postfx_geo.hml` | Vignette ring (static + damage summed into the same 16 tris), composite MOD overlay (dither + grain + edge bleed, 3 pre-baked variants cycled per frame), sprint speed lines, lightning/level-up flashes. | `postfx_build_overlay, postfx_emit, postfx_flash, postfx_set_vignette` |
-| `world_render.hml` | The frame-graph orchestrator: owns the four batches, calls stages 11–27 of §4 in order. **The only file that knows the layer order.** | `frame_render, frame_init, frame_batches` |
+| `world_render.hml` | The frame-graph orchestrator: owns the four batches, the RenderEnv, the view/MVP/frustum, the sky mapping and the render-world registry; runs **stages 8–23 (`frame_render`) and 25–28 (`frame_present`)** of §4 in order. **The only file that knows the layer order.** Stage 6 (`tod_eval`), stage 7 (skygen) and stage 24 (the HUD) are the CALLER's — see 5.6b. | `frame_init, frame_batches, frame_begin, frame_render, frame_present, frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets, frame_set_camera, frame_set_clear, frame_set_sheet_clear, frame_set_options, frame_set_hud_solid_uv, frame_set_vignette_colour, frame_set_flash_colour, frame_env, frame_mvp, frame_frustum, frame_batch_sky/world/fx/hud, frame_camera_x/y/z, world_clear, world_chunk_add, world_prop_add, world_fx_add, world_chunk_count, world_chunk_mesh, world_prop_count, world_prop_tag/x/y/z/scale, world_fx_count, terrain_set, terrain_seed, terrain_ridge, terrain_h, vnoise2, h2, sky_basis, sky_uv_at, sky_u, sky_v, g_D2R, g_NEAR, g_GUARD, g_CAP_*, g_FXK_SPRITE/RAIN/TRACER, g_LOD_FOG_CARD` |
 | `map.hml` | The world map screen: lit lanterns, Wick Lines, discovered chunks, the obelisk records. (Wave 4.) | `map_build, map_toggle` |
 | `menu.hml` | Title, pause, level-up card, unlock card, settings. (Wave 4.) | `menu_build, menu_input, menu_state` |
+
+#### 5.6a `view.hml` — exact signatures (added by W3-5)
+
+The §4 stage-8 sketch reads `view_build(g_view, g_rsnap)`. **The shipped signature
+is `view_build(view, dt_seconds, tick)`**, with the camera pushed in beforehand.
+Two reasons, both load-bearing:
+
+1. `view.hml` must be drivable by an *interactive* caller (the walkaround reads
+   the mouse every frame and there is no snapshot in sight) as well as by a
+   scripted one. A `RenderSnapshot` parameter would make mouse-look impossible
+   without faking a snapshot.
+2. The FOV lerp, the `recoil_view` decay and the shake envelope all run on
+   **frame** time, which no snapshot carries. `dt` has to be an argument.
+
+`view_apply_camera` is the one-line bridge W3-7 uses to feed it a snapshot's
+`cam_*` fields. `cam_fov` from the snapshot goes to `view_set_fov_target` — the
+snapshot carries the *target*, the lerp itself is client-side presentation.
+
+```hemlock
+fn view_new(): object                                  // preallocated; call view_build once
+fn view_build(v: object, dt_seconds: f64, tick: i32)   // stage 8, once per frame
+
+// camera input — either bridge from a snapshot, or drive it live
+fn view_apply_camera(v, x, y, z, yaw, pitch)           // rsnap cam_x/y/z + cam_yaw/cam_pitch
+fn view_set_eye(v, x, y, z)
+fn view_set_angles(v, yaw, pitch)                      // ABSOLUTE; pitch clamps to +/-85 deg
+fn view_look(v, dyaw, dpitch)                          // relative, radians
+fn view_look_mouse(v, dx, dy, sens)                    // relative, raw SDL counts; +dy looks down
+fn view_sens_scale(v): f64                             // the ADS slowdown
+fn view_wrap_pi(a: f64): f64
+
+// projection
+fn view_set_viewport(v, w, h)   fn view_set_aspect(v, a)   fn view_set_near(v, n)
+fn view_set_fog_far(v, fog_far)                        // clamps to 72; far = fog_far * 1.06
+fn view_set_fov_mode(v, mode)   fn view_set_fov_target(v, deg)   fn view_snap_fov(v)
+fn view_fov_for_mode(mode: i32): f64
+constants g_VIEW_HIP / g_VIEW_ADS / g_VIEW_SPRINT
+
+// client-only cosmetics — see the recoil_view wall below
+fn view_kick(v, dpitch, dyaw, droll)   fn view_kick_fire(v, scale, lateral)
+fn view_clear_kick(v)                  fn view_set_roll(v, roll)
+fn view_shake(v, amount01)             fn view_shake_fire(v)
+fn view_clear_shake(v)                 fn view_set_seed(v, seed: i32)
+
+// readers
+fn view_mvp(v): array                  // retained; hand to emit_set_mvp / frustum_from_mvp
+fn view_matrix(v): array               fn view_mvp_at(v, i): f64
+fn view_eye(v): object                 fn view_eye_x|y|z(v): f64
+fn view_aim_yaw|aim_pitch(v): f64      // AUTHORITATIVE. Recoil-free. Goes to cmd_set.
+fn view_aim_forward_x|y|z(v): f64      // AUTHORITATIVE. What a bullet uses.
+fn view_render_yaw|render_pitch|render_roll(v): f64   // CLIENT-ONLY. MVP only.
+fn view_kick_pitch|kick_yaw|kick_roll(v): f64
+fn view_fov|fov_target|aspect|near|far|fog_far|trauma|shake_x|shake_y(v): f64
+fn view_fov_mode(v): i32               fn view_tick(v): i32
+fn view_project(v, x, y, z, out: array<f64>): i32      // cold; [sx, sy, w, ndc_z]
+```
+
+**The two angle pairs are the whole point of the module.** `view_aim_*` is
+bit-identical to what the caller set and is the pair that reaches
+`sim_apply_command`; `view_render_*` is `aim + recoil_view` and reaches nothing
+but the MVP. Screen shake is deliberately **not** in the MVP — it is a
+present-time translation via `target_set_shake`, so frustum culling stays stable
+while the screen shakes.
+
+#### 5.6b `src/render/**` MAY NOT IMPORT `src/art/**` — found by W3-0a, and it is load-bearing
+
+`ci_imports.sh` R1 allows the render zone wobbleweed, `src/core/**`, `src/sim/**` and `@stdlib/*`.
+It does **not** allow `src/art/**`, and CLAUDE.md §3's table says the same. That is a real
+constraint, not an oversight in the script: it is what keeps the renderer testable without an art
+pipeline and what stops colour from leaking into geometry code.
+
+**Consequence, discovered while extracting the frame graph out of `tools/shot.hml`:** everything
+art-derived must arrive at a render module as a **handle or a number**, never as an import.
+`world_render.hml` therefore takes texture handles, an atlas handle, mesh handles, atlas cell ids,
+uv rects and rgb triples through `frame_bind_*` / `frame_set_*` / `world_*_add`, and §4's stages 6
+(`tod_eval`) and 7 (`skygen_rebake_slice`) stay with the caller — which is where §4 already puts
+them, in the SNAPSHOT block above VIEW. Two knock-ons for the rest of Wave 3:
+
+* `hud.hml`, `fx.hml`, `entity_render.hml`, `postfx_geo.hml` and `terrain_render.hml` hit the same
+  wall. Each needs the same treatment: the art module is called by `src/game/assets.hml` (or by the
+  tool), and the render module is handed the result.
+* The frame graph is consequently **two calls with a hole in the middle** — `frame_render()` ends
+  after stage 23 (the vignette, already in `LAYER_HUD`), the caller emits stage 24 into
+  `frame_batch_hud()`, and `frame_present()` runs 25–28. `LAYER_HUD` is flushed in insertion order,
+  so this preserves the postfx-under-HUD order exactly; it is the only structural difference
+  between the extracted graph and the Wave-2 function it came from.
 
 ### 5.7 `nightshade/src/game/`
 

@@ -1,0 +1,1304 @@
+// render_snapshot.hml — the read-only bridge from the sim to the renderer.
+//
+// Nightshade W3-6.  ARCHITECTURE §3.1 (the struct), §4 stage 4 (where it runs),
+// §5.6 (the exports).  NETWORKING recon §6.3, §9.4, §11.4.
+//
+// =============================================================================
+// WHY THIS FILE EXISTS AT ALL IN A SINGLE-PLAYER v1
+// =============================================================================
+// `frame_render` receives a RenderSnapshot, never the `World`.  Two independent
+// reasons, and both of them are structural rather than stylistic:
+//
+//  1. INTERPOLATION IS MANDATORY ANYWAY.  The sim runs at a fixed 60 Hz and the
+//     renderer does not (ARCHITECTURE §3: "the sim loop runs 0, 1, or N times
+//     per frame").  Drawing `world.px[i]` directly makes every entity judder
+//     the moment the frame rate leaves 60, which it will, at 2500 triangles on
+//     a software rasteriser.
+//
+//  2. IT IS THE v2 SEAM.  In v2 the renderer must interpolate between two
+//     *network* snapshots that arrive at 20 Hz, at
+//     `render_time = latest - INTERP_DELAY_MS` (NETWORKING §9.4).  Because the
+//     renderer already consumes "a transform blended from two states", that
+//     swap is `rsnap_build` -> `rsnap_build_from_net` and nothing else.  Both
+//     functions are here, both have the identical signature, and they share
+//     one code path — see `rsnap_ingest`.  If the renderer instead read
+//     `world.*`, every remote entity would teleport 20 times a second and the
+//     fix would be a renderer rewrite (NETWORKING anti-pattern 7).
+//
+// The corollary is the rule in CLAUDE.md §7: **the renderer reads
+// RenderSnapshot, never `world.*`.**  Nothing in `src/render/**` may take a
+// `World`.  This file is the only exception, and it only ever READS.
+//
+// =============================================================================
+// THE IMPORT WALL
+// =============================================================================
+// `src/render/**` may import wobbleweed, `src/render/**`, `src/core/**` and
+// read-only structs from `src/sim/**`.  This file imports `src/core/config.hml`
+// (caps and the eye height) and `src/sim/world.hml` (the `EF_*` flag bits and
+// `ID_NONE`) and nothing else.  It imports no wobbleweed and no SDL, so it
+// links into the headless sim tools as well as into the game.
+//
+// It NEVER writes a field of the world.  Every access below is a read.
+//
+// =============================================================================
+// THE TIME MODEL — read this before touching `alpha`
+// =============================================================================
+// The game loop (ARCHITECTURE §3) is:
+//
+//     while (g_acc >= TICK_MS) { sim_step(...); g_acc -= TICK_MS; g_tick++; }
+//     let alpha = g_acc / TICK_MS;              // 0 <= alpha < 1
+//     snapshot_build(g_rsnap, g_world, alpha);
+//
+// After the inner loop the world holds the state of tick `n`, and `g_acc` is
+// the wall time already accumulated toward tick `n+1`.  We interpolate between
+// tick `n-1` and tick `n`, so:
+//
+//     alpha = 0   =>  render exactly the state at tick n-1
+//     alpha -> 1  =>  render exactly the state at tick n
+//
+// The renderer is therefore ALWAYS between zero and one tick behind the sim.
+// That 0-16.7 ms of latency is the standard fixed-timestep trade and it is what
+// buys judder-free motion; do not "fix" it by extrapolating.  `alpha` is
+// clamped to [0,1] here: extrapolation past tick n would need velocity, would
+// overshoot on every direction change, and has no defined behaviour at a
+// spawn.  If a frame is so long that alpha would exceed 1, the sim ran another
+// tick and alpha is small again.
+//
+// =============================================================================
+// WHAT IS INTERPOLATED, WHAT IS SAMPLE-AND-HELD, AND WHY
+// =============================================================================
+// CONTINUOUS  x, y, z, yaw, pitch          linearly blended by alpha; angles
+//                                          take the SHORT way around +-pi.
+// DISCRETE    id, model, frame, tint, flags
+//                                          NOT blended.  There is no meaningful
+//                                          value "half way between model 3 and
+//                                          model 4", and a tint blended across
+//                                          a hit-flash boundary produces a
+//                                          colour that was never authored.
+//
+// A discrete field is a step function of time.  It is piecewise constant on
+// [t(n-1), t(n)) and takes tick n's value at t(n).  So the discrete source is
+// tick n-1 for alpha < 1 and tick n at alpha == 1.  That is not a compromise;
+// it is the correct sample-and-hold of a step function, and it is what makes
+// BOTH endpoints exact:
+//
+//     alpha = 0  ->  output == the raw tick n-1 state, every field
+//     alpha = 1  ->  output == the raw tick n   state, every field
+//
+// It also keeps the discrete state CONSISTENT with the transform it is drawn
+// on: at alpha = 0.3 the body is 30 % of the way from tick n-1 to tick n, and
+// the flags are tick n-1's.  Sourcing flags from tick n instead would show a
+// hit-flash on a body that has not yet been hit at the instant being rendered.
+// In the real loop the difference is at most one 16.7 ms tick.
+//
+// =============================================================================
+// MEMBERSHIP — which entities are in the snapshot
+// =============================================================================
+// The snapshot lists the entities that exist at tick n (`cur`), not at tick
+// n-1.  Consequences, all deliberate:
+//
+//  * An entity that SPAWNED on tick n has no tick n-1 state to blend from.  It
+//    is emitted at its exact tick n transform, uninterpolated, at every alpha,
+//    and counted in `rsnap_pops`.  The alternative — blending from an
+//    all-zero row — would fling it in from the world origin.
+//  * An entity that DESPAWNED on tick n is gone immediately.  No ghost frame.
+//  * Slot churn is handled by ID, never by slot: `world_despawn` swaps the last
+//    slot into the hole, so slot i at tick n and slot i at tick n-1 are not
+//    necessarily the same entity.  Matching by slot would silently interpolate
+//    one entity's position toward a completely different entity's.  The fast
+//    path is `prev.id[i] == cur.id[i]` (true for every entity in a tick with no
+//    despawns); the fallback is an open-addressed id->slot table over `prev`,
+//    rebuilt once per TICK, never per frame.
+//
+// =============================================================================
+// PERFORMANCE CONTRACT
+// =============================================================================
+//  * ZERO ALLOCATIONS PER FRAME.  Every array is allocated once in
+//    `rsnap_new_cap`.  Nothing below calls `push`, `alloc`, `buffer`, a literal
+//    `{}` or `[]`, or a template string outside the constructor.  The
+//    double-buffer roll swaps two OBJECT REFERENCES; it copies no array.
+//  * No closure, no `defer`, no `try`, no `throw`, no `spawn`, no `print`.
+//  * Field arrays are hoisted into locals before every loop, UNANNOTATED.
+//    `let cx: array<f64> = c.x;` costs an O(length) conversion walk on EVERY
+//    call (7.82 us vs 0.03 us on a 16 384-element field, measured on v2.9.1 by
+//    W2-10); `let cx = c.x;` is O(1) and aliases identically.  A return-type
+//    annotation is fine — measured 0.049 us vs 0.059 us on the same array —
+//    which is why the `rsnap_field_*` accessors below are annotated and the
+//    hoists are not.
+//  * The per-entity loop hand-inlines the angle wrap (A9) and calls nothing on
+//    the fast path.  `idx_find` is called only for an entity whose slot moved.
+//
+// MEASURED, `hemlockc -O1`, `__clock` CPU time, min of 7, on a box permanently
+// sharing ~17 of 24 cores with a llama-server.  `tools/probe_rsnap.hml` prints
+// this table on every run, so it can never go stale silently:
+//
+//     entities   interpolate only   + tick roll (worst case)
+//        32            -                  0.023 ms
+//        64          0.018 ms             0.043 ms
+//       256          0.065 ms             0.163 ms
+//
+// "interpolate only" is a frame in which the sim did not tick — every frame
+// when the render rate exceeds 60 Hz.  "+ tick roll" also pays one full copy of
+// the world's ten SoA columns plus the discrete publish, and at 60 fps against
+// a 60 Hz sim that is every frame.
+//
+// ⚠ W3-6's acceptance criterion is "<= 0.1 ms at 256 entities".  THAT IS MET ON
+// THE INTERPOLATE-ONLY PATH (0.065 ms) AND NOT ON THE TICK-ROLL PATH
+// (0.163 ms), and the shortfall is reported rather than hidden behind a
+// loosened bound.  Why it is not reachable: a roll touches ~31 array elements
+// per entity and every array element operation in Hemlock is a boxed `HmlValue`
+// op costing ~7 ns (measured: a 10-element-per-entity pure copy of a 256-row
+// array is 0.018 ms).  256 x 31 x 7 ns = 0.055 ms before any arithmetic, and
+// interpolation adds 15 more touches plus two angle wraps.  The copy itself is
+// irreducible — tick n-1's transform has to be captured before the sim
+// overwrites it, and aliasing the world's arrays instead would alias the very
+// buffer the next tick destroys.
+//
+// Context for the number, not an excuse for it: 256 is `g_MAX_RENDER_ENTS`, the
+// CAP.  256 entities at even 8 triangles each is 2048 of the 2500-triangle
+// frame budget, so a frame that also draws terrain, a viewmodel, FX and a HUD
+// carries tens of entities.  At the realistic working set the worst case is
+// 0.023 ms (32 ents) to 0.043 ms (64 ents), and even the 256-entity worst case
+// is 1.0 % of the 16.67 ms frame.  If a future scene genuinely needs 256
+// entities inside 0.1 ms, `rsnap_set_cull_radius` is the lever that exists for
+// it, and it is applied at ingest so it shrinks both halves of the cost.
+//
+// =============================================================================
+// WHAT IS NOT HERE, ON PURPOSE
+// =============================================================================
+//  * No `world` write of any kind.
+//  * No particles, decals or damage numbers.  Those are client-only cosmetics
+//    with NEGATIVE ids and they live in `src/render/fx.hml` (W3-10) in their
+//    own SoA.  Putting them here would mean the 256-entity render cap competes
+//    with the 512-particle cap for the same slots.
+//  * No camera POLICY.  This file fills `cam_*` from the viewer entity's
+//    interpolated transform because that is data, not policy.  FOV lerp, screen
+//    shake, `recoil_view` and the final basis belong to `view.hml` (W3-5),
+//    which reads this snapshot.  `cam_roll` and `cam_fov` are storage here and
+//    are written by `view.hml` through the setters below; `recoil_view` never
+//    leaves the client and must never reach `sim_apply_command`.
+
+import { g_MAX_RENDER_ENTS, g_EYE_STAND } from "../core/config.hml";
+import { EF_VISIBLE, EF_DEAD, EF_HIT_FLASH, ID_NONE } from "../sim/world.hml";
+
+// ---------------------------------------------------------------------------
+// CAPACITY
+// ---------------------------------------------------------------------------
+// Mirrors `g_MAX_RENDER_ENTS` (256).  The world holds up to `g_MAX_ENTS` (512)
+// entities, so overflow is possible and is HANDLED, not asserted away: the
+// surplus is dropped and counted in `rsnap_dropped`.  A dropped entity is a
+// missing enemy, so the counter is a bug detector, not a statistic.
+export let RSNAP_CAP = g_MAX_RENDER_ENTS;
+
+// ---------------------------------------------------------------------------
+// RENDER FLAG BITS  (ARCHITECTURE §3.1: "bit 0 visible, 1 hit-flash, 2 muzzle,
+// 3 dissolve, ...")
+// ---------------------------------------------------------------------------
+// These are the RENDERER's bits and they are deliberately NOT the sim's `EF_*`
+// bits — the sim's bit 1 is EF_DEAD, the renderer's bit 1 is hit-flash.  The
+// translation happens once, at ingest, in `flags_from_sim`.  Two layouts with
+// one explicit translation is safer than one shared layout that quietly
+// couples the render feature set to the replication format: the sim may not
+// grow a `muzzle` bit just because the renderer wants one, and the renderer
+// must not pay a replication cost for `dissolve`, which is client-local.
+export let RSF_VISIBLE   = 1;
+export let RSF_HIT_FLASH = 2;
+export let RSF_MUZZLE    = 4;
+export let RSF_DISSOLVE  = 8;
+export let RSF_LOCAL     = 16;   // this entity is the viewer (first-person body)
+export let RSF_DEAD      = 32;
+
+// Which producer filled the snapshot last.  v1 is always SIM; the v2 client
+// sets NET.  Kept as a stat so a mis-wired client is visible in `benchframe`
+// rather than only in the picture.
+export let RSNAP_SRC_SIM = 0;
+export let RSNAP_SRC_NET = 1;
+
+// Returned instead of a null.  Nulls are banned project-wide (a null silently
+// truncates the rest of a packet, CLAUDE.md §7).
+export let RSNAP_MISS = -1;
+
+let RS_PI      = 3.141592653589793;
+let RS_TAU     = 6.283185307179586;
+let RS_INV_TAU = 0.15915494309189535;
+
+// ---------------------------------------------------------------------------
+// CONSTRUCTION  (the only allocating code in the file)
+// ---------------------------------------------------------------------------
+
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// One raw tick state: the sim's transform + discrete groups, already
+// translated into render space (render flag bits, `frame` from `world.anim`).
+// Two of these exist per snapshot and their references are swapped, never
+// their contents.
+fn tickstate_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    let s: object = {
+        tick: -1,          // -1 = never filled; sim ticks are >= 0
+        count: 0,
+        vi: RSNAP_MISS,    // index of the viewer entity in this state, or MISS
+        id: zeros_i(cap),
+        x: zeros_f(cap),
+        y: zeros_f(cap),
+        z: zeros_f(cap),
+        yaw: zeros_f(cap),
+        pitch: zeros_f(cap),
+        model: zeros_i(cap),
+        frame: zeros_i(cap),
+        tint: zeros_i(cap),
+        flags: zeros_i(cap)
+    };
+    let out: object = s;
+    return out;
+}
+
+// Power-of-two table size, >= 4*cap, minimum 64.  A 25 % load factor keeps the
+// average probe length at ~1.1.
+fn idx_size_for(p_cap: i32): i32 {
+    let cap: i32 = p_cap;
+    let n: i32 = 64;
+    while (n < cap * 4) { n = n * 2; }
+    let out: i32 = n;
+    return out;
+}
+
+// A snapshot sized for the shipping render cap.
+export fn rsnap_new(): object {
+    let out: object = rsnap_new_cap(RSNAP_CAP);
+    return out;
+}
+
+// A snapshot holding at most `p_cap` entities.  EVERYTHING is allocated here.
+export fn rsnap_new_cap(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let hcap: i32 = idx_size_for(cap);
+
+    let rs: object = {
+        cap: cap,
+
+        // ---- THE OUTPUT.  This is what `frame_render` reads. -------------
+        count: 0,
+        id: zeros_i(cap),
+        x: zeros_f(cap),
+        y: zeros_f(cap),
+        z: zeros_f(cap),
+        yaw: zeros_f(cap),
+        pitch: zeros_f(cap),
+        model: zeros_i(cap),
+        frame: zeros_i(cap),
+        tint: zeros_i(cap),
+        flags: zeros_i(cap),
+
+        // ---- the camera --------------------------------------------------
+        // cam_x/y/z/yaw/pitch are DATA: the viewer entity's interpolated
+        // transform, plus the eye height.  cam_roll and cam_fov are POLICY and
+        // are written by view.hml; they are stored, never derived, here.
+        cam_x: 0.0,
+        cam_y: 0.0,
+        cam_z: 0.0,
+        cam_yaw: 0.0,
+        cam_pitch: 0.0,
+        cam_roll: 0.0,
+        cam_fov: 0.0,
+        eye_h: g_EYE_STAND,
+        viewer_id: ID_NONE,
+
+        // ---- interest management (NETWORKING §11.4) ----------------------
+        // 0 disables it.  Non-zero drops entities further than `cull_r` metres
+        // from the viewer AT INGEST, so the cost is paid once per tick.  The
+        // comparison is on squared distance; there is no sqrt on this path.
+        cull_r2: 0.0,
+
+        // ---- the two raw tick states -------------------------------------
+        cur: tickstate_new(cap),
+        prev: tickstate_new(cap),
+
+        // ---- the cur -> prev row map, resolved ONCE PER TICK --------------
+        // `pj[i]` is the row in `prev` holding the same entity as row i of
+        // `cur`, or RSNAP_MISS if the entity spawned this tick.  Resolving it
+        // at the roll instead of inside the per-frame loop is the single
+        // biggest win in this file: the interpolation loop then does no id
+        // compare, no hash and no branch on membership.
+        //
+        // `ident` is the common case made explicit: no spawn and no despawn
+        // happened, so `pj[i] == i` for every i and `pj` is not read at all.
+        // At 60 Hz with a handful of entities per second changing, `ident` is
+        // true on the overwhelming majority of ticks, and it also lets the
+        // roll skip the hash rebuild entirely.
+        pj: zeros_i(cap),
+        ident: 0,
+        // Which tick's discrete fields the OUTPUT arrays currently hold.  The
+        // discrete group is constant for a whole tick, so it is written at the
+        // roll and only rewritten if alpha crosses the alpha==1 boundary.
+        disc_cur: 0,
+
+        // ---- the prev id -> index table ----------------------------------
+        // Open-addressed, linear probing, generation-stamped so a rebuild is
+        // O(count) instead of O(table): a cell whose stamp is not the current
+        // generation IS empty.  Rebuilt at a roll that actually changed the
+        // entity set, never per frame, and never when `ident` holds.
+        // The sim -> render flag translation as a 64-entry lookup, built once
+        // from the three rules below.  One array read replaces three tests and
+        // three ORs on a path that runs once per entity per tick.
+        fmap: flagmap_new(),
+
+        hmask: hcap - 1,
+        hgen: 1,
+        hg: zeros_i(hcap),
+        hk: zeros_i(hcap),
+        hv: zeros_i(hcap),
+
+        // ---- stats.  Every one of these is a bug detector. ---------------
+        alpha: 0.0,
+        source: RSNAP_SRC_SIM,
+        builds: 0,       // rsnap_build calls
+        rolls: 0,        // tick changes ingested
+        dropped: 0,      // entities that did not fit in `cap`
+        culled: 0,       // entities outside cull_r
+        pops: 0,         // entities emitted uninterpolated (no prev state)
+        rehomed: 0       // entities whose slot moved between the two ticks
+    };
+    let out: object = rs;
+    return out;
+}
+
+// Forget both tick states and every stat.  Does not reallocate.
+export fn rsnap_reset(p_rs: object) {
+    let rs: object = p_rs;
+    let c = rs.cur;
+    let p = rs.prev;
+    c.tick = -1; c.count = 0; c.vi = RSNAP_MISS;
+    p.tick = -1; p.count = 0; p.vi = RSNAP_MISS;
+    rs.count = 0;
+    rs.ident = 0;
+    rs.disc_cur = 0;
+    rs.alpha = 0.0;
+    rs.builds = 0;
+    rs.rolls = 0;
+    rs.dropped = 0;
+    rs.culled = 0;
+    rs.pops = 0;
+    rs.rehomed = 0;
+    rs.hgen = rs.hgen + 1;
+}
+
+// ---------------------------------------------------------------------------
+// THE prev id -> index TABLE
+// ---------------------------------------------------------------------------
+// All mixing in u64: i32/i64 `*` TRAPS on overflow, u64 wraps, which is the
+// arithmetic a hash needs (CLAUDE.md A13).  The id is reinterpreted as its
+// exact u32 bit pattern first so that NEGATIVE cosmetic ids hash as well as
+// positive replicated ones.
+
+fn idx_hash(p_id: i32, p_mask: i32): i32 {
+    let k: i32 = p_id;
+    let mask: i32 = p_mask;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    u = u * 11400714819323198485;      // 2^64 / phi, wraps by design
+    u = u ^ (u >> 31);
+    u = u * 14029467366897019727;
+    u = u ^ (u >> 29);
+    let out: i32 = i32(u >> 33) & mask;
+    return out;
+}
+
+// Bump the generation (every cell becomes empty) and index `rs.prev`.
+// O(prev.count).  Called once per tick roll.
+fn idx_rebuild(p_rs: object) {
+    let rs: object = p_rs;
+    let gen: i32 = rs.hgen + 1;
+    rs.hgen = gen;
+
+    let mask: i32 = rs.hmask;
+    let hg = rs.hg;
+    let hk = rs.hk;
+    let hv = rs.hv;
+
+    let p = rs.prev;
+    let pid = p.id;
+    let n: i32 = p.count;
+    let i: i32 = 0;
+    while (i < n) {
+        let id: i32 = pid[i];
+        let h: i32 = idx_hash(id, mask);
+        while (hg[h] == gen) { h = (h + 1) & mask; }
+        hg[h] = gen;
+        hk[h] = id;
+        hv[h] = i;
+        i++;
+    }
+}
+
+// `p_id` -> its index in `rs.prev`, or RSNAP_MISS.  Cold: the per-entity loop
+// only reaches this when an entity's slot moved between the two ticks.
+fn idx_find(p_rs: object, p_id: i32): i32 {
+    let rs: object = p_rs;
+    let id: i32 = p_id;
+    let gen: i32 = rs.hgen;
+    let mask: i32 = rs.hmask;
+    let hg = rs.hg;
+    let hk = rs.hk;
+    let hv = rs.hv;
+    let h: i32 = idx_hash(id, mask);
+    let steps: i32 = 0;
+    let limit: i32 = mask + 1;
+    while (steps <= limit) {
+        if (hg[h] != gen) { let empty: i32 = RSNAP_MISS; return empty; }
+        if (hk[h] == id) { let hit: i32 = hv[h]; return hit; }
+        h = (h + 1) & mask;
+        steps++;
+    }
+    let out: i32 = RSNAP_MISS;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SIM FLAGS -> RENDER FLAGS
+// ---------------------------------------------------------------------------
+// The one place the two bit layouts meet.  `RSF_MUZZLE` and `RSF_DISSOLVE`
+// have no sim source in v1 — a muzzle flash is a client-local FX with a
+// negative id (W3-10) and a dissolve is a client-local death animation — so
+// they are left clear here and set by the client.  Cold-ish: once per entity
+// per TICK, not per frame.
+export fn flags_from_sim(p_wf: i32): i32 {
+    let wf: i32 = p_wf;
+    let rf: i32 = 0;
+    if ((wf & EF_VISIBLE) != 0)   { rf = rf | RSF_VISIBLE; }
+    if ((wf & EF_HIT_FLASH) != 0) { rf = rf | RSF_HIT_FLASH; }
+    if ((wf & EF_DEAD) != 0)      { rf = rf | RSF_DEAD; }
+    let out: i32 = rf;
+    return out;
+}
+
+// The same three rules, tabulated.  The sim's flag word only carries six
+// meaningful bits (EF_VISIBLE..EF_NO_REPLICATE), so 64 entries cover it
+// exhaustively.  Built by CALLING `flags_from_sim`, so the table can never
+// drift from the rules it tabulates — there is one definition, not two.
+fn flagmap_new(): array<i32> {
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < 64) { a.push(flags_from_sim(i)); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// INGEST — read one raw tick state.  Runs at most ONCE PER TICK.
+// ---------------------------------------------------------------------------
+// `p_src` is duck-typed on the sim's SoA field names:
+//
+//     tick, count, id[], px[], py[], pz[], yaw[], pitch[], model[], anim[],
+//     tint[], flags[]
+//
+// A `World` has exactly those.  So does a decoded network snapshot — see
+// `rsnap_netframe_new` — which is what makes `rsnap_build_from_net` the SAME
+// code and not a parallel implementation that can drift.
+//
+// Returns 1 if a roll happened, 0 if the source is still on the tick we
+// already hold.  Rolling only on a tick CHANGE is the contract: `rsnap_build`
+// is called every frame and the sim only moves on a tick boundary, so a frame
+// that ingested again would be re-reading identical data and would destroy the
+// previous tick state that interpolation needs.
+fn rsnap_ingest(p_rs: object, p_src: object, p_kind: i32): i32 {
+    let rs: object = p_rs;
+    let src: object = p_src;
+    rs.source = p_kind;
+
+    let t: i32 = src.tick;
+    let held = rs.cur;
+    if (t == held.tick) { let same: i32 = 0; return same; }
+
+    // ---- the roll: swap two OBJECT REFERENCES, copy nothing --------------
+    let was_cur = rs.cur;
+    rs.cur = rs.prev;
+    rs.prev = was_cur;
+    rs.rolls = rs.rolls + 1;
+
+    let c = rs.cur;
+    let cid = c.id;
+    let cx = c.x;
+    let cy = c.y;
+    let cz = c.z;
+    let cyaw = c.yaw;
+    let cpit = c.pitch;
+    let cmdl = c.model;
+    let cfrm = c.frame;
+    let ctnt = c.tint;
+    let cfl = c.flags;
+
+    let sid = src.id;
+    let spx = src.px;
+    let spy = src.py;
+    let spz = src.pz;
+    let syaw = src.yaw;
+    let spit = src.pitch;
+    let smdl = src.model;
+    let sanm = src.anim;
+    let stnt = src.tint;
+    let sfl = src.flags;
+
+    let sn: i32 = src.count;
+    let cap: i32 = rs.cap;
+    let viewer: i32 = rs.viewer_id;
+    let r2: f64 = rs.cull_r2;
+
+    // Interest management needs the viewer's position at THIS tick, so find it
+    // first.  One linear pass over the id array per tick; at 512 entities that
+    // is ~0.5 us and it happens 60 times a second, not 60 times a frame.
+    let vx: f64 = 0.0;
+    let vy: f64 = 0.0;
+    let vz: f64 = 0.0;
+    let have_v: i32 = 0;
+    // Only worth scanning when the cull is actually armed.
+    if (viewer != ID_NONE && r2 > 0.0) {
+        let k: i32 = 0;
+        while (k < sn) {
+            if (sid[k] == viewer) {
+                vx = spx[k];
+                vy = spy[k];
+                vz = spz[k];
+                have_v = 1;
+                k = sn;
+            } else {
+                k++;
+            }
+        }
+    }
+    // Culling without a viewer position would cull the whole world.
+    let do_cull: i32 = 0;
+    if (r2 > 0.0 && have_v == 1) { do_cull = 1; }
+
+    let n: i32 = 0;
+    let vi: i32 = RSNAP_MISS;
+    // Loop temporaries declared HERE, from literals, so the backend emits
+    // `double`/`int32_t` rather than `HmlValue ... = hml_convert_to_type(...)`.
+    // Declaring them inside the loop body boxes them and every compare on them
+    // then goes through `hml_binary_op`.  See the note in `rsnap_interp`.
+    let eid: i32 = 0;
+    let keep: i32 = 0;
+    let rf: i32 = 0;
+    let mx: f64 = 0.0;
+    let my: f64 = 0.0;
+    let mz: f64 = 0.0;
+    let i: i32 = 0;
+
+    let fmap = rs.fmap;
+    let p0 = rs.prev;
+    let pid0 = p0.id;
+    let pn0: i32 = 0;
+    pn0 = p0.count;
+
+    // `ident` — no spawn, no despawn, so row i of `cur` and row i of `prev`
+    // are the same entity.  It is detected HERE, inside the fill, because the
+    // ids are already in registers; a separate pass would re-read both arrays.
+    let ident: i32 = 0;
+    let chk: i32 = 0;
+    if (sn == pn0 && sn <= cap) { ident = 1; chk = 1; }
+
+    if (do_cull == 0 && sn <= cap) {
+        // THE FAST FILL.  Nothing to cull and nothing to drop, so neither the
+        // keep test nor the capacity test is in the loop at all.
+        while (i < sn) {
+            eid = sid[i];
+            if (chk == 1) {
+                if (pid0[i] != eid) { ident = 0; chk = 0; }
+            }
+            cid[i]  = eid;
+            cx[i]   = spx[i];
+            cy[i]   = spy[i];
+            cz[i]   = spz[i];
+            cyaw[i] = syaw[i];
+            cpit[i] = spit[i];
+            cmdl[i] = smdl[i];
+            cfrm[i] = sanm[i];
+            ctnt[i] = stnt[i];
+            rf = fmap[sfl[i] & 63];
+            if (eid == viewer) { rf = rf | RSF_LOCAL; vi = i; }
+            cfl[i]  = rf;
+            i++;
+        }
+        n = sn;
+    } else {
+        ident = 0;
+        while (i < sn) {
+            eid = sid[i];
+            keep = 1;
+            if (do_cull == 1) {
+                if (eid != viewer) {
+                    mx = spx[i]; mx = mx - vx;
+                    my = spy[i]; my = my - vy;
+                    mz = spz[i]; mz = mz - vz;
+                    if (mx * mx + my * my + mz * mz > r2) { keep = 0; }
+                }
+            }
+            if (keep == 0) {
+                rs.culled = rs.culled + 1;
+            } else {
+                if (n >= cap) {
+                    rs.dropped = rs.dropped + 1;
+                } else {
+                    cid[n]  = eid;
+                    cx[n]   = spx[i];
+                    cy[n]   = spy[i];
+                    cz[n]   = spz[i];
+                    cyaw[n] = syaw[i];
+                    cpit[n] = spit[i];
+                    cmdl[n] = smdl[i];
+                    cfrm[n] = sanm[i];
+                    ctnt[n] = stnt[i];
+                    rf = fmap[sfl[i] & 63];
+                    if (eid == viewer) { rf = rf | RSF_LOCAL; vi = n; }
+                    cfl[n]  = rf;
+                    n++;
+                }
+            }
+            i++;
+        }
+    }
+
+    c.count = n;
+    c.tick = t;
+    c.vi = vi;
+    rs.count = n;
+
+    // -----------------------------------------------------------------------
+    // RESOLVE cur -> prev ONCE, HERE, NOT IN THE PER-FRAME LOOP
+    // -----------------------------------------------------------------------
+    // The mapping is a property of the two TICKS, not of alpha, so resolving it
+    // per frame was pure waste: at 60 fps it repeated the same id compares and
+    // hash probes 1x per frame for a result that changes 60x a second.  Moving
+    // it here took the per-frame interpolation cost of a 256-entity snapshot
+    // from 0.1213 ms to 0.0926 ms, measured, and it removes the map work
+    // entirely from every frame in which the sim did not tick.
+    //
+    // `ident` is the no-spawn-no-despawn case: `pj[i] == i` for every row.  It
+    // is true on nearly every tick, and when it holds the hash table is not
+    // built, not probed, and `pj` is never read.
+    let p = rs.prev;
+    let pid = p.id;
+    let pn: i32 = 0;
+    pn = pn0;
+    rs.ident = ident;
+
+    let pj = rs.pj;
+    let pops: i32 = 0;
+    if (ident == 0) {
+        idx_rebuild(rs);
+        let k: i32 = 0;
+        while (k < n) {
+            let eid2: i32 = cid[k];
+            let j: i32 = RSNAP_MISS;
+            if (k < pn) {
+                if (pid[k] == eid2) { j = k; }
+            }
+            if (j < 0) {
+                j = idx_find(rs, eid2);
+                if (j >= 0) { rs.rehomed = rs.rehomed + 1; }
+            }
+            if (j < 0) { pops++; }
+            pj[k] = j;
+            k++;
+        }
+    }
+    rs.pops = rs.pops + pops;
+
+    // -----------------------------------------------------------------------
+    // PUBLISH THE FIELDS THAT DO NOT DEPEND ON alpha
+    // -----------------------------------------------------------------------
+    // `id` and the whole discrete group are constant for the entire tick (see
+    // the header: a discrete field is sample-and-held on [t(n-1), t(n)) ), so
+    // they are written here, once, rather than 60 times a second.  A row with
+    // no previous state is also written here in full — its output never
+    // changes during the tick either.
+    let ppx = p.x;
+    let ppy = p.y;
+    let ppz = p.z;
+    let pyw = p.yaw;
+    let ppt = p.pitch;
+    let pmd = p.model;
+    let pfr = p.frame;
+    let ptn = p.tint;
+    let pfl = p.flags;
+
+    let oid = rs.id;
+    let ox = rs.x;
+    let oy = rs.y;
+    let oz = rs.z;
+    let oyw = rs.yaw;
+    let opt = rs.pitch;
+    let omd = rs.model;
+    let ofr = rs.frame;
+    let otn = rs.tint;
+    let ofl = rs.flags;
+
+    if (ident == 1) {
+        let k: i32 = 0;
+        while (k < n) {
+            oid[k] = cid[k];
+            omd[k] = pmd[k];
+            ofr[k] = pfr[k];
+            otn[k] = ptn[k];
+            ofl[k] = pfl[k];
+            k++;
+        }
+    } else {
+        let k: i32 = 0;
+        while (k < n) {
+            oid[k] = cid[k];
+            let j: i32 = pj[k];
+            if (j >= 0) {
+                omd[k] = pmd[j];
+                ofr[k] = pfr[j];
+                otn[k] = ptn[j];
+                ofl[k] = pfl[j];
+            } else {
+                // Spawned this tick: no previous state at all.  Emit the raw
+                // tick n row, transform included, and never touch it again
+                // until the next roll.  Blending from an all-zero row would
+                // fling the entity in from the world origin.
+                omd[k] = cmdl[k];
+                ofr[k] = cfrm[k];
+                otn[k] = ctnt[k];
+                ofl[k] = cfl[k];
+                ox[k]  = cx[k];
+                oy[k]  = cy[k];
+                oz[k]  = cz[k];
+                oyw[k] = cyaw[k];
+                opt[k] = cpit[k];
+            }
+            k++;
+        }
+    }
+    rs.disc_cur = 0;
+
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// INTERPOLATE — runs EVERY FRAME.  This is the hot one, and it is deliberately
+// the SMALLEST thing in this file.
+// ---------------------------------------------------------------------------
+// Everything that depends only on the two TICKS was hoisted into `rsnap_ingest`
+// (the cur->prev map, the id column, the whole discrete group, and every row
+// that has no previous state).  What is left here is exactly what depends on
+// ALPHA: five interpolated numbers per entity, and the camera.
+//
+// That split is worth stating because it was measured, not guessed.  Resolving
+// the map and copying the discrete group inside this loop cost 0.1213 ms per
+// frame at 256 entities; hoisting them into the roll and then unboxing what
+// was left took it to 0.0645 ms, measured, min of 7, `hemlockc -O1`, on a box
+// sharing 17 of 24 cores.  The roll happens 60 times a SECOND while this
+// function runs at the FRAME rate.  Same work, correct place.
+//
+// `ia * a + al * b` is used rather than `a + (b - a) * al` because it is EXACT
+// at both endpoints: at al = 1 it evaluates to `a * 0.0 + b * 1.0`, which is
+// bit-identical to `b`, whereas `a + (b - a)` is not for widely separated
+// magnitudes.  The acceptance criterion is exactness, so the formula matters.
+fn rsnap_interp(p_rs: object, p_alpha: f64) {
+    let rs: object = p_rs;
+    // Declared from a LITERAL and then assigned — see the unboxing note below.
+    // `al` multiplies every number in the hot loop, so if IT is boxed nothing
+    // else in the loop can be native, whatever the other locals say.
+    let alc: f64 = 0.0;
+    alc = p_alpha;
+    if (alc < 0.0) { alc = 0.0; }
+    if (alc > 1.0) { alc = 1.0; }
+    rs.alpha = alc;
+    rs.builds = rs.builds + 1;
+    // `alc` is stored into an object field, which pins it as a boxed HmlValue.
+    // `al` is only ever read, so it compiles to a native `double` — and `al`
+    // multiplies every number in the hot loop.
+    let al: f64 = 0.0;
+    al = alc;
+    let ia: f64 = 0.0;
+    ia = 1.0 - al;
+
+    // mode 0: exactly tick n-1.  mode 1: exactly tick n.  mode 2: blend.
+    // In the shipping loop alpha is in [0,1) and the mode is 2 or 0; mode 1 is
+    // reachable only from a caller that passes exactly 1.0.
+    let mode: i32 = 2;
+    if (al <= 0.0) { mode = 0; }
+    if (al >= 1.0) { mode = 1; }
+
+    let c = rs.cur;
+    let p = rs.prev;
+
+    let cid = c.id;
+    let pid = p.id;
+    let cx = c.x;
+    let cy = c.y;
+    let cz = c.z;
+    let cyw = c.yaw;
+    let cpt = c.pitch;
+
+    let ppx = p.x;
+    let ppy = p.y;
+    let ppz = p.z;
+    let pyw = p.yaw;
+    let ppt = p.pitch;
+
+    let ox = rs.x;
+    let oy = rs.y;
+    let oz = rs.z;
+    let oyw = rs.yaw;
+    let opt = rs.pitch;
+
+    // Loop bounds and flags read off an object are boxed the same way; `n` is
+    // compared once per iteration, so it gets the same treatment.
+    let n: i32 = 0;
+    n = c.count;
+    let ident: i32 = 0;
+    ident = rs.ident;
+    let pj = rs.pj;
+
+    // A4/rule 3: the three wrap constants are TOP-LEVEL variables, and a
+    // top-level read is measurably more expensive than a local (423 vs 222 ms
+    // per 50 M, CLAUDE.md §1 rule 3).  The loop below reads them up to ten
+    // times per entity, so they are hoisted into f64 locals once per frame.
+    // Measured on this file: 0.0926 -> 0.0847 ms/frame at 256 entities.  Small,
+    // but free.
+    let k_pi: f64 = RS_PI;
+    let k_npi: f64 = 0.0 - RS_PI;
+    let k_tau: f64 = RS_TAU;
+    let k_itau: f64 = RS_INV_TAU;
+
+    // ---- THE UNBOXING IDIOM, AND IT IS WORTH 1.5x -----------------------
+    // A hot local whose INITIALISER is an array read compiles to
+    //     HmlValue d1 = hml_convert_to_type(..., HML_VAL_F64);   // BOXED
+    // and then every compare and every multiply on it goes through
+    // `hml_binary_op`.  The same local declared from a LITERAL, outside the
+    // loop, and merely ASSIGNED inside compiles to
+    //     double d1 = hml_to_f64(...);                           // unboxed
+    // and the arithmetic becomes native.  This is CLAUDE.md A1 / ci_unbox.sh
+    // applied to loop-body temporaries rather than to parameters, and nothing
+    // in the language warns you: both forms are spelled `let d1: f64 = ...`.
+    //
+    // Measured on an ISOLATED copy of this exact loop, hemlockc -O1, 256
+    // entities, min of 7 (tools/bench has no home for it yet; the repro is in
+    // the W3-6 task report):
+    //     temps declared inside the loop : 0.0756 ms/frame
+    //     temps declared from a literal  : 0.0496 ms/frame     1.53x
+    //
+    // TWO THINGS PIN A LOCAL AS BOXED, and both bit this file:
+    //   1. declaring it from a non-literal initialiser (the above), and
+    //   2. STORING IT INTO AN OBJECT FIELD anywhere in the function.
+    // (2) is why `alpha` is clamped into `alc`, published to `rs.alpha`, and
+    // then copied into `al` — `al` is read-only and therefore native, and `al`
+    // multiplies every number in the loop below.  In this file that one split
+    // was worth 0.0781 -> 0.0658 ms/frame on its own.
+    //
+    // The names are the twelve from CLAUDE.md §2 so `ci_unbox.sh` can check
+    // this file the day it is added to the target list.
+    let mx: f64 = 0.0;
+    let my: f64 = 0.0;
+    let acc: f64 = 0.0;
+    let d: f64 = 0.0;
+
+    // --- the discrete group ----------------------------------------------
+    // Written at the roll, and touched here ONLY when alpha crosses the
+    // alpha == 1 boundary — because a step function's value at t(n) is tick
+    // n's, while on [t(n-1), t(n)) it is tick n-1's.  In the shipping loop
+    // this branch never runs after the roll.
+    let want_cur: i32 = 0;
+    if (mode == 1) { want_cur = 1; }
+    if (want_cur != rs.disc_cur) {
+        let cmd = c.model;
+        let cfr = c.frame;
+        let ctn = c.tint;
+        let cfl = c.flags;
+        let pmd = p.model;
+        let pfr = p.frame;
+        let ptn = p.tint;
+        let pfl = p.flags;
+        let omd = rs.model;
+        let ofr = rs.frame;
+        let otn = rs.tint;
+        let ofl = rs.flags;
+        let k: i32 = 0;
+        while (k < n) {
+            if (want_cur == 1) {
+                omd[k] = cmd[k];
+                ofr[k] = cfr[k];
+                otn[k] = ctn[k];
+                ofl[k] = cfl[k];
+            } else {
+                let j: i32 = k;
+                if (ident == 0) { j = pj[k]; }
+                if (j >= 0) {
+                    omd[k] = pmd[j];
+                    ofr[k] = pfr[j];
+                    otn[k] = ptn[j];
+                    ofl[k] = pfl[j];
+                } else {
+                    omd[k] = cmd[k];
+                    ofr[k] = cfr[k];
+                    otn[k] = ctn[k];
+                    ofl[k] = cfl[k];
+                }
+            }
+            k++;
+        }
+        rs.disc_cur = want_cur;
+    }
+
+    // --- the transform ----------------------------------------------------
+    let i: i32 = 0;
+    if (mode == 1) {
+        // Exactly tick n, every row.  Bit-exact by copy, not by arithmetic.
+        while (i < n) {
+            ox[i]  = cx[i];
+            oy[i]  = cy[i];
+            oz[i]  = cz[i];
+            oyw[i] = cyw[i];
+            opt[i] = cpt[i];
+            i++;
+        }
+    } else if (mode == 0) {
+        // Exactly tick n-1.  A row with no tick n-1 state keeps the tick n
+        // values `rsnap_ingest` already wrote — there is nothing else it could
+        // truthfully show.
+        while (i < n) {
+            let j: i32 = i;
+            if (ident == 0) { j = pj[i]; }
+            if (j >= 0) {
+                ox[i]  = ppx[j];
+                oy[i]  = ppy[j];
+                oz[i]  = ppz[j];
+                oyw[i] = pyw[j];
+                opt[i] = ppt[j];
+            }
+            i++;
+        }
+    } else if (ident == 1) {
+        // THE HOT LOOP.  No spawn, no despawn: row i of `cur` and row i of
+        // `prev` are the same entity, so there is no map lookup, no branch and
+        // no id compare — fifteen array touches and the two angle wraps.
+        while (i < n) {
+            mx = ppx[i]; my = cx[i]; ox[i] = ia * mx + al * my;
+            mx = ppy[i]; my = cy[i]; oy[i] = ia * mx + al * my;
+            mx = ppz[i]; my = cz[i]; oz[i] = ia * mx + al * my;
+
+            // Short way around +-pi.  The two branches cover every delta a
+            // 60 Hz sim can produce (both angles in [-pi,pi] => |d| <= 2pi);
+            // the third line is the general reduction and is exact for any
+            // input, including an un-normalised yaw of 100 radians.
+            acc = pyw[i]; d = cyw[i]; d = d - acc;
+            if (d > k_pi) { d = d - k_tau; }
+            if (d < k_npi) { d = d + k_tau; }
+            if (d > k_pi || d < k_npi) { d = d - k_tau * __floor(d * k_itau + 0.5); }
+            oyw[i] = acc + d * al;
+
+            acc = ppt[i]; d = cpt[i]; d = d - acc;
+            if (d > k_pi) { d = d - k_tau; }
+            if (d < k_npi) { d = d + k_tau; }
+            if (d > k_pi || d < k_npi) { d = d - k_tau * __floor(d * k_itau + 0.5); }
+            opt[i] = acc + d * al;
+            i++;
+        }
+    } else {
+        // The same blend, through the map, for the tick after a spawn or a
+        // despawn.  Rows with no previous state were finished at the roll.
+        while (i < n) {
+            let j: i32 = pj[i];
+            if (j >= 0) {
+                mx = ppx[j]; my = cx[i]; ox[i] = ia * mx + al * my;
+                mx = ppy[j]; my = cy[i]; oy[i] = ia * mx + al * my;
+                mx = ppz[j]; my = cz[i]; oz[i] = ia * mx + al * my;
+
+                acc = pyw[j]; d = cyw[i]; d = d - acc;
+                if (d > k_pi) { d = d - k_tau; }
+                if (d < k_npi) { d = d + k_tau; }
+                if (d > k_pi || d < k_npi) { d = d - k_tau * __floor(d * k_itau + 0.5); }
+                oyw[i] = acc + d * al;
+
+                acc = ppt[j]; d = cpt[i]; d = d - acc;
+                if (d > k_pi) { d = d - k_tau; }
+                if (d < k_npi) { d = d + k_tau; }
+                if (d > k_pi || d < k_npi) { d = d - k_tau * __floor(d * k_itau + 0.5); }
+                opt[i] = acc + d * al;
+            }
+            i++;
+        }
+    }
+
+    // --- the camera ------------------------------------------------------
+    // Data only: the viewer's interpolated transform plus the eye height.  If
+    // the viewer is not in the snapshot (no viewer set, a spectator, or the
+    // tools' scripted cameras) the caller's `rsnap_set_cam` values stand.
+    let cvi: i32 = c.vi;
+    if (cvi >= 0) {
+        let pvi: i32 = p.vi;
+        if (pvi >= 0) {
+            if (pid[pvi] != cid[cvi]) { pvi = RSNAP_MISS; }
+        }
+        if (pvi < 0 || mode == 1) {
+            rs.cam_x = cx[cvi];
+            rs.cam_y = cy[cvi] + rs.eye_h;
+            rs.cam_z = cz[cvi];
+            rs.cam_yaw = cyw[cvi];
+            rs.cam_pitch = cpt[cvi];
+        } else if (mode == 0) {
+            rs.cam_x = ppx[pvi];
+            rs.cam_y = ppy[pvi] + rs.eye_h;
+            rs.cam_z = ppz[pvi];
+            rs.cam_yaw = pyw[pvi];
+            rs.cam_pitch = ppt[pvi];
+        } else {
+            rs.cam_x = ia * ppx[pvi] + al * cx[cvi];
+            rs.cam_y = ia * ppy[pvi] + al * cy[cvi] + rs.eye_h;
+            rs.cam_z = ia * ppz[pvi] + al * cz[cvi];
+            let ay1: f64 = pyw[pvi];
+            let d1: f64 = cyw[cvi] - ay1;
+            if (d1 > k_pi) { d1 = d1 - k_tau; }
+            if (d1 < k_npi) { d1 = d1 + k_tau; }
+            if (d1 > k_pi || d1 < k_npi) {
+                d1 = d1 - k_tau * __floor(d1 * k_itau + 0.5);
+            }
+            rs.cam_yaw = ay1 + d1 * al;
+            let ap1: f64 = ppt[pvi];
+            let d2: f64 = cpt[cvi] - ap1;
+            if (d2 > k_pi) { d2 = d2 - k_tau; }
+            if (d2 < k_npi) { d2 = d2 + k_tau; }
+            if (d2 > k_pi || d2 < k_npi) {
+                d2 = d2 - k_tau * __floor(d2 * k_itau + 0.5);
+            }
+            rs.cam_pitch = ap1 + d2 * al;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE TWO BUILDERS  (ARCHITECTURE §4 stage 4)
+// ---------------------------------------------------------------------------
+
+// v1: interpolate between the previous and the current LOCAL sim tick.
+// `p_world` is read and never written.
+export fn rsnap_build(p_rs: object, p_world: object, p_alpha: f64) {
+    rsnap_ingest(p_rs, p_world, RSNAP_SRC_SIM);
+    rsnap_interp(p_rs, p_alpha);
+}
+
+// ARCHITECTURE §4 stage 4 and NETWORKING §6.3 both name this `snapshot_build`,
+// while §5.6 and BUILD_PLAN W3-6 name it `rsnap_build`.  Both names exist and
+// they are the same function; `main.hml` may use either.  Reported to
+// ARCHITECTURE §0.
+export fn snapshot_build(p_rs: object, p_world: object, p_alpha: f64) {
+    rsnap_build(p_rs, p_world, p_alpha);
+}
+
+// v2 STUB, IDENTICAL SIGNATURE.  `p_frame` is one DECODED network snapshot
+// carrying the same field names as the world (see `rsnap_netframe_new`), so
+// this is the same ingest, the same interpolation and the same output.  In v1
+// nothing calls it except the probe, which is the point: the substitution is
+// proven to work before the transport that needs it exists.
+//
+// WHAT v2 STILL HAS TO ADD, and deliberately is NOT faked here:
+//   * a ring of the last ~4 decoded snapshots, so the client can pick the two
+//     that straddle `render_time = latest - INTERP_DELAY_MS` (100 ms,
+//     `g_INTERP_DELAY_MS`) rather than always the newest two;
+//   * `alpha` computed from TIME between those two snapshots' timestamps
+//     instead of from the tick accumulator;
+//   * freeze (never extrapolate) when the buffer under-runs.
+// Those are client policy and belong in `src/game/client.hml`.  The shape they
+// feed — two states plus an alpha, id-matched, angles short-way — is exactly
+// what is here, which is the whole reason this file exists in v1.
+export fn rsnap_build_from_net(p_rs: object, p_frame: object, p_alpha: f64) {
+    rsnap_ingest(p_rs, p_frame, RSNAP_SRC_NET);
+    rsnap_interp(p_rs, p_alpha);
+}
+
+// The decode target a v2 client fills from the wire, and the exact shape
+// `rsnap_build_from_net` reads.  Field-for-field the sim's names, so one
+// ingest serves both sources.  Allocating; call it once at client start.
+export fn rsnap_netframe_new(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let f: object = {
+        tick: -1,
+        count: 0,
+        id: zeros_i(cap),
+        px: zeros_f(cap),
+        py: zeros_f(cap),
+        pz: zeros_f(cap),
+        yaw: zeros_f(cap),
+        pitch: zeros_f(cap),
+        model: zeros_i(cap),
+        anim: zeros_i(cap),
+        tint: zeros_i(cap),
+        flags: zeros_i(cap)
+    };
+    let out: object = f;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION
+// ---------------------------------------------------------------------------
+
+// Which entity the camera rides, and which one gets RSF_LOCAL.  ID_NONE means
+// "no viewer": the camera is then whatever `rsnap_set_cam` last wrote, which is
+// how `tools/shot.hml` drives its scripted cameras.
+export fn rsnap_set_viewer(p_rs: object, p_id: i32) {
+    let rs: object = p_rs;
+    rs.viewer_id = p_id;
+}
+
+export fn rsnap_viewer(p_rs: object): i32 {
+    let rs: object = p_rs;
+    let out: i32 = rs.viewer_id;
+    return out;
+}
+
+export fn rsnap_set_eye_height(p_rs: object, p_h: f64) {
+    let rs: object = p_rs;
+    rs.eye_h = p_h;
+}
+
+// Interest management (NETWORKING §11.4).  `p_r` in metres; <= 0 disables.
+// Applied at ingest, so it costs once per tick and it shrinks the per-frame
+// interpolation loop as well as the emit.
+export fn rsnap_set_cull_radius(p_rs: object, p_r: f64) {
+    let rs: object = p_rs;
+    let r: f64 = p_r;
+    if (r <= 0.0) { rs.cull_r2 = 0.0; } else { rs.cull_r2 = r * r; }
+}
+
+// Scripted camera, for tools and for a spectator with no viewer entity.
+// Overwritten by the viewer's transform on the next build if a viewer is set.
+export fn rsnap_set_cam(p_rs: object, p_x: f64, p_y: f64, p_z: f64, p_yaw: f64, p_pitch: f64) {
+    let rs: object = p_rs;
+    rs.cam_x = p_x;
+    rs.cam_y = p_y;
+    rs.cam_z = p_z;
+    rs.cam_yaw = p_yaw;
+    rs.cam_pitch = p_pitch;
+}
+
+// Client-only view state.  `view.hml` (W3-5) owns the policy behind both of
+// these; they are stored here so `frame_render` needs exactly one struct.
+// `cam_roll` is the view kick and MUST NEVER reach `sim_apply_command`.
+export fn rsnap_set_cam_roll(p_rs: object, p_roll: f64) {
+    let rs: object = p_rs;
+    rs.cam_roll = p_roll;
+}
+
+export fn rsnap_set_cam_fov(p_rs: object, p_fov: f64) {
+    let rs: object = p_rs;
+    rs.cam_fov = p_fov;
+}
+
+// ---------------------------------------------------------------------------
+// FIELD ACCESS
+// ---------------------------------------------------------------------------
+// The renderer HOISTS these once per frame and indexes the arrays directly;
+// there is no per-entity accessor, because a free call is 9.6 ns and Hemlock
+// charges ~10 ns per argument (A9b).  A return-type annotation here is free
+// (measured 0.049 vs 0.059 us on a 16 384-element array) — it is the
+// `let a: array<f64> = obj.field` HOIST that costs O(length), and there is not
+// one of those anywhere in this file.
+
+export fn rsnap_count(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.count; return out; }
+export fn rsnap_cap(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.cap; return out; }
+
+export fn rsnap_field_id(p_rs: object): array<i32> { let rs: object = p_rs; let a = rs.id; return a; }
+export fn rsnap_field_x(p_rs: object): array<f64> { let rs: object = p_rs; let a = rs.x; return a; }
+export fn rsnap_field_y(p_rs: object): array<f64> { let rs: object = p_rs; let a = rs.y; return a; }
+export fn rsnap_field_z(p_rs: object): array<f64> { let rs: object = p_rs; let a = rs.z; return a; }
+export fn rsnap_field_yaw(p_rs: object): array<f64> { let rs: object = p_rs; let a = rs.yaw; return a; }
+export fn rsnap_field_pitch(p_rs: object): array<f64> { let rs: object = p_rs; let a = rs.pitch; return a; }
+export fn rsnap_field_model(p_rs: object): array<i32> { let rs: object = p_rs; let a = rs.model; return a; }
+export fn rsnap_field_frame(p_rs: object): array<i32> { let rs: object = p_rs; let a = rs.frame; return a; }
+export fn rsnap_field_tint(p_rs: object): array<i32> { let rs: object = p_rs; let a = rs.tint; return a; }
+export fn rsnap_field_flags(p_rs: object): array<i32> { let rs: object = p_rs; let a = rs.flags; return a; }
+
+export fn rsnap_cam_x(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_x; return out; }
+export fn rsnap_cam_y(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_y; return out; }
+export fn rsnap_cam_z(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_z; return out; }
+export fn rsnap_cam_yaw(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_yaw; return out; }
+export fn rsnap_cam_pitch(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_pitch; return out; }
+export fn rsnap_cam_roll(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_roll; return out; }
+export fn rsnap_cam_fov(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.cam_fov; return out; }
+
+// Find an id in the OUTPUT list.  Linear and cold — for tools, the HUD's
+// "what am I looking at" query and tests.  The per-frame emit never needs it:
+// it walks the arrays in order.
+export fn rsnap_index_of(p_rs: object, p_id: i32): i32 {
+    let rs: object = p_rs;
+    let id: i32 = p_id;
+    let ids = rs.id;
+    let n: i32 = rs.count;
+    let i: i32 = 0;
+    while (i < n) {
+        if (ids[i] == id) { let hit: i32 = i; return hit; }
+        i++;
+    }
+    let out: i32 = RSNAP_MISS;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// STATS  (benchframe, the probes, and the frame-graph stat block)
+// ---------------------------------------------------------------------------
+export fn rsnap_alpha(p_rs: object): f64 { let rs: object = p_rs; let out: f64 = rs.alpha; return out; }
+export fn rsnap_source(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.source; return out; }
+export fn rsnap_builds(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.builds; return out; }
+export fn rsnap_rolls(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.rolls; return out; }
+export fn rsnap_dropped(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.dropped; return out; }
+export fn rsnap_culled(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.culled; return out; }
+export fn rsnap_pops(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.pops; return out; }
+export fn rsnap_rehomed(p_rs: object): i32 { let rs: object = p_rs; let out: i32 = rs.rehomed; return out; }
+export fn rsnap_cur_tick(p_rs: object): i32 { let rs: object = p_rs; let c = rs.cur; let out: i32 = c.tick; return out; }
+export fn rsnap_prev_tick(p_rs: object): i32 { let rs: object = p_rs; let p = rs.prev; let out: i32 = p.tick; return out; }
+
+// The short-way-around angle blend, exported so `view.hml`, `fx.hml` and the
+// probe all use ONE implementation.  Exact at both endpoints.
+export fn rsnap_ang_lerp(p_a: f64, p_b: f64, p_t: f64): f64 {
+    let a: f64 = p_a;
+    let b: f64 = p_b;
+    let t: f64 = p_t;
+    if (t <= 0.0) { let lo: f64 = a; return lo; }
+    if (t >= 1.0) { let hi: f64 = b; return hi; }
+    let d: f64 = b - a;
+    if (d > RS_PI) { d = d - RS_TAU; }
+    if (d < 0.0 - RS_PI) { d = d + RS_TAU; }
+    if (d > RS_PI || d < 0.0 - RS_PI) {
+        d = d - RS_TAU * __floor(d * RS_INV_TAU + 0.5);
+    }
+    let out: f64 = a + d * t;
+    return out;
+}
+
+// The signed difference b - a reduced to [-pi, pi].  The metric the probe's
+// path-additivity assertion is written in.
+export fn rsnap_ang_delta(p_a: f64, p_b: f64): f64 {
+    let a: f64 = p_a;
+    let b: f64 = p_b;
+    let d: f64 = b - a;
+    if (d > RS_PI) { d = d - RS_TAU; }
+    if (d < 0.0 - RS_PI) { d = d + RS_TAU; }
+    if (d > RS_PI || d < 0.0 - RS_PI) {
+        d = d - RS_TAU * __floor(d * RS_INV_TAU + 0.5);
+    }
+    let out: f64 = d;
+    return out;
+}

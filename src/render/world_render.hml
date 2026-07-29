@@ -1,0 +1,1136 @@
+// ===========================================================================
+// nightshade/src/render/world_render.hml — THE FRAME GRAPH        (task W3-0a)
+// ===========================================================================
+//
+// ARCHITECTURE.md §5.6: "the frame-graph orchestrator: owns the four batches,
+// calls stages 11–27 of §4 in order. THE ONLY FILE THAT KNOWS THE LAYER ORDER."
+//
+// This file was EXTRACTED, unchanged in behaviour, out of `tools/shot.hml`,
+// which built it in Wave 2 because `src/render/` did not exist yet. It now has
+// two consumers — the screenshot harness and the interactive walkaround — and
+// `tools/ci_imports.sh` R7 fails the build the moment a tool carries a second
+// copy of it. Every line below is the Wave-2 code with its state re-plumbed
+// from harness globals to a public surface; nothing was retuned, and the nine
+// committed scenes render byte-identically across the move (see the W3-0a
+// report for the hashes).
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS FILE OWNS, AND WHAT IT REFUSES TO OWN
+// ---------------------------------------------------------------------------
+// OWNS: the four batches and their caps, the RenderEnv, the view basis and the
+// MVP, the frustum, the sky panorama mapping, the per-chunk / per-prop / per-
+// particle emit walks, the LOD switch, the layer order, the raster order, the
+// readback and the present. The stage numbers in the code are §4's.
+//
+// REFUSES: colour, time of day, weather, world generation, the HUD, the CLI.
+// Two hard reasons, not taste:
+//
+//   1. THE IMPORT WALL (CLAUDE.md §3, ci_imports.sh R1). `src/render/**` may
+//      import wobbleweed, `src/core/**`, `src/sim/**` and `@stdlib/*` — and
+//      NOT `src/art/**`. So this file cannot name a palette colour, cannot
+//      call `tod_eval`, cannot ask `skygen` to re-bake and cannot look up a
+//      `meshgen` asset. Everything art-derived arrives as a HANDLE or a NUMBER
+//      from the caller: texture handles, mesh handles, atlas cell ids, rgb
+//      triples. That is a feature — it is what makes the frame graph testable
+//      without an art pipeline, and it is why stages 6 (tod_eval) and 7
+//      (skygen re-bake) are the CALLER's, exactly as §4 has them (they sit in
+//      the SNAPSHOT block, above VIEW).
+//
+//   2. The HUD is per-consumer content: the harness draws scene labels, the
+//      walkaround draws a frame-budget readout. The HUD must still be emitted
+//      AFTER the vignette and BEFORE the flush, because LAYER_HUD is drawn in
+//      insertion order — so the frame graph is two calls with a hole in the
+//      middle:
+//
+//          frame_begin()                     stats + counters
+//          ... caller: stage 6 tod, stage 7 skygen ...
+//          frame_render()                    stages 8..23  (ends with postfx)
+//          ... caller: stage 24, its own HUD, into frame_batch_hud() ...
+//          frame_present()                   stages 25..28 + readback
+//
+//      That hole is the ONLY structural difference from the Wave-2 function.
+//      Insertion order inside LAYER_HUD is identical, so the pixels are.
+//
+// ---------------------------------------------------------------------------
+// DRIVING IT FROM A SECOND CONSUMER
+// ---------------------------------------------------------------------------
+// Every per-frame input is a setter, so an interactive client re-drives the
+// same frame graph without owning any of it:
+//
+//     frame_set_camera(x, y, z, yaw, pitch, fov)     every frame
+//     frame_set_clear(zenith_r, zenith_g, zenith_b)  every frame
+//     frame_set_options(sheet, viewmodel, lightning) every frame
+//     tod_eval(frame_env(), day_t, weather)          the caller's stage 6
+//
+// The world the graph walks is a registry the caller fills — `world_clear()`
+// then `world_chunk_add` / `world_prop_add` / `world_fx_add` — so a walkaround
+// can rebuild a chunk ring as the player moves without this file knowing what
+// a chunk is made of.
+//
+// ---------------------------------------------------------------------------
+// THE ONE THING HERE THAT IS ON LOAN
+// ---------------------------------------------------------------------------
+// `terrain_h` (and the two noise helpers under it) is a WORLD GENERATOR living
+// in a render file, and it is here for exactly one reason: stage 16 lays a
+// ground glow card under every dynamic light, and a glow card has to follow
+// the ground. Its four corners move with the light, so no amount of caller-
+// side precomputation covers a light that moves — which is every muzzle flash.
+// W3-1 (`src/sim/worldgen.hml`) and W3-2 (`src/sim/chunk.hml`) own this
+// properly; when they land, `terrain_h` becomes a three-line adapter over
+// `chunk_height_at` and the noise goes away. It is exported meanwhile so the
+// harness and the walkaround stand on the same ground, byte for byte.
+// ===========================================================================
+
+import { sin, cos, sqrt, floor, atan2, asin } from "@stdlib/math";
+
+// ---------------------------------------------------------------------------
+// the engine
+// ---------------------------------------------------------------------------
+import { sdl_clear, sdl_present, read_pixels_rect, set_draw_blend,
+         FMT_ARGB8888, BLEND_BLEND }
+       from "../../../wobbleweed/src/sdl.hml";
+import { target_begin, target_end, target_present }
+       from "../../../wobbleweed/src/target.hml";
+import { batch_new, batch_reset, batch_reserve, batch_commit, batch_vbuf,
+         batch_flush, batch_sort, batch_sort_flush, batch_count,
+         batch_write_vertex,
+         LAYER_SKY, LAYER_WORLD, LAYER_FX, LAYER_HUD }
+       from "../../../wobbleweed/src/batch.hml";
+import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
+         emit_set_backface, emit_set_lighting, emit_mesh_buf, emit_quad_world,
+         emit_stats_reset, emit_count_backface, emit_count_near,
+         emit_count_guard, emit_count_straddle, emit_count_submitted,
+         EMIT_BF_CCW }
+       from "../../../wobbleweed/src/emit.hml";
+import { env_new, env_field, env_far_plane, env_fog_factor, env_fog_alpha,
+         env_light_count,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_LIGHT0_X, ENV_LIGHT_STRIDE }
+       from "../../../wobbleweed/src/shade.hml";
+import { mesh_buf, mesh_tri_count, mesh_set_mvp, mesh_set_viewport,
+         mesh_set_near, mesh_set_cull, mesh_emit_yaw, mesh_reset_counters,
+         mesh_rej_near, mesh_rej_guard, mesh_rej_backface, MESH_CULL_NEG }
+       from "../../../wobbleweed/src/mesh.hml";
+import { billboard_set_mvp, billboard_set_viewport, billboard_set_near,
+         billboard_set_proj_persp, billboard_set_uv, billboard_world,
+         billboard_stretched, billboard_reset_counters }
+       from "../../../wobbleweed/src/billboard.hml";
+import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
+import { quad_screen_uv, quad_ring } from "../../../wobbleweed/src/quad.hml";
+import { frustum_new, frustum_from_mvp, frustum_sphere }
+       from "../../../wobbleweed/src/frustum.hml";
+import { mat_perspective, mat_look_dir, mat_mul, v3 }
+       from "../../../wobbleweed/src/vec.hml";
+import { stat_add, stat_set, stat_begin, stat_end,
+         stat_frame_begin, stat_frame_end,
+         STAT_TRIS_SUBMITTED, STAT_REJ_FRUSTUM, STAT_REJ_BACKFACE,
+         STAT_REJ_NEAR, STAT_REJ_GUARD, STAT_REJ_DISTANCE,
+         STAT_CLIP_STRADDLE,
+         STAT_CHUNKS_TESTED, STAT_CHUNKS_CULLED, STAT_CHUNKS_DRAWN,
+         STAT_ENTS_TESTED, STAT_ENTS_CULLED, STAT_ENTS_DRAWN,
+         STAT_PARTICLES,
+         STAT_T_VIEW, STAT_T_BATCH_RESET, STAT_T_EMIT_SKY,
+         STAT_T_EMIT_TERRAIN, STAT_T_EMIT_ENTITY, STAT_T_EMIT_VIEWMODEL,
+         STAT_T_EMIT_FX, STAT_T_EMIT, STAT_T_TARGET_BEGIN, STAT_T_CLEAR,
+         STAT_T_FLUSH_SKY, STAT_T_SORT_WORLD, STAT_T_FLUSH_WORLD,
+         STAT_T_SORT_FX, STAT_T_FLUSH_FX, STAT_T_POSTFX,
+         STAT_T_FLUSH_HUD, STAT_T_PRESENT }
+       from "../../../wobbleweed/src/stats.hml";
+
+// ---------------------------------------------------------------------------
+// the game — core only. NOT src/art: see THE IMPORT WALL above.
+// ---------------------------------------------------------------------------
+import { g_RES_W, g_RES_H } from "../core/config.hml";
+import { clampi, clampf } from "../core/mathx.hml";
+
+// ===========================================================================
+// 0. FIXED SHAPE
+// ===========================================================================
+
+export let g_NEAR: f64 = 0.15;
+export let g_GUARD: f64 = 640.0;        // guard-band margin in pixels
+export let g_CAP_SKY: i32 = 256;
+export let g_CAP_WORLD: i32 = 3500;     // the hard clamp of ARCHITECTURE §8
+export let g_CAP_FX: i32 = 640;
+export let g_CAP_HUD: i32 = 512;
+export let g_D2R: f64 = 0.017453292519943295;
+
+// world_fx_add draw kinds. The frame graph must not know what a "rain" sprite
+// is — it knows three billboard SHAPES, and the caller says which one its
+// fxgen cell wants. (Wave 2 branched on `cell == FX_RAIN`, which would have
+// dragged src/art through the import wall.)
+export let g_FXK_SPRITE: i32 = 0;       // camera-facing card, size p_s
+export let g_FXK_RAIN: i32 = 1;         // vertical streak, 1.5 m, 5 cm wide
+export let g_FXK_TRACER: i32 = 2;       // 2.6 m streak away from the camera
+
+// world_prop_add: pass this as p_d2 to get the FOG-RELATIVE far-LOD switch
+// instead of an absolute metre distance. See the long note on lod_pick.
+export let g_LOD_FOG_CARD: f64 = -1.0;
+
+// ===========================================================================
+// 1. BOUND RESOURCES — everything art-derived arrives here as a handle
+// ===========================================================================
+
+let g_win = null;
+let g_target = null;
+let g_fb = null;                        // ARGB8888 readback destination (ptr)
+
+let g_tex_world = null;
+let g_tex_fx = null;
+let g_tex_hud = null;
+let g_tex_sky = null;
+let g_atlas_fx = null;                  // for atlas_cell_uv on the FX cells
+
+let g_mesh_blob = null;                 // the mandatory contact blob (§9 r6)
+let g_mesh_vm = null;                   // the viewmodel
+let g_cell_glow: i32 = 0;               // the FX cell used for light pools
+
+// The vignette ring and the lightning flash are geometry, but their colours
+// are palette values, so the caller sets them once at boot.
+let g_vig_r: i32 = 0;   let g_vig_g: i32 = 0;   let g_vig_b: i32 = 0;
+let g_flash_r: i32 = 255; let g_flash_g: i32 = 255; let g_flash_b: i32 = 255;
+// HUD_SOLID's uv rect, the one texel every flat HUD/postfx quad samples.
+let g_solid_u0: f64 = 0.0; let g_solid_v0: f64 = 0.0;
+let g_solid_u1: f64 = 1.0; let g_solid_v1: f64 = 1.0;
+
+let g_env: array<f64> = env_new();
+let g_frustum: array<f64> = frustum_new();
+let g_mvp: array<f64> = [];
+
+let g_bsky = null;
+let g_bworld = null;
+let g_bfx = null;
+let g_bhud = null;
+
+// scratch, allocated once (A8)
+let g_dep: array<f64> = [];             // depth scratch for the emit calls
+let g_uvs: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+// ---------------------------------------------------------------------------
+// The four batches, in layer order. Owning these is this file's job by name
+// (ARCHITECTURE §5.6). Idempotent: calling it twice does not leak a batch,
+// because a batch is refcounted and the old one is dropped.
+// ---------------------------------------------------------------------------
+export fn frame_batches(): i32 {
+    g_bsky = batch_new(g_CAP_SKY, 400.0, LAYER_SKY);
+    g_bworld = batch_new(g_CAP_WORLD, 80.0, LAYER_WORLD);
+    g_bfx = batch_new(g_CAP_FX, 80.0, LAYER_FX);
+    g_bhud = batch_new(g_CAP_HUD, 4.0, LAYER_HUD);
+    if (g_bsky == null || g_bworld == null || g_bfx == null || g_bhud == null) {
+        let bad: i32 = -1;
+        return bad;
+    }
+    let ok: i32 = 0;
+    return ok;
+}
+
+// p_fb is the caller's ARGB8888 readback buffer, RES_W * RES_H * 4 bytes. It
+// stays the caller's because the caller is the one that turns it into a PNG or
+// blits it; the frame graph only fills it.
+export fn frame_init(p_win, p_target, p_fb: ptr): i32 {
+    g_win = p_win;
+    g_target = p_target;
+    g_fb = p_fb;
+    if (g_win == null || g_target == null) {
+        let bad: i32 = -1;
+        return bad;
+    }
+    let rc: i32 = frame_batches();
+    return rc;
+}
+
+export fn frame_bind_textures(p_world, p_fx, p_hud, p_sky) {
+    g_tex_world = p_world;
+    g_tex_fx = p_fx;
+    g_tex_hud = p_hud;
+    g_tex_sky = p_sky;
+}
+
+export fn frame_bind_fx_atlas(p_atlas) { g_atlas_fx = p_atlas; }
+
+// p_blob is the 2-triangle contact blob every prop gets (CLAUDE.md §9 rule 6,
+// no exceptions), p_vm the first-person weapon, p_glow_cell the additive FX
+// cell a dynamic light pools onto the ground with.
+export fn frame_bind_assets(p_blob, p_vm, p_glow_cell: i32) {
+    g_mesh_blob = p_blob;
+    g_mesh_vm = p_vm;
+    g_cell_glow = p_glow_cell;
+}
+
+export fn frame_set_hud_solid_uv(p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64) {
+    g_solid_u0 = p_u0; g_solid_v0 = p_v0;
+    g_solid_u1 = p_u1; g_solid_v1 = p_v1;
+}
+
+export fn frame_set_vignette_colour(p_r: i32, p_g: i32, p_b: i32) {
+    g_vig_r = p_r; g_vig_g = p_g; g_vig_b = p_b;
+}
+
+export fn frame_set_flash_colour(p_r: i32, p_g: i32, p_b: i32) {
+    g_flash_r = p_r; g_flash_g = p_g; g_flash_b = p_b;
+}
+
+export fn frame_env(): array<f64> { let out: array<f64> = g_env; return out; }
+export fn frame_mvp(): array<f64> { let out: array<f64> = g_mvp; return out; }
+export fn frame_frustum(): array<f64> { let out: array<f64> = g_frustum; return out; }
+export fn frame_batch_sky() { let out = g_bsky; return out; }
+export fn frame_batch_world() { let out = g_bworld; return out; }
+export fn frame_batch_fx() { let out = g_bfx; return out; }
+export fn frame_batch_hud() { let out = g_bhud; return out; }
+
+// ===========================================================================
+// 2. PER-FRAME INPUT — camera, clear colour, options
+// ===========================================================================
+
+let g_camx: f64 = 0.0;
+let g_camy: f64 = 0.0;
+let g_camz: f64 = 0.0;
+let g_yaw: f64 = 0.0;
+let g_pitch: f64 = 0.0;
+let g_fov: f64 = 70.0;
+
+let g_clear_r: i32 = 0; let g_clear_g: i32 = 0; let g_clear_b: i32 = 0;
+let g_sheet_r: i32 = 0; let g_sheet_g: i32 = 0; let g_sheet_b: i32 = 0;
+
+let g_opt_sheet: i32 = 0;       // 2D contact-sheet frame: no world, no postfx
+let g_opt_viewmodel: i32 = 0;
+let g_opt_lightning: i32 = 0;
+
+export fn frame_set_camera(p_x: f64, p_y: f64, p_z: f64,
+                           p_yaw: f64, p_pitch: f64, p_fov: f64) {
+    g_camx = p_x; g_camy = p_y; g_camz = p_z;
+    g_yaw = p_yaw; g_pitch = p_pitch; g_fov = p_fov;
+}
+
+// The clear is the SKY ZENITH, so a dropped sky frame is never black (§4.19).
+// Taken as f64 because that is what a sky keyframe is; clamped exactly as the
+// Wave-2 code clamped it.
+export fn frame_set_clear(p_r: f64, p_g: f64, p_b: f64) {
+    g_clear_r = clampi(i32(p_r), 0, 255);
+    g_clear_g = clampi(i32(p_g), 0, 255);
+    g_clear_b = clampi(i32(p_b), 0, 255);
+}
+
+export fn frame_set_sheet_clear(p_r: i32, p_g: i32, p_b: i32) {
+    g_sheet_r = p_r; g_sheet_g = p_g; g_sheet_b = p_b;
+}
+
+export fn frame_set_options(p_sheet: i32, p_viewmodel: i32, p_lightning: i32) {
+    g_opt_sheet = p_sheet;
+    g_opt_viewmodel = p_viewmodel;
+    g_opt_lightning = p_lightning;
+}
+
+export fn frame_camera_x(): f64 { let out: f64 = g_camx; return out; }
+export fn frame_camera_y(): f64 { let out: f64 = g_camy; return out; }
+export fn frame_camera_z(): f64 { let out: f64 = g_camz; return out; }
+
+// ===========================================================================
+// 3. THE GROUND — on loan from W3-1/W3-2. See the header.
+// ===========================================================================
+
+let g_ground_seed: i32 = 1;
+let g_ridge: f64 = 0.0;
+
+export fn terrain_set(p_seed: i32, p_ridge: f64) {
+    g_ground_seed = p_seed;
+    g_ridge = p_ridge;
+}
+export fn terrain_seed(): i32 { let out: i32 = g_ground_seed; return out; }
+export fn terrain_ridge(): f64 { let out: f64 = g_ridge; return out; }
+
+// Position-keyed hash: same coordinate, same value, whatever the order of
+// evaluation. Masked into u64 before every multiply (CLAUDE.md A13 — i32/i64
+// * + - TRAP on overflow).
+export fn h2(p_x: i32, p_y: i32, p_s: i32): f64 {
+    let hx: u64 = u64(p_x & 1048575);
+    let hy: u64 = u64(p_y & 1048575);
+    let hs: u64 = u64(p_s & 1048575);
+    let h: u64 = hx * 374761393 + hy * 668265263 + hs * 2246822519 + 3266489917;
+    h = h ^ (h >> 13);
+    h = h * 1274126177;
+    h = h ^ (h >> 16);
+    let out: f64 = f64(h & 65535) * 0.0000152587890625;
+    return out;
+}
+
+export fn vnoise2(p_x: f64, p_y: f64, p_s: i32): f64 {
+    let xi: i32 = i32(floor(p_x));
+    let yi: i32 = i32(floor(p_y));
+    let xf: f64 = p_x - f64(xi);
+    let yf: f64 = p_y - f64(yi);
+    let u: f64 = xf * xf * (3.0 - 2.0 * xf);
+    let v: f64 = yf * yf * (3.0 - 2.0 * yf);
+    let a: f64 = h2(xi, yi, p_s);
+    let b: f64 = h2(xi + 1, yi, p_s);
+    let c: f64 = h2(xi, yi + 1, p_s);
+    let d: f64 = h2(xi + 1, yi + 1, p_s);
+    let ab: f64 = a + (b - a) * u;
+    let cd: f64 = c + (d - c) * u;
+    let out: f64 = ab + (cd - ab) * v;
+    return out;
+}
+
+// Terrain height. ±1.5 m of undulation over 32 m destroys the ruler horizon
+// (CLAUDE.md §9 rule 5); the ridge term adds the spine ridge_golden needs.
+export fn terrain_h(p_x: f64, p_z: f64): f64 {
+    let x: f64 = p_x; let z: f64 = p_z;
+    let n0: f64 = vnoise2(x * 0.031, z * 0.031, g_ground_seed);
+    let n1: f64 = vnoise2(x * 0.089, z * 0.089, g_ground_seed + 3);
+    let n2: f64 = vnoise2(x * 0.215, z * 0.215, g_ground_seed + 9);
+    let h: f64 = (n0 - 0.5) * 5.2 + (n1 - 0.5) * 1.9 + (n2 - 0.5) * 0.55;
+    if (g_ridge > 0.0) {
+        let d: f64 = (z + 26.0) * 0.09;
+        let ridge: f64 = 13.0 / (1.0 + d * d);
+        h = h + ridge * g_ridge;
+        if (z < -40.0) { h = h - 5.5 * g_ridge; }
+    }
+    let out: f64 = h;
+    return out;
+}
+
+// ===========================================================================
+// 4. THE RENDER WORLD — the registry the frame graph walks
+// ---------------------------------------------------------------------------
+// Struct-of-arrays (CLAUDE.md A7), filled by the caller, never by this file.
+// A chunk is any world-space baked mesh: terrain tile, near apron, building.
+// A prop is a mesh INSTANCE with three LODs and a contact blob. A particle is
+// a billboard in one of three shapes.
+// ===========================================================================
+
+let g_ch_mesh: array = [];
+let g_ch_ox: array<f64> = [];
+let g_ch_oz: array<f64> = [];
+let g_ch_cx: array<f64> = [];
+let g_ch_cy: array<f64> = [];
+let g_ch_cz: array<f64> = [];
+let g_ch_r: array<f64> = [];
+
+let g_pr_m0: array = [];
+let g_pr_m1: array = [];
+let g_pr_m2: array = [];
+let g_pr_d1: array<f64> = [];
+let g_pr_d2: array<f64> = [];
+let g_pr_rad: array<f64> = [];
+let g_pr_x: array<f64> = [];
+let g_pr_y: array<f64> = [];
+let g_pr_z: array<f64> = [];
+let g_pr_yaw: array<f64> = [];
+let g_pr_s: array<f64> = [];
+let g_pr_tr: array<i32> = [];
+let g_pr_tg: array<i32> = [];
+let g_pr_tb: array<i32> = [];
+let g_pr_shadow: array<f64> = [];
+let g_pr_tag: array<i32> = [];      // opaque to this file; the caller's class
+
+let g_fx_x: array<f64> = [];
+let g_fx_y: array<f64> = [];
+let g_fx_z: array<f64> = [];
+let g_fx_s: array<f64> = [];
+let g_fx_cell: array<i32> = [];
+let g_fx_kind: array<i32> = [];
+let g_fx_r: array<i32> = [];
+let g_fx_g: array<i32> = [];
+let g_fx_b: array<i32> = [];
+let g_fx_a: array<i32> = [];
+
+export fn world_clear() {
+    g_ch_mesh = []; g_ch_ox = []; g_ch_oz = [];
+    g_ch_cx = []; g_ch_cy = []; g_ch_cz = []; g_ch_r = [];
+    g_pr_m0 = []; g_pr_m1 = []; g_pr_m2 = [];
+    g_pr_d1 = []; g_pr_d2 = []; g_pr_rad = [];
+    g_pr_x = []; g_pr_y = []; g_pr_z = [];
+    g_pr_yaw = []; g_pr_s = []; g_pr_tr = []; g_pr_tg = []; g_pr_tb = [];
+    g_pr_shadow = []; g_pr_tag = [];
+    g_fx_x = []; g_fx_y = []; g_fx_z = []; g_fx_s = [];
+    g_fx_cell = []; g_fx_kind = []; g_fx_r = []; g_fx_g = []; g_fx_b = [];
+    g_fx_a = [];
+}
+
+// (p_ox, p_oy, p_oz) is the mesh origin in world space; a mesh already built in
+// world space (an apron, a building) passes zeros. (p_cx, p_cy, p_cz, p_r) is
+// its bounding sphere, which is what the frustum and the fog wall test.
+export fn world_chunk_add(p_mesh, p_ox: f64, p_oz: f64,
+                          p_cx: f64, p_cy: f64, p_cz: f64, p_r: f64): i32 {
+    let idx: i32 = g_ch_mesh.length;
+    g_ch_mesh.push(p_mesh);
+    g_ch_ox.push(p_ox);
+    g_ch_oz.push(p_oz);
+    g_ch_cx.push(p_cx);
+    g_ch_cy.push(p_cy);
+    g_ch_cz.push(p_cz);
+    g_ch_r.push(p_r);
+    let out: i32 = idx;
+    return out;
+}
+
+// p_m0/p_m1/p_m2 are the three LOD meshes (pass the same handle three times
+// for an asset that has one), p_d1/p_d2 the switch distances in metres, p_rad
+// the LOD0 cull radius, p_y the GROUND height at (x, z) — the prop stands on
+// it and its contact blob is laid 3.5 cm above it.
+export fn world_prop_add(p_m0, p_m1, p_m2, p_d1: f64, p_d2: f64, p_rad: f64,
+                         p_x: f64, p_y: f64, p_z: f64,
+                         p_yaw: f64, p_s: f64,
+                         p_tr: i32, p_tg: i32, p_tb: i32,
+                         p_shadow: f64, p_tag: i32): i32 {
+    let idx: i32 = g_pr_m0.length;
+    g_pr_m0.push(p_m0); g_pr_m1.push(p_m1); g_pr_m2.push(p_m2);
+    g_pr_d1.push(p_d1); g_pr_d2.push(p_d2); g_pr_rad.push(p_rad);
+    g_pr_x.push(p_x); g_pr_y.push(p_y); g_pr_z.push(p_z);
+    g_pr_yaw.push(p_yaw); g_pr_s.push(p_s);
+    g_pr_tr.push(p_tr); g_pr_tg.push(p_tg); g_pr_tb.push(p_tb);
+    g_pr_shadow.push(p_shadow);
+    g_pr_tag.push(p_tag);
+    let out: i32 = idx;
+    return out;
+}
+
+export fn world_fx_add(p_x: f64, p_y: f64, p_z: f64, p_s: f64,
+                       p_cell: i32, p_kind: i32,
+                       p_r: i32, p_g: i32, p_b: i32, p_a: i32): i32 {
+    let idx: i32 = g_fx_x.length;
+    g_fx_x.push(p_x); g_fx_y.push(p_y); g_fx_z.push(p_z); g_fx_s.push(p_s);
+    g_fx_cell.push(p_cell); g_fx_kind.push(p_kind);
+    g_fx_r.push(p_r); g_fx_g.push(p_g); g_fx_b.push(p_b); g_fx_a.push(p_a);
+    let out: i32 = idx;
+    return out;
+}
+
+export fn world_chunk_count(): i32 { let out: i32 = g_ch_mesh.length; return out; }
+export fn world_chunk_mesh(p_i: i32) { let out = g_ch_mesh[p_i]; return out; }
+export fn world_prop_count(): i32 { let out: i32 = g_pr_m0.length; return out; }
+export fn world_prop_tag(p_i: i32): i32 { let out: i32 = g_pr_tag[p_i]; return out; }
+export fn world_prop_x(p_i: i32): f64 { let out: f64 = g_pr_x[p_i]; return out; }
+export fn world_prop_y(p_i: i32): f64 { let out: f64 = g_pr_y[p_i]; return out; }
+export fn world_prop_z(p_i: i32): f64 { let out: f64 = g_pr_z[p_i]; return out; }
+export fn world_prop_scale(p_i: i32): f64 { let out: f64 = g_pr_s[p_i]; return out; }
+export fn world_fx_count(): i32 { let out: i32 = g_fx_x.length; return out; }
+
+// ---------------------------------------------------------------------------
+// THE LOD SWITCH, and why p_d2 can be fog-relative.
+// ---------------------------------------------------------------------------
+// ⚠ THE FAR SWITCH IS FOG-RELATIVE, NOT A FIXED 46 m. READ THIS BEFORE PUTTING
+// THE CONSTANT BACK. A far LOD is usually a flat crossed-quad card with no
+// texture detail left, and a flat opaque card is only honest where the fog has
+// genuinely closed over it. 46 m is only past the fog wall in a scene whose
+// FOG_FAR is about 48; `ridge_golden`'s is 64 and it scatters trees out to
+// 61 m, so a dozen of them crossed into the card LOD while the fog was still
+// two-thirds open. MEASURED off that frame: one card sat on the crest at native
+// x164-180 y70-83 as RGB(189,139,90), luminance 148.1 with a luminance std of
+// 10.4 across 208 pixels — an opaque untextured slab 33 luminance off the sky
+// beside it, which the round-3 critic booked as "a naked untextured quad".
+//
+// So the threshold is where linear fog leaves under 8 % of the albedo, with a
+// 46 m floor that keeps every short-fog scene (26 m, 20 m) on exactly the LODs
+// it had. This can only cost triangles in the deep scenes that showed the bug.
+fn lod_pick(p_i: i32, p_dist: f64) {
+    let i: i32 = p_i;
+    let d: f64 = p_dist;
+    if (d < g_pr_d1[i]) { let m0 = g_pr_m0[i]; return m0; }
+    let d2: f64 = g_pr_d2[i];
+    if (d2 < 0.0) {
+        let fnear: f64 = env_field(g_env, ENV_FOG_NEAR);
+        let ffar: f64 = env_field(g_env, ENV_FOG_FAR);
+        d2 = fnear + (ffar - fnear) * 0.92;
+        if (d2 < 46.0) { d2 = 46.0; }
+    }
+    if (d < d2) { let m1 = g_pr_m1[i]; return m1; }
+    let m2 = g_pr_m2[i];
+    return m2;
+}
+
+// ===========================================================================
+// 5. EMIT HELPERS
+// ---------------------------------------------------------------------------
+// NOTE (reported, not fixed — batch.hml is not this task's file): `batch.hml`
+// has no `batch_release(b, n)`. `batch_reserve` advances the triangle count by
+// the full reservation, but `emit_mesh_buf` / `emit_quad_world` may write
+// FEWER triangles than reserved (culled, near-clipped, guard-rejected). The
+// unwritten tail must be handed back or the flush draws uninitialised memory.
+// The only way to do that today is to write `b.n` directly, which is what
+// mesh.hml itself does internally.
+// ===========================================================================
+
+fn emit_chunk(p_b, p_tex, p_mesh, p_ox: f64, p_oy: f64, p_oz: f64): i32 {
+    let ntris: i32 = mesh_tri_count(p_mesh);
+    if (ntris < 1) { let z: i32 = 0; return z; }
+    while (g_dep.length < ntris) { g_dep.push(0.0); }
+    let cur: i32 = batch_reserve(p_b, ntris);
+    if (cur < 0) { let z2: i32 = 0; return z2; }
+    let n: i32 = emit_mesh_buf(batch_vbuf(p_b), cur, ntris, g_dep, 0,
+                               mesh_buf(p_mesh), ntris,
+                               p_ox, p_oy, p_oz, 1.0, 0.0, 0.0, 1.0, 0.0);
+    p_b.n = p_b.n - (ntris - n);
+    for (let k = 0; k < n; k++) {
+        batch_commit(p_b, cur + k * 60, p_tex, g_dep[k]);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+fn emit_world_quad(p_b, p_tex,
+                   p_ax: f64, p_ay: f64, p_az: f64,
+                   p_bx: f64, p_by: f64, p_bz: f64,
+                   p_cx: f64, p_cy: f64, p_cz: f64,
+                   p_dx: f64, p_dy: f64, p_dz: f64,
+                   p_u0: f64, p_v0: f64, p_u1: f64, p_v1: f64,
+                   p_rgb: i32): i32 {
+    while (g_dep.length < 2) { g_dep.push(0.0); }
+    let cur: i32 = batch_reserve(p_b, 2);
+    if (cur < 0) { let z: i32 = 0; return z; }
+    let n: i32 = emit_quad_world(batch_vbuf(p_b), cur, g_dep, 0,
+                                 p_ax, p_ay, p_az, p_bx, p_by, p_bz,
+                                 p_cx, p_cy, p_cz, p_dx, p_dy, p_dz,
+                                 p_u0, p_v0, p_u1, p_v0, p_u1, p_v1, p_u0, p_v1,
+                                 0.0, 1.0, 0.0, p_rgb);
+    p_b.n = p_b.n - (2 - n);
+    for (let k = 0; k < n; k++) { batch_commit(p_b, cur + k * 60, p_tex, g_dep[k]); }
+    let out: i32 = n;
+    return out;
+}
+
+// One screen-space quad with four independent UVs. Written straight through
+// batch_write_vertex — the reference encoder for the 20-byte SDL_Vertex. The
+// sky panorama needs per-corner UVs, so the rect form is not enough.
+fn sky_quad_uv(p_b, p_tex,
+               p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64,
+               p_ua: f64, p_va: f64, p_ub: f64, p_vb: f64,
+               p_uc: f64, p_vc: f64, p_ud: f64, p_vd: f64,
+               p_r: i32, p_g: i32, p_bl: i32, p_a: i32, p_depth: f64): i32 {
+    let cur: i32 = batch_reserve(p_b, 2);
+    if (cur < 0) { let z: i32 = 0; return z; }
+    let buf: ptr = batch_vbuf(p_b);
+    batch_write_vertex(buf, cur, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
+    batch_write_vertex(buf, cur + 20, p_x1, p_y0, p_r, p_g, p_bl, p_a, p_ub, p_vb);
+    batch_write_vertex(buf, cur + 40, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
+    batch_write_vertex(buf, cur + 60, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
+    batch_write_vertex(buf, cur + 80, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
+    batch_write_vertex(buf, cur + 100, p_x0, p_y1, p_r, p_g, p_bl, p_a, p_ud, p_vd);
+    batch_commit(p_b, cur, p_tex, p_depth);
+    batch_commit(p_b, cur + 60, p_tex, p_depth);
+    let out: i32 = 2;
+    return out;
+}
+
+// ===========================================================================
+// 6. THE SKY QUAD — mapping a 360-degree panorama onto a 70-degree frustum
+// ---------------------------------------------------------------------------
+// skygen bakes U across a full turn of yaw and V from zenith (row 0) to
+// horizon (row H-1). Two triangles with corner UVs would squeeze all 360
+// degrees into the 70 the camera can see, so the sky is a small grid: each
+// vertex takes the exact panorama UV of its own view ray, and the affine error
+// inside an 8.75-degree column is under a texel. 48 triangles, at depth = FAR,
+// in the SKY layer, flushed in insertion order before anything else.
+//
+// Below the horizon V clamps to 1.0, which is the row skygen derives from
+// FOG_TINT_MUL — so the band under the horizon is the fog colour by
+// construction and there is no seam at the skyline (ART_BIBLE §11.5, §6.6).
+//
+// ---------------------------------------------------------------------------
+// ⚠ MIRRORED UVs DRAW NOTHING. Measured, not guessed.
+// ---------------------------------------------------------------------------
+// SDL 2.0.18's SOFTWARE renderer — the one every headless shot and the CI
+// fallback use — silently draws NOTHING for a textured triangle whose u runs
+// right-to-left. It is not a blend-mode issue and it is not a clipping issue.
+// Minimal repro (a 64x64 target, a 16x16 half-red/half-green texture, one
+// full-target quad, SDL_RenderGeometry, read back):
+//
+//     u 0.00 -> 1.00, BLEND_NONE   left 220,40   right 40,220     drawn
+//     u 1.00 -> 0.00, BLEND_NONE   left 0,0      right 0,0        NOTHING
+//     u 1.00 -> 0.00, BLEND_BLEND  left 0,0      right 0,0        NOTHING
+//     u 0.36 -> 0.60, BLEND_NONE   left 220,40   right 40,220     drawn
+//     u 0.60 -> 0.36, BLEND_NONE   left 0,0      right 0,0        NOTHING
+//
+// This cost two renders to find, because a dropped triangle leaves the CLEAR
+// colour behind and a sky cleared to its own zenith looks like a plausible sky.
+// It has already bitten twice in this project:
+//   * the panorama. This engine's right vector is (cos yaw, 0, sin yaw), so
+//     `atan2(x, z)` — skygen's own azimuth convention — DECREASES across the
+//     screen from left to right. Sampled literally, every sky quad is mirrored
+//     and the whole layer vanishes. sky_uv_at negates the azimuth and the
+//     CALLER must negate the x of the sun direction it hands skygen to match.
+//   * the minimap. hudgen ships one corner bracket and expects the other three
+//     to be uv flips (HUD_MM_CORNER). Three of the four corners were invisible.
+// Anything else in this project that plans to mirror a sprite with a uv flip —
+// a left-facing icon, a mirrored decal, a flipped viewmodel — has to bake a
+// second sprite instead, or draw on hardware only.
+// ===========================================================================
+
+let g_SKY_COLS: i32 = 10;
+let g_SKY_ROWS: i32 = 4;
+
+// The camera basis, hoisted once per sky pass, and the one output pair.
+let g_sk_thh: f64 = 0.0;   let g_sk_thv: f64 = 0.0;
+let g_sk_fx: f64 = 0.0;    let g_sk_fy: f64 = 0.0;   let g_sk_fz: f64 = -1.0;
+let g_sk_rx: f64 = 1.0;    let g_sk_rz: f64 = 0.0;
+let g_sk_ux: f64 = 0.0;    let g_sk_uy: f64 = 1.0;   let g_sk_uz: f64 = 0.0;
+let g_sk_u: f64 = 0.0;     let g_sk_v: f64 = 0.0;
+
+export fn sky_basis() {
+    let fovr: f64 = g_fov * g_D2R;
+    let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
+    let hh: f64 = fovr * 0.5;
+    g_sk_thv = sin(hh) / cos(hh);
+    g_sk_thh = g_sk_thv * aspect;
+    let cyw: f64 = cos(g_yaw * g_D2R);
+    let syw: f64 = sin(g_yaw * g_D2R);
+    let cpw: f64 = cos(g_pitch * g_D2R);
+    let spw: f64 = sin(g_pitch * g_D2R);
+    g_sk_fx = syw * cpw;  g_sk_fy = spw;  g_sk_fz = 0.0 - (cyw * cpw);
+    g_sk_rx = cyw;        g_sk_rz = syw;
+    g_sk_ux = 0.0 - (syw * spw);  g_sk_uy = cpw;  g_sk_uz = cyw * spw;
+}
+
+// Panorama UV of the view ray through NDC (x, y), into sky_u() / sky_v().
+// u is NOT wrapped into [0,1) here: the caller wants the continuous turn count
+// so it can split the one quad that crosses the seam.
+//
+// ⚠ THE AZIMUTH IS NEGATED. This is not a taste decision — see MIRRORED UVs in
+// the block comment above. `atan2(-wx, wz)` makes u ASCEND with screen x for
+// this engine's camera basis (right = (cos yaw, 0, sin yaw)), which is the only
+// thing SDL 2.0.18's software renderer will draw. The caller negates the x of
+// the sun direction it hands skygen by exactly the same token, so the sun and
+// moon still land at their true azimuths; only the procedural cloud and star
+// field is mirrored, which is unobservable.
+export fn sky_uv_at(p_ndcx: f64, p_ndcy: f64) {
+    let dx: f64 = p_ndcx * g_sk_thh;
+    let dy: f64 = p_ndcy * g_sk_thv;
+    let wx: f64 = g_sk_rx * dx + g_sk_ux * dy + g_sk_fx;
+    let wy: f64 = g_sk_uy * dy + g_sk_fy;
+    let wz: f64 = g_sk_rz * dx + g_sk_uz * dy + g_sk_fz;
+    let l: f64 = sqrt(wx * wx + wy * wy + wz * wz);
+    if (l > 0.0) { wx = wx / l; wy = wy / l; wz = wz / l; }
+    let az: f64 = atan2(0.0 - wx, wz);
+    let el: f64 = asin(clampf(wy, -1.0, 1.0));
+    g_sk_u = az / 6.283185307179586 + 0.5;
+    g_sk_v = clampf(1.0 - el / 1.5707963267948966, 0.0, 1.0);
+}
+
+export fn sky_u(): f64 { let out: f64 = g_sk_u; return out; }
+export fn sky_v(): f64 { let out: f64 = g_sk_v; return out; }
+
+fn sky_emit(p_depth: f64): i32 {
+    let cols: i32 = g_SKY_COLS;
+    let rows: i32 = g_SKY_ROWS;
+    sky_basis();
+    let w: f64 = f64(g_RES_W) / f64(cols);
+    let h: f64 = f64(g_RES_H) / f64(rows);
+    let tris: i32 = 0;
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            let nx0: f64 = f64(i) / f64(cols) * 2.0 - 1.0;
+            let nx1: f64 = f64(i + 1) / f64(cols) * 2.0 - 1.0;
+            let ny0: f64 = 1.0 - f64(j) / f64(rows) * 2.0;
+            let ny1: f64 = 1.0 - f64(j + 1) / f64(rows) * 2.0;
+            sky_uv_at(nx0, ny0); let ua: f64 = g_sk_u; let va: f64 = g_sk_v;
+            sky_uv_at(nx1, ny0); let ub: f64 = g_sk_u; let vb: f64 = g_sk_v;
+            sky_uv_at(nx1, ny1); let uc: f64 = g_sk_u; let vc: f64 = g_sk_v;
+            sky_uv_at(nx0, ny1); let ud: f64 = g_sk_u; let vd: f64 = g_sk_v;
+            // One quad spans 1/cols of the fov — under 10 degrees of azimuth —
+            // so the other three corners are within 0.03 turns of the first.
+            // Anything further apart is the +-180 seam, and wraps.
+            if (ub - ua > 0.5) { ub = ub - 1.0; }
+            if (ua - ub > 0.5) { ub = ub + 1.0; }
+            if (uc - ua > 0.5) { uc = uc - 1.0; }
+            if (ua - uc > 0.5) { uc = uc + 1.0; }
+            if (ud - ua > 0.5) { ud = ud - 1.0; }
+            if (ua - ud > 0.5) { ud = ud + 1.0; }
+            // The grid cells OVERLAP by 0.6 px on their right and bottom
+            // edges. SDL's software rasterizer has no shared-edge fill rule,
+            // so two triangles that meet exactly on x = 128.0 leave a one-pixel
+            // unwritten column — a thin dark line straight down the sky, which
+            // is what `muzzle_fog` showed at the column boundary. The overlap
+            // is sub-pixel in uv terms and both quads carry the same depth in
+            // an insertion-ordered layer, so it is invisible.
+            let x0: f64 = f64(i) * w;
+            let x1: f64 = f64(i + 1) * w + 0.6;
+            let y0: f64 = f64(j) * h;
+            let y1: f64 = f64(j + 1) * h + 0.6;
+            // A source rect with zero width or height is empty, and an empty
+            // rect draws nothing at all. Every row below the horizon has v
+            // clamped to exactly 1.0 at both ends, so without this the bottom
+            // of the frame silently loses its sky. One texel of span is enough
+            // and is invisible.
+            let epu: f64 = 0.001953125;      // 1/512
+            let epv: f64 = 0.00625;          // 1/160
+            if (ub - ua < epu) { ub = ua + epu; }
+            if (uc - ud < epu) { uc = ud + epu; }
+            if (vd - va < epv) { va = vd - epv; }
+            if (vc - vb < epv) { vb = vc - epv; }
+            if (va < 0.0) { va = 0.0; }
+            if (vb < 0.0) { vb = 0.0; }
+            // Shift into [0,1): the software renderer builds a source rect from
+            // the uv bounding box, so a negative u is not a wrap, it is a
+            // dropped triangle.
+            let lo: f64 = ua;
+            if (ud < lo) { lo = ud; }
+            let sh: f64 = floor(lo);
+            ua = ua - sh; ub = ub - sh; uc = uc - sh; ud = ud - sh;
+            let hi: f64 = ub;
+            if (uc > hi) { hi = uc; }
+            if (hi > 1.0) {
+                // This is the one column that straddles the panorama seam.
+                // Split it there rather than letting it run off the texture.
+                let t: f64 = (1.0 - ua) / (ub - ua);
+                let xc: f64 = x0 + (x1 - x0) * t;
+                tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, xc, y1,
+                                          ua, va, 1.0, vb, 1.0, vc, ud, vd,
+                                          255, 255, 255, 255, p_depth);
+                tris = tris + sky_quad_uv(g_bsky, g_tex_sky, xc, y0, x1, y1,
+                                          0.0, va, ub - 1.0, vb,
+                                          uc - 1.0, vc, 0.0, vd,
+                                          255, 255, 255, 255, p_depth);
+                continue;
+            }
+            tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, x1, y1,
+                                      ua, va, ub, vb, uc, vc, ud, vd,
+                                      255, 255, 255, 255, p_depth);
+        }
+    }
+    let out: i32 = tris;
+    return out;
+}
+
+// ===========================================================================
+// 7. THE FRAME — ARCHITECTURE.md §4, IN ORDER
+// ===========================================================================
+
+// Stage 0 of the caller's frame: reset the counters BEFORE stage 6, so the
+// time-of-day and sky-bake stages land inside the frame's own timing.
+export fn frame_begin() {
+    stat_frame_begin();
+    emit_stats_reset();
+    mesh_reset_counters();
+    billboard_reset_counters();
+}
+
+// STAGES 8..23. The caller has already run stage 6 (tod_eval into frame_env())
+// and stage 7 (the sky re-bake) — see THE IMPORT WALL in the header.
+// Returns the number of triangles the SKY layer emitted (0 in sheet mode).
+export fn frame_render(): i32 {
+    let sheet: i32 = g_opt_sheet;
+    let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
+    let fovr: f64 = g_fov * g_D2R;
+
+    emit_set_env(g_env);
+
+    // -- 8..10  view basis, MVP hoist, frustum extraction --------------------
+    stat_begin(STAT_T_VIEW);
+    let far: f64 = env_far_plane(g_env);
+    let proj = mat_perspective(fovr, aspect, g_NEAR, far);
+    let view = mat_look_dir(v3(g_camx, g_camy, g_camz), g_yaw * g_D2R, g_pitch * g_D2R);
+    g_mvp = mat_mul(proj, view);
+    emit_set_mvp(g_mvp);
+    emit_set_viewport(f64(g_RES_W), f64(g_RES_H), g_GUARD);
+    emit_set_near(g_NEAR);
+    emit_set_backface(EMIT_BF_CCW);
+    emit_set_lighting(0);               // baked vertex colour + fog only (G19)
+    mesh_set_mvp(g_mvp);
+    mesh_set_viewport(f64(g_RES_W), f64(g_RES_H));
+    mesh_set_near(g_NEAR);
+    mesh_set_cull(MESH_CULL_NEG);
+    billboard_set_mvp(g_mvp);
+    billboard_set_viewport(f64(g_RES_W), f64(g_RES_H));
+    billboard_set_near(g_NEAR);
+    billboard_set_proj_persp(fovr, aspect, f64(g_RES_W), f64(g_RES_H));
+    frustum_from_mvp(g_frustum, g_mvp);
+    stat_end(STAT_T_VIEW);
+
+    // The fog wall is the triangle budget (CLAUDE.md §6): nothing is drawn
+    // past it. It is read from the env, which stage 6 has already written.
+    let fog_far: f64 = env_field(g_env, ENV_FOG_FAR);
+
+    // -- 11  reset all four batches. No allocation past this line. -----------
+    stat_begin(STAT_T_BATCH_RESET);
+    batch_reset(g_bsky);
+    batch_reset(g_bworld);
+    batch_reset(g_bfx);
+    batch_reset(g_bhud);
+    stat_end(STAT_T_BATCH_RESET);
+
+    stat_begin(STAT_T_EMIT);
+
+    // -- 12  sky: the panorama, at depth = FAR -------------------------------
+    stat_begin(STAT_T_EMIT_SKY);
+    let skytris: i32 = 0;
+    if (sheet == 0) { skytris = sky_emit(far); }
+    stat_end(STAT_T_EMIT_SKY);
+
+    // -- 13  terrain: ring walk -> frustum_sphere per chunk -> emit ----------
+    stat_begin(STAT_T_EMIT_TERRAIN);
+    let tested: i32 = 0; let culled: i32 = 0; let drawn: i32 = 0;
+    if (sheet == 0) {
+        let nc: i32 = g_ch_mesh.length;
+        for (let i = 0; i < nc; i++) {
+            tested++;
+            let cx: f64 = g_ch_cx[i]; let cy: f64 = g_ch_cy[i]; let cz: f64 = g_ch_cz[i];
+            // distance cull first: never draw past the fog far plane
+            let ddx: f64 = cx - g_camx; let ddz: f64 = cz - g_camz;
+            let dist: f64 = sqrt(ddx * ddx + ddz * ddz) - g_ch_r[i];
+            if (dist > fog_far) { culled++; stat_add(STAT_REJ_DISTANCE, 1); continue; }
+            if (frustum_sphere(g_frustum, cx, cy, cz, g_ch_r[i]) == 0) {
+                culled++;
+                stat_add(STAT_REJ_FRUSTUM, 1);
+                continue;
+            }
+            emit_chunk(g_bworld, g_tex_world, g_ch_mesh[i],
+                       g_ch_ox[i], 0.0, g_ch_oz[i]);
+            drawn++;
+        }
+    }
+    stat_set(STAT_CHUNKS_TESTED, tested);
+    stat_set(STAT_CHUNKS_CULLED, culled);
+    stat_set(STAT_CHUNKS_DRAWN, drawn);
+    stat_end(STAT_T_EMIT_TERRAIN);
+
+    // -- 14  entities/props: real LOD + ONE contact blob each ----------------
+    stat_begin(STAT_T_EMIT_ENTITY);
+    let etested: i32 = 0; let eculled: i32 = 0; let edrawn: i32 = 0;
+    if (sheet == 0) {
+        let np: i32 = g_pr_m0.length;
+        let ftr: f64 = env_field(g_env, ENV_FOG_R);
+        let ftg2: f64 = env_field(g_env, ENV_FOG_G);
+        let ftb: f64 = env_field(g_env, ENV_FOG_B);
+        let blob = g_mesh_blob;
+        for (let k = 0; k < np; k++) {
+            etested++;
+            let px2: f64 = g_pr_x[k]; let py2: f64 = g_pr_y[k]; let pz2: f64 = g_pr_z[k];
+            let dx2: f64 = px2 - g_camx; let dz2: f64 = pz2 - g_camz;
+            let dd: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
+            let rad2: f64 = g_pr_rad[k] * g_pr_s[k];
+            if (dd - rad2 > fog_far) {
+                eculled++;
+                stat_add(STAT_REJ_DISTANCE, 1);
+                continue;
+            }
+            if (frustum_sphere(g_frustum, px2, py2 + rad2 * 0.5, pz2, rad2 + 1.0) == 0) {
+                eculled++;
+                stat_add(STAT_REJ_FRUSTUM, 1);
+                continue;
+            }
+            let m = lod_pick(k, dd);
+            // Per-instance point lighting. mesh_bake_light folds ambient + sun
+            // + bounce only, so a dynamic light reaches a static prop through
+            // its instance tint — the same approximation the fog uses, and
+            // exact enough for a prop small next to the light's radius.
+            let plr: f64 = 1.0; let plg: f64 = 1.0; let plb: f64 = 1.0;
+            let nl: i32 = env_light_count(g_env);
+            for (let li = 0; li < nl; li++) {
+                let lb2: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
+                let ldx: f64 = env_field(g_env, lb2) - px2;
+                let ldy: f64 = env_field(g_env, lb2 + 1) - (py2 + rad2 * 0.4);
+                let ldz: f64 = env_field(g_env, lb2 + 2) - pz2;
+                let lrad: f64 = env_field(g_env, lb2 + 6);
+                let ld: f64 = sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
+                if (ld < lrad) {
+                    let att: f64 = (1.0 - ld / lrad) * (1.0 - ld / lrad);
+                    plr = plr + env_field(g_env, lb2 + 3) * att;
+                    plg = plg + env_field(g_env, lb2 + 4) * att;
+                    plb = plb + env_field(g_env, lb2 + 5) * att;
+                }
+            }
+            // Per-instance fog: exact for props small next to the fog gradient.
+            let f: f64 = env_fog_factor(px2, py2 + rad2 * 0.4, pz2);
+            let a: i32 = i32(env_fog_alpha(f));
+            let tr2: i32 = clampi(i32(f64(g_pr_tr[k]) * plr * (1.0 - f * (1.0 - ftr))), 0, 255);
+            let tg3: i32 = clampi(i32(f64(g_pr_tg[k]) * plg * (1.0 - f * (1.0 - ftg2))), 0, 255);
+            let tb2: i32 = clampi(i32(f64(g_pr_tb[k]) * plb * (1.0 - f * (1.0 - ftb))), 0, 255);
+            mesh_emit_yaw(m, g_bworld, g_tex_world, px2, py2, pz2,
+                          g_pr_yaw[k], g_pr_s[k], tr2, tg3, tb2, a);
+            // The contact blob — a 2-triangle card, laid on the ground the
+            // prop was placed on. MANDATORY, no exceptions, not even in a test
+            // scene (CLAUDE.md §9 rule 6): the highest value-per-triangle
+            // spend we have.
+            let sh: f64 = g_pr_shadow[k] * g_pr_s[k] * 0.5;
+            mesh_emit_yaw(blob, g_bworld, g_tex_world,
+                          px2, py2 + 0.035, pz2,
+                          0.0, sh, 255, 255, 255, a);
+            edrawn++;
+        }
+    }
+    stat_set(STAT_ENTS_TESTED, etested);
+    stat_set(STAT_ENTS_CULLED, eculled);
+    stat_set(STAT_ENTS_DRAWN, edrawn);
+    stat_end(STAT_T_EMIT_ENTITY);
+
+    // -- 15  viewmodel: never culled, never fogged --------------------------
+    stat_begin(STAT_T_EMIT_VIEWMODEL);
+    if (sheet == 0 && g_opt_viewmodel != 0) {
+        let cy2: f64 = cos(g_yaw * g_D2R); let sy2: f64 = sin(g_yaw * g_D2R);
+        let cp2: f64 = cos(g_pitch * g_D2R); let sp2: f64 = sin(g_pitch * g_D2R);
+        let ffx: f64 = sy2 * cp2; let ffy: f64 = sp2; let ffz: f64 = 0.0 - (cy2 * cp2);
+        let rrx: f64 = cy2; let rrz: f64 = sy2;
+        let uux: f64 = 0.0 - (sy2 * sp2); let uuy: f64 = cp2; let uuz: f64 = cy2 * sp2;
+        // mesh_emit_yaw rotates local +z to (sin yaw, cos yaw); the camera
+        // looks down (sin yaw_c, -cos yaw_c), so the model yaw is PI - yaw_c.
+        let vyaw: f64 = 3.141592653589793 - g_yaw * g_D2R;
+        let vx: f64 = g_camx + ffx * 1.05 + rrx * 0.26 + uux * (0.0 - 0.34);
+        let vy: f64 = g_camy + ffy * 1.05 + uuy * (0.0 - 0.34);
+        let vz: f64 = g_camz + ffz * 1.05 + rrz * 0.26 + uuz * (0.0 - 0.34);
+        // The viewmodel is never fogged (§6.6) but it IS lit: a full-albedo gun
+        // at night is the single most common first-person lighting bug. It is
+        // baked with the world, so the tint is neutral and alpha is opaque.
+        mesh_emit_yaw(g_mesh_vm, g_bworld, g_tex_world,
+                      vx, vy, vz, vyaw, 1.0, 255, 255, 255, 255);
+    }
+    stat_end(STAT_T_EMIT_VIEWMODEL);
+
+    // -- 16  fx: particles, glow cards, tracers, rain ------------------------
+    stat_begin(STAT_T_EMIT_FX);
+    let nfx: i32 = 0;
+    if (sheet == 0) {
+        nfx = g_fx_x.length;
+        for (let q = 0; q < nfx; q++) {
+            atlas_cell_uv(g_atlas_fx, g_fx_cell[q], g_uvs, 0);
+            billboard_set_uv(g_uvs[0], g_uvs[1], g_uvs[2], g_uvs[3]);
+            let fa: f64 = env_fog_factor(g_fx_x[q], g_fx_y[q], g_fx_z[q]);
+            let al: i32 = clampi(i32(f64(g_fx_a[q]) * (1.0 - fa * 0.85)), 0, 255);
+            if (g_fx_kind[q] == g_FXK_RAIN) {
+                billboard_stretched(g_bfx, g_tex_fx,
+                                    g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                    g_fx_x[q] + 0.12, g_fx_y[q] - 1.5, g_fx_z[q],
+                                    0.05, g_fx_r[q], g_fx_g[q], g_fx_b[q], al);
+            } else if (g_fx_kind[q] == g_FXK_TRACER) {
+                let tdx: f64 = g_fx_x[q] - g_camx;
+                let tdz: f64 = g_fx_z[q] - g_camz;
+                let tl: f64 = sqrt(tdx * tdx + tdz * tdz);
+                if (tl < 0.001) { tl = 1.0; }
+                billboard_stretched(g_bfx, g_tex_fx,
+                                    g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                    g_fx_x[q] + tdx / tl * 2.6, g_fx_y[q],
+                                    g_fx_z[q] + tdz / tl * 2.6,
+                                    0.06, g_fx_r[q], g_fx_g[q], g_fx_b[q], al);
+            } else {
+                billboard_world(g_bfx, g_tex_fx, g_fx_x[q], g_fx_y[q], g_fx_z[q],
+                                g_fx_s[q], g_fx_r[q], g_fx_g[q], g_fx_b[q], al);
+            }
+        }
+        // One flat ground glow card per dynamic light. mesh_bake_light folds
+        // only ambient + sun + bounce, so this 2-triangle additive card is how
+        // a point light reaches the GROUND — which is what ART_BIBLE 12.2 asks
+        // for and what a PS1-era renderer would have done.
+        let nl2: i32 = env_light_count(g_env);
+        atlas_cell_uv(g_atlas_fx, g_cell_glow, g_uvs, 0);
+        for (let li = 0; li < nl2; li++) {
+            let lb3: i32 = ENV_LIGHT0_X + li * ENV_LIGHT_STRIDE;
+            let lx2: f64 = env_field(g_env, lb3);
+            let lz2: f64 = env_field(g_env, lb3 + 2);
+            // The card is a 2-triangle quad with only four corners following
+            // the ground, so beyond ~14 m it is seen edge-on and reads as a
+            // bright LINE across the terrain instead of a pool of light. Near
+            // lights (the muzzle flash, a lantern you are standing by) are
+            // exactly where a ground pool earns its two triangles.
+            let ldc: f64 = sqrt((lx2 - g_camx) * (lx2 - g_camx)
+                                + (lz2 - g_camz) * (lz2 - g_camz));
+            if (ldc > 14.0) { continue; }
+            let lrad2: f64 = env_field(g_env, lb3 + 6) * 0.62;
+            let lr2: i32 = clampi(i32(env_field(g_env, lb3 + 3) * 96.0), 0, 255);
+            let lg2: i32 = clampi(i32(env_field(g_env, lb3 + 4) * 96.0), 0, 255);
+            let lb4: i32 = clampi(i32(env_field(g_env, lb3 + 5) * 96.0), 0, 255);
+            emit_world_quad(g_bfx, g_tex_fx,
+                            lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
+                            lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 - lrad2) + 0.06, lz2 - lrad2,
+                            lx2 + lrad2, terrain_h(lx2 + lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
+                            lx2 - lrad2, terrain_h(lx2 - lrad2, lz2 + lrad2) + 0.06, lz2 + lrad2,
+                            g_uvs[0], g_uvs[1], g_uvs[2], g_uvs[3],
+                            (lr2 << 16) | (lg2 << 8) | lb4);
+        }
+    }
+    stat_set(STAT_PARTICLES, nfx);
+    stat_end(STAT_T_EMIT_FX);
+    stat_end(STAT_T_EMIT);
+
+    // -- 17  overflow accounting --------------------------------------------
+    stat_set(STAT_TRIS_SUBMITTED, emit_count_submitted()
+                                  + batch_count(g_bsky) + batch_count(g_bhud));
+    stat_add(STAT_REJ_BACKFACE, emit_count_backface() + mesh_rej_backface());
+    stat_add(STAT_REJ_NEAR, emit_count_near() + mesh_rej_near());
+    stat_add(STAT_REJ_GUARD, emit_count_guard() + mesh_rej_guard());
+    stat_add(STAT_CLIP_STRADDLE, emit_count_straddle());
+
+    // -- 18  target_begin ----------------------------------------------------
+    stat_begin(STAT_T_TARGET_BEGIN);
+    target_begin(g_target);
+    set_draw_blend(g_win, BLEND_BLEND);
+    stat_end(STAT_T_TARGET_BEGIN);
+
+    // -- 19  clear to the sky zenith so a dropped sky frame is never black ---
+    stat_begin(STAT_T_CLEAR);
+    sdl_clear(g_win, g_clear_r, g_clear_g, g_clear_b, 255);
+    if (sheet == 1) { sdl_clear(g_win, g_sheet_r, g_sheet_g, g_sheet_b, 255); }
+    stat_end(STAT_T_CLEAR);
+
+    // -- 20  SKY, insertion order, 1-3 draw calls ---------------------------
+    stat_begin(STAT_T_FLUSH_SKY);
+    batch_flush(g_win, g_bsky);
+    stat_end(STAT_T_FLUSH_SKY);
+
+    // -- 21  WORLD, bucket-sorted on view depth, then texture runs ----------
+    // batch.hml fuses sort+flush. The counting sort is idempotent, so it is
+    // timed on its own here and `flush.world` below still contains one sort;
+    // flush.world - sort.world is the pure gather+draw cost.
+    stat_begin(STAT_T_SORT_WORLD);
+    batch_sort(g_bworld);
+    stat_end(STAT_T_SORT_WORLD);
+    stat_begin(STAT_T_FLUSH_WORLD);
+    batch_sort_flush(g_win, g_bworld);
+    stat_end(STAT_T_FLUSH_WORLD);
+
+    // -- 22  FX, sorted, additive -------------------------------------------
+    stat_begin(STAT_T_SORT_FX);
+    batch_sort(g_bfx);
+    stat_end(STAT_T_SORT_FX);
+    stat_begin(STAT_T_FLUSH_FX);
+    batch_sort_flush(g_win, g_bfx);
+    stat_end(STAT_T_FLUSH_FX);
+
+    // -- 23  postfx: the vignette ring + the lightning flash -----------------
+    // This is the LAST thing in LAYER_HUD before the caller's stage 24, and it
+    // has to stay that way: LAYER_HUD is flushed in insertion order, so the
+    // vignette sits UNDER the HUD, not over it.
+    stat_begin(STAT_T_POSTFX);
+    if (sheet == 0) {
+        quad_ring(g_bhud, g_tex_hud, f64(g_RES_W) * 0.5, f64(g_RES_H) * 0.5,
+                  128.0, 96.0, 260.0, 210.0, 8,
+                  (g_solid_u0 + g_solid_u1) * 0.5, (g_solid_v0 + g_solid_v1) * 0.5,
+                  g_vig_r, g_vig_g, g_vig_b, 0, 150, 0.9);
+        if (g_opt_lightning != 0) {
+            quad_screen_uv(g_bhud, g_tex_hud, 0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
+                           g_solid_u0, g_solid_v0, g_solid_u1, g_solid_v1,
+                           g_flash_r, g_flash_g, g_flash_b, 54, 0.95);
+        }
+    }
+    stat_end(STAT_T_POSTFX);
+
+    let out: i32 = skytris;
+    return out;
+}
+
+// STAGES 25..28. Between frame_render and this, the caller emits its own HUD
+// into frame_batch_hud() — stage 24 of §4, hard-capped at 250 triangles.
+//
+// The authoritative image is the RES_W x RES_H target, read back while it is
+// still bound. Stages 26-27 still run, so the present path is exercised even
+// when the caller only wants the pixels.
+export fn frame_present(): i32 {
+    // -- 25  HUD flush, insertion order --------------------------------------
+    stat_begin(STAT_T_FLUSH_HUD);
+    batch_flush(g_win, g_bhud);
+    stat_end(STAT_T_FLUSH_HUD);
+
+    let rc: i32 = read_pixels_rect(g_win, 0, 0, g_RES_W, g_RES_H,
+                                   FMT_ARGB8888, g_fb, g_RES_W * 4);
+
+    // -- 26  target_end + integer upscale present with the shake offset ------
+    stat_begin(STAT_T_PRESENT);
+    target_end(g_target);
+    target_present(g_target);
+    // -- 27  present ---------------------------------------------------------
+    sdl_present(g_win);
+    stat_end(STAT_T_PRESENT);
+
+    // -- 28  stats -----------------------------------------------------------
+    stat_frame_end();
+    let out: i32 = rc;
+    return out;
+}

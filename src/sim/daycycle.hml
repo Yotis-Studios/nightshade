@@ -1,0 +1,350 @@
+// daycycle.hml — the simulation's clock. W3-12.
+//
+// tick -> day fraction, phase, shade-tier phase bonus, and the dusk-horn edge.
+//
+// SIM SIDE ONLY. This file decides WHEN. `src/art/tod.hml` decides what it
+// LOOKS like. There is not one colour, one keyframe or one SDL symbol below,
+// and there never will be: the import wall (CLAUDE.md §3) allows this directory
+// `@stdlib/math`, other `src/sim/**` and `src/core/**`, and this module needs
+// only the last of those. It imports NO math either — everything here is
+// integer arithmetic and one division.
+//
+// ---------------------------------------------------------------------------
+// THE DAY  (ARCHITECTURE decision D6 — gamedesign's 16 minutes wins)
+// ---------------------------------------------------------------------------
+//     Dawn 2:00 | Day 7:00 | Dusk 2:00 | Night 5:00   =  16:00  =  57 600 ticks
+//
+//     phase   ticks              day fraction        length
+//     Dawn        0 ..  7 199    0.0000 .. 0.1250     7 200
+//     Day     7 200 .. 32 399    0.1250 .. 0.5625    25 200
+//     Dusk   32 400 .. 39 599    0.5625 .. 0.6875     7 200
+//     Night  39 600 .. 57 599    0.6875 .. 1.0000    18 000
+//
+// Not one of those numbers is typed in below. Every boundary is DERIVED from
+// `config.hml`'s `g_PHASE_*_END` fractions and `g_DAY_TICKS`, once, at module
+// load, so moving a boundary is a one-line edit in the file that owns the
+// number. `probe_daycycle` asserts the derivation against the fractions rather
+// than against the table above — the table is a comment, the fractions are the
+// contract.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 1 — THE INTEGER TICK IS THE AUTHORITY. THE FRACTION IS DERIVED.
+// ---------------------------------------------------------------------------
+// `day_phase` compares INTEGERS. It never computes a day fraction and never
+// compares a float to a boundary. That is the whole reason "phase boundaries
+// land on exact tick counts" is true here by construction rather than by luck:
+// there is no rounding step in which tick 32 399 could be classified Dusk or
+// tick 32 400 classified Day.
+//
+// `day_frac` exists for the art layer (`tod_eval` takes a fraction) and for the
+// debug clock. Nothing in this file consumes it. A f64 entry point
+// (`day_phase_of_frac`) is provided for callers that only hold a scrubbed
+// fraction — it is the SAME comparison tod.hml makes, so the two agree — but
+// gameplay must call the tick form.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 2 — THE DUSK HORN IS AN EDGE FUNCTION, NOT A REMEMBERED FLAG
+// ---------------------------------------------------------------------------
+// The obvious implementation of "fires exactly once per day" is a module-level
+// `g_horn_fired` bool. It is wrong here for three separate reasons:
+//
+//   * BUILD_PLAN W3-12 says "pure — no globals". Mutable module state is state
+//     that `world_reset_session` cannot rewind and `save.hml` must remember.
+//   * ROLLBACK. The client re-simulates the same tick range after a
+//     misprediction and the server re-runs ticks on a late command. A flag
+//     fires on the first pass and stays silent on every replay, so the horn
+//     would be *missing* from the authoritative run. `replay.hml` compares
+//     bit-for-bit; a latch makes the second run differ from the first.
+//   * SLEEPING. The hub skips the clock forward by thousands of ticks. An edge
+//     COUNT over the skipped interval is well defined; a latch is not.
+//
+// So the horn is `day_horn_edge(prev_tick, tick)` -> how many horn instants lie
+// in the half-open interval (prev_tick, tick]. Advancing one tick at a time it
+// returns 1 exactly on the horn tick and 0 on the other 57 599; skipping a week
+// returns 7. It is a pure function of two integers, identical on every replay.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 3 — WHERE THE HORN SITS, AND WHY IT IS DERIVED FROM THE LEAD TIME
+// ---------------------------------------------------------------------------
+// `config.hml`: `g_DUSK_HORN_LEAD_S = 120.0  // two long notes at T-2:00`.
+// T is nightfall, so the horn is `night_start - lead`. Because the Dusk phase
+// is itself exactly 2:00 long, that instant coincides with the Day->Dusk
+// boundary — the horn *is* the sound of dusk starting, and the player gets the
+// whole dusk phase to get somewhere lit. Both facts are asserted as properties
+// (horn == dusk start, and night - horn == lead) instead of as the number
+// 32 400, so re-tuning either the lead or the phase lengths fails loudly at the
+// point where they stop agreeing rather than silently drifting apart.
+//
+// ---------------------------------------------------------------------------
+// CONVENTIONS
+// ---------------------------------------------------------------------------
+//   * Phase ranges are HALF-OPEN: [start_tick, end_tick). A phase changes ON
+//     its start tick.
+//   * Ticks may be any i32. Negative ticks floor-mod correctly (a rewound
+//     history buffer can hand us one); the day wraps forever in both
+//     directions with no accumulated drift, because nothing here integrates.
+//   * Every function is pure: same arguments -> same result, on every backend,
+//     forever. There is no mutable top-level state in this file at all.
+//   * Booleans are returned as i32 0/1 — `command.hml` has the same rule and
+//     the wire format has no bool.
+
+import {
+    g_DAY_MINUTES, g_DAY_SECONDS, g_DAY_TICKS,
+    g_PHASE_DAWN_END, g_PHASE_DAY_END, g_PHASE_DUSK_END,
+    g_DUSK_HORN_LEAD_S, g_TICK_HZ,
+    g_TIER_PHASE_DUSK, g_TIER_PHASE_NIGHT, g_SHADE_TIER_MAX
+} from "../core/config.hml";
+
+// ---------------------------------------------------------------------------
+// THE FOUR PHASES
+// ---------------------------------------------------------------------------
+// Named by ARCHITECTURE.md §5.4. Numbered in clock order so `phase + 1` is the
+// next phase and `PHASE_NIGHT` wraps to `PHASE_DAWN`; `day_phase_end_tick`
+// relies on that ordering.
+export let PHASE_DAWN: i32 = 0;
+export let PHASE_DAY: i32 = 1;
+export let PHASE_DUSK: i32 = 2;
+export let PHASE_NIGHT: i32 = 3;
+export let PHASE_COUNT: i32 = 4;
+export let PHASE_NONE: i32 = -1;      // "no edge this tick"
+
+// ---------------------------------------------------------------------------
+// THE DAY, in the units each caller wants it in
+// ---------------------------------------------------------------------------
+export let DAY_TICKS: i32 = g_DAY_TICKS;
+export let DAY_SECONDS: f64 = g_DAY_SECONDS;
+export let DAY_MINUTES: f64 = g_DAY_MINUTES;
+
+// Exact start tick of each phase, derived from the config fractions.
+// `+ 0.5` rounds rather than truncates: with today's dyadic fractions
+// (1/8, 9/16, 11/16) the products are exact and rounding is a no-op, but a
+// future 1/3 must not land on 19 199.
+export let PHASE_TICK_DAWN: i32 = 0;
+export let PHASE_TICK_DAY: i32 = i32(g_PHASE_DAWN_END * f64(g_DAY_TICKS) + 0.5);
+export let PHASE_TICK_DUSK: i32 = i32(g_PHASE_DAY_END * f64(g_DAY_TICKS) + 0.5);
+export let PHASE_TICK_NIGHT: i32 = i32(g_PHASE_DUSK_END * f64(g_DAY_TICKS) + 0.5);
+
+// The dusk horn. DERIVED (see DESIGN 3): nightfall minus the authored lead.
+export let HORN_LEAD_TICKS: i32 = i32(g_DUSK_HORN_LEAD_S * f64(g_TICK_HZ) + 0.5);
+export let HORN_TICK: i32 = PHASE_TICK_NIGHT - HORN_LEAD_TICKS;
+
+// Shade-tier phase bonus (GDD §4.2 / config §6): the world gets one tier deeper
+// at dusk and two at night. Dawn and Day give nothing back — the tier ladder is
+// distance-driven and the phase only ever makes it worse.
+export let TIER_BONUS_DAWN: i32 = 0;
+export let TIER_BONUS_DAY: i32 = 0;
+export let TIER_BONUS_DUSK: i32 = g_TIER_PHASE_DUSK;
+export let TIER_BONUS_NIGHT: i32 = g_TIER_PHASE_NIGHT;
+export let TIER_BONUS_MAX: i32 = g_SHADE_TIER_MAX;
+
+// ---------------------------------------------------------------------------
+// TICK -> POSITION IN THE DAY
+// ---------------------------------------------------------------------------
+
+// Tick within the current day, always in [0, DAY_TICKS). Floor-mod: a negative
+// tick maps into the day, it does not mirror.
+export fn day_tick_of(p_tick: i32): i32 {
+    let n: i32 = p_tick % DAY_TICKS;
+    if (n < 0) { n = n + DAY_TICKS; }
+    let out: i32 = n;
+    return out;
+}
+
+// Which day this tick belongs to. Day 0 starts at tick 0; floor division, so
+// tick -1 is day -1. The event log keys on this.
+export fn day_number(p_tick: i32): i32 {
+    let t: i32 = p_tick;
+    let d: i32 = (t - day_tick_of(t)) / DAY_TICKS;
+    let out: i32 = d;
+    return out;
+}
+
+// Day fraction in [0, 1). The ONLY consumer is the art layer (`tod_eval`) and
+// the debug clock; nothing in this file decides anything from it.
+export fn day_frac(p_tick: i32): f64 {
+    let n: i32 = day_tick_of(p_tick);
+    let out: f64 = f64(n) / f64(DAY_TICKS);
+    return out;
+}
+
+// Seconds elapsed in the current day, [0, DAY_SECONDS).
+export fn day_seconds(p_tick: i32): f64 {
+    let n: i32 = day_tick_of(p_tick);
+    let out: f64 = f64(n) / f64(g_TICK_HZ);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PHASE
+// ---------------------------------------------------------------------------
+
+// The phase this tick is in. Integer comparisons only (DESIGN 1).
+export fn day_phase(p_tick: i32): i32 {
+    let n: i32 = day_tick_of(p_tick);
+    if (n < PHASE_TICK_DAY) { let a: i32 = PHASE_DAWN; return a; }
+    if (n < PHASE_TICK_DUSK) { let b: i32 = PHASE_DAY; return b; }
+    if (n < PHASE_TICK_NIGHT) { let c: i32 = PHASE_DUSK; return c; }
+    let out: i32 = PHASE_NIGHT;
+    return out;
+}
+
+// Phase from a day fraction, for callers that only hold one (a scrubbed
+// `--tod 0.62` on the command line, the art harness). Deliberately the same
+// comparison `tod_phase` makes, against the same config fractions, so the two
+// modules can never disagree. Gameplay calls `day_phase`.
+export fn day_phase_of_frac(p_t: f64): i32 {
+    let t: f64 = p_t - f64(i32(p_t));
+    if (t < 0.0) { t = t + 1.0; }
+    if (t < g_PHASE_DAWN_END) { let a: i32 = PHASE_DAWN; return a; }
+    if (t < g_PHASE_DAY_END) { let b: i32 = PHASE_DAY; return b; }
+    if (t < g_PHASE_DUSK_END) { let c: i32 = PHASE_DUSK; return c; }
+    let out: i32 = PHASE_NIGHT;
+    return out;
+}
+
+// First tick of a phase, within the day. Out-of-range phase -> 0.
+export fn day_phase_start_tick(p_phase: i32): i32 {
+    let p: i32 = p_phase;
+    if (p == PHASE_DAY) { let a: i32 = PHASE_TICK_DAY; return a; }
+    if (p == PHASE_DUSK) { let b: i32 = PHASE_TICK_DUSK; return b; }
+    if (p == PHASE_NIGHT) { let c: i32 = PHASE_TICK_NIGHT; return c; }
+    let out: i32 = PHASE_TICK_DAWN;
+    return out;
+}
+
+// One past the last tick of a phase. Night ends at DAY_TICKS, which is Dawn of
+// the next day — the ranges are half-open and tile the day exactly.
+export fn day_phase_end_tick(p_phase: i32): i32 {
+    let p: i32 = p_phase;
+    if (p == PHASE_NIGHT) { let a: i32 = DAY_TICKS; return a; }
+    let out: i32 = day_phase_start_tick(p + 1);
+    return out;
+}
+
+// Length of a phase in ticks. The four lengths sum to DAY_TICKS.
+export fn day_phase_len(p_phase: i32): i32 {
+    let p: i32 = p_phase;
+    let out: i32 = day_phase_end_tick(p) - day_phase_start_tick(p);
+    return out;
+}
+
+// Progress through the current phase, [0, 1). 0 on the phase's first tick and
+// (len-1)/len on its last — it never reaches 1.0, because the tick at which it
+// would is the next phase's 0.
+export fn day_phase_t(p_tick: i32): f64 {
+    let n: i32 = day_tick_of(p_tick);
+    let p: i32 = day_phase(n);
+    let a: i32 = day_phase_start_tick(p);
+    let len: i32 = day_phase_len(p);
+    let out: f64 = f64(n - a) / f64(len);
+    return out;
+}
+
+// 1 during Night. The pacing switch: short fog, muzzle flashes as the primary
+// light, the tier bonus at its worst. Reads the PHASE, never the light.
+export fn day_is_night(p_tick: i32): i32 {
+    let p: i32 = day_phase(p_tick);
+    let out: i32 = 0;
+    if (p == PHASE_NIGHT) { out = 1; }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SHADE-TIER PHASE BONUS
+// ---------------------------------------------------------------------------
+// `worldgen_shade_tier` computes clamp(floor(d/200) + noise_tier + phase_bonus,
+// 0, 5). This is the third term. It is a function of the phase alone — never of
+// the fog, never of the light — so the tier a chunk reports and the tier the
+// director budgets from are the same integer.
+
+export fn day_tier_bonus_of_phase(p_phase: i32): i32 {
+    let p: i32 = p_phase;
+    if (p == PHASE_DUSK) { let a: i32 = TIER_BONUS_DUSK; return a; }
+    if (p == PHASE_NIGHT) { let b: i32 = TIER_BONUS_NIGHT; return b; }
+    let out: i32 = TIER_BONUS_DAWN;
+    return out;
+}
+
+export fn day_tier_bonus(p_tick: i32): i32 {
+    let p: i32 = day_phase(p_tick);
+    let out: i32 = day_tier_bonus_of_phase(p);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE DUSK HORN
+// ---------------------------------------------------------------------------
+
+// The within-day tick the horn sounds on.
+export fn day_horn_tick(): i32 {
+    let out: i32 = HORN_TICK;
+    return out;
+}
+
+// 1 if this exact tick is a horn tick.
+export fn day_is_horn_tick(p_tick: i32): i32 {
+    let n: i32 = day_tick_of(p_tick);
+    let out: i32 = 0;
+    if (n == HORN_TICK) { out = 1; }
+    return out;
+}
+
+// How many horn instants lie in [0 .. p_tick]. Internal; the edge is the
+// difference of two of these. Ticks before the first horn count 0, including
+// every negative tick.
+fn horn_count_upto(p_tick: i32): i32 {
+    let t: i32 = p_tick;
+    if (t < HORN_TICK) { let z: i32 = 0; return z; }
+    let out: i32 = ((t - HORN_TICK) / DAY_TICKS) + 1;
+    return out;
+}
+
+// THE EDGE (DESIGN 2). Number of horn instants in the half-open interval
+// (p_prev_tick, p_tick]. Call it as `day_horn_edge(tick - 1, tick)` from the
+// tick loop and it returns 1 exactly once per day; call it across a sleep skip
+// and it returns however many nights you slept through. Pure — replaying the
+// same interval always yields the same count.
+export fn day_horn_edge(p_prev_tick: i32, p_tick: i32): i32 {
+    let a: i32 = horn_count_upto(p_prev_tick);
+    let b: i32 = horn_count_upto(p_tick);
+    let d: i32 = b - a;
+    if (d < 0) { d = 0; }
+    let out: i32 = d;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PHASE EDGES AND LOOK-AHEAD
+// ---------------------------------------------------------------------------
+
+// The phase entered between p_prev_tick and p_tick, or PHASE_NONE (-1) if the
+// phase did not change. Intended for a one-tick advance; across a large skip it
+// reports only the phase you landed in, and a skip of exactly one whole day
+// reports PHASE_NONE. Use `day_horn_edge`'s counting form if you need every
+// boundary in a skipped interval.
+export fn day_phase_edge(p_prev_tick: i32, p_tick: i32): i32 {
+    let a: i32 = day_phase(p_prev_tick);
+    let b: i32 = day_phase(p_tick);
+    if (a == b) { let z: i32 = PHASE_NONE; return z; }
+    let out: i32 = b;
+    return out;
+}
+
+// Ticks from p_tick forward to the next start of p_phase. 0 if p_tick is
+// already that start tick, DAY_TICKS at most. This is the "2:14 to nightfall"
+// number the HUD wants and the "skip to dawn" number the hub bed wants.
+export fn day_ticks_until(p_tick: i32, p_phase: i32): i32 {
+    let n: i32 = day_tick_of(p_tick);
+    let s: i32 = day_phase_start_tick(p_phase);
+    let d: i32 = s - n;
+    if (d < 0) { d = d + DAY_TICKS; }
+    let out: i32 = d;
+    return out;
+}
+
+// Absolute tick of the next start of p_phase at or after p_tick.
+export fn day_next_phase_tick(p_tick: i32, p_phase: i32): i32 {
+    let t: i32 = p_tick;
+    let out: i32 = t + day_ticks_until(t, p_phase);
+    return out;
+}

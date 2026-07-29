@@ -1,0 +1,1283 @@
+// ---------------------------------------------------------------------------
+// audiobank.hml — the procedural SFX bank.                    Nightshade W3-14.
+// ---------------------------------------------------------------------------
+//
+// 65 sound effects, synthesized from nothing into S16 mono PCM `buffer`s and
+// handed to `wobbleweed/src/audio.hml`'s registry.  There are no asset files
+// and there never will be (ARCHITECTURE.md §6).
+//
+// ---------------------------------------------------------------------------
+// THE ONE RULE THAT IS LOAD-BEARING:  Mix_QuickLoad_RAW DOES NOT COPY.
+// ---------------------------------------------------------------------------
+// The `Mix_Chunk` the mixer hands back points straight at the bytes we
+// synthesized here, and SDL_mixer's AUDIO THREAD reads them on every callback
+// for as long as the chunk can be played.  If that memory dies, the mixer reads
+// freed memory from another thread and the process dies later, somewhere else,
+// for no visible reason.
+//
+// So this file never frees a PCM buffer.  Not on rebuild, not on shutdown, not
+// ever.  `g_bk_pcm` is a top-level array that retains every buffer for the
+// process lifetime, and `audio_register_pcm_mono` retains a second reference in
+// the engine registry.  Two live references, zero frees.  There is deliberately
+// no `bank_free`, no `bank_clear`, no `bank_reload`.  If you add one you have
+// added a use-after-free that will not reproduce under a debugger.
+//
+// `bank_build` is IDEMPOTENT: the second call is a no-op that returns the same
+// count.  Re-registering would double the registry's memory for no benefit; the
+// engine's `audio_init` already rebuilds every chunk against a new device.
+//
+// ---------------------------------------------------------------------------
+// WHY MONO, AND WHY THE RATE IS A PARAMETER
+// ---------------------------------------------------------------------------
+// `Mix_QuickLoad_RAW` performs NO conversion of any kind — not rate, not
+// format, not channel count.  Handing a stereo device a mono buffer plays it at
+// double speed.  `audio_register_pcm_mono` exists for exactly this: it expands
+// mono source PCM into a registry-owned device-format buffer once, at
+// registration time, and owns both forever.  Panning needs a stereo device, and
+// footsteps/impacts/gunshots all want panning, so mono registration is correct.
+//
+// The RATE, though, nothing can fix for us.  `bank_build_at(p_rate)` takes the
+// device's OBTAINED rate (`audio_out_freq()`), not the requested one.  Call
+// `audio_init` first, then `bank_build_at(audio_out_freq())`.  `bank_build()`
+// synthesizes at BANK_RATE (22050, the PS1-era-appropriate default the engine
+// opens with) for the case where the bank is built before the device.
+//
+// ---------------------------------------------------------------------------
+// THE MIX RULE:  THE GUN IS THE LOUDEST THING IN THE GAME, ALWAYS.
+// ---------------------------------------------------------------------------
+// GAME_DESIGN §7.  It is enforced on TWO independent knobs so that re-tuning
+// either one alone cannot quietly break it, and `probe_audiobank` asserts the
+// resulting ORDERING (not any particular number):
+//
+//   1. the normalisation target baked into the PCM  (`bk_peak_of`)
+//   2. the recommended play gain the caller passes to audio_play (`bank_gain`)
+//
+// Every gunshot normalises to BK_PEAK_GUN and plays at gain 1.0.  Nothing else
+// in the bank may reach that product.  A sound that needs to feel louder gets
+// more transient energy, not more peak.
+//
+// ---------------------------------------------------------------------------
+// SIZE
+// ---------------------------------------------------------------------------
+// 26.1 s of mono audio at 22050 Hz S16 = 1.10 MB.  On a STEREO device the engine
+// also owns the 2x expansion, so the registry holds 3x the mono figure — 3.30 MB,
+// and THAT is the number the 6 MB budget must be read against.  The probe asserts
+// it with a real stereo device open, because a mono-device measurement would
+// under-report the true cost by a factor of three.
+//
+// ---------------------------------------------------------------------------
+// DETERMINISM
+// ---------------------------------------------------------------------------
+// Every noise source is seeded from the sound's own index, never from a running
+// generator and never from a clock.  `bank_render(i, rate)` called twice
+// produces byte-identical output, which is what makes the WAV dump a stable
+// artefact and the spectral assertions repeatable.
+// ---------------------------------------------------------------------------
+
+import { sin, exp, pow, divi } from "@stdlib/math";
+
+import { audio_register_pcm_mono } from "../../../wobbleweed/src/audio.hml";
+
+// ===========================================================================
+// SOUND IDS.  Contiguous 0..BANK_COUNT-1; they index this module's tables,
+// NOT the engine registry.  `bank_sound(SFX_X)` maps to the engine id.
+// ===========================================================================
+
+// --- six gunshots ---------------------------------------------------------
+export const SFX_SPARROW      = 0;    // AR,        690 rpm
+export const SFX_TINKER       = 1;    // SMG,       900 rpm
+export const SFX_BELLOWS      = 2;    // shotgun,    75 rpm
+export const SFX_LONGSHADOW   = 3;    // marksman,   75 rpm
+export const SFX_KESTREL      = 4;    // revolver,  200 rpm
+export const SFX_EMBERLANCE   = 5;    // special,    40 rpm
+
+// --- impacts, one per material -------------------------------------------
+export const SFX_IMP_SOIL     = 6;
+export const SFX_IMP_GRASS    = 7;
+export const SFX_IMP_STONE    = 8;
+export const SFX_IMP_WOOD     = 9;
+export const SFX_IMP_METAL    = 10;
+export const SFX_IMP_FLESH    = 11;
+
+// --- footsteps: four surfaces x four variants (GAME_DESIGN §7 item 18) ----
+export const SFX_STEP_GRASS   = 12;   // 12..15
+export const SFX_STEP_DIRT    = 16;   // 16..19
+export const SFX_STEP_STONE   = 20;   // 20..23
+export const SFX_STEP_WOOD    = 24;   // 24..27
+export const BANK_STEP_VARIANTS = 4;
+
+// --- the pitch-rising hit-click chain: +0 +2 +4 +6 +8 semitones -----------
+export const SFX_HIT          = 28;   // 28..32
+export const BANK_HIT_STEPS   = 5;
+
+// --- the ember-pickup arpeggio -------------------------------------------
+export const SFX_EMBER        = 33;   // 33..37
+export const BANK_EMBER_STEPS = 5;
+
+// --- events ---------------------------------------------------------------
+export const SFX_KILL         = 38;   // the two-note kill chime
+export const SFX_BELL         = 39;   // the lantern bell
+export const SFX_HORN         = 40;   // the dusk horn, two long notes
+export const SFX_LEVELUP      = 41;   // ascending four-note motif
+export const SFX_STREAK1      = 42;
+export const SFX_STREAK2      = 43;
+export const SFX_STREAK3      = 44;
+export const SFX_WAVECLEAR    = 45;
+
+// --- weapon handling ------------------------------------------------------
+export const SFX_DRYFIRE      = 46;
+export const SFX_RELOAD_DROP  = 47;
+export const SFX_RELOAD_INS   = 48;
+export const SFX_RELOAD_SEAT  = 49;
+export const SFX_MAG_CLACK    = 50;   // the magazine hitting the floor
+export const SFX_SHELL_INS    = 51;
+export const SFX_PUMP         = 52;
+export const SFX_SWAP         = 53;
+
+// --- UI -------------------------------------------------------------------
+export const SFX_UI_MOVE      = 54;
+export const SFX_UI_CONFIRM   = 55;
+export const SFX_UI_BACK      = 56;
+export const SFX_XP_BLIP      = 57;
+export const SFX_HURT         = 58;
+
+// --- enemies --------------------------------------------------------------
+export const SFX_WISP_CHIME   = 59;
+export const SFX_HUSK_GROWL   = 60;
+export const SFX_WARDEN_STEP  = 61;
+
+// --- ambience beds (looped) ----------------------------------------------
+export const SFX_AMB_DAY      = 62;
+export const SFX_AMB_NIGHT    = 63;
+export const SFX_AMB_TOWN     = 64;
+
+export const BANK_COUNT       = 65;
+
+// ===========================================================================
+// GROUPS — used by the mix rule and by the probe's ordering assertions.
+// ===========================================================================
+export const GRP_GUN    = 0;
+export const GRP_IMPACT = 1;
+export const GRP_STEP   = 2;
+export const GRP_HIT    = 3;
+export const GRP_EVENT  = 4;
+export const GRP_WEAPON = 5;
+export const GRP_UI     = 6;
+export const GRP_ENEMY  = 7;
+export const GRP_AMB    = 8;
+
+// ===========================================================================
+// THE MIX.  Two knobs, both ordered so the gun always wins (see the header).
+// ===========================================================================
+export const BANK_RATE     = 22050;   // engine default; PS1-era appropriate
+
+const BK_PEAK_GUN    = 0.97;          // gunshots, and nothing else, live here
+const BK_PEAK_EVENT  = 0.58;
+const BK_PEAK_IMPACT = 0.55;
+const BK_PEAK_ENEMY  = 0.50;
+const BK_PEAK_HIT    = 0.45;
+const BK_PEAK_WEAPON = 0.42;
+const BK_PEAK_UI     = 0.35;
+const BK_PEAK_STEP   = 0.30;
+const BK_PEAK_AMB    = 0.20;
+
+const BK_TAU = 6.283185307179586;
+
+// The crossfade an ambience bed is rendered with so its loop point is
+// CONTINUOUS.  A fade-to-silence would also make the endpoints meet, and it
+// would sound like a hole every 3.2 s — the probe asserts BOTH endpoint
+// continuity and uniform energy so that cheat fails.
+const BK_AMB_XFADE_S = 0.25;
+
+// ===========================================================================
+// STATE.  Nothing here is ever released.  See the header.
+// ===========================================================================
+
+let g_bk_built  = 0;
+let g_bk_rate   = 0;
+let g_bk_pcm    = [];      // buffer per sfx — RETAINED FOREVER (2nd reference)
+let g_bk_id     = [];      // engine sound id per sfx, -1 before build
+let g_bk_bytes  = [];      // byte length per sfx
+let g_bk_smp    = [];      // sample count per sfx
+let g_bk_total  = 0;       // total mono PCM bytes
+
+// cold metadata, built once by bk_meta()
+let g_bk_meta   = 0;
+let g_bk_grp    = [];
+let g_bk_dur    = [];      // seconds
+let g_bk_gain   = [];      // recommended audio_play gain
+let g_bk_name   = [];
+
+// synthesis scratch: one f64 lane, allocated once, reused for every sound.
+// A5 — array<f64> beats a raw ptr for hot random-access float data.
+//
+// INVARIANT: on entry to bank_render the whole lane is ZERO, and bank_render
+// leaves it zero again.  The quantize pass zeroes as it reads, which removes a
+// whole clear pass from every sound (measured 30 ns/sample, ~20 ms of the
+// budget).  bk_need_scratch pushes zeros, so a freshly grown lane is zero too.
+let g_bk_scr: array<f64> = [];
+let g_bk_scrcap = 0;
+
+// White-noise table.  Measured on this box, compiled -O1: an inline 32-bit LCG
+// costs 110 ns/sample inside a filtered noise loop; a table read with an odd
+// stride costs 63 ns.  Over the ~1 M noise samples in the bank that is 47 ms of
+// the 150 ms budget, so the table is not a micro-optimisation.
+//
+// 2^17 entries = 5.9 s at 22050 Hz, longer than the longest lane, so no sound
+// ever wraps.  Each layer walks it with its own ODD stride, which is a full-
+// period permutation of the table — two layers that happen to start near each
+// other still get uncorrelated sequences, which a shared stride of 1 would not.
+const BK_NZ_BITS = 17;
+const BK_NZ_MASK = 131071;
+let g_bk_nz: array<f64> = [];
+let g_bk_nzn = 0;
+
+// ===========================================================================
+// METADATA
+// ===========================================================================
+
+fn bk_push(p_grp: i32, p_dur: f64, p_gain: f64, p_name: string) {
+    g_bk_grp.push(p_grp);
+    g_bk_dur.push(p_dur);
+    g_bk_gain.push(p_gain);
+    g_bk_name.push(p_name);
+}
+
+fn bk_meta() {
+    if (g_bk_meta == 1) { return; }
+    g_bk_meta = 1;
+
+    // ---- guns.  Gain 1.0, peak BK_PEAK_GUN.  Nothing else gets both. -----
+    bk_push(GRP_GUN, 0.30, 1.0, "gun_sparrow");
+    bk_push(GRP_GUN, 0.22, 1.0, "gun_tinker");
+    bk_push(GRP_GUN, 0.48, 1.0, "gun_bellows");
+    bk_push(GRP_GUN, 0.60, 1.0, "gun_longshadow");
+    bk_push(GRP_GUN, 0.38, 1.0, "gun_kestrel");
+    bk_push(GRP_GUN, 0.50, 1.0, "gun_emberlance");
+
+    // ---- impacts ---------------------------------------------------------
+    bk_push(GRP_IMPACT, 0.20, 0.75, "imp_soil");
+    bk_push(GRP_IMPACT, 0.20, 0.75, "imp_grass");
+    bk_push(GRP_IMPACT, 0.22, 0.75, "imp_stone");
+    bk_push(GRP_IMPACT, 0.22, 0.75, "imp_wood");
+    bk_push(GRP_IMPACT, 0.26, 0.75, "imp_metal");
+    bk_push(GRP_IMPACT, 0.20, 0.75, "imp_flesh");
+
+    // ---- footsteps -------------------------------------------------------
+    let s: i32 = 0;
+    while (s < 4) {
+        let v: i32 = 0;
+        while (v < BANK_STEP_VARIANTS) {
+            let nm: string = "step_grass";
+            if (s == 1) { nm = "step_dirt"; }
+            if (s == 2) { nm = "step_stone"; }
+            if (s == 3) { nm = "step_wood"; }
+            bk_push(GRP_STEP, 0.15, 0.45, `${nm}_${v}`);
+            v = v + 1;
+        }
+        s = s + 1;
+    }
+
+    // ---- hit chain -------------------------------------------------------
+    let h: i32 = 0;
+    while (h < BANK_HIT_STEPS) {
+        bk_push(GRP_HIT, 0.040, 0.80, `hit_${h}`);
+        h = h + 1;
+    }
+
+    // ---- ember arpeggio --------------------------------------------------
+    let e: i32 = 0;
+    while (e < BANK_EMBER_STEPS) {
+        bk_push(GRP_HIT, 0.14, 0.70, `ember_${e}`);
+        e = e + 1;
+    }
+
+    // ---- events ----------------------------------------------------------
+    bk_push(GRP_EVENT, 0.50, 0.90, "kill_chime");
+    bk_push(GRP_EVENT, 1.40, 0.90, "lantern_bell");
+    bk_push(GRP_EVENT, 2.60, 0.90, "dusk_horn");
+    bk_push(GRP_EVENT, 1.00, 0.85, "level_up");
+    bk_push(GRP_EVENT, 0.75, 0.85, "streak_1");
+    bk_push(GRP_EVENT, 0.75, 0.85, "streak_2");
+    bk_push(GRP_EVENT, 0.75, 0.85, "streak_3");
+    bk_push(GRP_EVENT, 0.85, 0.85, "wave_clear");
+
+    // ---- weapon handling -------------------------------------------------
+    bk_push(GRP_WEAPON, 0.075, 0.70, "dry_fire");
+    bk_push(GRP_WEAPON, 0.30, 0.60, "reload_drop");
+    bk_push(GRP_WEAPON, 0.22, 0.60, "reload_insert");
+    bk_push(GRP_WEAPON, 0.18, 0.60, "reload_seat");
+    bk_push(GRP_WEAPON, 0.35, 0.60, "mag_clack");
+    bk_push(GRP_WEAPON, 0.20, 0.60, "shell_insert");
+    bk_push(GRP_WEAPON, 0.35, 0.60, "pump");
+    bk_push(GRP_WEAPON, 0.25, 0.55, "weapon_swap");
+
+    // ---- UI --------------------------------------------------------------
+    bk_push(GRP_UI, 0.10, 0.60, "ui_move");
+    bk_push(GRP_UI, 0.18, 0.60, "ui_confirm");
+    bk_push(GRP_UI, 0.12, 0.60, "ui_back");
+    bk_push(GRP_UI, 0.10, 0.60, "xp_blip");
+    bk_push(GRP_UI, 0.35, 0.80, "hurt");
+
+    // ---- enemies ---------------------------------------------------------
+    bk_push(GRP_ENEMY, 0.55, 0.70, "wisp_chime");
+    bk_push(GRP_ENEMY, 0.70, 0.70, "husk_growl");
+    bk_push(GRP_ENEMY, 0.42, 0.70, "warden_step");
+
+    // ---- ambience --------------------------------------------------------
+    bk_push(GRP_AMB, 2.00, 0.35, "amb_day");
+    bk_push(GRP_AMB, 2.00, 0.35, "amb_night");
+    bk_push(GRP_AMB, 2.00, 0.35, "amb_town");
+}
+
+fn bk_peak_of(p_sfx: i32): f64 {
+    let g: i32 = g_bk_grp[p_sfx];
+    let out: f64 = BK_PEAK_UI;
+    if (g == GRP_GUN)    { out = BK_PEAK_GUN; }
+    if (g == GRP_IMPACT) { out = BK_PEAK_IMPACT; }
+    if (g == GRP_STEP)   { out = BK_PEAK_STEP; }
+    if (g == GRP_HIT)    { out = BK_PEAK_HIT; }
+    if (g == GRP_EVENT)  { out = BK_PEAK_EVENT; }
+    if (g == GRP_WEAPON) { out = BK_PEAK_WEAPON; }
+    if (g == GRP_ENEMY)  { out = BK_PEAK_ENEMY; }
+    if (g == GRP_AMB)    { out = BK_PEAK_AMB; }
+    let r: f64 = out;
+    return r;
+}
+
+// ===========================================================================
+// SYNTHESIS PRIMITIVES
+//
+// Every one of them is a per-sample loop, so every one follows the §4 hot
+// skeleton: p_-prefixed parameters copied into typed locals, no allocation, no
+// closure, no call inside the loop except the stdlib transcendental it needs.
+// They ADD into g_bk_scr so a sound is a sum of layers.
+// ===========================================================================
+
+// 32-bit LCG carried in u64 (A13: i32/i64 * + - throw on overflow; u64 wraps).
+fn bk_seed(p_sfx: i32, p_layer: i32): u64 {
+    let a: i64 = i64(p_sfx) & 4294967295;
+    let b: i64 = i64(p_layer) & 4294967295;
+    let h: u64 = u64(a) * 2654435761 + u64(b) * 2246822519 + 374761393;
+    h = (h ^ (h >> 15)) * 2246822507;
+    h = (h ^ (h >> 13)) * 3266489909;
+    h = (h ^ (h >> 16)) & 4294967295;
+    let out: u64 = h | 1;
+    return out;
+}
+
+fn bk_need_noise() {
+    if (g_bk_nzn > 0) { return; }
+    let n: i32 = 1;
+    let b: i32 = 0;
+    while (b < BK_NZ_BITS) { n = n * 2; b = b + 1; }
+    let st: u64 = 2463534242;
+    let i: i32 = 0;
+    while (i < n) {
+        st = (st * 1664525 + 1013904223) & 4294967295;
+        g_bk_nz.push(f64((st >> 8) & 65535) * 0.000030517578125 - 1.0);
+        i = i + 1;
+    }
+    g_bk_nzn = n;
+}
+
+// A layer whose envelope has fallen below this contributes less than a third of
+// an S16 LSB after normalisation, so stopping there is inaudible — and it is
+// where most of the synthesis budget went: a 110 neper/s crack layer written
+// across a 0.72 s buffer spends 95 % of its samples below -100 dB.
+const BK_ENV_FLOOR = 0.00001;
+
+// ---------------------------------------------------------------------------
+// THREE MEASURED CODEGEN FACTS SHAPE EVERY LOOP BELOW.  All three were found
+// with `hemlockc -c --emit-c`, and each is worth 10-25 % of the boot budget.
+//
+//  1. `for (let i: i32 = 0; i < n; i++)` beats `while (i < n) { ... i = i + 1; }` by
+//     23 % on an identical body (43.4 vs 56.1 ms per 1 M iterations, -O1) —
+//     CLAUDE.md A10: `+` emits an overflow check that `++` does not.
+//     `while` + `i++` lands in between at 48.0.
+//
+//  2. `let k: f64 = exp(...)` leaves k BOXED: the backend only emits
+//     `double k = hml_to_f64(x)` when the initialiser is a plain identifier.
+//     Every derived scalar therefore goes through a two-step copy
+//     (`let k0 = exp(...); let k: f64 = k0;`).  A boxed loop-carried scalar
+//     costs a `hml_binary_op` dispatch on every use.
+//
+//  3. A local that is written STRAIGHT into an array element gets boxed for
+//     its whole lifetime.  So the accumulator stays a `double` and a dedicated
+//     `sink` takes the store: `sink = v; buf[i] = sink;`.
+// ---------------------------------------------------------------------------
+
+// Band-limited noise burst with an exponential decay.
+//   p_lp  one-pole low-pass coefficient 0..1 (higher = brighter)
+//   p_hp  one-pole coefficient of the low-pass that is SUBTRACTED (higher =
+//         thinner).  lp - hp is a cheap band-pass.
+//   p_dec decay in nepers per second.
+fn bk_noise(p_i0: i32, p_n: i32, p_amp: f64, p_dec: f64,
+            p_lp: f64, p_hp: f64, p_seed: u64) {
+    let n: i32 = p_n;
+    if (n < 1 || p_amp <= 0.0) { return; }
+    bk_need_noise();
+    let i0: i32 = p_i0;
+    let amp: f64 = p_amp;
+    let a: f64 = p_lp;
+    let b: f64 = p_hp;
+    let k0 = exp(0.0 - p_dec / f64(g_bk_rate));
+    let k: f64 = k0;
+    let fl0 = BK_ENV_FLOOR / p_amp;
+    let floor_env: f64 = fl0;
+    let ix0 = i32(p_seed & BK_NZ_MASK);
+    let idx: i32 = ix0;
+    let sd0 = 1 + 2 * i32((p_seed >> 20) & 31);
+    let stride: i32 = sd0;
+    let mk0 = BK_NZ_MASK;
+    let msk: i32 = mk0;
+    let lo: f64 = 0.0;
+    let hi: f64 = 0.0;
+    let env: f64 = 1.0;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    let nz: array<f64> = g_bk_nz;
+    // The loop counter MUST start at a literal 0: `for (let i: i32 = e0; ...)`
+    // falls off the backend's native-counter path and back onto boxed
+    // `while (1)` (verified in --emit-c), which costs ~25 % on this loop alone.
+    for (let i: i32 = 0; i < n; i++) {
+        let r0 = nz[idx];
+        let r: f64 = r0;
+        idx = (idx + stride) & msk;
+        lo = lo + a * (r - lo);
+        hi = hi + b * (lo - hi);
+        let j: i32 = i0 + i;
+        let c0 = buf[j];
+        let c: f64 = c0;
+        let v: f64 = c + (lo - hi) * env * amp;
+        sink = v;
+        buf[j] = sink;
+        env = env * k;
+        if (env < floor_env) { break; }
+    }
+}
+
+// Pitched tone with an exponential frequency glide f0 -> f1 over p_n samples,
+// a linear attack of p_att seconds and an exponential decay of p_dec nepers/s.
+//   p_shape  0 sine   1 triangle   2 saw   3 square
+fn bk_tone(p_i0: i32, p_n: i32, p_f0: f64, p_f1: f64, p_amp: f64,
+           p_dec: f64, p_shape: i32, p_att: f64) {
+    let n: i32 = p_n;
+    if (n < 1 || p_amp <= 0.0) { return; }
+    let i0: i32 = p_i0;
+    let amp: f64 = p_amp;
+    let rt0 = f64(g_bk_rate);
+    let rate: f64 = rt0;
+    let fr: f64 = p_f0;
+    let ratio: f64 = 1.0;
+    if (p_f0 > 0.0 && p_f1 > 0.0) { ratio = pow(p_f1 / p_f0, 1.0 / f64(n)); }
+    let k0 = exp(0.0 - p_dec / rate);
+    let k: f64 = k0;
+    let na0 = i32(p_att * rate);
+    let na: i32 = na0;
+    if (na < 1) { na = 1; }
+    if (na > n) { na = n; }
+    let iv0 = 1.0 / f64(na);
+    let inva: f64 = iv0;
+    let fl0 = BK_ENV_FLOOR / p_amp;
+    let floor_env: f64 = fl0;
+    let tau0 = BK_TAU;
+    let tau: f64 = tau0;
+    let sh: i32 = p_shape;
+    let ph: f64 = 0.0;
+    let env: f64 = 0.0;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    let rinv: f64 = 1.0 / rate;
+    for (let i: i32 = 0; i < n; i++) {
+        if (i < na) {
+            env = f64(i) * inva;
+        } else {
+            env = env * k;
+            if (env < floor_env) { break; }
+        }
+        let sv: f64 = 0.0;
+        if (sh == 0) { sv = sin(tau * ph); }
+        if (sh == 1) {
+            if (ph < 0.5) { sv = 4.0 * ph - 1.0; } else { sv = 3.0 - 4.0 * ph; }
+        }
+        if (sh == 2) { sv = 2.0 * ph - 1.0; }
+        if (sh == 3) {
+            if (ph < 0.5) { sv = 1.0; } else { sv = 0.0 - 1.0; }
+        }
+        let j: i32 = i0 + i;
+        let c0 = buf[j];
+        let c: f64 = c0;
+        let v: f64 = c + sv * env * amp;
+        sink = v;
+        buf[j] = sink;
+        ph = ph + fr * rinv;
+        if (ph >= 1.0) { ph = ph - 1.0; }
+        fr = fr * ratio;
+    }
+}
+
+// Two-operator FM — the only cheap way to get a convincing bell or chime.
+// A harmonic p_ratio (2.0, 3.0) keeps a clean fundamental at p_fc, which is
+// what the pitch assertions need; an inharmonic one (1.41) gives the metallic
+// clang the lantern bell wants.
+fn bk_fm(p_i0: i32, p_n: i32, p_fc: f64, p_ratio: f64, p_index: f64,
+         p_amp: f64, p_dec: f64, p_idec: f64) {
+    let n: i32 = p_n;
+    if (n < 1 || p_amp <= 0.0) { return; }
+    let i0: i32 = p_i0;
+    let amp: f64 = p_amp;
+    let rt0 = f64(g_bk_rate);
+    let rate: f64 = rt0;
+    let dc: f64 = p_fc / rate;
+    let dm: f64 = p_fc * p_ratio / rate;
+    let k0 = exp(0.0 - p_dec / rate);
+    let k: f64 = k0;
+    let ki0 = exp(0.0 - p_idec / rate);
+    let ki: f64 = ki0;
+    let fl0 = BK_ENV_FLOOR / p_amp;
+    let floor_env: f64 = fl0;
+    let tau0 = BK_TAU;
+    let tau: f64 = tau0;
+    let idx: f64 = p_index;
+    let pc: f64 = 0.0;
+    let pm: f64 = 0.0;
+    let env: f64 = 1.0;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    for (let i: i32 = 0; i < n; i++) {
+        let m: f64 = sin(tau * pm);
+        let s: f64 = sin(tau * pc + idx * m);
+        let j: i32 = i0 + i;
+        let c0 = buf[j];
+        let c: f64 = c0;
+        let v: f64 = c + s * env * amp;
+        sink = v;
+        buf[j] = sink;
+        pc = pc + dc;
+        if (pc >= 1.0) { pc = pc - 1.0; }
+        pm = pm + dm;
+        if (pm >= 1.0) { pm = pm - 1.0; }
+        env = env * k;
+        idx = idx * ki;
+        if (env < floor_env) { break; }
+    }
+}
+
+// One-pole low-pass over the whole lane.  Kills the aliasing a naive saw makes
+// near Nyquist and gives the whole bank its muffled 1997 character.  Only the
+// recipes that want EXTRA filtering call this; the per-group final filter is
+// folded into bk_finish.
+fn bk_lp(p_n: i32, p_a: f64) {
+    let n: i32 = p_n;
+    let a: f64 = p_a;
+    let y: f64 = 0.0;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    for (let i: i32 = 0; i < n; i++) {
+        let c0 = buf[i];
+        let c: f64 = c0;
+        y = y + a * (c - y);
+        sink = y;
+        buf[i] = sink;
+    }
+}
+
+// DC block + low-pass + peak, in ONE pass.  Three separate passes over the
+// bank's 600 k samples cost ~50 ms of a 150 ms budget; this costs ~20.
+//
+// The DC blocker is a one-pole high-pass at ~2 Hz.  Without it the summed
+// thumps leave an offset that eats headroom and clicks on every retrigger.
+// p_a >= 1.0 bypasses the low-pass (the hit clicks and the chimes want their
+// top end).
+fn bk_finish(p_n: i32, p_a: f64): f64 {
+    let n: i32 = p_n;
+    let a: f64 = p_a;
+    let ad0 = 12.0 / f64(g_bk_rate);
+    let ad: f64 = ad0;
+    let dolp: i32 = 0;
+    if (a < 1.0) { dolp = 1; }
+    let yd: f64 = 0.0;
+    let yl: f64 = 0.0;
+    let m: f64 = 0.0;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    for (let i: i32 = 0; i < n; i++) {
+        let c0 = buf[i];
+        let c: f64 = c0;
+        yd = yd + ad * (c - yd);
+        let x: f64 = c - yd;
+        if (dolp == 1) { yl = yl + a * (x - yl); x = yl; }
+        sink = x;
+        buf[i] = sink;
+        if (x < 0.0) { x = 0.0 - x; }
+        if (x > m) { m = x; }
+    }
+    let out: f64 = m;
+    return out;
+}
+
+// Soft saturation, the Pade approximation of tanh.  Used on the guns only: it
+// is what turns a sum of noise bursts into something with a chest.
+fn bk_sat(p_n: i32, p_drive: f64) {
+    let n: i32 = p_n;
+    let dr: f64 = p_drive;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    for (let i: i32 = 0; i < n; i++) {
+        let c0 = buf[i];
+        let c: f64 = c0;
+        let x: f64 = c * dr;
+        if (x > 3.0) { x = 3.0; }
+        if (x < 0.0 - 3.0) { x = 0.0 - 3.0; }
+        let v: f64 = x * (27.0 + x * x) / (27.0 + 9.0 * x * x);
+        sink = v;
+        buf[i] = sink;
+    }
+}
+
+fn bk_peak(p_n: i32): f64 {
+    let n: i32 = p_n;
+    let buf: array<f64> = g_bk_scr;
+    let m: f64 = 0.0;
+    for (let i: i32 = 0; i < n; i++) {
+        let c0 = buf[i];
+        let x: f64 = c0;
+        if (x < 0.0) { x = 0.0 - x; }
+        if (x > m) { m = x; }
+    }
+    let out: f64 = m;
+    return out;
+}
+
+// Turn the tail of the lane into a seamless loop: the last p_x samples are
+// cross-faded into the first p_x, and the sound is then p_n samples long with
+// a CONTINUOUS join.  Not a fade — the energy at the seam is preserved.
+fn bk_loopfold(p_n: i32, p_x: i32) {
+    let n: i32 = p_n;
+    let iv0 = 1.0 / f64(p_x);
+    let inv: f64 = iv0;
+    let nx: i32 = p_x;
+    let sink: f64 = 0.0;
+    let buf: array<f64> = g_bk_scr;
+    for (let i: i32 = 0; i < nx; i++) {
+        let t: f64 = f64(i) * inv;
+        let a0 = buf[i];
+        let a: f64 = a0;
+        let b0 = buf[n + i];
+        let b: f64 = b0;
+        let v: f64 = a * t + b * (1.0 - t);
+        sink = v;
+        buf[i] = sink;
+    }
+}
+
+// ===========================================================================
+// RECIPES.  One dispatcher, called 65 times at boot.  Cold code.
+// ===========================================================================
+
+fn bk_gun(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let rate: f64 = f64(g_bk_rate);
+
+    // crack / body / tail / thump, tuned per weapon
+    let crack_a: f64 = 1.0;   let crack_d: f64 = 110.0; let crack_lp: f64 = 0.88;
+    let body_a: f64  = 0.85;  let body_d: f64  = 26.0;  let body_lp: f64  = 0.34;
+    let tail_a: f64  = 0.35;  let tail_d: f64  = 8.0;   let tail_lp: f64  = 0.12;
+    let th_f0: f64   = 165.0; let th_f1: f64   = 52.0;  let th_a: f64 = 0.70;
+    let th_d: f64    = 26.0;
+    let ring_f: f64  = 0.0;   let ring_a: f64  = 0.0;
+
+    if (sfx == SFX_TINKER) {
+        crack_d = 150.0; crack_lp = 0.92;
+        body_a = 0.70;  body_d = 34.0; body_lp = 0.42;
+        tail_a = 0.20;  tail_d = 14.0;
+        th_f0 = 195.0;  th_f1 = 76.0;  th_a = 0.50; th_d = 34.0;
+    }
+    if (sfx == SFX_BELLOWS) {
+        crack_d = 70.0; crack_lp = 0.72;
+        body_a = 1.00;  body_d = 15.0; body_lp = 0.24;
+        tail_a = 0.55;  tail_d = 5.0;  tail_lp = 0.09;
+        th_f0 = 125.0;  th_f1 = 38.0;  th_a = 0.95; th_d = 13.0;
+    }
+    if (sfx == SFX_LONGSHADOW) {
+        crack_a = 1.15; crack_d = 90.0; crack_lp = 0.95;
+        body_a = 0.80;  body_d = 12.0;  body_lp = 0.30;
+        tail_a = 0.60;  tail_d = 4.0;   tail_lp = 0.07;
+        th_f0 = 140.0;  th_f1 = 42.0;   th_a = 0.85; th_d = 11.0;
+        ring_f = 2600.0; ring_a = 0.10;
+    }
+    if (sfx == SFX_KESTREL) {
+        crack_d = 120.0; crack_lp = 0.90;
+        body_a = 0.80;   body_d = 22.0; body_lp = 0.32;
+        tail_a = 0.30;   tail_d = 9.0;
+        th_f0 = 175.0;   th_f1 = 55.0;  th_a = 0.75; th_d = 22.0;
+        ring_f = 1900.0; ring_a = 0.14;
+    }
+    if (sfx == SFX_EMBERLANCE) {
+        // not a bang: a pressurised ignition.  Slow bloom, then a low roar.
+        crack_a = 0.55; crack_d = 26.0; crack_lp = 0.60;
+        body_a = 0.95;  body_d = 7.0;   body_lp = 0.20;
+        tail_a = 0.50;  tail_d = 3.5;   tail_lp = 0.06;
+        th_f0 = 90.0;   th_f1 = 150.0;  th_a = 0.60; th_d = 5.0;
+        ring_f = 0.0;   ring_a = 0.0;
+    }
+
+    let ncrack: i32 = i32(0.06 * rate);
+    if (ncrack > n) { ncrack = n; }
+    bk_noise(0, ncrack, crack_a, crack_d, crack_lp, 0.020, bk_seed(sfx, 1));
+    bk_noise(0, n, body_a, body_d, body_lp, 0.006, bk_seed(sfx, 2));
+    bk_noise(0, n, tail_a, tail_d, tail_lp, 0.0025, bk_seed(sfx, 3));
+    bk_tone(0, divi(n, 2), th_f0, th_f1, th_a, th_d, 0, 0.0004);
+    if (ring_a > 0.0) {
+        bk_tone(0, n, ring_f, ring_f * 0.94, ring_a, 18.0, 0, 0.001);
+    }
+    if (sfx == SFX_EMBERLANCE) {
+        bk_fm(0, n, 62.0, 1.5, 3.0, 0.45, 4.0, 6.0);
+    }
+    bk_sat(n, 2.2);
+}
+
+fn bk_impact(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+
+    if (sfx == SFX_IMP_SOIL) {
+        bk_noise(0, n, 1.0, 46.0, 0.26, 0.055, bk_seed(sfx, 1));
+        bk_tone(0, divi(n, 2), 120.0, 58.0, 0.55, 40.0, 0, 0.0004);
+    }
+    if (sfx == SFX_IMP_GRASS) {
+        bk_noise(0, n, 1.0, 62.0, 0.46, 0.140, bk_seed(sfx, 1));
+        bk_noise(0, n, 0.35, 26.0, 0.20, 0.050, bk_seed(sfx, 2));
+    }
+    if (sfx == SFX_IMP_STONE) {
+        bk_noise(0, n, 1.0, 74.0, 0.78, 0.170, bk_seed(sfx, 1));
+        bk_tone(0, n, 1750.0, 1600.0, 0.28, 42.0, 0, 0.0003);
+        bk_tone(0, divi(n, 2), 220.0, 150.0, 0.30, 55.0, 0, 0.0003);
+    }
+    if (sfx == SFX_IMP_WOOD) {
+        bk_noise(0, n, 0.85, 54.0, 0.52, 0.090, bk_seed(sfx, 1));
+        bk_tone(0, n, 330.0, 262.0, 0.70, 30.0, 1, 0.0004);
+        bk_tone(0, n, 660.0, 528.0, 0.22, 44.0, 0, 0.0004);
+    }
+    if (sfx == SFX_IMP_METAL) {
+        bk_noise(0, n, 0.80, 96.0, 0.92, 0.220, bk_seed(sfx, 1));
+        bk_fm(0, n, 2350.0, 1.414, 3.2, 0.55, 14.0, 26.0);
+        bk_fm(0, n, 1180.0, 1.414, 2.0, 0.30, 10.0, 20.0);
+    }
+    if (sfx == SFX_IMP_FLESH) {
+        bk_noise(0, n, 1.0, 42.0, 0.22, 0.045, bk_seed(sfx, 1));
+        bk_tone(0, divi(n, 2), 96.0, 44.0, 0.75, 34.0, 0, 0.0004);
+        bk_tone(0, n, 300.0, 145.0, 0.28, 52.0, 1, 0.0004);
+    }
+}
+
+fn bk_step(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let surf: i32 = divi(sfx - SFX_STEP_GRASS, BANK_STEP_VARIANTS);
+    let variant: i32 = sfx - SFX_STEP_GRASS - surf * BANK_STEP_VARIANTS;
+
+    // Per-variant jitter, deterministic from the index.  GAME_DESIGN §7.18
+    // asks for 6 % pitch jitter at PLAY time; this is the sample-level
+    // variation that keeps four footfalls from sounding like one sample.
+    let j: f64 = f64(variant) * 0.055 - 0.082;
+
+    // Brightness is the whole design here: stone is the brightest surface and
+    // dirt is the dullest, with grass and wood between.  The probe asserts the
+    // ORDER, not any coefficient.
+    // Every footstep normalises to the same peak, so a surface's character has
+    // to live in its BAND, not its level — and an over-bright grass hiss will
+    // out-sparkle a stone clack once both are normalised.  Grass damps a boot;
+    // stone does not.  The order the probe asserts is stone > wood > grass >
+    // dirt, brightest to dullest.
+    let lp: f64 = 0.30; let hp: f64 = 0.060; let dec: f64 = 55.0;
+    let th: f64 = 0.22; let thf: f64 = 85.0;  let body: f64 = 0.0;
+    if (surf == 1) { lp = 0.18; hp = 0.028; dec = 45.0; th = 0.48; thf = 92.0; }
+    if (surf == 2) { lp = 0.98; hp = 0.620; dec = 58.0; th = 0.06; thf = 160.0; }
+    if (surf == 3) { lp = 0.40; hp = 0.070; dec = 46.0; th = 0.26; thf = 118.0;
+                     body = 0.40; }
+
+    bk_noise(0, n, 1.0, dec * (1.0 + j), lp * (1.0 + j * 0.5), hp,
+             bk_seed(sfx, 1));
+    bk_noise(0, n, 0.30, dec * 2.6, lp, hp * 1.8, bk_seed(sfx, 2));
+    if (th > 0.0) {
+        bk_tone(0, divi(n, 2), thf * (1.0 + j), thf * 0.55, th, 60.0, 0, 0.0005);
+    }
+    if (body > 0.0) {
+        bk_tone(0, n, 265.0 * (1.0 + j), 220.0, body, 40.0, 1, 0.0005);
+    }
+}
+
+// The pitch chain.  +2 semitones per consecutive hit up to +8; the caller
+// resets to step 0 after 0.6 s of no hit (GAME_DESIGN §7.2).  The tone is what
+// carries the pitch, so it dominates: the transient is deliberately quiet
+// enough that the fundamental is unambiguous under a DFT.
+fn bk_hit(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let step: i32 = sfx - SFX_HIT;
+    let f0: f64 = 1046.5 * pow(2.0, f64(step * 2) / 12.0);
+    bk_tone(0, n, f0, f0 * 0.985, 1.0, 95.0, 0, 0.0008);
+    bk_tone(0, n, f0 * 2.0, f0 * 1.97, 0.22, 150.0, 0, 0.0008);
+    bk_noise(0, n, 0.18, 420.0, 0.92, 0.30, bk_seed(sfx, 1));
+}
+
+// The ember-pickup arpeggio: a major-pentatonic run, one ping per mote.
+fn bk_ember(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let step: i32 = sfx - SFX_EMBER;
+    let semi: i32 = 0;
+    if (step == 1) { semi = 2; }
+    if (step == 2) { semi = 4; }
+    if (step == 3) { semi = 7; }
+    if (step == 4) { semi = 9; }
+    let f0: f64 = 783.99 * pow(2.0, f64(semi) / 12.0);
+    bk_fm(0, n, f0, 2.0, 1.1, 0.85, 22.0, 40.0);
+    bk_tone(0, n, f0, f0, 0.55, 20.0, 0, 0.002);
+}
+
+fn bk_event(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let rate: f64 = f64(g_bk_rate);
+
+    if (sfx == SFX_KILL) {
+        // two notes, D6 then G6 — the "you did it" interval
+        let n1: i32 = i32(0.30 * rate);
+        let n2: i32 = n - i32(0.22 * rate);
+        bk_fm(0, n1, 1174.66, 2.0, 1.4, 0.90, 14.0, 30.0);
+        bk_tone(0, n1, 1174.66, 1174.66, 0.40, 13.0, 0, 0.001);
+        bk_fm(i32(0.22 * rate), n2, 1567.98, 2.0, 1.4, 0.85, 10.0, 26.0);
+        bk_tone(i32(0.22 * rate), n2, 1567.98, 1567.98, 0.38, 9.0, 0, 0.001);
+    }
+    if (sfx == SFX_BELL) {
+        // the lantern bell.  Inharmonic ratio = metal, not a sine.
+        bk_fm(0, n, 220.0, 1.414, 4.2, 1.00, 1.5, 5.0);
+        bk_fm(0, n, 440.0, 2.756, 2.0, 0.32, 2.0, 6.5);
+        bk_tone(0, n, 110.0, 110.0, 0.35, 1.3, 0, 0.004);
+        bk_noise(0, i32(0.05 * rate), 0.30, 120.0, 0.85, 0.25, bk_seed(sfx, 1));
+    }
+    if (sfx == SFX_HORN) {
+        // TWO LONG NOTES, descending.  This is the sound the whole game teaches
+        // you to dread (GAME_DESIGN §7.19), so it is low, slow and doubled.
+        let na: i32 = i32(1.15 * rate);
+        let o2: i32 = i32(1.40 * rate);
+        let nb: i32 = n - o2;
+        bk_tone(0, na, 146.83, 145.60, 0.90, 1.1, 2, 0.14);
+        bk_tone(0, na, 149.90, 148.60, 0.30, 1.1, 2, 0.16);
+        bk_tone(0, na, 73.42, 72.80, 0.40, 1.0, 0, 0.18);
+        bk_tone(o2, nb, 110.00, 108.90, 0.95, 0.9, 2, 0.16);
+        bk_tone(o2, nb, 112.30, 111.10, 0.30, 0.9, 2, 0.18);
+        bk_tone(o2, nb, 55.00, 54.50, 0.45, 0.8, 0, 0.20);
+        bk_lp(n, 0.10);
+    }
+    if (sfx == SFX_LEVELUP) {
+        // ascending four-note motif, C5 E5 G5 C6
+        let gap: f64 = 0.22;
+        let k: i32 = 0;
+        while (k < 4) {
+            let f: f64 = 523.25;
+            if (k == 1) { f = 659.26; }
+            if (k == 2) { f = 783.99; }
+            if (k == 3) { f = 1046.50; }
+            let o: i32 = i32(f64(k) * gap * rate);
+            let ln: i32 = n - o;
+            let cap: i32 = i32(0.45 * rate);
+            if (ln > cap) { ln = cap; }
+            bk_fm(o, ln, f, 2.0, 1.0, 0.80, 12.0, 22.0);
+            bk_tone(o, ln, f, f, 0.35, 11.0, 0, 0.004);
+            k = k + 1;
+        }
+    }
+    if (sfx == SFX_STREAK1 || sfx == SFX_STREAK2 || sfx == SFX_STREAK3) {
+        let f: f64 = 196.00;
+        if (sfx == SFX_STREAK2) { f = 233.08; }
+        if (sfx == SFX_STREAK3) { f = 293.66; }
+        bk_tone(0, n, f, f * 0.995, 0.90, 2.4, 2, 0.05);
+        bk_tone(0, n, f * 1.5, f * 1.49, 0.40, 2.8, 2, 0.07);
+        bk_tone(0, n, f * 0.5, f * 0.497, 0.35, 2.2, 0, 0.06);
+        bk_lp(n, 0.16);
+    }
+    if (sfx == SFX_WAVECLEAR) {
+        bk_tone(0, n, 130.81, 261.63, 0.80, 2.0, 0, 0.10);
+        bk_fm(0, n, 1046.50, 3.0, 1.6, 0.35, 3.0, 8.0);
+        bk_noise(0, n, 0.20, 3.0, 0.30, 0.10, bk_seed(sfx, 1));
+    }
+}
+
+fn bk_weapon(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let rate: f64 = f64(g_bk_rate);
+
+    if (sfx == SFX_DRYFIRE) {
+        bk_noise(0, n, 1.0, 520.0, 0.95, 0.36, bk_seed(sfx, 1));
+        bk_tone(0, n, 3100.0, 2600.0, 0.45, 400.0, 0, 0.0002);
+    }
+    if (sfx == SFX_RELOAD_DROP) {
+        bk_noise(0, n, 0.85, 28.0, 0.40, 0.150, bk_seed(sfx, 1));
+        bk_noise(0, i32(0.03 * rate), 0.60, 180.0, 0.90, 0.30, bk_seed(sfx, 2));
+        bk_tone(0, divi(n, 2), 640.0, 480.0, 0.30, 70.0, 3, 0.0004);
+    }
+    if (sfx == SFX_RELOAD_INS) {
+        bk_noise(0, n, 0.70, 36.0, 0.55, 0.180, bk_seed(sfx, 1));
+        bk_tone(i32(0.12 * rate), n - i32(0.12 * rate),
+                820.0, 700.0, 0.55, 120.0, 3, 0.0004);
+    }
+    if (sfx == SFX_RELOAD_SEAT) {
+        bk_noise(0, n, 1.0, 130.0, 0.72, 0.220, bk_seed(sfx, 1));
+        bk_tone(0, n, 900.0, 690.0, 0.60, 95.0, 3, 0.0003);
+        bk_tone(0, divi(n, 2), 210.0, 150.0, 0.40, 70.0, 0, 0.0003);
+    }
+    if (sfx == SFX_MAG_CLACK) {
+        // two bounces — the magazine hits the floor, then hits it again
+        bk_noise(0, n, 1.0, 150.0, 0.80, 0.250, bk_seed(sfx, 1));
+        bk_fm(0, n, 1450.0, 1.414, 2.4, 0.45, 20.0, 34.0);
+        let o: i32 = i32(0.155 * rate);
+        bk_noise(o, n - o, 0.45, 190.0, 0.80, 0.250, bk_seed(sfx, 2));
+        bk_fm(o, n - o, 1720.0, 1.414, 2.0, 0.22, 26.0, 40.0);
+    }
+    if (sfx == SFX_SHELL_INS) {
+        bk_noise(0, n, 0.80, 60.0, 0.62, 0.200, bk_seed(sfx, 1));
+        bk_tone(i32(0.09 * rate), n - i32(0.09 * rate),
+                520.0, 420.0, 0.55, 90.0, 1, 0.0004);
+    }
+    if (sfx == SFX_PUMP) {
+        // pull, then push — the Bellows' whole personality
+        bk_noise(0, i32(0.14 * rate), 0.85, 22.0, 0.58, 0.200, bk_seed(sfx, 1));
+        let o: i32 = i32(0.165 * rate);
+        bk_noise(o, n - o, 1.0, 26.0, 0.62, 0.210, bk_seed(sfx, 2));
+        bk_tone(o, n - o, 480.0, 360.0, 0.50, 60.0, 3, 0.0004);
+        bk_tone(o, n - o, 180.0, 130.0, 0.35, 46.0, 0, 0.0004);
+    }
+    if (sfx == SFX_SWAP) {
+        bk_noise(0, n, 1.0, 18.0, 0.34, 0.130, bk_seed(sfx, 1));
+        bk_tone(i32(0.16 * rate), n - i32(0.16 * rate),
+                430.0, 340.0, 0.35, 80.0, 3, 0.0005);
+    }
+}
+
+fn bk_ui(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+    let rate: f64 = f64(g_bk_rate);
+
+    if (sfx == SFX_UI_MOVE) {
+        bk_tone(0, n, 1396.9, 1396.9, 1.0, 42.0, 0, 0.002);
+        bk_tone(0, n, 2793.8, 2793.8, 0.20, 70.0, 0, 0.002);
+    }
+    if (sfx == SFX_UI_CONFIRM) {
+        bk_tone(0, divi(n, 2), 880.0, 880.0, 1.0, 26.0, 0, 0.002);
+        bk_tone(divi(n, 2), divi(n, 2), 1318.5, 1318.5, 1.0, 22.0, 0, 0.002);
+    }
+    if (sfx == SFX_UI_BACK) {
+        bk_tone(0, n, 880.0, 587.3, 1.0, 34.0, 0, 0.002);
+    }
+    if (sfx == SFX_XP_BLIP) {
+        bk_fm(0, n, 1760.0, 2.0, 0.9, 1.0, 46.0, 90.0);
+    }
+    if (sfx == SFX_HURT) {
+        bk_tone(0, n, 92.0, 40.0, 1.0, 16.0, 0, 0.0008);
+        bk_noise(0, n, 0.55, 24.0, 0.30, 0.060, bk_seed(sfx, 1));
+        bk_tone(0, i32(0.10 * rate), 240.0, 150.0, 0.35, 40.0, 1, 0.0008);
+    }
+}
+
+fn bk_enemy(p_sfx: i32, p_n: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_n;
+
+    if (sfx == SFX_WISP_CHIME) {
+        // "audible chime 0.5 s" — GAME_DESIGN §3 enemy table.  Airy, not metal.
+        bk_fm(0, n, 1318.5, 1.5, 1.8, 0.90, 5.0, 9.0);
+        bk_fm(0, n, 1975.5, 1.5, 1.2, 0.35, 6.5, 11.0);
+        bk_tone(0, n, 1318.5, 1330.0, 0.30, 4.5, 0, 0.02);
+    }
+    if (sfx == SFX_HUSK_GROWL) {
+        bk_tone(0, n, 72.0, 58.0, 0.90, 2.2, 2, 0.06);
+        bk_tone(0, n, 108.5, 88.0, 0.35, 2.4, 2, 0.08);
+        bk_noise(0, n, 0.45, 2.0, 0.24, 0.060, bk_seed(sfx, 1));
+        bk_lp(n, 0.20);
+    }
+    if (sfx == SFX_WARDEN_STEP) {
+        bk_tone(0, n, 62.0, 30.0, 1.0, 11.0, 0, 0.0006);
+        bk_noise(0, n, 0.55, 30.0, 0.42, 0.120, bk_seed(sfx, 1));
+        bk_noise(0, n, 0.25, 8.0, 0.16, 0.040, bk_seed(sfx, 2));
+    }
+}
+
+// Ambience beds.  Rendered p_n + xfade samples long, then folded so the loop
+// point is continuous — see bk_loopfold.  Level is deliberately the lowest in
+// the bank: a bed you notice is a bed that is too loud.
+fn bk_amb(p_sfx: i32, p_ntotal: i32) {
+    let sfx: i32 = p_sfx;
+    let n: i32 = p_ntotal;
+
+    if (sfx == SFX_AMB_DAY) {
+        bk_noise(0, n, 1.00, 0.0, 0.020, 0.0012, bk_seed(sfx, 1));
+        bk_noise(0, n, 0.40, 0.0, 0.140, 0.0400, bk_seed(sfx, 2));
+        bk_tone(0, n, 196.0, 196.0, 0.05, 0.0, 0, 0.30);
+    }
+    if (sfx == SFX_AMB_NIGHT) {
+        bk_noise(0, n, 1.00, 0.0, 0.012, 0.0009, bk_seed(sfx, 1));
+        bk_noise(0, n, 0.30, 0.0, 0.055, 0.0200, bk_seed(sfx, 2));
+        bk_tone(0, n, 55.0, 55.0, 0.30, 0.0, 0, 0.40);
+    }
+    if (sfx == SFX_AMB_TOWN) {
+        bk_noise(0, n, 0.55, 0.0, 0.018, 0.0011, bk_seed(sfx, 1));
+        bk_noise(0, n, 0.40, 0.0, 0.620, 0.3000, bk_seed(sfx, 2));  // fire crackle
+        bk_tone(0, n, 110.0, 110.0, 0.28, 0.0, 0, 0.35);
+        bk_tone(0, n, 164.8, 164.8, 0.16, 0.0, 0, 0.35);
+    }
+}
+
+// ===========================================================================
+// THE DISPATCHER
+// ===========================================================================
+
+fn bk_samples(p_sfx: i32, p_rate: i32): i32 {
+    let n: i32 = i32(g_bk_dur[p_sfx] * f64(p_rate));
+    if (n < 8) { n = 8; }
+    let out: i32 = n;
+    return out;
+}
+
+fn bk_need_scratch(p_n: i32) {
+    let n: i32 = p_n;
+    if (g_bk_scrcap >= n) { return; }
+    let want: i32 = n + 1024;
+    while (g_bk_scrcap < want) {
+        g_bk_scr.push(0.0);
+        g_bk_scrcap = g_bk_scrcap + 1;
+    }
+}
+
+// Synthesize ONE sound into g_bk_scr and quantize it into a fresh S16 buffer.
+// Registers nothing and retains nothing: this is the function the probe times
+// and dumps with, so that timing the bank does not grow the audio registry.
+export fn bank_render(p_sfx: i32, p_rate: i32): buffer {
+    bk_meta();
+    let sfx: i32 = p_sfx;
+    if (sfx < 0 || sfx >= BANK_COUNT) { let z: buffer = buffer(2); return z; }
+    let saved: i32 = g_bk_rate;
+    g_bk_rate = p_rate;
+
+    let n: i32 = bk_samples(sfx, p_rate);
+    let grp: i32 = g_bk_grp[sfx];
+    let xf: i32 = 0;
+    if (grp == GRP_AMB) { xf = i32(BK_AMB_XFADE_S * f64(p_rate)); }
+
+    bk_need_scratch(n + xf);
+
+    // Per-group final low-pass.  >= 1.0 means "leave the top end alone" — the
+    // hit clicks, the chimes and the bell live up there.
+    let lpa: f64 = 1.0;
+
+    if (grp == GRP_GUN)    { bk_gun(sfx, n);    lpa = 0.62; }
+    if (grp == GRP_IMPACT) { bk_impact(sfx, n); lpa = 0.70; }
+    if (grp == GRP_STEP)   { bk_step(sfx, n);   lpa = 0.80; }
+    if (grp == GRP_HIT) {
+        if (sfx < SFX_EMBER) { bk_hit(sfx, n); } else { bk_ember(sfx, n); }
+    }
+    if (grp == GRP_EVENT)  { bk_event(sfx, n); }
+    if (grp == GRP_WEAPON) { bk_weapon(sfx, n); lpa = 0.75; }
+    if (grp == GRP_UI)     { bk_ui(sfx, n);     lpa = 0.72; }
+    if (grp == GRP_ENEMY)  { bk_enemy(sfx, n);  lpa = 0.70; }
+    if (grp == GRP_AMB)    { bk_amb(sfx, n + xf); lpa = 0.60; }
+
+    let pk: f64 = bk_finish(n + xf, lpa);
+    if (grp == GRP_AMB) {
+        // The crossfade sums two decorrelated halves, so it can move the peak.
+        // Measure AFTER folding or the bed normalises to the wrong level.
+        bk_loopfold(n, xf);
+        pk = bk_peak(n);
+    }
+
+    // ---- normalise and quantize to S16 little-endian, in ONE pass ---------
+    // The lane is zeroed as it is read, which restores the "lane is all zero"
+    // invariant without a separate clear pass.
+    let g: f64 = 0.0;
+    if (pk > 0.0) { g = bk_peak_of(sfx) * 32767.0 / pk; }
+    let out: buffer = buffer(n * 2);
+    let src: array<f64> = g_bk_scr;
+    let total: i32 = n + xf;
+    for (let i: i32 = 0; i < n; i++) {
+        let c0 = src[i];
+        let c: f64 = c0;
+        let x: f64 = c * g;
+        src[i] = 0.0;
+        if (x > 32767.0) { x = 32767.0; }
+        if (x < 0.0 - 32767.0) { x = 0.0 - 32767.0; }
+        let q0 = i32(x);
+        let q: i32 = q0;
+        if (q < 0) { q = q + 65536; }
+        out[i * 2] = q & 255;
+        out[i * 2 + 1] = (q >> 8) & 255;
+    }
+    for (let i: i32 = n; i < total; i++) { src[i] = 0.0; }
+
+    g_bk_rate = saved;
+    let r: buffer = out;
+    return r;
+}
+
+// ===========================================================================
+// BUILD
+// ===========================================================================
+
+// Synthesize the whole bank at p_rate and register every buffer with the
+// engine.  Returns the number of sounds registered (0 if already built).
+//
+// IDEMPOTENT: a second call is a no-op.  Registering twice would double the
+// engine's memory and buy nothing — audio_init already rebuilds every chunk
+// against a new device, without re-registration.
+export fn bank_build_at(p_rate: i32): i32 {
+    if (g_bk_built == 1) { let already: i32 = 0; return already; }
+    bk_meta();
+    let rate: i32 = p_rate;
+    if (rate < 8000) { rate = BANK_RATE; }
+    g_bk_rate = rate;
+    g_bk_total = 0;
+
+    let i: i32 = 0;
+    while (i < BANK_COUNT) {
+        let pcm: buffer = bank_render(i, rate);
+        let nb: i32 = pcm.length;
+        // Retained HERE and, independently, inside audio.hml's registry.
+        // Mix_QuickLoad_RAW does not copy: dropping either reference would be
+        // a use-after-free on SDL_mixer's audio thread.
+        g_bk_pcm.push(pcm);
+        g_bk_bytes.push(nb);
+        g_bk_smp.push(divi(nb, 2));
+        g_bk_id.push(audio_register_pcm_mono(pcm, nb));
+        g_bk_total = g_bk_total + nb;
+        i = i + 1;
+    }
+    g_bk_built = 1;
+    let out: i32 = BANK_COUNT;
+    return out;
+}
+
+// Build at the engine default rate.  Prefer bank_build_at(audio_out_freq())
+// when a device is already open — Mix_QuickLoad_RAW does not resample.
+export fn bank_build(): i32 {
+    return bank_build_at(BANK_RATE);
+}
+
+// ===========================================================================
+// QUERY
+// ===========================================================================
+
+export fn bank_is_built(): i32 { let out: i32 = g_bk_built; return out; }
+export fn bank_count(): i32 { let out: i32 = BANK_COUNT; return out; }
+export fn bank_rate(): i32 { let out: i32 = g_bk_rate; return out; }
+export fn bank_total_bytes(): i32 { let out: i32 = g_bk_total; return out; }
+
+// The ENGINE sound id for a bank sfx, or -1 before bank_build.
+export fn bank_sound(p_sfx: i32): i32 {
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= g_bk_id.length) { let bad: i32 = 0 - 1; return bad; }
+    let out: i32 = g_bk_id[s];
+    return out;
+}
+
+export fn bank_bytes(p_sfx: i32): i32 {
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= g_bk_bytes.length) { let bad: i32 = 0; return bad; }
+    let out: i32 = g_bk_bytes[s];
+    return out;
+}
+
+export fn bank_samples(p_sfx: i32): i32 {
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= g_bk_smp.length) { let bad: i32 = 0; return bad; }
+    let out: i32 = g_bk_smp[s];
+    return out;
+}
+
+export fn bank_group(p_sfx: i32): i32 {
+    bk_meta();
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= BANK_COUNT) { let bad: i32 = 0 - 1; return bad; }
+    let out: i32 = g_bk_grp[s];
+    return out;
+}
+
+export fn bank_name(p_sfx: i32): string {
+    bk_meta();
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= BANK_COUNT) { let bad: string = "?"; return bad; }
+    let out: string = g_bk_name[s];
+    return out;
+}
+
+// The recommended gain for audio_play.  Half of the mix rule; the other half is
+// the peak baked into the PCM.  See the header.
+export fn bank_gain(p_sfx: i32): f64 {
+    bk_meta();
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= BANK_COUNT) { let bad: f64 = 0.0; return bad; }
+    let out: f64 = g_bk_gain[s];
+    return out;
+}
+
+export fn bank_duration(p_sfx: i32): f64 {
+    bk_meta();
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= BANK_COUNT) { let bad: f64 = 0.0; return bad; }
+    let out: f64 = g_bk_dur[s];
+    return out;
+}
+
+// One decoded sample in -1..1, read back THROUGH the retained buffer.  This is
+// how the probe proves the bytes the mixer will read are alive and correct, and
+// how the WAV dump and every spectral assertion get their data.
+export fn bank_sample(p_sfx: i32, p_i: i32): f64 {
+    let s: i32 = p_sfx;
+    if (s < 0 || s >= g_bk_pcm.length) { let bad: f64 = 0.0; return bad; }
+    let i: i32 = p_i;
+    if (i < 0 || i >= g_bk_smp[s]) { let bad2: f64 = 0.0; return bad2; }
+    let p = buffer_ptr(g_bk_pcm[s]);
+    let lo: i32 = ptr_deref_u8(ptr_offset(p, i * 2, 1));
+    let hi: i32 = ptr_deref_u8(ptr_offset(p, i * 2 + 1, 1));
+    let v: i32 = lo | (hi << 8);
+    if (v >= 32768) { v = v - 65536; }
+    let out: f64 = f64(v) / 32768.0;
+    return out;
+}
+
+// The step index of the pitch chain for p_consecutive consecutive hits.
+// GAME_DESIGN §7.2: +2 semitones per hit up to +8, then it holds; the caller
+// resets p_consecutive to 0 after 0.6 s without a hit.
+export fn bank_hit_sfx(p_consecutive: i32): i32 {
+    let c: i32 = p_consecutive;
+    if (c < 0) { c = 0; }
+    if (c > BANK_HIT_STEPS - 1) { c = BANK_HIT_STEPS - 1; }
+    let out: i32 = SFX_HIT + c;
+    return out;
+}
+
+// A footstep for a surface (0 grass, 1 dirt, 2 stone, 3 wood) and a step
+// counter; the variant rotates so no two consecutive footfalls are the same
+// sample.
+export fn bank_step_sfx(p_surface: i32, p_seq: i32): i32 {
+    let s: i32 = p_surface;
+    if (s < 0) { s = 0; }
+    if (s > 3) { s = 3; }
+    let q: i32 = p_seq;
+    if (q < 0) { q = 0 - q; }
+    let v: i32 = q - divi(q, BANK_STEP_VARIANTS) * BANK_STEP_VARIANTS;
+    let out: i32 = SFX_STEP_GRASS + s * BANK_STEP_VARIANTS + v;
+    return out;
+}
+
+// One-line diagnostic.  Built on demand — never per frame (N3).
+export fn bank_report_string(): string {
+    let a: string = `bank ${BANK_COUNT} sfx @ ${g_bk_rate}Hz S16 mono `;
+    let b: string = `pcm=${g_bk_total}B built=${g_bk_built}`;
+    let out: string = a + b;
+    return out;
+}

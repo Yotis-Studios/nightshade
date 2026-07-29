@@ -1,0 +1,784 @@
+// probe_view.hml — verification program for W3-5 (src/render/view.hml).
+//
+// Run COMPILED. Headless, no SDL, no window.
+//     hemlockc -O1 tools/probe_view.hml -o /tmp/probe_view && /tmp/probe_view
+//
+// Prints one line per measurement, then `PASS n/n`, and exits 0 only if every
+// assertion held AND the assertion count is the expected one (so a skipped
+// branch cannot shrink numerator and denominator together and still read green).
+//
+//   W3-5 acceptance                                    asserted in section
+//   pitch +/-85 stable                                   [1] [2]
+//   the FOV lerp is frame-rate independent               [3]
+//   recoil_view never reaches sim_apply_command          [4]  (source scan +
+//                                                             a live cmd_hash
+//                                                             comparison WITH a
+//                                                             negative control)
+//   shake is deterministic from tick + seed              [5]
+//   far plane = fog_far * 1.06                           [6]
+//   usable by an interactive mouse-look caller           [7]
+//   cost                                                 [8]
+//
+// EVERY assertion below is a PROPERTY, not a magic number (CLAUDE.md failure
+// mode (a)): "the basis stays orthonormal", "30 fps and 240 fps agree", "the
+// aim is bit-identical with and without recoil", "wider FOV pulls a point
+// toward the centre". Re-tuning the FOV table or the kick strength must not
+// turn a single one of them red.
+
+import { exit } from "@stdlib/process";
+import { sin, cos, tan, sqrt, atan2, floor, log } from "@stdlib/math";
+import { read_file, list_dir } from "@stdlib/fs";
+import { lines } from "@stdlib/strings";
+
+import {
+    view_new, view_build, view_mvp, view_matrix, view_mvp_at,
+    view_set_viewport, view_set_aspect, view_set_fog_far, view_set_near,
+    view_set_eye, view_set_angles, view_look, view_look_mouse, view_sens_scale,
+    view_apply_camera, view_set_fov_mode, view_set_fov_target, view_snap_fov,
+    view_fov_for_mode, view_kick, view_kick_fire, view_clear_kick, view_set_roll,
+    view_shake, view_shake_fire, view_clear_shake, view_set_seed,
+    view_eye, view_eye_x, view_eye_y, view_eye_z,
+    view_aim_yaw, view_aim_pitch,
+    view_aim_forward_x, view_aim_forward_y, view_aim_forward_z,
+    view_render_yaw, view_render_pitch, view_render_roll,
+    view_kick_pitch, view_kick_yaw, view_kick_roll,
+    view_fov, view_fov_target, view_fov_mode, view_aspect, view_near, view_far,
+    view_fog_far, view_shake_x, view_shake_y, view_trauma, view_tick,
+    view_project, view_wrap_pi,
+    g_VIEW_HIP, g_VIEW_ADS, g_VIEW_SPRINT, g_VIEW_PI, g_VIEW_TAU, g_VIEW_DEG,
+    g_VIEW_PITCH_CLAMP, g_VIEW_PITCH_HARD, g_VIEW_FOV_TAU,
+    g_VIEW_TRAUMA_RATE, g_VIEW_TRAUMA_FIRE
+} from "../src/render/view.hml";
+
+// The real command module. §4 builds an actual InputCommand from the view and
+// hashes it — the strongest available form of "recoil_view does not reach the
+// sim", since `cmd_hash` is exactly what the replay determinism gate compares.
+import { cmd_new, cmd_set, cmd_hash, cmd_yaw, cmd_pitch, q_ang } from "../src/sim/command.hml";
+
+import {
+    g_FOV_HIP, g_FOV_ADS, g_FOV_SPRINT, g_FOV_LERP_S, g_PITCH_CLAMP_DEG,
+    g_NEAR_PLANE, g_FAR_PLANE_SCALE, g_FOG_FAR_CAP, g_SHAKE_MAX_PX,
+    g_SHAKE_FIRE_S, g_KICK_DECAY, g_MOUSE_SENS_RAD, g_ADS_SENS_MULT,
+    g_ASPECT, g_RES_W, g_RES_H
+} from "../src/core/config.hml";
+
+// Every assertion below is unconditional; this is the count.
+let g_EXPECTED_ASSERTIONS = 66;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(label: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${label}`); }
+}
+fn note(s: string) { g_notes.push(s); }
+
+fn f4(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 10000.0 + 0.5);
+    let whole: i64 = scaled / 10000;
+    let frac: i64 = scaled - whole * 10000;
+    let fs: string = `${frac}`;
+    if (frac < 1000) { fs = `0${fs}`; }
+    if (frac < 100) { fs = `0${fs}`; }
+    if (frac < 10) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+// Scientific-ish formatter, because most of the numbers in this probe are
+// convergence residuals and `f4` renders every one of them as "0.0000".
+fn fsci(p_x: f64): string {
+    let x: f64 = p_x;
+    if (x == 0.0) { return "0"; }
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let e: i32 = i32(floor(log(x) / 2.302585092994046));
+    let m: f64 = x;
+    let k: i32 = 0;
+    if (e > 0) { while (k < e) { m = m / 10.0; k = k + 1; } }
+    if (e < 0) { while (k > e) { m = m * 10.0; k = k - 1; } }
+    let s: string = `${f4(m)}e${e}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+fn absf2(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a;
+    return out;
+}
+
+fn zeros(p_n: i32): array<f64> {
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0.0); i = i + 1; }
+    return a;
+}
+
+// Is every element of the MVP a finite, sane number? NaN fails `x == x`; an
+// infinity or a blown-up element fails the magnitude test.
+fn mvp_sane(p_v: object): i32 {
+    let v: object = p_v;
+    let bad: i32 = 0;
+    let i: i32 = 0;
+    while (i < 16) {
+        let m: f64 = view_mvp_at(v, i);
+        if (m != m) { bad = bad + 1; }
+        if (absf2(m) > 1000000.0) { bad = bad + 1; }
+        i = i + 1;
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// Worst orthonormality error of the view matrix's 3x3 rotation block: the three
+// row lengths against 1 and the three row-pair dots against 0. This is the
+// property that "pitch is stable" actually means — no magic number in sight.
+fn ortho_err(p_v: object): f64 {
+    let vm: array = view_matrix(p_v);
+    let ax: f64 = vm[0]; let ay: f64 = vm[1]; let az: f64 = vm[2];
+    let bx: f64 = vm[4]; let by: f64 = vm[5]; let bz: f64 = vm[6];
+    let cx: f64 = vm[8]; let cy: f64 = vm[9]; let cz: f64 = vm[10];
+    let e: f64 = absf2(ax*ax + ay*ay + az*az - 1.0);
+    let e2: f64 = absf2(bx*bx + by*by + bz*bz - 1.0);
+    if (e2 > e) { e = e2; }
+    let e3: f64 = absf2(cx*cx + cy*cy + cz*cz - 1.0);
+    if (e3 > e) { e = e3; }
+    let d1: f64 = absf2(ax*bx + ay*by + az*bz);
+    if (d1 > e) { e = d1; }
+    let d2: f64 = absf2(ax*cx + ay*cy + az*cz);
+    if (d2 > e) { e = d2; }
+    let d3: f64 = absf2(bx*cx + by*cy + bz*cz);
+    if (d3 > e) { e = d3; }
+    let out: f64 = e;
+    return out;
+}
+
+fn mvp_equal(p_a: object, p_b: object): i32 {
+    let same: i32 = 1;
+    let i: i32 = 0;
+    while (i < 16) {
+        if (view_mvp_at(p_a, i) != view_mvp_at(p_b, i)) { same = 0; }
+        i = i + 1;
+    }
+    let out: i32 = same;
+    return out;
+}
+
+// A fresh View configured the way the game configures it. Every section starts
+// from one of these so no section can inherit another's state.
+fn fresh(): object {
+    let v: object = view_new();
+    view_set_viewport(v, f64(g_RES_W), f64(g_RES_H));
+    view_set_fog_far(v, g_FOG_FAR_CAP);
+    view_set_seed(v, 1337);
+    view_set_fov_mode(v, g_VIEW_HIP);
+    view_snap_fov(v);
+    view_build(v, 0.0, 0);
+    let out: object = v;
+    return out;
+}
+
+// Run `steps` frames of `dt` with a fixed FOV target and report the FOV. The
+// whole frame-rate-independence argument is that this is a function of
+// steps*dt only.
+fn fov_after(p_dt: f64, p_steps: i32): f64 {
+    let v: object = fresh();
+    view_set_fov_mode(v, g_VIEW_ADS);
+    let i: i32 = 0;
+    while (i < p_steps) {
+        view_build(v, p_dt, i);
+        i = i + 1;
+    }
+    let out: f64 = view_fov(v);
+    return out;
+}
+
+fn kick_after(p_dt: f64, p_steps: i32): f64 {
+    let v: object = fresh();
+    view_kick(v, 0.05, 0.0, 0.0);
+    let i: i32 = 0;
+    while (i < p_steps) {
+        view_build(v, p_dt, i);
+        i = i + 1;
+    }
+    let out: f64 = view_kick_pitch(v);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Timing, CLAUDE.md RULE T: __clock() CPU time, minimum of TRIALS batches.
+// ---------------------------------------------------------------------------
+let g_TRIALS = 7;
+
+fn build_us(p_v: object, p_reps: i32): f64 {
+    let v: object = p_v;
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < g_TRIALS) {
+        let c0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < reps) {
+            view_build(v, 0.016666666666666666, i);
+            i = i + 1;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_view — W3-5 camera and view");
+    print("");
+
+    let out4: array<f64> = zeros(4);
+    let out4b: array<f64> = zeros(4);
+
+    // =======================================================================
+    print("[1] the basis: conventions, and stability across the whole pitch range");
+    // -----------------------------------------------------------------------
+    let v: object = fresh();
+    view_set_eye(v, 0.0, 0.0, 0.0);
+    view_set_angles(v, 0.0, 0.0);
+    view_build(v, 0.0, 0);
+    ok("yaw=pitch=0 looks along world -Z",
+       absf2(view_aim_forward_x(v)) < 1.0e-15 &&
+       absf2(view_aim_forward_y(v)) < 1.0e-15 &&
+       absf2(view_aim_forward_z(v) + 1.0) < 1.0e-15);
+
+    view_set_angles(v, g_VIEW_PI * 0.5, 0.0);
+    view_build(v, 0.0, 0);
+    ok("yaw = +90 deg turns RIGHT, to world +X",
+       view_aim_forward_x(v) > 0.999999 && absf2(view_aim_forward_z(v)) < 1.0e-9);
+
+    view_set_angles(v, 0.0, 0.6);
+    view_build(v, 0.0, 0);
+    ok("positive pitch looks UP (forward.y > 0)", view_aim_forward_y(v) > 0.5);
+
+    // The sweep: every 0.05 deg of aim pitch across the full clamped range, at
+    // eight yaws and from an off-origin eye. 27 216 builds.
+    let worst_ortho: f64 = 0.0;
+    let bad_mvp: i32 = 0;
+    let worst_centre: f64 = 0.0;
+    let worst_w: f64 = 0.0;
+    let yi: i32 = 0;
+    while (yi < 8) {
+        let yaw: f64 = 0.0 - g_VIEW_PI + f64(yi) * (g_VIEW_TAU / 8.0);
+        let pi2: i32 = 0;
+        while (pi2 <= 3400) {
+            let pitch: f64 = (0.0 - g_PITCH_CLAMP_DEG + f64(pi2) * 0.05) * g_VIEW_DEG;
+            view_set_eye(v, 12.5, 3.25, -40.0);
+            view_set_angles(v, yaw, pitch);
+            view_build(v, 0.0, pi2);
+            let e: f64 = ortho_err(v);
+            if (e > worst_ortho) { worst_ortho = e; }
+            bad_mvp = bad_mvp + mvp_sane(v);
+            // a point 10 m straight down the aim axis must land on the crosshair
+            let d: f64 = 10.0;
+            let px: f64 = 12.5 + view_aim_forward_x(v) * d;
+            let py: f64 = 3.25 + view_aim_forward_y(v) * d;
+            let pz: f64 = 0.0 - 40.0 + view_aim_forward_z(v) * d;
+            view_project(v, px, py, pz, out4);
+            let dx: f64 = absf2(out4[0] - f64(g_RES_W) * 0.5);
+            let dy: f64 = absf2(out4[1] - f64(g_RES_H) * 0.5);
+            if (dx > worst_centre) { worst_centre = dx; }
+            if (dy > worst_centre) { worst_centre = dy; }
+            let we: f64 = absf2(out4[2] - d);
+            if (we > worst_w) { worst_w = we; }
+            pi2 = pi2 + 1;
+        }
+        yi = yi + 1;
+    }
+    print(`  27 216 builds over pitch -85..+85 deg x 8 yaws:`);
+    print(`    worst orthonormality error   ${fsci(worst_ortho)}`);
+    print(`    worst crosshair offset       ${fsci(worst_centre)} px`);
+    print(`    worst |w - distance|         ${fsci(worst_w)} m`);
+    ok("the basis stays orthonormal across the whole pitch range", worst_ortho < 1.0e-12);
+    ok("no MVP element is ever NaN, infinite or blown up", bad_mvp == 0);
+    ok("the aim axis projects to the screen centre at every pitch", worst_centre < 0.002);
+    ok("clip w IS the distance along forward, in metres (the painter key)", worst_w < 1.0e-9);
+    note(`basis orthonormality holds to ${fsci(worst_ortho)} over 27 216 builds`);
+
+    // =======================================================================
+    print("");
+    print("[2] the clamps: aim at +/-85, render allowed to +/-89.9, never a pole");
+    // -----------------------------------------------------------------------
+    v = fresh();
+    view_set_angles(v, 0.0, 100.0 * g_VIEW_DEG);
+    ok("aim pitch clamps UP at g_PITCH_CLAMP_DEG",
+       absf2(view_aim_pitch(v) - g_VIEW_PITCH_CLAMP) < 1.0e-12);
+    view_set_angles(v, 0.0, 0.0 - 100.0 * g_VIEW_DEG);
+    ok("aim pitch clamps DOWN at -g_PITCH_CLAMP_DEG",
+       absf2(view_aim_pitch(v) + g_VIEW_PITCH_CLAMP) < 1.0e-12);
+
+    v = fresh();
+    let s2: i32 = 0;
+    while (s2 < 2000) { view_look(v, 0.013, 0.011); s2 = s2 + 1; }
+    ok("2000 accumulated look-ups sit exactly on the clamp, not past it",
+       absf2(view_aim_pitch(v) - g_VIEW_PITCH_CLAMP) < 1.0e-12);
+    ok("accumulated yaw stays wrapped into (-pi, pi]",
+       view_aim_yaw(v) > 0.0 - g_VIEW_PI - 1.0e-12 && view_aim_yaw(v) <= g_VIEW_PI + 1.0e-12);
+    // wrapping must not change where the camera actually points
+    let wrapped: f64 = view_aim_yaw(v);
+    let raw: f64 = 2000.0 * 0.013;
+    ok("wrapping is exact: cos/sin of the wrapped yaw match the raw yaw",
+       absf2(cos(wrapped) - cos(raw)) < 1.0e-9 && absf2(sin(wrapped) - sin(raw)) < 1.0e-9);
+
+    // recoil is allowed to push the PICTURE past the aim clamp, but not to 90.
+    v = fresh();
+    view_set_angles(v, 0.4, g_VIEW_PITCH_CLAMP);
+    view_kick(v, 2.0, 0.0, 0.0);
+    view_build(v, 0.0, 0);
+    let aim_before: f64 = view_aim_pitch(v);
+    ok("recoil_view can push the render pitch past the aim clamp",
+       view_render_pitch(v) > g_VIEW_PITCH_CLAMP);
+    ok("...but never to the pole: render pitch clamps at +/-89.9 deg",
+       absf2(view_render_pitch(v) - g_VIEW_PITCH_HARD) < 1.0e-12);
+    ok("...and the AIM pitch is untouched by the kick",
+       aim_before == g_VIEW_PITCH_CLAMP);
+    ok("at the hard clamp the basis is still orthonormal and the MVP sane",
+       ortho_err(v) < 1.0e-12 && mvp_sane(v) == 0);
+
+    // =======================================================================
+    print("");
+    print("[3] the FOV lerp is frame-rate independent");
+    // -----------------------------------------------------------------------
+    // 0.1 s of a hip -> ADS transition, reached five different ways. Exact
+    // frame-rate independence is what `exp` buys; a `x += (t-x)*k` lerp would
+    // spread these by degrees.
+    let f_1x: f64 = fov_after(0.1, 1);
+    let f_30: f64 = fov_after(1.0 / 30.0, 3);
+    let f_60: f64 = fov_after(1.0 / 60.0, 6);
+    let f_240: f64 = fov_after(1.0 / 240.0, 24);
+    // an irregular frame time: 12 x 1/240 + 4 x 3/240, same 0.1 s total
+    let vj: object = fresh();
+    view_set_fov_mode(vj, g_VIEW_ADS);
+    let ji: i32 = 0;
+    while (ji < 12) { view_build(vj, 1.0 / 240.0, ji); ji = ji + 1; }
+    while (ji < 16) { view_build(vj, 3.0 / 240.0, ji); ji = ji + 1; }
+    let f_jit: f64 = view_fov(vj);
+
+    let spread: f64 = 0.0;
+    let cand: array<f64> = [f_1x, f_30, f_60, f_240, f_jit];
+    let ci: i32 = 0;
+    while (ci < 5) {
+        let dd: f64 = absf2(cand[ci] - f_240);
+        if (dd > spread) { spread = dd; }
+        ci = ci + 1;
+    }
+    print(`  after 0.1 s of hip->ADS:  1 step ${f4(f_1x)}  30fps ${f4(f_30)}  60fps ${f4(f_60)}  240fps ${f4(f_240)}  jittered ${f4(f_jit)}`);
+    print(`    worst spread ${fsci(spread)} deg`);
+    ok("30 / 60 / 240 fps, one big step and a jittered frame time all agree",
+       spread < 1.0e-9);
+    ok("the transition is genuinely in progress at the comparison point (the test has power)",
+       f_240 > g_FOV_ADS + 1.0 && f_240 < g_FOV_HIP - 1.0);
+    note(`FOV lerp: 1-step / 30 / 60 / 240 fps / jittered agree to ${fsci(spread)} deg`);
+
+    // the shape of the curve, as a property of the design, not of the numbers
+    let f_t: f64 = fov_after(1.0 / 240.0, i32(g_FOV_LERP_S * 240.0));
+    let done1: f64 = (g_FOV_HIP - f_t) / (g_FOV_HIP - g_FOV_ADS);
+    let f_t3: f64 = fov_after(1.0 / 240.0, i32(g_FOV_LERP_S * 720.0));
+    let done3: f64 = (g_FOV_HIP - f_t3) / (g_FOV_HIP - g_FOV_ADS);
+    print(`  transition completed after g_FOV_LERP_S: ${f4(done1 * 100.0)} %, after 3x: ${f4(done3 * 100.0)} %`);
+    ok("the FOV transition is >= 95 % complete after g_FOV_LERP_S", done1 >= 0.95);
+    ok("...and >= 99.7 % complete after three times that", done3 >= 0.997);
+    ok("the lerp never overshoots either end", f_240 <= g_FOV_HIP && f_240 >= g_FOV_ADS);
+
+    // the three modes, asserted as an ordering, not as three numbers
+    ok("ADS is the narrowest FOV and sprint the widest",
+       view_fov_for_mode(g_VIEW_ADS) < view_fov_for_mode(g_VIEW_HIP) &&
+       view_fov_for_mode(g_VIEW_HIP) < view_fov_for_mode(g_VIEW_SPRINT));
+    v = fresh();
+    view_set_fov_mode(v, g_VIEW_SPRINT);
+    view_snap_fov(v);
+    ok("view_snap_fov lands exactly on the target (a lerp tail in a one-frame render is a bug)",
+       view_fov(v) == view_fov_target(v));
+
+    // a wider FOV must pull an off-centre point TOWARD the centre. That is what
+    // the number means; asserting it beats asserting 70.0.
+    v = fresh();
+    view_set_eye(v, 0.0, 0.0, 0.0);
+    view_set_angles(v, 0.0, 0.0);
+    view_set_fov_target(v, g_FOV_ADS);
+    view_snap_fov(v);
+    view_build(v, 0.0, 0);
+    view_project(v, 2.0, 0.0, -10.0, out4);
+    view_set_fov_target(v, g_FOV_SPRINT);
+    view_snap_fov(v);
+    view_build(v, 0.0, 0);
+    view_project(v, 2.0, 0.0, -10.0, out4b);
+    let off_narrow: f64 = absf2(out4[0] - f64(g_RES_W) * 0.5);
+    let off_wide: f64 = absf2(out4b[0] - f64(g_RES_W) * 0.5);
+    print(`  a point 2 m off-axis at 10 m:  ADS ${f4(off_narrow)} px from centre, sprint ${f4(off_wide)} px`);
+    ok("a wider FOV pulls an off-centre point toward the centre", off_wide < off_narrow);
+
+    // =======================================================================
+    print("");
+    print("[4] recoil_view NEVER leaves the client");
+    // -----------------------------------------------------------------------
+    // (a) live: a View that has been kicked and shaken for 200 frames, against
+    //     a control View driven with the identical aim and no kick at all.
+    let vk: object = fresh();
+    let vc: object = fresh();
+    view_set_seed(vk, 20260728);
+    view_set_seed(vc, 20260728);
+    let t4: i32 = 0;
+    while (t4 < 200) {
+        let yaw: f64 = 0.017 * f64(t4);
+        let pitch: f64 = 0.9 * sin(0.05 * f64(t4));
+        view_apply_camera(vk, 1.0, 1.7, 2.0, yaw, pitch);
+        view_apply_camera(vc, 1.0, 1.7, 2.0, yaw, pitch);
+        view_kick_fire(vk, 1.0, 0.4);
+        view_shake_fire(vk);
+        view_build(vk, 1.0 / 60.0, t4);
+        view_build(vc, 1.0 / 60.0, t4);
+        t4 = t4 + 1;
+    }
+    ok("200 kicked frames: aim yaw is BIT-IDENTICAL to the un-kicked control",
+       view_aim_yaw(vk) == view_aim_yaw(vc));
+    ok("200 kicked frames: aim pitch is BIT-IDENTICAL to the control",
+       view_aim_pitch(vk) == view_aim_pitch(vc));
+    ok("200 kicked frames: the aim FORWARD vector is bit-identical to the control",
+       view_aim_forward_x(vk) == view_aim_forward_x(vc) &&
+       view_aim_forward_y(vk) == view_aim_forward_y(vc) &&
+       view_aim_forward_z(vk) == view_aim_forward_z(vc));
+    ok("the kick IS applied to the picture (the comparison has power)",
+       mvp_equal(vk, vc) == 0 && absf2(view_kick_pitch(vk)) > 1.0e-4);
+
+    // (b) the real InputCommand. `cmd_hash` is what the replay gate compares.
+    let ca: object = cmd_new();
+    let cb: object = cmd_new();
+    cmd_set(ca, 200, 16, 0.0, 1.0, view_aim_yaw(vk), view_aim_pitch(vk), 0, 0, 7);
+    cmd_set(cb, 200, 16, 0.0, 1.0, view_aim_yaw(vc), view_aim_pitch(vc), 0, 0, 7);
+    ok("an InputCommand built from the AIM angles hashes identically with and without recoil",
+       cmd_hash(ca) == cmd_hash(cb));
+    let cr: object = cmd_new();
+    cmd_set(cr, 200, 16, 0.0, 1.0, view_render_yaw(vk), view_render_pitch(vk), 0, 0, 7);
+    ok("NEGATIVE CONTROL: the same command built from the RENDER angles hashes differently",
+       cmd_hash(cr) != cmd_hash(ca));
+    note(`recoil_view is ${f4(view_kick_pitch(vk) / g_VIEW_DEG)} deg of visible pitch and 0 quantization steps of command`);
+
+    // (c) the structural argument: the sim cannot even name this file.
+    let sim_dir: string = "/home/nbeerbower/Projects/nightshade/src/sim";
+    let simfiles: array = list_dir(sim_dir);
+    let sim_hits: i32 = 0;
+    let scanned: i32 = 0;
+    let sim_lines: i32 = 0;
+    let si: i32 = 0;
+    while (si < simfiles.length) {
+        let nm: string = simfiles[si];
+        if (nm.contains(".hml")) {
+            let txt: string = read_file(`${sim_dir}/${nm}`);
+            scanned = scanned + 1;
+            // CODE only. Comments are stripped exactly as ci_imports.sh does
+            // (`sed 's://.*::'`): world.hml legitimately *documents* that client
+            // cosmetics live in src/render/fx.hml, and a doc reference is not a
+            // dependency. What must not exist is a line of code that names any
+            // of this.
+            let sl: array = lines(txt);
+            let sj: i32 = 0;
+            while (sj < sl.length) {
+                let srcln: string = sl[sj];
+                let code: string = srcln;
+                if (srcln.contains("//")) { code = srcln.split("//")[0]; }
+                sim_lines = sim_lines + 1;
+                if (code.contains("recoil_view")) { sim_hits = sim_hits + 1; }
+                if (code.contains("view.hml")) { sim_hits = sim_hits + 1; }
+                if (code.contains("/render/")) { sim_hits = sim_hits + 1; }
+                sj = sj + 1;
+            }
+        }
+        si = si + 1;
+    }
+    print(`  scanned ${sim_lines} lines of code in ${scanned} files under src/sim/`);
+    ok("no line of code under src/sim/ names recoil_view, view.hml or src/render",
+       sim_hits == 0 && scanned >= 4);
+
+    // (d) and the flow the other way is walled too: view.hml imports no sim, no net.
+    let vsrc: string = read_file("/home/nbeerbower/Projects/nightshade/src/render/view.hml");
+    let vlines: array = lines(vsrc);
+    let bad_imports: i32 = 0;
+    let cmd_exports: i32 = 0;
+    let li: i32 = 0;
+    while (li < vlines.length) {
+        let ln: string = vlines[li];
+        if (ln.contains("from \"") && !ln.contains("//")) {
+            if (ln.contains("/sim/")) { bad_imports = bad_imports + 1; }
+            if (ln.contains("/net/")) { bad_imports = bad_imports + 1; }
+            if (ln.contains("gn.hml")) { bad_imports = bad_imports + 1; }
+        }
+        if (ln.contains("export fn ")) {
+            if (ln.contains("command") || ln.contains("cmd_")) { cmd_exports = cmd_exports + 1; }
+        }
+        li = li + 1;
+    }
+    ok("view.hml imports nothing from src/sim, src/net or gn.hml", bad_imports == 0);
+    ok("view.hml exports no command-shaped function", cmd_exports == 0);
+
+    // =======================================================================
+    print("");
+    print("[5] screen shake: deterministic from tick + seed, and NOT in the MVP");
+    // -----------------------------------------------------------------------
+    let va: object = fresh();
+    let vb: object = fresh();
+    view_set_seed(va, 909); view_set_seed(vb, 909);
+    let vd: object = fresh();
+    view_set_seed(vd, 910);
+    let diff_seed: i32 = 0;
+    let identical: i32 = 1;
+    let worst_amp: f64 = 0.0;
+    let sum_x: f64 = 0.0;
+    let sum_y: f64 = 0.0;
+    let nsh: i32 = 0;
+    let ti: i32 = 0;
+    while (ti < 20000) {
+        // hold trauma pinned so the sample, not the envelope, is under test
+        view_shake(va, 1.0); view_shake(vb, 1.0); view_shake(vd, 1.0);
+        view_build(va, 1.0 / 60.0, ti);
+        view_build(vb, 1.0 / 60.0, ti);
+        view_build(vd, 1.0 / 60.0, ti);
+        if (view_shake_x(va) != view_shake_x(vb)) { identical = 0; }
+        if (view_shake_y(va) != view_shake_y(vb)) { identical = 0; }
+        if (view_shake_x(va) != view_shake_x(vd)) { diff_seed = diff_seed + 1; }
+        let ax: f64 = absf2(view_shake_x(va));
+        let ay2: f64 = absf2(view_shake_y(va));
+        if (ax > worst_amp) { worst_amp = ax; }
+        if (ay2 > worst_amp) { worst_amp = ay2; }
+        sum_x = sum_x + view_shake_x(va);
+        sum_y = sum_y + view_shake_y(va);
+        nsh = nsh + 1;
+        ti = ti + 1;
+    }
+    let mean_x: f64 = sum_x / f64(nsh);
+    let mean_y: f64 = sum_y / f64(nsh);
+    print(`  20 000 ticks at trauma 1.0: worst |offset| ${f4(worst_amp)} px (cap ${f4(g_SHAKE_MAX_PX)}), mean (${f4(mean_x)}, ${f4(mean_y)}) px`);
+    ok("two Views with the same seed shake bit-identically at every tick", identical == 1);
+    ok("a different seed gives a different stream", diff_seed > 19000);
+    ok("the offset never exceeds g_SHAKE_MAX_PX", worst_amp <= g_SHAKE_MAX_PX);
+    ok("the shake is unbiased: it does not drift the image off centre",
+       absf2(mean_x) < 0.12 && absf2(mean_y) < 0.12);
+
+    let vz: object = fresh();
+    view_clear_shake(vz);
+    view_build(vz, 1.0 / 60.0, 44);
+    ok("zero trauma is exactly zero offset, not a small one",
+       view_shake_x(vz) == 0.0 && view_shake_y(vz) == 0.0);
+
+    // shake must not perturb the MVP: culling stays stable while the screen shakes
+    let vm0: object = fresh();
+    let vm1: object = fresh();
+    view_apply_camera(vm0, 3.0, 1.7, -8.0, 0.7, 0.2);
+    view_apply_camera(vm1, 3.0, 1.7, -8.0, 0.7, 0.2);
+    view_shake(vm1, 1.0);
+    view_build(vm0, 1.0 / 60.0, 99);
+    view_build(vm1, 1.0 / 60.0, 99);
+    ok("the MVP is bit-identical at trauma 0 and trauma 1 (shake is present-time, not view-time)",
+       mvp_equal(vm0, vm1) == 1 && absf2(view_shake_x(vm1)) > 0.0);
+
+    // the envelope: linear decay, therefore also frame-rate independent
+    let ve1: object = fresh();
+    let ve2: object = fresh();
+    view_shake(ve1, 1.0); view_shake(ve2, 1.0);
+    let ei: i32 = 0;
+    while (ei < 12) { view_build(ve1, 1.0 / 240.0, ei); ei = ei + 1; }
+    view_build(ve2, 12.0 / 240.0, 0);
+    ok("trauma decay is frame-rate independent (12 small steps == 1 big one)",
+       absf2(view_trauma(ve1) - view_trauma(ve2)) < 1.0e-12);
+    let vf: object = fresh();
+    view_shake_fire(vf);
+    let steps_alive: i32 = 0;
+    while (view_trauma(vf) > 0.0 && steps_alive < 100000) {
+        view_build(vf, 1.0 / 600.0, steps_alive);
+        steps_alive = steps_alive + 1;
+    }
+    let fire_s: f64 = f64(steps_alive) / 600.0;
+    print(`  one fire shake lasts ${f4(fire_s * 1000.0)} ms (g_SHAKE_FIRE_S = ${f4(g_SHAKE_FIRE_S * 1000.0)} ms)`);
+    ok("one fire shake lasts exactly g_SHAKE_FIRE_S", absf2(fire_s - g_SHAKE_FIRE_S) < 0.002);
+
+    // =======================================================================
+    print("");
+    print("[6] the planes, the depth key and the projection");
+    // -----------------------------------------------------------------------
+    v = fresh();
+    view_set_fog_far(v, 200.0);
+    ok("fog_far is clamped to g_FOG_FAR_CAP — fog distance IS the triangle budget",
+       view_fog_far(v) == g_FOG_FAR_CAP);
+    ok("the far plane is DERIVED as fog_far * g_FAR_PLANE_SCALE, never hardcoded",
+       absf2(view_far(v) - view_fog_far(v) * g_FAR_PLANE_SCALE) < 1.0e-12);
+    view_set_fog_far(v, 45.0);
+    ok("...and it tracks fog_far when the shade tier changes it",
+       absf2(view_far(v) - 45.0 * g_FAR_PLANE_SCALE) < 1.0e-12);
+
+    v = fresh();
+    view_set_eye(v, 0.0, 0.0, 0.0);
+    view_set_angles(v, 0.0, 0.0);
+    view_build(v, 0.0, 0);
+    let farm: f64 = view_far(v);
+    view_project(v, 0.0, 0.0, 0.0 - farm, out4);
+    ok("a point on the far plane sits at ndc z = 1", absf2(out4[3] - 1.0) < 1.0e-9);
+    view_project(v, 0.0, 0.0, 0.0 - farm * 1.1, out4);
+    ok("a point beyond the far plane is outside the clip volume", out4[3] > 1.0);
+    view_project(v, 0.0, 0.0, 0.0 - view_near(v) * 1.0001, out4);
+    ok("a point just past the near plane sits at ndc z ~ -1", out4[3] < 0.0 - 0.999);
+    let behind: i32 = view_project(v, 0.0, 0.0, 5.0, out4);
+    ok("a point behind the camera is rejected, not projected", behind == 0);
+
+    view_project(v, 2.0, 0.0, -10.0, out4);
+    ok("a point to the RIGHT of the aim projects right of centre", out4[0] > f64(g_RES_W) * 0.5);
+    view_project(v, 0.0, 2.0, -10.0, out4);
+    ok("a point ABOVE the aim projects above centre (screen y grows downward)",
+       out4[1] < f64(g_RES_H) * 0.5);
+
+    // roll: the image must rotate by exactly the roll angle, and rigidly.
+    // The aspect is set square so the ndc space is isotropic and the property
+    // is expressible without an aspect correction.
+    let vr: object = fresh();
+    view_set_viewport(vr, 240.0, 240.0);
+    view_set_eye(vr, 0.0, 0.0, 0.0);
+    view_set_angles(vr, 0.0, 0.0);
+    view_build(vr, 0.0, 0);
+    view_project(vr, 2.0, 1.0, -10.0, out4);
+    let rx0: f64 = out4[0] - 120.0;
+    let ry0: f64 = 120.0 - out4[1];
+    let ang0: f64 = atan2(ry0, rx0);
+    let rad0: f64 = sqrt(rx0 * rx0 + ry0 * ry0);
+    let roll: f64 = 0.3;
+    view_set_roll(vr, roll);
+    view_build(vr, 0.0, 0);
+    view_project(vr, 2.0, 1.0, -10.0, out4b);
+    let rx1: f64 = out4b[0] - 120.0;
+    let ry1: f64 = 120.0 - out4b[1];
+    let ang1: f64 = atan2(ry1, rx1);
+    let rad1: f64 = sqrt(rx1 * rx1 + ry1 * ry1);
+    print(`  roll ${f4(roll)} rad rotated the image by ${f4(ang0 - ang1)} rad, radius ${f4(rad0)} -> ${f4(rad1)} px`);
+    ok("roll rotates the image by exactly the roll angle", absf2((ang0 - ang1) - roll) < 1.0e-9);
+    ok("roll is rigid: it preserves distance from the screen centre", absf2(rad1 - rad0) < 1.0e-9);
+    let vr0: object = fresh();
+    view_set_viewport(vr0, 240.0, 240.0);
+    view_set_eye(vr0, 0.0, 0.0, 0.0);
+    view_set_angles(vr0, 0.0, 0.0);
+    view_set_roll(vr0, 0.0);
+    view_build(vr0, 0.0, 0);
+    view_set_roll(vr, 0.0);
+    view_build(vr, 0.0, 0);
+    ok("roll = 0 costs nothing: the MVP is bit-identical to the un-rolled path",
+       mvp_equal(vr, vr0) == 1);
+
+    // =======================================================================
+    print("");
+    print("[7] the interactive surface the walkaround will actually call");
+    // -----------------------------------------------------------------------
+    let vw: object = fresh();
+    view_set_angles(vw, 0.0, 0.0);
+    view_look_mouse(vw, 100.0, 0.0, 1.0);
+    ok("view_look_mouse: +dx turns RIGHT by dx * g_MOUSE_SENS_RAD",
+       absf2(view_aim_yaw(vw) - 100.0 * g_MOUSE_SENS_RAD) < 1.0e-12);
+    view_set_angles(vw, 0.0, 0.0);
+    view_look_mouse(vw, 0.0, 100.0, 1.0);
+    ok("view_look_mouse: +dy is DOWN on screen and lowers the aim",
+       view_aim_pitch(vw) < 0.0);
+    view_set_angles(vw, 0.0, 0.0);
+    view_look_mouse(vw, 100.0, 0.0, 0.5);
+    ok("the sensitivity multiplier scales the turn linearly",
+       absf2(view_aim_yaw(vw) - 50.0 * g_MOUSE_SENS_RAD) < 1.0e-12);
+    view_set_fov_mode(vw, g_VIEW_ADS);
+    let sads: f64 = view_sens_scale(vw);
+    view_set_fov_mode(vw, g_VIEW_HIP);
+    let ship: f64 = view_sens_scale(vw);
+    ok("aiming down sights slows the mouse down", sads < ship);
+
+    // a long interactive session: 60 000 frames of jittery mouse input
+    let vlong: object = fresh();
+    let bad_long: i32 = 0;
+    let li2: i32 = 0;
+    while (li2 < 60000) {
+        let dx: f64 = 7.0 * sin(0.37 * f64(li2)) + 3.0;
+        let dy: f64 = 5.0 * cos(0.11 * f64(li2));
+        view_look_mouse(vlong, dx, dy, 1.0);
+        view_set_eye(vlong, 0.01 * f64(li2), 1.7, 0.0);
+        view_build(vlong, 1.0 / 60.0, li2);
+        if (view_aim_yaw(vlong) != view_aim_yaw(vlong)) { bad_long = bad_long + 1; }
+        if (view_aim_yaw(vlong) > g_VIEW_PI || view_aim_yaw(vlong) < 0.0 - g_VIEW_PI) { bad_long = bad_long + 1; }
+        if (absf2(view_aim_pitch(vlong)) > g_VIEW_PITCH_CLAMP + 1.0e-12) { bad_long = bad_long + 1; }
+        li2 = li2 + 1;
+    }
+    bad_long = bad_long + mvp_sane(vlong);
+    print(`  60 000 frames of mouse-look: ${bad_long} invariant violations`);
+    ok("a 60 000-frame mouse-look session never leaves the clamps or produces a NaN",
+       bad_long == 0);
+    ok("...and the basis is still orthonormal at the end of it", ortho_err(vlong) < 1.0e-12);
+
+    // the kick decay is frame-rate independent too
+    let k30: f64 = kick_after(1.0 / 30.0, 3);
+    let k240: f64 = kick_after(1.0 / 240.0, 24);
+    ok("recoil_view decay is frame-rate independent", absf2(k30 - k240) < 1.0e-12);
+    let k1s: f64 = kick_after(1.0 / 240.0, 240);
+    ok("recoil_view decays away to nothing within a second", absf2(k1s) < 1.0e-4);
+    note(`recoil_view decays from 0.05 rad to ${fsci(absf2(k1s))} rad in 1.0 s at g_KICK_DECAY = ${f4(g_KICK_DECAY)}/s`);
+
+    // the accessors a caller reads every frame
+    let vacc: object = fresh();
+    view_apply_camera(vacc, 4.5, 1.7, 0.0 - 9.5, 0.25, 0.1);
+    view_build(vacc, 1.0 / 60.0, 5);
+    let evv: object = view_eye(vacc);
+    ok("the eye accessors agree with what was set, scalar and object form",
+       view_eye_x(vacc) == 4.5 && view_eye_y(vacc) == 1.7 && view_eye_z(vacc) == 0.0 - 9.5 &&
+       evv.x == 4.5 && evv.y == 1.7 && evv.z == 0.0 - 9.5);
+    ok("view_tick reports the tick the frame is presenting", view_tick(vacc) == 5);
+    ok("view_mvp and view_mvp_at agree", view_mvp(vacc)[6] == view_mvp_at(vacc, 6));
+    ok("view_wrap_pi wraps a runaway angle into (-pi, pi]",
+       absf2(view_wrap_pi(19.0 * g_VIEW_TAU + 1.0) - 1.0) < 1.0e-9);
+
+    // =======================================================================
+    print("");
+    print("[8] cost of view_build (RULE T: __clock CPU time, min of 7 batches)");
+    // -----------------------------------------------------------------------
+    let vt: object = fresh();
+    view_apply_camera(vt, 12.0, 1.7, 40.0, 0.6, 0.15);
+    view_shake(vt, 1.0);
+    view_kick(vt, 0.02, 0.01, 0.005);
+    let us: f64 = build_us(vt, 200000);
+    print(`  view_build: ${f4(us)} us/call, once per frame`);
+    note(`view_build costs ${f4(us)} us/frame == ${f4(us / 166.7)} % of the 16.67 ms frame`);
+    // REGRESSION GUARD, not a frame-budget assertion (CLAUDE.md §1.2 / RULE T).
+    // Measured on this box (min-of-7 __clock CPU time, 200 000 calls a batch):
+    //     llama-server resident but idle   2.64 - 2.69 us/call
+    //     under 16-way CPU contention      3.26 - 4.20 us/call
+    // The guard sits at 8.0 us, ~1.9x the worst loaded reading, and catches
+    // anything that turns this once-per-frame call into a per-vertex-shaped
+    // cost (a mat_mul chain, a per-frame allocation storm). Even the loaded
+    // figure is 0.025 % of the 16.67 ms frame, so this is not a budget line.
+    ok("view_build stays under the 8.0 us/frame regression guard (2.7 us quiet, 4.2 us loaded)",
+       us < 8.0);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    if (g_n != g_EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${g_EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+main();

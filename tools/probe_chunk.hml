@@ -1,0 +1,1319 @@
+// probe_chunk.hml — acceptance probe for W3-2 (src/sim/chunk.hml).
+//
+// Run COMPILED, from the nightshade repo root:
+//     hemlockc -O1 tools/probe_chunk.hml -o /tmp/pc && /tmp/pc
+//
+// It links no SDL and needs no display: `src/sim/**` is behind the import wall.
+// Verify with `nm /tmp/pc | grep -c SDL_` -> 0.
+//
+// RUN IT COMPILED.  Every correctness assertion passes interpreted too, but the
+// timing section and the RSS section are only meaningful on the shipping
+// backend (`hemlockc` is ground truth, CLAUDE.md §2).
+//
+// -----------------------------------------------------------------------------
+// THE FIVE W3-2 ACCEPTANCE CRITERIA, AND WHERE EACH IS CHECKED
+// -----------------------------------------------------------------------------
+//   1. <= 1.5 B per height sample vs 16 for array<i32>   -> §10  (REPORTED, and
+//      it is the one criterion this task does NOT meet — see the note there.)
+//   2. chunk_height_at / chunk_normal_at bilinear-correct
+//      against a reference                               -> §3, §4
+//   3. the edit overlay round-trips through save/load    -> §6
+//   4. the LRU never exceeds its cap, and never evicts a
+//      chunk inside the render ring                      -> §7
+//   5. a memory report at a 15x15 loaded region          -> §10
+//   plus the task emphasis: allocate once, reuse, RSS flat over 10 000 frames
+//                                                        -> §9
+//
+// -----------------------------------------------------------------------------
+// THE REFERENCE
+// -----------------------------------------------------------------------------
+// `chunk.hml` has no generator in it — it takes an injected source (see that
+// file's header).  This probe injects an ANALYTIC one and then recomputes the
+// expected answers from the same analytic function, independently of anything
+// the store did.  So "bilinear-correct against a reference" is literally what
+// is checked: the reference is a function, not a golden number, and it stays
+// correct if worldgen is retuned.
+//
+// Assertions are PROPERTIES wherever a property exists (unit-length normals,
+// tangents orthogonal to the normal, edits invisible in the generated arena,
+// cache size cannot change an answer).  Magic numbers appear only where the
+// number IS the contract: 9 samples, 81 per chunk, 2 bytes each.
+//
+// The probe asserts its own ASSERTION COUNT, so a block that silently stops
+// running fails the build instead of printing a smaller green number.
+
+import { exit } from "@stdlib/process";
+import { open } from "@stdlib/fs";
+import { xhash3, floori } from "../src/core/mathx.hml";
+
+import {
+    chunk_store_new, chunk_store_new_cap, chunk_set_source, chunk_has_source,
+    chunk_key, chunk_sample_index, chunk_at_m,
+    chunk_get, chunk_find, chunk_evict, chunk_evict_lru, chunk_drop_all,
+    chunk_pin_ring, chunk_pin, chunk_pinned,
+    chunk_dirty, chunk_mark_dirty, chunk_clear_dirty, chunk_meta,
+    chunk_height_gen, chunk_height_cm, chunk_biome, chunk_light, chunk_set_light,
+    chunk_height_at, chunk_normal_at,
+    chunk_set_edit, chunk_clear_edit, chunk_edit_get, chunk_edit_count,
+    chunk_edit_cap, chunk_edit_full_count, chunk_edits_in, chunk_clear_edits,
+    chunk_edits_bytes, chunk_edits_save, chunk_edits_load,
+    chunk_cap, chunk_resident, chunk_seed, chunk_set_seed,
+    chunk_load_count, chunk_evict_count, chunk_hit_count, chunk_miss_count,
+    chunk_refused_count, chunk_no_source_count, chunk_sample_miss_count,
+    chunk_height_bytes, chunk_attr_bytes, chunk_bytes_per_sample,
+    chunk_overlay_bytes, chunk_table_entries,
+    CHUNK_N, CHUNK_CELLS, CHUNK_SAMPLES, CHUNK_M, CHUNK_CELL_M, CHUNK_CM_PER_M,
+    CHUNK_H_STRIDE_B, CHUNK_A_STRIDE_B, CHUNK_H_MAX_CM,
+    SLOT_NONE, EDIT_NONE, CHUNK_H_MISS,
+    CDIRTY_HEIGHT, CDIRTY_LIGHT, CDIRTY_MESH, CDIRTY_ALL,
+    CHUNK_SAVE_HDR_B, CHUNK_SAVE_REC_B
+} from "../src/sim/chunk.hml";
+
+let EXPECTED_ASSERTS = 199;
+
+let g_n = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ok(p_cond: i32, p_name: string) {
+    g_n = g_n + 1;
+    if (p_cond == 1) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}`);
+    }
+}
+
+fn eqi(p_a: i32, p_b: i32, p_name: string) {
+    let a: i32 = p_a;
+    let b: i32 = p_b;
+    let c: i32 = 0;
+    if (a == b) { c = 1; }
+    if (c == 0) { print(`        got ${a}, want ${b}`); }
+    ok(c, p_name);
+}
+
+fn nearf(p_a: f64, p_b: f64, p_eps: f64, p_name: string) {
+    let a: f64 = p_a;
+    let b: f64 = p_b;
+    let d: f64 = a - b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let c: i32 = 0;
+    if (d < p_eps) { c = 1; }
+    if (c == 0) { print(`        got ${a}, want ${b}`); }
+    ok(c, p_name);
+}
+
+fn tru(p_c: i32, p_name: string) { ok(p_c, p_name); }
+
+// f64 -> fixed-3 string (H-5: never let a number print in scientific form).
+fn f3(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 1000.0 + 0.5);
+    let whole: i64 = scaled / 1000;
+    let frac: i64 = scaled - whole * 1000;
+    let fs: string = `${frac}`;
+    if (frac < 100) { fs = `0${fs}`; }
+    if (frac < 10) { fs = `00${frac}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+// /proc/self/statm: "size resident shared text lib data dt", in pages.
+fn rss_kb(): i64 {
+    let f = open("/proc/self/statm", "r");
+    let s = f.read();
+    f.close();
+    let parts = s.trim().split(" ");
+    let pages: i64 = i64(parts[1]);
+    let out: i64 = pages * 4;
+    return out;
+}
+
+// ===========================================================================
+// THE REFERENCE WORLD — an analytic source, and its independent recomputation
+// ===========================================================================
+// Lattice coordinates are ABSOLUTE: gx = cx * 8 + ix.  Two neighbouring chunks
+// therefore evaluate the identical function at their shared edge, which is what
+// makes the field C0 across a chunk boundary — the same contract W3-1's real
+// worldgen must satisfy.  Heights land in 40.00 .. 60.00 m: wide enough that
+// almost every one of a chunk's 81 samples is a distinct value (so an indexing
+// bug cannot hide behind a repeat), narrow enough that slopes stay finite.
+
+let REF_SEED_SALT = 7;
+
+fn ref_h_cm(p_gx: i32, p_gz: i32, p_seed: i32): i32 {
+    let h: u64 = xhash3(p_gx, p_gz, REF_SEED_SALT, p_seed);
+    let v: i32 = i32(h % 2000);
+    let out: i32 = 4000 + v;
+    return out;
+}
+
+fn ref_biome(p_gx: i32, p_gz: i32): i32 {
+    let v: i32 = (p_gx * 3 + p_gz * 5) % 6;
+    if (v < 0) { v = v + 6; }
+    let out: i32 = v;
+    return out;
+}
+
+fn ref_light(p_gx: i32, p_gz: i32): i32 {
+    let v: i32 = (p_gx * 7 + p_gz * 11) % 256;
+    if (v < 0) { v = v + 256; }
+    let out: i32 = v;
+    return out;
+}
+
+// The injected source.  Exactly the contract in chunk.hml's header.
+fn ref_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+              p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let hp: ptr = buffer_ptr(p_hbuf);
+    let ap: ptr = buffer_ptr(p_abuf);
+    let hoff: i32 = p_hoff;
+    let aoff: i32 = p_aoff;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let seed: i32 = p_seed;
+    let n: i32 = CHUNK_N;
+    let iz: i32 = 0;
+    while (iz < n) {
+        let ix: i32 = 0;
+        while (ix < n) {
+            let si: i32 = iz * n + ix;
+            let gx: i32 = cx * CHUNK_CELLS + ix;
+            let gz: i32 = cz * CHUNK_CELLS + iz;
+            ptr_write_u16(ptr_offset(hp, hoff + si * 2, 1), ref_h_cm(gx, gz, seed));
+            ptr_write_u8(ptr_offset(ap, aoff + si, 1), ref_biome(gx, gz));
+            ptr_write_u8(ptr_offset(ap, aoff + CHUNK_SAMPLES + si, 1), ref_light(gx, gz));
+            ix++;
+        }
+        iz++;
+    }
+    // The opaque META word: a POI-roll stand-in, so the round trip is checked.
+    let meta: i32 = (cx * 1000003 + cz * 65537) % 1000;
+    return meta;
+}
+
+// The reference bilinear height, in metres, computed WITHOUT the store.
+fn ref_height_at(p_wx: f64, p_wz: f64, p_seed: i32): f64 {
+    let wx: f64 = p_wx;
+    let wz: f64 = p_wz;
+    let gxf: f64 = wx / CHUNK_CELL_M;
+    let gzf: f64 = wz / CHUNK_CELL_M;
+    let gx: i32 = floori(gxf);
+    let gz: i32 = floori(gzf);
+    let tx: f64 = gxf - f64(gx);
+    let tz: f64 = gzf - f64(gz);
+    let h00: f64 = f64(ref_h_cm(gx, gz, p_seed));
+    let h10: f64 = f64(ref_h_cm(gx + 1, gz, p_seed));
+    let h01: f64 = f64(ref_h_cm(gx, gz + 1, p_seed));
+    let h11: f64 = f64(ref_h_cm(gx + 1, gz + 1, p_seed));
+    let a: f64 = h00 + (h10 - h00) * tx;
+    let b: f64 = h01 + (h11 - h01) * tx;
+    let out: f64 = (a + (b - a) * tz) / CHUNK_CM_PER_M;
+    return out;
+}
+
+fn new_ref_store(p_cap: i32, p_ecap: i32, p_seed: i32): object {
+    let cs: object = chunk_store_new_cap(p_cap, p_ecap, p_seed);
+    chunk_set_source(cs, ref_source);
+    return cs;
+}
+
+// ===========================================================================
+// 1. SHAPE — the contract numbers, and the key packing
+// ===========================================================================
+fn test_shape() {
+    print("-- 1. shape and keys");
+    eqi(CHUNK_N, 9, "CHUNK_N is 9 (a 32 m chunk on a 4 m grid, edges inclusive)");
+    eqi(CHUNK_CELLS, 8, "CHUNK_CELLS is 8");
+    eqi(CHUNK_SAMPLES, 81, "81 height samples per chunk");
+    eqi(CHUNK_H_STRIDE_B, 162, "height stride is 81 * 2 bytes (u16 centimetres)");
+    eqi(CHUNK_A_STRIDE_B, 162, "attr stride is 81 biome + 81 light bytes");
+    nearf(CHUNK_M, 32.0, 0.000001, "chunk edge is 32 m");
+    nearf(CHUNK_CELL_M, 4.0, 0.000001, "grid cell is 4 m");
+    nearf(CHUNK_CM_PER_M, 100.0, 0.000001, "heights are centimetres");
+    eqi(CHUNK_H_MAX_CM, 65535, "u16 ceiling is 655.35 m of headroom");
+    tru(CHUNK_CELLS * i32(CHUNK_CELL_M) == i32(CHUNK_M) ? 1 : 0,
+        "8 cells of 4 m exactly tile the 32 m chunk");
+
+    // sample indexing
+    eqi(chunk_sample_index(0, 0), 0, "sample_index(0,0) is 0");
+    eqi(chunk_sample_index(8, 8), 80, "sample_index(8,8) is 80");
+    eqi(chunk_sample_index(3, 2), 21, "sample_index is iz * N + ix");
+    eqi(chunk_sample_index(-1, 0), -1, "sample_index rejects out of range");
+    eqi(chunk_sample_index(0, 9), -1, "sample_index rejects iz == N");
+
+    // keys: distinct over a realistic world, and stable
+    eqi(chunk_key(0, 0), chunk_key(0, 0), "chunk_key is a function");
+    tru(chunk_key(1, 0) != chunk_key(0, 1) ? 1 : 0, "chunk_key(1,0) != chunk_key(0,1)");
+    tru(chunk_key(-1, 0) != chunk_key(1, 0) ? 1 : 0, "chunk_key separates the sign");
+    let dup: i32 = 0;
+    let seen: array<i32> = [];
+    let cz: i32 = -20;
+    while (cz <= 20) {
+        let cx: i32 = -20;
+        while (cx <= 20) { seen.push(chunk_key(cx, cz)); cx++; }
+        cz++;
+    }
+    let n: i32 = seen.length;
+    let i: i32 = 0;
+    while (i < n) {
+        let j: i32 = i + 1;
+        while (j < n) {
+            if (seen[i] == seen[j]) { dup = dup + 1; }
+            j++;
+        }
+        i++;
+    }
+    eqi(dup, 0, "41x41 chunk keys around the origin are all distinct");
+    eqi(n, 1681, "the key sweep really covered 41x41 chunks");
+
+    // world metres -> chunk index, including negative space
+    eqi(chunk_at_m(0.0), 0, "chunk_at_m(0) is chunk 0");
+    eqi(chunk_at_m(31.999), 0, "chunk_at_m stays in chunk 0 up to 32 m");
+    eqi(chunk_at_m(32.0), 1, "chunk_at_m(32) is chunk 1");
+    eqi(chunk_at_m(-0.001), -1, "chunk_at_m floors into negative space");
+    eqi(chunk_at_m(-32.0), -1, "chunk_at_m(-32) is chunk -1");
+}
+
+// ===========================================================================
+// 2. THE STORE REFUSES TO INVENT TERRAIN
+// ===========================================================================
+fn test_no_source() {
+    print("-- 2. a store with no generator refuses, it does not fabricate");
+    let cs: object = chunk_store_new_cap(8, 64, 1234);
+    eqi(chunk_has_source(cs), 0, "a fresh store has no source");
+    eqi(chunk_get(cs, 0, 0), SLOT_NONE, "chunk_get refuses without a source");
+    eqi(chunk_no_source_count(cs), 1, "the refusal is counted, not silent");
+    eqi(chunk_resident(cs), 0, "nothing became resident");
+    nearf(chunk_height_at(cs, 4.0, 4.0), CHUNK_H_MISS, 0.5,
+          "chunk_height_at returns the LOUD miss sentinel, never a plausible 0 m");
+    eqi(chunk_sample_miss_count(cs), 1, "the sampler miss is counted");
+    let nrm: array<f64> = [0.0, 0.0, 0.0];
+    eqi(chunk_normal_at(cs, 4.0, 4.0, nrm), 0, "chunk_normal_at reports the miss");
+    nearf(nrm[1], 1.0, 0.000001, "a missed normal is straight up, not garbage");
+}
+
+// ===========================================================================
+// 3. GENERATION AND THE BILINEAR SAMPLERS
+// ===========================================================================
+fn test_generate_and_sample() {
+    print("-- 3. generation, and the samplers against the analytic reference");
+    let seed: i32 = 20260728;
+    let cs: object = new_ref_store(64, 256, seed);
+    eqi(chunk_has_source(cs), 1, "the source is installed");
+
+    let slot: i32 = chunk_get(cs, 0, 0);
+    tru(slot >= 0 ? 1 : 0, "chunk (0,0) loaded");
+    eqi(chunk_resident(cs), 1, "one chunk resident");
+    eqi(chunk_load_count(cs), 1, "one load");
+    eqi(chunk_dirty(cs, slot), CDIRTY_ALL, "a freshly loaded chunk is fully dirty");
+    eqi(chunk_meta(cs, slot), 0, "the opaque META word round-trips from the source");
+
+    // every one of the 81 samples matches the reference, and they are distinct
+    // (a distinct-value field is what makes an indexing bug impossible to hide)
+    let bad: i32 = 0;
+    let bbad: i32 = 0;
+    let lbad: i32 = 0;
+    let vals: array<i32> = [];
+    let iz: i32 = 0;
+    while (iz < CHUNK_N) {
+        let ix: i32 = 0;
+        while (ix < CHUNK_N) {
+            let si: i32 = iz * CHUNK_N + ix;
+            if (chunk_height_gen(cs, slot, si) != ref_h_cm(ix, iz, seed)) { bad = bad + 1; }
+            if (chunk_biome(cs, slot, si) != ref_biome(ix, iz)) { bbad = bbad + 1; }
+            if (chunk_light(cs, slot, si) != ref_light(ix, iz)) { lbad = lbad + 1; }
+            vals.push(chunk_height_gen(cs, slot, si));
+            ix++;
+        }
+        iz++;
+    }
+    eqi(bad, 0, "all 81 stored heights match the reference exactly");
+    eqi(bbad, 0, "all 81 biome bytes match the reference");
+    eqi(lbad, 0, "all 81 light bytes match the reference");
+    let dup: i32 = 0;
+    let i: i32 = 0;
+    while (i < 81) {
+        let j: i32 = i + 1;
+        while (j < 81) { if (vals[i] == vals[j]) { dup = dup + 1; } j++; }
+        i++;
+    }
+    tru(dup <= 8 ? 1 : 0, "the reference field is near-distinct per sample, so indexing cannot hide");
+
+    // at a lattice point the bilinear sampler must return that exact sample
+    let latt_bad: i32 = 0;
+    iz = 0;
+    while (iz < CHUNK_N) {
+        let ix: i32 = 0;
+        while (ix < CHUNK_N) {
+            let wx: f64 = f64(ix) * CHUNK_CELL_M;
+            let wz: f64 = f64(iz) * CHUNK_CELL_M;
+            if (ix == CHUNK_N - 1) { wx = wx - 0.0000001; }
+            if (iz == CHUNK_N - 1) { wz = wz - 0.0000001; }
+            let got: f64 = chunk_height_at(cs, wx, wz);
+            let want: f64 = f64(ref_h_cm(ix, iz, seed)) / 100.0;
+            let d: f64 = got - want;
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > 0.0005) { latt_bad = latt_bad + 1; }
+            ix++;
+        }
+        iz++;
+    }
+    eqi(latt_bad, 0, "the sampler reproduces every lattice sample exactly");
+
+    // interior points: bilinear-correct against the reference, over 4 chunks
+    let interior_bad: i32 = 0;
+    let worst: f64 = 0.0;
+    let k: i32 = 0;
+    while (k < 400) {
+        let wx: f64 = -32.0 + f64(k % 20) * 3.37 + 0.11;
+        let wz: f64 = -32.0 + f64(k / 20) * 3.19 + 0.07;
+        let got: f64 = chunk_height_at(cs, wx, wz);
+        let want: f64 = ref_height_at(wx, wz, seed);
+        let d: f64 = got - want;
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > worst) { worst = d; }
+        if (d > 0.0000001) { interior_bad = interior_bad + 1; }
+        k++;
+    }
+    eqi(interior_bad, 0, "400 interior points are bilinear-correct across 4 chunks");
+    print(`   worst bilinear error over 400 samples : ${f3(worst * 1000.0)} mm`);
+
+    // C0 across a chunk seam: the limit from the left equals the value at the
+    // seam, because both chunks carry the same shared lattice column.
+    let seam_l: f64 = chunk_height_at(cs, 31.9999999, 7.3);
+    let seam_r: f64 = chunk_height_at(cs, 32.0000001, 7.3);
+    nearf(seam_l, seam_r, 0.001, "no seam in x: the height is continuous across a chunk edge");
+    let seamz_l: f64 = chunk_height_at(cs, 7.3, 63.9999999);
+    let seamz_r: f64 = chunk_height_at(cs, 7.3, 64.0000001);
+    nearf(seamz_l, seamz_r, 0.001, "no seam in z either");
+
+    // negative space
+    let nwant: f64 = ref_height_at(-17.3, -41.9, seed);
+    nearf(chunk_height_at(cs, -17.3, -41.9), nwant, 0.0000001,
+          "negative world coordinates sample the right chunk and cell");
+
+    // ---- normals -------------------------------------------------------
+    let nrm: array<f64> = [0.0, 0.0, 0.0];
+    let unit_bad: i32 = 0;
+    let tan_bad: i32 = 0;
+    let up_bad: i32 = 0;
+    let grad_bad: i32 = 0;
+    // Sample points sit strictly INSIDE a cell (fractional cell coordinate in
+    // [0.28, 0.72]).  That is not cherry-picking, it is the definition: a
+    // bilinear heightfield is C0 but not C1, so its gradient is genuinely
+    // discontinuous ON a cell edge and a central difference across one is not a
+    // gradient of anything.  The seam behaviour is checked separately, above,
+    // as CONTINUITY OF HEIGHT — which is the property that actually matters.
+    k = 0;
+    while (k < 200) {
+        let cellx: i32 = k % 10;
+        let cellz: i32 = k / 10;
+        let fx: f64 = 0.28 + f64(k % 7) * 0.073;
+        let fz: f64 = 0.28 + f64(k % 5) * 0.105;
+        let wx: f64 = (f64(cellx) + fx) * CHUNK_CELL_M;
+        let wz: f64 = (f64(cellz) + fz) * CHUNK_CELL_M;
+        chunk_normal_at(cs, wx, wz, nrm);
+        let nx: f64 = nrm[0];
+        let ny: f64 = nrm[1];
+        let nz: f64 = nrm[2];
+
+        // PROPERTY 1: unit length
+        let len: f64 = __sqrt(nx * nx + ny * ny + nz * nz);
+        if (len < 0.999999 || len > 1.000001) { unit_bad = unit_bad + 1; }
+        // PROPERTY 2: points up out of a heightfield
+        if (ny <= 0.0) { up_bad = up_bad + 1; }
+
+        // PROPERTY 3: both surface tangents are orthogonal to it.  The tangents
+        // come from a CENTRAL DIFFERENCE of chunk_height_at inside one cell —
+        // an independent path through the code from the analytic gradient the
+        // normal uses, so agreement is evidence, not tautology.
+        let e: f64 = 0.05;
+        let hx1: f64 = chunk_height_at(cs, wx + e, wz);
+        let hx0: f64 = chunk_height_at(cs, wx - e, wz);
+        let hz1: f64 = chunk_height_at(cs, wx, wz + e);
+        let hz0: f64 = chunk_height_at(cs, wx, wz - e);
+        let dhdx: f64 = (hx1 - hx0) / (2.0 * e);
+        let dhdz: f64 = (hz1 - hz0) / (2.0 * e);
+        let dot_x: f64 = nx * 1.0 + ny * dhdx;
+        let dot_z: f64 = nz * 1.0 + ny * dhdz;
+        if (dot_x > 0.000001 || dot_x < -0.000001) { tan_bad = tan_bad + 1; }
+        if (dot_z > 0.000001 || dot_z < -0.000001) { tan_bad = tan_bad + 1; }
+
+        // PROPERTY 4: the normal's slope IS the reference field's slope
+        let rx1: f64 = ref_height_at(wx + e, wz, seed);
+        let rx0: f64 = ref_height_at(wx - e, wz, seed);
+        let rdx: f64 = (rx1 - rx0) / (2.0 * e);
+        let want_nx: f64 = 0.0 - rdx * ny;
+        let dd: f64 = nx - want_nx;
+        if (dd < 0.0) { dd = 0.0 - dd; }
+        if (dd > 0.000001) { grad_bad = grad_bad + 1; }
+        k++;
+    }
+    eqi(unit_bad, 0, "200 normals are unit length");
+    eqi(up_bad, 0, "200 normals point up out of the heightfield");
+    eqi(tan_bad, 0, "both surface tangents are orthogonal to the normal at 200 points");
+    eqi(grad_bad, 0, "the normal encodes the reference field's own gradient");
+
+    // a flat region has a flat normal — build one with edits, then undo it
+    let s2: i32 = chunk_get(cs, 5, 5);
+    let si: i32 = 0;
+    while (si < CHUNK_SAMPLES) { chunk_set_edit(cs, 5, 5, si, 5000); si++; }
+    chunk_normal_at(cs, 5.0 * 32.0 + 13.7, 5.0 * 32.0 + 21.3, nrm);
+    nearf(nrm[0], 0.0, 0.0000001, "a flat chunk has nx == 0");
+    nearf(nrm[1], 1.0, 0.0000001, "a flat chunk has ny == 1");
+    nearf(nrm[2], 0.0, 0.0000001, "a flat chunk has nz == 0");
+    nearf(chunk_height_at(cs, 5.0 * 32.0 + 13.7, 5.0 * 32.0 + 21.3), 50.0, 0.0000001,
+          "a flat chunk samples flat everywhere");
+    chunk_clear_edits(cs);
+}
+
+// ===========================================================================
+// 4. THE EDIT OVERLAY — sparse, never baked, survives eviction
+// ===========================================================================
+fn test_edits() {
+    print("-- 4. the sparse edit overlay");
+    let seed: i32 = 99;
+    let cs: object = new_ref_store(16, 1024, seed);
+    let slot: i32 = chunk_get(cs, 2, -3);
+    let si: i32 = chunk_sample_index(4, 6);
+    let gen: i32 = chunk_height_gen(cs, slot, si);
+
+    eqi(chunk_edit_get(cs, 2, -3, si), EDIT_NONE, "no edit before one is made");
+    eqi(chunk_edit_count(cs), 0, "the overlay starts empty");
+    chunk_clear_dirty(cs, slot, CDIRTY_ALL);
+    eqi(chunk_dirty(cs, slot), 0, "dirty flags can be cleared");
+
+    eqi(chunk_set_edit(cs, 2, -3, si, gen + 250), 1, "an edit is accepted");
+    eqi(chunk_edit_count(cs), 1, "the overlay holds exactly one entry");
+    eqi(chunk_edit_get(cs, 2, -3, si), gen + 250, "the edit reads back");
+    eqi(chunk_height_cm(cs, slot, si), gen + 250, "the effective height is the edit");
+    eqi(chunk_height_gen(cs, slot, si), gen,
+        "THE GENERATED ARRAY IS UNTOUCHED — the edit was never baked in");
+    eqi(chunk_dirty(cs, slot) & CDIRTY_HEIGHT, CDIRTY_HEIGHT, "the edit dirtied the height");
+    eqi(chunk_dirty(cs, slot) & CDIRTY_MESH, CDIRTY_MESH, "the edit dirtied the mesh");
+    eqi(chunk_edits_in(cs, 2, -3), 1, "the chunk knows it carries one edit");
+    eqi(chunk_edits_in(cs, 2, -2), 0, "a neighbour carries none");
+
+    // the sampler sees it
+    let wx: f64 = 2.0 * 32.0 + 4.0 * 4.0;
+    let wz: f64 = -3.0 * 32.0 + 6.0 * 4.0;
+    nearf(chunk_height_at(cs, wx, wz), f64(gen + 250) / 100.0, 0.0000001,
+          "chunk_height_at returns the edited height at that lattice point");
+
+    // an update replaces rather than inserts
+    eqi(chunk_set_edit(cs, 2, -3, si, gen + 500), 1, "an edit can be updated");
+    eqi(chunk_edit_count(cs), 1, "an update does not add an entry");
+    eqi(chunk_edit_get(cs, 2, -3, si), gen + 500, "the update took");
+
+    // clearing reverts to the generated height
+    eqi(chunk_clear_edit(cs, 2, -3, si), 1, "an edit can be cleared");
+    eqi(chunk_edit_count(cs), 0, "the overlay is empty again");
+    eqi(chunk_height_cm(cs, slot, si), gen, "the sample reverted to the generated height");
+    eqi(chunk_clear_edit(cs, 2, -3, si), 0, "clearing twice is a no-op, not a corruption");
+
+    // clamping
+    chunk_set_edit(cs, 2, -3, 0, -500);
+    eqi(chunk_edit_get(cs, 2, -3, 0), 0, "a negative edit clamps to 0 cm");
+    chunk_set_edit(cs, 2, -3, 0, 999999);
+    eqi(chunk_edit_get(cs, 2, -3, 0), CHUNK_H_MAX_CM, "an over-range edit clamps to the u16 ceiling");
+    eqi(chunk_set_edit(cs, 2, -3, CHUNK_SAMPLES, 100), 0, "an out-of-range sample index is refused");
+    eqi(chunk_set_edit(cs, 2, -3, -1, 100), 0, "a negative sample index is refused");
+    chunk_clear_edit(cs, 2, -3, 0);
+
+    // 300 DISTINCT edits over 4 chunks (75 samples each), then eviction, reload
+    let made: i32 = 0;
+    let k: i32 = 0;
+    while (k < 300) {
+        let c: i32 = k / 75;
+        let cx: i32 = c % 2;
+        let cz: i32 = c / 2;
+        let s: i32 = k % 75;
+        made = made + chunk_set_edit(cs, cx, cz, s, 4321 + k);
+        k++;
+    }
+    eqi(made, 300, "300 distinct edits over 4 chunks were all accepted");
+    eqi(chunk_edit_count(cs), 300, "the overlay holds all 300");
+
+    let s00: i32 = chunk_get(cs, 0, 0);
+    let e00: i32 = chunk_edits_in(cs, 0, 0);
+    tru(e00 > 0 ? 1 : 0, "chunk (0,0) carries edits");
+    let probe_si: i32 = 33;
+    let before: i32 = chunk_height_cm(cs, s00, probe_si);
+
+    // EVICT the chunk. The edits live in the store-wide overlay, keyed by chunk
+    // coordinates, so they must survive — that is the difference between an
+    // overlay and a baked array.
+    eqi(chunk_evict(cs, 0, 0), 1, "chunk (0,0) evicted");
+    eqi(chunk_find(cs, 0, 0), SLOT_NONE, "it really is gone");
+    eqi(chunk_edit_count(cs), 300, "eviction did NOT drop a single edit");
+    let s00b: i32 = chunk_get(cs, 0, 0);
+    eqi(chunk_edits_in(cs, 0, 0), e00, "the reloaded chunk recovered its edit count");
+    eqi(chunk_height_cm(cs, s00b, probe_si), before,
+        "the reloaded chunk reads the same edited height");
+
+    // a cleared overlay reverts everything
+    eqi(chunk_clear_edits(cs), 300, "clear_edits reports what it dropped");
+    eqi(chunk_edit_count(cs), 0, "the overlay is empty");
+    eqi(chunk_edits_in(cs, 0, 0), 0, "the resident chunk's edit count was rebuilt");
+}
+
+// ===========================================================================
+// 5. A FULL OVERLAY REFUSES — it never corrupts and never silently drops
+// ===========================================================================
+fn test_edit_overflow() {
+    print("-- 5. a full overlay refuses, counts, and stays readable");
+    let cs: object = new_ref_store(8, 16, 5);
+    eqi(chunk_edit_cap(cs), 16, "the overlay cap is fixed at startup");
+    let accepted: i32 = 0;
+    let refused: i32 = 0;
+    let k: i32 = 0;
+    while (k < 40) {
+        let r: i32 = chunk_set_edit(cs, 0, 0, k % CHUNK_SAMPLES, 1000 + k);
+        if (r == 1) { accepted = accepted + 1; } else { refused = refused + 1; }
+        k++;
+    }
+    tru(accepted > 0 ? 1 : 0, "some edits were accepted");
+    tru(refused > 0 ? 1 : 0, "the rest were REFUSED, not silently dropped");
+    eqi(chunk_edit_count(cs), accepted, "the count matches what was accepted");
+    tru(chunk_edit_count(cs) <= chunk_edit_cap(cs) ? 1 : 0, "the overlay never exceeds its cap");
+    tru(chunk_edit_full_count(cs) == refused ? 1 : 0, "every refusal is counted");
+    // and the accepted ones are all still exactly readable
+    let bad: i32 = 0;
+    k = 0;
+    while (k < 40) {
+        let v: i32 = chunk_edit_get(cs, 0, 0, k % CHUNK_SAMPLES);
+        if (v != EDIT_NONE && v < 1000) { bad = bad + 1; }
+        k++;
+    }
+    eqi(bad, 0, "nothing in the full overlay was corrupted");
+}
+
+// ===========================================================================
+// 5c. HASH-TABLE STRESS — both tables delete by backward shift, not tombstones
+// ===========================================================================
+// Neither the residency table nor the overlay uses tombstones: a deletion pulls
+// the following run back over the hole.  That is the one piece of clever code in
+// the module, it is wrong in a way that only shows up after thousands of mixed
+// insert/delete operations, and a session streams chunks for hours.  So: churn
+// both tables hard and check the invariants after every operation.
+fn test_table_stress() {
+    print("-- 5c. table churn: 2 000 residency ops and 1 500 overlay ops");
+    let seed: i32 = 606;
+    let cs: object = new_ref_store(16, 512, seed);
+
+    // --- residency ------------------------------------------------------
+    let wrong_chunk: i32 = 0;
+    let overcap: i32 = 0;
+    let countmismatch: i32 = 0;
+    let k: i32 = 0;
+    while (k < 2000) {
+        let cx: i32 = i32(xhash3(k, 1, 3, seed) % 13) - 6;
+        let cz: i32 = i32(xhash3(k, 2, 4, seed) % 13) - 6;
+        if (k % 3 == 2) { chunk_evict(cs, cx, cz); }
+        else { chunk_get(cs, cx, cz); }
+
+        if (chunk_resident(cs) > chunk_cap(cs)) { overcap = overcap + 1; }
+        // every findable chunk must hold the terrain of the coordinates it
+        // claims — a corrupted probe chain shows up here as the wrong heights
+        let found: i32 = 0;
+        let qz: i32 = -6;
+        while (qz <= 6) {
+            let qx: i32 = -6;
+            while (qx <= 6) {
+                let s: i32 = chunk_find(cs, qx, qz);
+                if (s >= 0) {
+                    found = found + 1;
+                    if (chunk_height_gen(cs, s, 0) != ref_h_cm(qx * CHUNK_CELLS, qz * CHUNK_CELLS, seed)) {
+                        wrong_chunk = wrong_chunk + 1;
+                    }
+                }
+                qx++;
+            }
+            qz++;
+        }
+        if (found != chunk_resident(cs)) { countmismatch = countmismatch + 1; }
+        k++;
+    }
+    eqi(wrong_chunk, 0, "2 000 mixed get/evict ops: every found chunk holds its OWN terrain");
+    eqi(overcap, 0, "and the cap was never exceeded");
+    eqi(countmismatch, 0, "and the table's contents always matched the resident count");
+
+    // --- overlay --------------------------------------------------------
+    let cs2: object = new_ref_store(4, 512, seed);
+    let lost: i32 = 0;
+    let ghost: i32 = 0;
+    let live: array<i32> = [];
+    let i: i32 = 0;
+    while (i < 300) { live.push(0); i++; }
+    k = 0;
+    while (k < 1500) {
+        let idx: i32 = i32(xhash3(k, 9, 11, seed) % 300);
+        let cx: i32 = idx / 81;
+        let si: i32 = idx % 81;
+        if (live[idx] == 1) {
+            chunk_clear_edit(cs2, cx, 0, si);
+            live[idx] = 0;
+        } else {
+            if (chunk_set_edit(cs2, cx, 0, si, 5000 + idx) == 1) { live[idx] = 1; }
+        }
+        k++;
+    }
+    // every edit that should be live is findable with the right value, and
+    // nothing that was deleted is still there
+    i = 0;
+    while (i < 300) {
+        let cx: i32 = i / 81;
+        let si: i32 = i % 81;
+        let got: i32 = chunk_edit_get(cs2, cx, 0, si);
+        if (live[i] == 1) {
+            if (got != 5000 + i) { lost = lost + 1; }
+        } else {
+            if (got != EDIT_NONE) { ghost = ghost + 1; }
+        }
+        i++;
+    }
+    eqi(lost, 0, "1 500 overlay insert/delete ops: no live edit was lost or corrupted");
+    eqi(ghost, 0, "and no deleted edit came back from the dead");
+    let expect: i32 = 0;
+    i = 0;
+    while (i < 300) { expect = expect + live[i]; i++; }
+    eqi(chunk_edit_count(cs2), expect, "the overlay's count matches the model exactly");
+}
+
+// ===========================================================================
+// 5b. THE REST OF THE SURFACE — defaults, counters, light bake, dirty bits
+// ===========================================================================
+// Every exported function is exercised somewhere in this probe. An export that
+// nothing calls is an export nobody has checked.
+fn test_surface() {
+    print("-- 5b. defaults, counters, the light bake, dirty bits");
+    let d: object = chunk_store_new();
+    eqi(chunk_cap(d), 64, "chunk_store_new takes its cap from config (g_CHUNK_CACHE)");
+    eqi(chunk_edit_cap(d), 4096, "and its edit cap from CHUNK_EDIT_CAP_DEFAULT");
+    eqi(chunk_seed(d), 1337, "and its seed from config (g_WORLD_SEED_DEFAULT)");
+    eqi(chunk_resident(d), 0, "a fresh store holds nothing");
+
+    let cs: object = new_ref_store(8, 64, 3);
+    let s0: i32 = chunk_get(cs, 0, 0);
+    eqi(chunk_miss_count(cs), 1, "the first get is a miss");
+    eqi(chunk_hit_count(cs), 0, "and not a hit");
+    chunk_get(cs, 0, 0);
+    chunk_get(cs, 0, 0);
+    eqi(chunk_hit_count(cs), 2, "two more gets are hits");
+    eqi(chunk_load_count(cs), 1, "and only one generation happened");
+
+    // the light bake writes back, and dirties the mesh but not the height
+    chunk_clear_dirty(cs, s0, CDIRTY_ALL);
+    let before: i32 = chunk_light(cs, s0, 12);
+    eqi(chunk_set_light(cs, s0, 12, 200), 200, "set_light returns the stored value");
+    eqi(chunk_light(cs, s0, 12), 200, "the baked light reads back");
+    tru(chunk_light(cs, s0, 13) != 200 || before == 200 ? 1 : 0, "it wrote ONE sample, not the row");
+    eqi(chunk_set_light(cs, s0, 13, 999), 255, "an over-range light clamps to 255");
+    eqi(chunk_set_light(cs, s0, 14, -5), 0, "a negative light clamps to 0");
+    eqi(chunk_dirty(cs, s0) & CDIRTY_LIGHT, CDIRTY_LIGHT, "the light bake dirtied the light");
+    eqi(chunk_dirty(cs, s0) & CDIRTY_MESH, CDIRTY_MESH, "and the mesh");
+    eqi(chunk_dirty(cs, s0) & CDIRTY_HEIGHT, 0, "but NOT the height — the bits are independent");
+    eqi(chunk_mark_dirty(cs, s0, CDIRTY_HEIGHT) & CDIRTY_HEIGHT, CDIRTY_HEIGHT, "mark_dirty sets a bit");
+    eqi(chunk_clear_dirty(cs, s0, CDIRTY_MESH) & CDIRTY_MESH, 0, "clear_dirty clears one bit");
+    eqi(chunk_dirty(cs, s0) & CDIRTY_LIGHT, CDIRTY_LIGHT, "and leaves the others alone");
+
+    // biome bytes come back as the source wrote them
+    eqi(chunk_biome(cs, s0, 40), ref_biome(4, 4), "the biome byte reads back");
+
+    // evict_lru and pin/unpin
+    chunk_get(cs, 1, 0);
+    chunk_get(cs, 2, 0);
+    chunk_pin(cs, 0, 0, 1);
+    let ev: i32 = chunk_evict_lru(cs);
+    tru(ev >= 0 ? 1 : 0, "evict_lru evicted something");
+    tru(chunk_find(cs, 0, 0) >= 0 ? 1 : 0, "and it was not the pinned chunk");
+    eqi(chunk_pin(cs, 77, 77, 1), 0, "pinning an absent chunk is a no-op, not a crash");
+    chunk_pin(cs, 0, 0, 0);
+    eqi(chunk_pinned(cs, chunk_find(cs, 0, 0)), 0, "a chunk can be unpinned");
+}
+
+// ===========================================================================
+// 6. SAVE / LOAD ROUND TRIP
+// ===========================================================================
+fn test_save_load() {
+    print("-- 6. the edit overlay round-trips through save/load");
+    let cs: object = new_ref_store(32, 1024, 4242);
+    let N: i32 = 200;
+    let k: i32 = 0;
+    while (k < N) {
+        let cx: i32 = (k % 7) - 3;
+        let cz: i32 = ((k / 7) % 7) - 3;
+        let si: i32 = (k * 13) % CHUNK_SAMPLES;
+        chunk_set_edit(cs, cx, cz, si, 2000 + k * 3);
+        k++;
+    }
+    let n0: i32 = chunk_edit_count(cs);
+    tru(n0 > 150 ? 1 : 0, "the save fixture holds a substantial number of edits");
+    eqi(chunk_edits_bytes(cs), CHUNK_SAVE_HDR_B + n0 * CHUNK_SAVE_REC_B,
+        "the reported blob size is header + 16 B per edit");
+
+    let blob: buffer = buffer(chunk_edits_bytes(cs));
+    let wrote: i32 = chunk_edits_save(cs, blob);
+    eqi(wrote, chunk_edits_bytes(cs), "save wrote exactly the reported number of bytes");
+
+    let small: buffer = buffer(CHUNK_SAVE_HDR_B);
+    eqi(chunk_edits_save(cs, small), -1, "save refuses a buffer that is too small");
+
+    // wipe, reload, and compare the SET of edits — the format promises the set,
+    // not a byte image, because the table order is an implementation detail.
+    chunk_clear_edits(cs);
+    eqi(chunk_edit_count(cs), 0, "the overlay was wiped before the reload");
+    let loaded: i32 = chunk_edits_load(cs, blob);
+    eqi(loaded, n0, "load reports the same number of edits");
+    eqi(chunk_edit_count(cs), n0, "the overlay holds the same number of edits");
+
+    let mismatch: i32 = 0;
+    k = 0;
+    while (k < N) {
+        let cx: i32 = (k % 7) - 3;
+        let cz: i32 = ((k / 7) % 7) - 3;
+        let si: i32 = (k * 13) % CHUNK_SAMPLES;
+        if (chunk_edit_get(cs, cx, cz, si) == EDIT_NONE) { mismatch = mismatch + 1; }
+        k++;
+    }
+    eqi(mismatch, 0, "every edit made survives the round trip");
+
+    // and their VALUES survive: the last write to a (chunk, sample) wins, both
+    // before and after, so a straight comparison against a second store works.
+    let cs2: object = new_ref_store(32, 1024, 4242);
+    chunk_edits_load(cs2, blob);
+    let vbad: i32 = 0;
+    k = 0;
+    while (k < N) {
+        let cx: i32 = (k % 7) - 3;
+        let cz: i32 = ((k / 7) % 7) - 3;
+        let si: i32 = (k * 13) % CHUNK_SAMPLES;
+        if (chunk_edit_get(cs2, cx, cz, si) != chunk_edit_get(cs, cx, cz, si)) { vbad = vbad + 1; }
+        k++;
+    }
+    eqi(vbad, 0, "a second store loads byte-identical values from the same blob");
+
+    // the reloaded edits are visible through the sampler, in a chunk that was
+    // never resident when the blob was written
+    let slot: i32 = chunk_get(cs2, -3, -3);
+    tru(chunk_edits_in(cs2, -3, -3) > 0 ? 1 : 0,
+        "a chunk loaded AFTER the blob picks up its edits");
+
+    // corrupt headers are rejected, never half-loaded
+    let bad_magic: buffer = buffer(64);
+    ptr_write_i32(ptr_offset(buffer_ptr(bad_magic), 0, 1), 12345);
+    eqi(chunk_edits_load(cs2, bad_magic), -1, "a bad magic is rejected");
+    let tiny: buffer = buffer(4);
+    eqi(chunk_edits_load(cs2, tiny), -1, "a truncated blob is rejected");
+    let trunc: buffer = buffer(CHUNK_SAVE_HDR_B + 8);
+    let tp: ptr = buffer_ptr(trunc);
+    ptr_write_i32(ptr_offset(tp, 0, 1), ptr_read_i32(ptr_offset(buffer_ptr(blob), 0, 1)));
+    ptr_write_i32(ptr_offset(tp, 4, 1), ptr_read_i32(ptr_offset(buffer_ptr(blob), 4, 1)));
+    ptr_write_i32(ptr_offset(tp, 8, 1), 99);
+    eqi(chunk_edits_load(cs2, trunc), -1, "a blob whose count exceeds its bytes is rejected");
+}
+
+// ===========================================================================
+// 7. LRU AND PINS
+// ===========================================================================
+fn test_lru_and_pins() {
+    print("-- 7. LRU cap, and the render ring is never evicted");
+    // --- plain LRU order -------------------------------------------------
+    let cs: object = new_ref_store(4, 64, 11);
+    chunk_get(cs, 0, 0);
+    chunk_get(cs, 1, 0);
+    chunk_get(cs, 2, 0);
+    chunk_get(cs, 3, 0);
+    eqi(chunk_resident(cs), 4, "the cache filled to its cap");
+    chunk_get(cs, 0, 0);                       // touch (0,0) so (1,0) is oldest
+    chunk_get(cs, 4, 0);                       // forces one eviction
+    eqi(chunk_resident(cs), 4, "the cache never exceeds its cap");
+    tru(chunk_find(cs, 1, 0) == SLOT_NONE ? 1 : 0, "the LEAST recently used chunk was evicted");
+    tru(chunk_find(cs, 0, 0) >= 0 ? 1 : 0, "the recently touched chunk survived");
+    tru(chunk_find(cs, 4, 0) >= 0 ? 1 : 0, "the new chunk is resident");
+    eqi(chunk_evict_count(cs), 1, "exactly one eviction happened");
+
+    // --- the cap holds under a long thrash -------------------------------
+    let over: i32 = 0;
+    let k: i32 = 0;
+    while (k < 500) {
+        chunk_get(cs, k % 37, k / 37);
+        if (chunk_resident(cs) > chunk_cap(cs)) { over = over + 1; }
+        k++;
+    }
+    eqi(over, 0, "500 loads through a 4-slot cache never exceeded the cap");
+
+    // --- the render ring is untouchable ----------------------------------
+    let rs: object = new_ref_store(40, 64, 12);
+    let pinned: i32 = chunk_pin_ring(rs, 10, -10, 2);
+    eqi(pinned, 25, "a radius-2 ring is 25 chunks, all resident and pinned");
+    eqi(chunk_resident(rs), 25, "the ring is exactly the resident set");
+
+    // stream 100 chunks past it; not one ring member may be evicted
+    let lost: i32 = 0;
+    let overcap: i32 = 0;
+    k = 0;
+    while (k < 100) {
+        chunk_get(rs, 100 + (k % 50), 200 + (k / 50));
+        let dz: i32 = -2;
+        while (dz <= 2) {
+            let dx: i32 = -2;
+            while (dx <= 2) {
+                if (chunk_find(rs, 10 + dx, -10 + dz) < 0) { lost = lost + 1; }
+                dx++;
+            }
+            dz++;
+        }
+        if (chunk_resident(rs) > chunk_cap(rs)) { overcap = overcap + 1; }
+        k++;
+    }
+    eqi(lost, 0, "100 streaming loads evicted ZERO chunks from the render ring");
+    eqi(overcap, 0, "and never exceeded the cap while doing it");
+
+    // an explicit evict of a pinned chunk is refused, loudly
+    let r0: i32 = chunk_refused_count(rs);
+    eqi(chunk_evict(rs, 10, -10), -1, "chunk_evict refuses a pinned chunk");
+    eqi(chunk_refused_count(rs), r0 + 1, "the refusal is counted");
+    tru(chunk_find(rs, 10, -10) >= 0 ? 1 : 0, "the pinned chunk is still there");
+
+    // --- a cap smaller than the ring: refuse, do not corrupt -------------
+    let ts: object = new_ref_store(25, 64, 13);
+    eqi(chunk_pin_ring(ts, 0, 0, 2), 25, "a 25-slot store holds exactly the ring");
+    let before: i32 = chunk_resident(ts);
+    eqi(chunk_get(ts, 99, 99), SLOT_NONE, "a 26th chunk is REFUSED when every slot is pinned");
+    tru(chunk_refused_count(ts) > 0 ? 1 : 0, "the refusal is counted");
+    eqi(chunk_resident(ts), before, "the refusal changed nothing");
+    let ring_ok: i32 = 1;
+    let dz2: i32 = -2;
+    while (dz2 <= 2) {
+        let dx2: i32 = -2;
+        while (dx2 <= 2) {
+            if (chunk_find(ts, dx2, dz2) < 0) { ring_ok = 0; }
+            dx2++;
+        }
+        dz2++;
+    }
+    eqi(ring_ok, 1, "the ring is intact after the refusal");
+    // a new ring releases the old pins
+    chunk_pin_ring(ts, 40, 40, 2);
+    eqi(chunk_resident(ts), 25, "re-pinning a new ring recycled the old slots");
+    tru(chunk_find(ts, 40, 40) >= 0 ? 1 : 0, "the new ring is resident");
+
+    // --- eviction is a pure cache operation: answers cannot change -------
+    eqi(chunk_pinned(ts, chunk_find(ts, 40, 40)), 1, "a ring member reports itself pinned");
+    eqi(chunk_drop_all(ts), 25, "drop_all drops the whole ring, pins included");
+    eqi(chunk_resident(ts), 0, "nothing is resident afterwards");
+}
+
+// ===========================================================================
+// 8. DETERMINISM — the cache cannot change an answer
+// ===========================================================================
+fn test_determinism() {
+    print("-- 8. cache size and eviction order cannot change an answer");
+    let seed: i32 = 777;
+    let small: object = new_ref_store(2, 64, seed);      // thrashes constantly
+    let big: object = new_ref_store(256, 64, seed);      // never evicts
+    let diff: i32 = 0;
+    let nrm_diff: i32 = 0;
+    let na: array<f64> = [0.0, 0.0, 0.0];
+    let nb: array<f64> = [0.0, 0.0, 0.0];
+    // The query order cycles between three regions 1 km apart, so the 2-slot
+    // store evicts on very nearly every call while the 256-slot store never
+    // does.  Same points, opposite cache behaviour, identical answers required.
+    let k: i32 = 0;
+    while (k < 600) {
+        let wx: f64 = f64(k) * 1.7 - 300.0 + f64(k % 3) * 1000.0;
+        let wz: f64 = f64(k) * 0.9 - 200.0;
+        let a: f64 = chunk_height_at(small, wx, wz);
+        let b: f64 = chunk_height_at(big, wx, wz);
+        if (a != b) { diff = diff + 1; }
+        chunk_normal_at(small, wx, wz, na);
+        chunk_normal_at(big, wx, wz, nb);
+        if (na[0] != nb[0] || na[1] != nb[1] || na[2] != nb[2]) { nrm_diff = nrm_diff + 1; }
+        k++;
+    }
+    eqi(diff, 0, "600 heights are BIT-identical through a 2-slot and a 256-slot cache");
+    eqi(nrm_diff, 0, "600 normals are bit-identical too");
+    tru(chunk_evict_count(small) > 300 ? 1 : 0, "the 2-slot store really did thrash");
+    eqi(chunk_evict_count(big), 0, "the 256-slot store never evicted");
+
+    // seed changes the world; it does not change the plumbing
+    let other: object = new_ref_store(64, 64, seed + 1);
+    let same: i32 = 0;
+    k = 0;
+    while (k < 200) {
+        let wx: f64 = f64(k) * 2.3;
+        if (chunk_height_at(other, wx, 5.0) == chunk_height_at(big, wx, 5.0)) { same = same + 1; }
+        k++;
+    }
+    tru(same < 20 ? 1 : 0, "a different seed produces a different world");
+
+    // re-seeding an existing store drops residency but keeps the player's work
+    let cs: object = new_ref_store(16, 64, seed);
+    chunk_get(cs, 0, 0);
+    chunk_set_edit(cs, 0, 0, 5, 12345);
+    chunk_set_seed(cs, seed + 5);
+    eqi(chunk_resident(cs), 0, "re-seeding drops every generated chunk");
+    eqi(chunk_edit_count(cs), 1, "re-seeding keeps the player's edits — they are not the generator's");
+    eqi(chunk_seed(cs), seed + 5, "the new seed took");
+}
+
+// ===========================================================================
+// 9. RSS FLAT OVER 10 000 FRAMES  (the task emphasis)
+// ===========================================================================
+// One "frame" is what the game does: pin the 5x5 render ring around the camera,
+// then query terrain (movement, raycasts, entity grounding) and occasionally
+// place an edit.  The camera walks so the ring genuinely streams chunks in and
+// out.  If anything in the store allocated per frame — a chunk object, a
+// temporary array, a string — RSS would climb over 10 000 of these.
+// One frame of the game's chunk work, `p_from` .. `p_to`.  Returned as a sum so
+// nothing can be optimized away.
+fn walk_frames(p_cs: object, p_from: i32, p_to: i32, p_nrm: array<f64>): f64 {
+    let cs: object = p_cs;
+    let nrm = p_nrm;
+    let acc: f64 = 0.0;
+    let f: i32 = p_from;
+    while (f < p_to) {
+        // a camera walking a long loop, ~0.12 m per frame
+        let camx: f64 = 140.0 + f64(f) * 0.12;
+        let camz: f64 = -90.0 + f64(f % 1200) * 0.11;
+        let ccx: i32 = floori(camx / CHUNK_M);
+        let ccz: i32 = floori(camz / CHUNK_M);
+        chunk_pin_ring(cs, ccx, ccz, 2);
+
+        // 16 terrain queries per frame: player, 4 capsule corners, 8 AI, tracers
+        let q: i32 = 0;
+        while (q < 16) {
+            acc = acc + chunk_height_at(cs, camx + f64(q) * 1.9 - 15.0, camz + f64(q) * 1.3 - 10.0);
+            q++;
+        }
+        chunk_normal_at(cs, camx, camz, nrm);
+        acc = acc + nrm[1];
+
+        // a build action every 64 frames and a demolition every 128, so the
+        // overlay CHURNS rather than only growing
+        if (f % 64 == 0) { chunk_set_edit(cs, ccx, ccz, f % CHUNK_SAMPLES, 4500); }
+        if (f % 128 == 0) { chunk_clear_edit(cs, ccx, ccz, f % CHUNK_SAMPLES); }
+        f++;
+    }
+    let out: f64 = acc;
+    return out;
+}
+
+fn test_rss_flat() {
+    print("-- 9. zero per-frame allocation: RSS over 10 000 frames");
+    let cs: object = new_ref_store(64, 4096, 31337);
+    let nrm: array<f64> = [0.0, 0.0, 0.0];
+
+    // Warm with 1 000 frames of the SAME loop, so the baseline is taken on a
+    // settled heap: first-touch page faults and the allocator's own arena
+    // growth are startup costs, not per-frame costs, and measuring them as
+    // growth would be measuring the wrong thing.
+    let acc: f64 = walk_frames(cs, 0, 1000, nrm);
+    let base_kb: i64 = rss_kb();
+    let base_edits: i32 = chunk_edit_count(cs);
+    let base_loads: i32 = chunk_load_count(cs);
+
+    acc = acc + walk_frames(cs, 1000, 4000, nrm);
+    let c1_kb: i64 = rss_kb();
+    acc = acc + walk_frames(cs, 4000, 7000, nrm);
+    let c2_kb: i64 = rss_kb();
+    acc = acc + walk_frames(cs, 7000, 11000, nrm);
+    let c3_kb: i64 = rss_kb();
+
+    let seg1: i64 = c1_kb - base_kb;
+    let seg2: i64 = c2_kb - c1_kb;
+    let seg3: i64 = c3_kb - c2_kb;
+    let total: i64 = c3_kb - base_kb;
+    let loads: i32 = chunk_load_count(cs) - base_loads;
+
+    print(`   RSS after 1 000 warm frames : ${base_kb} KB`);
+    print(`   after  4 000 frames         : ${c1_kb} KB   (segment +${seg1} KB)`);
+    print(`   after  7 000 frames         : ${c2_kb} KB   (segment +${seg2} KB)`);
+    print(`   after 11 000 frames         : ${c3_kb} KB   (segment +${seg3} KB, total +${total} KB)`);
+    print(`   chunk loads / evictions     : ${chunk_load_count(cs)} / ${chunk_evict_count(cs)}`);
+    print(`   height queries in the 10 000: ${10000 * 16}`);
+
+    // PROPERTY, not a magic number: RSS does not grow WITH THE FRAME COUNT.
+    // The per-segment deltas are what proves it — a store that allocated even
+    // 64 B per frame would add ~190 KB to EVERY 3 000-frame segment, and one
+    // 162 B chunk buffer per load would add ~20 KB to each.
+    //
+    // Whole-run growth is deliberately NOT the assertion. Measured alone (the
+    // same loop in a fresh process, `scratchpad/rss.hml`) this store is flat at
+    // 2 688 KB from frame 1 000 to frame 14 000, delta zero. Inside this probe
+    // the first segment sometimes shows +192 KB as the ALLOCATOR settles after
+    // the 3 MB of test fixtures the sections above built and dropped — that is
+    // the heap's history, not this store's behaviour, and asserting on it would
+    // be asserting on the order the probe's own sections run in.
+    tru(seg2 <= 64 ? 1 : 0, "frames 4 000-7 000 added <= 64 KB of RSS");
+    tru(seg3 <= 64 ? 1 : 0, "frames 7 000-11 000 added <= 64 KB of RSS");
+    tru(total <= 512 ? 1 : 0, "and the whole 10 000-frame run stayed inside 512 KB");
+    tru(loads > 200 ? 1 : 0, "the traversal really did stream chunks in (loads)");
+    tru(chunk_evict_count(cs) > 200 ? 1 : 0, "and really did evict them");
+    tru(chunk_resident(cs) <= chunk_cap(cs) ? 1 : 0, "residency still respects the cap at the end");
+    tru(chunk_sample_miss_count(cs) == 0 ? 1 : 0, "not one terrain query missed over 10 000 frames");
+    tru(acc != 0.0 ? 1 : 0, "the queries were not optimized away");
+    tru(chunk_edit_count(cs) >= base_edits ? 1 : 0, "the overlay survived the traversal");
+}
+
+// ===========================================================================
+// 10. THE MEMORY REPORT — a 15x15 loaded region
+// ===========================================================================
+// W3-2's first acceptance criterion is "<= 1.5 bytes per height sample (vs 16
+// for an array<i32>)".  It is reported here with the measured number, and the
+// honest answer is in the assertion text: 1.5 B/sample is not reachable while
+// heights are u16 centimetres, because a u16 IS 2 bytes.  What is asserted is
+// the property the criterion exists to protect — that the heightfield costs a
+// small multiple of its payload and is many times cheaper than the array<i32>
+// it replaced — measured in this same process, against a real array<i32>.
+fn test_memory_report() {
+    print("-- 10. memory report: a 15x15 loaded region (225 chunks)");
+    let R: i32 = 15;
+    let NC: i32 = R * R;
+    let samples: f64 = f64(NC) * f64(CHUNK_SAMPLES);
+
+    // The A/B is measured at 10x scale (ten 15x15 regions, and ten equivalent
+    // array<i32> sets).  RSS is a 4 KB-quantised instrument and the process
+    // heap already has freed space from the sections above, so a single 72 KB
+    // region measures as anything between 0 and 76 KB — the first draft of this
+    // probe measured "0 KB" and divided by it.  At 10x the signal is ~2 MB and
+    // the noise floor stops mattering.
+    let SETS: i32 = 10;
+    let all_samples: f64 = samples * f64(SETS);
+
+    let r0: i64 = rss_kb();
+    let stores: array = [];
+    let s: i32 = 0;
+    while (s < SETS) {
+        let st: object = new_ref_store(NC, 4096, 20260728 + s);
+        let cz: i32 = 0;
+        while (cz < R) {
+            let cx: i32 = 0;
+            while (cx < R) { chunk_get(st, cx - 7, cz - 7); cx++; }
+            cz++;
+        }
+        stores.push(st);
+        s++;
+    }
+    let r1: i64 = rss_kb();
+
+    // the same number of height samples as Hemlock `array<i32>`, in-process
+    let ref_chunks: array = [];
+    let c: i32 = 0;
+    while (c < NC * SETS) {
+        let a: array<i32> = [];
+        a.reserve(CHUNK_SAMPLES);
+        let i: i32 = 0;
+        while (i < CHUNK_SAMPLES) { a.push(4000 + i); i++; }
+        ref_chunks.push(a);
+        c++;
+    }
+    let r2: i64 = rss_kb();
+
+    let cs: object = stores[0];
+    eqi(chunk_resident(cs), NC, "all 225 chunks of the 15x15 region are resident");
+
+    let store_kb: f64 = f64(r1 - r0);
+    let arr_kb: f64 = f64(r2 - r1);
+    if (store_kb < 1.0) { store_kb = 1.0; }        // never divide by a zero delta
+    if (arr_kb < 1.0) { arr_kb = 1.0; }
+    let store_bps: f64 = store_kb * 1024.0 / all_samples;
+    let arr_bps: f64 = arr_kb * 1024.0 / all_samples;
+    let payload_bps: f64 = chunk_bytes_per_sample(cs);
+
+    // The exact component accounting.  A Hemlock `array` element is ~16 B
+    // (CLAUDE.md A6, measured 16.03), which is why only the PER-CHUNK tables
+    // are arrays and everything per-sample is a buffer.
+    let slot_tbl_b: f64 = f64(NC) * 8.0 * 16.0;          // 8 arrays x cap
+    let res_tbl_b: f64 = f64(chunk_table_entries(cs)) * 16.0;
+    let analytic_b: f64 = f64(chunk_height_bytes(cs)) + f64(chunk_attr_bytes(cs))
+                        + f64(chunk_overlay_bytes(cs)) + slot_tbl_b + res_tbl_b;
+
+    print(`   one region             : ${NC} chunks x ${CHUNK_SAMPLES} = ${i32(samples)} height samples`);
+    print(`   height arena  buffer   : ${chunk_height_bytes(cs)} B   (${f3(payload_bps)} B/sample — THE payload)`);
+    print(`   attr arena    buffer   : ${chunk_attr_bytes(cs)} B   (biome + baked light, 2.00 B/sample)`);
+    print(`   edit overlay  buffer   : ${chunk_overlay_bytes(cs)} B   (${chunk_edit_cap(cs)} slots x 12 B, ${chunk_edit_count(cs)} used)`);
+    print(`   per-chunk tables array : ${i32(slot_tbl_b)} B   (8 x cap x 16 B = 128 B/chunk)`);
+    print(`   residency hash  array  : ${i32(res_tbl_b)} B   (${chunk_table_entries(cs)} entries x 16 B)`);
+    print(`   analytic total         : ${i32(analytic_b)} B  -> ${f3(analytic_b / samples)} B/height-sample`);
+    print(`   measured over ${SETS} regions (${i32(all_samples)} samples):`);
+    print(`     WHOLE STORE          : ${i32(store_kb)} KB  -> ${f3(store_bps)} B/height-sample`);
+    print(`     array<i32> heights   : ${i32(arr_kb)} KB  -> ${f3(arr_bps)} B/height-sample`);
+    print(`     saving               : ${f3(arr_bps / store_bps)}x whole-store, ${f3(arr_bps / payload_bps)}x payload-to-payload`);
+    print(`   NOTE  the W3-2 criterion asks for <= 1.5 B/height sample. u16`);
+    print(`         centimetres are 2.00 B/sample BY CONSTRUCTION, so 1.5 is not`);
+    print(`         reachable while heights are the buffer(u16) the architecture`);
+    print(`         mandates. REPORTED AS NOT ACHIEVED rather than redefined.`);
+
+    // PROPERTIES that survive re-tuning:
+    nearf(payload_bps, 2.0, 0.0001, "the height payload is exactly 2.00 B/sample (u16 cm)");
+    tru(arr_bps > 8.0 ? 1 : 0, "an array<i32> really does cost > 8 B per height sample here");
+    tru(arr_bps / payload_bps >= 5.0 ? 1 : 0,
+        "the u16 arena is >= 5x cheaper per height sample than the array<i32> it replaced");
+    tru(store_bps < arr_bps ? 1 : 0,
+        "the WHOLE store — arenas, overlay, every table — still costs less per sample than an array<i32> of heights alone");
+    tru(analytic_b / samples < 12.0 ? 1 : 0, "the analytic whole-store cost is < 12 B per height sample");
+    nearf(analytic_b / (store_kb * 1024.0 / f64(SETS)), 1.0, 0.45,
+          "the analytic accounting agrees with the measured RSS within 45 % (RSS is 4 KB-quantised and the heap reuses freed space)");
+    eqi(chunk_height_bytes(cs), NC * CHUNK_H_STRIDE_B, "the height arena is cap * 162 B, no slack");
+    tru(ref_chunks.length == NC * SETS ? 1 : 0, "the array<i32> comparison set was really built");
+    tru(stores.length == SETS ? 1 : 0, "all ten regions were really loaded");
+
+    // the 15x15 region is still correct after all that
+    let slot: i32 = chunk_find(cs, 0, 0);
+    tru(slot >= 0 ? 1 : 0, "the origin chunk is still resident");
+    eqi(chunk_height_gen(cs, slot, 40), ref_h_cm(4, 4, 20260728),
+        "and still reads the reference height");
+}
+
+// ===========================================================================
+// 11. TIMING — RULE T: __clock CPU time, minimum of 7 batches
+// ===========================================================================
+// This box permanently shares ~17 of 24 cores with a llama-server, so every
+// bound below is a REGRESSION GUARD at ~2x the LOADED measurement, never a
+// certification of an idle machine.  Both numbers are in the assertion text.
+let TRIALS = 7;
+
+fn time_height_us(p_cs: object, p_reps: i32): f64 {
+    let cs: object = p_cs;
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let acc: f64 = 0.0;
+        let i: i32 = 0;
+        while (i < reps) {
+            acc = acc + chunk_height_at(cs, f64(i) * 0.031, f64(i) * 0.017);
+            i++;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        if (acc == 12345.6789) { print(""); }     // keep the loop alive
+        t++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn time_get_hit_us(p_cs: object, p_reps: i32): f64 {
+    let cs: object = p_cs;
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let i: i32 = 0;
+        let acc: i32 = 0;
+        while (i < reps) {
+            acc = acc + chunk_get(cs, i % 5, i / 5 % 5);
+            i++;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        if (acc == -777) { print(""); }
+        t++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn time_pin_ring_ms(p_cs: object, p_reps: i32): f64 {
+    let cs: object = p_cs;
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < TRIALS) {
+        let c0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < reps) { chunk_pin_ring(cs, 2, 2, 2); i++; }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0 / f64(reps);
+        if (t == 0 || ms < best) { best = ms; }
+        t++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn test_timing() {
+    print("-- 11. timing (RULE T: __clock CPU time, min of 7)");
+    let cs: object = new_ref_store(64, 4096, 5150);
+    // warm the cache over the sampled area
+    let w: i32 = 0;
+    while (w < 40) { chunk_get(cs, w % 8, w / 8); w++; }
+
+    let h_us: f64 = time_height_us(cs, 20000);
+    let g_us: f64 = time_get_hit_us(cs, 20000);
+    let p_ms: f64 = time_pin_ring_ms(cs, 2000);
+
+    // the same query with an edited chunk, to price the overlay probe
+    let si: i32 = 0;
+    while (si < CHUNK_SAMPLES) { chunk_set_edit(cs, 0, 0, si, 4200); si++; }
+    let he_us: f64 = time_height_us(cs, 20000);
+    chunk_clear_edits(cs);
+
+    print(`   chunk_height_at (cache hit)    : ${f3(h_us)} us/call`);
+    print(`   chunk_height_at (edited chunk) : ${f3(he_us)} us/call`);
+    print(`   chunk_get       (cache hit)    : ${f3(g_us)} us/call`);
+    print(`   chunk_pin_ring  (25 hits)      : ${f3(p_ms)} ms/frame`);
+    print(`   16 height queries + 1 ring pin : ${f3(h_us * 16.0 / 1000.0 + p_ms)} ms/frame`);
+
+    // Regression guards at ~2x the LOADED measurement (RULE T). This box is
+    // never idle — a llama-server holds ~17 of 24 cores — so there is no idle
+    // number to quote; what is quoted instead is the spread across five runs of
+    // this probe, which is +/-7 % (0.73 .. 0.78 us). That tightness is itself
+    // evidence that contention is not what these numbers are made of.
+    tru(h_us < 1.6 ? 1 : 0,
+        "chunk_height_at < 1.6 us/call (guard at ~2x the 0.73-0.78 us loaded measurement; no idle box exists)");
+    tru(g_us < 1.8 ? 1 : 0,
+        "chunk_get hit < 1.8 us/call (guard at ~2x the 0.80-0.89 us loaded measurement)");
+    tru(p_ms < 0.06 ? 1 : 0,
+        "chunk_pin_ring < 0.06 ms/frame (guard at ~2.5x the 0.021-0.023 ms loaded measurement)");
+    tru(h_us * 16.0 / 1000.0 + p_ms < 0.10 ? 1 : 0,
+        "a whole frame of chunk work < 0.10 ms — 0.6 % of the 16.67 ms budget (measured 0.033-0.035 ms)");
+    // A RATIO assertion, which survives machine load because both sides inflate
+    // together: the overlay probe must not dominate the unedited path.
+    tru(he_us < h_us * 4.0 ? 1 : 0,
+        "an edited chunk costs < 4x an unedited one (the overlay probe is not the price of terrain)");
+}
+
+// ===========================================================================
+fn main() {
+    print("== probe_chunk — W3-2 chunk storage ==");
+    test_shape();
+    test_no_source();
+    test_generate_and_sample();
+    test_edits();
+    test_edit_overflow();
+    test_surface();
+    test_table_stress();
+    test_save_load();
+    test_lru_and_pins();
+    test_determinism();
+    test_rss_flat();
+    test_memory_report();
+    test_timing();
+
+    print("");
+    if (g_n != EXPECTED_ASSERTS) {
+        print(`ASSERTION COUNT ${g_n}, EXPECTED ${EXPECTED_ASSERTS} — a block was skipped or deleted`);
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+    if (g_fail > 0) {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+    print(`PASS ${g_pass}/${g_n}`);
+}
+main();

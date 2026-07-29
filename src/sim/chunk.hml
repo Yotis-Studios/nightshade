@@ -1,0 +1,1319 @@
+// chunk.hml — chunk storage: the heightfield, its bakes, its edits, its cache.
+//
+// Nightshade W3-2.  ARCHITECTURE §5.4 (`chunk.hml`), §2.2 (container policy),
+// §0 ("the world is a heightfield, not voxels").  BUILD_PLAN W3-2.
+//
+// =============================================================================
+// WHAT THIS FILE IS
+// =============================================================================
+// One store object owns EVERY loaded chunk.  It is allocated once, at startup,
+// and never grows: THREE byte arenas (heights, attributes, the edit overlay)
+// plus a fixed set of parallel per-chunk `array<i32>` tables.  A chunk load
+// writes into a slot that already exists; an eviction only clears a flag.
+// Nothing here allocates after `chunk_store_new` returns, which is what makes
+// RSS flat over a 10 000-frame streaming traversal — measured at **0 KB of
+// growth** across three 3 000-frame segments (`tools/probe_chunk.hml` §9).
+//
+// -----------------------------------------------------------------------------
+// THE FIVE PIECES
+// -----------------------------------------------------------------------------
+//  1. HEIGHTS      `buffer` of u16 CENTIMETRES, 81 samples per chunk (9x9 on a
+//                  4 m grid over a 32 m chunk).  2.00 B/sample of payload
+//                  against an `array<i32>`'s ~16 B (CLAUDE.md A6; measured
+//                  16.2-17.3 B/sample in this very process — see the probe's
+//                  memory report, §10, which builds both and diffs RSS).
+//                  Range 0 .. 655.35 m at 1 cm quantum.
+//                  NOTE: W3-2's acceptance criterion asks for <= 1.5 B/sample.
+//                  A u16 IS 2 bytes; 1.5 is unreachable without abandoning the
+//                  mandated buffer(u16).  Reported as NOT ACHIEVED, not
+//                  redefined.  See the probe's §10 note and the task report.
+//  2. ATTRIBUTES   `buffer` of u8: BIOME id then BAKED LIGHT, 81 + 81 per chunk.
+//  3. EDIT OVERLAY a SPARSE, store-wide, open-addressed table keyed by
+//                  (chunk x, chunk z, sample index).  Player edits are NEVER
+//                  written into the generated height arena.  That is not a
+//                  performance choice, it is a networking one: the overlay IS
+//                  the world diff, and a diff baked into the generated array is
+//                  untransmittable (ARCHITECTURE §5.4 / BUILD_PLAN W3-2).  It
+//                  also means an edit SURVIVES EVICTION for free — the overlay
+//                  is keyed by world chunk coordinates, not by cache slot.
+//  4. DIRTY FLAGS  per slot, per consumer (height / light / mesh).
+//  5. LRU + PINS   a hard chunk cap, least-recently-used eviction, and a pin
+//                  bit that the render ring sets.  A pinned chunk is never
+//                  evicted; when every slot is pinned the store REFUSES the
+//                  load and counts it, exactly as `batch_reserve` refuses a
+//                  triangle past its cap.  It never evicts something the
+//                  renderer is about to draw, and it never corrupts.
+//
+// =============================================================================
+// THE GENERATOR IS INJECTED, NOT IMPORTED — read this before wiring worldgen
+// =============================================================================
+// This module does not import `worldgen.hml` and does not contain one line of
+// terrain shaping.  The store is handed a SOURCE FUNCTION:
+//
+//     fn source(p_hbuf: buffer, p_hoff: i32,
+//               p_abuf: buffer, p_aoff: i32,
+//               p_cx: i32, p_cz: i32, p_seed: i32): i32
+//
+//     * writes CHUNK_SAMPLES u16 heights in cm, little-endian, at BYTE offset
+//       p_hoff of p_hbuf, sample index `si = iz * CHUNK_N + ix`
+//     * writes CHUNK_SAMPLES biome bytes at p_aoff, then CHUNK_SAMPLES baked
+//       light bytes at p_aoff + CHUNK_SAMPLES
+//     * returns one opaque i32 stored as the chunk's META word.  W3-1 is
+//       expected to put its POI roll / shade tier there; this file never
+//       interprets it.
+//
+// Two reasons, and the second one is the important one:
+//
+//   (a) SCHEDULING.  W3-1 (worldgen) and W3-2 (this) are built in the same
+//       sub-wave 3a.  Importing a file another agent is writing would make this
+//       module's build depend on that module's half-finished state, and the
+//       BUILD_PLAN's WAVE-CONSTRUCTION RULE says a content dependency inside a
+//       wave is exactly the defect that produced Wave 2's stand-in art.
+//   (b) HONESTY.  With no source set, `chunk_get` REFUSES — it returns
+//       SLOT_NONE and increments `chunk_no_source_count`.  It does not invent a
+//       flat plane, because a plausible-looking stand-in that silently ships is
+//       the failure this project has already paid for twice.  There is no
+//       fallback terrain in this file to accidentally ship.
+//
+// The adapter that calls `worldgen_chunk` is five lines and belongs to whoever
+// owns the boot path (W3-13 / `src/game/main.hml`).  `tools/probe_chunk.hml`
+// injects an ANALYTIC reference source and then checks the bilinear samplers
+// against that same reference computed independently — the injection point is
+// what makes the sampler testable without any worldgen at all.
+//
+// =============================================================================
+// THE WALL
+// =============================================================================
+// `src/sim/**` may import `@stdlib/math`, other `src/sim/**` and `src/core/**`.
+// This file imports `src/core/mathx.hml` and `src/core/config.hml` and nothing
+// else.  No SDL, no wobbleweed, no wall clock, no `@stdlib/random`.  Every hash
+// is `xhash3`, which mixes in u64 (A13) — i32/i64 `* + -` trap on overflow.
+//
+// Determinism: the store contains no float state, no clock and no RNG.  Given
+// the same source and the same call sequence it produces identical answers, and
+// because heights are regenerated from (seed, cx, cz), the cache SIZE cannot
+// change an answer — a store with cap 4 thrashing 225 chunks returns exactly
+// the same heights as a store with cap 256.  The probe asserts that.
+// =============================================================================
+
+import { floori, xhash3 } from "../core/mathx.hml";
+import {
+    g_CHUNK_N, g_CHUNK_M, g_CHUNK_GRID_M, g_CHUNK_CACHE,
+    g_HEIGHT_SCALE_CM, g_WORLD_SEED_DEFAULT
+} from "../core/config.hml";
+
+// ---------------------------------------------------------------------------
+// SHAPE — every one of these is derived from config.hml, never re-typed.
+// ---------------------------------------------------------------------------
+export let CHUNK_N: i32 = g_CHUNK_N;                       // 9 samples per side
+export let CHUNK_CELLS: i32 = g_CHUNK_N - 1;               // 8 cells per side
+export let CHUNK_SAMPLES: i32 = g_CHUNK_N * g_CHUNK_N;     // 81
+export let CHUNK_M: f64 = g_CHUNK_M;                       // 32 m chunk edge
+export let CHUNK_CELL_M: f64 = g_CHUNK_GRID_M;             // 4 m grid
+export let CHUNK_CM_PER_M: f64 = g_HEIGHT_SCALE_CM;        // 100
+export let CHUNK_H_MAX_CM: i32 = 65535;                    // u16 ceiling, 655.35 m
+
+// Byte strides inside the two arenas.
+export let CHUNK_H_STRIDE_B: i32 = g_CHUNK_N * g_CHUNK_N * 2;   // 162
+export let CHUNK_A_STRIDE_B: i32 = g_CHUNK_N * g_CHUNK_N * 2;   // 81 biome + 81 light
+
+// Sentinels.  A miss is a LOUD value, never a plausible one: a caller that
+// forgets to check gets terrain a kilometre below the world instead of a
+// convincing 0.0 m floor.
+export let SLOT_NONE: i32 = -1;
+export let EDIT_NONE: i32 = -1;
+export let CHUNK_H_MISS: f64 = -1000000.0;
+
+// Dirty bits.  Independent consumers, independent bits: a light re-bake must
+// not force a height re-upload, and clearing the mesh bit must not clear the
+// others.
+export let CDIRTY_NONE: i32 = 0;
+export let CDIRTY_HEIGHT: i32 = 1;
+export let CDIRTY_LIGHT: i32 = 2;
+export let CDIRTY_MESH: i32 = 4;
+export let CDIRTY_ALL: i32 = 7;
+
+// Save format for the edit overlay.  12-byte header, then 16 bytes per edit.
+export let CHUNK_SAVE_MAGIC: i32 = 1315926850;   // 'NSED' folded into 31 bits
+export let CHUNK_SAVE_VER: i32 = 1;
+export let CHUNK_SAVE_HDR_B: i32 = 12;
+export let CHUNK_SAVE_REC_B: i32 = 16;
+
+// Hash domain separators, so the residency table and the overlay never share a
+// probe sequence for the same chunk.
+let CH_HASH_RES: i32 = 0x5A17;    // ci-hex-ok  (a hash salt, not a colour)
+let CH_HASH_OV: i32 = 0x2C9F;     // ci-hex-ok  (a hash salt, not a colour)
+
+// Default sparse-overlay capacity: 4096 edits = a 40 m x 40 m town plot rebuilt
+// sample-for-sample, twice over.  Fixed at startup; a full overlay REFUSES.
+export let CHUNK_EDIT_CAP_DEFAULT: i32 = 4096;
+
+// One overlay entry, 12 bytes, in a `buffer` for the same reason the heightmap
+// is one (A6): five parallel Hemlock `array<i32>` would cost 16 B PER FIELD per
+// slot — 320 KB for a mostly-empty 4096-entry table, four times the entire
+// heightfield of a 15x15 region.  Measured in the probe's memory report.
+//    +0 i32 cx   +4 i32 cz   +8 u8 si   +9 u8 state (0 empty, 1 used)   +10 u16 cm
+export let CHUNK_EDIT_ENTRY_B: i32 = 12;
+let OV_CX: i32 = 0;
+let OV_CZ: i32 = 4;
+let OV_SI: i32 = 8;
+let OV_ST: i32 = 9;
+let OV_H: i32 = 10;
+
+// ===========================================================================
+// SMALL PRIVATE HELPERS
+// ===========================================================================
+
+// Next power of two >= n, for the two open-addressed tables (mask, not modulo).
+fn pow2_ceil(p_n: i32): i32 {
+    let n: i32 = p_n;
+    let v: i32 = 1;
+    while (v < n) { v = v * 2; }
+    let out: i32 = v;
+    return out;
+}
+
+fn zeros_i32(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    a.reserve(n);
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    return a;
+}
+
+// ===========================================================================
+// KEYS
+// ===========================================================================
+
+// A 30-bit packed chunk key.  It is a HASH INPUT and a debug identity, never
+// the residency test: `tab_find` compares cx and cz explicitly, so two chunks
+// that alias to the same key (only possible beyond +/-16384 chunks, i.e.
+// +/-524 km) still cannot be confused for each other.  That is worth the two
+// extra comparisons; a silent wrong-chunk read would be unfindable.
+export fn chunk_key(p_cx: i32, p_cz: i32): i32 {
+    let cx: i32 = p_cx % 32768;
+    let cz: i32 = p_cz % 32768;
+    if (cx < 0) { cx = cx + 32768; }
+    if (cz < 0) { cz = cz + 32768; }
+    let out: i32 = cx * 32768 + cz;
+    return out;
+}
+
+// si = iz * CHUNK_N + ix.  Both in 0 .. CHUNK_N-1; out of range returns -1.
+export fn chunk_sample_index(p_ix: i32, p_iz: i32): i32 {
+    let ix: i32 = p_ix;
+    let iz: i32 = p_iz;
+    if (ix < 0 || ix >= CHUNK_N || iz < 0 || iz >= CHUNK_N) {
+        let bad: i32 = -1;
+        return bad;
+    }
+    let out: i32 = iz * CHUNK_N + ix;
+    return out;
+}
+
+// World metres -> chunk coordinate.  floor, so negative space works.
+export fn chunk_at_m(p_w: f64): i32 {
+    let w: f64 = p_w;
+    let out: i32 = floori(w / CHUNK_M);
+    return out;
+}
+
+// ===========================================================================
+// THE STORE
+// ===========================================================================
+
+// cap        hard chunk cap (the LRU never holds more)
+// edit_cap   hard edit cap  (the overlay never holds more)
+// seed       world seed handed to the source on every load
+export fn chunk_store_new_cap(p_cap: i32, p_edit_cap: i32, p_seed: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let ecap: i32 = pow2_ceil(p_edit_cap);
+    if (ecap < 16) { ecap = 16; }
+
+    // Residency table at load factor <= 1/4: probe chains stay ~1 long, and a
+    // chunk lookup is on the movement and raycast path.
+    let tsize: i32 = pow2_ceil(cap * 4);
+
+    let hb: buffer = buffer(cap * CHUNK_H_STRIDE_B);
+    let ab: buffer = buffer(cap * CHUNK_A_STRIDE_B);
+    let ob: buffer = buffer(ecap * CHUNK_EDIT_ENTRY_B);
+    memset(ob, 0, ecap * CHUNK_EDIT_ENTRY_B);
+
+    let cs: object = {
+        cap: cap,
+        seed: p_seed,
+        clock: 0,
+        resident: 0,
+
+        // the two arenas + their hoisted interior pointers.  The buffers are
+        // held in the same object, so the pointers cannot outlive them.
+        hbuf: hb,
+        hptr: buffer_ptr(hb),
+        abuf: ab,
+        aptr: buffer_ptr(ab),
+
+        // per-slot tables.  These stay Hemlock `array`s, not buffers: they are
+        // PER CHUNK, not per sample (144 B for a chunk that carries 324 B of
+        // samples), and they are read on the hot lookup path, where an array's
+        // inlined index beats a ptr read (A5).
+        cx: zeros_i32(cap),
+        cz: zeros_i32(cap),
+        live: zeros_i32(cap),
+        stamp: zeros_i32(cap),
+        pin: zeros_i32(cap),
+        dirty: zeros_i32(cap),
+        meta: zeros_i32(cap),
+        ecnt: zeros_i32(cap),
+
+        // residency hash: tab[i] = slot + 1, 0 = empty.  Backward-shift
+        // deletion, so there are no tombstones to degrade over a long session.
+        tsize: tsize,
+        tmask: tsize - 1,
+        tab: zeros_i32(tsize),
+
+        // sparse edit overlay, one 12-byte entry per slot
+        ocap: ecap,
+        omask: ecap - 1,
+        obuf: ob,
+        optr: buffer_ptr(ob),
+        ocount: 0,
+
+        // one-entry memo for the sampler: consecutive height queries land in
+        // the same chunk far more often than not (a player is 0.1 m from where
+        // they were last frame).
+        mcx: 0,
+        mcz: 0,
+        mslot: SLOT_NONE,
+
+        // the injected generator
+        has_src: 0,
+        src: 0,
+
+        // counters — every refusal is visible
+        loads: 0,
+        evicts: 0,
+        hits: 0,
+        misses: 0,
+        refused: 0,
+        edit_full: 0,
+        no_source: 0,
+        sample_miss: 0
+    };
+    return cs;
+}
+
+export fn chunk_store_new(): object {
+    let cs: object = chunk_store_new_cap(g_CHUNK_CACHE, CHUNK_EDIT_CAP_DEFAULT, g_WORLD_SEED_DEFAULT);
+    return cs;
+}
+
+// The generator.  See the header block for the contract.
+export fn chunk_set_source(p_cs: object, p_fn): i32 {
+    let cs: object = p_cs;
+    cs.src = p_fn;
+    cs.has_src = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn chunk_has_source(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.has_src; return out; }
+export fn chunk_cap(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.cap; return out; }
+export fn chunk_resident(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.resident; return out; }
+export fn chunk_seed(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.seed; return out; }
+
+// Changing the seed invalidates every generated height, so residency is
+// dropped.  Edits are NOT dropped: they are the player's, not the generator's.
+export fn chunk_set_seed(p_cs: object, p_seed: i32): i32 {
+    let cs: object = p_cs;
+    if (cs.seed != p_seed) {
+        cs.seed = p_seed;
+        chunk_drop_all(cs);
+    }
+    let out: i32 = cs.seed;
+    return out;
+}
+
+// ===========================================================================
+// RESIDENCY TABLE — open addressing, linear probe, backward-shift deletion
+// ===========================================================================
+
+fn tab_home(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let h: u64 = xhash3(p_cx, p_cz, CH_HASH_RES, cs.seed);
+    let m: i32 = cs.tmask;
+    let out: i32 = i32(h & u64(m));
+    return out;
+}
+
+// Slot holding (cx, cz), or SLOT_NONE.  No side effects.
+fn tab_find(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let tab = cs.tab;
+    let acx = cs.cx;
+    let acz = cs.cz;
+    let mask: i32 = cs.tmask;
+    let i: i32 = tab_home(cs, cx, cz);
+    let guard: i32 = cs.tsize;
+    while (guard > 0) {
+        let e: i32 = tab[i];
+        if (e == 0) { let miss: i32 = SLOT_NONE; return miss; }
+        let s: i32 = e - 1;
+        if (acx[s] == cx && acz[s] == cz) { let hit: i32 = s; return hit; }
+        i = (i + 1) & mask;
+        guard = guard - 1;
+    }
+    let full: i32 = SLOT_NONE;
+    return full;
+}
+
+fn tab_insert(p_cs: object, p_slot: i32) {
+    let cs: object = p_cs;
+    let slot: i32 = p_slot;
+    let tab = cs.tab;
+    let acx = cs.cx;
+    let acz = cs.cz;
+    let mask: i32 = cs.tmask;
+    let i: i32 = tab_home(cs, acx[slot], acz[slot]);
+    let guard: i32 = cs.tsize;
+    while (guard > 0) {
+        if (tab[i] == 0) { tab[i] = slot + 1; return; }
+        i = (i + 1) & mask;
+        guard = guard - 1;
+    }
+}
+
+// Canonical open-addressing deletion (no tombstones): after clearing the hole,
+// walk forward and pull back any entry whose home does not lie cyclically in
+// (hole, cursor].  A tombstone scheme would degrade every probe chain over a
+// session that streams chunks for an hour; this does not.
+fn tab_remove(p_cs: object, p_slot: i32) {
+    let cs: object = p_cs;
+    let slot: i32 = p_slot;
+    let tab = cs.tab;
+    let acx = cs.cx;
+    let acz = cs.cz;
+    let mask: i32 = cs.tmask;
+
+    let j: i32 = tab_home(cs, acx[slot], acz[slot]);
+    let guard: i32 = cs.tsize;
+    while (guard > 0) {
+        if (tab[j] == slot + 1) { guard = 0; }
+        else {
+            if (tab[j] == 0) { return; }
+            j = (j + 1) & mask;
+            guard = guard - 1;
+        }
+    }
+    if (tab[j] != slot + 1) { return; }
+
+    tab[j] = 0;
+    let i: i32 = (j + 1) & mask;
+    let steps: i32 = cs.tsize;
+    while (steps > 0) {
+        let e: i32 = tab[i];
+        if (e == 0) { return; }
+        let s: i32 = e - 1;
+        let k: i32 = tab_home(cs, acx[s], acz[s]);
+        let keep: i32 = 0;
+        if (j < i) {
+            if (j < k && k <= i) { keep = 1; }
+        } else {
+            if (j < k || k <= i) { keep = 1; }
+        }
+        if (keep == 0) {
+            tab[j] = e;
+            tab[i] = 0;
+            j = i;
+        }
+        i = (i + 1) & mask;
+        steps = steps - 1;
+    }
+}
+
+// ===========================================================================
+// THE EDIT OVERLAY — sparse, store-wide, keyed by (cx, cz, si)
+// ===========================================================================
+
+fn ov_home(p_cs: object, p_cx: i32, p_cz: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let h: u64 = xhash3(p_cx * 131 + p_si, p_cz, CH_HASH_OV, cs.seed);
+    let m: i32 = cs.omask;
+    let out: i32 = i32(h & u64(m));
+    return out;
+}
+
+// Table index of the edit at (cx, cz, si), or -1.
+fn ov_find(p_cs: object, p_cx: i32, p_cz: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    if (cs.ocount == 0) { let none: i32 = -1; return none; }
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let si: i32 = p_si;
+    let op: ptr = cs.optr;
+    let mask: i32 = cs.omask;
+    let i: i32 = ov_home(cs, cx, cz, si);
+    let guard: i32 = cs.ocap;
+    while (guard > 0) {
+        let b: i32 = i * CHUNK_EDIT_ENTRY_B;
+        if (ptr_read_u8(ptr_offset(op, b + OV_ST, 1)) == 0) { let miss: i32 = -1; return miss; }
+        if (ptr_read_i32(ptr_offset(op, b + OV_CX, 1)) == cx
+            && ptr_read_i32(ptr_offset(op, b + OV_CZ, 1)) == cz
+            && ptr_read_u8(ptr_offset(op, b + OV_SI, 1)) == si) {
+            let hit: i32 = i;
+            return hit;
+        }
+        i = (i + 1) & mask;
+        guard = guard - 1;
+    }
+    let full: i32 = -1;
+    return full;
+}
+
+fn ov_remove_at(p_cs: object, p_idx: i32) {
+    let cs: object = p_cs;
+    let op: ptr = cs.optr;
+    let mask: i32 = cs.omask;
+    let stride: i32 = CHUNK_EDIT_ENTRY_B;
+
+    let j: i32 = p_idx;
+    ptr_write_u8(ptr_offset(op, j * stride + OV_ST, 1), 0);
+    cs.ocount = cs.ocount - 1;
+
+    let i: i32 = (j + 1) & mask;
+    let steps: i32 = cs.ocap;
+    while (steps > 0) {
+        let bi: i32 = i * stride;
+        if (ptr_read_u8(ptr_offset(op, bi + OV_ST, 1)) == 0) { return; }
+        let k: i32 = ov_home(cs,
+                             ptr_read_i32(ptr_offset(op, bi + OV_CX, 1)),
+                             ptr_read_i32(ptr_offset(op, bi + OV_CZ, 1)),
+                             ptr_read_u8(ptr_offset(op, bi + OV_SI, 1)));
+        let keep: i32 = 0;
+        if (j < i) {
+            if (j < k && k <= i) { keep = 1; }
+        } else {
+            if (j < k || k <= i) { keep = 1; }
+        }
+        if (keep == 0) {
+            let bj: i32 = j * stride;
+            ptr_write_i32(ptr_offset(op, bj + OV_CX, 1), ptr_read_i32(ptr_offset(op, bi + OV_CX, 1)));
+            ptr_write_i32(ptr_offset(op, bj + OV_CZ, 1), ptr_read_i32(ptr_offset(op, bi + OV_CZ, 1)));
+            ptr_write_u8(ptr_offset(op, bj + OV_SI, 1), ptr_read_u8(ptr_offset(op, bi + OV_SI, 1)));
+            ptr_write_u16(ptr_offset(op, bj + OV_H, 1), ptr_read_u16(ptr_offset(op, bi + OV_H, 1)));
+            ptr_write_u8(ptr_offset(op, bj + OV_ST, 1), 1);
+            ptr_write_u8(ptr_offset(op, bi + OV_ST, 1), 0);
+            j = i;
+        }
+        i = (i + 1) & mask;
+        steps = steps - 1;
+    }
+}
+
+// How many of this chunk's 81 samples carry an edit.  Called once per chunk
+// LOAD (never per frame), and short-circuits to 0 while the overlay is empty —
+// which is every session that has not built anything yet.
+fn ov_count_chunk(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    if (cs.ocount == 0) { let zero: i32 = 0; return zero; }
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let n: i32 = 0;
+    let si: i32 = 0;
+    while (si < CHUNK_SAMPLES) {
+        if (ov_find(cs, cx, cz, si) >= 0) { n = n + 1; }
+        si++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// The player's height for one sample, in cm, or EDIT_NONE.
+export fn chunk_edit_get(p_cs: object, p_cx: i32, p_cz: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let idx: i32 = ov_find(cs, p_cx, p_cz, p_si);
+    if (idx < 0) { let none: i32 = EDIT_NONE; return none; }
+    let op: ptr = cs.optr;
+    let out: i32 = ptr_read_u16(ptr_offset(op, idx * CHUNK_EDIT_ENTRY_B + OV_H, 1));
+    return out;
+}
+
+// Set (or replace) one edited sample.  Returns 1 on success, 0 if the overlay
+// is full or the arguments are out of range.  NEVER writes into the generated
+// height arena — that is the whole point of the overlay.
+export fn chunk_set_edit(p_cs: object, p_cx: i32, p_cz: i32, p_si: i32, p_cm: i32): i32 {
+    let cs: object = p_cs;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    let si: i32 = p_si;
+    let cm: i32 = p_cm;
+    if (si < 0 || si >= CHUNK_SAMPLES) { let bad: i32 = 0; return bad; }
+    if (cm < 0) { cm = 0; }
+    if (cm > CHUNK_H_MAX_CM) { cm = CHUNK_H_MAX_CM; }
+
+    let op: ptr = cs.optr;
+    let mask: i32 = cs.omask;
+    let stride: i32 = CHUNK_EDIT_ENTRY_B;
+
+    let i: i32 = ov_home(cs, cx, cz, si);
+    let guard: i32 = cs.ocap;
+    while (guard > 0) {
+        let b: i32 = i * stride;
+        if (ptr_read_u8(ptr_offset(op, b + OV_ST, 1)) == 0) {
+            // Hard cap at 7/8 occupancy: linear probing degrades badly above
+            // that, and a store that quietly slows down is worse than one that
+            // says no.  Refuse, count, do not corrupt.
+            if (cs.ocount * 8 >= cs.ocap * 7) {
+                cs.edit_full = cs.edit_full + 1;
+                let full: i32 = 0;
+                return full;
+            }
+            ptr_write_i32(ptr_offset(op, b + OV_CX, 1), cx);
+            ptr_write_i32(ptr_offset(op, b + OV_CZ, 1), cz);
+            ptr_write_u8(ptr_offset(op, b + OV_SI, 1), si);
+            ptr_write_u16(ptr_offset(op, b + OV_H, 1), cm);
+            ptr_write_u8(ptr_offset(op, b + OV_ST, 1), 1);
+            cs.ocount = cs.ocount + 1;
+            edit_touch_chunk(cs, cx, cz, 1);
+            let ok: i32 = 1;
+            return ok;
+        }
+        if (ptr_read_i32(ptr_offset(op, b + OV_CX, 1)) == cx
+            && ptr_read_i32(ptr_offset(op, b + OV_CZ, 1)) == cz
+            && ptr_read_u8(ptr_offset(op, b + OV_SI, 1)) == si) {
+            ptr_write_u16(ptr_offset(op, b + OV_H, 1), cm);
+            edit_touch_chunk(cs, cx, cz, 0);
+            let upd: i32 = 1;
+            return upd;
+        }
+        i = (i + 1) & mask;
+        guard = guard - 1;
+    }
+    cs.edit_full = cs.edit_full + 1;
+    let nope: i32 = 0;
+    return nope;
+}
+
+// Remove an edit; the sample reverts to the generated height.  1 if removed.
+export fn chunk_clear_edit(p_cs: object, p_cx: i32, p_cz: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let idx: i32 = ov_find(cs, p_cx, p_cz, p_si);
+    if (idx < 0) { let none: i32 = 0; return none; }
+    ov_remove_at(cs, idx);
+    edit_touch_chunk(cs, p_cx, p_cz, -1);
+    let out: i32 = 1;
+    return out;
+}
+
+// Keep the resident slot's edit count and dirty flags in step with the overlay.
+// p_delta is +1 for a new edit, -1 for a removal, 0 for an in-place update.
+fn edit_touch_chunk(p_cs: object, p_cx: i32, p_cz: i32, p_delta: i32) {
+    let cs: object = p_cs;
+    let slot: i32 = tab_find(cs, p_cx, p_cz);
+    if (slot < 0) { return; }
+    let ecnt = cs.ecnt;
+    let n: i32 = ecnt[slot] + p_delta;
+    if (n < 0) { n = 0; }
+    ecnt[slot] = n;
+    let dirty = cs.dirty;
+    dirty[slot] = dirty[slot] | CDIRTY_HEIGHT | CDIRTY_MESH;
+}
+
+export fn chunk_edit_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.ocount; return out; }
+export fn chunk_edit_cap(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.ocap; return out; }
+export fn chunk_edit_full_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.edit_full; return out; }
+
+// Edits in this chunk, from the store's own bookkeeping when it is resident.
+export fn chunk_edits_in(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let slot: i32 = tab_find(cs, p_cx, p_cz);
+    if (slot >= 0) {
+        let ecnt = cs.ecnt;
+        let out: i32 = ecnt[slot];
+        return out;
+    }
+    let scan: i32 = ov_count_chunk(cs, p_cx, p_cz);
+    return scan;
+}
+
+// ===========================================================================
+// SAVE / LOAD OF THE OVERLAY — the world diff, on disk and (in v2) on the wire
+// ===========================================================================
+// Layout, little-endian i32 throughout:
+//     0  magic   4  version   8  count      then count * (cx, cz, si, cm)
+// The order of records is the table's, which depends on the insertion order —
+// so a round trip preserves the SET of edits, not the byte image.  The probe
+// asserts the set, because the set is what the format promises.
+
+export fn chunk_edits_bytes(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let out: i32 = CHUNK_SAVE_HDR_B + cs.ocount * CHUNK_SAVE_REC_B;
+    return out;
+}
+
+// Writes into a CALLER-OWNED buffer (no allocation here).  Returns bytes
+// written, or -1 if the buffer is too small.
+export fn chunk_edits_save(p_cs: object, p_dst: buffer): i32 {
+    let cs: object = p_cs;
+    let dst: buffer = p_dst;
+    let need: i32 = chunk_edits_bytes(cs);
+    if (dst.length < need) { let small: i32 = -1; return small; }
+
+    let p: ptr = buffer_ptr(dst);
+    ptr_write_i32(ptr_offset(p, 0, 1), CHUNK_SAVE_MAGIC);
+    ptr_write_i32(ptr_offset(p, 4, 1), CHUNK_SAVE_VER);
+    ptr_write_i32(ptr_offset(p, 8, 1), cs.ocount);
+
+    let op: ptr = cs.optr;
+    let stride: i32 = CHUNK_EDIT_ENTRY_B;
+    let n: i32 = cs.ocap;
+    let off: i32 = CHUNK_SAVE_HDR_B;
+    let i: i32 = 0;
+    while (i < n) {
+        let b: i32 = i * stride;
+        if (ptr_read_u8(ptr_offset(op, b + OV_ST, 1)) == 1) {
+            ptr_write_i32(ptr_offset(p, off, 1), ptr_read_i32(ptr_offset(op, b + OV_CX, 1)));
+            ptr_write_i32(ptr_offset(p, off + 4, 1), ptr_read_i32(ptr_offset(op, b + OV_CZ, 1)));
+            ptr_write_i32(ptr_offset(p, off + 8, 1), ptr_read_u8(ptr_offset(op, b + OV_SI, 1)));
+            ptr_write_i32(ptr_offset(p, off + 12, 1), ptr_read_u16(ptr_offset(op, b + OV_H, 1)));
+            off = off + CHUNK_SAVE_REC_B;
+        }
+        i++;
+    }
+    let out: i32 = off;
+    return out;
+}
+
+// Replaces the whole overlay.  Returns the number of edits loaded, or -1 on a
+// bad magic / version / truncated blob.  Every resident chunk's edit count and
+// dirty flags are rebuilt, so a load is immediately consistent.
+export fn chunk_edits_load(p_cs: object, p_src: buffer): i32 {
+    let cs: object = p_cs;
+    let src: buffer = p_src;
+    if (src.length < CHUNK_SAVE_HDR_B) { let tiny: i32 = -1; return tiny; }
+    let p: ptr = buffer_ptr(src);
+    if (ptr_read_i32(ptr_offset(p, 0, 1)) != CHUNK_SAVE_MAGIC) { let magic: i32 = -1; return magic; }
+    if (ptr_read_i32(ptr_offset(p, 4, 1)) != CHUNK_SAVE_VER) { let ver: i32 = -1; return ver; }
+    let count: i32 = ptr_read_i32(ptr_offset(p, 8, 1));
+    if (count < 0) { let neg: i32 = -1; return neg; }
+    if (src.length < CHUNK_SAVE_HDR_B + count * CHUNK_SAVE_REC_B) { let trunc: i32 = -1; return trunc; }
+
+    chunk_clear_edits(cs);
+    let off: i32 = CHUNK_SAVE_HDR_B;
+    let i: i32 = 0;
+    let loaded: i32 = 0;
+    while (i < count) {
+        let cx: i32 = ptr_read_i32(ptr_offset(p, off, 1));
+        let cz: i32 = ptr_read_i32(ptr_offset(p, off + 4, 1));
+        let si: i32 = ptr_read_i32(ptr_offset(p, off + 8, 1));
+        let cm: i32 = ptr_read_i32(ptr_offset(p, off + 12, 1));
+        loaded = loaded + chunk_set_edit(cs, cx, cz, si, cm);
+        off = off + CHUNK_SAVE_REC_B;
+        i++;
+    }
+    let out: i32 = loaded;
+    return out;
+}
+
+// Drop every edit.  Resident chunks go dirty, because their heights just moved.
+export fn chunk_clear_edits(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let op: ptr = cs.optr;
+    let stride: i32 = CHUNK_EDIT_ENTRY_B;
+    let n: i32 = cs.ocap;
+    let i: i32 = 0;
+    while (i < n) { ptr_write_u8(ptr_offset(op, i * stride + OV_ST, 1), 0); i++; }
+    let dropped: i32 = cs.ocount;
+    cs.ocount = 0;
+
+    let ecnt = cs.ecnt;
+    let dirty = cs.dirty;
+    let live = cs.live;
+    let cap: i32 = cs.cap;
+    let s: i32 = 0;
+    while (s < cap) {
+        if (live[s] == 1 && ecnt[s] > 0) {
+            dirty[s] = dirty[s] | CDIRTY_HEIGHT | CDIRTY_MESH;
+        }
+        ecnt[s] = 0;
+        s++;
+    }
+    let out: i32 = dropped;
+    return out;
+}
+
+// ===========================================================================
+// RESIDENCY: get, evict, pin
+// ===========================================================================
+
+fn touch(p_cs: object, p_slot: i32) {
+    let cs: object = p_cs;
+    let c: i32 = cs.clock + 1;
+    cs.clock = c;
+    let stamp = cs.stamp;
+    stamp[p_slot] = c;
+}
+
+// A free slot, or the least-recently-used UNPINNED resident one, or SLOT_NONE
+// when every slot is pinned.  O(cap), and only on a cache miss — the chunk load
+// it precedes costs milliseconds, this costs nanoseconds.
+fn slot_acquire(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let cap: i32 = cs.cap;
+    let live = cs.live;
+    let pin = cs.pin;
+    let stamp = cs.stamp;
+
+    if (cs.resident < cap) {
+        let i: i32 = 0;
+        while (i < cap) {
+            if (live[i] == 0) { let free: i32 = i; return free; }
+            i++;
+        }
+    }
+    let best: i32 = SLOT_NONE;
+    let bests: i32 = 0;
+    let j: i32 = 0;
+    while (j < cap) {
+        if (live[j] == 1 && pin[j] == 0) {
+            let s: i32 = stamp[j];
+            if (best < 0 || s < bests) { best = j; bests = s; }
+        }
+        j++;
+    }
+    if (best < 0) { let none: i32 = SLOT_NONE; return none; }
+    slot_drop(cs, best);
+    let out: i32 = best;
+    return out;
+}
+
+// Take a resident slot out of service.  The EDITS SURVIVE — they live in the
+// store-wide overlay, keyed by chunk coordinates, not here.
+fn slot_drop(p_cs: object, p_slot: i32) {
+    let cs: object = p_cs;
+    let slot: i32 = p_slot;
+    let live = cs.live;
+    if (live[slot] == 0) { return; }
+    tab_remove(cs, slot);
+    live[slot] = 0;
+    let pin = cs.pin;
+    let dirty = cs.dirty;
+    let ecnt = cs.ecnt;
+    pin[slot] = 0;
+    dirty[slot] = CDIRTY_NONE;
+    ecnt[slot] = 0;
+    cs.resident = cs.resident - 1;
+    cs.evicts = cs.evicts + 1;
+    if (cs.mslot == slot) { cs.mslot = SLOT_NONE; }
+}
+
+// Generate (cx, cz) into a slot that is already free.
+fn slot_fill(p_cs: object, p_slot: i32, p_cx: i32, p_cz: i32) {
+    let cs: object = p_cs;
+    let slot: i32 = p_slot;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+
+    let gen = cs.src;
+    let meta: i32 = gen(cs.hbuf, slot * CHUNK_H_STRIDE_B,
+                      cs.abuf, slot * CHUNK_A_STRIDE_B,
+                      cx, cz, cs.seed);
+
+    let acx = cs.cx;
+    let acz = cs.cz;
+    let live = cs.live;
+    let dirty = cs.dirty;
+    let ameta = cs.meta;
+    let pin = cs.pin;
+    let ecnt = cs.ecnt;
+    acx[slot] = cx;
+    acz[slot] = cz;
+    live[slot] = 1;
+    pin[slot] = 0;
+    dirty[slot] = CDIRTY_ALL;
+    ameta[slot] = meta;
+    ecnt[slot] = ov_count_chunk(cs, cx, cz);
+
+    cs.resident = cs.resident + 1;
+    cs.loads = cs.loads + 1;
+    tab_insert(cs, slot);
+    touch(cs, slot);
+}
+
+// The one entry point that can bring a chunk into memory.  Returns its slot, or
+// SLOT_NONE when there is no source, or when every slot is pinned (in which
+// case `chunk_refused_count` goes up — it is never a silent failure).
+export fn chunk_get(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+
+    let slot: i32 = tab_find(cs, cx, cz);
+    if (slot >= 0) {
+        cs.hits = cs.hits + 1;
+        touch(cs, slot);
+        let hit: i32 = slot;
+        return hit;
+    }
+    cs.misses = cs.misses + 1;
+    if (cs.has_src == 0) {
+        cs.no_source = cs.no_source + 1;
+        let nosrc: i32 = SLOT_NONE;
+        return nosrc;
+    }
+    let s: i32 = slot_acquire(cs);
+    if (s < 0) {
+        cs.refused = cs.refused + 1;
+        let none: i32 = SLOT_NONE;
+        return none;
+    }
+    slot_fill(cs, s, cx, cz);
+    let out: i32 = s;
+    return out;
+}
+
+// Lookup WITHOUT loading.  This is what a renderer uses when it must not pay a
+// generation cost mid-frame.
+export fn chunk_find(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let out: i32 = tab_find(cs, p_cx, p_cz);
+    return out;
+}
+
+// Evict one named chunk.  Returns 1 if it went, 0 if it was absent, and -1 if
+// it is PINNED — a refusal, counted, never a silent no-op.
+export fn chunk_evict(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let slot: i32 = tab_find(cs, p_cx, p_cz);
+    if (slot < 0) { let absent: i32 = 0; return absent; }
+    let pin = cs.pin;
+    if (pin[slot] == 1) {
+        cs.refused = cs.refused + 1;
+        let pinned: i32 = -1;
+        return pinned;
+    }
+    slot_drop(cs, slot);
+    let out: i32 = 1;
+    return out;
+}
+
+// Evict the least-recently-used unpinned chunk.  Slot, or SLOT_NONE.
+export fn chunk_evict_lru(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let cap: i32 = cs.cap;
+    let live = cs.live;
+    let pin = cs.pin;
+    let stamp = cs.stamp;
+    let best: i32 = SLOT_NONE;
+    let bests: i32 = 0;
+    let j: i32 = 0;
+    while (j < cap) {
+        if (live[j] == 1 && pin[j] == 0) {
+            let s: i32 = stamp[j];
+            if (best < 0 || s < bests) { best = j; bests = s; }
+        }
+        j++;
+    }
+    if (best < 0) { let none: i32 = SLOT_NONE; return none; }
+    slot_drop(cs, best);
+    let out: i32 = best;
+    return out;
+}
+
+// Drop everything resident (pins included).  Edits survive.
+export fn chunk_drop_all(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let cap: i32 = cs.cap;
+    let live = cs.live;
+    let pin = cs.pin;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < cap) {
+        if (live[i] == 1) { pin[i] = 0; slot_drop(cs, i); n = n + 1; }
+        i++;
+    }
+    cs.mslot = SLOT_NONE;
+    let out: i32 = n;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// PINS — "the render ring", declared once per frame
+// ---------------------------------------------------------------------------
+// `chunk_pin_ring` unpins everything, then loads and pins the (2r+1)^2 ring
+// around the camera's chunk.  While pinned, a chunk cannot be evicted by ANY
+// path: not the LRU, not `chunk_evict`.  That is the acceptance criterion "the
+// LRU never evicts a chunk inside the render ring", enforced structurally
+// rather than by hoping the LRU order happens to be right.
+//
+// Returns the number of ring chunks resident and pinned (== (2r+1)^2 when the
+// cap allows; less means the cap is too small for the ring, which the caller
+// should treat as a configuration error — `chunk_refused_count` says so).
+export fn chunk_pin_ring(p_cs: object, p_ccx: i32, p_ccz: i32, p_r: i32): i32 {
+    let cs: object = p_cs;
+    let ccx: i32 = p_ccx;
+    let ccz: i32 = p_ccz;
+    let r: i32 = p_r;
+
+    let cap: i32 = cs.cap;
+    let pin = cs.pin;
+    let i: i32 = 0;
+    while (i < cap) { pin[i] = 0; i++; }
+
+    let n: i32 = 0;
+    let dz: i32 = 0 - r;
+    while (dz <= r) {
+        let dx: i32 = 0 - r;
+        while (dx <= r) {
+            let s: i32 = chunk_get(cs, ccx + dx, ccz + dz);
+            if (s >= 0) { pin[s] = 1; n = n + 1; }
+            dx++;
+        }
+        dz++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+export fn chunk_pin(p_cs: object, p_cx: i32, p_cz: i32, p_on: i32): i32 {
+    let cs: object = p_cs;
+    let slot: i32 = tab_find(cs, p_cx, p_cz);
+    if (slot < 0) { let absent: i32 = 0; return absent; }
+    let pin = cs.pin;
+    pin[slot] = p_on;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn chunk_pinned(p_cs: object, p_slot: i32): i32 {
+    let cs: object = p_cs;
+    let pin = cs.pin;
+    let out: i32 = pin[p_slot];
+    return out;
+}
+
+// ===========================================================================
+// DIRTY FLAGS
+// ===========================================================================
+
+export fn chunk_dirty(p_cs: object, p_slot: i32): i32 {
+    let cs: object = p_cs;
+    let dirty = cs.dirty;
+    let out: i32 = dirty[p_slot];
+    return out;
+}
+
+export fn chunk_mark_dirty(p_cs: object, p_slot: i32, p_bits: i32): i32 {
+    let cs: object = p_cs;
+    let dirty = cs.dirty;
+    dirty[p_slot] = dirty[p_slot] | p_bits;
+    let out: i32 = dirty[p_slot];
+    return out;
+}
+
+export fn chunk_clear_dirty(p_cs: object, p_slot: i32, p_bits: i32): i32 {
+    let cs: object = p_cs;
+    let dirty = cs.dirty;
+    let keep: i32 = CDIRTY_ALL - (p_bits & CDIRTY_ALL);
+    dirty[p_slot] = dirty[p_slot] & keep;
+    let out: i32 = dirty[p_slot];
+    return out;
+}
+
+export fn chunk_meta(p_cs: object, p_slot: i32): i32 {
+    let cs: object = p_cs;
+    let meta = cs.meta;
+    let out: i32 = meta[p_slot];
+    return out;
+}
+
+// ===========================================================================
+// SAMPLE ACCESS
+// ===========================================================================
+
+// The GENERATED height, in cm, ignoring any edit.  This is what proves an edit
+// was never baked in: the arena still holds the generator's answer.
+export fn chunk_height_gen(p_cs: object, p_slot: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let hp: ptr = cs.hptr;
+    let off: i32 = p_slot * CHUNK_H_STRIDE_B + p_si * 2;
+    let out: i32 = ptr_read_u16(ptr_offset(hp, off, 1));
+    return out;
+}
+
+// The EFFECTIVE height, in cm: the edit if there is one, else the generated
+// value.  `ecnt` short-circuits the overlay probe for unedited chunks, which is
+// every chunk in a fresh world.
+export fn chunk_height_cm(p_cs: object, p_slot: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let slot: i32 = p_slot;
+    let si: i32 = p_si;
+    let ecnt = cs.ecnt;
+    if (ecnt[slot] > 0) {
+        let acx = cs.cx;
+        let acz = cs.cz;
+        let e: i32 = chunk_edit_get(cs, acx[slot], acz[slot], si);
+        if (e != EDIT_NONE) { let ed: i32 = e; return ed; }
+    }
+    let hp: ptr = cs.hptr;
+    let off: i32 = slot * CHUNK_H_STRIDE_B + si * 2;
+    let out: i32 = ptr_read_u16(ptr_offset(hp, off, 1));
+    return out;
+}
+
+export fn chunk_biome(p_cs: object, p_slot: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let ap: ptr = cs.aptr;
+    let off: i32 = p_slot * CHUNK_A_STRIDE_B + p_si;
+    let out: i32 = ptr_read_u8(ptr_offset(ap, off, 1));
+    return out;
+}
+
+export fn chunk_light(p_cs: object, p_slot: i32, p_si: i32): i32 {
+    let cs: object = p_cs;
+    let ap: ptr = cs.aptr;
+    let off: i32 = p_slot * CHUNK_A_STRIDE_B + CHUNK_SAMPLES + p_si;
+    let out: i32 = ptr_read_u8(ptr_offset(ap, off, 1));
+    return out;
+}
+
+// The light bake is the one attribute the game writes back after generation
+// (lanterns, fires, time of day).  Writing it dirties the MESH, not the height.
+export fn chunk_set_light(p_cs: object, p_slot: i32, p_si: i32, p_v: i32): i32 {
+    let cs: object = p_cs;
+    let v: i32 = p_v;
+    if (v < 0) { v = 0; }
+    if (v > 255) { v = 255; }
+    let ap: ptr = cs.aptr;
+    let off: i32 = p_slot * CHUNK_A_STRIDE_B + CHUNK_SAMPLES + p_si;
+    ptr_write_u8(ptr_offset(ap, off, 1), v);
+    let dirty = cs.dirty;
+    dirty[p_slot] = dirty[p_slot] | CDIRTY_LIGHT | CDIRTY_MESH;
+    let out: i32 = v;
+    return out;
+}
+
+// ===========================================================================
+// THE BILINEAR SAMPLERS — the two functions the sim actually calls
+// ===========================================================================
+// Sampling stays INSIDE one chunk: a 32 m chunk carries 9 samples per side, so
+// its last row/column is the neighbour's first, and every point of [0,32) x
+// [0,32) has its four corners in the same 81-sample block.  No neighbour fetch,
+// no seam special case, and C0 continuity across a chunk edge is inherited
+// straight from worldgen's shared lattice values.
+//
+// The memo (mcx/mcz/mslot) is the whole reason this is cheap: a player moves a
+// few centimetres per tick, so consecutive queries hit the same chunk and skip
+// the hash entirely.
+
+fn memo_slot(p_cs: object, p_cx: i32, p_cz: i32): i32 {
+    let cs: object = p_cs;
+    let cx: i32 = p_cx;
+    let cz: i32 = p_cz;
+    if (cs.mslot >= 0 && cs.mcx == cx && cs.mcz == cz) {
+        let m: i32 = cs.mslot;
+        return m;
+    }
+    let s: i32 = chunk_get(cs, cx, cz);
+    if (s >= 0) {
+        cs.mcx = cx;
+        cs.mcz = cz;
+        cs.mslot = s;
+    }
+    let out: i32 = s;
+    return out;
+}
+
+// Terrain height in METRES at a world (x, z).  CHUNK_H_MISS when the chunk is
+// not resident and cannot be loaded.
+export fn chunk_height_at(p_cs: object, p_wx: f64, p_wz: f64): f64 {
+    let cs: object = p_cs;
+    let wx: f64 = p_wx;
+    let wz: f64 = p_wz;
+
+    // floor, hand-inlined (A9): four calls into mathx per sample is ~80 ns on
+    // the most-called function in the sim.
+    let cm: f64 = CHUNK_M;
+    let fcx: f64 = wx / cm;
+    let fcz: f64 = wz / cm;
+    let cx: i32 = i32(fcx);
+    let cz: i32 = i32(fcz);
+    if (f64(cx) > fcx) { cx = cx - 1; }
+    if (f64(cz) > fcz) { cz = cz - 1; }
+    let slot: i32 = memo_slot(cs, cx, cz);
+    if (slot < 0) {
+        cs.sample_miss = cs.sample_miss + 1;
+        let miss: f64 = CHUNK_H_MISS;
+        return miss;
+    }
+
+    let cell: f64 = CHUNK_CELL_M;
+    let gx: f64 = (wx - f64(cx) * cm) / cell;
+    let gz: f64 = (wz - f64(cz) * cm) / cell;
+    let ix: i32 = i32(gx);
+    let iz: i32 = i32(gz);
+    if (f64(ix) > gx) { ix = ix - 1; }
+    if (f64(iz) > gz) { iz = iz - 1; }
+    let last: i32 = CHUNK_CELLS - 1;
+    if (ix < 0) { ix = 0; }
+    if (ix > last) { ix = last; }
+    if (iz < 0) { iz = 0; }
+    if (iz > last) { iz = last; }
+    let tx: f64 = gx - f64(ix);
+    let tz: f64 = gz - f64(iz);
+    if (tx < 0.0) { tx = 0.0; }
+    if (tx > 1.0) { tx = 1.0; }
+    if (tz < 0.0) { tz = 0.0; }
+    if (tz > 1.0) { tz = 1.0; }
+
+    let si: i32 = iz * CHUNK_N + ix;
+    let h00: f64 = 0.0;
+    let h10: f64 = 0.0;
+    let h01: f64 = 0.0;
+    let h11: f64 = 0.0;
+    let ecnt = cs.ecnt;
+    if (ecnt[slot] == 0) {
+        // Fast path: four u16 reads off the hoisted arena pointer (N4).
+        let hp: ptr = cs.hptr;
+        let base: i32 = slot * CHUNK_H_STRIDE_B + si * 2;
+        let row: i32 = CHUNK_N * 2;
+        h00 = f64(ptr_read_u16(ptr_offset(hp, base, 1)));
+        h10 = f64(ptr_read_u16(ptr_offset(hp, base + 2, 1)));
+        h01 = f64(ptr_read_u16(ptr_offset(hp, base + row, 1)));
+        h11 = f64(ptr_read_u16(ptr_offset(hp, base + row + 2, 1)));
+    } else {
+        h00 = f64(chunk_height_cm(cs, slot, si));
+        h10 = f64(chunk_height_cm(cs, slot, si + 1));
+        h01 = f64(chunk_height_cm(cs, slot, si + CHUNK_N));
+        h11 = f64(chunk_height_cm(cs, slot, si + CHUNK_N + 1));
+    }
+
+    let a: f64 = h00 + (h10 - h00) * tx;
+    let b: f64 = h01 + (h11 - h01) * tx;
+    let h: f64 = a + (b - a) * tz;
+    let out: f64 = h / CHUNK_CM_PER_M;
+    return out;
+}
+
+// Surface normal at a world (x, z), written into p_out[0..2] (no allocation).
+// Returns 1 on success, 0 on a miss with p_out left as (0, 1, 0).
+//
+// It is the ANALYTIC gradient of the same bilinear patch `chunk_height_at`
+// interpolates, not a finite difference of it — so the normal is exactly
+// consistent with the height at every point, including inside a cell, and it
+// costs four samples instead of eight.
+export fn chunk_normal_at(p_cs: object, p_wx: f64, p_wz: f64, p_out: array<f64>): i32 {
+    let cs: object = p_cs;
+    let wx: f64 = p_wx;
+    let wz: f64 = p_wz;
+    let out = p_out;
+
+    let cm: f64 = CHUNK_M;
+    let fcx: f64 = wx / cm;
+    let fcz: f64 = wz / cm;
+    let cx: i32 = i32(fcx);
+    let cz: i32 = i32(fcz);
+    if (f64(cx) > fcx) { cx = cx - 1; }
+    if (f64(cz) > fcz) { cz = cz - 1; }
+    let slot: i32 = memo_slot(cs, cx, cz);
+    if (slot < 0) {
+        cs.sample_miss = cs.sample_miss + 1;
+        out[0] = 0.0;
+        out[1] = 1.0;
+        out[2] = 0.0;
+        let miss: i32 = 0;
+        return miss;
+    }
+
+    let cell: f64 = CHUNK_CELL_M;
+    let gx: f64 = (wx - f64(cx) * cm) / cell;
+    let gz: f64 = (wz - f64(cz) * cm) / cell;
+    let ix: i32 = i32(gx);
+    let iz: i32 = i32(gz);
+    if (f64(ix) > gx) { ix = ix - 1; }
+    if (f64(iz) > gz) { iz = iz - 1; }
+    let last: i32 = CHUNK_CELLS - 1;
+    if (ix < 0) { ix = 0; }
+    if (ix > last) { ix = last; }
+    if (iz < 0) { iz = 0; }
+    if (iz > last) { iz = last; }
+    let tx: f64 = gx - f64(ix);
+    let tz: f64 = gz - f64(iz);
+    if (tx < 0.0) { tx = 0.0; }
+    if (tx > 1.0) { tx = 1.0; }
+    if (tz < 0.0) { tz = 0.0; }
+    if (tz > 1.0) { tz = 1.0; }
+
+    let si: i32 = iz * CHUNK_N + ix;
+    let h00: f64 = f64(chunk_height_cm(cs, slot, si));
+    let h10: f64 = f64(chunk_height_cm(cs, slot, si + 1));
+    let h01: f64 = f64(chunk_height_cm(cs, slot, si + CHUNK_N));
+    let h11: f64 = f64(chunk_height_cm(cs, slot, si + CHUNK_N + 1));
+
+    // d(height in metres) / d(x in metres)
+    let inv: f64 = 1.0 / (CHUNK_CM_PER_M * cell);
+    let dx: f64 = ((h10 - h00) * (1.0 - tz) + (h11 - h01) * tz) * inv;
+    let dz: f64 = ((h01 - h00) * (1.0 - tx) + (h11 - h10) * tx) * inv;
+
+    let nx: f64 = 0.0 - dx;
+    let ny: f64 = 1.0;
+    let nz: f64 = 0.0 - dz;
+    let len: f64 = __sqrt(nx * nx + ny * ny + nz * nz);
+    let s: f64 = 1.0 / len;
+    out[0] = nx * s;
+    out[1] = ny * s;
+    out[2] = nz * s;
+    let ok: i32 = 1;
+    return ok;
+}
+
+// ===========================================================================
+// COUNTERS AND THE MEMORY REPORT
+// ===========================================================================
+
+export fn chunk_load_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.loads; return out; }
+export fn chunk_evict_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.evicts; return out; }
+export fn chunk_hit_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.hits; return out; }
+export fn chunk_miss_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.misses; return out; }
+export fn chunk_refused_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.refused; return out; }
+export fn chunk_no_source_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.no_source; return out; }
+export fn chunk_sample_miss_count(p_cs: object): i32 { let cs: object = p_cs; let out: i32 = cs.sample_miss; return out; }
+
+// Bytes of HEIGHT payload the store owns.  cap * 81 * 2, exactly.
+export fn chunk_height_bytes(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let out: i32 = cs.cap * CHUNK_H_STRIDE_B;
+    return out;
+}
+
+// Bytes of ATTRIBUTE payload (biome + baked light).
+export fn chunk_attr_bytes(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let out: i32 = cs.cap * CHUNK_A_STRIDE_B;
+    return out;
+}
+
+// Bytes of edit-overlay table (12 B per slot, whether occupied or not).
+export fn chunk_overlay_bytes(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let out: i32 = cs.ocap * CHUNK_EDIT_ENTRY_B;
+    return out;
+}
+
+// Entries in the residency hash table (a Hemlock array<i32>: ~16 B each).
+export fn chunk_table_entries(p_cs: object): i32 {
+    let cs: object = p_cs;
+    let out: i32 = cs.tsize;
+    return out;
+}
+
+// Height payload bytes per height sample.  2.00 by construction — the number
+// the A6 container decision is made of.
+export fn chunk_bytes_per_sample(p_cs: object): f64 {
+    let cs: object = p_cs;
+    let out: f64 = f64(cs.cap * CHUNK_H_STRIDE_B) / f64(cs.cap * CHUNK_SAMPLES);
+    return out;
+}

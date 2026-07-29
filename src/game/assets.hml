@@ -1,0 +1,616 @@
+// ===========================================================================
+// nightshade/src/game/assets.hml — THE BOOT SEQUENCE                (W3-13)
+// ===========================================================================
+//
+// There are no asset files. Every texture, every glyph, every mesh in
+// Nightshade is generated here, once, at boot, behind a title card.
+// ARCHITECTURE.md §6 is the specification; this file is that specification
+// executed, in that order, with a stopwatch on each stage.
+//
+//   assets_build(win)                 -> run every remaining stage
+//   assets_build_stage(win, s)        -> run ONE stage (this is the title-card
+//                                        hook: main.hml presents a frame
+//                                        between calls, so the ~167 ms of
+//                                        generation is 7 visible steps and not
+//                                        one frozen window)
+//   assets_print_report()             -> the per-stage millisecond table
+//
+// ---------------------------------------------------------------------------
+// THE FOUR TEXTURES, AND WHY A FIFTH IS A BUG
+// ---------------------------------------------------------------------------
+// CLAUDE.md §6: blend mode is per-texture, so blend mode IS the material
+// model. There are exactly four materials, therefore exactly four textures:
+//
+//   ASSET_WORLD  256x256  BLEND_BLEND   opaque world surfaces + 2 alpha decals
+//   ASSET_FX     128x128  BLEND_ADD     everything that emits light
+//   ASSET_HUD    128x128  BLEND_BLEND   fonts, icons, chrome
+//   ASSET_SKY    512x160  BLEND_NONE    the panorama: never lit, never fogged
+//
+// A fifth texture is not "one more upload", it is a fifth material that no
+// layer knows how to sort or flush. `g_as_tex_created` counts every null ->
+// non-null texture transition this module causes and `assets_texture_created()`
+// publishes it; `tools/probe_assets.hml` asserts it is exactly 4 after a boot
+// and STILL exactly 4 after a second `assets_build`.
+//
+// ---------------------------------------------------------------------------
+// IDEMPOTENCE — the property, not the flag
+// ---------------------------------------------------------------------------
+// Every stage carries its own `done` bit and is skipped when set. So:
+//   * assets_build(win) twice          -> the second call does nothing, creates
+//                                         no textures, and the four texture
+//                                         pointers are IDENTICAL.
+//   * assets_build(null) then (win)    -> the CPU stages run headless, the
+//                                         upload stage runs later when a window
+//                                         exists. This is the `simtest`/`bake`
+//                                         path and it is why upload is its own
+//                                         stage rather than four lines glued to
+//                                         the ends of four bakes.
+// `assets_reset()` exists for tools and probes that need to time a cold boot;
+// a shipping build calls it never.
+//
+// ---------------------------------------------------------------------------
+// DEVIATION FROM ARCHITECTURE §6, DELIBERATE, ONE
+// ---------------------------------------------------------------------------
+// §6's listing shows each bake followed immediately by its own upload. Here all
+// four uploads are one trailing stage. Reasons: (a) the CPU-only boot above
+// becomes expressible, (b) the "exactly four textures" invariant lives at one
+// place instead of four, (c) it costs 0.33 ms total, measured, so there is no
+// perf argument either way. Bake order is unchanged from §6.
+//
+// §6 also lists `bank_build()` (W3-14) and `postfx_build_overlay()` (W3-9).
+// Neither module exists at the time this file was written and neither may be
+// invented here. AS_STAGE_SFX is the wired, timed, currently-empty hook for
+// W3-14; see the note on it. `postfx_build_overlay` is NOT given a stage,
+// because §6 says it uploads a fifth texture (BLEND_MOD) while §6's own header
+// and W3-13's acceptance say four textures exactly. That contradiction is
+// reported, not silently resolved — see the W3-13 task report.
+// ===========================================================================
+
+import { BLEND_BLEND, BLEND_ADD, BLEND_NONE }
+       from "../../../wobbleweed/src/sdl.hml";
+import { atlas_new, atlas_upload, atlas_free, atlas_cell_uv, atlas_tex,
+         atlas_cell_count }
+       from "../../../wobbleweed/src/atlas.hml";
+
+import { g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS, g_ATLAS_FX_PX, g_ATLAS_HUD_PX,
+         g_SKY_W, g_SKY_H, g_BUDGET_BOOT_MS }
+       from "../core/config.hml";
+
+import { texgen_build_world_atlas, texgen_material_count,
+         CELL_DIRT, CELL_STONE_A, CELL_WOOD_PLANK, CELL_WOOD_LOG, CELL_BARK,
+         CELL_LEAF_PINE, CELL_CONCRETE, CELL_METAL_PANEL, CELL_FABRIC_CRM,
+         CELL_WINDOW }
+       from "../art/texgen.hml";
+import { fxgen_build_atlas } from "../art/fxgen.hml";
+import { hudgen_build_atlas } from "../art/hudgen.hml";
+import { skygen_init, skygen_bake_all, skygen_atlas, skygen_free }
+       from "../art/skygen.hml";
+import { meshgen_build_all, meshgen_set_material_uv, meshgen_mesh,
+         meshgen_count, meshgen_tris, meshgen_name,
+         MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT, MG_MAT_GLASS }
+       from "../art/meshgen.hml";
+
+// ===========================================================================
+// 1. THE PUBLIC INDICES
+// ===========================================================================
+
+// Texture slots. The order is the §6 bake order, which is also the order the
+// frame graph binds them in.
+export let ASSET_WORLD = 0;
+export let ASSET_FX    = 1;
+export let ASSET_HUD   = 2;
+export let ASSET_SKY   = 3;
+export let ASSET_TEX_COUNT = 4;
+
+// Boot stages, in execution order.
+export let AS_STAGE_WORLD  = 0;   // ATLAS_WORLD  : 41 tiles + 2 decals
+export let AS_STAGE_FX     = 1;   // ATLAS_FX     : 28 additive sprites
+export let AS_STAGE_HUD    = 2;   // ATLAS_HUD    : 2 fonts + 26 sprites
+export let AS_STAGE_SKY    = 3;   // TEX_SKY      : the 512x160 panorama
+export let AS_STAGE_MESH   = 4;   // bind materials, then 34 meshes
+export let AS_STAGE_SFX    = 5;   // W3-14 audiobank hook (empty today)
+export let AS_STAGE_UPLOAD = 6;   // 4 x atlas_upload, 4 blend modes
+export let AS_STAGE_COUNT  = 7;
+
+// Error codes from assets_build / assets_build_stage.
+export let AS_OK            = 0;
+export let AS_ERR_STAGE     = 0 - 1;    // bad stage index
+export let AS_ERR_TEXGEN    = 0 - 2;
+export let AS_ERR_FXGEN     = 0 - 3;
+export let AS_ERR_HUDGEN    = 0 - 4;
+export let AS_ERR_SKYGEN    = 0 - 5;
+export let AS_ERR_MESHGEN   = 0 - 6;
+export let AS_ERR_UPLOAD    = 0 - 7;
+export let AS_ERR_NO_WINDOW = 0 - 8;    // upload attempted with win == null
+
+// ===========================================================================
+// 2. STATE
+// ===========================================================================
+// Four atlases and four textures as four named variables rather than an array:
+// an SDL texture is a `ptr`, and a `ptr` in an `array` is a boxed value whose
+// identity comparison is the one thing this module's central invariant depends
+// on. Named variables keep `assets_tex(i) == assets_tex(i)` trivially true.
+
+let g_as_atlas_world = null;
+let g_as_atlas_fx    = null;
+let g_as_atlas_hud   = null;
+let g_as_atlas_sky   = null;
+
+let g_as_tex_world = ptr_null();
+let g_as_tex_fx    = ptr_null();
+let g_as_tex_hud   = ptr_null();
+let g_as_tex_sky   = ptr_null();
+
+let g_as_done: array<i32> = [];        // per stage, 0/1
+let g_as_ms: array<f64> = [];          // per stage, milliseconds, __clock CPU time
+let g_as_seq: array<i32> = [];         // the stages that actually ran, in order
+let g_as_tex_created: i32 = 0;         // null -> non-null texture transitions
+let g_as_world_cells: i32 = 0;
+let g_as_mesh_tris: i32 = 0;
+let g_as_sfx_n: i32 = 0;
+let g_as_seed: i32 = 1337;             // the atlas seed; deterministic, no clock
+let g_as_err: i32 = 0;
+let g_as_uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+fn as_state_init() {
+    g_as_done = [];
+    g_as_ms = [];
+    for (let i = 0; i < AS_STAGE_COUNT; i++) { g_as_done.push(0); g_as_ms.push(0.0); }
+    g_as_seq = [];
+}
+as_state_init();
+
+// ===========================================================================
+// 3. THE MATERIAL BIND TABLE
+// ---------------------------------------------------------------------------
+// meshgen bakes UVs into its vertex arena, so every material must point at a
+// real ATLAS_WORLD cell BEFORE meshgen_build_all() and can never be repointed
+// afterwards. meshgen self-binds MG_MAT_SPEC (7 -> CELL_SNOW) and
+// MG_MAT_NSFLORA (23 -> CELL_NS_FLORA) through its identity default, and
+// derives MG_MAT_VMSKIN / MG_MAT_VMRAIL as texel windows inside METAL and SPEC
+// during build_all. These ten are the ones the boot sequence owes it.
+// ===========================================================================
+
+fn as_bind_materials(): i32 {
+    let a = g_as_atlas_world;
+    if (a == null) { return AS_ERR_TEXGEN; }
+    let pairs: array<i32> = [
+        MG_MAT_BARK,     CELL_BARK,
+        MG_MAT_LEAF,     CELL_LEAF_PINE,
+        MG_MAT_STONE,    CELL_STONE_A,
+        MG_MAT_WOOD,     CELL_WOOD_PLANK,
+        MG_MAT_METAL,    CELL_METAL_PANEL,
+        MG_MAT_CONCRETE, CELL_CONCRETE,
+        MG_MAT_CLOTH,    CELL_FABRIC_CRM,
+        MG_MAT_HIDE,     CELL_WOOD_LOG,
+        MG_MAT_DIRT,     CELL_DIRT,
+        MG_MAT_GLASS,    CELL_WINDOW
+    ];
+    let n: i32 = pairs.length;
+    for (let i = 0; i < n; i = i + 2) {
+        atlas_cell_uv(a, pairs[i + 1], g_as_uv, 0);
+        meshgen_set_material_uv(pairs[i], g_as_uv[0], g_as_uv[1],
+                                g_as_uv[2], g_as_uv[3]);
+    }
+    return AS_OK;
+}
+
+// The cell a material was bound to — so a probe can assert the mesh library is
+// UV-bound to the REAL atlas rather than to meshgen's identity defaults.
+export fn assets_material_cell(p_mat: i32): i32 {
+    if (p_mat == MG_MAT_BARK)     { return CELL_BARK; }
+    if (p_mat == MG_MAT_LEAF)     { return CELL_LEAF_PINE; }
+    if (p_mat == MG_MAT_STONE)    { return CELL_STONE_A; }
+    if (p_mat == MG_MAT_WOOD)     { return CELL_WOOD_PLANK; }
+    if (p_mat == MG_MAT_METAL)    { return CELL_METAL_PANEL; }
+    if (p_mat == MG_MAT_CONCRETE) { return CELL_CONCRETE; }
+    if (p_mat == MG_MAT_CLOTH)    { return CELL_FABRIC_CRM; }
+    if (p_mat == MG_MAT_HIDE)     { return CELL_WOOD_LOG; }
+    if (p_mat == MG_MAT_DIRT)     { return CELL_DIRT; }
+    if (p_mat == MG_MAT_GLASS)    { return CELL_WINDOW; }
+    return 0 - 1;
+}
+
+// ===========================================================================
+// 4. THE STAGES
+// ---------------------------------------------------------------------------
+// Each returns AS_OK or a negative AS_ERR_*. None of them times itself — the
+// stopwatch lives in assets_build_stage so that every stage is measured the
+// same way and a new stage cannot forget to be measured.
+// ===========================================================================
+
+fn as_do_world(): i32 {
+    if (g_as_atlas_world == null) {
+        g_as_atlas_world = atlas_new(g_ATLAS_WORLD_PX, g_ATLAS_WORLD_PX,
+                                     g_ATLAS_WORLD_CELLS, g_ATLAS_WORLD_CELLS);
+    }
+    if (g_as_atlas_world == null) { return AS_ERR_TEXGEN; }
+    g_as_world_cells = texgen_build_world_atlas(g_as_atlas_world, g_as_seed);
+    if (g_as_world_cells != texgen_material_count()) { return AS_ERR_TEXGEN; }
+    return AS_OK;
+}
+
+fn as_do_fx(): i32 {
+    g_as_atlas_fx = fxgen_build_atlas();
+    if (g_as_atlas_fx == null) { return AS_ERR_FXGEN; }
+    return AS_OK;
+}
+
+fn as_do_hud(): i32 {
+    g_as_atlas_hud = hudgen_build_atlas();
+    if (g_as_atlas_hud == null) { return AS_ERR_HUDGEN; }
+    return AS_OK;
+}
+
+fn as_do_sky(): i32 {
+    // skygen_init is one-shot inside skygen (lattice, star field, LUTs); on a
+    // re-boot after assets_reset it returns immediately, which is why
+    // probe_assets reports a COLD total and a WARM total separately.
+    skygen_init();
+    if (skygen_bake_all() != g_SKY_H) { return AS_ERR_SKYGEN; }
+    g_as_atlas_sky = skygen_atlas();
+    if (g_as_atlas_sky == null) { return AS_ERR_SKYGEN; }
+    return AS_OK;
+}
+
+fn as_do_mesh(): i32 {
+    let rc: i32 = as_bind_materials();
+    if (rc != AS_OK) { return rc; }
+    g_as_mesh_tris = meshgen_build_all();
+    if (g_as_mesh_tris <= 0) { return AS_ERR_MESHGEN; }
+    return AS_OK;
+}
+
+// AS_STAGE_SFX — the W3-14 hook. DELIBERATELY EMPTY, AND HERE IS WHY.
+//
+// ARCHITECTURE §6 puts `bank_build()` here: ~60 SFX synthesised to S16 mono
+// PCM and handed to `audio_register_pcm`. W3-13's Deps are W2-5/6/7/8 + W1-8;
+// `src/game/audiobank.hml` belongs to W3-14, which is running in parallel, and
+// this file may not depend on a signature its task was not given. So the stage
+// is honestly EMPTY: 0.00 ms, 0 sounds registered, `assets_sfx()` returns null.
+// It is still wired, ordered, timed and reported, so that W3-14 lands as
+//
+//     import { bank_build, bank_count } from "./audiobank.hml";
+//     ...  bank_build();  g_as_sfx_n = bank_count();
+//
+// and its cost appears in the same table as everything else.
+//
+// ⚠ MEASURED WARNING FOR WHOEVER CONNECTS IT (2026-07-28, -O3, min of 5, this
+// box): `bank_build()` as it landed costs **389 ms** for 65 sounds / 1.42 MB.
+// The atlases and meshes cost 167 ms. 167 + 389 = 556 ms, so connecting the
+// two as they stand puts BOOT AT 1.4x ITS 400 ms BUDGET. W3-14's own
+// acceptance criterion is "synthesis <= 150 ms", so this is a W3-14 defect to
+// fix rather than a budget to raise — do not wire it and quietly move the
+// number. Reported, not worked around.
+fn as_do_sfx(): i32 {
+    g_as_sfx_n = 0;
+    return AS_OK;
+}
+
+fn as_do_upload(p_win): i32 {
+    let win = p_win;
+    if (win == null) { return AS_ERR_NO_WINDOW; }
+    if (g_as_atlas_world == null) { return AS_ERR_UPLOAD; }
+    if (g_as_atlas_fx == null) { return AS_ERR_UPLOAD; }
+    if (g_as_atlas_hud == null) { return AS_ERR_UPLOAD; }
+    if (g_as_atlas_sky == null) { return AS_ERR_UPLOAD; }
+
+    // The blend mode is not decoration: it is which of the four materials this
+    // texture IS. World composites over the sky, FX only ever adds light, HUD
+    // composites over the frame, and the sky is the frame's floor and is never
+    // lit, fogged or tinted, so it takes no blending at all.
+    g_as_tex_world = as_upload_one(win, g_as_atlas_world, BLEND_BLEND, g_as_tex_world);
+    g_as_tex_fx    = as_upload_one(win, g_as_atlas_fx,    BLEND_ADD,   g_as_tex_fx);
+    g_as_tex_hud   = as_upload_one(win, g_as_atlas_hud,   BLEND_BLEND, g_as_tex_hud);
+    g_as_tex_sky   = as_upload_one(win, g_as_atlas_sky,   BLEND_NONE,  g_as_tex_sky);
+
+    if (g_as_tex_world == ptr_null()) { return AS_ERR_UPLOAD; }
+    if (g_as_tex_fx == ptr_null()) { return AS_ERR_UPLOAD; }
+    if (g_as_tex_hud == ptr_null()) { return AS_ERR_UPLOAD; }
+    if (g_as_tex_sky == ptr_null()) { return AS_ERR_UPLOAD; }
+    return AS_OK;
+}
+
+// One upload, counting texture CREATION rather than upload calls. atlas_upload
+// creates the SDL texture only when the atlas has none, so a null -> non-null
+// transition here is exactly one new SDL texture in the process.
+fn as_upload_one(p_win, p_atlas, p_blend: i32, p_prev): ptr {
+    let had: i32 = 0;
+    if (atlas_tex(p_atlas) != ptr_null()) { had = 1; }
+    let t = atlas_upload(p_win, p_atlas, p_blend);
+    if (t == ptr_null()) { let bad: ptr = ptr_null(); return bad; }
+    if (had == 0) { g_as_tex_created++; }
+    let out: ptr = t;
+    return out;
+}
+
+// ===========================================================================
+// 5. THE DRIVER
+// ===========================================================================
+
+// Run one stage if it has not run. Returns AS_OK (also when the stage was
+// already done), or a negative AS_ERR_*. The stopwatch is __clock() CPU time
+// per CLAUDE.md RULE T — never a wall clock, which on this box reads whatever
+// the llama-server is doing.
+export fn assets_build_stage(p_win, p_stage: i32): i32 {
+    let s: i32 = p_stage;
+    if (s < 0) { return AS_ERR_STAGE; }
+    if (s >= AS_STAGE_COUNT) { return AS_ERR_STAGE; }
+    if (g_as_done[s] == 1) { return AS_OK; }
+
+    let t0: f64 = __clock();
+    let rc: i32 = AS_OK;
+    if (s == AS_STAGE_WORLD) { rc = as_do_world(); }
+    if (s == AS_STAGE_FX) { rc = as_do_fx(); }
+    if (s == AS_STAGE_HUD) { rc = as_do_hud(); }
+    if (s == AS_STAGE_SKY) { rc = as_do_sky(); }
+    if (s == AS_STAGE_MESH) { rc = as_do_mesh(); }
+    if (s == AS_STAGE_SFX) { rc = as_do_sfx(); }
+    if (s == AS_STAGE_UPLOAD) { rc = as_do_upload(p_win); }
+    let t1: f64 = __clock();
+
+    if (rc != AS_OK) {
+        // AS_ERR_NO_WINDOW is not a failure, it is the headless boot: the CPU
+        // stages are done and the upload waits for a window. Everything else
+        // is a real error and is recorded.
+        if (rc != AS_ERR_NO_WINDOW) { g_as_err = rc; }
+        let bad: i32 = rc;
+        return bad;
+    }
+    g_as_ms[s] = (t1 - t0) * 1000.0;
+    g_as_done[s] = 1;
+    g_as_seq.push(s);
+    let ok: i32 = AS_OK;
+    return ok;
+}
+
+// The whole boot. Runs every stage that has not run, in AS_STAGE_* order.
+// Returns AS_OK, or the first negative error. Calling it twice does nothing
+// the second time; calling it with `null` runs the six CPU stages and leaves
+// the upload for a later call that has a window.
+export fn assets_build(p_win): i32 {
+    let win = p_win;
+    for (let s = 0; s < AS_STAGE_COUNT; s++) {
+        let rc: i32 = assets_build_stage(win, s);
+        if (rc != AS_OK) {
+            if (rc == AS_ERR_NO_WINDOW) {
+                // headless: skip the upload, everything else already ran
+            } else {
+                let bad: i32 = rc;
+                return bad;
+            }
+        }
+    }
+    let ok: i32 = AS_OK;
+    return ok;
+}
+
+// Destroy the four textures and forget every stage, so the next assets_build
+// is a full cold-ish boot. TOOLS AND PROBES ONLY — a shipping build boots once
+// and never calls this. (skygen's one-shot lattice/star init is inside skygen
+// and is not undone, so a rebuilt sky stage is cheaper than the first one.)
+export fn assets_reset() {
+    if (g_as_atlas_world != null) { atlas_free(g_as_atlas_world); }
+    if (g_as_atlas_fx != null) { atlas_free(g_as_atlas_fx); }
+    if (g_as_atlas_hud != null) { atlas_free(g_as_atlas_hud); }
+    if (g_as_atlas_sky != null) { skygen_free(); }
+    g_as_atlas_world = null;
+    g_as_atlas_fx = null;
+    g_as_atlas_hud = null;
+    g_as_atlas_sky = null;
+    g_as_tex_world = ptr_null();
+    g_as_tex_fx = ptr_null();
+    g_as_tex_hud = ptr_null();
+    g_as_tex_sky = ptr_null();
+    g_as_tex_created = 0;
+    g_as_world_cells = 0;
+    g_as_mesh_tris = 0;
+    g_as_sfx_n = 0;
+    g_as_err = 0;
+    as_state_init();
+}
+
+// ===========================================================================
+// 6. ACCESSORS
+// ===========================================================================
+
+export fn assets_atlas(p_id: i32) {
+    if (p_id == ASSET_WORLD) { return g_as_atlas_world; }
+    if (p_id == ASSET_FX) { return g_as_atlas_fx; }
+    if (p_id == ASSET_HUD) { return g_as_atlas_hud; }
+    if (p_id == ASSET_SKY) { return g_as_atlas_sky; }
+    return null;
+}
+
+export fn assets_tex(p_id: i32): ptr {
+    if (p_id == ASSET_WORLD) { let t: ptr = g_as_tex_world; return t; }
+    if (p_id == ASSET_FX) { let t: ptr = g_as_tex_fx; return t; }
+    if (p_id == ASSET_HUD) { let t: ptr = g_as_tex_hud; return t; }
+    if (p_id == ASSET_SKY) { let t: ptr = g_as_tex_sky; return t; }
+    let n: ptr = ptr_null();
+    return n;
+}
+
+// The blend mode each texture is contractually uploaded with (CLAUDE.md §6).
+export fn assets_blend(p_id: i32): i32 {
+    if (p_id == ASSET_WORLD) { let b: i32 = BLEND_BLEND; return b; }
+    if (p_id == ASSET_FX) { let b: i32 = BLEND_ADD; return b; }
+    if (p_id == ASSET_HUD) { let b: i32 = BLEND_BLEND; return b; }
+    if (p_id == ASSET_SKY) { let b: i32 = BLEND_NONE; return b; }
+    return 0 - 1;
+}
+
+export fn assets_tex_name(p_id: i32): string {
+    if (p_id == ASSET_WORLD) { return "ATLAS_WORLD"; }
+    if (p_id == ASSET_FX) { return "ATLAS_FX"; }
+    if (p_id == ASSET_HUD) { return "ATLAS_HUD"; }
+    if (p_id == ASSET_SKY) { return "TEX_SKY"; }
+    return "?";
+}
+
+// How many SDL textures this module has created and not destroyed. MUST be 4
+// after a boot, and MUST NOT grow on a second boot.
+export fn assets_texture_created(): i32 { let o: i32 = g_as_tex_created; return o; }
+
+// How many of the four slots currently hold a live texture.
+export fn assets_texture_count(): i32 {
+    let n: i32 = 0;
+    if (g_as_tex_world != ptr_null()) { n++; }
+    if (g_as_tex_fx != ptr_null()) { n++; }
+    if (g_as_tex_hud != ptr_null()) { n++; }
+    if (g_as_tex_sky != ptr_null()) { n++; }
+    let o: i32 = n;
+    return o;
+}
+
+export fn assets_mesh(p_id: i32) { return meshgen_mesh(p_id); }
+export fn assets_mesh_count(): i32 { let o: i32 = meshgen_count(); return o; }
+export fn assets_mesh_name(p_id: i32): string { let o: string = meshgen_name(p_id); return o; }
+export fn assets_mesh_tris(p_id: i32): i32 { let o: i32 = meshgen_tris(p_id); return o; }
+export fn assets_mesh_tris_total(): i32 { let o: i32 = g_as_mesh_tris; return o; }
+export fn assets_world_cells(): i32 { let o: i32 = g_as_world_cells; return o; }
+
+// The W3-14 hook. Returns the registered audio chunk for a SFX id, or null
+// until `src/game/audiobank.hml` exists and AS_STAGE_SFX calls bank_build().
+export fn assets_sfx(p_id: i32) {
+    if (g_as_sfx_n == 0) { return null; }
+    return null;
+}
+export fn assets_sfx_count(): i32 { let o: i32 = g_as_sfx_n; return o; }
+
+export fn assets_seed(): i32 { let o: i32 = g_as_seed; return o; }
+export fn assets_set_seed(p_seed: i32) { g_as_seed = p_seed; }
+export fn assets_error(): i32 { let o: i32 = g_as_err; return o; }
+
+// ===========================================================================
+// 7. THE BOOT REPORT — the numbers the title card is hiding
+// ===========================================================================
+
+export fn assets_stage_name(p_s: i32): string {
+    if (p_s == AS_STAGE_WORLD) { return "world_atlas"; }
+    if (p_s == AS_STAGE_FX) { return "fx_atlas"; }
+    if (p_s == AS_STAGE_HUD) { return "hud_atlas"; }
+    if (p_s == AS_STAGE_SKY) { return "sky_panorama"; }
+    if (p_s == AS_STAGE_MESH) { return "meshes"; }
+    if (p_s == AS_STAGE_SFX) { return "sfx"; }
+    if (p_s == AS_STAGE_UPLOAD) { return "upload"; }
+    return "?";
+}
+
+// What the title card says while the stage runs. Short, uppercase, no numbers:
+// the player is looking at a logo, not a profiler.
+export fn assets_stage_label(p_s: i32): string {
+    if (p_s == AS_STAGE_WORLD) { return "WEAVING THE GROUND"; }
+    if (p_s == AS_STAGE_FX) { return "STRIKING SPARKS"; }
+    if (p_s == AS_STAGE_HUD) { return "CUTTING LETTERS"; }
+    if (p_s == AS_STAGE_SKY) { return "HANGING THE SKY"; }
+    if (p_s == AS_STAGE_MESH) { return "GROWING TREES"; }
+    if (p_s == AS_STAGE_SFX) { return "TUNING THE AIR"; }
+    if (p_s == AS_STAGE_UPLOAD) { return "LIGHTING THE LANTERN"; }
+    return "";
+}
+
+export fn assets_stage_ms(p_s: i32): f64 {
+    if (p_s < 0) { return 0.0; }
+    if (p_s >= AS_STAGE_COUNT) { return 0.0; }
+    let o: f64 = g_as_ms[p_s];
+    return o;
+}
+export fn assets_stage_done(p_s: i32): i32 {
+    if (p_s < 0) { return 0; }
+    if (p_s >= AS_STAGE_COUNT) { return 0; }
+    let o: i32 = g_as_done[p_s];
+    return o;
+}
+export fn assets_stages_done(): i32 {
+    let n: i32 = 0;
+    for (let i = 0; i < AS_STAGE_COUNT; i++) { if (g_as_done[i] == 1) { n++; } }
+    let o: i32 = n;
+    return o;
+}
+// Fraction of the boot complete, for the title card's progress bar.
+export fn assets_progress(): f64 {
+    let o: f64 = f64(assets_stages_done()) / f64(AS_STAGE_COUNT);
+    return o;
+}
+// The i-th stage that actually ran. The boot order is a contract, so it is
+// observable: probe_assets asserts this sequence is strictly ascending and
+// covers every stage exactly once.
+export fn assets_seq_len(): i32 { let o: i32 = g_as_seq.length; return o; }
+export fn assets_seq(p_i: i32): i32 {
+    if (p_i < 0) { return 0 - 1; }
+    if (p_i >= g_as_seq.length) { return 0 - 1; }
+    let o: i32 = g_as_seq[p_i];
+    return o;
+}
+
+export fn assets_total_ms(): f64 {
+    let acc: f64 = 0.0;
+    for (let i = 0; i < AS_STAGE_COUNT; i++) { acc = acc + g_as_ms[i]; }
+    let o: f64 = acc;
+    return o;
+}
+export fn assets_budget_ms(): f64 { let o: f64 = g_BUDGET_BOOT_MS; return o; }
+export fn assets_over_budget(): i32 {
+    if (assets_total_ms() > g_BUDGET_BOOT_MS) { return 1; }
+    return 0;
+}
+export fn assets_is_built(): i32 {
+    if (assets_stages_done() == AS_STAGE_COUNT) { return 1; }
+    return 0;
+}
+
+// The per-stage breakdown W3-13 owes. Printed once, at boot, behind the title
+// card — never per frame (CLAUDE.md N3).
+export fn assets_print_report() {
+    print("--- asset boot -------------------------------------------------");
+    for (let i = 0; i < AS_STAGE_COUNT; i++) {
+        let mark: string = "  ";
+        if (g_as_done[i] == 0) { mark = "!!"; }
+        print(`${mark} ${i} ${assets_stage_name(i)}  ${g_as_ms[i]} ms`);
+    }
+    let tot: f64 = assets_total_ms();
+    print(`   total ${tot} ms  / budget ${g_BUDGET_BOOT_MS} ms`);
+    print(`   textures ${assets_texture_count()} (created ${g_as_tex_created}), world cells ${g_as_world_cells}, mesh tris ${g_as_mesh_tris}, sfx ${g_as_sfx_n}`);
+    if (assets_over_budget() == 1) {
+        eprint(`ASSET BOOT OVER BUDGET: ${tot} ms > ${g_BUDGET_BOOT_MS} ms`);
+    }
+    if (g_as_err != 0) { eprint(`ASSET BOOT ERROR ${g_as_err}`); }
+    print("----------------------------------------------------------------");
+}
+
+// The same table as one line, for a stats sidecar.
+export fn assets_report_string(): string {
+    let s: string = "";
+    for (let i = 0; i < AS_STAGE_COUNT; i++) {
+        s = s + assets_stage_name(i) + "=" + `${g_as_ms[i]}` + "ms ";
+    }
+    s = s + "total=" + `${assets_total_ms()}` + "ms budget=" + `${g_BUDGET_BOOT_MS}` + "ms";
+    let o: string = s;
+    return o;
+}
+
+// Dimensions, so a caller never re-hardcodes them. `assets_atlas(id).w/.h` is
+// the truth; these are config's claim about it, and probe_assets asserts the
+// two agree — which is how a texgen that quietly changed size gets caught.
+export fn assets_expect_w(p_id: i32): i32 {
+    if (p_id == ASSET_WORLD) { let o: i32 = g_ATLAS_WORLD_PX; return o; }
+    if (p_id == ASSET_FX) { let o: i32 = g_ATLAS_FX_PX; return o; }
+    if (p_id == ASSET_HUD) { let o: i32 = g_ATLAS_HUD_PX; return o; }
+    if (p_id == ASSET_SKY) { let o: i32 = g_SKY_W; return o; }
+    return 0;
+}
+export fn assets_expect_h(p_id: i32): i32 {
+    if (p_id == ASSET_WORLD) { let o: i32 = g_ATLAS_WORLD_PX; return o; }
+    if (p_id == ASSET_FX) { let o: i32 = g_ATLAS_FX_PX; return o; }
+    if (p_id == ASSET_HUD) { let o: i32 = g_ATLAS_HUD_PX; return o; }
+    if (p_id == ASSET_SKY) { let o: i32 = g_SKY_H; return o; }
+    return 0;
+}
+export fn assets_cell_count(p_id: i32): i32 {
+    let a = assets_atlas(p_id);
+    if (a == null) { return 0; }
+    let o: i32 = atlas_cell_count(a);
+    return o;
+}
