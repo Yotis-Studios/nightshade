@@ -33,6 +33,50 @@ hemlock-lang footprint advice (A6) applies to heightmaps and light bakes instead
 
 ---
 
+## 0.1 CORRECTION — "mirrored UVs draw nothing" is FALSE on the triangle path
+
+Recorded because it invalidates a workaround that is still in the code.
+
+**The real mechanism.** `SDL_RenderGeometryRaw` (SDL 2.0.20, `SDL_render.c:4210`) diverts to
+`SDL_SW_RenderGeometryRaw` on the **software renderer**, which tries to *"reinterpret triangles as
+SDL_Rect"*. Whenever two consecutive triangles share exactly 2 vertices, whose four positions form
+an **exactly** axis-aligned rect (float `==`, no epsilon), and whose four vertex colours are
+bit-identical, SDL **deletes the quad** and issues `SDL_RenderCopyF` instead — throwing away two of
+the four corner UVs, because a rect blit only has a source rect.
+
+Two consequences, both of which we hit:
+1. **The sky rendered as blocks with hard seams**, because every cell met all three conditions and
+   was drawn as an unsheared crop rather than a sheared quad.
+2. **Cells rendered pure white** when the shear made the source span collapse: `s.w` computed to
+   `(int)(-0.9) = 0`, and SDL fell through to the *untextured* branch, filling the rect with the
+   flat vertex colour. Sky vertices are full white, so: solid white rectangles.
+
+**Fix:** `sky_quad_uv` offsets one vertex by **1/1024 px** (`g_SKY_SHEAR`), breaking the
+axis-aligned condition so the real triangle path runs. Free — `SW_QueueGeometry` truncates
+destination coordinates to whole pixels before rasterizing, so the offset is invisible. Verified:
+pure-white cells went from **664 regions / 575,960 px across 340 of 2112 swept frames to zero**, and
+vertical cell-boundary |ΔLuma| at pitch +45 fell **32.15 → 4.23**. Triangles and frame time unchanged.
+
+### What this invalidates
+The comment block "MIRRORED UVs DRAW NOTHING" in `world_render.hml` described the same bug, not a
+rasterizer limitation: a mirrored `u` makes `s.w` negative and `RenderCopyF` rejects it. Confirmed
+in C against the real libSDL2 that **the triangle path draws either winding correctly**
+(`textured=19200` vs `textured=0` on the rect path).
+
+**Therefore `hudgen.hml`'s baked-second-sprite workaround for `HUD_MM_CORNER` is unnecessary** — a
+UV flip works on the triangle path. It is harmless (it costs atlas cells, not frame time), so it is
+recorded here rather than ripped out mid-playtest.
+
+**The negated azimuth in `sky_emit` stays** — that is required by the seam split for a different
+reason.
+
+> The general lesson: the HUD is *also* silently taking the rect path, and that is fine there
+> because a HUD quad's UVs genuinely are an axis-aligned rect, so the two discarded corners carry no
+> information. It only bites when a quad needs true per-corner UVs. Anyone adding a second such
+> quad should know this exists.
+
+---
+
 ## 1. THE SHAPE OF THE THING
 
 Three repositories, three responsibilities, one hard rule between them.

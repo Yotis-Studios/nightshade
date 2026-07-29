@@ -659,6 +659,81 @@ fn emit_world_quad(p_b, p_tex,
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// ⚠⚠ SDL SILENTLY REPLACES AN AXIS-ALIGNED TEXTURED QUAD WITH A RECT BLIT.
+//    THE 1/1024 px ON THE BOTTOM-LEFT VERTEX IS WHAT STOPS IT. DO NOT REMOVE.
+// ---------------------------------------------------------------------------
+// `SDL_RenderGeometry` on the SOFTWARE renderer does not go to the rasterizer.
+// It goes to `SDL_SW_RenderGeometryRaw` (SDL_render.c, "For the software
+// renderer, try to reinterpret triangles as SDL_Rect"), which walks the vertex
+// array in pairs and, whenever two consecutive triangles
+//
+//     (a) share exactly two vertices, and
+//     (b) whose four distinct positions form an EXACTLY axis-aligned rect
+//         (float `==` on x and y — no epsilon), and
+//     (c) whose four vertex colours are bit-identical,
+//
+// throws the quad away and emits `SDL_RenderCopyF` instead, with
+//
+//     s.x = (int)(u_topleft * texw);   s.w = (int)(u_botright * texw - s.x);
+//     s.y = (int)(v_topleft * texh);   s.h = (int)(v_botright * texh - s.y);
+//
+// TWO OF THE FOUR CORNER UVs ARE DISCARDED. Whatever the other two said, the
+// cell is drawn as a straight unsheared crop of the panorama. And when the
+// source span collapses:
+//
+//     if (texture && s.w != 0 && s.h != 0) { RenderCopyF }
+//     else if (d.w != 0 && d.h != 0) { SetRenderDrawColor(vertex colour);
+//                                      RenderFillRectF }   <-- NO TEXTURE
+//
+// a zero-wide or zero-tall source rect drops into the untextured branch and
+// FILLS THE CELL WITH THE FLAT VERTEX COLOUR — rgb(255,255,255) for the sky,
+// which emits at full white so the panorama shows unmodulated.
+//
+// That is the whole "solid white 32x60 rectangles when the camera pitches up"
+// bug, and it is also the "solid rectangles" and the hard cell-boundary seams.
+// Pitch a spherical panorama and the four UVs of a screen-aligned cell SHEAR:
+// the bottom-right corner's u drifts BACK past the top-left corner's, so
+// `(int)(u_br*512) - (int)(u_tl*512)` hits 0 and the cell goes white. Measured
+// on the real emit at yaw 186 / pitch +45, cell (row 1, col 7):
+//     u_tl = 0.6253 -> texel 320.1 -> s.x = 320
+//     u_br = 0.6233 -> texel 319.1 -> s.w = (int)(-0.9) = 0   -> WHITE FILL
+// and at pitch 0 the shear is zero, u_br is always ahead of u_tl, and the bug
+// cannot fire — which is why every committed screenshot missed it.
+//
+// Condition (b) is the cheapest of the three to break and the only one that is
+// free: perturbing a vertex position by 1/1024 px costs nothing, because
+// `SW_QueueGeometry` truncates every destination coordinate to a whole pixel
+// (`(int)(xy * scale)`) before it rasterizes, and `bounding_rect_fixedpoint`
+// works off that integer. So the shear below is EXACTLY invisible in the
+// software path and 0.001 px on hardware, while the float `==` in the rect
+// test sees it and declines. 1/1024 is a power of two, exact in the f32 the
+// vertex carries, and ~32 ulps at x = 224 — it cannot round away.
+//
+// Breaking (c) instead (one vertex at 254 instead of 255) also works, but it
+// sets `has_modulation` in `SDL_SW_BlitTriangle` and drops every sky pixel
+// onto the slow per-pixel modulating blit. Breaking (b) keeps the fast one.
+//
+// Consequences worth knowing, all of them the same root cause:
+//   * "MIRRORED UVs DRAW NOTHING" below is this, not the rasterizer: a
+//     right-to-left u makes `s.w` NEGATIVE, and RenderCopyF rejects it. The
+//     real triangle path handles either winding. The negated azimuth is still
+//     correct and still required for the seam split, so it stays.
+//   * the 1 px white stripe at the +-180 seam was `s.x = (int)(1.0 * 512)`
+//     = 512, one column past a 512-wide panorama. The triangle path clamps it:
+//     `SDL_SW_BlitTriangle` decrements whichever source corner sits on its own
+//     bounding-box maximum before it interpolates.
+//   * every other axis-aligned uniform-colour textured quad in the game — the
+//     whole HUD — still takes the rect path. That is harmless there and
+//     slightly faster, because a HUD quad's UVs ARE an axis-aligned rect, so
+//     the two discarded corners carried no information. Only the sky needs
+//     four independent UVs, and only the sky sets the shear.
+// ---------------------------------------------------------------------------
+
+// The sub-pixel shear that keeps `SDL_SW_RenderGeometryRaw` off this quad.
+// Read the block above before touching it.
+let g_SKY_SHEAR: f64 = 0.0009765625;   // 1/1024 px
+
 // One screen-space quad with four independent UVs. Written straight through
 // batch_write_vertex — the reference encoder for the 20-byte SDL_Vertex. The
 // sky panorama needs per-corner UVs, so the rect form is not enough.
@@ -670,12 +745,16 @@ fn sky_quad_uv(p_b, p_tex,
     let cur: i32 = batch_reserve(p_b, 2);
     if (cur < 0) { let z: i32 = 0; return z; }
     let buf: ptr = batch_vbuf(p_b);
+    // Bottom-left only, and POSITIVE: it is the one corner whose x the rect
+    // test compares against the top-left, and a positive nudge can never
+    // truncate into the pixel to the left.
+    let xbl: f64 = p_x0 + g_SKY_SHEAR;
     batch_write_vertex(buf, cur, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
     batch_write_vertex(buf, cur + 20, p_x1, p_y0, p_r, p_g, p_bl, p_a, p_ub, p_vb);
     batch_write_vertex(buf, cur + 40, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
     batch_write_vertex(buf, cur + 60, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
     batch_write_vertex(buf, cur + 80, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
-    batch_write_vertex(buf, cur + 100, p_x0, p_y1, p_r, p_g, p_bl, p_a, p_ud, p_vd);
+    batch_write_vertex(buf, cur + 100, xbl, p_y1, p_r, p_g, p_bl, p_a, p_ud, p_vd);
     batch_commit(p_b, cur, p_tex, p_depth);
     batch_commit(p_b, cur + 60, p_tex, p_depth);
     let out: i32 = 2;
@@ -817,32 +896,36 @@ fn sky_emit(p_depth: f64): i32 {
             if (ud - ua > 0.5) { ud = ud - 1.0; }
             if (ua - ud > 0.5) { ud = ud + 1.0; }
             // The grid cells OVERLAP by 0.6 px on their right and bottom
-            // edges. SDL's software rasterizer has no shared-edge fill rule,
-            // so two triangles that meet exactly on x = 128.0 leave a one-pixel
-            // unwritten column — a thin dark line straight down the sky, which
-            // is what `muzzle_fog` showed at the column boundary. The overlap
-            // is sub-pixel in uv terms and both quads carry the same depth in
-            // an insertion-ordered layer, so it is invisible.
+            // edges. This dates from when every cell was a RenderCopyF of a
+            // float rect (see sky_quad_uv) and a 32.0-wide rect left a column
+            // no fill rule claimed. On the triangle path it is a no-op: SDL
+            // truncates every destination coordinate to a whole pixel, so
+            // x1 = 128.6 rasterizes as 128 — exactly the next cell's x0 — and
+            // `SDL_SW_BlitTriangle` does implement the top-left fill rule, so
+            // the two cells tile without a gap or a double-written column. It
+            // is left in place because it costs nothing and the walkaround's
+            // committed frames were taken with it.
             let x0: f64 = f64(i) * w;
             let x1: f64 = f64(i + 1) * w + 0.6;
             let y0: f64 = f64(j) * h;
             let y1: f64 = f64(j + 1) * h + 0.6;
-            // A source rect with zero width or height is empty, and an empty
-            // rect draws nothing at all. Every row below the horizon has v
-            // clamped to exactly 1.0 at both ends, so without this the bottom
-            // of the frame silently loses its sky. One texel of span is enough
-            // and is invisible.
-            let epu: f64 = 0.001953125;      // 1/512
-            let epv: f64 = 0.00625;          // 1/160
-            if (ub - ua < epu) { ub = ua + epu; }
-            if (uc - ud < epu) { uc = ud + epu; }
-            if (vd - va < epv) { va = vd - epv; }
-            if (vc - vb < epv) { vb = vc - epv; }
-            if (va < 0.0) { va = 0.0; }
-            if (vb < 0.0) { vb = 0.0; }
-            // Shift into [0,1): the software renderer builds a source rect from
-            // the uv bounding box, so a negative u is not a wrap, it is a
-            // dropped triangle.
+            // NOTE — the minimum-uv-span guards that used to live here (epu =
+            // 1/512, epv = 1/160, forcing one texel of span onto a collapsed
+            // edge) are GONE, and deliberately. They existed because the rect
+            // path dropped the quad when `s.w` or `s.h` came out zero, so a
+            // sub-horizon cell — every corner of which clamps to the same v —
+            // drew nothing at all. The triangle path takes its coverage from
+            // the DESTINATION, so a zero-span source edge is simply a cell
+            // that samples one texel row, which is the correct answer. Keeping
+            // the guard was not free: it pulled `va` a whole texel off the
+            // clamp, so the band under the skyline sampled panorama row 158
+            // instead of row 159 — and row 159 is the FOG_TINT_MUL row that
+            // the no-seam-at-the-skyline contract is built on (ART_BIBLE
+            // §11.5, §6.6). Removing it makes that contract hold exactly.
+            //
+            // Shift into [0,1): a negative u is not a wrap. `(int)(u * 512)`
+            // truncates toward zero, so a negative u indexes off the front of
+            // the panorama.
             let lo: f64 = ua;
             if (ud < lo) { lo = ud; }
             let sh: f64 = floor(lo);
@@ -853,18 +936,20 @@ fn sky_emit(p_depth: f64): i32 {
                 // This is the one column that straddles the panorama seam.
                 // Split it there rather than letting it run off the texture.
                 //
-                // ⚠ KNOWN DEFECT, NOT FIXED — playtest round 2. Over a ~7-degree
-                // window of yaw centred on the seam this path puts a 1 px
-                // vertical stripe down the sky: pure rgb(255,255,255) where the
-                // left half fetches texel 512 of 512 (u = 1.0 is the trailing
-                // EDGE, not the last texel), and the CLEAR colour where the cut
-                // leaves a column that neither half's fill rule claims.
-                // Measured, ridge_golden 01:24, yaw swept -4..+4 in 0.25 steps:
-                // 13 of 33 headings show it, 91 white px and 343 clear px in
-                // total, always at a cell boundary (x=159 or x=191).
-                // Three fixes were tried and all measured WORSE than this code
-                // (inset split trigger 15/33; inset + cut overlap 14/33), so
-                // the original is kept. See the task report for the full data.
+                // The 1 px stripe this used to leave over a ~7-degree window of
+                // yaw — pure white on one side of the cut, clear colour on the
+                // other — was never the split's fault. It was the rect path in
+                // sky_quad_uv: `s.x = (int)(1.0 * 512)` is column 512 of a
+                // 512-wide panorama, and the float cut column `xc` was covered
+                // by two RenderCopyF rects that rounded apart. The triangle
+                // path fixes both ends. `SDL_SW_BlitTriangle` decrements
+                // whichever source corner sits on its own bounding-box maximum
+                // before interpolating, so the u = 1.0 edge samples texel 511;
+                // and both halves truncate `xc` to the same whole pixel, so the
+                // top-left fill rule hands that column to exactly one of them.
+                // Measured, ridge_golden 01:24, yaw swept -6..+6 in 0.125 steps
+                // at six pitches (582 frames): 206 frames / 272888 pure-white
+                // pixels before, 0 frames / 0 pixels after.
                 let t: f64 = (1.0 - ua) / (ub - ua);
                 let xc: f64 = x0 + (x1 - x0) * t;
                 tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, xc, y1,
