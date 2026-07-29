@@ -1,0 +1,1265 @@
+// =============================================================================
+//  probe_movement.hml — W4-1 acceptance probe for src/sim/movement.hml.
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT, and BOTH ways — the printed hashes
+//  are what make running it twice meaningful:
+//      hemlockc -O1 tools/probe_movement.hml -o /tmp/pmv && /tmp/pmv
+//      hemlock  tools/probe_movement.hml
+//  Interpreted and compiled output must be byte-identical (diff them).
+//
+//  It exits 1 on any failure AND on an assertion-count mismatch — a probe that
+//  silently stops running half its checks is worse than no probe.
+//
+//  WHAT IT ASSERTS, and why it asserts it that way
+//  -----------------------------------------------
+//  Properties and invariants first, digits only where GDD §2.3 states a digit
+//  and W4-1's acceptance names a tolerance ("apex 0.99 m, air time 0.60 s,
+//  within 1 %"). Where a number is an EMERGENT measurement rather than a
+//  design constant — the downhill slide-jump chain, ns/call — the probe PRINTS
+//  it and bounds it loosely, because pinning an emergent number is how probes
+//  go stale silently.
+//
+//  Terrain comes from three deterministic sources: a flat plane, an exact
+//  15-degree slope, and the REAL `worldgen.hml` through the ARCHITECTURE
+//  §5.4b adapter, so the collision path is exercised against shipping terrain
+//  and not only against a fixture.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { is_dir, read_file } from "@stdlib/fs";
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import { chunk_store_new_cap, chunk_set_source, chunk_height_at, chunk_normal_at,
+         CHUNK_N, CHUNK_SAMPLES, CHUNK_CELLS, CHUNK_M, CHUNK_H_STRIDE_B,
+         CHUNK_H_MISS } from "../src/sim/chunk.hml";
+
+import { worldgen_chunk, worldgen_poi_roll } from "../src/sim/worldgen.hml";
+
+import { cmd_new, cmd_set, cmd_hash,
+         BTN_JUMP, BTN_CROUCH, BTN_SPRINT, BTN_ADS } from "../src/sim/command.hml";
+
+import { world_new, world_spawn_player } from "../src/sim/world.hml";
+
+import { ps_new, move_place, move_apply, move_apply_ex,
+         predicted_capture, predicted_restore, move_state_hash,
+         move_px, move_py, move_pz, move_eye_y, move_grounded, move_sliding,
+         move_mantling, move_speed_h, move_height, move_take_fall_damage,
+         move_solids_new, move_solids_add, move_solids_count,
+         move_from_world, move_to_world,
+         move_ground_miss_count, move_call_count, move_reset_counters,
+         PS_PX, PS_PY, PS_PZ, PS_VX, PS_VY, PS_VZ, PS_YAW, PS_PITCH,
+         PS_GROUNDED, PS_CROUCH, PS_EYE, PS_SLIDE_T, PS_SLIDE_CD,
+         PS_COYOTE_T, PS_JUMP_BUF_T, PS_BHOP_T, PS_MANTLE_T, PS_LEDGE_T,
+         PS_AIR_T, PS_FALL_PEAK, PS_FALL_DMG, PS_STEP_DIST, PS_TICKS,
+         PS_FIELDS,
+         MOVE_EV_JUMP, MOVE_EV_LAND, MOVE_EV_SLIDE_START, MOVE_EV_SLIDE_END,
+         MOVE_EV_SLIDEJUMP, MOVE_EV_MANTLE_START, MOVE_EV_MANTLE_END,
+         MOVE_EV_FALL_DMG, MOVE_EV_STEP, MOVE_EV_BLOCKED, MOVE_EV_STEP_UP,
+         MOVE_SPEED_CAP, MOVE_COYOTE_S, MOVE_BHOP_S, MOVE_JUMPBUF_S
+       } from "../src/sim/movement.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump it deliberately, never to make red go green.
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 127;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+// |a - b| <= tol
+fn near(p_a: f64, p_b: f64, p_tol: f64): bool {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let out: bool = d <= p_tol;
+    return out;
+}
+
+// The acceptance tolerance for a GDD number: 1 %.
+fn pct1(p_v: f64): f64 {
+    let a: f64 = p_v;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a * 0.01;
+    return out;
+}
+
+// ===========================================================================
+//  THREE TERRAIN SOURCES
+// ===========================================================================
+//  All three obey the chunk.hml injected-source contract: 81 u16-LE cm heights
+//  at hoff, 81 biome bytes at aoff, 81 light bytes at aoff + 81.
+
+let g_FLAT_M: f64 = 10.0;
+
+fn flat_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+               p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let hp: ptr = buffer_ptr(p_hbuf);
+    let ap: ptr = buffer_ptr(p_abuf);
+    let hoff: i32 = p_hoff;
+    let aoff: i32 = p_aoff;
+    let cm: i32 = i32(g_FLAT_M * 100.0);
+    let n: i32 = CHUNK_SAMPLES;
+    let si: i32 = 0;
+    while (si < n) {
+        ptr_write_u16(ptr_offset(hp, hoff + si * 2, 1), cm);
+        ptr_write_u8(ptr_offset(ap, aoff + si, 1), 0);
+        ptr_write_u8(ptr_offset(ap, aoff + n + si, 1), 255);
+        si++;
+    }
+    return 0;
+}
+
+// An EXACT constant grade downhill along +x, starting at x = 0. The sample
+// grid reconstructs a linear function exactly, so the slope is the slope.
+let g_SLOPE_BASE_M: f64 = 200.0;
+let g_SLOPE_GRADE: f64 = 0.2679491924311227;     // tan 15 degrees
+
+fn slope_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let hp: ptr = buffer_ptr(p_hbuf);
+    let ap: ptr = buffer_ptr(p_abuf);
+    let hoff: i32 = p_hoff;
+    let aoff: i32 = p_aoff;
+    let n: i32 = CHUNK_N;
+    let iz: i32 = 0;
+    while (iz < n) {
+        let ix: i32 = 0;
+        while (ix < n) {
+            let si: i32 = iz * n + ix;
+            let wx: f64 = f64(p_cx) * CHUNK_M + f64(ix) * 4.0;
+            let h: f64 = g_SLOPE_BASE_M;
+            if (wx > 0.0) { h = g_SLOPE_BASE_M - g_SLOPE_GRADE * wx; }
+            if (h < 1.0) { h = 1.0; }
+            ptr_write_u16(ptr_offset(hp, hoff + si * 2, 1), i32(h * 100.0 + 0.5));
+            ptr_write_u8(ptr_offset(ap, aoff + si, 1), 0);
+            ptr_write_u8(ptr_offset(ap, aoff + CHUNK_SAMPLES + si, 1), 255);
+            ix++;
+        }
+        iz++;
+    }
+    return 0;
+}
+
+// The REAL generator, through the ARCHITECTURE §5.4b five-line adapter.
+let g_ws_h: buffer = buffer(162);
+let g_ws_b: buffer = buffer(81);
+
+fn wgen_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+               p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    worldgen_chunk(p_seed, p_cx, p_cz, g_ws_h, g_ws_b);
+    memcpy(ptr_offset(buffer_ptr(p_hbuf), p_hoff, 1), buffer_ptr(g_ws_h), 162);
+    memcpy(ptr_offset(buffer_ptr(p_abuf), p_aoff, 1), buffer_ptr(g_ws_b), 81);
+    let ap: ptr = buffer_ptr(p_abuf);
+    let n: i32 = CHUNK_SAMPLES;
+    let si: i32 = 0;
+    while (si < n) {
+        ptr_write_u8(ptr_offset(ap, p_aoff + n + si, 1), 255);
+        si++;
+    }
+    let meta: i32 = worldgen_poi_roll(p_seed, p_cx, p_cz);
+    return meta;
+}
+
+fn flat_store(): object {
+    let cs: object = chunk_store_new_cap(64, 16, 1);
+    chunk_set_source(cs, flat_source);
+    return cs;
+}
+
+fn slope_store(): object {
+    let cs: object = chunk_store_new_cap(64, 16, 1);
+    chunk_set_source(cs, slope_source);
+    return cs;
+}
+
+fn wgen_store(p_seed: i32): object {
+    let cs: object = chunk_store_new_cap(64, 16, p_seed);
+    chunk_set_source(cs, wgen_source);
+    return cs;
+}
+
+// ===========================================================================
+//  DRIVING THE SIM
+// ===========================================================================
+//  Yaw pi/2 makes forward = (sin yaw, -cos yaw) = (+1, 0), i.e. world +x.
+//  Every test that measures a distance drives along +x for that reason.
+
+let g_YAW_PX: f64 = 1.5707963267948966;
+let g_cmd: object = cmd_new();
+let g_tick: i32 = 0;
+let g_ev_or: i32 = 0;
+let g_ev_and_first: i32 = 0;
+
+fn drive(p_ps: array<f64>, p_cs: object, p_sol: array<f64>, p_n: i32,
+         p_mx: f64, p_my: f64, p_yaw: f64, p_btn: i32): i32 {
+    let ps = p_ps;
+    let n: i32 = p_n;
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        cmd_set(g_cmd, g_tick, 16, p_mx, p_my, p_yaw, 0.0, p_btn, 0, g_tick);
+        g_tick = g_tick + 1;
+        acc = acc | move_apply_ex(ps, p_cs, g_cmd, p_sol);
+        i++;
+    }
+    g_ev_or = acc;
+    let out: i32 = acc;
+    return out;
+}
+
+// One tick, so a test can watch an edge.
+fn drive1(p_ps: array<f64>, p_cs: object, p_sol: array<f64>,
+          p_mx: f64, p_my: f64, p_yaw: f64, p_btn: i32): i32 {
+    let out: i32 = drive(p_ps, p_cs, p_sol, 1, p_mx, p_my, p_yaw, p_btn);
+    return out;
+}
+
+let g_nosol: array<f64> = [];
+
+// ===========================================================================
+//  1. STATE SHAPE, CAPTURE/RESTORE, HASH
+// ===========================================================================
+fn test_state() {
+    print("-- 1. PredictedState: shape, capture/restore, bit-exact hash");
+
+    let ps: array<f64> = ps_new();
+    ck(ps.length == PS_FIELDS, "ps_new allocates exactly PS_FIELDS slots", `${ps.length}`);
+    ck(PS_FIELDS >= 30, "PredictedState is wide enough to hold every movement variable",
+       `${PS_FIELDS}`);
+
+    // Every named variable W4-1 calls out has an index, and they are distinct.
+    let seen: array<i32> = [];
+    let i: i32 = 0;
+    while (i < PS_FIELDS) { seen.push(0); i++; }
+    seen[PS_COYOTE_T] = seen[PS_COYOTE_T] + 1;
+    seen[PS_SLIDE_T] = seen[PS_SLIDE_T] + 1;
+    seen[PS_BHOP_T] = seen[PS_BHOP_T] + 1;
+    seen[PS_SLIDE_CD] = seen[PS_SLIDE_CD] + 1;
+    seen[PS_JUMP_BUF_T] = seen[PS_JUMP_BUF_T] + 1;
+    seen[PS_MANTLE_T] = seen[PS_MANTLE_T] + 1;
+    let dup: i32 = 0;
+    let tot: i32 = 0;
+    i = 0;
+    while (i < PS_FIELDS) {
+        if (seen[i] > 1) { dup = dup + 1; }
+        tot = tot + seen[i];
+        i++;
+    }
+    ck(dup == 0 && tot == 6,
+       "coyote / slide / bhop / slide-cd / jump-buffer / mantle each own a distinct field",
+       `dup=${dup} tot=${tot}`);
+
+    // Round trip.
+    let cs: object = flat_store();
+    move_place(ps, cs, 3.0, -7.0);
+    drive(ps, cs, g_nosol, 40, 0.3, 1.0, 0.7, BTN_SPRINT);
+    let snap: array<f64> = ps_new();
+    let ncap: i32 = predicted_capture(snap, ps);
+    ck(ncap == PS_FIELDS, "predicted_capture copies every field", `${ncap}`);
+
+    let h0: i32 = move_state_hash(ps);
+    drive(ps, cs, g_nosol, 25, -1.0, 0.0, 2.1, BTN_JUMP);
+    let h1: i32 = move_state_hash(ps);
+    ck(h0 != h1, "moving changes the state hash (the hash is not a constant)",
+       `${h0} vs ${h1}`);
+
+    let nres: i32 = predicted_restore(ps, snap);
+    ck(nres == PS_FIELDS, "predicted_restore copies every field", `${nres}`);
+    ck(move_state_hash(ps) == h0, "capture -> mutate -> restore reproduces the hash exactly",
+       `${move_state_hash(ps)} vs ${h0}`);
+
+    let bitexact: i32 = 1;
+    i = 0;
+    while (i < PS_FIELDS) {
+        if (ps[i] != snap[i]) { bitexact = 0; }
+        i++;
+    }
+    ck(bitexact == 1, "capture/restore round-trips every field BIT-for-bit, not near-enough", "");
+
+    // The hash must see a one-ulp difference; that is the whole point of
+    // hashing the IEEE bytes instead of rounding first.
+    let a: array<f64> = ps_new();
+    let b: array<f64> = ps_new();
+    predicted_capture(a, ps);
+    predicted_capture(b, ps);
+    ck(move_state_hash(a) == move_state_hash(b), "identical states hash identically", "");
+    b[PS_PX] = b[PS_PX] + 0.0000000000001;
+    ck(move_state_hash(a) != move_state_hash(b),
+       "a 1e-13 m divergence in one field changes the hash", "");
+}
+
+// ===========================================================================
+//  2. GROUND SPEEDS — the GDD §2.3 table, to 1 %
+// ===========================================================================
+fn steady_speed(p_cs: object, p_btn: i32, p_mx: f64, p_my: f64): f64 {
+    let ps: array<f64> = ps_new();
+    move_place(ps, p_cs, 0.0, 0.0);
+    drive(ps, p_cs, g_nosol, 180, p_mx, p_my, g_YAW_PX, p_btn);
+    let out: f64 = move_speed_h(ps);
+    return out;
+}
+
+fn test_speeds() {
+    print("-- 2. ground speeds (GDD 2.3: walk 4.4 / sprint 7.0 / crouch 2.3 / ADS 2.9)");
+    let cs: object = flat_store();
+
+    let vw: f64 = steady_speed(cs, 0, 0.0, 1.0);
+    print(`   walk    ${vw} m/s`);
+    ck(near(vw, 4.4, pct1(4.4)), "walk settles at 4.4 m/s (1 %)", `${vw}`);
+
+    let vs: f64 = steady_speed(cs, BTN_SPRINT, 0.0, 1.0);
+    print(`   sprint  ${vs} m/s`);
+    ck(near(vs, 7.0, pct1(7.0)), "sprint settles at 7.0 m/s (1 %)", `${vs}`);
+
+    let vc: f64 = steady_speed(cs, BTN_CROUCH, 0.0, 1.0);
+    print(`   crouch  ${vc} m/s`);
+    ck(near(vc, 2.3, pct1(2.3)), "crouch walk settles at 2.3 m/s (1 %)", `${vc}`);
+
+    let va: f64 = steady_speed(cs, BTN_ADS, 0.0, 1.0);
+    print(`   ADS     ${va} m/s`);
+    ck(near(va, 2.9, pct1(2.9)), "ADS walk settles at 2.9 m/s (1 %)", `${va}`);
+
+    // Sprinting sideways or backwards is not sprinting: the +-40 degree cone.
+    // 39 degrees inside, 41 degrees outside; the axes are quantized to 1/127,
+    // so the test angles are built from sin/cos and quantization is part of it.
+    let a39: f64 = 0.6806784082777885;      // 39 deg in radians
+    let a41: f64 = 0.7155849933176751;      // 41 deg
+    let v39: f64 = steady_speed(cs, BTN_SPRINT, sin(a39), cos(a39));
+    let v41: f64 = steady_speed(cs, BTN_SPRINT, sin(a41), cos(a41));
+    print(`   sprint at 39 deg ${v39} m/s, at 41 deg ${v41} m/s`);
+    ck(near(v39, 7.0, pct1(7.0) * 2.0), "sprint is allowed 39 deg off forward", `${v39}`);
+    ck(v41 < 4.7 && v41 > 4.1, "sprint is REFUSED 41 deg off forward (falls back to walk)",
+       `${v41}`);
+    let vback: f64 = steady_speed(cs, BTN_SPRINT, 0.0, -1.0);
+    ck(near(vback, 4.4, pct1(4.4)), "sprinting backwards is walking", `${vback}`);
+
+    // Crouch and ADS beat sprint; sprint never wins a stance argument.
+    let vcs: f64 = steady_speed(cs, BTN_SPRINT | BTN_CROUCH, 0.0, 1.0);
+    ck(near(vcs, 2.3, pct1(2.3)), "crouch+sprint is crouch speed, not sprint", `${vcs}`);
+
+    // Ground acceleration is 60 m/s^2 and ground friction is 8.0/s, and the
+    // two fight: bare accel would reach 4.4 m/s in 4.4 ticks, friction taxes
+    // ~13 % of the current speed every tick on the way, so the real figure is
+    // ~7 ticks. Assert the FEEL property — full speed inside 0.15 s — rather
+    // than a digit that ignores half the model.
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    let t: i32 = 0;
+    let reached: i32 = -1;
+    while (t < 60) {
+        drive1(ps, cs, g_nosol, 0.0, 1.0, g_YAW_PX, 0);
+        t++;
+        if (reached < 0 && move_speed_h(ps) >= 4.4 * 0.999) { reached = t; }
+    }
+    print(`   walk speed reached in ${reached} ticks = ${f64(reached) / 60.0} s`);
+    ck(reached >= 4 && reached <= 9, "accel 60 vs friction 8.0 reaches walk speed in <= 0.15 s",
+       `${reached} ticks`);
+
+    // Friction 8.0/s: released input decays, and it actually STOPS.
+    drive(ps, cs, g_nosol, 60, 0.0, 0.0, g_YAW_PX, 0);
+    ck(move_speed_h(ps) < 0.001, "friction brings the player to a full stop, not a crawl",
+       `${move_speed_h(ps)}`);
+
+    // Stance geometry.
+    let ps2: array<f64> = ps_new();
+    move_place(ps2, cs, 0.0, 0.0);
+    ck(near(move_eye_y(ps2) - move_py(ps2), 1.62, 0.001), "standing eye is 1.62 m", "");
+    ck(near(move_height(ps2), 1.75, 0.001), "standing capsule is 1.75 m", "");
+    drive(ps2, cs, g_nosol, 30, 0.0, 0.0, g_YAW_PX, BTN_CROUCH);
+    ck(near(move_eye_y(ps2) - move_py(ps2), 0.82, 0.001), "crouched eye is 0.82 m", "");
+    ck(near(move_height(ps2), 0.95, 0.001), "crouched capsule is 0.95 m", "");
+    // Crouch transition is 0.15 s = 9 ticks: half way after 4.
+    let ps3: array<f64> = ps_new();
+    move_place(ps3, cs, 0.0, 0.0);
+    drive(ps3, cs, g_nosol, 4, 0.0, 0.0, g_YAW_PX, BTN_CROUCH);
+    let mid: f64 = ps3[PS_CROUCH];
+    ck(mid > 0.35 && mid < 0.65, "the 0.15 s crouch transition is half done after 4 ticks",
+       `${mid}`);
+}
+
+// ===========================================================================
+//  3. THE JUMP — apex 0.99 m, air time 0.60 s
+// ===========================================================================
+fn test_jump() {
+    print("-- 3. jump: apex 0.99 m, air time 0.60 s (GDD 2.3, 1 %)");
+    let cs: object = flat_store();
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    let y0: f64 = move_py(ps);
+
+    let ev1: i32 = drive1(ps, cs, g_nosol, 0.0, 0.0, g_YAW_PX, BTN_JUMP);
+    ck((ev1 & MOVE_EV_JUMP) != 0, "pressing jump on the ground emits MOVE_EV_JUMP", "");
+    ck(move_grounded(ps) == 0, "the player leaves the ground on the jump tick", "");
+
+    let apex: f64 = 0.0;
+    let air: i32 = 1;
+    let landed: i32 = 0;
+    let t: i32 = 0;
+    while (t < 200 && landed == 0) {
+        let ev: i32 = drive1(ps, cs, g_nosol, 0.0, 0.0, g_YAW_PX, 0);
+        t++;
+        let h: f64 = move_py(ps) - y0;
+        if (h > apex) { apex = h; }
+        if ((ev & MOVE_EV_LAND) != 0) { landed = 1; air = t + 1; }
+    }
+    let airs: f64 = f64(air) / 60.0;
+    print(`   apex ${apex} m, air time ${airs} s (${air} ticks)`);
+    ck(landed == 1, "the jump lands", "");
+    ck(near(apex, 0.99, pct1(0.99)), "apex is 0.99 m (1 %)", `${apex}`);
+    ck(near(airs, 0.60, pct1(0.60)), "air time is 0.60 s (1 %)", `${airs}`);
+    ck(move_grounded(ps) == 1, "the player is grounded after landing", "");
+    ck(near(move_py(ps), y0, 0.0001), "the player lands back on the surface it left", "");
+    ck(move_take_fall_damage(ps) == 0.0, "a 0.99 m jump does no fall damage", "");
+
+    // Jump distance: walk cannot clear 4 m; that is the control for the slide.
+    let ps2: array<f64> = ps_new();
+    move_place(ps2, cs, 0.0, 0.0);
+    drive(ps2, cs, g_nosol, 60, 0.0, 1.0, g_YAW_PX, 0);
+    let x0: f64 = move_px(ps2);
+    drive1(ps2, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_JUMP);
+    let land2: i32 = 0;
+    t = 0;
+    while (t < 200 && land2 == 0) {
+        let ev2: i32 = drive1(ps2, cs, g_nosol, 0.0, 1.0, g_YAW_PX, 0);
+        t++;
+        if ((ev2 & MOVE_EV_LAND) != 0) { land2 = 1; }
+    }
+    let dwalk: f64 = move_px(ps2) - x0;
+    print(`   walking jump clears ${dwalk} m`);
+    ck(near(dwalk, 4.4 * 0.6, 0.15), "a walking jump covers walk speed x air time", `${dwalk}`);
+    ck(dwalk < 4.0, "a walking jump CANNOT clear a 4 m gap", `${dwalk}`);
+}
+
+// ===========================================================================
+//  4. THE SLIDE, AND THE PROTECTED SLIDE-JUMP
+// ===========================================================================
+fn test_slide() {
+    print("-- 4. slide 6.0 -> 9.2 -> 3.0 over 0.75 s, cd 0.90 s; slide-jump keeps 85 %");
+    let cs: object = flat_store();
+
+    // Sprinting (7.0 >= 6.0) then crouch: burst to 9.2.
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    drive(ps, cs, g_nosol, 90, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    let vpre: f64 = move_speed_h(ps);
+    let ev: i32 = drive1(ps, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    ck((ev & MOVE_EV_SLIDE_START) != 0, "crouch above 6.0 m/s starts a slide", `${vpre}`);
+    ck(move_sliding(ps) == 1, "the slide timer is running", "");
+    let vburst: f64 = move_speed_h(ps);
+    print(`   entry ${vpre} m/s -> burst ${vburst} m/s`);
+    ck(vburst > vpre, "the slide is a BURST: it is faster than the run that entered it", "");
+    ck(near(vburst, 9.2, pct1(9.2) * 2.0), "slide burst is 9.2 m/s", `${vburst}`);
+
+    // 0.75 s later it has decayed to 3.0 and ended. The eye is measured a few
+    // ticks in: the stance blend is 0.15 s and the burst tick is tick zero of
+    // it, so reading the eye on the burst tick measures the blend, not the slide.
+    let t: i32 = 0;
+    let vend: f64 = 0.0;
+    let ended: i32 = 0;
+    let eye_mid: f64 = 0.0;
+    while (t < 60 && ended == 0) {
+        let e2: i32 = drive1(ps, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+        vend = move_speed_h(ps);
+        t++;
+        if (t == 12) { eye_mid = ps[PS_EYE]; }
+        if ((e2 & MOVE_EV_SLIDE_END) != 0) { ended = 1; }
+    }
+    print(`   slide ended after ${t + 1} ticks at ${vend} m/s, eye at 0.2 s = ${eye_mid} m`);
+    ck(ended == 1, "the slide ends on its own", `${t} ticks`);
+    ck(near(f64(t + 1) / 60.0, 0.75, 0.02), "slide lasts 0.75 s", `${f64(t + 1) / 60.0}`);
+    ck(near(vend, 3.0, pct1(3.0)), "slide decays to exactly 3.0 m/s (1 %)", `${vend}`);
+    ck(near(eye_mid, 0.70, 0.01), "the eye drops to 0.70 m during the slide", `${eye_mid}`);
+
+    // Cooldown 0.90 s: a re-slide before it expires is refused, and the one
+    // after it is not. The slide itself is 45 ticks, so the two probes sit at
+    // 0.23 s and 0.98 s after the slide ended.
+    let ps2: array<f64> = ps_new();
+    move_place(ps2, cs, 0.0, 0.0);
+    drive(ps2, cs, g_nosol, 90, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    drive1(ps2, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    drive(ps2, cs, g_nosol, 44, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);   // slide runs out
+    drive(ps2, cs, g_nosol, 14, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);                // back over 6 m/s
+    let cd: f64 = ps2[PS_SLIDE_CD];
+    let vre: f64 = move_speed_h(ps2);
+    let ev3: i32 = drive1(ps2, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    ck(vre >= 6.0, "the re-slide probe is above the 6.0 m/s slide threshold", `${vre}`);
+    ck(cd > 0.0, "the slide cooldown is still running 0.23 s after the slide ended", `${cd}`);
+    ck((ev3 & MOVE_EV_SLIDE_START) == 0, "a slide during the cooldown is refused", "");
+    drive(ps2, cs, g_nosol, 45, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    let ev4: i32 = drive1(ps2, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    ck(ps2[PS_SLIDE_CD] == 0.0, "the 0.90 s cooldown expires", `${ps2[PS_SLIDE_CD]}`);
+    ck((ev4 & MOVE_EV_SLIDE_START) != 0, "once the 0.90 s cooldown expires the slide returns", "");
+
+    // Below 6.0 m/s there is no slide at all.
+    let ps3: array<f64> = ps_new();
+    move_place(ps3, cs, 0.0, 0.0);
+    drive(ps3, cs, g_nosol, 90, 0.0, 1.0, g_YAW_PX, 0);          // walking, 4.4
+    let ev5: i32 = drive1(ps3, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_CROUCH);
+    ck((ev5 & MOVE_EV_SLIDE_START) == 0, "crouching at walk speed is a crouch, not a slide", "");
+
+    // ---- THE SLIDE-JUMP: 85 % of current horizontal speed ------------------
+    let ps4: array<f64> = ps_new();
+    move_place(ps4, cs, 0.0, 0.0);
+    drive(ps4, cs, g_nosol, 90, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    drive1(ps4, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    let vs: f64 = move_speed_h(ps4);
+    let ev6: i32 = drive1(ps4, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_JUMP);
+    let vj: f64 = move_speed_h(ps4);
+    print(`   slide-jump ${vs} -> ${vj} m/s (ratio ${vj / vs})`);
+    ck((ev6 & MOVE_EV_SLIDEJUMP) != 0, "jumping out of a slide emits MOVE_EV_SLIDEJUMP", "");
+    ck((ev6 & MOVE_EV_JUMP) != 0, "a slide-jump is also a jump", "");
+    ck(near(vj / vs, 0.85, 0.01), "a slide-jump keeps 85 % of horizontal speed",
+       `${vj / vs}`);
+    ck(vj > 7.0, "a slide-jump leaves the ground FASTER than a sprint — the tech pays", `${vj}`);
+    ck(move_sliding(ps4) == 0, "the slide is cancelled by the jump", "");
+
+    // ...and it clears a gap a walk cannot.
+    let x0: f64 = move_px(ps4);
+    let land: i32 = 0;
+    let t2: i32 = 0;
+    while (t2 < 200 && land == 0) {
+        let e7: i32 = drive1(ps4, cs, g_nosol, 0.0, 1.0, g_YAW_PX, 0);
+        t2++;
+        if ((e7 & MOVE_EV_LAND) != 0) { land = 1; }
+    }
+    let dslide: f64 = move_px(ps4) - x0;
+    print(`   slide-jump clears ${dslide} m`);
+    ck(dslide > 4.0, "a slide-jump CLEARS a 4 m gap", `${dslide}`);
+}
+
+// ===========================================================================
+//  5. A REAL 4 m GAP, IN GEOMETRY
+// ===========================================================================
+//  The heightfield is bilinear on a 4 m grid and cannot express a pit with
+//  vertical walls, so the gap course is built from solids: two platforms at
+//  y = 10 with exactly 4 m of nothing between them, over terrain at y = 10 far
+//  below... in fact over the flat plane itself, which is what you fall onto.
+fn gap_course(): array<f64> {
+    let sol: array<f64> = move_solids_new();
+    move_solids_add(sol, -20.0, 0.0, -6.0, 0.0, 14.0, 6.0);     // near platform, top y=14
+    move_solids_add(sol, 4.0, 0.0, -6.0, 30.0, 14.0, 6.0);      // far platform, 4 m gap
+    let out: array<f64> = sol;
+    return out;
+}
+
+fn gap_run(p_slide: i32): f64 {
+    let cs: object = flat_store();
+    let sol: array<f64> = gap_course();
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, -18.0, 0.0);
+    ps[PS_PY] = 14.0;                       // standing on the near platform
+    ps[PS_FALL_PEAK] = 14.0;
+    // Run at the lip and take off from it — a jump taken eight metres early
+    // measures nothing but the runway.
+    // The control run-up is a WALK (4.4 m/s); the slide run-up is a sprint,
+    // because a slide can only be entered above 6.0 m/s. Comparing a sprint
+    // take-off against a slide take-off would measure the wrong thing.
+    let runup: i32 = 0;
+    if (p_slide == 1) { runup = BTN_SPRINT; }
+    let t: i32 = 0;
+    while (t < 400 && move_px(ps) < -0.6) {
+        drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, runup);
+        t++;
+    }
+    if (p_slide == 1) {
+        drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+        drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_JUMP);
+    } else {
+        drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, BTN_JUMP);
+    }
+    drive(ps, cs, sol, 90, 0.0, 1.0, g_YAW_PX, 0);
+    let out: f64 = move_py(ps);
+    return out;
+}
+
+fn test_gap() {
+    print("-- 5. the 4 m gap course (solids): the slide crosses, the walk falls in");
+    let ywalk: f64 = gap_run(0);
+    let yslide: f64 = gap_run(1);
+    print(`   walk-jump ends at y=${ywalk}, slide-jump ends at y=${yslide}`);
+    ck(ywalk < 12.0, "a walking jump falls into the 4 m gap", `${ywalk}`);
+    ck(near(yslide, 14.0, 0.01), "a slide-jump lands on the far platform", `${yslide}`);
+}
+
+// ===========================================================================
+//  6. DOWNHILL SLIDE-JUMP CHAINING
+// ===========================================================================
+//  W4-1's acceptance says a chain reaches "~11 m/s" downhill. That number is
+//  EMERGENT — it falls out of the jump, the 85 % rule, the bhop window and the
+//  slope projection — so the probe measures and prints it, and bounds it by
+//  the property that matters: chaining must beat sprinting by a wide margin
+//  and must never reach the anti-runaway clamp.
+fn test_chain() {
+    print("-- 6. downhill slide-jump chain on an exact 15 degree slope");
+    let cs: object = slope_store();
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 4.0, 0.0);
+
+    drive(ps, cs, g_nosol, 80, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    let vsprint: f64 = move_speed_h(ps);
+    drive1(ps, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    drive1(ps, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_JUMP);
+
+    // Pulse jump every other tick: the jump buffer (0.12 s) guarantees a
+    // buffered press is waiting on every touchdown. That is the bhop input.
+    let vmax: f64 = 0.0;
+    let jumps: i32 = 0;
+    let t: i32 = 0;
+    while (t < 420) {
+        let btn: i32 = BTN_SPRINT;
+        if (t % 2 == 0) { btn = BTN_SPRINT | BTN_JUMP; }
+        let ev: i32 = drive1(ps, cs, g_nosol, 0.0, 1.0, g_YAW_PX, btn);
+        if ((ev & MOVE_EV_JUMP) != 0) { jumps = jumps + 1; }
+        let v: f64 = move_speed_h(ps);
+        if (v > vmax) { vmax = v; }
+        t++;
+    }
+    print(`   sprint ${vsprint} m/s -> chained ${vmax} m/s over ${jumps} jumps`);
+    ck(jumps >= 5, "the chain actually chains (each hop gets longer as it speeds up)",
+       `${jumps} jumps in 7 s`);
+    ck(vmax > vsprint * 1.4, "chaining downhill is far faster than sprinting downhill",
+       `${vmax} vs ${vsprint}`);
+    ck(near(vmax, 11.0, 0.55), "the downhill chain tops out around 11 m/s", `${vmax}`);
+    ck(vmax <= MOVE_SPEED_CAP, "and it tops out AT the declared movement ceiling, not past it",
+       `${vmax} vs cap ${MOVE_SPEED_CAP}`);
+
+    // Walking down the same slope must NOT accelerate: the ground snap exists
+    // precisely so a descending slope does not fire a landing every tick.
+    let ps2: array<f64> = ps_new();
+    move_place(ps2, cs, 4.0, 0.0);
+    let lands: i32 = 0;
+    t = 0;
+    while (t < 300) {
+        let e2: i32 = drive1(ps2, cs, g_nosol, 0.0, 1.0, g_YAW_PX, 0);
+        if ((e2 & MOVE_EV_LAND) != 0) { lands = lands + 1; }
+        t++;
+    }
+    print(`   walking 5 s down the same slope: ${lands} landings, ${move_speed_h(ps2)} m/s`);
+    ck(lands == 0, "walking down a slope never leaves the ground (no free landings)",
+       `${lands}`);
+    ck(near(move_speed_h(ps2), 4.4, pct1(4.4) * 3.0),
+       "walking downhill stays at walk speed, it does not accelerate",
+       `${move_speed_h(ps2)}`);
+}
+
+// ===========================================================================
+//  7. MANTLE — every waist-high ledge in a course, and only those
+// ===========================================================================
+fn ledge_course(p_h: f64): array<f64> {
+    let sol: array<f64> = move_solids_new();
+    move_solids_add(sol, 5.0, 0.0, -8.0, 25.0, p_h, 8.0);
+    let out: array<f64> = sol;
+    return out;
+}
+
+// Walk into a ledge of height h for 2 s. Returns 2 if mantled up, 1 if walked
+// or stepped up, 0 if it is a wall.
+fn ledge_try(p_h: f64): i32 {
+    let cs: object = flat_store();
+    let sol: array<f64> = ledge_course(p_h + g_FLAT_M);
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    let mant: i32 = 0;
+    let t: i32 = 0;
+    while (t < 200) {
+        let ev: i32 = drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, 0);
+        if ((ev & MOVE_EV_MANTLE_START) != 0) { mant = 1; }
+        t++;
+    }
+    let up: i32 = 0;
+    if (move_py(ps) >= g_FLAT_M + p_h - 0.02) { up = 1; }
+    let out: i32 = 0;
+    if (up == 1 && mant == 1) { out = 2; }
+    if (up == 1 && mant == 0) { out = 1; }
+    return out;
+}
+
+fn test_mantle() {
+    print("-- 7. mantle: every ledge 0.60-1.40 m is climbable, nothing outside it is");
+    // Sweep the whole band at 5 cm, exactly as the acceptance criterion asks:
+    // "every waist-high ledge in a test course is mantleable".
+    let bad_mantle: i32 = 0;
+    let n_mantle: i32 = 0;
+    let h: f64 = 0.60;
+    while (h <= 1.4001) {
+        let r: i32 = ledge_try(h);
+        if (r != 2) {
+            bad_mantle = bad_mantle + 1;
+            print(`   FAILED to mantle a ${h} m ledge (result ${r})`);
+        }
+        n_mantle = n_mantle + 1;
+        h = h + 0.05;
+    }
+    print(`   ${n_mantle} ledges swept over [0.60, 1.40] m at 5 cm`);
+    ck(n_mantle >= 16, "the sweep really covers the band", `${n_mantle}`);
+    ck(bad_mantle == 0, "EVERY waist-high ledge in the course is mantleable",
+       `${bad_mantle} failures`);
+
+    // Below the step-up you simply walk up; no mantle animation for a kerb.
+    ck(ledge_try(0.20) == 1, "a 0.20 m kerb is a step-up, not a mantle", "");
+    ck(ledge_try(0.34) == 1, "a 0.34 m step is a step-up, not a mantle", "");
+    // Above the mantle window it is a wall.
+    ck(ledge_try(1.60) == 0, "a 1.60 m ledge is too high to mantle", "");
+    ck(ledge_try(3.00) == 0, "a 3.00 m wall is a wall", "");
+    // The documented dead band between step-up (0.35) and mantle (0.60).
+    let dead: i32 = ledge_try(0.50);
+    print(`   NOTE: a 0.50 m ledge (GDD dead band 0.35-0.60 m) result = ${dead}`);
+    ck(dead == 0, "the GDD's 0.35-0.60 m dead band is implemented as written (reported)",
+       `${dead}`);
+
+    // Timing and the aim lock.
+    let cs: object = flat_store();
+    let sol: array<f64> = ledge_course(1.0 + g_FLAT_M);
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    let started: i32 = -1;
+    let ended: i32 = -1;
+    let t: i32 = 0;
+    let yaw_at_start: f64 = 0.0;
+    let rail: i32 = 0;
+    while (t < 200) {
+        // Turn the view from the moment the vault starts and keep it turned:
+        // the aim must not follow DURING, and must be following again AFTER.
+        let yaw: f64 = g_YAW_PX;
+        if (started >= 0) { yaw = g_YAW_PX + 1.0; }
+        let ev: i32 = drive1(ps, cs, sol, 0.0, 1.0, yaw, 0);
+        if ((ev & MOVE_EV_MANTLE_START) != 0) { started = t; yaw_at_start = ps[PS_YAW]; }
+        if ((ev & MOVE_EV_MANTLE_END) != 0) { ended = t; }
+        if (move_mantling(ps) == 1) { rail = rail + 1; }
+        t++;
+    }
+    // Two ways of measuring the same 0.35 s: ticks spent in the mantle state,
+    // and the span between the start and end events. They must agree, and
+    // they only do because move_apply's timer test carries an epsilon — see
+    // the note there about the 3e-17 residue that otherwise buys a 22nd tick.
+    let dur: f64 = f64(ended - started) / 60.0;
+    let raild: f64 = f64(rail) / 60.0;
+    print(`   mantle rail ${raild} s (${rail} ticks); start-event to end-event ${dur} s`);
+    ck(started >= 0 && ended > started, "the mantle starts and finishes", "");
+    ck(near(raild, 0.35, pct1(0.35)), "the mantle rail takes 0.35 s (1 %)", `${raild}`);
+    ck(near(ps[PS_YAW], g_YAW_PX + 1.0, 0.01),
+       "aim resumes following the command once the mantle ends", `${ps[PS_YAW]}`);
+    ck(move_py(ps) >= g_FLAT_M + 1.0 - 0.02, "the mantle ends standing on the ledge",
+       `${move_py(ps)}`);
+    ck(move_take_fall_damage(ps) == 0.0, "a mantle does no fall damage (GDD 2.3)", "");
+
+    // Aim really is locked DURING the vault.
+    let ps2: array<f64> = ps_new();
+    move_place(ps2, cs, 0.0, 0.0);
+    let locked_ok: i32 = 1;
+    let saw: i32 = 0;
+    t = 0;
+    while (t < 120) {
+        let yaw2: f64 = g_YAW_PX;
+        if (move_mantling(ps2) == 1) { yaw2 = 0.3; saw = 1; }
+        drive1(ps2, cs, sol, 0.0, 1.0, yaw2, 0);
+        if (move_mantling(ps2) == 1 && near(ps2[PS_YAW], 0.3, 0.01)) { locked_ok = 0; }
+        t++;
+    }
+    ck(saw == 1, "the aim-lock test actually saw a mantle", "");
+    ck(locked_ok == 1, "aim is LOCKED for the duration of the mantle (GDD 2.3)", "");
+}
+
+// ===========================================================================
+//  8. FALL DAMAGE — none below 6 m, then 8 HP per metre
+// ===========================================================================
+fn fall_from(p_drop: f64): f64 {
+    let cs: object = flat_store();
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    ps[PS_PY] = g_FLAT_M + p_drop;
+    ps[PS_FALL_PEAK] = g_FLAT_M + p_drop;
+    ps[PS_GROUNDED] = 0.0;
+    let t: i32 = 0;
+    while (t < 400 && move_grounded(ps) == 0) {
+        drive1(ps, cs, g_nosol, 0.0, 0.0, g_YAW_PX, 0);
+        t++;
+    }
+    let out: f64 = move_take_fall_damage(ps);
+    return out;
+}
+
+fn test_fall() {
+    print("-- 8. fall damage: free below 6 m, then 8 HP per metre");
+    let d3: f64 = fall_from(3.0);
+    let d6: f64 = fall_from(6.0);
+    let d10: f64 = fall_from(10.0);
+    let d20: f64 = fall_from(20.0);
+    print(`   3 m -> ${d3} HP, 6 m -> ${d6} HP, 10 m -> ${d10} HP, 20 m -> ${d20} HP`);
+    ck(d3 == 0.0, "a 3 m fall is free", `${d3}`);
+    ck(d6 <= 0.001, "a 6 m fall is free (the threshold is inclusive)", `${d6}`);
+    ck(near(d10, 32.0, 0.5), "a 10 m fall costs (10-6)*8 = 32 HP", `${d10}`);
+    ck(near(d20, 112.0, 1.0), "a 20 m fall costs (20-6)*8 = 112 HP", `${d20}`);
+    ck(d20 > d10 && d10 > d6, "fall damage is monotonic in height", "");
+    // Draining is idempotent: the caller cannot apply the same damage twice.
+    let cs: object = flat_store();
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 0.0, 0.0);
+    ps[PS_FALL_DMG] = 17.0;
+    let first: f64 = move_take_fall_damage(ps);
+    let second: f64 = move_take_fall_damage(ps);
+    ck(first == 17.0 && second == 0.0, "fall damage drains exactly once", `${first}/${second}`);
+}
+
+// ===========================================================================
+//  9. COYOTE TIME, JUMP BUFFER, BHOP WINDOW
+// ===========================================================================
+fn test_windows() {
+    print("-- 9. coyote time, jump buffer, bhop window");
+    let cs: object = flat_store();
+    let sol: array<f64> = move_solids_new();
+    move_solids_add(sol, -20.0, 0.0, -6.0, 0.0, 14.0, 6.0);       // a platform edge at x=0
+
+    // Walk off the edge, then jump 3 ticks later: coyote time must allow it.
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, -6.0, 0.0);
+    ps[PS_PY] = 14.0;
+    ps[PS_FALL_PEAK] = 14.0;
+    let t: i32 = 0;
+    let off: i32 = -1;
+    while (t < 200 && off < 0) {
+        drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, 0);
+        if (move_grounded(ps) == 0) { off = t; }
+        t++;
+    }
+    ck(off >= 0, "the player walks off the platform edge", "");
+    ck(ps[PS_COYOTE_T] > 0.0, "coyote time starts when the ground runs out",
+       `${ps[PS_COYOTE_T]}`);
+    drive(ps, cs, sol, 2, 0.0, 1.0, g_YAW_PX, 0);
+    let evc: i32 = drive1(ps, cs, sol, 0.0, 1.0, g_YAW_PX, BTN_JUMP);
+    ck((evc & MOVE_EV_JUMP) != 0, "a jump 3 ticks after leaving the edge still fires (coyote)",
+       `${MOVE_COYOTE_S} s window`);
+
+    // ...but not long after.
+    let ps2: array<f64> = ps_new();
+    move_place(ps2, cs, -6.0, 0.0);
+    ps2[PS_PY] = 14.0;
+    ps2[PS_FALL_PEAK] = 14.0;
+    t = 0;
+    off = -1;
+    while (t < 200 && off < 0) {
+        drive1(ps2, cs, sol, 0.0, 1.0, g_YAW_PX, 0);
+        if (move_grounded(ps2) == 0) { off = t; }
+        t++;
+    }
+    drive(ps2, cs, sol, 12, 0.0, 1.0, g_YAW_PX, 0);
+    let evc2: i32 = drive1(ps2, cs, sol, 0.0, 1.0, g_YAW_PX, BTN_JUMP);
+    ck((evc2 & MOVE_EV_JUMP) == 0, "coyote time expires; you cannot jump from mid-air", "");
+
+    // Jump buffer: press jump while falling, land, and it fires on touchdown.
+    let ps3: array<f64> = ps_new();
+    move_place(ps3, cs, 0.0, 0.0);
+    ps3[PS_PY] = g_FLAT_M + 3.0;
+    ps3[PS_FALL_PEAK] = g_FLAT_M + 3.0;
+    ps3[PS_GROUNDED] = 0.0;
+    // Fall until 4 ticks before landing, then hold jump.
+    let saw_jump: i32 = 0;
+    let saw_land: i32 = 0;
+    t = 0;
+    while (t < 200 && saw_jump == 0) {
+        let btn: i32 = 0;
+        if (ps3[PS_PY] < g_FLAT_M + 0.35) { btn = BTN_JUMP; }
+        let ev: i32 = drive1(ps3, cs, g_nosol, 0.0, 0.0, g_YAW_PX, btn);
+        if ((ev & MOVE_EV_LAND) != 0) { saw_land = 1; }
+        if ((ev & MOVE_EV_JUMP) != 0) { saw_jump = 1; }
+        t++;
+    }
+    ck(saw_land == 1, "the buffered-jump test lands first", "");
+    ck(saw_jump == 1, "a jump pressed before touchdown fires on landing (jump buffer)",
+       `${MOVE_JUMPBUF_S} s`);
+
+    // Bhop window: the window opens on landing and closes on its own.
+    let ps4: array<f64> = ps_new();
+    move_place(ps4, cs, 0.0, 0.0);
+    drive(ps4, cs, g_nosol, 60, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    drive1(ps4, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_JUMP);
+    t = 0;
+    let landed: i32 = 0;
+    while (t < 100 && landed == 0) {
+        let ev: i32 = drive1(ps4, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+        if ((ev & MOVE_EV_LAND) != 0) { landed = 1; }
+        t++;
+    }
+    ck(landed == 1 && near(ps4[PS_BHOP_T], MOVE_BHOP_S, 0.001),
+       "the bhop window opens to its full width on contact", `${ps4[PS_BHOP_T]}`);
+    drive(ps4, cs, g_nosol, 12, 0.0, 0.0, g_YAW_PX, 0);
+    ck(ps4[PS_BHOP_T] == 0.0, "the bhop window closes on its own", `${ps4[PS_BHOP_T]}`);
+
+    // And it does what it is for: a landing inside the window is not taxed.
+    // Chain two jumps on FLAT ground and compare the speed kept against the
+    // same two jumps with the jump delayed past the window.
+    let ps5: array<f64> = ps_new();
+    move_place(ps5, cs, 0.0, 0.0);
+    drive(ps5, cs, g_nosol, 60, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    drive1(ps5, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_CROUCH);
+    drive1(ps5, cs, g_nosol, 0.0, 1.0, g_YAW_PX, BTN_SPRINT | BTN_JUMP);
+    let vair: f64 = move_speed_h(ps5);
+    t = 0;
+    landed = 0;
+    while (t < 100 && landed == 0) {
+        let btn2: i32 = BTN_SPRINT;
+        if (t % 2 == 0) { btn2 = BTN_SPRINT | BTN_JUMP; }
+        let ev: i32 = drive1(ps5, cs, g_nosol, 0.0, 1.0, g_YAW_PX, btn2);
+        if ((ev & MOVE_EV_JUMP) != 0 && t > 2) { landed = 1; }
+        t++;
+    }
+    let vkept: f64 = move_speed_h(ps5);
+    print(`   bhop on flat: left at ${vair} m/s, re-jumped at ${vkept} m/s`);
+    ck(vkept > vair * 0.95, "a bhop keeps > 95 % of the speed it landed with",
+       `${vkept} / ${vair}`);
+    ck(vkept <= vair + 0.001, "a bhop never ADDS speed on flat ground", `${vkept}`);
+}
+
+// ===========================================================================
+// 10. TERRAIN COLLISION AGAINST THE REAL WORLDGEN
+// ===========================================================================
+fn test_terrain() {
+    print("-- 10. collision against the real worldgen heightfield (seed 1337)");
+    move_reset_counters();
+    let cs: object = wgen_store(1337);
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 12.0, 12.0);
+
+    let below: i32 = 0;
+    let above: i32 = 0;
+    let maxgap: f64 = 0.0;
+    let t: i32 = 0;
+    while (t < 1800) {
+        // A long wander: turn slowly, sprint, and jump every 90 ticks.
+        let yaw: f64 = f64(t) * 0.004;
+        let btn: i32 = BTN_SPRINT;
+        if (t % 90 == 0) { btn = BTN_SPRINT | BTN_JUMP; }
+        drive1(ps, cs, g_nosol, 0.0, 1.0, yaw, btn);
+        let gh: f64 = chunk_height_at(cs, move_px(ps), move_pz(ps));
+        let dy: f64 = move_py(ps) - gh;
+        if (dy < -0.35) { below = below + 1; }
+        if (move_grounded(ps) == 1 && dy > 0.05) { above = above + 1; }
+        if (move_grounded(ps) == 1) {
+            let a: f64 = dy;
+            if (a < 0.0) { a = 0.0 - a; }
+            if (a > maxgap) { maxgap = a; }
+        }
+        t++;
+    }
+    print(`   1800 ticks: ${below} below-surface, ${above} floating, max |gap| ${maxgap} m`);
+    ck(below == 0, "the player never sinks below the heightfield", `${below}`);
+    ck(above == 0, "a grounded player is never floating above the heightfield", `${above}`);
+    ck(maxgap < 0.01, "a grounded player sits ON the surface", `${maxgap}`);
+    ck(move_ground_miss_count() == 0, "no ground misses: streaming kept up",
+       `${move_ground_miss_count()}`);
+    ck(move_call_count() == 1800, "every tick called move_apply exactly once",
+       `${move_call_count()}`);
+
+    // The world hash of a walk is stable and the walk actually went somewhere.
+    let dist: f64 = sqrt((move_px(ps) - 12.0) * (move_px(ps) - 12.0) +
+                         (move_pz(ps) - 12.0) * (move_pz(ps) - 12.0));
+    print(`   ended ${dist} m from the start, hash ${move_state_hash(ps)}`);
+    ck(dist > 20.0, "the 30 s sprint covered real ground", `${dist}`);
+}
+
+// ===========================================================================
+// 11. DETERMINISM — the criterion the whole module exists for
+// ===========================================================================
+//  A scripted command sequence, run twice from the same start on the same
+//  seed, must produce a bit-identical state. A different seed must not.
+fn scripted_run(p_seed: i32, p_ticks: i32): i32 {
+    let cs: object = wgen_store(p_seed);
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 20.0, -13.0);
+    let t: i32 = 0;
+    while (t < p_ticks) {
+        // A deterministic, varied input script: turn, strafe, sprint, crouch,
+        // slide, jump — every branch in move_apply gets visited.
+        let yaw: f64 = 0.7 + f64(t) * 0.011;
+        let mx: f64 = sin(f64(t) * 0.13);
+        let my: f64 = 1.0;
+        if (t % 37 == 0) { my = -1.0; }
+        let btn: i32 = 0;
+        if (t % 3 != 0) { btn = btn | BTN_SPRINT; }
+        if (t % 53 == 0) { btn = btn | BTN_CROUCH; }
+        if (t % 29 == 0) { btn = btn | BTN_JUMP; }
+        if (t % 61 == 0) { btn = btn | BTN_ADS; }
+        cmd_set(g_cmd, t, 16, mx, my, yaw, 0.0, btn, 0, t);
+        move_apply(ps, cs, g_cmd);
+        t++;
+    }
+    let out: i32 = move_state_hash(ps);
+    return out;
+}
+
+fn test_determinism() {
+    print("-- 11. determinism: same seed + same commands -> bit-identical state");
+
+    let a: i32 = scripted_run(1337, 900);
+    let b: i32 = scripted_run(1337, 900);
+    print(`   TRAJ_HASH seed=1337 ticks=900 : ${a}`);
+    print(`   TRAJ_HASH seed=1337 ticks=900 : ${b}   (second run)`);
+    ck(a == b, "the same seed and the same 900 commands hash identically", `${a} vs ${b}`);
+
+    let c: i32 = scripted_run(90210, 900);
+    print(`   TRAJ_HASH seed=90210 ticks=900 : ${c}`);
+    ck(a != c, "NEGATIVE CONTROL: a different world seed produces a different trajectory",
+       `${a} vs ${c}`);
+
+    // Shorter and longer runs of the same script differ, so the hash is not
+    // saturating into some fixed point.
+    let d: i32 = scripted_run(1337, 300);
+    print(`   TRAJ_HASH seed=1337 ticks=300 : ${d}`);
+    ck(d != a, "300 ticks and 900 ticks of the same script differ", `${d} vs ${a}`);
+
+    // ---- replay 8 commands from a captured state, bit-for-bit -------------
+    let cs: object = wgen_store(1337);
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 20.0, -13.0);
+    let t: i32 = 0;
+    while (t < 240) {
+        cmd_set(g_cmd, t, 16, sin(f64(t) * 0.13), 1.0, 0.7 + f64(t) * 0.011,
+                0.0, BTN_SPRINT, 0, t);
+        move_apply(ps, cs, g_cmd);
+        t++;
+    }
+    let snap: array<f64> = ps_new();
+    predicted_capture(snap, ps);
+    let h_at_capture: i32 = move_state_hash(ps);
+
+    // The eight commands. Deliberately spicy: a slide, a slide-jump, a turn.
+    let btns: array<i32> = [BTN_SPRINT, BTN_SPRINT | BTN_CROUCH, BTN_SPRINT | BTN_JUMP,
+                            BTN_SPRINT, 0, BTN_CROUCH, BTN_JUMP, BTN_ADS];
+    let first: array<f64> = ps_new();
+    let k: i32 = 0;
+    while (k < 8) {
+        cmd_set(g_cmd, 240 + k, 16, 0.25, 1.0, 0.9, 0.1, btns[k], 0, 240 + k);
+        move_apply(ps, cs, g_cmd);
+        k++;
+    }
+    predicted_capture(first, ps);
+    let h_after: i32 = move_state_hash(ps);
+
+    predicted_restore(ps, snap);
+    ck(move_state_hash(ps) == h_at_capture, "restore returns exactly to the captured state",
+       `${move_state_hash(ps)} vs ${h_at_capture}`);
+    k = 0;
+    while (k < 8) {
+        cmd_set(g_cmd, 240 + k, 16, 0.25, 1.0, 0.9, 0.1, btns[k], 0, 240 + k);
+        move_apply(ps, cs, g_cmd);
+        k++;
+    }
+    ck(move_state_hash(ps) == h_after,
+       "replaying 8 commands from a captured state reproduces the state hash",
+       `${move_state_hash(ps)} vs ${h_after}`);
+    let same: i32 = 1;
+    let bad_field: i32 = -1;
+    k = 0;
+    while (k < PS_FIELDS) {
+        if (ps[k] != first[k]) { same = 0; bad_field = k; }
+        k++;
+    }
+    ck(same == 1, "...and every one of the 36 fields matches BIT-for-bit",
+       `first mismatch at field ${bad_field}`);
+    print(`   REPLAY_HASH ${h_after}`);
+
+    // The command itself hashes stably — if this ever moves, the divergence is
+    // in command.hml, not here, and the report will say so.
+    cmd_set(g_cmd, 7, 16, 0.25, 1.0, 0.9, 0.1, BTN_SPRINT, 0, 7);
+    print(`   CMD_HASH ${cmd_hash(g_cmd)}`);
+}
+
+// ===========================================================================
+// 12. THE WORLD BRIDGE
+// ===========================================================================
+fn test_world_bridge() {
+    print("-- 12. world.hml bridge: transform in, transform out");
+    let w: object = world_new();
+    let slot: i32 = world_spawn_player(w, 1);
+    ck(slot >= 0, "a player spawns", `${slot}`);
+
+    let cs: object = flat_store();
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 5.0, -5.0);
+    drive(ps, cs, g_nosol, 40, 0.0, 1.0, g_YAW_PX, BTN_SPRINT);
+    move_to_world(w, slot, ps);
+
+    let ps2: array<f64> = ps_new();
+    move_from_world(w, slot, ps2);
+    ck(ps2[PS_PX] == ps[PS_PX] && ps2[PS_PY] == ps[PS_PY] && ps2[PS_PZ] == ps[PS_PZ],
+       "position round-trips through the world exactly", "");
+    ck(ps2[PS_VX] == ps[PS_VX] && ps2[PS_VZ] == ps[PS_VZ],
+       "velocity round-trips through the world exactly", "");
+    ck(ps2[PS_GROUNDED] == ps[PS_GROUNDED], "the grounded flag round-trips", "");
+    // The transform is all that crosses: prediction-only fields stay local.
+    ck(ps2[PS_SLIDE_CD] == 0.0 && ps2[PS_BHOP_T] == 0.0,
+       "prediction-only fields are NOT read back from the world (they never ship)", "");
+}
+
+// ===========================================================================
+// 13. THE IMPORT WALL, IN THE FILE ITSELF
+// ===========================================================================
+fn test_wall() {
+    print("-- 13. the import wall and the banned constructs, read off the source");
+    let src: string = read_file("src/sim/movement.hml");
+    ck(src.length > 2000, "movement.hml was found and read", `${src.length} bytes`);
+    // Quoted forms, so the file's own prose about what it does NOT import
+    // cannot fail its own scan.
+    ck(src.contains("\"@stdlib/random\"") == false, "no @stdlib/random (CLAUDE.md 7)", "");
+    ck(src.contains("wobbleweed/") == false, "no wobbleweed import", "");
+    ck(src.contains("SDL_") == false, "no SDL symbol", "");
+    ck(src.contains("__clock") == false, "NO WALL CLOCK anywhere in the movement model", "");
+    ck(src.contains("ticks()") == false, "no ticks()", "");
+    ck(src.contains("src/render") == false, "no renderer import", "");
+    ck(src.contains("src/net") == false, "no net import", "");
+    // The fixed timestep is a constant, never a parameter.
+    ck(src.contains("g_TICK_DT") == true, "the step comes from g_TICK_DT", "");
+    ck(src.contains("dt_ms") == false, "the command's measured dt_ms is never read", "");
+    // No closures, no defer, no throw on the per-tick path (CLAUDE.md 1).
+    ck(src.contains("defer ") == false, "no defer", "");
+    ck(src.contains("throw ") == false, "no throw", "");
+    ck(src.contains("=> {") == false, "no closure literals", "");
+    ck(src.contains("print(") == false, "the sim never prints (replay purity)", "");
+}
+
+// ===========================================================================
+// 14. PERFORMANCE — RULE T: __clock() + min of 7
+// ===========================================================================
+fn test_perf() {
+    print("-- 14. performance (RULE T: __clock CPU time, min of 7 batches)");
+    let TRIALS: i32 = 7;
+    let N: i32 = 20000;
+
+    // BACKEND + LOAD CALIBRATION, the pattern probe_sim_core.hml established:
+    // an empty loop measures 12.5 ns/iteration compiled -O1 on this box and an
+    // order of magnitude more interpreted, so scaling the bound by it turns an
+    // absolute bound into a ratio bound (CLAUDE.md 1.2) and lets the SAME
+    // assertion run compiled and interpreted.
+    let NC: i32 = 2000000;
+    let bestc: f64 = 1000000.0;
+    let calsink: i32 = 0;
+    let tc: i32 = 0;
+    while (tc < TRIALS) {
+        let tc0: f64 = __clock();
+        let ci: i32 = 0;
+        while (ci < NC) { calsink = calsink ^ ci; ci = ci + 1; }
+        let cdt: f64 = __clock() - tc0;
+        if (cdt < bestc) { bestc = cdt; }
+        tc++;
+    }
+    let cal: f64 = bestc * 1000000000.0 / f64(NC);
+    let scale: f64 = cal / 12.5;
+    if (scale < 1.0) { scale = 1.0; }
+    print(`   calibration ${cal} ns/iter -> bound scale x${scale}   sink=${calsink}`);
+
+    // The command build is measured separately so the movement figure is the
+    // movement figure and not "movement plus whatever cmd_set costs today".
+    let bestq: f64 = 1000000.0;
+    let tq: i32 = 0;
+    while (tq < TRIALS) {
+        let q0: f64 = __clock();
+        let qi: i32 = 0;
+        while (qi < N) {
+            cmd_set(g_cmd, qi, 16, 0.2, 1.0, f64(qi) * 0.004, 0.0, BTN_SPRINT, 0, qi);
+            qi++;
+        }
+        let qdt: f64 = __clock() - q0;
+        if (qdt < bestq) { bestq = qdt; }
+        tq++;
+    }
+    let nsq: f64 = bestq * 1000000000.0 / f64(N);
+
+    // Worst realistic case: real terrain, sprinting, jumping, crossing chunks.
+    let cs: object = wgen_store(1337);
+    let ps: array<f64> = ps_new();
+    move_place(ps, cs, 20.0, -13.0);
+
+    let best: f64 = 1000000.0;
+    let sink: f64 = 0.0;
+    let trial: i32 = 0;
+    while (trial < TRIALS) {
+        move_place(ps, cs, 20.0, -13.0);
+        let t0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < N) {
+            let yaw: f64 = f64(i) * 0.004;
+            let btn: i32 = BTN_SPRINT;
+            if (i % 90 == 0) { btn = BTN_SPRINT | BTN_JUMP; }
+            if (i % 137 == 0) { btn = BTN_SPRINT | BTN_CROUCH; }
+            cmd_set(g_cmd, i, 16, 0.2, 1.0, yaw, 0.0, btn, 0, i);
+            move_apply(ps, cs, g_cmd);
+            i++;
+        }
+        let dt: f64 = __clock() - t0;
+        if (dt < best) { best = dt; }
+        sink = sink + move_px(ps);
+        trial++;
+    }
+    let nsboth: f64 = best * 1000000000.0 / f64(N);
+    let ns: f64 = nsboth - nsq;
+    let ms: f64 = ns / 1000000.0;
+    let pctb: f64 = ms / 2.0 * 100.0;
+    print(`   cmd_set                       ${nsq} ns/tick`);
+    print(`   cmd_set + move_apply          ${nsboth} ns/tick`);
+    print(`   move_apply alone              ${ns} ns/tick`);
+    print(`   one player  = ${ms} ms/tick = ${pctb} % of the 2.0 ms sim budget   sink=${sink}`);
+    // Loaded on this box (llama-server holding ~17 of 24 cores) move_apply
+    // measures ~5.0 us compiled and ~45 us interpreted. The bound is a
+    // REGRESSION GUARD at ~2x the loaded compiled number, scaled by the
+    // backend calibration, with both numbers in the text (CLAUDE.md 1.2).
+    ck(ns < 11000.0 * scale,
+       "move_apply <= 11000 ns/tick x scale (regression guard; loaded compiled ~5000)",
+       `${ns} ns, scale ${scale}`);
+    ck(ms < 0.20 * scale, "one player's movement is under 10 % of the 2.0 ms sim budget",
+       `${ms} ms`);
+
+    // 32 players' worth, which is the multiplayer ceiling NETWORKING plans for.
+    let ms32: f64 = ms * 32.0;
+    print(`   32 players  = ${ms32} ms/tick`);
+    ck(ms32 < 2.0 * scale, "even 32 simulated players fit inside the whole sim budget", `${ms32} ms`);
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_movement  —  W4-1  (src/sim/movement.hml, GDD 2.3)");
+    print("");
+
+    if (is_dir("src/sim") != true) {
+        print("FAIL  run this from the nightshade repo root: src/sim/ not found from here");
+        exit(1);
+    }
+
+    test_state();       print("");
+    test_speeds();      print("");
+    test_jump();        print("");
+    test_slide();       print("");
+    test_gap();         print("");
+    test_chain();       print("");
+    test_mantle();      print("");
+    test_fall();        print("");
+    test_windows();     print("");
+    test_terrain();     print("");
+    test_determinism(); print("");
+    test_world_bridge();print("");
+    test_wall();        print("");
+    test_perf();        print("");
+
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

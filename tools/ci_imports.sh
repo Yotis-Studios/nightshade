@@ -386,14 +386,37 @@ if [ -f "$REAL_FG" ] && [ -f "$SHOT" ]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# R8 — no wall clock in the simulation, INCLUDING compiler builtins.
+#
+# R1/R5 parse `import` lines, so they are structurally blind to `__clock()`,
+# which is a hemlockc BUILTIN and needs no import. Gate 4a proved the hole by
+# planting a `__clock()` call inside a src/sim function: every existing rule
+# passed and CI stayed green.
+#
+# That matters more here than anywhere else in the tree. src/sim is the future
+# authoritative server and its whole value is being bit-reproducible from a
+# seed. A single wall-clock read makes the simulation unreproducible, and
+# nothing else in this repo would notice.
+# ---------------------------------------------------------------------------
+RULE_FAIL[R8]=0
+while IFS= read -r f; do
+    [ -e "$f" ] || continue
+    # strip // comments and blank lines before matching, so prose about the ban
+    # does not trip the ban
+    if sed 's|//.*||' "$f" | grep -qE '(^|[^A-Za-z0-9_])(__clock|time_ms|now_ms|SDL_GetTicks|clock_now)[[:space:]]*\('; then
+        err R8 "$(basename "$f") reads a wall clock. src/sim must be reproducible from a seed alone -- use the tick counter, never real time. (__clock is a builtin, so no import rule can catch this.)"
+    fi
+done < <(find "$NS_ROOT/src/sim" -name '*.hml' 2>/dev/null)
+
 echo
 printf '   files=%d imports=%d warnings=%d hex-exemptions=%d\n' \
        "$N_FILES" "$N_IMPORTS" "$WARNS" "$HEX_EXEMPT"
-for r in R1 R2 R3 R4 R5 R6 R7; do
+for r in R1 R2 R3 R4 R5 R6 R7 R8; do
     if [ "${RULE_FAIL[$r]}" -eq 0 ]; then printf '   %-3s PASS\n' "$r"
     else printf '   %-3s FAIL (%d)\n' "$r" "${RULE_FAIL[$r]}"; fi
 done
-echo "   RULES 7/7 checked"
+echo "   RULES 8/8 checked"
 if [ "$FAIL" -ne 0 ]; then echo "CI_IMPORTS FAIL"; exit 1; fi
 echo "CI_IMPORTS PASS"
 exit 0

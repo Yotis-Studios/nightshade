@@ -1,0 +1,1209 @@
+// probe_weapons.hml — W4-2 acceptance probe for src/sim/weapons.hml.
+//
+// Run FROM THE REPO ROOT, and BOTH ways — the state hashes below are only
+// meaningful if interpreted and compiled agree on every one of them:
+//     hemlockc -O1 tools/probe_weapons.hml -o /tmp/pw && /tmp/pw
+//     hemlock  tools/probe_weapons.hml
+//
+//     /tmp/pw --ttk        print the GDD §2.4 TTK matrix and nothing else
+//                          (the W4-2 "verified by" artefact — diff it by eye
+//                           against the table in docs/recon/GAME_DESIGN.md)
+//
+// Exits 1 on any failed assertion AND on an assertion-count mismatch. A probe
+// that silently stops running half its checks is worse than no probe.
+//
+// It imports `@stdlib/process` (exit), `@stdlib/fs` (to grep its own subject
+// for banned symbols) and `src/sim` + `src/core`. No SDL. Headless.
+
+import { exit } from "@stdlib/process";
+import { read_file } from "@stdlib/fs";
+import { sqrt } from "@stdlib/math";
+
+import { g_TICK_DT, g_FOG_FAR_CAP, g_RECOIL_SETTLE_S, g_WPN_COUNT,
+         g_WPN_SPARROW, g_WPN_TINKER, g_WPN_BELLOWS,
+         g_WPN_LONGSHADOW, g_WPN_KESTREL, g_WPN_EMBERLANCE
+       } from "../src/core/config.hml";
+
+import { rng_new, rng_seed, RNG_SPREAD } from "../src/sim/rng.hml";
+
+import { WPN_NONE, WPN_SPARROW, WPN_TINKER, WPN_BELLOWS, WPN_LONGSHADOW,
+         WPN_KESTREL, WPN_EMBERLANCE, WPN_COUNT,
+         wpn_valid, wpn_dmg_at, wpn_dmg_hit, wpn_dmg_shot,
+         wpn_rpm, wpn_shot_interval, wpn_mag, wpn_reserve, wpn_pellets,
+         wpn_reload_time, wpn_is_shell_reload, wpn_ads_time, wpn_sprint_to_fire,
+         wpn_swap_in, wpn_swap_out, wpn_max_range, wpn_spread,
+         wpn_bloom_per_shot, wpn_bloom_max, wpn_recover, wpn_jitter,
+         wpn_spread_half_rad, wpn_hs_mult, wpn_bloom_for_shots,
+         wpn_pattern_len, wpn_recoil_v, wpn_recoil_h, wpn_recoil_rand,
+         wpn_recoil, wpn_burn_total,
+         wpn_ttk_shots, wpn_ttk_shots_dot, wpn_ttk_ms,
+         wpn_state_new, wpn_state_reset, wpn_cur, wpn_ammo, wpn_reserve_ammo,
+         wpn_recoil_aim_pitch, wpn_recoil_aim_yaw, wpn_cur_spread,
+         wpn_can_fire, wpn_fire, wpn_reload_begin, wpn_swap_begin, wpn_step,
+         wpn_state_hash, wpn_hash_all,
+         WS_CUR, WS_FIRE_T, WS_RELOAD_T, WS_ADS, WS_BLOOM, WS_SHOT_IDX,
+         WS_RC_V, WS_RC_H, WS_SHOTS, WS_FIELDS,
+         g_BLOOM_RECOVER_S, g_PATTERN_RESET_S
+       } from "../src/sim/weapons.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green.
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 378;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_ok: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_ok) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+fn ckf(p_a: f64, p_b: f64, p_eps: f64, p_name: string) {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = -d; }
+    let ok: bool = d <= p_eps;
+    ck(ok, p_name, `got ${p_a}, want ${p_b} (eps ${p_eps})`);
+}
+
+fn ni(p_v: f64): i32 {
+    let out: i32 = i32(p_v + 0.5);
+    return out;
+}
+
+// Under the interpreter argv[0] is the .hml script; compiled it is the binary.
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+// ===========================================================================
+//  THE GDD §2.4 TABLES, TRANSCRIBED HERE INDEPENDENTLY OF THE MODULE.
+//  If weapons.hml and this file are ever edited to agree with each other
+//  instead of with the design, the TTK section below still catches it — the
+//  TTK matrix is a THIRD, redundant transcription of the same design.
+// ===========================================================================
+let g_wname = ["Sparrow", "Tinker", "Bellows", "Longshadow", "Kestrel", "Emberlance"];
+
+let g_gdd_near   = [ 26.0, 19.0, 13.0, 78.0, 45.0, 60.0 ];
+let g_gdd_far    = [ 18.0, 11.0,  5.0, 68.0, 30.0, 60.0 ];
+let g_gdd_hs     = [  1.50, 1.40, 1.25, 2.10, 1.50, 1.00 ];
+let g_gdd_rpm    = [690.0,900.0, 75.0, 75.0,200.0, 40.0 ];
+let g_gdd_mag    = [ 30,   32,    6,    8,    6,    3   ];
+let g_gdd_res    = [210,  256,   42,   56,   48,   12   ];
+let g_gdd_pel    = [  1,    1,    9,    1,    1,    1   ];
+let g_gdd_rl     = [  1.85, 1.55, 0.55, 2.30, 2.10, 2.60 ];
+let g_gdd_rle    = [  2.40, 2.05, 0.55, 2.85, 2.10, 2.60 ];
+// r0/r1: Longshadow amended 55/110 -> 34/68 and 140 -> 72 per ARCHITECTURE D2.
+let g_gdd_r0     = [ 22.0,  9.0,  6.0, 34.0, 14.0,  0.0 ];
+let g_gdd_r1     = [ 46.0, 22.0, 14.0, 68.0, 30.0,  0.0 ];
+let g_gdd_maxr   = [ 70.0, 35.0, 18.0, 72.0, 45.0, 40.0 ];
+let g_gdd_ads    = [  0.24, 0.19, 0.30, 0.38, 0.22, 0.34 ];
+let g_gdd_stf    = [  0.22, 0.18, 0.28, 0.34, 0.20, 0.30 ];
+let g_gdd_swin   = [  0.55, 0.45, 0.62, 0.75, 0.35, 0.70 ];
+let g_gdd_swout  = [  0.40, 0.32, 0.48, 0.55, 0.25, 0.50 ];
+let g_gdd_sbase  = [  3.2,  4.0,  6.5,  9.0,  3.6,  2.5 ];
+let g_gdd_scap   = [  6.0,  7.5,  6.5,  9.0,  6.5,  2.5 ];
+let g_gdd_sbloom = [  0.35, 0.30, 0.0,  1.20, 0.55, 0.0 ];
+let g_gdd_sads   = [  0.25, 0.55, 4.5,  0.05, 0.20, 1.0 ];
+let g_gdd_recov  = [  7.0,  9.0,  5.0,  4.0,  8.0,  6.0 ];
+
+// GDD §2.2 enemy HP, the six TTK matrix columns.
+let g_ehp   = [ 15.0, 30.0, 90.0, 90.0,  70.0, 220.0 ];
+let g_ehead = [ 0,    0,    0,    1,     0,    0     ];
+let g_ename = ["Wisp 15", "Mote 30", "Husk 90", "Husk head", "Spitter 70", "Warden 220"];
+
+// The GDD §2.4 TTK matrix, ten rows: {weapon, range}, then shots/ms per column.
+// -1 means "the GDD prints no reproducible number for this cell".
+let g_ttk_w  = [ 0,   0,    1,   1,    2,   2,    3,   4,   5   ];
+let g_ttk_r  = [ 0.0, 60.0, 0.0, 30.0, 6.0, 12.0, 0.0, 0.0, 0.0 ];
+let g_ttk_lbl = ["Sparrow near", "Sparrow far", "Tinker near", "Tinker far",
+                 "Bellows <=6m", "Bellows @12m", "Longshadow", "Kestrel near",
+                 "Emberlance"];
+// shots, row-major 9 x 6
+let g_ttk_n = [
+    1, 2, 4, 3, 3, 9,          // Sparrow near
+    1, 2, 5, 4, 4, 13,         // Sparrow far
+    1, 2, 5, 4, 4, 12,         // Tinker near
+    2, 3, 9, 6, 7, 20,         // Tinker far
+    1, 1, 1, 1, 1, 3,          // Bellows <= 6 m   (Warden 3: see the report)
+    1, 1, 2, 2, 2, 5,          // Bellows @ 12 m   (Warden 5: see the report)
+    1, 1, 2, 1, 1, 3,          // Longshadow
+    1, 1, 2, 2, 2, 6,          // Kestrel near     (Warden 6: see the report)
+    1, 1, 1, 1, 1, 3           // Emberlance  (impact + one burn)
+];
+// ms, -1 where the GDD prints only a shot count or an explicit approximation
+let g_ttk_ms = [
+    0.0, 87.0, 261.0, 174.0, 174.0, 696.0,
+    0.0, 87.0, 348.0, 261.0, 261.0, 1043.0,
+    0.0, 67.0, 267.0, 200.0, 200.0, 733.0,
+    67.0, 133.0, 533.0, 333.0, 400.0, 1267.0,
+    -1.0, -1.0, 0.0, -1.0, -1.0, 1600.0,
+    -1.0, -1.0, 800.0, -1.0, 800.0, 3200.0,
+    -1.0, -1.0, 800.0, 0.0, 0.0, 1600.0,
+    -1.0, -1.0, 300.0, 300.0, 300.0, 1500.0,
+    -1.0, -1.0, -1.0, -1.0, -1.0, -1.0
+];
+// The three cells the GDD's own numbers cannot be reproduced from — see the
+// task report. They are EXCLUDED from the assertion and PRINTED, so they can
+// never quietly become "passing".
+//   idx = row*6 + col
+let g_ttk_skip = [ 29, 35, 47 ];
+
+fn ttk_skipped(p_idx: i32): i32 {
+    let i = 0;
+    let out: i32 = 0;
+    while (i < g_ttk_skip.length) {
+        if (g_ttk_skip[i] == p_idx) { out = 1; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// ===========================================================================
+//  --ttk : print the matrix. This is the W4-2 "verified by" artefact.
+// ===========================================================================
+fn pad(p_s: string, p_n: i32): string {
+    let s: string = p_s;
+    while (s.length < p_n) { s = s + " "; }
+    let out: string = s;
+    return out;
+}
+
+fn print_ttk() {
+    print("");
+    print("GDD 2.4 TTK MATRIX  --  shots to kill / time in ms   (computed from src/sim/weapons.hml)");
+    print("");
+    let hdr: string = pad("weapon", 14);
+    let c = 0;
+    while (c < 6) { hdr = hdr + pad(g_ename[c], 13); c = c + 1; }
+    print(hdr);
+    print("--------------------------------------------------------------------------------------------");
+    let row = 0;
+    while (row < 9) {
+        let w: i32 = g_ttk_w[row];
+        let r: f64 = g_ttk_r[row];
+        let line: string = pad(g_ttk_lbl[row], 14);
+        let col = 0;
+        while (col < 6) {
+            let n: i32 = wpn_ttk_shots_dot(w, g_ehp[col], r, g_ehead[col]);
+            let ms: f64 = 0.0;
+            if (n > 1) { ms = f64(n - 1) * 60000.0 / wpn_rpm(w); }
+            let cell: string = `${n} / ${ni(ms)}`;
+            let idx: i32 = row * 6 + col;
+            if (ttk_skipped(idx) == 1) { cell = cell + " *"; }
+            line = line + pad(cell, 13);
+            col = col + 1;
+        }
+        print(line);
+        row = row + 1;
+    }
+    print("");
+    print("  * cell where the printed GDD number is not reproducible from the printed");
+    print("    GDD inputs. GDD says: Bellows<=6m/Warden 3 (model 2), Bellows@12m/Warden 5");
+    print("    (model 4), Kestrel/Warden 6 (model 5). Reported to the orchestrator; the");
+    print("    Warden front plate is combat.hml's (W4-3), not this table's.");
+    print("");
+}
+
+// ===========================================================================
+// A.  IDS AND TABLE SHAPE
+// ===========================================================================
+fn section_ids() {
+    print("A. ids and table shape");
+    ck(WPN_COUNT == g_WPN_COUNT, "A1 WPN_COUNT == config", `${WPN_COUNT}`);
+    ck(WPN_SPARROW == g_WPN_SPARROW, "A2 Sparrow id == config", `${WPN_SPARROW}`);
+    ck(WPN_TINKER == g_WPN_TINKER, "A3 Tinker id == config", `${WPN_TINKER}`);
+    ck(WPN_BELLOWS == g_WPN_BELLOWS, "A4 Bellows id == config", `${WPN_BELLOWS}`);
+    ck(WPN_LONGSHADOW == g_WPN_LONGSHADOW, "A5 Longshadow id == config", `${WPN_LONGSHADOW}`);
+    ck(WPN_KESTREL == g_WPN_KESTREL, "A6 Kestrel id == config", `${WPN_KESTREL}`);
+    ck(WPN_EMBERLANCE == g_WPN_EMBERLANCE, "A7 Emberlance id == config", `${WPN_EMBERLANCE}`);
+    ck(WPN_NONE < 0, "A8 WPN_NONE is negative", `${WPN_NONE}`);
+
+    // Every query is total: a bad id returns a zero, it does not trap. The
+    // authoritative server must not die on a malformed command.
+    ck(wpn_valid(-1) == 0, "A9 wpn_valid(-1) == 0", "");
+    ck(wpn_valid(6) == 0, "A10 wpn_valid(6) == 0", "");
+    ck(wpn_valid(0) == 1, "A11 wpn_valid(0) == 1", "");
+    ckf(wpn_dmg_at(-1, 10.0), 0.0, 0.0, "A12 dmg_at(bad id) == 0");
+    ckf(wpn_dmg_at(99, 10.0), 0.0, 0.0, "A13 dmg_at(bad id) == 0");
+    ck(wpn_mag(-5) == 0, "A14 mag(bad id) == 0", "");
+    ck(wpn_pattern_len(7) == 0, "A15 pattern_len(bad id) == 0", "");
+}
+
+// ===========================================================================
+// B.  THE TABLE REPRODUCES GDD §2.4 (with the one documented D2 amendment)
+// ===========================================================================
+fn section_table() {
+    print("B. table vs GDD 2.4");
+    let w = 0;
+    while (w < 6) {
+        ckf(wpn_dmg_at(w, 0.0), g_gdd_near[w], 0.0, `B.near ${g_wname[w]}`);
+        ckf(wpn_dmg_at(w, 1000.0), g_gdd_far[w], 0.0, `B.far ${g_wname[w]}`);
+        ckf(wpn_dmg_hit(w, 0.0, 1) / wpn_dmg_at(w, 0.0), g_gdd_hs[w], 1.0e-12, `B.hs ${g_wname[w]}`);
+        ckf(wpn_rpm(w), g_gdd_rpm[w], 0.0, `B.rpm ${g_wname[w]}`);
+        ck(wpn_mag(w) == g_gdd_mag[w], `B.mag ${g_wname[w]}`, `${wpn_mag(w)}`);
+        ck(wpn_reserve(w) == g_gdd_res[w], `B.reserve ${g_wname[w]}`, `${wpn_reserve(w)}`);
+        ck(wpn_pellets(w) == g_gdd_pel[w], `B.pellets ${g_wname[w]}`, `${wpn_pellets(w)}`);
+        ckf(wpn_reload_time(w, 0), g_gdd_rl[w], 0.0, `B.reload ${g_wname[w]}`);
+        ckf(wpn_reload_time(w, 1), g_gdd_rle[w], 0.0, `B.reload_empty ${g_wname[w]}`);
+        ckf(wpn_ads_time(w), g_gdd_ads[w], 0.0, `B.ads ${g_wname[w]}`);
+        ckf(wpn_sprint_to_fire(w), g_gdd_stf[w], 0.0, `B.stf ${g_wname[w]}`);
+        ckf(wpn_swap_in(w), g_gdd_swin[w], 0.0, `B.swap_in ${g_wname[w]}`);
+        ckf(wpn_swap_out(w), g_gdd_swout[w], 0.0, `B.swap_out ${g_wname[w]}`);
+        ckf(wpn_spread(w, 0.0, 0.0), g_gdd_sbase[w], 0.0, `B.spread_base ${g_wname[w]}`);
+        ckf(wpn_spread(w, 999.0, 0.0), g_gdd_scap[w], 0.0, `B.spread_cap ${g_wname[w]}`);
+        ckf(wpn_bloom_per_shot(w), g_gdd_sbloom[w], 0.0, `B.bloom ${g_wname[w]}`);
+        ckf(wpn_spread(w, 0.0, 1.0), g_gdd_sads[w], 0.0, `B.spread_ads ${g_wname[w]}`);
+        ckf(wpn_recover(w), g_gdd_recov[w], 0.0, `B.recover ${g_wname[w]}`);
+        ckf(wpn_max_range(w), g_gdd_maxr[w], 0.0, `B.max_range ${g_wname[w]}`);
+        w = w + 1;
+    }
+
+    // Emberlance-only columns.
+    ckf(wpn_burn_total(WPN_EMBERLANCE), 60.0, 0.0, "B.burn 12/s x 5 s == 60");
+    let bt = 0;
+    let others_zero: i32 = 1;
+    while (bt < 6) {
+        if (bt != WPN_EMBERLANCE) {
+            if (wpn_burn_total(bt) != 0.0) { others_zero = 0; }
+        }
+        bt = bt + 1;
+    }
+    ck(others_zero == 1, "B.burn only the Emberlance burns", "");
+
+    // Shell reload: Bellows and nobody else (GDD "0.55 s/shell, interruptible").
+    let sh = 0;
+    let shell_ok: i32 = 1;
+    while (sh < 6) {
+        let want: i32 = 0;
+        if (sh == WPN_BELLOWS) { want = 1; }
+        if (wpn_is_shell_reload(sh) != want) { shell_ok = 0; }
+        sh = sh + 1;
+    }
+    ck(shell_ok == 1, "B.shell only the Bellows reloads by the shell", "");
+
+    // B.hs the injected accessor combat.hml (W4-3) asks for agrees with the
+    // table, and is safe on a bad id (1.0, not 0.0 — a zero would silently
+    // delete every headshot).
+    let hs = 0;
+    let hs_ok: i32 = 1;
+    while (hs < 6) {
+        if (wpn_hs_mult(hs) != g_gdd_hs[hs]) { hs_ok = 0; }
+        hs = hs + 1;
+    }
+    ck(hs_ok == 1, "B.hs wpn_hs_mult matches the GDD column", "");
+    ckf(wpn_hs_mult(-1), 1.0, 0.0, "B.hs a bad id multiplies by 1.0, not 0.0");
+
+    // B.cone the FULL-CONE reading, and the single conversion to a half-angle
+    // in radians. `deg * 0.5 * PI/180` must be exactly what combat.hml's
+    // adapter computes, or the two disagree by a factor of two.
+    ckf(wpn_spread_half_rad(WPN_BELLOWS, 0.0, 0.0), 6.5 * 0.5 * 3.141592653589793 / 180.0,
+        1.0e-15, "B.cone Bellows hip half-angle in radians");
+    ckf(wpn_spread_half_rad(WPN_LONGSHADOW, 0.0, 1.0), 0.05 * 0.5 * 3.141592653589793 / 180.0,
+        1.0e-15, "B.cone Longshadow ADS half-angle in radians");
+
+    // B.bloom the shots -> degrees bridge, and its clamp.
+    ckf(wpn_bloom_for_shots(WPN_SPARROW, 0), 0.0, 0.0, "B.bloom 0 shots is 0 deg");
+    ckf(wpn_bloom_for_shots(WPN_SPARROW, 4), 1.4, 1.0e-12, "B.bloom 4 shots is 4 x 0.35 deg");
+    ckf(wpn_bloom_for_shots(WPN_SPARROW, 999), wpn_bloom_max(WPN_SPARROW), 0.0,
+        "B.bloom clamps at cap - base");
+    ckf(wpn_bloom_for_shots(WPN_BELLOWS, 999), 0.0, 0.0, "B.bloom a fixed-cone gun never blooms");
+}
+
+// ===========================================================================
+// C.  RANGE FALLOFF — properties, not just endpoints
+// ===========================================================================
+fn section_falloff() {
+    print("C. range falloff");
+    let w = 0;
+    while (w < 6) {
+        // C1 monotone non-increasing over 0..150 m: a gun never gets stronger
+        // with distance. Sampled every 0.25 m.
+        let prev: f64 = wpn_dmg_at(w, 0.0);
+        let mono: i32 = 1;
+        let r: f64 = 0.0;
+        while (r <= 150.0) {
+            let d: f64 = wpn_dmg_at(w, r);
+            if (d > prev + 1.0e-12) { mono = 0; }
+            prev = d;
+            r = r + 0.25;
+        }
+        ck(mono == 1, `C.mono ${g_wname[w]} damage never rises with range`, "");
+
+        // C2 flat at dmg_near up to r0, flat at dmg_far past r1.
+        ckf(wpn_dmg_at(w, g_gdd_r0[w]), g_gdd_near[w], 1.0e-12, `C.r0 ${g_wname[w]}`);
+        ckf(wpn_dmg_at(w, g_gdd_r1[w] + 40.0), g_gdd_far[w], 1.0e-12, `C.r1 ${g_wname[w]}`);
+
+        // C3 exactly halfway between r0 and r1 the damage is the midpoint.
+        if (g_gdd_r1[w] > g_gdd_r0[w]) {
+            let mid: f64 = (g_gdd_r0[w] + g_gdd_r1[w]) * 0.5;
+            ckf(wpn_dmg_at(w, mid), (g_gdd_near[w] + g_gdd_far[w]) * 0.5, 1.0e-9,
+                `C.mid ${g_wname[w]}`);
+        } else {
+            ckf(wpn_dmg_at(w, 20.0), g_gdd_near[w], 0.0, `C.mid ${g_wname[w]} (no falloff)`);
+        }
+
+        // C4 negative / absurd ranges do not produce absurd damage.
+        ckf(wpn_dmg_at(w, -10.0), g_gdd_near[w], 0.0, `C.neg ${g_wname[w]}`);
+        w = w + 1;
+    }
+
+    // C5 THE FOG WALL. No weapon's max useful range may exceed FOG_FAR — you
+    // cannot shoot what the triangle budget will not draw (ARCHITECTURE D2).
+    let over: i32 = 0;
+    let worst: f64 = 0.0;
+    let k = 0;
+    while (k < 6) {
+        if (wpn_max_range(k) > g_FOG_FAR_CAP) { over = over + 1; }
+        if (wpn_max_range(k) > worst) { worst = wpn_max_range(k); }
+        k = k + 1;
+    }
+    ck(over == 0, "C5 no weapon out-ranges FOG_FAR", `${over} do; longest ${worst} vs cap ${g_FOG_FAR_CAP}`);
+    print(`   C5  longest max-useful range = ${worst} m, FOG_FAR cap = ${g_FOG_FAR_CAP} m`);
+
+    // C6 the D2 amendment is actually in force (55/110 would fail C5).
+    ckf(wpn_dmg_at(WPN_LONGSHADOW, 68.0), 68.0, 1.0e-12, "C6 Longshadow r1 amended to 68 m");
+    ck(wpn_dmg_at(WPN_LONGSHADOW, 34.0) == 78.0, "C6b Longshadow r0 amended to 34 m",
+       `${wpn_dmg_at(WPN_LONGSHADOW, 34.0)}`);
+
+    // C7 falloff still separates the weapons the way the design says: at 30 m
+    // the marksman rifle out-damages the SMG by more than 5x.
+    let ls: f64 = wpn_dmg_at(WPN_LONGSHADOW, 30.0);
+    let tk: f64 = wpn_dmg_at(WPN_TINKER, 30.0);
+    ck(ls > tk * 5.0, "C7 Longshadow >> Tinker at 30 m", `${ls} vs ${tk}`);
+
+    // C8 the Bellows is a doorway gun: full damage at 6 m, halved-ish by 14 m.
+    ck(wpn_dmg_shot(WPN_BELLOWS, 6.0, 0) > wpn_dmg_shot(WPN_BELLOWS, 14.0, 0) * 2.0,
+       "C8 Bellows loses more than half its damage from 6 m to 14 m", "");
+}
+
+// ===========================================================================
+// D.  THE TTK MATRIX
+// ===========================================================================
+fn section_ttk() {
+    print("D. TTK matrix vs GDD 2.4");
+    let row = 0;
+    let cells = 0;
+    while (row < 9) {
+        let w: i32 = g_ttk_w[row];
+        let r: f64 = g_ttk_r[row];
+        let col = 0;
+        while (col < 6) {
+            let idx: i32 = row * 6 + col;
+            if (ttk_skipped(idx) == 0) {
+                let n: i32 = wpn_ttk_shots_dot(w, g_ehp[col], r, g_ehead[col]);
+                ck(n == g_ttk_n[idx], `D.shots ${g_ttk_lbl[row]} vs ${g_ename[col]}`,
+                   `got ${n}, GDD ${g_ttk_n[idx]}`);
+                cells = cells + 1;
+                let want_ms: f64 = g_ttk_ms[idx];
+                if (want_ms >= 0.0) {
+                    let ms: f64 = 0.0;
+                    if (n > 1) { ms = f64(n - 1) * 60000.0 / wpn_rpm(w); }
+                    ck(ni(ms) == ni(want_ms), `D.ms ${g_ttk_lbl[row]} vs ${g_ename[col]}`,
+                       `got ${ni(ms)}, GDD ${ni(want_ms)}`);
+                }
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    print(`   D  ${cells} of 54 matrix cells asserted; 3 excluded and printed by --ttk`);
+
+    // --- the three criteria BUILD_PLAN names by hand -----------------------
+    // D-a  Sparrow vs Husk, near: 4 shots / 261 ms.
+    let sn: i32 = wpn_ttk_shots(WPN_SPARROW, 90.0, 0.0, 0);
+    let sms: f64 = wpn_ttk_ms(WPN_SPARROW, 90.0, 0.0, 0);
+    ck(sn == 4, "D-a Sparrow kills a Husk in 4 body shots", `${sn}`);
+    ck(ni(sms) == 261, "D-a Sparrow vs Husk near == 261 ms", `${sms}`);
+
+    // D-b  Bellows one-shots a Husk at every range <= 6 m, and NOT past it.
+    let allin: i32 = 1;
+    let r: f64 = 0.0;
+    while (r <= 6.0) {
+        if (wpn_ttk_shots(WPN_BELLOWS, 90.0, r, 0) != 1) { allin = 0; }
+        r = r + 0.1;
+    }
+    ck(allin == 1, "D-b Bellows one-shots a Husk at every range <= 6 m", "");
+    ck(wpn_ttk_shots(WPN_BELLOWS, 90.0, 6.0, 0) == 1, "D-b Bellows one-shot AT 6.0 m", "");
+    ck(wpn_ttk_shots(WPN_BELLOWS, 90.0, 12.0, 0) == 2,
+       "D-b the one-shot ENDS past 6 m (2 shots at 12 m)", "");
+
+    // D-c  Longshadow one-shots a Husk in the head at ANY range, including
+    //      past the fog wall where its damage has fully fallen off.
+    let anyr: i32 = 1;
+    let worst_dmg: f64 = 1.0e9;
+    let rr: f64 = 0.0;
+    while (rr <= 150.0) {
+        let n: i32 = wpn_ttk_shots(WPN_LONGSHADOW, 90.0, rr, 1);
+        if (n != 1) { anyr = 0; }
+        let d: f64 = wpn_dmg_shot(WPN_LONGSHADOW, rr, 1);
+        if (d < worst_dmg) { worst_dmg = d; }
+        rr = rr + 0.25;
+    }
+    ck(anyr == 1, "D-c Longshadow one-shots a Husk in the head at ANY range", "");
+    ck(worst_dmg >= 90.0, "D-c its worst-case headshot still exceeds Husk HP",
+       `${worst_dmg} vs 90`);
+    print(`   D-c Longshadow worst-case headshot damage over 0..150 m = ${worst_dmg}`);
+
+    // D-d  the design statements the matrix is supposed to encode.
+    //      "Sparrow is never wrong but never best": at 0 m it is never the
+    //      fastest killer of a Husk, and never the slowest either.
+    let sp: f64 = wpn_ttk_ms(WPN_SPARROW, 90.0, 0.0, 0);
+    let faster: i32 = 0;
+    let slower: i32 = 0;
+    let q = 0;
+    while (q < 6) {
+        if (q != WPN_SPARROW) {
+            let t: f64 = wpn_ttk_ms(q, 90.0, 0.0, 0);
+            if (t < sp) { faster = faster + 1; }
+            if (t > sp) { slower = slower + 1; }
+        }
+        q = q + 1;
+    }
+    ck(faster >= 1, "D-d something out-kills the Sparrow up close", `${faster}`);
+    ck(slower >= 1, "D-d the Sparrow out-kills something up close", `${slower}`);
+
+    // "Tinker is a knife that dies past 22 m" — past its r1 it needs at least
+    // twice as many shots on a Husk as it does point blank.
+    let tn: i32 = wpn_ttk_shots(WPN_TINKER, 90.0, 0.0, 0);
+    let tf: i32 = wpn_ttk_shots(WPN_TINKER, 90.0, 25.0, 0);
+    ck(tf >= tn * 2 - 1, "D-d Tinker falls apart past 22 m", `${tn} -> ${tf}`);
+}
+
+// ===========================================================================
+// E.  RECOIL PATTERNS
+// ===========================================================================
+fn section_recoil() {
+    print("E. recoil patterns");
+
+    // E1 pattern lengths, exactly as §2.4 prints them.
+    ck(wpn_pattern_len(WPN_SPARROW) == 30, "E1 Sparrow pattern is 30 long",
+       `${wpn_pattern_len(WPN_SPARROW)}`);
+    ck(wpn_pattern_len(WPN_TINKER) == 32, "E1 Tinker pattern is 32 long",
+       `${wpn_pattern_len(WPN_TINKER)}`);
+    let sing = 0;
+    let sing_ok: i32 = 1;
+    while (sing < 6) {
+        if (sing >= 2) {
+            if (wpn_pattern_len(sing) != 1) { sing_ok = 0; }
+        }
+        sing = sing + 1;
+    }
+    ck(sing_ok == 1, "E1 the four single-shot weapons have 1-entry patterns", "");
+
+    // E2 the pattern length equals the magazine for the two automatics — the
+    // GDD's way of saying the pattern is per-magazine.
+    ck(wpn_pattern_len(WPN_SPARROW) == wpn_mag(WPN_SPARROW), "E2 Sparrow pattern == mag", "");
+    ck(wpn_pattern_len(WPN_TINKER) == wpn_mag(WPN_TINKER), "E2 Tinker pattern == mag", "");
+
+    // E3 the printed Sparrow runs, shot by shot.
+    ckf(wpn_recoil_v(WPN_SPARROW, 0), 0.62, 0.0, "E3 Sparrow shot 1 v");
+    ckf(wpn_recoil_h(WPN_SPARROW, 0), 0.00, 0.0, "E3 Sparrow shot 1 h");
+    ckf(wpn_recoil_v(WPN_SPARROW, 1), 0.60, 0.0, "E3 Sparrow shot 2 v");
+    ckf(wpn_recoil_h(WPN_SPARROW, 1), -0.06, 0.0, "E3 Sparrow shot 2 h");
+    ckf(wpn_recoil_v(WPN_SPARROW, 2), 0.58, 0.0, "E3 Sparrow shot 3 v");
+    ckf(wpn_recoil_h(WPN_SPARROW, 2), 0.10, 0.0, "E3 Sparrow shot 3 h");
+    let s4 = 3;
+    let run48: i32 = 1;
+    while (s4 <= 7) {
+        if (wpn_recoil_v(WPN_SPARROW, s4) != 0.42) { run48 = 0; }
+        if (wpn_recoil_h(WPN_SPARROW, s4) != 0.22) { run48 = 0; }
+        s4 = s4 + 1;
+    }
+    ck(run48 == 1, "E3 Sparrow shots 4-8 are (0.42, +0.22), drifting right", "");
+    let s9 = 8;
+    let run915: i32 = 1;
+    while (s9 <= 14) {
+        if (wpn_recoil_v(WPN_SPARROW, s9) != 0.30) { run915 = 0; }
+        if (wpn_recoil_h(WPN_SPARROW, s9) != -0.18) { run915 = 0; }
+        s9 = s9 + 1;
+    }
+    ck(run915 == 1, "E3 Sparrow shots 9-15 are (0.30, -0.18), hooking left", "");
+    let s16 = 15;
+    let run1630: i32 = 1;
+    while (s16 <= 29) {
+        if (wpn_recoil_v(WPN_SPARROW, s16) != 0.26) { run1630 = 0; }
+        if (wpn_recoil_rand(WPN_SPARROW, s16) != 0.20) { run1630 = 0; }
+        s16 = s16 + 1;
+    }
+    ck(run1630 == 1, "E3 Sparrow shots 16-30 are (0.26, +/-0.20 random)", "");
+
+    // E4 the printed Tinker runs.
+    let t1 = 0;
+    let tr1: i32 = 1;
+    while (t1 <= 4) {
+        if (wpn_recoil_v(WPN_TINKER, t1) != 0.38) { tr1 = 0; }
+        if (wpn_recoil_h(WPN_TINKER, t1) != 0.05) { tr1 = 0; }
+        t1 = t1 + 1;
+    }
+    ck(tr1 == 1, "E4 Tinker shots 1-5 are (0.38, +0.05)", "");
+    let t2 = 5;
+    let tr2: i32 = 1;
+    while (t2 <= 13) {
+        if (wpn_recoil_v(WPN_TINKER, t2) != 0.34) { tr2 = 0; }
+        if (wpn_recoil_h(WPN_TINKER, t2) != 0.26) { tr2 = 0; }
+        t2 = t2 + 1;
+    }
+    ck(tr2 == 1, "E4 Tinker shots 6-14 are (0.34, +0.26), hard right climb", "");
+    let t3 = 14;
+    let tr3: i32 = 1;
+    while (t3 <= 31) {
+        if (wpn_recoil_v(WPN_TINKER, t3) != 0.30) { tr3 = 0; }
+        if (wpn_recoil_h(WPN_TINKER, t3) != -0.30) { tr3 = 0; }
+        t3 = t3 + 1;
+    }
+    ck(tr3 == 1, "E4 Tinker shots 15-32 are (0.30, -0.30), whipping left", "");
+
+    // E5 the four single-shot kicks.
+    ckf(wpn_recoil_v(WPN_BELLOWS, 0), 2.40, 0.0, "E5 Bellows kick_v");
+    ckf(wpn_recoil_rand(WPN_BELLOWS, 0), 0.30, 0.0, "E5 Bellows +/-0.30");
+    ckf(wpn_recoil_v(WPN_LONGSHADOW, 0), 2.90, 0.0, "E5 Longshadow kick_v");
+    ckf(wpn_recoil_rand(WPN_LONGSHADOW, 0), 0.15, 0.0, "E5 Longshadow +/-0.15");
+    ckf(wpn_recoil_v(WPN_KESTREL, 0), 1.35, 0.0, "E5 Kestrel kick_v");
+    ckf(wpn_recoil_rand(WPN_KESTREL, 0), 0.25, 0.0, "E5 Kestrel +/-0.25");
+    ckf(wpn_recoil_v(WPN_EMBERLANCE, 0), 1.80, 0.0, "E5 Emberlance kick_v");
+    ckf(wpn_recoil_rand(WPN_EMBERLANCE, 0), 0.0, 0.0, "E5 Emberlance has no h randomness");
+
+    // E6 jitter is declared ONLY on the two automatics, and only on kick_h.
+    ckf(wpn_jitter(WPN_SPARROW), 0.06, 0.0, "E6 Sparrow jitter +/-0.06");
+    ckf(wpn_jitter(WPN_TINKER), 0.10, 0.0, "E6 Tinker jitter +/-0.10");
+
+    // E7 THE VERTICAL COLUMN IS NEVER RANDOM. 4000 draws across every weapon
+    // and every shot index: kick_v must equal the table value EXACTLY, every
+    // time. This is the property that makes the pattern learnable.
+    let out = [0.0, 0.0];
+    let st = rng_new();
+    let vfixed: i32 = 1;
+    let ww = 0;
+    while (ww < 6) {
+        let n: i32 = wpn_pattern_len(ww);
+        let s = 0;
+        while (s < n) {
+            let trial = 0;
+            while (trial < 25) {
+                rng_seed(st, 8191 + trial, RNG_SPREAD, s, ww);
+                wpn_recoil(ww, s, st, out);
+                if (out[0] != wpn_recoil_v(ww, s)) { vfixed = 0; }
+                trial = trial + 1;
+            }
+            s = s + 1;
+        }
+        ww = ww + 1;
+    }
+    ck(vfixed == 1, "E7 kick_v is bit-exact the table value on every draw (1725 draws)", "");
+
+    // E8 kick_h DOES move, and stays inside |h| + rand + jitter.
+    let hmoved: i32 = 0;
+    let inband: i32 = 1;
+    let k = 0;
+    while (k < 2000) {
+        rng_seed(st, 4242, RNG_SPREAD, k, WPN_SPARROW);
+        wpn_recoil(WPN_SPARROW, 20, st, out);       // a +/-0.20 random shot
+        if (out[1] != 0.0) { hmoved = 1; }
+        let lim: f64 = 0.20 + 0.06;
+        if (out[1] > lim) { inband = 0; }
+        if (out[1] < -lim) { inband = 0; }
+        k = k + 1;
+    }
+    ck(hmoved == 1, "E8 kick_h actually varies", "");
+    ck(inband == 1, "E8 kick_h stays within rand + jitter", "");
+
+    // E9 a weapon with neither rand nor jitter consumes NO rng draws and is
+    // therefore perfectly repeatable without a seed at all.
+    rng_seed(st, 1, RNG_SPREAD, 0, 0);
+    wpn_recoil(WPN_EMBERLANCE, 0, st, out);
+    let e_h1: f64 = out[1];
+    rng_seed(st, 999999, RNG_SPREAD, 77, 3);
+    wpn_recoil(WPN_EMBERLANCE, 0, st, out);
+    ck(out[1] == e_h1, "E9 Emberlance recoil is seed-independent (0 draws)", "");
+    ck(e_h1 == 0.0, "E9 and exactly 0.00 horizontal", `${e_h1}`);
+}
+
+// ===========================================================================
+// F.  DETERMINISM — same seed twice, different seed differs
+// ===========================================================================
+
+// Drive one weapon state through a scripted command sequence and return a
+// rolling hash of EVERY tick's state, not just the last one. Hashing only the
+// final state would be a fraud: recoil decays to exactly zero and ammo is an
+// integer, so two different seeds converge on an identical end state and a
+// final-state-only test would "pass" while proving nothing. The rolling hash
+// is a fingerprint of the whole trajectory.
+fn run_script(p_seed: i32, p_weapon: i32, p_swap: i32): i32 {
+    let st = wpn_state_new(1);
+    wpn_state_reset(st, 0, p_weapon);
+    let rng = rng_new();
+    let out = [0.0, 0.0];
+    let roll: u64 = 14695981039346656037;
+    let tick = 0;
+    while (tick < 900) {
+        // A fixed, seed-independent command script: hold fire for 40 ticks,
+        // release for 10, reload at 300, ADS from 400, swap at 600.
+        let m: i32 = tick % 50;
+        let fire: i32 = 0;
+        if (m < 40) { fire = 1; }
+        let ads: i32 = 0;
+        if (tick >= 400) { ads = 1; }
+        let sprint: i32 = 0;
+        if (tick >= 700) { if (tick < 720) { sprint = 1; } }
+
+        if (tick == 300) { wpn_reload_begin(st, 0); }
+        if (tick == 600) { if (p_swap == 1) { wpn_swap_begin(st, 0, WPN_KESTREL); } }
+
+        if (fire == 1) {
+            rng_seed(rng, p_seed, RNG_SPREAD, tick, 1);
+            wpn_fire(st, 0, rng, out);
+        }
+        wpn_step(st, 0, ads, sprint);
+        roll = (roll ^ u64(wpn_state_hash(st, 0))) * 1099511628211;
+        tick = tick + 1;
+    }
+    let h: i32 = i32((roll >> 33) & 2147483647);
+    return h;
+}
+
+fn section_determinism() {
+    print("F. determinism");
+
+    let w = 0;
+    while (w < 6) {
+        let a: i32 = run_script(20260729, w, 1);
+        let b: i32 = run_script(20260729, w, 1);
+        ck(a == b, `F1 ${g_wname[w]}: same seed + same commands -> same hash`,
+           `${a} vs ${b}`);
+        w = w + 1;
+    }
+
+    // F2 NEGATIVE CONTROL. A different seed must produce a different state for
+    // every weapon that has any horizontal randomness at all. The Emberlance
+    // has none by design, so it must NOT differ — asserting that it does would
+    // be asserting a bug.
+    let differ = 0;
+    let w2 = 0;
+    while (w2 < 6) {
+        // No mid-script swap here: the control has to isolate ONE weapon's
+        // randomness, and swapping to the Kestrel at tick 600 would smuggle the
+        // Kestrel's +/-0.25 into the Emberlance's "has no randomness" case.
+        let a: i32 = run_script(20260729, w2, 0);
+        let b: i32 = run_script(-77000001, w2, 0);
+        let has_rand: i32 = 0;
+        if (wpn_jitter(w2) > 0.0) { has_rand = 1; }
+        if (wpn_recoil_rand(w2, 0) > 0.0) { has_rand = 1; }
+        if (has_rand == 1) {
+            ck(a != b, `F2 ${g_wname[w2]}: a different seed gives a different state`,
+               `${a} == ${b}`);
+            if (a != b) { differ = differ + 1; }
+        } else {
+            ck(a == b, `F2 ${g_wname[w2]}: no-randomness weapon is seed-independent`,
+               `${a} vs ${b}`);
+        }
+        w2 = w2 + 1;
+    }
+    ck(differ == 5, "F2 five of six weapons are seed-sensitive", `${differ}`);
+
+    // F3 the hash is sensitive to the STATE, not just to the seed: one extra
+    // shot must move it.
+    let s1 = wpn_state_new(1);
+    let s2 = wpn_state_new(1);
+    let rng = rng_new();
+    let out = [0.0, 0.0];
+    wpn_state_reset(s1, 0, WPN_SPARROW);
+    wpn_state_reset(s2, 0, WPN_SPARROW);
+    ck(wpn_state_hash(s1, 0) == wpn_state_hash(s2, 0), "F3 two fresh states hash equal", "");
+    rng_seed(rng, 5, RNG_SPREAD, 0, 1);
+    wpn_fire(s1, 0, rng, out);
+    ck(wpn_state_hash(s1, 0) != wpn_state_hash(s2, 0), "F3 one shot moves the hash", "");
+
+    // F4 multi-slot hashing sees every slot.
+    let ms = wpn_state_new(4);
+    let h0: i32 = wpn_hash_all(ms, 4);
+    rng_seed(rng, 5, RNG_SPREAD, 0, 1);
+    wpn_fire(ms, 3 * WS_FIELDS, rng, out);
+    ck(wpn_hash_all(ms, 4) != h0, "F4 wpn_hash_all covers the last slot", "");
+
+    // F5 the golden hash. A number that pins the ENTIRE model — table, recoil
+    // stream, state machine and all — to one value across both backends and
+    // across time. Print it; if it changes, the change had better be intended.
+    let golden: i32 = run_script(1337, WPN_SPARROW, 1);
+    print(`   F5  golden Sparrow script hash (seed 1337, 900 ticks) = ${golden}`);
+    ck(golden == 934327907, "F5 golden script hash",
+       `got ${golden}; if this changed on purpose, update the literal AND say why`);
+}
+
+// ===========================================================================
+// G.  THE STATE MACHINE
+// ===========================================================================
+fn section_state() {
+    print("G. fire / reload / cooldown / recoil_aim");
+
+    let st = wpn_state_new(1);
+    let rng = rng_new();
+    let out = [0.0, 0.0];
+
+    // G1 a fresh state is loaded, idle and holding the Kestrel — the sidearm
+    // you never lose (GDD §2.4).
+    ck(wpn_cur(st, 0) == WPN_KESTREL, "G1 fresh state holds the Kestrel", `${wpn_cur(st,0)}`);
+    let full: i32 = 1;
+    let w = 0;
+    while (w < 6) {
+        if (wpn_ammo(st, 0, w) != wpn_mag(w)) { full = 0; }
+        if (wpn_reserve_ammo(st, 0, w) != wpn_reserve(w)) { full = 0; }
+        w = w + 1;
+    }
+    ck(full == 1, "G1 every magazine and reserve starts full", "");
+    ck(wpn_can_fire(st, 0) == 1, "G1 a fresh weapon can fire", "");
+
+    // G2 firing costs exactly one round and starts a cooldown.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    rng_seed(rng, 11, RNG_SPREAD, 0, 1);
+    ck(wpn_fire(st, 0, rng, out) == 1, "G2 the first shot fires", "");
+    ck(wpn_ammo(st, 0, WPN_SPARROW) == 29, "G2 one round consumed",
+       `${wpn_ammo(st, 0, WPN_SPARROW)}`);
+    ck(wpn_can_fire(st, 0) == 0, "G2 the next shot is on cooldown", "");
+
+    // G3 the cooldown enforces the design RPM to within one tick. 690 RPM over
+    // 10 s of held fire, with a magazine that never runs dry (reload skipped by
+    // refilling), must land inside [design, design + one tick per shot].
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    let shots = 0;
+    let t = 0;
+    while (t < 600) {
+        rng_seed(rng, 11, RNG_SPREAD, t, 1);
+        if (wpn_fire(st, 0, rng, out) == 1) { shots = shots + 1; }
+        st[16 + WPN_SPARROW] = 30.0;            // bottomless mag, on purpose
+        wpn_step(st, 0, 0, 0);
+        t = t + 1;
+    }
+    let design: f64 = 690.0 * 10.0 / 60.0;      // shots the design predicts
+    ck(f64(shots) <= design + 1.0, "G3 the sim never fires FASTER than the design RPM",
+       `${shots} vs ${design}`);
+    ck(f64(shots) >= design - 1.0, "G3 nor slower: the cooldown carries the remainder",
+       `${shots} vs ${design}`);
+    print(`   G3  Sparrow: ${shots} shots in 10 s of held fire; design says ${ni(design)}`);
+
+    // G4 a magazine reload restores exactly the magazine, from the reserve.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    let f = 0;
+    let ffired = 0;
+    while (ffired < 10) {
+        rng_seed(rng, 3, RNG_SPREAD, f, 1);
+        if (wpn_fire(st, 0, rng, out) == 1) { ffired = ffired + 1; }
+        wpn_step(st, 0, 0, 0);
+        f = f + 1;
+    }
+    ck(wpn_ammo(st, 0, WPN_SPARROW) == 20, "G4 ten shots left 20 rounds",
+       `${wpn_ammo(st, 0, WPN_SPARROW)}`);
+    ck(wpn_reload_begin(st, 0) == 1, "G4 a reload starts", "");
+    let ticks = 0;
+    while (st[WS_RELOAD_T] > 0.0) { wpn_step(st, 0, 0, 0); ticks = ticks + 1; }
+    ck(wpn_ammo(st, 0, WPN_SPARROW) == 30, "G4 the magazine is full again",
+       `${wpn_ammo(st, 0, WPN_SPARROW)}`);
+    ck(wpn_reserve_ammo(st, 0, WPN_SPARROW) == 200, "G4 ten rounds came out of the reserve",
+       `${wpn_reserve_ammo(st, 0, WPN_SPARROW)}`);
+    // A duration, not a tick count: the criterion is "the reload lasts the
+    // table's 1.85 s", to within the one tick the timestep can never resolve.
+    let dur: f64 = f64(ticks) * g_TICK_DT;
+    ck(dur >= 1.85 - g_TICK_DT, "G4 a tactical reload is not shorter than 1.85 s",
+       `${dur} s over ${ticks} ticks`);
+    ck(dur <= 1.85 + g_TICK_DT, "G4 nor longer than 1.85 s + one tick",
+       `${dur} s over ${ticks} ticks`);
+    let want_ticks: i32 = ticks;
+    ck(st[WS_SHOT_IDX] == 0.0, "G4 the reload reset the recoil pattern index", "");
+
+    // G5 an EMPTY reload takes the longer time.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    st[16 + WPN_SPARROW] = 0.0;
+    wpn_reload_begin(st, 0);
+    let et = 0;
+    while (st[WS_RELOAD_T] > 0.0) { wpn_step(st, 0, 0, 0); et = et + 1; }
+    let edur: f64 = f64(et) * g_TICK_DT;
+    ck(edur >= 2.40 - g_TICK_DT, "G5 an empty reload is not shorter than 2.40 s",
+       `${edur} s over ${et} ticks`);
+    ck(edur <= 2.40 + g_TICK_DT, "G5 nor longer than 2.40 s + one tick",
+       `${edur} s over ${et} ticks`);
+    ck(et > want_ticks, "G5 and it is strictly slower than the tactical one", "");
+
+    // G6 the Bellows loads shell by shell and is INTERRUPTIBLE by firing.
+    wpn_state_reset(st, 0, WPN_BELLOWS);
+    st[16 + WPN_BELLOWS] = 0.0;
+    wpn_reload_begin(st, 0);
+    let shells = 0;
+    let bt = 0;
+    while (bt < 200) {
+        wpn_step(st, 0, 0, 0);
+        bt = bt + 1;
+        if (wpn_ammo(st, 0, WPN_BELLOWS) > shells) { shells = wpn_ammo(st, 0, WPN_BELLOWS); }
+        if (shells >= 3) { bt = 200; }
+    }
+    ck(shells >= 3, "G6 the Bellows loads one shell at a time", `${shells}`);
+    ck(wpn_can_fire(st, 0) == 1, "G6 it can fire mid-reload (interruptible)", "");
+    rng_seed(rng, 2, RNG_SPREAD, 0, 1);
+    wpn_fire(st, 0, rng, out);
+    ck(st[WS_RELOAD_T] == 0.0, "G6 firing cancelled the shell reload", "");
+
+    // G7 a magazine reload is NOT interruptible.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    st[16 + WPN_SPARROW] = 5.0;
+    wpn_reload_begin(st, 0);
+    wpn_step(st, 0, 0, 0);
+    ck(wpn_can_fire(st, 0) == 0, "G7 a magazine reload blocks firing", "");
+
+    // G8 recoil_aim: accumulates upward, then decays back to exactly zero.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    let p0: f64 = wpn_recoil_aim_pitch(st, 0);
+    ck(p0 == 0.0, "G8 recoil_aim starts at zero", `${p0}`);
+    let n = 0;
+    let nfired = 0;
+    while (nfired < 8) {
+        rng_seed(rng, 7, RNG_SPREAD, n, 1);
+        if (wpn_fire(st, 0, rng, out) == 1) { nfired = nfired + 1; }
+        wpn_step(st, 0, 0, 0);
+        n = n + 1;
+    }
+    let climbed: f64 = wpn_recoil_aim_pitch(st, 0);
+    ck(climbed > 1.0, "G8 eight Sparrow shots climb the aim by over a degree",
+       `${climbed}`);
+    let dec = 0;
+    while (dec < 600) { wpn_step(st, 0, 0, 0); dec = dec + 1; }
+    ck(wpn_recoil_aim_pitch(st, 0) == 0.0, "G8 recoil_aim decays to exactly 0.0 pitch",
+       `${wpn_recoil_aim_pitch(st, 0)}`);
+    ck(wpn_recoil_aim_yaw(st, 0) == 0.0, "G8 recoil_aim decays to exactly 0.0 yaw",
+       `${wpn_recoil_aim_yaw(st, 0)}`);
+
+    // G9 the recovery honours the 0.16 s settle window: nothing decays before it.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    rng_seed(rng, 7, RNG_SPREAD, 0, 1);
+    wpn_fire(st, 0, rng, out);
+    let held: f64 = wpn_recoil_aim_pitch(st, 0);
+    let settle_ticks: i32 = i32(g_RECOIL_SETTLE_S / g_TICK_DT);
+    let sw = 0;
+    while (sw < settle_ticks) { wpn_step(st, 0, 0, 0); sw = sw + 1; }
+    ck(wpn_recoil_aim_pitch(st, 0) == held, "G9 no recovery inside the 0.16 s settle window",
+       `${wpn_recoil_aim_pitch(st, 0)} vs ${held}`);
+    wpn_step(st, 0, 0, 0);
+    ck(wpn_recoil_aim_pitch(st, 0) < held, "G9 recovery begins right after it", "");
+
+    // G10 the recovery RATE is the table's deg/s, measured over 0.5 s.
+    wpn_state_reset(st, 0, WPN_LONGSHADOW);
+    rng_seed(rng, 7, RNG_SPREAD, 0, 1);
+    wpn_fire(st, 0, rng, out);
+    let start: f64 = sqrt(st[WS_RC_V] * st[WS_RC_V] + st[WS_RC_H] * st[WS_RC_H]);
+    let rt = 0;
+    while (rt < settle_ticks + 30) { wpn_step(st, 0, 0, 0); rt = rt + 1; }
+    let now: f64 = sqrt(st[WS_RC_V] * st[WS_RC_V] + st[WS_RC_H] * st[WS_RC_H]);
+    let moved: f64 = start - now;
+    let expect: f64 = 4.0 * 30.0 * g_TICK_DT;      // Longshadow recovers 4.0 deg/s
+    ckf(moved, expect, 0.02, "G10 recovery rate == the table's deg/s");
+
+    // G11 bloom: rises per shot, clamps at the cap, returns to zero.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    ckf(wpn_cur_spread(st, 0), 3.2, 1.0e-12, "G11 rested hipfire spread == base");
+    let bn = 0;
+    while (bn < 120) {
+        rng_seed(rng, 7, RNG_SPREAD, bn, 1);
+        wpn_fire(st, 0, rng, out);
+        st[16 + WPN_SPARROW] = 30.0;            // bottomless mag, on purpose
+        wpn_step(st, 0, 0, 0);
+        bn = bn + 1;
+    }
+    ckf(wpn_cur_spread(st, 0), 6.0, 1.0e-12, "G11 sustained fire pins spread at the cap");
+    let bd = 0;
+    while (bd < 200) { wpn_step(st, 0, 0, 0); bd = bd + 1; }
+    ckf(wpn_cur_spread(st, 0), 3.2, 1.0e-12, "G11 bloom recovers to base");
+
+    // G12 ADS: the lerp reaches 1.0 in the table's ADS time, no sooner, and it
+    // is frame-rate independent BY CONSTRUCTION (there is no dt parameter).
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    let want_ads: i32 = i32(0.24 / g_TICK_DT + 0.9999);
+    let at = 0;
+    while (at < want_ads - 1) { wpn_step(st, 0, 1, 0); at = at + 1; }
+    ck(st[WS_ADS] < 1.0, "G12 not fully aimed one tick early", `${st[WS_ADS]}`);
+    wpn_step(st, 0, 1, 0);
+    ck(st[WS_ADS] == 1.0, "G12 fully aimed after the table's ADS time", `${st[WS_ADS]}`);
+    ckf(wpn_cur_spread(st, 0), 0.25, 1.0e-12, "G12 aimed spread == the ADS value");
+
+    // G13 sprint-to-fire: sprinting locks the trigger, and it stays locked for
+    // the table's delay after the sprint ends.
+    wpn_state_reset(st, 0, WPN_LONGSHADOW);
+    wpn_step(st, 0, 0, 1);
+    ck(wpn_can_fire(st, 0) == 0, "G13 you cannot fire while sprinting", "");
+    let lock = 0;
+    while (wpn_can_fire(st, 0) == 0) {
+        wpn_step(st, 0, 0, 0);
+        lock = lock + 1;
+        if (lock > 200) { ck(false, "G13 sprint lock never released", ""); lock = 999; }
+    }
+    let ldur: f64 = f64(lock) * g_TICK_DT;
+    ck(ldur >= 0.34 - g_TICK_DT, "G13 the lock lasts the table's sprint-to-fire time",
+       `${ldur} s over ${lock} ticks`);
+    ck(ldur <= 0.34 + g_TICK_DT, "G13 and no longer", `${ldur} s over ${lock} ticks`);
+
+    // G14 swap: stow then raise, blocked from firing throughout, and the new
+    // weapon is in hand at the end.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    ck(wpn_swap_begin(st, 0, WPN_KESTREL) == 1, "G14 a swap starts", "");
+    let swt = 0;
+    let blocked: i32 = 1;
+    while (wpn_cur(st, 0) != WPN_KESTREL) {
+        if (wpn_can_fire(st, 0) != 0) { blocked = 0; }
+        wpn_step(st, 0, 0, 0);
+        swt = swt + 1;
+        if (swt > 300) { wpn_state_reset(st, 0, WPN_KESTREL); }
+    }
+    ck(blocked == 1, "G14 you cannot fire while stowing", "");
+    let raise = 0;
+    while (wpn_can_fire(st, 0) == 0) {
+        wpn_step(st, 0, 0, 0);
+        raise = raise + 1;
+        if (raise > 300) { ck(false, "G14 the swap never completed", ""); raise = 999; }
+    }
+    let sdur: f64 = f64(swt + raise) * g_TICK_DT;
+    ck(sdur >= 0.40 + 0.35 - 2.0 * g_TICK_DT,
+       "G14 swap costs swap_out(Sparrow) + swap_in(Kestrel)", `${sdur} s`);
+    ck(sdur <= 0.40 + 0.35 + 2.0 * g_TICK_DT, "G14 and no more", `${sdur} s`);
+    ck(wpn_cur(st, 0) == WPN_KESTREL, "G14 the Kestrel is in hand", "");
+
+    // G15 you cannot reload with an empty reserve, and you cannot fire dry.
+    wpn_state_reset(st, 0, WPN_KESTREL);
+    st[22 + WPN_KESTREL] = 0.0;
+    st[16 + WPN_KESTREL] = 0.0;
+    ck(wpn_reload_begin(st, 0) == 0, "G15 no reload without a reserve", "");
+    ck(wpn_can_fire(st, 0) == 0, "G15 no firing with an empty magazine", "");
+    ck(wpn_fire(st, 0, rng, out) == 0, "G15 wpn_fire refuses and returns 0", "");
+
+    // G16 the pattern index resets after a firing pause.
+    wpn_state_reset(st, 0, WPN_SPARROW);
+    let pn = 0;
+    let pfired = 0;
+    while (pfired < 5) {
+        rng_seed(rng, 7, RNG_SPREAD, pn, 1);
+        if (wpn_fire(st, 0, rng, out) == 1) { pfired = pfired + 1; }
+        wpn_step(st, 0, 0, 0);
+        pn = pn + 1;
+    }
+    ck(st[WS_SHOT_IDX] == 5.0, "G16 five shots advanced the pattern to index 5",
+       `${st[WS_SHOT_IDX]}`);
+    let pause: i32 = i32(g_PATTERN_RESET_S / g_TICK_DT) + 2;
+    let pp = 0;
+    while (pp < pause) { wpn_step(st, 0, 0, 0); pp = pp + 1; }
+    ck(st[WS_SHOT_IDX] == 0.0, "G16 a pause resets the pattern index", `${st[WS_SHOT_IDX]}`);
+
+    // G17 the lifetime shot counter is monotone and matches rounds spent.
+    wpn_state_reset(st, 0, WPN_KESTREL);
+    let fired = 0;
+    let ft = 0;
+    while (ft < 300) {
+        rng_seed(rng, 9, RNG_SPREAD, ft, 1);
+        if (wpn_fire(st, 0, rng, out) == 1) { fired = fired + 1; }
+        wpn_step(st, 0, 0, 0);
+        ft = ft + 1;
+    }
+    ck(i32(st[WS_SHOTS]) == fired, "G17 WS_SHOTS counts exactly the shots fired",
+       `${i32(st[WS_SHOTS])} vs ${fired}`);
+    ck(fired == 6, "G17 a Kestrel cylinder is six rounds and then it is dry", `${fired}`);
+}
+
+// ===========================================================================
+// H.  THE WALL — this module may not reach outside src/sim + src/core.
+// ===========================================================================
+fn section_wall() {
+    print("H. import wall");
+    let src: string = read_file("src/sim/weapons.hml");
+    let banned = ["@stdlib/random", "@stdlib/time", "@stdlib/fs", "@stdlib/process",
+                  "wobbleweed", "gn.hml", "sdl.hml", "SDL_", "__clock", "ticks(",
+                  "recoil_view", "src/render", "src/art", "src/net"];
+    let hits: string = "";
+    let lines = src.split("\n");
+    let l = 0;
+    while (l < lines.length) {
+        let code: string = lines[l].split("//")[0];
+        let b = 0;
+        while (b < banned.length) {
+            if (code.contains(banned[b])) { hits = `${hits} ${l}:${banned[b]}`; }
+            b = b + 1;
+        }
+        l = l + 1;
+    }
+    ck(hits == "", "H1 no banned import or symbol in weapons.hml CODE", `${hits}`);
+
+    // H2 the scanner is not blind — it must find a real import line in itself.
+    let selftext: string = read_file("tools/probe_weapons.hml");
+    let sl = selftext.split("\n");
+    let si = 0;
+    let sawit: i32 = 0;
+    while (si < sl.length) {
+        if (sl[si].split("//")[0].contains("@stdlib/fs")) { sawit = 1; }
+        si = si + 1;
+    }
+    ck(sawit == 1, "H2 the scanner detects a real import line", "scanner blind");
+
+    // H3 `recoil_view` appears NOWHERE in the sim's weapon module. The camera
+    // kick must never be able to move a bullet (NETWORKING §12.2).
+    ck(src.contains("recoil_aim"), "H3 weapons.hml owns recoil_aim", "");
+    let code_only: string = "";
+    let c = 0;
+    while (c < lines.length) { code_only = code_only + lines[c].split("//")[0]; c = c + 1; }
+    ck(code_only.contains("recoil_view") == false,
+       "H3 recoil_view appears in no line of weapons.hml CODE", "");
+}
+
+// ===========================================================================
+// I.  PERFORMANCE (RULE T: __clock CPU time, min of 7, bound at ~2x loaded)
+// ===========================================================================
+fn section_perf() {
+    print("I. performance (RULE T: __clock CPU time, min of 7 trials)");
+    let TRIALS = 7;
+
+    // Backend + load calibration, so the bounds below are RATIOS. This box
+    // permanently shares ~17 of 24 cores; absolute bounds do not survive it.
+    let NC = 2000000;
+    let bestc: f64 = 1000000.0;
+    let calsink: i32 = 0;
+    let tc = 0;
+    while (tc < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < NC) { calsink = calsink ^ i; i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < bestc) { bestc = dt; }
+        tc = tc + 1;
+    }
+    let cal: f64 = bestc * 1000000000.0 / f64(NC);
+    let scale: f64 = cal / 12.5;
+    if (scale < 1.0) { scale = 1.0; }
+    print(`   I0  calibration: empty loop ${cal} ns/iter (scale x${scale}); compiled=${compiled()}`);
+
+    // I1 — wpn_step, the only thing this module runs every tick per player.
+    let st = wpn_state_new(64);
+    let N1 = 200000;
+    let best1: f64 = 1000000.0;
+    let t1 = 0;
+    while (t1 < TRIALS) {
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N1) { wpn_step(st, 0, 0, 0); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best1) { best1 = dt; }
+        t1 = t1 + 1;
+    }
+    let ns1: f64 = best1 * 1000000000.0 / f64(N1);
+    print(`   I1  wpn_step        ${ns1} ns/call  (min of ${TRIALS}, ${N1} calls)`);
+    // MEASURED on this box (17 of 24 cores held by llama-server), compiled -O1,
+    // min-of-7: 515 ns/call. Bound at 2x that, per RULE T — a regression guard,
+    // not an idle-box certificate. Interpreted it is ~3400 ns, hence `scale`.
+    ck(ns1 < 1030.0 * scale, "I1 wpn_step under 1030 ns x scale (measured 515 ns compiled, loaded)",
+       `${ns1} ns, bound ${1030.0 * scale}`);
+
+    // I2 — wpn_dmg_at, the query combat.hml calls per pellet per hit.
+    let N2 = 1000000;
+    let best2: f64 = 1000000.0;
+    let acc2: f64 = 0.0;
+    let t2 = 0;
+    while (t2 < TRIALS) {
+        acc2 = 0.0;
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N2) { acc2 = acc2 + wpn_dmg_at(i % 6, 17.5); i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < best2) { best2 = dt; }
+        t2 = t2 + 1;
+    }
+    let ns2: f64 = best2 * 1000000000.0 / f64(N2);
+    print(`   I2  wpn_dmg_at      ${ns2} ns/call  (min of ${TRIALS}, ${N2} calls)  sink=${acc2}`);
+    // MEASURED: 132 ns/call compiled -O1, loaded. Bound at 2x.
+    ck(ns2 < 264.0 * scale, "I2 wpn_dmg_at under 264 ns x scale (measured 132 ns compiled, loaded)",
+       `${ns2} ns, bound ${264.0 * scale}`);
+
+    // I3 — wpn_fire + wpn_recoil, the burst path.
+    let rng = rng_new();
+    let out = [0.0, 0.0];
+    let N3 = 200000;
+    let best3: f64 = 1000000.0;
+    let t3 = 0;
+    while (t3 < TRIALS) {
+        wpn_state_reset(st, 0, WPN_SPARROW);
+        let t0: f64 = __clock();
+        let i = 0;
+        while (i < N3) {
+            st[16 + WPN_SPARROW] = 30.0;
+            st[2] = 0.0;
+            wpn_fire(st, 0, rng, out);
+            i = i + 1;
+        }
+        let dt: f64 = __clock() - t0;
+        if (dt < best3) { best3 = dt; }
+        t3 = t3 + 1;
+    }
+    let ns3: f64 = best3 * 1000000000.0 / f64(N3);
+    print(`   I3  wpn_fire        ${ns3} ns/call  (min of ${TRIALS}, ${N3} calls)`);
+    // MEASURED: 1417 ns/call compiled -O1, loaded. It is dearer than wpn_step
+    // because it touches eleven separate top-level table arrays (CLAUDE.md rule
+    // 3) plus two rng draws; at 15 trigger pulls a second that is 0.02 ms/frame,
+    // so it is not worth de-optimising the table's readability for. Bound at 2x.
+    ck(ns3 < 2840.0 * scale, "I3 wpn_fire under 2840 ns x scale (measured 1417 ns compiled, loaded)",
+       `${ns3} ns, bound ${2840.0 * scale}`);
+
+    // I4 — THE BUDGET LINE. The realistic per-tick cost of this module in v1 is
+    // one wpn_step and (at most) one wpn_fire for the local player. Report it
+    // against the 2.0 ms whole-sim budget (config g_BUDGET_SIM_MS).
+    let per_tick_ms: f64 = (ns1 + ns3) / 1000000.0;
+    let pct: f64 = per_tick_ms * 100.0 / 2.0;
+    print(`   I4  weapons cost/tick, 1 player = ${per_tick_ms} ms  (${pct} % of the 2.0 ms sim budget)`);
+    // MEASURED: 0.0019 ms/tick compiled -O1, loaded — 0.10 % of the 2.0 ms sim
+    // budget. Bound at 0.05 ms (2.5 % of the budget), ~26x the measured value,
+    // because this is the number that must never quietly grow.
+    ck(per_tick_ms < 0.05 * scale, "I4 weapons is under 2.5 % of the sim budget (measured 0.0019 ms compiled, loaded)",
+       `${per_tick_ms} ms, bound ${0.05 * scale} ms`);
+
+    // I5 — and at the 14-agent / 8-player worst case it is still small.
+    let heavy_ms: f64 = (ns1 * 8.0 + ns3 * 8.0) / 1000000.0;
+    print(`   I5  weapons cost/tick, 8 players firing = ${heavy_ms} ms`);
+    // MEASURED: 0.0155 ms/tick for eight simultaneously firing players.
+    ck(heavy_ms < 0.35 * scale, "I5 eight firing players stay under 0.35 ms x scale (measured 0.0155 ms compiled, loaded)",
+       `${heavy_ms} ms, bound ${0.35 * scale} ms`);
+}
+
+// ===========================================================================
+fn main() {
+    if (args.length > 1) {
+        if (args[1] == "--ttk") {
+            print_ttk();
+            exit(0);
+        }
+    }
+
+    print("== probe_weapons.hml — W4-2, src/sim/weapons.hml ==");
+    print("");
+    section_ids();
+    section_table();
+    section_falloff();
+    section_ttk();
+    section_recoil();
+    section_determinism();
+    section_state();
+    section_wall();
+    section_perf();
+    print_ttk();
+
+    print("");
+    print(`asserts=${g_asserts} pass=${g_pass} fail=${g_fail} (expected ${g_expect_asserts})`);
+    if (g_fail != 0) {
+        print("PROBE_WEAPONS FAIL");
+        exit(1);
+    }
+    if (g_asserts != g_expect_asserts) {
+        print(`PROBE_WEAPONS FAIL — assertion count ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    print("PROBE_WEAPONS PASS");
+}
+main();

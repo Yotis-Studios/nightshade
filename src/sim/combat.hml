@@ -1,0 +1,1651 @@
+// =============================================================================
+//  combat.hml — authoritative hit registration and damage.          W4-3.
+// =============================================================================
+//
+//  ARCHITECTURE §4 stage 3f, §5.4.  GAME_DESIGN §2.2, §2.4, §2.5, §7.
+//  NETWORKING §11.5 (the event stride) and §12 (the authority matrix).
+//
+// -----------------------------------------------------------------------------
+//  THIS MODULE IS THE AUTHORITY.  THE CLIENT MAY PREDICT; IT MAY NOT DECIDE.
+// -----------------------------------------------------------------------------
+//  NETWORKING §12: "anything that changes what is true must be decided by the
+//  server; anything that only changes what it looks or sounds like is decided
+//  by the client, immediately."  Every function here is on the "what is true"
+//  side.  Nothing here reads a clock, a renderer, a projection or an input
+//  device.  The aim axis is rebuilt from the InputCommand's QUANTIZED yaw and
+//  pitch — the same two integers the wire carries — so that a predicting client
+//  and the authority trace the identical ray from the identical numbers.
+//
+//  There is deliberately NO reference in this file to any render-side
+//  transform, screen basis or eye matrix.  A hitscan that consults one cannot
+//  be reproduced on a headless server, and that is the single most common way
+//  an authoritative shooter quietly stops being authoritative.
+//
+// -----------------------------------------------------------------------------
+//  THE IMPORT WALL (CLAUDE.md §3)
+// -----------------------------------------------------------------------------
+//  `@stdlib/math`, `src/core/**`, `src/sim/**`.  Nothing else, ever.
+//
+//  NOTE — `weapons.hml` (W4-2) is NOT imported.  It is a sibling task in the
+//  same sub-wave, and ARCHITECTURE §5.4b's WAVE-CONSTRUCTION RULE forbids a
+//  content dependency inside a wave (this is exactly why `chunk.hml` takes an
+//  injected generator instead of importing `worldgen.hml`).  The weapon table
+//  reaches this module the same way: through four injected function values
+//  installed once by the boot path.  See §5 for the exact contract; the adapter
+//  is four one-line forwards.
+//
+// -----------------------------------------------------------------------------
+//  WHAT A SHOT IS
+// -----------------------------------------------------------------------------
+//  Hitscan only (GDD §9.12 puts ballistics out of scope; the Emberlance is the
+//  one projectile and it lives in `projectiles.hml`).
+//
+//    1. rebuild the aim axis from the command's quantized yaw/pitch
+//    2. per pellet: perturb inside the weapon's spread cone using RNG_SPREAD,
+//       seeded from (world_seed, RNG_SPREAD, tick, shooter_id) — so the cone
+//       is bit-reproducible and a replay fires the identical pellets
+//    3. ray vs every live entity AABB, with a head volume on top
+//    4. ray vs the heightfield by DDA, bounded by the nearest entity hit
+//    5. nearest wins; damage is `dmg_at(weapon, range)` x headshot multiplier,
+//       reduced 75 % by the Warden front plate while that plate is intact
+//    6. emit the events
+//
+//  Pellets are AGGREGATED PER VICTIM before damage is applied.  A Bellows shell
+//  that lands nine pellets on one Husk produces ONE hitmarker, ONE damage
+//  number and ONE flash carrying the summed damage — but nine impact sparks,
+//  one per pellet, because nine sparks is what a shotgun looks like.  That is
+//  also what keeps GDD §7.8's "max 8 damage numbers on screen" honest.
+//
+// -----------------------------------------------------------------------------
+//  THE HIT-FEEDBACK CONTRACT (GDD §2.5, CLAUDE.md §9) — NON-NEGOTIABLE
+// -----------------------------------------------------------------------------
+//  Every bullet that connects with an entity emits, IN THE SAME TICK, all five
+//  of:
+//        EV_HITMARKER        the 4-tick white cross          (§7.1)
+//        EV_HIT_FLASH        the enemy's 0.06 s flash        (§7.3)
+//        EV_DAMAGE_NUMBER    the rising numeral              (§7.8)
+//        EV_IMPACT           the spark billboard + burst     (§7.7)
+//        EV_SOUND            the 40 ms pitch-chained click   (§7.2)
+//  plus EV_HIT, the authoritative fact the other five are derived from.
+//  `combat_feedback_ok()` re-checks this across the whole bus and the probe
+//  asserts it.  A missing signal is a failed build, not a polish item.
+//
+// -----------------------------------------------------------------------------
+//  THE EVENT BUS LIVES HERE, AND THAT IS A REPORTED GAP
+// -----------------------------------------------------------------------------
+//  ARCHITECTURE §5.4 lists no `src/sim/events.hml`, and `src/net/protocol.hml`
+//  (which owns EV_HIT..EV_SOUND) is across the import wall from the sim.  The
+//  bus below is therefore defined here, with the NETWORKING §11.5 type numbers
+//  MIRRORED EXACTLY (EV_HIT = 1 ... EV_SOUND = 14) and the four feedback types
+//  added above the reserved range at 20..23.  Its record is exactly the
+//  argument list of `transport_send_event`, so the server adapter is a loop
+//  with no translation.  `combat_ev_mirror_ok()` lets a tool that can see both
+//  zones assert the two copies still agree.  If someone later owns
+//  `src/sim/events.hml`, §1 and §3 move there verbatim and nothing else changes.
+//
+// -----------------------------------------------------------------------------
+//  PERFORMANCE CONTRACT
+// -----------------------------------------------------------------------------
+//  * Everything is allocated in `combat_new_cap`.  Firing allocates nothing.
+//  * The per-shot victim scratch is a fixed 16-wide SoA on the context.
+//  * Entity fields are hoisted UNANNOTATED (`let px = w.px;`) — annotating an
+//    object-field hoist costs an O(length) conversion walk on every call
+//    (world.hml's performance contract: 7.82 us vs 0.03 us).
+//  * No closure, no `defer`, no `try`, no `throw`, no template string, no
+//    allocation and no `print` on any path reachable from `combat_fire`.
+//  * Combat NEVER despawns.  Death sets EF_DEAD and zeroes hp; the reaper is a
+//    later stage.  That is what makes a slot index stable for the whole shot.
+//  * All hash mixing is `u64` (A13: i32/i64 `*` THROWS on overflow).
+// =============================================================================
+
+import { sqrt, sin, cos, tan } from "@stdlib/math";
+
+import { floori } from "../core/mathx.hml";
+
+import { g_HITSCAN_MAX_M, g_HEADSHOT_VOL_TOP,
+         g_CAPSULE_RADIUS, g_HEIGHT_STAND,
+         g_ENEMY_HUSK, g_ENEMY_WARDEN, g_ENEMY_KIND_COUNT,
+         g_MAX_DAMAGE_NUMBERS
+       } from "../core/config.hml";
+
+import { world_id_of,
+         KIND_PLAYER, KIND_AI, KIND_NPC, ID_NONE,
+         EF_DEAD, EF_INVULN, EF_HIT_FLASH
+       } from "./world.hml";
+
+import { chunk_height_at, CHUNK_CELL_M, CHUNK_H_MISS } from "./chunk.hml";
+
+import { rng_new, rng_seed, rng_f01, RNG_SPREAD } from "./rng.hml";
+
+import { cmd_yaw, cmd_pitch } from "./command.hml";
+
+// ===========================================================================
+// 0.  SMALL ALLOCATORS  (startup only — never on a firing path)
+// ===========================================================================
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn fill_i(p_n: i32, p_v: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(p_v); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// i32 -> u64 by its exact 32-bit pattern, then an FNV-ish mix.  Never through
+// f64: H-10 makes `f64(u64)` signed-wrong above 2^63 and there is no reason to
+// go anywhere near that boundary in a state hash.
+fn mix_u64(p_h: u64, p_v: i32): u64 {
+    let k: i32 = p_v;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    let h: u64 = (p_h ^ u) * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+// ===========================================================================
+// 1.  EVENT TYPES
+// ===========================================================================
+// 1..14 MIRROR NETWORKING §11.5 / src/net/protocol.hml exactly.  Do not
+// renumber them: `src/net/` and `src/sim/` cannot see each other, so the only
+// thing keeping the two copies honest is that both were transcribed from the
+// same paragraph of the same document — and `combat_ev_mirror_ok`.
+export let EV_HIT           = 1;
+export let EV_KILL          = 2;
+export let EV_DAMAGE_TAKEN  = 3;
+export let EV_SPAWN         = 4;
+export let EV_DESPAWN       = 5;
+export let EV_PICKUP        = 6;
+export let EV_RELOAD_DONE   = 7;
+export let EV_WEAPON_SWITCH = 8;
+export let EV_DOOR          = 9;
+export let EV_BLOCK_PLACED  = 10;
+export let EV_BLOCK_BROKEN  = 11;
+export let EV_XP            = 12;
+export let EV_LEVELUP       = 13;
+export let EV_SOUND         = 14;
+
+// The four cosmetic-derivation events GDD §2.5 requires and NETWORKING §11.5
+// does not reserve.  Placed above the reserved block so a future protocol
+// addition cannot collide silently.
+export let EV_HITMARKER     = 20;
+export let EV_HIT_FLASH     = 21;
+export let EV_DAMAGE_NUMBER = 22;
+export let EV_IMPACT        = 23;
+
+// The five signals of the §2.5 contract.  EV_SOUND is the audio blip.
+export let FEEDBACK_COUNT   = 5;
+
+// EV_HITMARKER `sub` bits.
+export let HM_HEAD    = 1;    // amber marker + amber damage number (§7.1/§7.8)
+export let HM_KILL    = 2;    // red-tinted, 1.6x
+export let HM_FALLOFF = 4;    // grey damage number: range reduced the damage
+export let HM_ARMOR   = 8;    // the Warden plate ate 75 % of it
+
+// EV_IMPACT `sub`: which material the pellet landed on.  Drives the particle
+// tint of GDD §7.7.
+export let SURF_TERRAIN = 0;
+export let SURF_FLESH   = 1;
+export let SURF_ARMOR   = 2;
+
+// EV_SOUND `sub`: sfx ids.  The hit blip carries its own pitch step, because
+// GDD §7.2's "+2 semitones per consecutive hit up to +8, resets after 0.6 s"
+// is a fact about the SHOT SEQUENCE, and only the authority knows whether the
+// previous shot connected.
+export let SFX_HIT_BLIP     = 1;    // + pitch step 0..4  ->  1..5
+export let SFX_PITCH_STEPS  = 5;    // 0, +2, +4, +6, +8 semitones
+export let SFX_KILL_CHIME   = 6;
+export let SFX_IMPACT_WORLD = 7;
+export let SFX_IMPACT_ARMOR = 8;
+
+export let HIT_CHAIN_TICKS = 36;    // GDD §7.2: 0.6 s * 60 Hz
+export let HIT_FLASH_CS    = 6;     // GDD §7.3: 0.06 s, in centiseconds
+
+// ===========================================================================
+// 2.  DAMAGE KINDS
+// ===========================================================================
+// `projectiles.hml` (W4-4) and `ai.hml` (W4-5) call `combat_apply_damage` with
+// these.  Non-bullet kinds ride in EV_HIT.sub offset by DMG_SUB_BASE, so a
+// packet dump can still tell a burn tick from a Sparrow round.
+export let DMG_BULLET    = 0;
+export let DMG_MELEE     = 1;
+export let DMG_BURN      = 2;
+export let DMG_EXPLOSION = 3;
+export let DMG_FALL      = 4;
+export let DMG_CONTACT   = 5;
+export let DMG_KIND_COUNT = 6;
+export let DMG_SUB_BASE   = 64;     // weapon ids are 0..15, so 64 is clear
+
+// ===========================================================================
+// 3.  THE EVENT BUS
+// ===========================================================================
+// Flat parallel `array<i32>` — the NETWORKING §11.5 record, one column each,
+// in `transport_send_event`'s argument order:
+//
+//     tick  type  sub  actor_id  target_id  x_q  y_q  z_q
+//
+// Positions are quantized to the 1/16 m wire grid AT PUSH TIME and stored as
+// ABSOLUTE i32.  Two reasons:
+//   (a) the sim state hash then contains exactly the number the wire will
+//       carry, so a desync cannot hide inside the rounding;
+//   (b) NETWORKING's i16 is RELATIVE TO THE RECEIVING PLAYER and the world is
+//       infinite, so the absolute value cannot be an i16.  The subtraction
+//       belongs to the packer, which is the only code that knows who receives.
+export let EV_Q_PER_M     = 16.0;
+export let EV_CAP_DEFAULT = 512;
+
+// Quantize metres to the 1/16 m wire grid.  ROUNDS, never truncates, so that
+// q(dq(q(v))) == q(v).  `command.hml`'s `q_ang` rounds for the same reason and
+// NETWORKING §11.1's pseudo-code is wrong about it in the same way.
+export fn ev_q(p_v: f64): i32 {
+    let v: f64 = p_v;
+    let out: i32 = floori(v * EV_Q_PER_M + 0.5);
+    return out;
+}
+
+export fn ev_dq(p_q: i32): f64 {
+    let out: f64 = f64(p_q) / EV_Q_PER_M;
+    return out;
+}
+
+export fn evbus_new(): object {
+    let out: object = evbus_new_cap(EV_CAP_DEFAULT);
+    return out;
+}
+
+export fn evbus_new_cap(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let b: object = {
+        cap: cap,
+        count: 0,
+        dropped: 0,
+        pushed: 0,
+        tick: zeros_i(cap),
+        type: zeros_i(cap),
+        sub: zeros_i(cap),
+        actor: zeros_i(cap),
+        target: zeros_i(cap),
+        x_q: zeros_i(cap),
+        y_q: zeros_i(cap),
+        z_q: zeros_i(cap)
+    };
+    let out: object = b;
+    return out;
+}
+
+// Empty the bus.  Called once per tick, before the combat stage runs, so that
+// "in the same tick" is a property anyone can check by looking at the bus.
+export fn evbus_reset(p_b: object) {
+    let b: object = p_b;
+    b.count = 0;
+}
+
+// Push one event.  Returns 1, or 0 if the bus is full — and COUNTS the drop.
+// A dropped event is a missing hitmarker; it must never be silent.
+export fn evbus_push(p_b: object, p_tick: i32, p_type: i32, p_sub: i32,
+                     p_actor: i32, p_target: i32,
+                     p_xq: i32, p_yq: i32, p_zq: i32): i32 {
+    let b: object = p_b;
+    let n: i32 = b.count;
+    if (n >= b.cap) {
+        b.dropped = b.dropped + 1;
+        let full: i32 = 0;
+        return full;
+    }
+    let a_tk = b.tick;    a_tk[n] = p_tick;
+    let a_ty = b.type;    a_ty[n] = p_type;
+    let a_sb = b.sub;     a_sb[n] = p_sub;
+    let a_ac = b.actor;   a_ac[n] = p_actor;
+    let a_tg = b.target;  a_tg[n] = p_target;
+    let a_xx = b.x_q;     a_xx[n] = p_xq;
+    let a_yy = b.y_q;     a_yy[n] = p_yq;
+    let a_zz = b.z_q;     a_zz[n] = p_zq;
+    b.count = n + 1;
+    b.pushed = b.pushed + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// The metre-taking form.  Quantizes at the boundary so no caller can forget.
+fn evbus_push_m(p_b: object, p_tick: i32, p_type: i32, p_sub: i32,
+                p_actor: i32, p_target: i32,
+                p_x: f64, p_y: f64, p_z: f64): i32 {
+    let out: i32 = evbus_push(p_b, p_tick, p_type, p_sub, p_actor, p_target,
+                              ev_q(p_x), ev_q(p_y), ev_q(p_z));
+    return out;
+}
+
+export fn evbus_count(p_b: object): i32   { let b: object = p_b; let o: i32 = b.count; return o; }
+export fn evbus_cap(p_b: object): i32     { let b: object = p_b; let o: i32 = b.cap; return o; }
+export fn evbus_dropped(p_b: object): i32 { let b: object = p_b; let o: i32 = b.dropped; return o; }
+export fn evbus_pushed(p_b: object): i32  { let b: object = p_b; let o: i32 = b.pushed; return o; }
+
+export fn evbus_tick(p_b: object, p_i: i32): i32   { let b: object = p_b; let a = b.tick;   let o: i32 = a[p_i]; return o; }
+export fn evbus_type(p_b: object, p_i: i32): i32   { let b: object = p_b; let a = b.type;   let o: i32 = a[p_i]; return o; }
+export fn evbus_sub(p_b: object, p_i: i32): i32    { let b: object = p_b; let a = b.sub;    let o: i32 = a[p_i]; return o; }
+export fn evbus_actor(p_b: object, p_i: i32): i32  { let b: object = p_b; let a = b.actor;  let o: i32 = a[p_i]; return o; }
+export fn evbus_target(p_b: object, p_i: i32): i32 { let b: object = p_b; let a = b.target; let o: i32 = a[p_i]; return o; }
+export fn evbus_xq(p_b: object, p_i: i32): i32     { let b: object = p_b; let a = b.x_q;    let o: i32 = a[p_i]; return o; }
+export fn evbus_yq(p_b: object, p_i: i32): i32     { let b: object = p_b; let a = b.y_q;    let o: i32 = a[p_i]; return o; }
+export fn evbus_zq(p_b: object, p_i: i32): i32     { let b: object = p_b; let a = b.z_q;    let o: i32 = a[p_i]; return o; }
+
+export fn evbus_x(p_b: object, p_i: i32): f64 { let o: f64 = ev_dq(evbus_xq(p_b, p_i)); return o; }
+export fn evbus_y(p_b: object, p_i: i32): f64 { let o: f64 = ev_dq(evbus_yq(p_b, p_i)); return o; }
+export fn evbus_z(p_b: object, p_i: i32): f64 { let o: f64 = ev_dq(evbus_zq(p_b, p_i)); return o; }
+
+// How many events of `p_type` targeting `p_target` are on the bus right now.
+// The §2.5 contract check is built out of this.
+export fn evbus_count_for(p_b: object, p_type: i32, p_target: i32): i32 {
+    let b: object = p_b;
+    let n: i32 = b.count;
+    let a_ty = b.type;
+    let a_tg = b.target;
+    let hits: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (a_ty[i] == p_type) {
+            if (a_tg[i] == p_target) { hits++; }
+        }
+        i++;
+    }
+    let out: i32 = hits;
+    return out;
+}
+
+// A content hash of the whole bus.  This is half of the determinism gate: two
+// runs that agree on the world but disagree on the events are still a desync,
+// and the events are what the player actually sees and hears.
+export fn evbus_hash(p_b: object): i32 {
+    let b: object = p_b;
+    let n: i32 = b.count;
+    let a_tk = b.tick;
+    let a_ty = b.type;
+    let a_sb = b.sub;
+    let a_ac = b.actor;
+    let a_tg = b.target;
+    let a_xx = b.x_q;
+    let a_yy = b.y_q;
+    let a_zz = b.z_q;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < n) {
+        h = mix_u64(h, a_tk[i]);
+        h = mix_u64(h, a_ty[i]);
+        h = mix_u64(h, a_sb[i]);
+        h = mix_u64(h, a_ac[i]);
+        h = mix_u64(h, a_tg[i]);
+        h = mix_u64(h, a_xx[i]);
+        h = mix_u64(h, a_yy[i]);
+        h = mix_u64(h, a_zz[i]);
+        i++;
+    }
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// 4.  HITBOXES
+// ===========================================================================
+// GDD §2.2 gives HP, speed, damage and triangle counts but no body dimensions,
+// and ARCHITECTURE §5 assigns them to no file.  They are hit registration's
+// business, so they live here — and they are REPORTED as a §5 gap.
+//
+// Read the table against CLAUDE.md §9.10 — "every enemy needs one asymmetric
+// feature and a distinct head:shoulder ratio".  These radii are what make a
+// Warden read as a wall and a Wisp read as a mosquito:
+//
+//   Wisp      0.35 / 0.70   an orb.  Small, but 15 HP, so still one bullet.
+//   Mote      0.45 / 0.90   fatter and slower — the one you can always hit.
+//   Husk      0.40 / 1.85   humanoid, the player's own capsule.  The ruler.
+//   Spitter   0.45 / 1.60   hunched.
+//   Warden    0.65 / 2.30   the flank prompt.  You cannot miss it; you can
+//                           only fail to get around it.
+//   Bulwark   1.10 / 3.20   the wave-3 punctuation.
+//
+// The head volume is the top `g_HEADSHOT_VOL_TOP` (0.22) of the body height,
+// inset horizontally to HEAD_R_MULT of the body radius.  EVERY class has one:
+// the headshot multiplier in GDD §2.4 is a property of the WEAPON, not of the
+// target, so making it unreachable on two classes would be inventing design.
+//
+// Indices are `g_ENEMY_*` from config.hml, in that order.  `combat_hb_ok()`
+// asserts the width so a class added to config without a hitbox fails loudly.
+export let HEAD_R_MULT = 0.55;
+
+let HB_R: array<f64> = [0.35, 0.45, 0.40, 0.45, 0.65, 1.10];
+let HB_H: array<f64> = [0.70, 0.90, 1.85, 1.60, 2.30, 3.20];
+
+// GDD §2.2: Warden "220 (+80 front plate, 75 % DR while intact)".
+export let WARDEN_PLATE_HP = 80;
+export let PLATE_DR        = 0.75;   // damage reduction while intact
+export let PLATE_ARC_COS   = 0.0;    // front hemisphere: shots into the facing
+
+// The plate covers the torso, not the head.  That is what makes GDD §2.4's
+// "Warden always wants a flank OR a Longshadow" true of both halves of the
+// sentence: go around it, or shoot over it.
+export let PLATE_COVERS_HEAD = 0;
+
+// The hitbox table is exactly as wide as config's enemy-class enum.
+export fn combat_hb_ok(): i32 {
+    let out: i32 = 1;
+    if (HB_R.length != g_ENEMY_KIND_COUNT) { out = 0; }
+    if (HB_H.length != g_ENEMY_KIND_COUNT) { out = 0; }
+    return out;
+}
+
+// The enemy class of an AI slot.  CONVENTION: `world.model` (replication group
+// `state`) carries the `g_ENEMY_*` index for KIND_AI entities, because the
+// renderer needs the same number to pick a mesh.  Reported as a §5 addition.
+fn class_of(p_w: object, p_slot: i32): i32 {
+    let wr: object = p_w;
+    let models = wr.model;
+    let cls: i32 = models[p_slot];
+    if (cls < 0 || cls >= g_ENEMY_KIND_COUNT) { cls = g_ENEMY_HUSK; }
+    let out: i32 = cls;
+    return out;
+}
+
+// Body radius for an entity slot, in metres.
+export fn combat_body_r(p_w: object, p_slot: i32): f64 {
+    let wr: object = p_w;
+    let s: i32 = p_slot;
+    let kinds = wr.kind;
+    if (kinds[s] == KIND_PLAYER) { let pr: f64 = g_CAPSULE_RADIUS; return pr; }
+    let out: f64 = HB_R[class_of(wr, s)];
+    return out;
+}
+
+// Body height for an entity slot, in metres, measured from the feet.
+export fn combat_body_h(p_w: object, p_slot: i32): f64 {
+    let wr: object = p_w;
+    let s: i32 = p_slot;
+    let kinds = wr.kind;
+    if (kinds[s] == KIND_PLAYER) { let ph: f64 = g_HEIGHT_STAND; return ph; }
+    let out: f64 = HB_H[class_of(wr, s)];
+    return out;
+}
+
+// The plate pool an enemy class spawns with.  `ai.hml` writes this into
+// `world.armor` at spawn; combat is the only thing that spends it.
+export fn combat_plate_hp(p_cls: i32): i32 {
+    let cls: i32 = p_cls;
+    let out: i32 = 0;
+    if (cls == g_ENEMY_WARDEN) { out = WARDEN_PLATE_HP; }
+    return out;
+}
+
+// ===========================================================================
+// 5.  THE RAY RESULT
+// ===========================================================================
+// A caller-owned `array<f64>`, never allocated per shot (A8 / N6).
+export let RAY_T      = 0;    // distance along the ray, metres
+export let RAY_X      = 1;
+export let RAY_Y      = 2;
+export let RAY_Z      = 3;
+export let RAY_NX     = 4;    // surface normal (terrain) or -dir (entity)
+export let RAY_NY     = 5;
+export let RAY_NZ     = 6;
+export let RAY_KIND   = 7;    // RAY_MISS / RAY_TERRAIN / RAY_ENTITY
+export let RAY_SLOT   = 8;    // entity slot, or -1
+export let RAY_HEAD   = 9;    // 1 if the head volume was the entry surface
+export let RAY_FIELDS = 10;
+
+export let RAY_MISS    = 0;
+export let RAY_TERRAIN = 1;
+export let RAY_ENTITY  = 2;
+
+export fn combat_ray_scratch(): array<f64> {
+    let out: array<f64> = zeros_f(RAY_FIELDS);
+    return out;
+}
+
+// ===========================================================================
+// 6.  THE COMBAT CONTEXT
+// ===========================================================================
+// One object, allocated once.  Holds the event bus, the injected weapon table,
+// the per-shot victim scratch, the per-attacker hit chain, and the counters.
+//
+// ---------------------------------------------------------------------------
+// combat_set_weapon_source — THE INJECTED WEAPON-TABLE CONTRACT
+// ---------------------------------------------------------------------------
+// Four function values, installed once by the boot path (W4-11).  Each is a
+// direct forward to `src/sim/weapons.hml` (W4-2):
+//
+//     fn dmg_at (p_wpn: i32, p_range_m: f64): f64      ->  wpn_dmg_at
+//          GDD §2.4 falloff: lerp(near, far, clamp((r-r0)/(r1-r0), 0, 1)).
+//          PER PELLET for the Bellows (13 near / 5 far), not per shell.
+//
+//     fn hs_mult(p_wpn: i32): f64                      ->  wpn_hs_mult
+//          GDD §2.4 "HS mult" column: 1.50 Sparrow ... 2.10 Longshadow.
+//
+//     fn pellets(p_wpn: i32): i32                      ->  wpn_pellets
+//          1 for everything except the Bellows (9); +1 by affix.
+//
+//     fn spread (p_wpn: i32, p_bloom: f64, p_ads01: f64): f64
+//                                                  ->  wpn_spread_half_rad
+//          The cone HALF-ANGLE in RADIANS.  `p_bloom` is accumulated bloom in
+//          DEGREES; `p_ads01` is 0 = hip, 1 = fully aimed, fractions during the
+//          ADS lerp.  GDD §2.4's table is a FULL CONE in degrees ("Bellows
+//          6.5 deg cone"), so the conversion is `deg * 0.5 * PI/180`.  That
+//          halving is load-bearing, not a rounding choice: read as a HALF-angle
+//          the Bellows' pellet disc is 1.37 m across at 6 m — wider than a Husk
+//          — and "the Bellows one-shots a Husk inside 6 m", the entire reason to
+//          play Ashwood, stops being true.  W4-2 reached the same conclusion
+//          independently.  BOTH REPORT IT: §2.4 does not say which it is.
+//
+//  All four signatures are byte-identical to `weapons.hml`'s, so the boot-path
+//  adapter is a single call with four bare function names and no wrapper:
+//
+//      combat_set_weapon_source(cx, wpn_dmg_at, wpn_hs_mult,
+//                                   wpn_pellets, wpn_spread_half_rad);
+//
+//  `wpn_hs_mult`, `wpn_pellets` and `wpn_spread_half_rad` are NOT in
+//  ARCHITECTURE §5's export list for weapons.hml (it names only `wpn_dmg_at,
+//  wpn_rpm, wpn_mag, wpn_recoil, wpn_spread, wpn_ads_time`).  REPORTED — §5
+//  needs the three added.
+//
+// With no source installed `combat_fire` REFUSES (returns 0, increments
+// `no_weapon_source`).  There is deliberately no fallback weapon table in this
+// file to accidentally ship — the same call `chunk.hml` makes about terrain.
+// ---------------------------------------------------------------------------
+
+export let VICTIM_SCRATCH = 16;      // >= max pellets + affix headroom
+export let CHAIN_SLOTS    = 65;      // player slots 1..64; index 0 unused
+
+export fn combat_new(): object {
+    let out: object = combat_new_cap(EV_CAP_DEFAULT);
+    return out;
+}
+
+export fn combat_new_cap(p_ev_cap: i32): object {
+    let vs: i32 = VICTIM_SCRATCH;
+    let cx: object = {
+        events: evbus_new_cap(p_ev_cap),
+
+        // injected weapon table
+        f_dmg: 0,
+        f_hs: 0,
+        f_pel: 0,
+        f_spr: 0,
+        has_src: 0,
+
+        // RNG state for the spread cone.  Caller-owned, so reseeding every
+        // shot allocates nothing.
+        rng: rng_new(),
+
+        // per-shot victim aggregation (SoA, fixed width, never grows)
+        hv_n: 0,
+        hv_slot: zeros_i(vs),
+        hv_head: zeros_i(vs),
+        hv_fall: zeros_i(vs),
+        hv_dmg: zeros_f(vs),
+        hv_x: zeros_f(vs),
+        hv_y: zeros_f(vs),
+        hv_z: zeros_f(vs),
+
+        // GDD §7.2 hit-sound pitch chain, per attacking player slot.
+        // `chain_tick` starts one full window in the past so the FIRST hit of a
+        // session is step 0 and not step 1 (tick 0 minus a zero-initialized
+        // "last hit" would read as "you hit something last frame").  The offset
+        // is small and negative on purpose: `tick - prev` must never overflow
+        // an i32, and i32 subtraction TRAPS on overflow in Hemlock.
+        chain_n: zeros_i(CHAIN_SLOTS),
+        chain_tick: fill_i(CHAIN_SLOTS, 0 - HIT_CHAIN_TICKS - 1),
+
+        // scratch for the ray result, so combat_fire allocates nothing
+        ray: zeros_f(RAY_FIELDS),
+
+        // set by combat_apply_damage, read by combat_fire for the marker bits
+        last_plated: 0,
+
+        // counters — every refusal is visible
+        shots: 0,
+        pellets_fired: 0,
+        pellets_hit: 0,
+        terrain_hits: 0,
+        misses: 0,
+        kills: 0,
+        headshots: 0,
+        plate_blocks: 0,
+        damage_dealt: 0,
+        no_weapon_source: 0,
+        start_solid: 0,
+        overkill: 0
+    };
+    let out: object = cx;
+    return out;
+}
+
+export fn combat_set_weapon_source(p_cx: object, p_dmg_at, p_hs_mult,
+                                   p_pellets, p_spread): i32 {
+    let cx: object = p_cx;
+    cx.f_dmg = p_dmg_at;
+    cx.f_hs = p_hs_mult;
+    cx.f_pel = p_pellets;
+    cx.f_spr = p_spread;
+    cx.has_src = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn combat_has_weapon_source(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let out: i32 = cx.has_src;
+    return out;
+}
+
+export fn combat_events(p_cx: object): object {
+    let cx: object = p_cx;
+    let out: object = cx.events;
+    return out;
+}
+
+// Clear the bus for a new tick.  `sim_step` calls this at the top of the damage
+// stage; the transport drains the bus at the end of the same tick.
+export fn combat_begin_tick(p_cx: object) {
+    let cx: object = p_cx;
+    evbus_reset(cx.events);
+}
+
+export let STAT_SHOTS            = 0;
+export let STAT_PELLETS_FIRED    = 1;
+export let STAT_PELLETS_HIT      = 2;
+export let STAT_TERRAIN_HITS     = 3;
+export let STAT_MISSES           = 4;
+export let STAT_KILLS            = 5;
+export let STAT_HEADSHOTS        = 6;
+export let STAT_PLATE_BLOCKS     = 7;
+export let STAT_DAMAGE_DEALT     = 8;
+export let STAT_NO_WEAPON_SOURCE = 9;
+export let STAT_START_SOLID      = 10;
+export let STAT_OVERKILL         = 11;
+export let STAT_COUNT            = 12;
+
+export fn combat_stat(p_cx: object, p_which: i32): i32 {
+    let cx: object = p_cx;
+    let k: i32 = p_which;
+    let out: i32 = 0;
+    if (k == STAT_SHOTS)            { out = cx.shots; }
+    if (k == STAT_PELLETS_FIRED)    { out = cx.pellets_fired; }
+    if (k == STAT_PELLETS_HIT)      { out = cx.pellets_hit; }
+    if (k == STAT_TERRAIN_HITS)     { out = cx.terrain_hits; }
+    if (k == STAT_MISSES)           { out = cx.misses; }
+    if (k == STAT_KILLS)            { out = cx.kills; }
+    if (k == STAT_HEADSHOTS)        { out = cx.headshots; }
+    if (k == STAT_PLATE_BLOCKS)     { out = cx.plate_blocks; }
+    if (k == STAT_DAMAGE_DEALT)     { out = cx.damage_dealt; }
+    if (k == STAT_NO_WEAPON_SOURCE) { out = cx.no_weapon_source; }
+    if (k == STAT_START_SOLID)      { out = cx.start_solid; }
+    if (k == STAT_OVERKILL)         { out = cx.overkill; }
+    return out;
+}
+
+// ===========================================================================
+// 7.  RAY vs HEIGHTFIELD — DDA over the 4 m grid
+// ===========================================================================
+// Amanatides-Woo cell traversal on XZ.  Inside each cell the ray segment is
+// sampled at entry, midpoint and exit; a sign change in
+// `ray_y(t) - height(ray_xz(t))` is bisected DDA_BISECT times, which pins the
+// root to better than 1 mm over the 140 m ceiling.  The midpoint sample is
+// not decoration: the surface inside a 4 m cell is a bilinear patch and can
+// bulge above a chord whose two endpoints are both in the air.
+//
+// Returns t in [0, maxd], or -1.0 for no hit.  Never allocates, never throws.
+// An unloaded chunk reads back CHUNK_H_MISS and is treated as EMPTY AIR, not
+// as a wall — a shot must never be stopped by a streaming decision.
+let DDA_BISECT = 18;
+let DDA_CELL_LIMIT = 4096;
+
+fn hf_gap(p_cs: object, p_ox: f64, p_oy: f64, p_oz: f64,
+          p_dx: f64, p_dy: f64, p_dz: f64, p_t: f64): f64 {
+    let t: f64 = p_t;
+    let qx: f64 = p_ox + p_dx * t;
+    let qy: f64 = p_oy + p_dy * t;
+    let qz: f64 = p_oz + p_dz * t;
+    let h: f64 = chunk_height_at(p_cs, qx, qz);
+    if (h <= CHUNK_H_MISS) { let air: f64 = 1000000.0; return air; }
+    let out: f64 = qy - h;
+    return out;
+}
+
+fn ray_terrain(p_cs: object, p_ox: f64, p_oy: f64, p_oz: f64,
+               p_dx: f64, p_dy: f64, p_dz: f64, p_maxd: f64): f64 {
+    let ox: f64 = p_ox;
+    let oy: f64 = p_oy;
+    let oz: f64 = p_oz;
+    let dx: f64 = p_dx;
+    let dy: f64 = p_dy;
+    let dz: f64 = p_dz;
+    let maxd: f64 = p_maxd;
+
+    // Already underground at the muzzle.  Report a hit at zero rather than let
+    // the shot leave the world; `start_solid` makes it visible.
+    let g0: f64 = hf_gap(p_cs, ox, oy, oz, dx, dy, dz, 0.0);
+    if (g0 <= 0.0) { let solid: f64 = 0.0; return solid; }
+
+    let cell: f64 = CHUNK_CELL_M;
+    let ix: i32 = floori(ox / cell);
+    let iz: i32 = floori(oz / cell);
+
+    let stepx: i32 = 0;
+    let tdx: f64 = 1000000000.0;
+    let tmx: f64 = 1000000000.0;
+    if (dx > 0.0) {
+        stepx = 1;
+        tdx = cell / dx;
+        tmx = (f64(ix + 1) * cell - ox) / dx;
+    }
+    if (dx < 0.0) {
+        stepx = 0 - 1;
+        tdx = 0.0 - cell / dx;
+        tmx = (f64(ix) * cell - ox) / dx;
+    }
+
+    let stepz: i32 = 0;
+    let tdz: f64 = 1000000000.0;
+    let tmz: f64 = 1000000000.0;
+    if (dz > 0.0) {
+        stepz = 1;
+        tdz = cell / dz;
+        tmz = (f64(iz + 1) * cell - oz) / dz;
+    }
+    if (dz < 0.0) {
+        stepz = 0 - 1;
+        tdz = 0.0 - cell / dz;
+        tmz = (f64(iz) * cell - oz) / dz;
+    }
+
+    let t0: f64 = 0.0;
+    let guard: i32 = 0;
+    while (t0 < maxd) {
+        guard++;
+        if (guard > DDA_CELL_LIMIT) { break; }
+
+        // exit parameter of the cell we are standing in
+        let t1: f64 = tmx;
+        if (tmz < t1) { t1 = tmz; }
+        if (t1 > maxd) { t1 = maxd; }
+        if (t1 <= t0) { t1 = t0 + 0.0009765625; }
+
+        let tm: f64 = (t0 + t1) * 0.5;
+        let gm: f64 = hf_gap(p_cs, ox, oy, oz, dx, dy, dz, tm);
+        let gb: f64 = hf_gap(p_cs, ox, oy, oz, dx, dy, dz, t1);
+
+        // two sub-segments: entry->mid, then mid->exit
+        let lo: f64 = 0.0 - 1.0;
+        let hi: f64 = 0.0 - 1.0;
+        if (gm <= 0.0) { lo = t0; hi = tm; }
+        if (lo < 0.0) {
+            if (gb <= 0.0) { lo = tm; hi = t1; }
+        }
+        if (lo >= 0.0) {
+            // bisect the bracket:  gap(lo) > 0,  gap(hi) <= 0
+            let bi: i32 = 0;
+            while (bi < DDA_BISECT) {
+                let mid: f64 = (lo + hi) * 0.5;
+                let gg: f64 = hf_gap(p_cs, ox, oy, oz, dx, dy, dz, mid);
+                if (gg > 0.0) { lo = mid; } else { hi = mid; }
+                bi++;
+            }
+            let hit: f64 = hi;
+            return hit;
+        }
+
+        if (t1 >= maxd) { break; }
+
+        // advance one cell
+        if (tmx < tmz) {
+            ix = ix + stepx;
+            tmx = tmx + tdx;
+        } else {
+            iz = iz + stepz;
+            tmz = tmz + tdz;
+        }
+        t0 = t1;
+    }
+
+    let out: f64 = 0.0 - 1.0;
+    return out;
+}
+
+// The heightfield normal at a point, by central difference of the same
+// bilinear patch the DDA marched.  `chunk_normal_at` is exact but wants
+// another caller-owned array; combat only needs the normal to orient an impact
+// billboard, so a 5 cm difference is enough and cheaper.
+fn hf_normal(p_cs: object, p_x: f64, p_z: f64, p_out: array<f64>) {
+    let out = p_out;
+    let e: f64 = 0.05;
+    let hx0: f64 = chunk_height_at(p_cs, p_x - e, p_z);
+    let hx1: f64 = chunk_height_at(p_cs, p_x + e, p_z);
+    let hz0: f64 = chunk_height_at(p_cs, p_x, p_z - e);
+    let hz1: f64 = chunk_height_at(p_cs, p_x, p_z + e);
+    let ok: i32 = 1;
+    if (hx0 <= CHUNK_H_MISS) { ok = 0; }
+    if (hx1 <= CHUNK_H_MISS) { ok = 0; }
+    if (hz0 <= CHUNK_H_MISS) { ok = 0; }
+    if (hz1 <= CHUNK_H_MISS) { ok = 0; }
+    if (ok == 0) {
+        out[RAY_NX] = 0.0;
+        out[RAY_NY] = 1.0;
+        out[RAY_NZ] = 0.0;
+    } else {
+        let nx: f64 = 0.0 - (hx1 - hx0) / (2.0 * e);
+        let nz: f64 = 0.0 - (hz1 - hz0) / (2.0 * e);
+        let ny: f64 = 1.0;
+        let len: f64 = sqrt(nx * nx + ny * ny + nz * nz);
+        if (len <= 0.0) { len = 1.0; }
+        out[RAY_NX] = nx / len;
+        out[RAY_NY] = ny / len;
+        out[RAY_NZ] = nz / len;
+    }
+}
+
+// ===========================================================================
+// 8.  RAY vs AXIS-ALIGNED BOX  (the slab test)
+// ===========================================================================
+// Returns the entry parameter, or -1.0 if the ray misses, the box is behind,
+// or the entry is beyond `p_maxd`.  Hand-inlined min/max (A9): this runs once
+// per entity per pellet.
+fn ray_aabb(p_ox: f64, p_oy: f64, p_oz: f64,
+            p_dx: f64, p_dy: f64, p_dz: f64,
+            p_lx: f64, p_ly: f64, p_lz: f64,
+            p_hx: f64, p_hy: f64, p_hz: f64, p_maxd: f64): f64 {
+    let tmin: f64 = 0.0;
+    let tmax: f64 = p_maxd;
+    let eps: f64 = 0.000000001;
+
+    let dxv: f64 = p_dx;
+    if (dxv > 0.0 - eps && dxv < eps) {
+        if (p_ox < p_lx || p_ox > p_hx) { let m1: f64 = 0.0 - 1.0; return m1; }
+    } else {
+        let inv1: f64 = 1.0 / dxv;
+        let ta: f64 = (p_lx - p_ox) * inv1;
+        let tb: f64 = (p_hx - p_ox) * inv1;
+        if (ta > tb) { let sw1: f64 = ta; ta = tb; tb = sw1; }
+        if (ta > tmin) { tmin = ta; }
+        if (tb < tmax) { tmax = tb; }
+        if (tmin > tmax) { let m2: f64 = 0.0 - 1.0; return m2; }
+    }
+
+    let dyv: f64 = p_dy;
+    if (dyv > 0.0 - eps && dyv < eps) {
+        if (p_oy < p_ly || p_oy > p_hy) { let m3: f64 = 0.0 - 1.0; return m3; }
+    } else {
+        let inv2: f64 = 1.0 / dyv;
+        let tc: f64 = (p_ly - p_oy) * inv2;
+        let td: f64 = (p_hy - p_oy) * inv2;
+        if (tc > td) { let sw2: f64 = tc; tc = td; td = sw2; }
+        if (tc > tmin) { tmin = tc; }
+        if (td < tmax) { tmax = td; }
+        if (tmin > tmax) { let m4: f64 = 0.0 - 1.0; return m4; }
+    }
+
+    let dzv: f64 = p_dz;
+    if (dzv > 0.0 - eps && dzv < eps) {
+        if (p_oz < p_lz || p_oz > p_hz) { let m5: f64 = 0.0 - 1.0; return m5; }
+    } else {
+        let inv3: f64 = 1.0 / dzv;
+        let te: f64 = (p_lz - p_oz) * inv3;
+        let tf2: f64 = (p_hz - p_oz) * inv3;
+        if (te > tf2) { let sw3: f64 = te; te = tf2; tf2 = sw3; }
+        if (te > tmin) { tmin = te; }
+        if (tf2 < tmax) { tmax = tf2; }
+        if (tmin > tmax) { let m6: f64 = 0.0 - 1.0; return m6; }
+    }
+
+    if (tmax < 0.0) { let m7: f64 = 0.0 - 1.0; return m7; }
+    let out: f64 = tmin;
+    return out;
+}
+
+// ===========================================================================
+// 9.  COMBAT_RAYCAST — the authoritative "what did this ray hit"
+// ===========================================================================
+// Entities first (a bounded loop over live slots), then the heightfield,
+// bounded by the nearest entity hit so that a shot which connects never pays
+// for a 140 m terrain march.
+//
+//   p_ignore_id   the shooter's entity id, so you cannot shoot yourself
+//   p_out         RAY_FIELDS wide; see §5
+//
+// Returns RAY_MISS / RAY_TERRAIN / RAY_ENTITY.  `p_cs` may be null (a headless
+// test with no chunk store); the heightfield is then simply absent.
+// NOTE the UNANNOTATED `p_cs`: it accepts `null` for a headless caller that has
+// no chunk store, and the interpreter (correctly) rejects `null` for a `: object`
+// parameter where the compiler lets it through.  Every use below is guarded.
+export fn combat_raycast(p_cx: object, p_w: object, p_cs,
+                         p_ox: f64, p_oy: f64, p_oz: f64,
+                         p_dx: f64, p_dy: f64, p_dz: f64,
+                         p_maxd: f64, p_ignore_id: i32,
+                         p_out: array<f64>): i32 {
+    let cx: object = p_cx;
+    let wr: object = p_w;
+    let out = p_out;
+    let ox: f64 = p_ox;
+    let oy: f64 = p_oy;
+    let oz: f64 = p_oz;
+    let dx: f64 = p_dx;
+    let dy: f64 = p_dy;
+    let dz: f64 = p_dz;
+    let maxd: f64 = p_maxd;
+    if (maxd > g_HITSCAN_MAX_M) { maxd = g_HITSCAN_MAX_M; }
+    if (maxd < 0.0) { maxd = 0.0; }
+
+    out[RAY_T] = maxd;
+    out[RAY_X] = ox + dx * maxd;
+    out[RAY_Y] = oy + dy * maxd;
+    out[RAY_Z] = oz + dz * maxd;
+    out[RAY_NX] = 0.0 - dx;
+    out[RAY_NY] = 0.0 - dy;
+    out[RAY_NZ] = 0.0 - dz;
+    out[RAY_KIND] = 0.0;
+    out[RAY_SLOT] = 0.0 - 1.0;
+    out[RAY_HEAD] = 0.0;
+
+    // ---- entities -------------------------------------------------------
+    let n: i32 = wr.count;
+    let ids = wr.id;
+    let kinds = wr.kind;
+    let flags = wr.flags;
+    let px = wr.px;
+    let py = wr.py;
+    let pz = wr.pz;
+
+    let best: f64 = maxd;
+    let best_slot: i32 = 0 - 1;
+    let best_head: i32 = 0;
+
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = kinds[i];
+        let live: i32 = 0;
+        if (k == KIND_PLAYER) { live = 1; }
+        if (k == KIND_AI)     { live = 1; }
+        if (k == KIND_NPC)    { live = 1; }
+        if (live == 1) {
+            if (ids[i] == p_ignore_id) { live = 0; }
+        }
+        if (live == 1) {
+            if ((flags[i] & EF_DEAD) != 0) { live = 0; }
+        }
+        if (live == 1) {
+            let br: f64 = combat_body_r(wr, i);
+            let bh: f64 = combat_body_h(wr, i);
+            let ex: f64 = px[i];
+            let ey: f64 = py[i];
+            let ez: f64 = pz[i];
+            let t_body: f64 = ray_aabb(ox, oy, oz, dx, dy, dz,
+                                       ex - br, ey, ez - br,
+                                       ex + br, ey + bh, ez + br, best);
+            if (t_body >= 0.0 && t_body < best) {
+                // Head volume: the top g_HEADSHOT_VOL_TOP of the body, inset
+                // horizontally to HEAD_R_MULT of the radius.  It is a strict
+                // SUBSET of the body box, so a ray that intersects it has
+                // necessarily entered the body first and the two tests cannot
+                // disagree about whether the entity was hit.
+                //
+                // The rule is "the ray passes through the head volume", NOT
+                // "the head is the first surface".  A near-horizontal shot at
+                // head height enters the body box at the SHOULDER plane, which
+                // is 0.18 m closer than the narrower head plane; an
+                // entry-surface rule would score that as a body shot and quietly
+                // delete the Longshadow's whole reason to exist.
+                let hr: f64 = br * HEAD_R_MULT;
+                let hy0: f64 = ey + bh * (1.0 - g_HEADSHOT_VOL_TOP);
+                let t_head: f64 = ray_aabb(ox, oy, oz, dx, dy, dz,
+                                           ex - hr, hy0, ez - hr,
+                                           ex + hr, ey + bh, ez + hr, maxd);
+                best = t_body;
+                best_slot = i;
+                best_head = 0;
+                if (t_head >= 0.0) { best_head = 1; }
+            }
+        }
+        i++;
+    }
+
+    // ---- heightfield ----------------------------------------------------
+    let tmax_terrain: f64 = maxd;
+    if (best_slot >= 0) { tmax_terrain = best; }
+
+    let t_ter: f64 = 0.0 - 1.0;
+    if (p_cs != null) {
+        t_ter = ray_terrain(p_cs, ox, oy, oz, dx, dy, dz, tmax_terrain);
+    }
+
+    if (t_ter >= 0.0) {
+        if (t_ter <= 0.0) { cx.start_solid = cx.start_solid + 1; }
+        let hx: f64 = ox + dx * t_ter;
+        let hy: f64 = oy + dy * t_ter;
+        let hz: f64 = oz + dz * t_ter;
+        out[RAY_T] = t_ter;
+        out[RAY_X] = hx;
+        out[RAY_Y] = hy;
+        out[RAY_Z] = hz;
+        out[RAY_KIND] = f64(RAY_TERRAIN);
+        out[RAY_SLOT] = 0.0 - 1.0;
+        out[RAY_HEAD] = 0.0;
+        hf_normal(p_cs, hx, hz, out);
+        let rt: i32 = RAY_TERRAIN;
+        return rt;
+    }
+
+    if (best_slot >= 0) {
+        out[RAY_T] = best;
+        out[RAY_X] = ox + dx * best;
+        out[RAY_Y] = oy + dy * best;
+        out[RAY_Z] = oz + dz * best;
+        out[RAY_NX] = 0.0 - dx;
+        out[RAY_NY] = 0.0 - dy;
+        out[RAY_NZ] = 0.0 - dz;
+        out[RAY_KIND] = f64(RAY_ENTITY);
+        out[RAY_SLOT] = f64(best_slot);
+        out[RAY_HEAD] = f64(best_head);
+        let re: i32 = RAY_ENTITY;
+        return re;
+    }
+
+    let rm: i32 = RAY_MISS;
+    return rm;
+}
+
+// ===========================================================================
+// 10.  DAMAGE
+// ===========================================================================
+
+// Is the incoming shot striking the victim's front plate arc?
+// `p_dx/p_dz` is the direction the SHOT is TRAVELLING, normalized on XZ.  The
+// plate faces the victim's yaw in the same basis the rest of the sim uses:
+// facing = (sin yaw, -cos yaw) on XZ.  The shot strikes the front when it is
+// travelling INTO the facing, i.e. dot(facing, dir) < -PLATE_ARC_COS.
+export fn combat_plate_faces(p_yaw: f64, p_dx: f64, p_dz: f64): i32 {
+    let fx: f64 = sin(p_yaw);
+    let fz: f64 = 0.0 - cos(p_yaw);
+    let dot: f64 = fx * p_dx + fz * p_dz;
+    let out: i32 = 0;
+    if (0.0 - dot > PLATE_ARC_COS) { out = 1; }
+    return out;
+}
+
+// Would this hit be reduced by an intact plate?  Pure; no side effects.  Used
+// by `combat_fire` to set HM_ARMOR without re-deriving the state.
+fn plate_applies(p_w: object, p_slot: i32, p_head: i32,
+                 p_dirx: f64, p_dirz: f64): i32 {
+    let wr: object = p_w;
+    let s: i32 = p_slot;
+    let kinds = wr.kind;
+    if (kinds[s] != KIND_AI) { let no1: i32 = 0; return no1; }
+    if (class_of(wr, s) != g_ENEMY_WARDEN) { let no2: i32 = 0; return no2; }
+    let armor = wr.armor;
+    if (armor[s] <= 0) { let no3: i32 = 0; return no3; }
+    if (p_head == 1 && PLATE_COVERS_HEAD == 0) { let no4: i32 = 0; return no4; }
+    let yaws = wr.yaw;
+    let out: i32 = combat_plate_faces(yaws[s], p_dirx, p_dirz);
+    return out;
+}
+
+// Apply damage to one entity.  THE ONLY PLACE HP CHANGES.
+//
+//   p_raw       damage before the plate, after falloff and headshot multiplier
+//   p_flags     HM_* bits already known by the caller (HM_HEAD, HM_FALLOFF)
+//   p_dirx/z    the XZ direction the damage was travelling, for the plate arc
+//   p_hx/y/z    where it landed, in metres
+//
+// Returns the damage actually removed from HP.  Emits EV_HIT, EV_KILL and (for
+// a player victim) EV_DAMAGE_TAKEN.  The five §2.5 feedback events are emitted
+// by `combat_fire`, which is the only caller that knows a BULLET was involved
+// — a burn tick must not paint a hitmarker.
+export fn combat_apply_damage(p_cx: object, p_w: object, p_attacker_id: i32,
+                              p_victim_slot: i32, p_raw: f64, p_weapon: i32,
+                              p_dmg_kind: i32, p_flags: i32,
+                              p_dirx: f64, p_dirz: f64,
+                              p_hx: f64, p_hy: f64, p_hz: f64): i32 {
+    let cx: object = p_cx;
+    let wr: object = p_w;
+    let vs: i32 = p_victim_slot;
+    cx.last_plated = 0;
+    if (vs < 0 || vs >= wr.count) { let bad: i32 = 0; return bad; }
+
+    let flags = wr.flags;
+    let fl: i32 = flags[vs];
+    if ((fl & EF_DEAD) != 0)   { let gone: i32 = 0; return gone; }
+    if ((fl & EF_INVULN) != 0) { let inv: i32 = 0; return inv; }
+
+    let hp = wr.hp;
+    let armor = wr.armor;
+    let kinds = wr.kind;
+    let lastby = wr.last_hit_by;
+
+    let raw: f64 = p_raw;
+    if (raw < 0.0) { raw = 0.0; }
+
+    let hmbits: i32 = p_flags;
+    let head: i32 = 0;
+    if ((hmbits & HM_HEAD) != 0) { head = 1; }
+
+    // ---- the Warden front plate (GDD §2.2) ------------------------------
+    // 75 % DR while intact.  The plate absorbs the FULL incoming damage out of
+    // its own 80-point pool while passing 25 % through to the body, so the
+    // plate breaks in the same number of shots whether or not it is reducing
+    // anything.  That is what makes "keep shooting the plate" a slow but real
+    // option and "go around" the fast one — which is the whole design intent
+    // of the Warden (GDD §2.2: "stop shooting the wall, go around").
+    let plated: i32 = plate_applies(wr, vs, head, p_dirx, p_dirz);
+    let applied: f64 = raw;
+    if (plated == 1) {
+        applied = raw * (1.0 - PLATE_DR);
+        let pool: i32 = armor[vs];
+        let eat: i32 = i32(raw + 0.5);
+        if (eat > pool) { eat = pool; }
+        armor[vs] = pool - eat;
+        hmbits = hmbits | HM_ARMOR;
+        cx.plate_blocks = cx.plate_blocks + 1;
+        cx.last_plated = 1;
+    }
+
+    // Round to the nearest HP.  A hit that lands must never do zero: at 320x240
+    // a damage number of 0 reads as "my gun is broken".
+    let dmg_i: i32 = i32(applied + 0.5);
+    if (dmg_i < 1 && applied > 0.0) { dmg_i = 1; }
+
+    let before: i32 = hp[vs];
+    let after: i32 = before - dmg_i;
+    if (after < 0) {
+        cx.overkill = cx.overkill - after;
+        after = 0;
+    }
+    hp[vs] = after;
+    let dealt: i32 = before - after;
+    cx.damage_dealt = cx.damage_dealt + dealt;
+
+    lastby[vs] = p_attacker_id;
+    flags[vs] = fl | EF_HIT_FLASH;
+
+    let tick: i32 = wr.tick;
+    let vid: i32 = world_id_of(wr, vs);
+    let bus: object = cx.events;
+
+    // EV_HIT — the authoritative fact.  `sub` is the weapon for bullet damage
+    // and DMG_SUB_BASE + kind otherwise (NETWORKING §11.5: "weapon id / damage
+    // type"), so a packet dump can tell a burn tick from a Sparrow round.
+    let sub_hit: i32 = p_weapon;
+    if (p_dmg_kind != DMG_BULLET) { sub_hit = DMG_SUB_BASE + p_dmg_kind; }
+    evbus_push_m(bus, tick, EV_HIT, sub_hit, p_attacker_id, vid, p_hx, p_hy, p_hz);
+
+    // EV_DAMAGE_TAKEN — GDD §7.13's 4-segment direction indicator, so the
+    // position field is where the damage CAME FROM, not where it landed.
+    if (kinds[vs] == KIND_PLAYER) {
+        let sub_dt: i32 = dealt;
+        if (sub_dt > 255) { sub_dt = 255; }
+        evbus_push_m(bus, tick, EV_DAMAGE_TAKEN, sub_dt, p_attacker_id, vid,
+                     p_hx - p_dirx, p_hy, p_hz - p_dirz);
+    }
+
+    if (after <= 0) {
+        flags[vs] = flags[vs] | EF_DEAD;
+        cx.kills = cx.kills + 1;
+        let px = wr.px;
+        let py = wr.py;
+        let pz = wr.pz;
+        evbus_push_m(bus, tick, EV_KILL, sub_hit, p_attacker_id, vid,
+                     px[vs], py[vs], pz[vs]);
+    }
+
+    let out: i32 = dealt;
+    return out;
+}
+
+export fn combat_is_dead(p_w: object, p_slot: i32): i32 {
+    let wr: object = p_w;
+    let s: i32 = p_slot;
+    if (s < 0 || s >= wr.count) { let bad: i32 = 1; return bad; }
+    let flags = wr.flags;
+    let out: i32 = 0;
+    if ((flags[s] & EF_DEAD) != 0) { out = 1; }
+    return out;
+}
+
+// ===========================================================================
+// 11.  THE HIT-SOUND PITCH CHAIN  (GDD §7.2)
+// ===========================================================================
+// +2 semitones per consecutive hit, up to +8, reset after 0.6 s of no hits.
+// Server-side, because only the authority knows whether the previous shot
+// connected.  Flat i32 arrays indexed by player slot: serializable, snapshot-
+// able, and free of the closure-captured counter this is usually written as.
+fn chain_step(p_cx: object, p_attacker_id: i32, p_tick: i32): i32 {
+    let cx: object = p_cx;
+    let aid: i32 = p_attacker_id;
+    if (aid < 1 || aid >= CHAIN_SLOTS) { let none: i32 = 0; return none; }
+    let cn = cx.chain_n;
+    let ct = cx.chain_tick;
+    let prev: i32 = ct[aid];
+    let step: i32 = 0;
+    if (p_tick - prev <= HIT_CHAIN_TICKS) { step = cn[aid] + 1; }
+    if (step > SFX_PITCH_STEPS - 1) { step = SFX_PITCH_STEPS - 1; }
+    cn[aid] = step;
+    ct[aid] = p_tick;
+    let out: i32 = step;
+    return out;
+}
+
+// The pitch chain is SIM STATE, not a cosmetic counter: it decides which sfx
+// id an authoritative event carries.  A rollback that does not restore it
+// replays the same tick and emits a different sound, which is a desync in the
+// only channel the player can actually hear.  These two calls are what
+// `snapshot.hml` and the rollback path use; `CHAIN_FIELDS` is the width.
+export let CHAIN_FIELDS = 130;      // 2 * CHAIN_SLOTS
+
+export fn combat_chain_capture(p_cx: object, p_out: array<i32>): i32 {
+    let cx: object = p_cx;
+    let out = p_out;
+    if (out.length < CHAIN_FIELDS) { let bad: i32 = 0; return bad; }
+    let cn = cx.chain_n;
+    let ct = cx.chain_tick;
+    let i: i32 = 0;
+    while (i < CHAIN_SLOTS) {
+        out[i] = cn[i];
+        out[CHAIN_SLOTS + i] = ct[i];
+        i++;
+    }
+    let ok: i32 = 1;
+    return ok;
+}
+
+export fn combat_chain_restore(p_cx: object, p_src: array<i32>): i32 {
+    let cx: object = p_cx;
+    let src = p_src;
+    if (src.length < CHAIN_FIELDS) { let bad: i32 = 0; return bad; }
+    let cn = cx.chain_n;
+    let ct = cx.chain_tick;
+    let i: i32 = 0;
+    while (i < CHAIN_SLOTS) {
+        cn[i] = src[i];
+        ct[i] = src[CHAIN_SLOTS + i];
+        i++;
+    }
+    let ok: i32 = 1;
+    return ok;
+}
+
+export fn combat_chain_scratch(): array<i32> {
+    let out: array<i32> = zeros_i(CHAIN_FIELDS);
+    return out;
+}
+
+export fn combat_chain_step_of(p_cx: object, p_attacker_id: i32): i32 {
+    let cx: object = p_cx;
+    let aid: i32 = p_attacker_id;
+    if (aid < 1 || aid >= CHAIN_SLOTS) { let none: i32 = 0; return none; }
+    let cn = cx.chain_n;
+    let out: i32 = cn[aid];
+    return out;
+}
+
+// ===========================================================================
+// 12.  COMBAT_FIRE — one trigger pull
+// ===========================================================================
+// Everything above exists so that this function can be short and honest.
+//
+//   p_shooter_slot  the firing entity's slot
+//   p_eye_y         ABSOLUTE world Y of the eye.  Passed in rather than
+//                   derived, because eye height is a PredictedState field owned
+//                   by `movement.hml` (crouch and slide drop it to 0.82 / 0.70)
+//                   and combat must not keep a second copy of that state.
+//   p_cmd           the InputCommand.  THE AIM AXIS COMES FROM HERE, from the
+//                   quantized yaw and pitch, and from nowhere else.
+//   p_bloom         accumulated bloom in DEGREES (weapons.hml owns the decay;
+//                   `wpn_bloom_for_shots` converts a shot count if that is all
+//                   the caller has)
+//   p_ads01         0 = hip, 1 = fully aimed, fractions during the ADS lerp.
+//                   Passed in rather than read from BTN_ADS because the button
+//                   is a boolean and the CONE IS NOT: a shot fired 0.12 s into
+//                   a 0.24 s ADS pull is genuinely half-aimed, and reading the
+//                   bit would quietly hand the player the aimed cone instantly.
+//                   The weapon state that knows the lerp is `weapons.hml`'s.
+//
+// Returns the number of distinct victims damaged.
+export fn combat_fire(p_cx: object, p_w: object, p_cs,
+                      p_shooter_slot: i32, p_eye_y: f64,
+                      p_cmd: object, p_bloom: f64, p_ads01: f64): i32 {
+    let cx: object = p_cx;
+    let wr: object = p_w;
+    let ss: i32 = p_shooter_slot;
+    if (ss < 0 || ss >= wr.count) { let bad: i32 = 0; return bad; }
+    if (cx.has_src == 0) {
+        cx.no_weapon_source = cx.no_weapon_source + 1;
+        let nosrc: i32 = 0;
+        return nosrc;
+    }
+
+    let tick: i32 = wr.tick;
+    let seed: i32 = wr.seed;
+    let shooter_id: i32 = world_id_of(wr, ss);
+    let weapons = wr.weapon;
+    let wpn: i32 = weapons[ss];
+
+    let f_dmg = cx.f_dmg;
+    let f_hs = cx.f_hs;
+    let f_pel = cx.f_pel;
+    let f_spr = cx.f_spr;
+
+    let npel: i32 = f_pel(wpn);
+    if (npel < 1) { npel = 1; }
+    if (npel > VICTIM_SCRATCH) { npel = VICTIM_SCRATCH; }
+    let cone: f64 = f_spr(wpn, p_bloom, p_ads01);
+    if (cone < 0.0) { cone = 0.0; }
+    let hsm: f64 = f_hs(wpn);
+    let near_ref: f64 = f_dmg(wpn, 0.0);
+
+    // ---- the aim axis, from the command ---------------------------------
+    // The SAME two quantized integers the wire carries, dequantized by
+    // `command.hml`.  A predicting client running this code on its own copy of
+    // the command traces the identical ray.
+    let yaw: f64 = cmd_yaw(p_cmd);
+    let pit: f64 = cmd_pitch(p_cmd);
+    // The `+ 0.0` is NOT dead code and it is NOT the folded identity of
+    // CLAUDE.md §1 rule 9.  Measured on v2.9.1: `let x: f64 = sin(y);` — a
+    // typed f64 local initialised DIRECTLY from an `@stdlib/math` extern —
+    // stays BOXED (`HmlValue x = hml_convert_to_type(...)`), and `f64(sin(y))`
+    // does not rescue it; routing the result through one arithmetic expression
+    // does (`double x = hml_to_f64(...)`).  These four are each read four times
+    // in the basis below, so the copy is worth it.  Reported for
+    // docs/HEMLOCK_ISSUES.md with a self-contained repro.
+    let t_cp: f64 = cos(pit);
+    let t_sp: f64 = sin(pit);
+    let t_cy: f64 = cos(yaw);
+    let t_sy: f64 = sin(yaw);
+    let cp: f64 = t_cp + 0.0;
+    let sp: f64 = t_sp + 0.0;
+    let cy: f64 = t_cy + 0.0;
+    let sy: f64 = t_sy + 0.0;
+    let fwx: f64 = sy * cp;
+    let fwy: f64 = sp;
+    let fwz: f64 = 0.0 - cy * cp;
+    // right = (cos yaw, 0, sin yaw);  up = right x fwd
+    let rgx: f64 = cy;
+    let rgz: f64 = sy;
+    let upx: f64 = 0.0 - sp * sy;
+    let upy: f64 = cp;
+    let upz: f64 = sp * cy;
+
+    let pxs = wr.px;
+    let pzs = wr.pz;
+    let ox: f64 = pxs[ss];
+    let oy: f64 = p_eye_y;
+    let oz: f64 = pzs[ss];
+
+    // ---- the spread stream ----------------------------------------------
+    // (world_seed, RNG_SPREAD, tick, shooter_id).  Reseeded per shot, so the
+    // cone is a pure function of the tick and the shooter: a replay of the same
+    // commands fires the same pellets, and two clients predicting the same
+    // command agree without talking to each other.
+    let st = cx.rng;
+    rng_seed(st, seed, RNG_SPREAD, tick, shooter_id);
+
+    let ray = cx.ray;
+    let bus: object = cx.events;
+    cx.shots = cx.shots + 1;
+    cx.hv_n = 0;
+
+    let hv_slot = cx.hv_slot;
+    let hv_head = cx.hv_head;
+    let hv_fall = cx.hv_fall;
+    let hv_dmg = cx.hv_dmg;
+    let hv_x = cx.hv_x;
+    let hv_y = cx.hv_y;
+    let hv_z = cx.hv_z;
+
+    // ---- pass 1: trace every pellet, aggregate by victim -----------------
+    let p: i32 = 0;
+    while (p < npel) {
+        cx.pellets_fired = cx.pellets_fired + 1;
+
+        // Uniform over the cone's DISC: r = cone * sqrt(u), theta = 2*pi*v.
+        // The sqrt is what stops the centre of the cone from clumping, which is
+        // the difference between "a spread" and "a laser with a fringe".
+        let u0: f64 = rng_f01(st);
+        let u1: f64 = rng_f01(st);
+        let rr: f64 = cone * sqrt(u0);
+        let th: f64 = 6.283185307179586 * u1;
+        let tanr: f64 = tan(rr);
+        let ca: f64 = cos(th) * tanr;
+        let sa: f64 = sin(th) * tanr;
+
+        let ddx: f64 = fwx + rgx * ca + upx * sa;
+        let ddy: f64 = fwy + upy * sa;
+        let ddz: f64 = fwz + rgz * ca + upz * sa;
+        let dl: f64 = sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+        if (dl <= 0.0) { dl = 1.0; }
+        ddx = ddx / dl;
+        ddy = ddy / dl;
+        ddz = ddz / dl;
+
+        let kind: i32 = combat_raycast(cx, wr, p_cs, ox, oy, oz,
+                                       ddx, ddy, ddz, g_HITSCAN_MAX_M,
+                                       shooter_id, ray);
+
+        if (kind == RAY_ENTITY) {
+            cx.pellets_hit = cx.pellets_hit + 1;
+            let vslot: i32 = i32(ray[RAY_SLOT]);
+            let range: f64 = ray[RAY_T];
+            let head: i32 = i32(ray[RAY_HEAD]);
+            let base: f64 = f_dmg(wpn, range);
+            let dmg: f64 = base;
+            if (head == 1) {
+                dmg = base * hsm;
+                cx.headshots = cx.headshots + 1;
+            }
+            let fell: i32 = 0;
+            if (base < near_ref - 0.000001) { fell = 1; }
+
+            // accumulate onto this victim's scratch row
+            let row: i32 = 0 - 1;
+            let q: i32 = 0;
+            let hn: i32 = cx.hv_n;
+            while (q < hn) {
+                if (hv_slot[q] == vslot) { row = q; q = hn; } else { q++; }
+            }
+            if (row < 0 && hn < VICTIM_SCRATCH) {
+                row = hn;
+                hv_slot[row] = vslot;
+                hv_head[row] = 0;
+                hv_fall[row] = 0;
+                hv_dmg[row] = 0.0;
+                hv_x[row] = ray[RAY_X];
+                hv_y[row] = ray[RAY_Y];
+                hv_z[row] = ray[RAY_Z];
+                cx.hv_n = hn + 1;
+            }
+            if (row >= 0) {
+                hv_dmg[row] = hv_dmg[row] + dmg;
+                if (head == 1) { hv_head[row] = 1; }
+                if (fell == 1) { hv_fall[row] = 1; }
+            }
+
+            // GDD §7.7: one impact spark PER PELLET.  Nine sparks is what a
+            // shotgun looks like; one is what a rifle looks like.
+            evbus_push_m(bus, tick, EV_IMPACT, SURF_FLESH, shooter_id,
+                         world_id_of(wr, vslot),
+                         ray[RAY_X], ray[RAY_Y], ray[RAY_Z]);
+        }
+
+        if (kind == RAY_TERRAIN) {
+            cx.terrain_hits = cx.terrain_hits + 1;
+            evbus_push_m(bus, tick, EV_IMPACT, SURF_TERRAIN, shooter_id, ID_NONE,
+                         ray[RAY_X], ray[RAY_Y], ray[RAY_Z]);
+            evbus_push_m(bus, tick, EV_SOUND, SFX_IMPACT_WORLD, shooter_id,
+                         ID_NONE, ray[RAY_X], ray[RAY_Y], ray[RAY_Z]);
+        }
+
+        if (kind == RAY_MISS) { cx.misses = cx.misses + 1; }
+
+        p++;
+    }
+
+    // ---- pass 2: one damage application + one feedback set per victim ----
+    let victims: i32 = cx.hv_n;
+    let v: i32 = 0;
+    while (v < victims) {
+        let vslot: i32 = hv_slot[v];
+        let hx: f64 = hv_x[v];
+        let hy: f64 = hv_y[v];
+        let hz: f64 = hv_z[v];
+        let raw: f64 = hv_dmg[v];
+        let head: i32 = hv_head[v];
+
+        let hm: i32 = 0;
+        if (head == 1) { hm = hm | HM_HEAD; }
+        // Grey damage number (GDD §7.8) means "range took a bite out of this",
+        // which is information the player needs and cannot get any other way at
+        // 320x240.
+        if (hv_fall[v] == 1) { hm = hm | HM_FALLOFF; }
+
+        // XZ direction from the shooter to the impact, for the plate arc
+        let sdx: f64 = hx - ox;
+        let sdz: f64 = hz - oz;
+        let sl: f64 = sqrt(sdx * sdx + sdz * sdz);
+        if (sl <= 0.0) { sl = 1.0; }
+        sdx = sdx / sl;
+        sdz = sdz / sl;
+
+        let vid: i32 = world_id_of(wr, vslot);
+
+        let dealt: i32 = combat_apply_damage(cx, wr, shooter_id, vslot, raw,
+                                             wpn, DMG_BULLET, hm,
+                                             sdx, sdz, hx, hy, hz);
+        if (cx.last_plated == 1) { hm = hm | HM_ARMOR; }
+
+        let flags2 = wr.flags;
+        let killed: i32 = 0;
+        if ((flags2[vslot] & EF_DEAD) != 0) { killed = 1; }
+        if (killed == 1) { hm = hm | HM_KILL; }
+
+        // ============================================================
+        // THE FIVE SIGNALS OF GDD §2.5.  ALL FIVE, THIS TICK, NO EXCEPTIONS.
+        // ============================================================
+        // 1. hitmarker
+        evbus_push_m(bus, tick, EV_HITMARKER, hm, shooter_id, vid, hx, hy, hz);
+
+        // 2. enemy flash — positioned at the victim's centre, not the impact,
+        //    because the whole body flashes.
+        let pxs2 = wr.px;
+        let pys2 = wr.py;
+        let pzs2 = wr.pz;
+        let bh: f64 = combat_body_h(wr, vslot);
+        evbus_push_m(bus, tick, EV_HIT_FLASH, HIT_FLASH_CS, shooter_id, vid,
+                     pxs2[vslot], pys2[vslot] + bh * 0.5, pzs2[vslot]);
+
+        // 3. damage number
+        let shown: i32 = dealt;
+        if (shown > 255) { shown = 255; }
+        evbus_push_m(bus, tick, EV_DAMAGE_NUMBER, shown, shooter_id, vid,
+                     hx, hy, hz);
+
+        // 4. impact billboard — one per pellet was already emitted in pass 1.
+        //    A plate hit gets a second, differently tinted one, because a
+        //    ricochet off armour must not read like flesh.
+        if ((hm & HM_ARMOR) != 0) {
+            evbus_push_m(bus, tick, EV_IMPACT, SURF_ARMOR, shooter_id, vid,
+                         hx, hy, hz);
+        }
+
+        // 5. audio blip, pitch-chained per §7.2
+        let step: i32 = chain_step(cx, shooter_id, tick);
+        let sfx: i32 = SFX_HIT_BLIP + step;
+        if ((hm & HM_ARMOR) != 0) { sfx = SFX_IMPACT_ARMOR; }
+        if (killed == 1) { sfx = SFX_KILL_CHIME; }
+        evbus_push_m(bus, tick, EV_SOUND, sfx, shooter_id, vid, hx, hy, hz);
+
+        v++;
+    }
+
+    let out: i32 = victims;
+    return out;
+}
+
+// ===========================================================================
+// 13.  THE §2.5 CONTRACT CHECK
+// ===========================================================================
+// For every EV_HIT on the bus with a real target, are all five feedback signals
+// present for that same target in the same tick?  Returns the number of MISSING
+// signals — 0 is the only acceptable answer.  Cheap enough to run every tick in
+// `simtest`; deliberately NOT called from `combat_fire`, because a contract
+// that polices itself from inside the thing it polices proves nothing.
+export fn combat_feedback_ok(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let b: object = cx.events;
+    let n: i32 = b.count;
+    let a_ty = b.type;
+    let a_tg = b.target;
+    let bad: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (a_ty[i] == EV_HIT) {
+            let tgt: i32 = a_tg[i];
+            if (tgt != ID_NONE) {
+                if (evbus_count_for(b, EV_HITMARKER, tgt) < 1)     { bad++; }
+                if (evbus_count_for(b, EV_HIT_FLASH, tgt) < 1)     { bad++; }
+                if (evbus_count_for(b, EV_DAMAGE_NUMBER, tgt) < 1) { bad++; }
+                if (evbus_count_for(b, EV_IMPACT, tgt) < 1)        { bad++; }
+                if (evbus_count_for(b, EV_SOUND, tgt) < 1)         { bad++; }
+            }
+        }
+        i++;
+    }
+    let out: i32 = bad;
+    return out;
+}
+
+// How many damage numbers are on the bus?  GDD §7.8 caps the SCREEN at 8; the
+// authority does not cap the truth, but the client needs to know when it is
+// discarding, so the number is exposed rather than enforced here.
+export fn combat_damage_number_count(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let b: object = cx.events;
+    let n: i32 = b.count;
+    let a_ty = b.type;
+    let c: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (a_ty[i] == EV_DAMAGE_NUMBER) { c++; }
+        i++;
+    }
+    let out: i32 = c;
+    return out;
+}
+
+export fn combat_damage_number_cap(): i32 {
+    let out: i32 = g_MAX_DAMAGE_NUMBERS;
+    return out;
+}
+
+// The NETWORKING §11.5 mirror check.  A tool that can see both `src/net/` and
+// `src/sim/` calls this with protocol.hml's constants and asserts 1.
+export fn combat_ev_mirror_ok(p_hit: i32, p_kill: i32, p_dmg_taken: i32,
+                              p_sound: i32): i32 {
+    let out: i32 = 1;
+    if (p_hit != EV_HIT) { out = 0; }
+    if (p_kill != EV_KILL) { out = 0; }
+    if (p_dmg_taken != EV_DAMAGE_TAKEN) { out = 0; }
+    if (p_sound != EV_SOUND) { out = 0; }
+    return out;
+}

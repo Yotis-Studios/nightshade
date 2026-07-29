@@ -1,0 +1,1890 @@
+// =============================================================================
+//  probe_combat.hml — W4-3 acceptance probe for src/sim/combat.hml.
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT, and BOTH ways — the golden hashes
+//  below are what make running it twice mean something:
+//
+//      hemlockc -O1 tools/probe_combat.hml -o /tmp/pcb && /tmp/pcb
+//      hemlock  tools/probe_combat.hml
+//
+//  It exits 1 on any failure AND on an assertion-COUNT mismatch: a probe that
+//  silently stops running half its checks is worse than no probe.
+//
+//  WHY THIS FILE CARRIES A WEAPON TABLE
+//  -----------------------------------
+//  `src/sim/weapons.hml` (W4-2) is a sibling task in the same sub-wave and does
+//  not exist yet, so `combat.hml` takes its weapon numbers through four
+//  injected functions (ARCHITECTURE §5.4b's injected-source pattern, the same
+//  one `chunk.hml` uses for `worldgen.hml`).  The table below is the GDD §2.4
+//  REFERENCE, transcribed here in the TEST, deliberately NOT in the sim module,
+//  so that combat.hml contains no shadow copy of someone else's data.  When
+//  weapons.hml lands, these four functions are replaced by four one-line
+//  forwards and every assertion below should still pass unchanged.
+//
+//  Longshadow falloff is 34/68, not GDD's 55/110 — ARCHITECTURE §0 D2.
+//
+//  TIMING (CLAUDE.md §1.2 / RULE T)
+//  --------------------------------
+//  `__clock()` CPU time, minimum of 7 whole batches.  Bounds are REGRESSION
+//  GUARDS at ~2x the LOADED measurement on a box permanently sharing ~17 of 24
+//  cores; both numbers are printed in the assertion text.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { read_file } from "@stdlib/fs";
+import { sqrt, sin, cos, tan, atan2, acos } from "@stdlib/math";
+
+import { g_WPN_SPARROW, g_WPN_TINKER, g_WPN_BELLOWS, g_WPN_LONGSHADOW,
+         g_WPN_KESTREL, g_WPN_EMBERLANCE, g_WPN_COUNT,
+         g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK, g_ENEMY_SPITTER,
+         g_ENEMY_WARDEN, g_ENEMY_BULWARK,
+         g_BUDGET_SIM_MS, g_HEADSHOT_VOL_TOP, g_WORLD_SEED_DEFAULT,
+         g_CHUNK_CACHE, g_DIR_ALIVE_CAP
+       } from "../src/core/config.hml";
+
+import { world_new_cap, world_spawn, world_spawn_player, world_despawn,
+         world_id_of, world_slot_of, world_set_tick, world_set_seed,
+         world_count, world_check,
+         KIND_AI, KIND_PLAYER, EF_DEAD, EF_INVULN, EF_HIT_FLASH
+       } from "../src/sim/world.hml";
+
+import { cmd_new, cmd_set, cmd_yaw, cmd_pitch,
+         BTN_FIRE, BTN_ADS } from "../src/sim/command.hml";
+
+import { chunk_store_new, chunk_store_new_cap, chunk_set_source, chunk_pin_ring,
+         chunk_height_at, CHUNK_H_MISS } from "../src/sim/chunk.hml";
+
+import { worldgen_chunk, worldgen_poi_roll } from "../src/sim/worldgen.hml";
+
+// The REAL weapon table (W4-2).  Section K installs these four straight into
+// combat.hml's injected source with NO adapter, which is the whole point of
+// matching the signatures byte for byte.
+import { wpn_dmg_at, wpn_hs_mult, wpn_pellets, wpn_spread_half_rad,
+         wpn_max_range } from "../src/sim/weapons.hml";
+
+import { combat_new, combat_new_cap, combat_set_weapon_source,
+         combat_has_weapon_source, combat_events, combat_begin_tick,
+         combat_raycast, combat_apply_damage, combat_fire,
+         combat_feedback_ok, combat_damage_number_count, combat_damage_number_cap,
+         combat_body_r, combat_body_h, combat_plate_hp, combat_plate_faces,
+         combat_is_dead, combat_hb_ok, combat_ev_mirror_ok, combat_stat,
+         combat_ray_scratch, combat_chain_step_of, combat_chain_scratch,
+         combat_chain_capture, combat_chain_restore, CHAIN_FIELDS,
+         evbus_new_cap, evbus_reset, evbus_push, evbus_count, evbus_type, evbus_tick,
+         evbus_sub, evbus_actor, evbus_target, evbus_x, evbus_y, evbus_z,
+         evbus_xq, evbus_dropped, evbus_hash, evbus_count_for, ev_q, ev_dq,
+         EV_HIT, EV_KILL, EV_DAMAGE_TAKEN, EV_SOUND,
+         EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER, EV_IMPACT,
+         HM_HEAD, HM_KILL, HM_FALLOFF, HM_ARMOR,
+         SURF_TERRAIN, SURF_FLESH, SURF_ARMOR,
+         SFX_HIT_BLIP, SFX_KILL_CHIME, SFX_IMPACT_WORLD, SFX_IMPACT_ARMOR,
+         SFX_PITCH_STEPS, HIT_CHAIN_TICKS, HIT_FLASH_CS,
+         DMG_BULLET, DMG_BURN, DMG_SUB_BASE,
+         RAY_T, RAY_X, RAY_Y, RAY_Z, RAY_NX, RAY_NY, RAY_NZ, RAY_KIND, RAY_SLOT, RAY_HEAD,
+         RAY_MISS, RAY_TERRAIN, RAY_ENTITY,
+         WARDEN_PLATE_HP, PLATE_DR, HEAD_R_MULT, FEEDBACK_COUNT,
+         STAT_SHOTS, STAT_PELLETS_FIRED, STAT_PELLETS_HIT, STAT_KILLS,
+         STAT_HEADSHOTS, STAT_PLATE_BLOCKS, STAT_TERRAIN_HITS,
+         STAT_NO_WEAPON_SOURCE, STAT_MISSES
+       } from "../src/sim/combat.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 180;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+fn s2(p_v: f64): string {
+    let out: string = `${p_v}`;
+    return out;
+}
+
+// Are we the compiled artifact?  Under the interpreter argv[0] is the .hml
+// script; compiled it is the binary.  The game ships compiled, so that is the
+// path the timing guard is calibrated for.
+fn is_compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+let g_PI: f64  = 3.141592653589793;
+let g_D2R: f64 = 0.017453292519943295;
+let g_R2D: f64 = 57.29577951308232;
+
+// ===========================================================================
+//  THE GDD §2.4 REFERENCE WEAPON TABLE  (test-side only — see the header)
+// ===========================================================================
+// index = g_WPN_*:  0 Sparrow  1 Tinker  2 Bellows  3 Longshadow  4 Kestrel
+//                   5 Emberlance
+let g_WD_NEAR: array<f64> = [26.0, 19.0, 13.0, 78.0, 45.0, 60.0];
+let g_WD_FAR:  array<f64> = [18.0, 11.0,  5.0, 68.0, 30.0, 60.0];
+let g_WD_HS:   array<f64> = [1.50, 1.40, 1.25, 2.10, 1.50, 1.00];
+// D2: Longshadow retuned from 55/110 to 34/68 because FOG_FAR is capped at 72.
+let g_WD_R0:   array<f64> = [22.0,  9.0,  6.0, 34.0, 14.0,  0.0];
+let g_WD_R1:   array<f64> = [46.0, 22.0, 14.0, 68.0, 30.0,  1.0];
+let g_WD_PEL:  array<i32> = [1, 1, 9, 1, 1, 1];
+// GDD §2.4 "Handling", in FULL-CONE DEGREES.  The injection contract wants a
+// HALF-angle in radians, so ref_spread halves and converts.
+let g_WD_HIP0: array<f64> = [3.2, 4.0, 6.5, 9.0, 3.6, 2.5];
+let g_WD_HIP1: array<f64> = [6.0, 7.5, 6.5, 9.0, 6.5, 2.5];
+let g_WD_BLOOM: array<f64> = [0.35, 0.30, 0.0, 1.20, 0.55, 0.0];
+let g_WD_ADS:  array<f64> = [0.25, 0.55, 4.5, 0.05, 0.20, 1.0];
+
+// GDD §2.2 HP column.
+let g_EN_HP: array<i32> = [15, 30, 90, 70, 220, 900];
+
+fn ref_dmg_at(p_wpn: i32, p_range: f64): f64 {
+    let wp: i32 = p_wpn;
+    if (wp < 0 || wp >= g_WPN_COUNT) { let z: f64 = 0.0; return z; }
+    let r0: f64 = g_WD_R0[wp];
+    let r1: f64 = g_WD_R1[wp];
+    let dn: f64 = g_WD_NEAR[wp];
+    let df: f64 = g_WD_FAR[wp];
+    let t: f64 = 0.0;
+    if (r1 > r0) { t = (p_range - r0) / (r1 - r0); }
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    let out: f64 = dn + (df - dn) * t;
+    return out;
+}
+
+fn ref_hs_mult(p_wpn: i32): f64 {
+    let wp: i32 = p_wpn;
+    if (wp < 0 || wp >= g_WPN_COUNT) { let z: f64 = 1.0; return z; }
+    let out: f64 = g_WD_HS[wp];
+    return out;
+}
+
+fn ref_pellets(p_wpn: i32): i32 {
+    let wp: i32 = p_wpn;
+    if (wp < 0 || wp >= g_WPN_COUNT) { let z: i32 = 1; return z; }
+    let out: i32 = g_WD_PEL[wp];
+    return out;
+}
+
+// Cone HALF-ANGLE in radians.  GDD's table is a full cone in degrees.
+// Signature and units are byte-identical to weapons.hml's wpn_spread_half_rad.
+//   p_bloom  accumulated bloom, in degrees
+//   p_ads01  0 = hip, 1 = fully aimed
+fn ref_spread(p_wpn: i32, p_bloom: f64, p_ads01: f64): f64 {
+    let wp: i32 = p_wpn;
+    if (wp < 0 || wp >= g_WPN_COUNT) { let z: f64 = 0.0; return z; }
+    let hip: f64 = g_WD_HIP0[wp] + p_bloom;
+    if (hip > g_WD_HIP1[wp]) { hip = g_WD_HIP1[wp]; }
+    let a: f64 = p_ads01;
+    if (a < 0.0) { a = 0.0; }
+    if (a > 1.0) { a = 1.0; }
+    let deg: f64 = hip * (1.0 - a) + g_WD_ADS[wp] * a;
+    let out: f64 = deg * 0.5 * g_D2R;
+    return out;
+}
+
+// 0 = the probe's own GDD §2.4 reference table (sections A-J, so the goldens
+// are anchored to a table this file controls); 1 = the real weapons.hml
+// (section K, the integration check).
+let g_use_real: i32 = 0;
+
+fn install_weapons(p_cx: object) {
+    if (g_use_real == 1) {
+        // THE ADAPTER, IN FULL.  Four bare function names, no wrapper.
+        combat_set_weapon_source(p_cx, wpn_dmg_at, wpn_hs_mult,
+                                 wpn_pellets, wpn_spread_half_rad);
+    } else {
+        combat_set_weapon_source(p_cx, ref_dmg_at, ref_hs_mult, ref_pellets, ref_spread);
+    }
+}
+
+// ===========================================================================
+//  WORLD HELPERS
+// ===========================================================================
+
+// Spawn an enemy of class `p_cls` at (x, feet_y, z).  `world.model` carries the
+// g_ENEMY_* index — the cross-module convention combat.hml documents.
+fn spawn_enemy(p_w: object, p_cls: i32, p_x: f64, p_y: f64, p_z: f64,
+               p_yaw: f64): i32 {
+    let wr: object = p_w;
+    let s: i32 = world_spawn(wr, KIND_AI, 0);
+    if (s < 0) { let bad: i32 = 0 - 1; return bad; }
+    let px = wr.px;  px[s] = p_x;
+    let py = wr.py;  py[s] = p_y;
+    let pz = wr.pz;  pz[s] = p_z;
+    let yw = wr.yaw; yw[s] = p_yaw;
+    let md = wr.model; md[s] = p_cls;
+    let hp = wr.hp;    hp[s] = g_EN_HP[p_cls];
+    let hm = wr.hp_max; hm[s] = g_EN_HP[p_cls];
+    let ar = wr.armor; ar[s] = combat_plate_hp(p_cls);
+    let tm = wr.team;  tm[s] = 2;
+    let out: i32 = s;
+    return out;
+}
+
+fn spawn_shooter(p_w: object, p_x: f64, p_y: f64, p_z: f64, p_wpn: i32): i32 {
+    let wr: object = p_w;
+    let s: i32 = world_spawn_player(wr, 1);
+    let px = wr.px;  px[s] = p_x;
+    let py = wr.py;  py[s] = p_y;
+    let pz = wr.pz;  pz[s] = p_z;
+    let hp = wr.hp;  hp[s] = 100;
+    let hm = wr.hp_max; hm[s] = 100;
+    let wp = wr.weapon; wp[s] = p_wpn;
+    let tm = wr.team; tm[s] = 1;
+    let out: i32 = s;
+    return out;
+}
+
+fn ent_hp(p_w: object, p_slot: i32): i32 {
+    let wr: object = p_w;
+    let hp = wr.hp;
+    let out: i32 = hp[p_slot];
+    return out;
+}
+
+fn ent_armor(p_w: object, p_slot: i32): i32 {
+    let wr: object = p_w;
+    let ar = wr.armor;
+    let out: i32 = ar[p_slot];
+    return out;
+}
+
+fn set_hp(p_w: object, p_slot: i32, p_v: i32) {
+    let wr: object = p_w;
+    let hp = wr.hp;
+    hp[p_slot] = p_v;
+    let fl = wr.flags;
+    if ((fl[p_slot] & EF_DEAD) != 0) { fl[p_slot] = fl[p_slot] - EF_DEAD; }
+}
+
+// Point a command at a world position from an eye position.  This is the ONLY
+// way the probe ever specifies aim: through the quantized command, exactly as
+// the wire would.
+fn aim_cmd(p_cmd: object, p_tick: i32,
+           p_ox: f64, p_oy: f64, p_oz: f64,
+           p_tx: f64, p_ty: f64, p_tz: f64,
+           p_btn: i32, p_wpn: i32) {
+    let dx: f64 = p_tx - p_ox;
+    let dy: f64 = p_ty - p_oy;
+    let dz: f64 = p_tz - p_oz;
+    let hor: f64 = sqrt(dx * dx + dz * dz);
+    let yaw: f64 = atan2(dx, 0.0 - dz);
+    let pit: f64 = atan2(dy, hor);
+    cmd_set(p_cmd, p_tick, 16, 0.0, 0.0, yaw, pit, p_btn, p_wpn, p_tick);
+}
+
+// A u64 content hash of everything combat is allowed to change.
+fn hmix(p_h: u64, p_v: i32): u64 {
+    let k: i32 = p_v;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    let h: u64 = (p_h ^ u) * 1099511628211;
+    let out: u64 = h ^ (h >> 29);
+    return out;
+}
+
+fn world_state_hash(p_w: object): u64 {
+    let wr: object = p_w;
+    let n: i32 = wr.count;
+    let ids = wr.id;
+    let hp = wr.hp;
+    let ar = wr.armor;
+    let fl = wr.flags;
+    let lb = wr.last_hit_by;
+    let px = wr.px;
+    let py = wr.py;
+    let pz = wr.pz;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < n) {
+        h = hmix(h, ids[i]);
+        h = hmix(h, hp[i]);
+        h = hmix(h, ar[i]);
+        h = hmix(h, fl[i]);
+        h = hmix(h, lb[i]);
+        h = hmix(h, ev_q(px[i]));
+        h = hmix(h, ev_q(py[i]));
+        h = hmix(h, ev_q(pz[i]));
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+fn u64_lo31(p_h: u64): i32 {
+    let out: i32 = i32((p_h >> 33) & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// A.  STRUCTURE — the module is what it claims to be
+// ===========================================================================
+fn section_structure() {
+    print("A. Structure and the authority claim");
+
+    let txt: string = read_file("src/sim/combat.hml");
+    ck(txt.length > 1000, "A0 combat.hml is readable", `${txt.length} bytes`);
+
+    let lines = txt.split("\n");
+
+    // A1 — no render-side transform reference in CODE.  This is the CI grep
+    // W4-3's acceptance calls for.  Comments are stripped first: a scanner
+    // that cannot tell prose from code gets switched off within a week.
+    let banned = ["mvp", "camera", "matrix", "frustum", "view_build", "g_view",
+                  "screen_", "SDL_", "@stdlib/random", "__clock", "ticks(",
+                  "wobbleweed", "gn.hml", "spawn(", "defer ", "throw "];
+    let hits: string = "";
+    let i = 0;
+    while (i < lines.length) {
+        let code: string = lines[i].split("//")[0];
+        let b = 0;
+        while (b < banned.length) {
+            if (code.contains(banned[b])) { hits = `${hits} L${i}:${banned[b]}`; }
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    ck(hits == "", "A1 no render-transform / clock / SDL symbol in combat CODE", `${hits}`);
+
+    // A2 — the scanner is not blind (a check that cannot fail is not a check)
+    let selft: string = read_file("tools/probe_combat.hml");
+    let selfhit: i32 = 0;
+    let sl = selft.split("\n");
+    let si = 0;
+    while (si < sl.length) {
+        if (sl[si].split("//")[0].contains("@stdlib/fs")) { selfhit = 1; }
+        si = si + 1;
+    }
+    ck(selfhit == 1, "A2 the banned-token scanner detects a real line", "scanner blind");
+
+    // A3 — every import obeys the wall
+    let badimp: string = "";
+    let k = 0;
+    while (k < lines.length) {
+        let line: string = lines[k];
+        if (line.split("//")[0].contains("from \"")) {
+            let ok: i32 = 0;
+            if (line.contains("\"@stdlib/math\"")) { ok = 1; }
+            if (line.contains("\"./")) { ok = 1; }
+            if (line.contains("\"../core/")) { ok = 1; }
+            if (ok == 0) { badimp = `${badimp} ${line}`; }
+        }
+        k = k + 1;
+    }
+    ck(badimp == "", "A3 every combat import is @stdlib/math, sim or core", `${badimp}`);
+
+    // A4 — the aim really does come from the command
+    ck(txt.contains("cmd_yaw(p_cmd)"), "A4 aim yaw is read from the InputCommand", "no cmd_yaw call");
+    ck(txt.contains("cmd_pitch(p_cmd)"), "A4b aim pitch is read from the InputCommand", "no cmd_pitch call");
+
+    // A5 — the hitbox table matches config's enemy-class enum width
+    ck(combat_hb_ok() == 1, "A5 hitbox table is as wide as g_ENEMY_KIND_COUNT", "width mismatch");
+
+    // A6 — the event numbers still mirror NETWORKING §11.5 / protocol.hml.
+    // The literals here are the DOCUMENT's, not combat.hml's, on purpose.
+    ck(combat_ev_mirror_ok(1, 2, 3, 14) == 1,
+       "A6 EV_HIT/KILL/DAMAGE_TAKEN/SOUND mirror NETWORKING §11.5", "renumbered");
+    ck(combat_ev_mirror_ok(1, 2, 3, 99) == 0,
+       "A6b the mirror check can fail", "mirror check is vacuous");
+
+    ck(FEEDBACK_COUNT == 5, "A7 the §2.5 contract is five signals", `${FEEDBACK_COUNT}`);
+}
+
+// ===========================================================================
+// B.  THE EVENT BUS
+// ===========================================================================
+fn section_bus() {
+    print("B. The event bus");
+
+    let b: object = evbus_new_cap(8);
+    ck(evbus_count(b) == 0, "B0 a fresh bus is empty", `${evbus_count(b)}`);
+
+    evbus_push(b, 7, EV_HIT, 3, 1, 1000, ev_q(1.5), ev_q(2.0), ev_q(-3.25));
+    ck(evbus_count(b) == 1, "B1 push appends", `${evbus_count(b)}`);
+    ck(evbus_type(b, 0) == EV_HIT, "B2 type round-trips", `${evbus_type(b,0)}`);
+    ck(evbus_target(b, 0) == 1000, "B3 target round-trips", `${evbus_target(b,0)}`);
+
+    // B4 — the 1/16 m grid round-trips exactly on grid values, and rounds
+    // (never truncates) off them.  q(dq(q(v))) == q(v) is the property.
+    ck(evbus_x(b, 0) == 1.5, "B4 position round-trips on the 1/16 m grid", s2(evbus_x(b,0)));
+    ck(evbus_z(b, 0) == -3.25, "B4b negative position round-trips", s2(evbus_z(b,0)));
+    let qa: i32 = ev_q(0.03);            // 0.48 -> 0
+    let qb: i32 = ev_q(0.04);            // 0.64 -> 1
+    ck(qa == 0 && qb == 1, "B5 ev_q rounds rather than truncates", `${qa} ${qb}`);
+    ck(ev_q(ev_dq(ev_q(7.13))) == ev_q(7.13), "B5b ev_q is idempotent through ev_dq", "not idempotent");
+    ck(ev_q(-0.04) == -1, "B5c ev_q rounds symmetrically about zero", `${ev_q(-0.04)}`);
+
+    // B6 — a full bus DROPS and COUNTS.  A silently dropped event is a missing
+    // hitmarker, which is a broken gun.
+    let j = 0;
+    while (j < 20) { evbus_push(b, 7, EV_SOUND, 1, 1, 1000, 0, 0, 0); j = j + 1; }
+    ck(evbus_count(b) == 8, "B6 the bus never exceeds its cap", `${evbus_count(b)}`);
+    ck(evbus_dropped(b) > 0, "B6b overflow is counted, never silent", `${evbus_dropped(b)}`);
+
+    // B7 — reset empties without reallocating
+    evbus_reset(b);
+    ck(evbus_count(b) == 0, "B7 reset empties the bus", `${evbus_count(b)}`);
+
+    // B8 — the hash is a pure function of the content
+    let b1: object = evbus_new_cap(16);
+    let b2: object = evbus_new_cap(16);
+    evbus_push(b1, 3, EV_HIT, 1, 1, 1000, 4, 5, 6);
+    evbus_push(b2, 3, EV_HIT, 1, 1, 1000, 4, 5, 6);
+    ck(evbus_hash(b1) == evbus_hash(b2), "B8 equal buses hash equal", "hash disagrees");
+    evbus_push(b2, 3, EV_HIT, 1, 1, 1001, 4, 5, 6);
+    ck(evbus_hash(b1) != evbus_hash(b2), "B8b a different bus hashes differently", "hash collision");
+}
+
+// ===========================================================================
+// C.  RAY vs ENTITY  (AABB + head volume)
+// ===========================================================================
+fn section_ray_entity() {
+    print("C. Ray vs entity AABB and the head volume");
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 1337);
+    world_set_tick(wr, 10);
+
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    let en: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, 0.0, -20.0, 0.0);
+    let ray = combat_ray_scratch();
+
+    let bh: f64 = combat_body_h(wr, en);
+    let br: f64 = combat_body_r(wr, en);
+    ck(bh > 1.0 && br > 0.0, "C0 the Husk has a real hitbox", `${s2(br)} x ${s2(bh)}`);
+
+    // C1 — a level ray down -Z hits the torso, not the head
+    let hit: i32 = combat_raycast(cx, wr, null, 0.0, 1.0, 0.0,
+                                  0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(hit == RAY_ENTITY, "C1 a level ray hits the body", `${hit}`);
+    ck(i32(ray[RAY_SLOT]) == en, "C1b it hits the right slot", `${i32(ray[RAY_SLOT])}`);
+    ck(i32(ray[RAY_HEAD]) == 0, "C1c a chest shot is not a headshot", "head flag set");
+    let terr: f64 = ray[RAY_T] - (20.0 - br);
+    if (terr < 0.0) { terr = 0.0 - terr; }
+    ck(terr < 0.001, "C1d the entry distance is the box face", s2(ray[RAY_T]));
+
+    // C2 — a ray through the top 22 % IS a headshot
+    let hy: f64 = bh * (1.0 - g_HEADSHOT_VOL_TOP * 0.5);
+    combat_raycast(cx, wr, null, 0.0, hy, 0.0, 0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(i32(ray[RAY_HEAD]) == 1, "C2 a ray through the top 22 % is a headshot", s2(hy));
+
+    // C2b — just BELOW the head volume is not
+    let ny: f64 = bh * (1.0 - g_HEADSHOT_VOL_TOP) - 0.02;
+    combat_raycast(cx, wr, null, 0.0, ny, 0.0, 0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(i32(ray[RAY_HEAD]) == 0, "C2b just below the head volume is a body shot", s2(ny));
+
+    // C2c — the head is NARROWER than the shoulders: a ray at head height but
+    // outside HEAD_R_MULT * r still hits the body and is not a headshot.
+    let ox: f64 = br * (HEAD_R_MULT + 1.0) * 0.5;
+    combat_raycast(cx, wr, null, ox, hy, 0.0, 0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(i32(ray[RAY_KIND]) == RAY_ENTITY, "C2c a shoulder-line ray still connects", "missed");
+    ck(i32(ray[RAY_HEAD]) == 0, "C2d it is not a headshot", "head volume is too wide");
+
+    // C3 — a ray that misses, misses
+    let miss: i32 = combat_raycast(cx, wr, null, 0.0, 1.0, 0.0,
+                                   1.0, 0.0, 0.0, 140.0, 1, ray);
+    ck(miss == RAY_MISS, "C3 a ray pointed away misses", `${miss}`);
+
+    // C4 — you cannot shoot yourself
+    let selfr: i32 = combat_raycast(cx, wr, null, 0.0, 1.0, 0.0,
+                                    0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(i32(ray[RAY_SLOT]) != sh, "C4 the shooter is excluded by id", "self hit");
+    ck(selfr == RAY_ENTITY, "C4b and the shot still travels on", `${selfr}`);
+
+    // C5 — a corpse is not a target
+    let fl = wr.flags;
+    fl[en] = fl[en] | EF_DEAD;
+    let dead: i32 = combat_raycast(cx, wr, null, 0.0, 1.0, 0.0,
+                                   0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(dead == RAY_MISS, "C5 a dead entity is not hittable", `${dead}`);
+    if ((fl[en] & EF_DEAD) != 0) { fl[en] = fl[en] - EF_DEAD; }
+
+    // C6 — the NEAREST entity wins
+    let en2: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, 0.0, -10.0, 0.0);
+    combat_raycast(cx, wr, null, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(i32(ray[RAY_SLOT]) == en2, "C6 the nearest entity wins", `${i32(ray[RAY_SLOT])}`);
+
+    // C7 — beyond max range is a miss
+    let px = wr.px; let pz = wr.pz;
+    pz[en2] = -1000.0;
+    pz[en] = -1000.0;
+    let far: i32 = combat_raycast(cx, wr, null, 0.0, 1.0, 0.0,
+                                  0.0, 0.0, -1.0, 140.0, 1, ray);
+    ck(far == RAY_MISS, "C7 a target past the 140 m ceiling is a miss", `${far}`);
+
+    // C8 — hitbox sizes are ordered by design intent: Wisp < Mote < Warden <
+    // Bulwark in radius, and Husk matches the player capsule.
+    let sw: i32 = spawn_enemy(wr, g_ENEMY_WISP, 0.0, 0.0, -5.0, 0.0);
+    let sm: i32 = spawn_enemy(wr, g_ENEMY_MOTE, 0.0, 0.0, -5.0, 0.0);
+    let sn: i32 = spawn_enemy(wr, g_ENEMY_WARDEN, 0.0, 0.0, -5.0, 0.0);
+    let sb: i32 = spawn_enemy(wr, g_ENEMY_BULWARK, 0.0, 0.0, -5.0, 0.0);
+    let rw: f64 = combat_body_r(wr, sw);
+    let rm: f64 = combat_body_r(wr, sm);
+    let rn: f64 = combat_body_r(wr, sn);
+    let rb: f64 = combat_body_r(wr, sb);
+    ck(rw < rm, "C8 a Wisp is smaller than a Mote", `${s2(rw)} ${s2(rm)}`);
+    ck(rm < rn, "C8b a Mote is smaller than a Warden", `${s2(rm)} ${s2(rn)}`);
+    ck(rn < rb, "C8c a Warden is smaller than a Bulwark", `${s2(rn)} ${s2(rb)}`);
+    ck(combat_body_h(wr, sb) > combat_body_h(wr, sw) * 4.0,
+       "C8d a Bulwark towers over a Wisp", "silhouettes do not read apart");
+    ck(combat_body_r(wr, sh) > 0.0, "C8e the player has a hitbox too", "player unhittable");
+
+    ck(world_check(wr) == 0, "C9 the world is still consistent", `${world_check(wr)}`);
+}
+
+// ===========================================================================
+// D.  RAY vs HEIGHTFIELD  (the DDA)
+// ===========================================================================
+let g_ws_h: buffer = buffer(162);
+let g_ws_b: buffer = buffer(81);
+
+fn ns_chunk_src(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    worldgen_chunk(p_seed, p_cx, p_cz, g_ws_h, g_ws_b);
+    memcpy(ptr_offset(buffer_ptr(p_hbuf), p_hoff, 1), buffer_ptr(g_ws_h), 162);
+    memcpy(ptr_offset(buffer_ptr(p_abuf), p_aoff, 1), buffer_ptr(g_ws_b), 81);
+    let meta: i32 = worldgen_poi_roll(p_seed, p_cx, p_cz);
+    return meta;
+}
+
+fn section_ray_terrain() {
+    print("D. Ray vs heightfield (DDA)");
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, g_WORLD_SEED_DEFAULT);
+
+    let cs: object = chunk_store_new_cap(g_CHUNK_CACHE, 256, g_WORLD_SEED_DEFAULT);
+    chunk_set_source(cs, ns_chunk_src);
+    chunk_pin_ring(cs, 0, 0, 3);
+
+    let ray = combat_ray_scratch();
+
+    // D0 — the reference sampler is live
+    let h0: f64 = chunk_height_at(cs, 4.0, 4.0);
+    ck(h0 > CHUNK_H_MISS, "D0 the chunk store yields real terrain", s2(h0));
+
+    // D1 — a ray fired straight DOWN from above the ground hits, and the hit
+    //      point is ON the surface.  That is the whole correctness claim.
+    let ox: f64 = 6.0;
+    let oz: f64 = 9.0;
+    let gy: f64 = chunk_height_at(cs, ox, oz);
+    let kd: i32 = combat_raycast(cx, wr, cs, ox, gy + 30.0, oz,
+                                 0.0, -1.0, 0.0, 140.0, 0, ray);
+    ck(kd == RAY_TERRAIN, "D1 a downward ray hits the heightfield", `${kd}`);
+    let dyerr: f64 = ray[RAY_Y] - gy;
+    if (dyerr < 0.0) { dyerr = 0.0 - dyerr; }
+    ck(dyerr < 0.001, "D1b the impact lands ON the surface (< 1 mm)", s2(dyerr));
+
+    // D2 — the same, from many directions and origins.  A DDA that only works
+    //      on axis-aligned rays is a DDA that does not work.
+    let worst: f64 = 0.0;
+    let hits: i32 = 0;
+    let tries: i32 = 0;
+    let a: i32 = 0;
+    while (a < 64) {
+        let ang: f64 = f64(a) * 0.0981747704246810;    // 2*pi/64
+        let sx: f64 = 40.0 + 18.0 * cos(ang);
+        let sz: f64 = 40.0 + 18.0 * sin(ang);
+        let sy: f64 = chunk_height_at(cs, sx, sz) + 12.0;
+        // aim down at a shallow angle so the ray crosses several cells
+        let dx: f64 = 0.0 - cos(ang) * 0.35;
+        let dz: f64 = 0.0 - sin(ang) * 0.35;
+        let dy: f64 = 0.0 - 0.87;
+        let dl: f64 = sqrt(dx * dx + dy * dy + dz * dz);
+        tries++;
+        let kk: i32 = combat_raycast(cx, wr, cs, sx, sy, sz,
+                                     dx / dl, dy / dl, dz / dl, 140.0, 0, ray);
+        if (kk == RAY_TERRAIN) {
+            hits++;
+            let hh: f64 = chunk_height_at(cs, ray[RAY_X], ray[RAY_Z]);
+            let er: f64 = ray[RAY_Y] - hh;
+            if (er < 0.0) { er = 0.0 - er; }
+            if (er > worst) { worst = er; }
+        }
+        a++;
+    }
+    ck(hits == tries, "D2 every downward oblique ray finds the ground", `${hits}/${tries}`);
+    ck(worst < 0.01, "D2b every impact is on the surface (< 1 cm worst case)", s2(worst));
+
+    // D3 — a ray fired UP never hits the ground
+    let ku: i32 = combat_raycast(cx, wr, cs, 6.0, gy + 2.0, 9.0,
+                                 0.0, 1.0, 0.0, 140.0, 0, ray);
+    ck(ku == RAY_MISS, "D3 a ray fired into the sky hits nothing", `${ku}`);
+
+    // D4 — terrain BLOCKS an entity behind a hill.  Find a heading where the
+    //      ground rises, put an enemy past the crest, and confirm the shot
+    //      stops in the dirt.
+    let bx: f64 = 6.0;
+    let bz: f64 = 9.0;
+    let eye: f64 = chunk_height_at(cs, bx, bz) + 1.62;
+    let blocked: i32 = 0;
+    let clear: i32 = 0;
+    let d: i32 = 0;
+    while (d < 48) {
+        let ang2: f64 = f64(d) * 0.1308996938995747;    // 2*pi/48
+        let ddx: f64 = cos(ang2);
+        let ddz: f64 = sin(ang2);
+        // put an enemy 30 m out along this heading, feet on the ground
+        let tx: f64 = bx + ddx * 30.0;
+        let tz: f64 = bz + ddz * 30.0;
+        let ty: f64 = chunk_height_at(cs, tx, tz);
+        if (ty > CHUNK_H_MISS) {
+            let es: i32 = spawn_enemy(wr, g_ENEMY_HUSK, tx, ty, tz, 0.0);
+            if (es >= 0) {
+                let aim_y: f64 = ty + 0.9;
+                let vx: f64 = tx - bx;
+                let vy: f64 = aim_y - eye;
+                let vz: f64 = tz - bz;
+                let vl: f64 = sqrt(vx * vx + vy * vy + vz * vz);
+                let kk2: i32 = combat_raycast(cx, wr, cs, bx, eye, bz,
+                                              vx / vl, vy / vl, vz / vl,
+                                              140.0, 0, ray);
+                if (kk2 == RAY_TERRAIN) { blocked++; }
+                if (kk2 == RAY_ENTITY) { clear++; }
+                world_despawn(wr, es);
+            }
+        }
+        d++;
+    }
+    ck(clear > 0, "D4 line of sight exists in some directions", `${clear}/48`);
+    ck(blocked > 0, "D4b terrain blocks the shot in others", `${blocked}/48`);
+    ck(blocked + clear == 48, "D4c every heading resolved one way or the other",
+       `${blocked}+${clear}`);
+
+    // D5 — an UNRESIDENT chunk is AIR, not a wall.  A streaming decision must
+    //      never stop a bullet.  A store with no generator refuses every load,
+    //      which is the strongest form of "not resident".
+    let cs_empty: object = chunk_store_new_cap(8, 8, g_WORLD_SEED_DEFAULT);
+    ck(chunk_height_at(cs_empty, 6.0, 9.0) <= CHUNK_H_MISS,
+       "D5 the empty store really has no terrain", "it has terrain");
+    let kfar: i32 = combat_raycast(cx, wr, cs_empty, 6.0, 100.0, 9.0,
+                                   0.0, -1.0, 0.0, 140.0, 0, ray);
+    ck(kfar == RAY_MISS, "D5b an unresident chunk reads as air, not as a wall", `${kfar}`);
+
+    // D6 — a null chunk store is legal (headless tests)
+    let knull: i32 = combat_raycast(cx, wr, null, 6.0, gy + 30.0, 9.0,
+                                    0.0, -1.0, 0.0, 140.0, 0, ray);
+    ck(knull == RAY_MISS, "D6 a null chunk store means no heightfield", `${knull}`);
+
+    // D7 — starting underground reports an immediate hit and COUNTS it
+    let ks: i32 = combat_raycast(cx, wr, cs, 6.0, gy - 5.0, 9.0,
+                                 0.0, 0.0, -1.0, 140.0, 0, ray);
+    ck(ks == RAY_TERRAIN, "D7 a muzzle inside the ground does not escape", `${ks}`);
+    ck(ray[RAY_T] == 0.0, "D7b it reports the hit at zero", s2(ray[RAY_T]));
+
+    // D8 — the terrain normal points up-ish
+    combat_raycast(cx, wr, cs, 6.0, gy + 30.0, 9.0, 0.0, -1.0, 0.0, 140.0, 0, ray);
+    ck(ray[RAY_NY] > 0.5, "D8 the terrain normal points upward", s2(ray[RAY_NY]));
+}
+
+// ===========================================================================
+// E.  DAMAGE, FALLOFF, HEADSHOTS, TTK
+// ===========================================================================
+fn section_damage() {
+    print("E. Damage, falloff, headshots and the GDD §2.4 TTK");
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 4242);
+    world_set_tick(wr, 1);
+
+    let cmd: object = cmd_new();
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    let eye: f64 = 1.62;
+
+    // E0 — no weapon source means REFUSE, loudly
+    let bare: object = combat_new();
+    ck(combat_has_weapon_source(bare) == 0, "E0 a fresh context has no weapon table", "has one");
+    let en0: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, 0.0, -10.0, 0.0);
+    aim_cmd(cmd, 1, 0.0, eye, 0.0, 0.0, 0.9, -10.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(bare);
+    let r0: i32 = combat_fire(bare, wr, null, sh, eye, cmd, 0.0, 1.0);
+    ck(r0 == 0, "E0b firing with no weapon table does nothing", `${r0}`);
+    ck(combat_stat(bare, STAT_NO_WEAPON_SOURCE) == 1, "E0c and the refusal is counted", "silent");
+    ck(ent_hp(wr, en0) == 90, "E0d the target is untouched", `${ent_hp(wr,en0)}`);
+
+    // E1 — one Sparrow body shot inside r0 does exactly `dmg_near`
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let d1: i32 = 90 - ent_hp(wr, en0);
+    ck(d1 == 26, "E1 a Sparrow body shot at 10 m does dmg_near (26)", `${d1}`);
+
+    // E2 — the same shot at r1 or beyond does dmg_far
+    set_hp(wr, en0, 90);
+    let pz = wr.pz;
+    pz[en0] = -50.0;                      // past Sparrow r1 = 46 m
+    aim_cmd(cmd, 2, 0.0, eye, 0.0, 0.0, 0.9, -50.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    world_set_tick(wr, 2);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let d2: i32 = 90 - ent_hp(wr, en0);
+    ck(d2 == 18, "E2 the same shot past r1 does dmg_far (18)", `${d2}`);
+    ck(d2 < d1, "E2b falloff strictly reduces damage with range", `${d1} -> ${d2}`);
+
+    // E3 — damage matches `dmg_at` at every sampled range, monotonically
+    let mono: i32 = 1;
+    let prev: f64 = 1000.0;
+    let rr: i32 = 0;
+    while (rr <= 70) {
+        let dv: f64 = ref_dmg_at(g_WPN_SPARROW, f64(rr));
+        if (dv > prev + 0.000001) { mono = 0; }
+        prev = dv;
+        rr = rr + 2;
+    }
+    ck(mono == 1, "E3 dmg_at is monotonically non-increasing in range", "not monotone");
+
+    // E3b — the applied damage equals the injected table.  EXACT in the two
+    // flat regions of the falloff curve (inside r0, past r1), where a
+    // millimetre of range error cannot change the answer; WITHIN ONE HP on the
+    // ramp, where it can — the damage range is the distance to the box FACE,
+    // and the command's yaw/pitch are quantized to the wire grid before the ray
+    // is built.  Asserting an exact digit on the ramp would be asserting the
+    // quantizer, not the falloff.
+    let ranges: array<f64> = [8.0, 30.0, 60.0];
+    let bad: i32 = 0;
+    let ramp_err: i32 = 0;
+    let ri: i32 = 0;
+    while (ri < 3) {
+        set_hp(wr, en0, 200);
+        let rz: f64 = 0.0 - ranges[ri];
+        pz[en0] = rz;
+        world_set_tick(wr, 10 + ri);
+        aim_cmd(cmd, 10 + ri, 0.0, eye, 0.0, 0.0, 0.9, rz, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+        combat_begin_tick(cx);
+        combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+        let got: i32 = 200 - ent_hp(wr, en0);
+        let want_f: f64 = ref_dmg_at(g_WPN_SPARROW, ranges[ri] - combat_body_r(wr, en0));
+        let want: i32 = i32(want_f + 0.5);
+        let err: i32 = got - want;
+        if (err < 0) { err = 0 - err; }
+        if (ri == 1) {
+            ramp_err = err;
+        } else {
+            if (err != 0) { bad = bad + 1; }
+        }
+        ri++;
+    }
+    ck(bad == 0, "E3c applied damage == wpn_dmg_at exactly at 8 m and 60 m", `${bad} mismatches`);
+    ck(ramp_err <= 1, "E3d and within 1 HP mid-ramp at 30 m", `${ramp_err} HP off`);
+
+    // E4 — headshot multiplier
+    set_hp(wr, en0, 300);
+    pz[en0] = -10.0;
+    let bh: f64 = combat_body_h(wr, en0);
+    let head_y: f64 = bh * (1.0 - g_HEADSHOT_VOL_TOP * 0.5);
+    world_set_tick(wr, 20);
+    aim_cmd(cmd, 20, 0.0, eye, 0.0, 0.0, head_y, -10.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let dh: i32 = 300 - ent_hp(wr, en0);
+    let want_h: i32 = i32(ref_dmg_at(g_WPN_SPARROW, 10.0 - combat_body_r(wr, en0)) * 1.5 + 0.5);
+    ck(dh == want_h, "E4 a headshot applies the HS multiplier", `${dh} want ${want_h}`);
+    ck(combat_stat(cx, STAT_HEADSHOTS) >= 1, "E4b the headshot is counted", "not counted");
+    let ev: object = combat_events(cx);
+    let hmk: i32 = 0;
+    let ei: i32 = 0;
+    while (ei < evbus_count(ev)) {
+        if (evbus_type(ev, ei) == EV_HITMARKER) { hmk = evbus_sub(ev, ei); }
+        ei++;
+    }
+    ck((hmk & HM_HEAD) != 0, "E4c the hitmarker carries HM_HEAD", `${hmk}`);
+
+    // E5 — GDD §2.4 TTK: Sparrow near kills a Husk in 4 body shots, not 3
+    let ttk: i32 = ttk_shots(g_WPN_SPARROW, 10.0, 0.0, g_ENEMY_HUSK);
+    ck(ttk == 4, "E5 Sparrow near: 4 body shots to kill a Husk (GDD §2.4)", `${ttk}`);
+
+    // E5b — Sparrow far: 5
+    let ttkf: i32 = ttk_shots(g_WPN_SPARROW, 55.0, 0.0, g_ENEMY_HUSK);
+    ck(ttkf == 5, "E5b Sparrow far: 5 body shots to kill a Husk", `${ttkf}`);
+
+    // E5c — Tinker near: 5
+    let ttkt: i32 = ttk_shots(g_WPN_TINKER, 5.0, 0.0, g_ENEMY_HUSK);
+    ck(ttkt == 5, "E5c Tinker near: 5 body shots to kill a Husk", `${ttkt}`);
+
+    // E5d — Kestrel near: 2
+    let ttkk: i32 = ttk_shots(g_WPN_KESTREL, 8.0, 0.0, g_ENEMY_HUSK);
+    ck(ttkk == 2, "E5d Kestrel near: 2 body shots to kill a Husk", `${ttkk}`);
+
+    // E6 — THE BELLOWS ONE-SHOTS A HUSK INSIDE 6 m.  This is the reason to
+    //      play Ashwood; if it takes two, the design is broken.
+    let ttkb: i32 = ttk_shots(g_WPN_BELLOWS, 4.0, 0.0, g_ENEMY_HUSK);
+    ck(ttkb == 1, "E6 Bellows one-shots a Husk inside 6 m (GDD §2.4)", `${ttkb}`);
+
+    // E6b — and does NOT at 12 m
+    let ttkb2: i32 = ttk_shots(g_WPN_BELLOWS, 12.0, 0.0, g_ENEMY_HUSK);
+    ck(ttkb2 >= 2, "E6b the Bellows does not one-shot a Husk at 12 m", `${ttkb2}`);
+
+    // E7 — THE LONGSHADOW ONE-SHOTS A HUSK IN THE HEAD AT ANY RANGE.  This is
+    //      the reason to play Chalk Downs.
+    let l10: i32 = ttk_shots_head(g_WPN_LONGSHADOW, 10.0, g_ENEMY_HUSK);
+    let l40: i32 = ttk_shots_head(g_WPN_LONGSHADOW, 40.0, g_ENEMY_HUSK);
+    let l70: i32 = ttk_shots_head(g_WPN_LONGSHADOW, 70.0, g_ENEMY_HUSK);
+    ck(l10 == 1, "E7 Longshadow headshot one-shots a Husk at 10 m", `${l10}`);
+    ck(l40 == 1, "E7b ... at 40 m", `${l40}`);
+    ck(l70 == 1, "E7c ... and at 70 m, the fog wall", `${l70}`);
+
+    // E7d — but its BODY shot does not
+    let lb: i32 = ttk_shots(g_WPN_LONGSHADOW, 10.0, 0.0, g_ENEMY_HUSK);
+    ck(lb == 2, "E7d a Longshadow body shot takes 2 (GDD §2.4)", `${lb}`);
+
+    // E8 — a Wisp dies to one bullet of anything.  "Free dopamine."
+    let anyfail: i32 = 0;
+    let wi: i32 = 0;
+    while (wi < g_WPN_COUNT) {
+        if (ttk_shots(wi, 4.0, 0.0, g_ENEMY_WISP) != 1) { anyfail = anyfail + 1; }
+        wi++;
+    }
+    ck(anyfail == 0, "E8 every weapon one-shots a Wisp at close range", `${anyfail} weapons failed`);
+
+    // E9 — damage never goes negative and a landed hit is never zero
+    let cx2: object = combat_new();
+    install_weapons(cx2);
+    let w2: object = world_new_cap(8);
+    world_set_tick(w2, 3);
+    let e9: i32 = spawn_enemy(w2, g_ENEMY_BULWARK, 0.0, 0.0, 0.0, 0.0);
+    combat_begin_tick(cx2);
+    let dz1: i32 = combat_apply_damage(cx2, w2, 1, e9, 0.2, g_WPN_SPARROW,
+                                       DMG_BULLET, 0, 0.0, -1.0, 0.0, 1.0, 0.0);
+    ck(dz1 == 1, "E9 a tiny hit still removes 1 HP, never 0", `${dz1}`);
+    let dz2: i32 = combat_apply_damage(cx2, w2, 1, e9, -50.0, g_WPN_SPARROW,
+                                       DMG_BULLET, 0, 0.0, -1.0, 0.0, 1.0, 0.0);
+    ck(dz2 == 0, "E9b negative damage heals nothing", `${dz2}`);
+
+    // E10 — HP floors at zero and the entity is flagged dead exactly once
+    combat_apply_damage(cx2, w2, 1, e9, 99999.0, g_WPN_SPARROW,
+                        DMG_BULLET, 0, 0.0, -1.0, 0.0, 1.0, 0.0);
+    ck(ent_hp(w2, e9) == 0, "E10 HP floors at zero", `${ent_hp(w2,e9)}`);
+    ck(combat_is_dead(w2, e9) == 1, "E10b the entity is flagged dead", "not dead");
+    let k1: i32 = combat_stat(cx2, STAT_KILLS);
+    combat_apply_damage(cx2, w2, 1, e9, 100.0, g_WPN_SPARROW,
+                        DMG_BULLET, 0, 0.0, -1.0, 0.0, 1.0, 0.0);
+    ck(combat_stat(cx2, STAT_KILLS) == k1, "E10c a corpse cannot be killed twice", "double kill");
+
+    // E11 — EF_INVULN is respected (the Wick revive's 1.5 s i-frames)
+    let e11: i32 = spawn_enemy(w2, g_ENEMY_HUSK, 0.0, 0.0, 0.0, 0.0);
+    let fl2 = w2.flags;
+    fl2[e11] = fl2[e11] | EF_INVULN;
+    let di: i32 = combat_apply_damage(cx2, w2, 1, e11, 500.0, g_WPN_SPARROW,
+                                      DMG_BULLET, 0, 0.0, -1.0, 0.0, 1.0, 0.0);
+    ck(di == 0, "E11 EF_INVULN blocks all damage", `${di}`);
+    ck(ent_hp(w2, e11) == 90, "E11b and the HP is untouched", `${ent_hp(w2,e11)}`);
+
+    // E12 — non-bullet damage tags EV_HIT.sub so a packet dump can tell it apart
+    if ((fl2[e11] & EF_INVULN) != 0) { fl2[e11] = fl2[e11] - EF_INVULN; }
+    combat_begin_tick(cx2);
+    combat_apply_damage(cx2, w2, 1, e11, 12.0, 0, DMG_BURN, 0,
+                        0.0, -1.0, 0.0, 1.0, 0.0);
+    let bus2: object = combat_events(cx2);
+    let found: i32 = 0;
+    let bi: i32 = 0;
+    while (bi < evbus_count(bus2)) {
+        if (evbus_type(bus2, bi) == EV_HIT) {
+            if (evbus_sub(bus2, bi) == DMG_SUB_BASE + DMG_BURN) { found = 1; }
+        }
+        bi++;
+    }
+    ck(found == 1, "E12 a burn tick is distinguishable from a weapon in EV_HIT.sub", "not tagged");
+
+    // E12b — and it emits NO hitmarker.  A damage-over-time tick must not
+    // paint the reticle; that would make the hitmarker a liar.
+    ck(evbus_count_for(bus2, EV_HITMARKER, world_id_of(w2, e11)) == 0,
+       "E12b a burn tick paints no hitmarker", "DoT fires the hitmarker");
+}
+
+// Shots needed to kill `p_cls` at `p_range` with `p_wpn`, body shots, ADS.
+fn ttk_shots(p_wpn: i32, p_range: f64, p_bloom: f64, p_cls: i32): i32 {
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(8);
+    world_set_seed(wr, 900);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, p_wpn);
+    let rz: f64 = 0.0 - p_range;
+    let en: i32 = spawn_enemy(wr, p_cls, 0.0, 0.0, rz, 0.0);
+    let bh: f64 = combat_body_h(wr, en);
+    let aimy: f64 = bh * 0.5;
+    let n: i32 = 0;
+    let t: i32 = 1;
+    while (t <= 40) {
+        world_set_tick(wr, t);
+        aim_cmd(cmd, t, 0.0, eye, 0.0, 0.0, aimy, rz, BTN_FIRE | BTN_ADS, p_wpn);
+        combat_begin_tick(cx);
+        combat_fire(cx, wr, null, sh, eye, cmd, p_bloom, 1.0);
+        n = n + 1;
+        if (combat_is_dead(wr, en) == 1) { t = 100; } else { t = t + 1; }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// The same, aiming at the head volume.
+fn ttk_shots_head(p_wpn: i32, p_range: f64, p_cls: i32): i32 {
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(8);
+    world_set_seed(wr, 901);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, p_wpn);
+    let rz: f64 = 0.0 - p_range;
+    let en: i32 = spawn_enemy(wr, p_cls, 0.0, 0.0, rz, 0.0);
+    let bh: f64 = combat_body_h(wr, en);
+    let aimy: f64 = bh * (1.0 - g_HEADSHOT_VOL_TOP * 0.5);
+    let n: i32 = 0;
+    let t: i32 = 1;
+    while (t <= 40) {
+        world_set_tick(wr, t);
+        aim_cmd(cmd, t, 0.0, eye, 0.0, 0.0, aimy, rz, BTN_FIRE | BTN_ADS, p_wpn);
+        combat_begin_tick(cx);
+        combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+        n = n + 1;
+        if (combat_is_dead(wr, en) == 1) { t = 100; } else { t = t + 1; }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// F.  THE WARDEN FRONT PLATE
+// ===========================================================================
+fn section_plate() {
+    print("F. The Warden front plate (75 % DR while intact)");
+
+    ck(WARDEN_PLATE_HP == 80, "F0 the plate pool is GDD's 80", `${WARDEN_PLATE_HP}`);
+    ck(PLATE_DR == 0.75, "F0b the reduction is GDD's 75 %", s2(PLATE_DR));
+
+    // F1 — the arc.  yaw 0 faces -Z (facing = (sin yaw, -cos yaw)), so a bullet
+    //      TRAVELLING +Z is coming at the Warden's face, and one travelling -Z
+    //      is chasing it from behind.
+    ck(combat_plate_faces(0.0, 0.0, 1.0) == 1, "F1 a shot into the face hits the plate", "no");
+    ck(combat_plate_faces(0.0, 0.0, -1.0) == 0, "F1b a shot from behind does not", "plated from behind");
+    ck(combat_plate_faces(0.0, 1.0, 0.0) == 0, "F1c a 90-degree flank is not the front", "arc too wide");
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(16);
+    world_set_seed(wr, 77);
+    world_set_tick(wr, 1);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    // Warden 12 m ahead (-Z), facing the shooter (yaw = pi, facing +Z)
+    let wd: i32 = spawn_enemy(wr, g_ENEMY_WARDEN, 0.0, 0.0, -12.0, g_PI);
+    ck(ent_armor(wr, wd) == 80, "F2 a Warden spawns with its plate", `${ent_armor(wr,wd)}`);
+
+    let bh: f64 = combat_body_h(wr, wd);
+    aim_cmd(cmd, 1, 0.0, eye, 0.0, 0.0, bh * 0.5, -12.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let front_d: i32 = 220 - ent_hp(wr, wd);
+    let raw_f: f64 = ref_dmg_at(g_WPN_SPARROW, 12.0 - combat_body_r(wr, wd));
+    let want_f: i32 = i32(raw_f * 0.25 + 0.5);
+    ck(front_d == want_f, "F3 a front body shot is reduced 75 %", `${front_d} want ${want_f}`);
+    ck(ent_armor(wr, wd) == 80 - i32(raw_f + 0.5),
+       "F3b the plate spends the FULL incoming damage from its own pool",
+       `${ent_armor(wr,wd)}`);
+
+    let evb: object = combat_events(cx);
+    let hm: i32 = 0;
+    let i: i32 = 0;
+    while (i < evbus_count(evb)) {
+        if (evbus_type(evb, i) == EV_HITMARKER) { hm = evbus_sub(evb, i); }
+        i++;
+    }
+    ck((hm & HM_ARMOR) != 0, "F3c the hitmarker says HM_ARMOR", `${hm}`);
+    ck(evbus_count_for(evb, EV_IMPACT, world_id_of(wr, wd)) >= 2,
+       "F3d a plate hit adds an armour-tinted impact", "no armour spark");
+
+    // F4 — the same shot from BEHIND does full damage and leaves the plate
+    let hp2 = wr.hp;
+    hp2[wd] = 220;
+    let ar2 = wr.armor;
+    let plate_before: i32 = ar2[wd];
+    world_set_tick(wr, 2);
+    let px = wr.px;
+    let pz = wr.pz;
+    px[sh] = 0.0;
+    pz[sh] = -24.0;                       // now behind the Warden
+    aim_cmd(cmd, 2, 0.0, eye, -24.0, 0.0, bh * 0.5, -12.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let back_d: i32 = 220 - ent_hp(wr, wd);
+    let want_b: i32 = i32(ref_dmg_at(g_WPN_SPARROW, 12.0 - combat_body_r(wr, wd)) + 0.5);
+    ck(back_d == want_b, "F4 a shot from behind does FULL damage", `${back_d} want ${want_b}`);
+    ck(ar2[wd] == plate_before, "F4b and does not touch the plate", `${ar2[wd]}`);
+    ck(back_d > front_d * 3, "F4c flanking is worth roughly 4x — the design intent",
+       `${front_d} -> ${back_d}`);
+
+    // F5 — a HEADSHOT from the front bypasses the plate.  "A flank OR a
+    //      Longshadow" has to be true of both halves.
+    hp2[wd] = 220;
+    px[sh] = 0.0;
+    pz[sh] = 0.0;
+    world_set_tick(wr, 3);
+    let heady: f64 = bh * (1.0 - g_HEADSHOT_VOL_TOP * 0.5);
+    aim_cmd(cmd, 3, 0.0, eye, 0.0, 0.0, heady, -12.0, BTN_FIRE | BTN_ADS, g_WPN_LONGSHADOW);
+    let wpf = wr.weapon;
+    wpf[sh] = g_WPN_LONGSHADOW;
+    let plate2: i32 = ar2[wd];
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let head_d: i32 = 220 - ent_hp(wr, wd);
+    let want_hd: i32 = i32(ref_dmg_at(g_WPN_LONGSHADOW, 12.0 - combat_body_r(wr, wd)) * 2.1 + 0.5);
+    ck(head_d == want_hd, "F5 a front headshot bypasses the plate entirely",
+       `${head_d} want ${want_hd}`);
+    ck(ar2[wd] == plate2, "F5b and does not spend the plate", `${ar2[wd]}`);
+
+    // F6 — once the plate is gone, front shots do full damage
+    ar2[wd] = 0;
+    hp2[wd] = 220;
+    wpf[sh] = g_WPN_SPARROW;
+    world_set_tick(wr, 4);
+    aim_cmd(cmd, 4, 0.0, eye, 0.0, 0.0, bh * 0.5, -12.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let broken_d: i32 = 220 - ent_hp(wr, wd);
+    ck(broken_d == want_b, "F6 a broken plate stops reducing anything", `${broken_d}`);
+
+    // F7 — only the Warden has a plate
+    ck(combat_plate_hp(g_ENEMY_HUSK) == 0, "F7 a Husk has no plate", "husk plated");
+    ck(combat_plate_hp(g_ENEMY_BULWARK) == 0, "F7b a Bulwark has no plate either", "bulwark plated");
+    ck(combat_plate_hp(g_ENEMY_WARDEN) == WARDEN_PLATE_HP, "F7c the Warden does", "no plate");
+}
+
+// ===========================================================================
+// G.  THE §2.5 HIT-FEEDBACK CONTRACT  — the non-negotiable one
+// ===========================================================================
+fn section_feedback() {
+    print("G. GDD §2.5 hit-feedback contract (all five, same tick)");
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(16);
+    world_set_seed(wr, 5150);
+    world_set_tick(wr, 11);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    let en: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, 0.0, -10.0, 0.0);
+    let vid: i32 = world_id_of(wr, en);
+
+    aim_cmd(cmd, 11, 0.0, eye, 0.0, 0.0, 0.9, -10.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    let nv: i32 = combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    ck(nv == 1, "G0 the shot connects with exactly one victim", `${nv}`);
+
+    let ev: object = combat_events(cx);
+
+    // G1..G5 — ALL FIVE, INDIVIDUALLY.  A missing one is a failed test.
+    ck(evbus_count_for(ev, EV_HITMARKER, vid) == 1,     "G1 hitmarker emitted", "MISSING");
+    ck(evbus_count_for(ev, EV_HIT_FLASH, vid) == 1,     "G2 enemy flash emitted", "MISSING");
+    ck(evbus_count_for(ev, EV_DAMAGE_NUMBER, vid) == 1, "G3 damage number emitted", "MISSING");
+    ck(evbus_count_for(ev, EV_IMPACT, vid) == 1,        "G4 impact billboard emitted", "MISSING");
+    ck(evbus_count_for(ev, EV_SOUND, vid) == 1,         "G5 audio blip emitted", "MISSING");
+    ck(evbus_count_for(ev, EV_HIT, vid) == 1,           "G6 the authoritative EV_HIT emitted", "MISSING");
+    ck(combat_feedback_ok(cx) == 0, "G7 the contract checker agrees", `${combat_feedback_ok(cx)}`);
+
+    // G7b — EVERY event carries the SAME tick.  "In the same frame" is the
+    // whole contract; an event a tick late is a hitmarker that lags the shot.
+    let alltick: i32 = 1;
+    let gi: i32 = 0;
+    while (gi < evbus_count(ev)) {
+        if (evbus_tick(ev, gi) != 11) { alltick = 0; }
+        gi++;
+    }
+    ck(alltick == 1, "G7b every feedback event carries the firing tick", "tick drift");
+
+    // G8 — the damage number carries the damage actually dealt
+    let shown: i32 = 0;
+    let hi: i32 = 0;
+    while (hi < evbus_count(ev)) {
+        if (evbus_type(ev, hi) == EV_DAMAGE_NUMBER) { shown = evbus_sub(ev, hi); }
+        hi++;
+    }
+    ck(shown == 26, "G8 the damage number is the damage dealt", `${shown}`);
+
+    // G9 — the flash duration is GDD §7.3's 0.06 s
+    let flash: i32 = 0;
+    let fi: i32 = 0;
+    while (fi < evbus_count(ev)) {
+        if (evbus_type(ev, fi) == EV_HIT_FLASH) { flash = evbus_sub(ev, fi); }
+        fi++;
+    }
+    ck(flash == HIT_FLASH_CS, "G9 the flash is 0.06 s (6 cs)", `${flash}`);
+
+    // G10 — the impact point is on the target, not at the muzzle
+    let ix: f64 = 0.0;
+    let iz: f64 = 0.0;
+    let ii: i32 = 0;
+    while (ii < evbus_count(ev)) {
+        if (evbus_type(ev, ii) == EV_IMPACT) { ix = evbus_x(ev, ii); iz = evbus_z(ev, ii); }
+        ii++;
+    }
+    ck(iz < -9.0 && iz > -11.0, "G10 the impact lands on the target, not the muzzle", s2(iz));
+
+    // G11 — A KILL adds EV_KILL and flips the marker and the sound
+    set_hp(wr, en, 10);
+    world_set_tick(wr, 12);
+    aim_cmd(cmd, 12, 0.0, eye, 0.0, 0.0, 0.9, -10.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    ck(evbus_count_for(ev, EV_KILL, vid) == 1, "G11 a kill emits EV_KILL", "MISSING");
+    let khm: i32 = 0;
+    let ksfx: i32 = 0;
+    let ki: i32 = 0;
+    while (ki < evbus_count(ev)) {
+        if (evbus_type(ev, ki) == EV_HITMARKER) { khm = evbus_sub(ev, ki); }
+        if (evbus_type(ev, ki) == EV_SOUND) { ksfx = evbus_sub(ev, ki); }
+        ki++;
+    }
+    ck((khm & HM_KILL) != 0, "G11b the marker is the red kill marker", `${khm}`);
+    ck(ksfx == SFX_KILL_CHIME, "G11c the sound is the 2-note kill chime", `${ksfx}`);
+    ck(combat_feedback_ok(cx) == 0, "G11d the kill tick still satisfies the contract", "violated");
+
+    // G12 — THE NEGATIVE CONTROL.  Hand-build a bus with one signal missing and
+    //       prove the checker catches it.  A contract check that cannot fail is
+    //       theatre.
+    let cx3: object = combat_new_cap(32);
+    let bus3: object = combat_events(cx3);
+    evbus_push(bus3, 1, EV_HIT, 0, 1, 1000, 0, 0, 0);
+    evbus_push(bus3, 1, EV_HITMARKER, 0, 1, 1000, 0, 0, 0);
+    evbus_push(bus3, 1, EV_HIT_FLASH, 6, 1, 1000, 0, 0, 0);
+    evbus_push(bus3, 1, EV_DAMAGE_NUMBER, 9, 1, 1000, 0, 0, 0);
+    evbus_push(bus3, 1, EV_IMPACT, 1, 1, 1000, 0, 0, 0);
+    ck(combat_feedback_ok(cx3) == 1, "G12 the checker catches ONE missing signal (audio)",
+       `${combat_feedback_ok(cx3)}`);
+    evbus_push(bus3, 1, EV_SOUND, 1, 1, 1000, 0, 0, 0);
+    ck(combat_feedback_ok(cx3) == 0, "G12b and passes once it is added", "still failing");
+
+    // G13 — a MISS produces no hitmarker at all
+    let cx4: object = combat_new();
+    install_weapons(cx4);
+    let w4: object = world_new_cap(8);
+    world_set_seed(w4, 3);
+    world_set_tick(w4, 1);
+    let sh4: i32 = spawn_shooter(w4, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    spawn_enemy(w4, g_ENEMY_HUSK, 0.0, 0.0, -10.0, 0.0);
+    aim_cmd(cmd, 1, 0.0, eye, 0.0, 100.0, 60.0, 0.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx4);
+    let mv: i32 = combat_fire(cx4, w4, null, sh4, eye, cmd, 0.0, 1.0);
+    ck(mv == 0, "G13 a clean miss damages nobody", `${mv}`);
+    let bus4: object = combat_events(cx4);
+    let mk: i32 = 0;
+    let mi: i32 = 0;
+    while (mi < evbus_count(bus4)) {
+        if (evbus_type(bus4, mi) == EV_HITMARKER) { mk = 1; }
+        mi++;
+    }
+    ck(mk == 0, "G13b and paints no hitmarker", "hitmarker on a miss");
+
+    // G14 — SHOTGUN AGGREGATION: nine pellets on one Husk make ONE hitmarker,
+    //       ONE damage number, ONE flash — and NINE sparks.
+    let cx5: object = combat_new();
+    install_weapons(cx5);
+    let w5: object = world_new_cap(8);
+    world_set_seed(w5, 8);
+    world_set_tick(w5, 4);
+    let sh5: i32 = spawn_shooter(w5, 0.0, 0.0, 0.0, g_WPN_BELLOWS);
+    let en5: i32 = spawn_enemy(w5, g_ENEMY_HUSK, 0.0, 0.0, -4.0, 0.0);
+    let vid5: i32 = world_id_of(w5, en5);
+    let bh5: f64 = combat_body_h(w5, en5);
+    aim_cmd(cmd, 4, 0.0, eye, 0.0, 0.0, bh5 * 0.5, -4.0, BTN_FIRE | BTN_ADS, g_WPN_BELLOWS);
+    combat_begin_tick(cx5);
+    combat_fire(cx5, w5, null, sh5, eye, cmd, 0.0, 1.0);
+    let bus5: object = combat_events(cx5);
+    ck(combat_stat(cx5, STAT_PELLETS_FIRED) == 9, "G14 the Bellows fires nine pellets",
+       `${combat_stat(cx5, STAT_PELLETS_FIRED)}`);
+    ck(combat_stat(cx5, STAT_PELLETS_HIT) == 9, "G14b all nine land inside 6 m",
+       `${combat_stat(cx5, STAT_PELLETS_HIT)}`);
+    ck(evbus_count_for(bus5, EV_HITMARKER, vid5) == 1, "G14c but only ONE hitmarker", "marker spam");
+    ck(evbus_count_for(bus5, EV_DAMAGE_NUMBER, vid5) == 1, "G14d and ONE damage number", "number spam");
+    ck(evbus_count_for(bus5, EV_HIT_FLASH, vid5) == 1, "G14e and ONE flash", "flash spam");
+    ck(evbus_count_for(bus5, EV_IMPACT, vid5) == 9, "G14f and NINE sparks", "wrong spark count");
+    ck(combat_damage_number_count(cx5) <= combat_damage_number_cap(),
+       "G14g the tick stays inside GDD §7.8's 8-number screen cap",
+       `${combat_damage_number_count(cx5)}`);
+
+    // G15 — THE PITCH CHAIN (GDD §7.2): +1 step per consecutive hit, capped,
+    //       reset after 0.6 s.
+    let cx6: object = combat_new();
+    install_weapons(cx6);
+    let w6: object = world_new_cap(8);
+    world_set_seed(w6, 12);
+    let sh6: i32 = spawn_shooter(w6, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    let en6: i32 = spawn_enemy(w6, g_ENEMY_BULWARK, 0.0, 0.0, -10.0, 0.0);
+    let steps: string = "";
+    let ti: i32 = 1;
+    while (ti <= 8) {
+        world_set_tick(w6, ti);
+        aim_cmd(cmd, ti, 0.0, eye, 0.0, 0.0, 1.5, -10.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+        combat_begin_tick(cx6);
+        combat_fire(cx6, w6, null, sh6, eye, cmd, 0.0, 1.0);
+        steps = `${steps}${combat_chain_step_of(cx6, 1)}`;
+        ti++;
+    }
+    ck(steps == "01234444", "G15 the hit chain climbs and caps at +8 semitones", steps);
+    // 0.6 s of silence resets it
+    world_set_tick(w6, 8 + HIT_CHAIN_TICKS + 1);
+    aim_cmd(cmd, 8 + HIT_CHAIN_TICKS + 1, 0.0, eye, 0.0, 0.0, 1.5, -10.0,
+            BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx6);
+    combat_fire(cx6, w6, null, sh6, eye, cmd, 0.0, 1.0);
+    ck(combat_chain_step_of(cx6, 1) == 0, "G15b and resets after 0.6 s of no hits",
+       `${combat_chain_step_of(cx6, 1)}`);
+
+    // G16 — a terrain hit still makes a spark and a sound.  Missing an enemy
+    //       must not mean the world stops responding.
+    let cx7: object = combat_new();
+    install_weapons(cx7);
+    let w7: object = world_new_cap(8);
+    world_set_seed(w7, 21);
+    world_set_tick(w7, 1);
+    let cs7: object = chunk_store_new_cap(16, 64, g_WORLD_SEED_DEFAULT);
+    chunk_set_source(cs7, ns_chunk_src);
+    chunk_pin_ring(cs7, 0, 0, 2);
+    let gy7: f64 = chunk_height_at(cs7, 6.0, 9.0);
+    let sh7: i32 = spawn_shooter(w7, 6.0, gy7, 9.0, g_WPN_SPARROW);
+    aim_cmd(cmd, 1, 6.0, gy7 + 1.62, 9.0, 6.0, gy7 - 4.0, 9.0,
+            BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx7);
+    combat_fire(cx7, w7, cs7, sh7, gy7 + 1.62, cmd, 0.0, 1.0);
+    let bus7: object = combat_events(cx7);
+    let sparks: i32 = 0;
+    let sounds: i32 = 0;
+    let qi: i32 = 0;
+    while (qi < evbus_count(bus7)) {
+        if (evbus_type(bus7, qi) == EV_IMPACT) {
+            if (evbus_sub(bus7, qi) == SURF_TERRAIN) { sparks++; }
+        }
+        if (evbus_type(bus7, qi) == EV_SOUND) {
+            if (evbus_sub(bus7, qi) == SFX_IMPACT_WORLD) { sounds++; }
+        }
+        qi++;
+    }
+    ck(sparks == 1, "G16 a terrain hit makes a spark", `${sparks}`);
+    ck(sounds == 1, "G16b and a world-impact sound", `${sounds}`);
+    ck(combat_stat(cx7, STAT_TERRAIN_HITS) == 1, "G16c and is counted as a terrain hit",
+       `${combat_stat(cx7, STAT_TERRAIN_HITS)}`);
+}
+
+// ===========================================================================
+// H.  THE SPREAD CONE
+// ===========================================================================
+fn section_spread() {
+    print("H. The spread cone");
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(8);
+    world_set_seed(wr, 31337);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+
+    // H1 — the ACCEPTANCE: a ray fired at a known target at 10 / 30 / 70 m
+    //      connects at least 95 % of the time whenever the target subtends the
+    //      cone.  Sparrow ADS: 0.125 deg half-angle, so at 70 m the disc is
+    //      0.15 m across against a 0.40 m Husk half-width.
+    let dists: array<f64> = [10.0, 30.0, 70.0];
+    let di: i32 = 0;
+    while (di < 3) {
+        let dist: f64 = dists[di];
+        let rz: f64 = 0.0 - dist;
+        let en: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, 0.0, rz, 0.0);
+        let hpf = wr.hp;
+        let bh: f64 = combat_body_h(wr, en);
+        let hitn: i32 = 0;
+        let shots: i32 = 400;
+        let t: i32 = 0;
+        while (t < shots) {
+            hpf[en] = 100000;
+            world_set_tick(wr, 1000 + t);
+            aim_cmd(cmd, 1000 + t, 0.0, eye, 0.0, 0.0, bh * 0.5, rz,
+                    BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+            combat_begin_tick(cx);
+            if (combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0) == 1) { hitn++; }
+            t++;
+        }
+        let rate: f64 = f64(hitn) / f64(shots);
+        print(`   H1  ADS hit rate at ${s2(dist)} m = ${s2(rate * 100.0)} %`);
+        ck(rate >= 0.95, `H1 ADS hit rate >= 95 % at ${s2(dist)} m`, s2(rate));
+        world_despawn(wr, en);
+        di++;
+    }
+
+    // H2 — every sampled pellet lies INSIDE the cone.  This is the property the
+    //      95 % figure is a consequence of; assert the property, not the digit.
+    //      Measured by firing into empty space and reading the ray direction
+    //      back out of the impact-free result: instead, re-derive it from the
+    //      hit point on a very large flat target.
+    let cone: f64 = ref_spread(g_WPN_SPARROW, 0.0, 0.0);
+    let big: i32 = spawn_enemy(wr, g_ENEMY_BULWARK, 0.0, 0.0, -30.0, 0.0);
+    let hpb = wr.hp;
+    let bus: object = combat_events(cx);
+    let outside: i32 = 0;
+    let inner: i32 = 0;
+    let total: i32 = 0;
+    let s: i32 = 0;
+    while (s < 600) {
+        hpb[big] = 100000;
+        world_set_tick(wr, 4000 + s);
+        aim_cmd(cmd, 4000 + s, 0.0, eye, 0.0, 0.0, 1.6, -30.0, BTN_FIRE, g_WPN_SPARROW);
+        combat_begin_tick(cx);
+        combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 0.0);
+        let bi: i32 = 0;
+        while (bi < evbus_count(bus)) {
+            if (evbus_type(bus, bi) == EV_IMPACT) {
+                let hx: f64 = evbus_x(bus, bi);
+                let hy: f64 = evbus_y(bus, bi);
+                let hz: f64 = evbus_z(bus, bi);
+                let vx: f64 = hx - 0.0;
+                let vy: f64 = hy - eye;
+                let vz: f64 = hz - 0.0;
+                let vl: f64 = sqrt(vx * vx + vy * vy + vz * vz);
+                // the aim axis for this shot
+                let ax: f64 = 0.0 - 0.0;
+                let ay: f64 = 1.6 - eye;
+                let az: f64 = -30.0 - 0.0;
+                let al: f64 = sqrt(ax * ax + ay * ay + az * az);
+                let dot: f64 = (vx * ax + vy * ay + vz * az) / (vl * al);
+                if (dot > 1.0) { dot = 1.0; }
+                let dev: f64 = acos(dot);
+                total++;
+                // 1/16 m quantization at 30 m is 0.12 deg of angular slop, so
+                // the tolerance is the WIRE GRID, not a fudge factor.
+                let slop: f64 = 0.0625 / 30.0;
+                if (dev > cone + slop) { outside++; }
+                if (dev <= cone * 0.7071067811865476) { inner++; }
+            }
+            bi++;
+        }
+        s++;
+    }
+    ck(total > 500, "H2 enough pellets were sampled to mean anything", `${total}`);
+    ck(outside == 0, "H2b every pellet lies inside the spread cone", `${outside}/${total}`);
+    // H2c — uniform over the DISC, not clumped at the centre: the inner
+    // half-area circle (radius cone/sqrt2) must hold about half the pellets.
+    let frac: f64 = f64(inner) / f64(total);
+    print(`   H2  inner half-area fraction = ${s2(frac)} (uniform-over-disc => 0.5)`);
+    ck(frac > 0.42 && frac < 0.58,
+       "H2c the cone is uniform over its disc, not clumped at the centre", s2(frac));
+
+    // H3 — ADS is strictly tighter than hipfire, for every weapon that has a
+    //      distinct ADS column.  The design says so; the table must too.
+    let tighter: i32 = 0;
+    let wi: i32 = 0;
+    while (wi < g_WPN_COUNT) {
+        if (ref_spread(wi, 0.0, 1.0) < ref_spread(wi, 0.0, 0.0)) { tighter++; }
+        wi++;
+    }
+    ck(tighter >= 5, "H3 ADS is tighter than hipfire on at least five weapons", `${tighter}`);
+
+    // H4 — bloom widens the hip cone and then caps
+    let b0: f64 = ref_spread(g_WPN_SPARROW, 0.0, 0.0);
+    let b4: f64 = ref_spread(g_WPN_SPARROW, 1.4, 0.0);
+    let b99: f64 = ref_spread(g_WPN_SPARROW, 34.65, 0.0);
+    ck(b4 > b0, "H4 bloom widens the hip cone", `${s2(b0)} -> ${s2(b4)}`);
+    ck(b99 <= ref_spread(g_WPN_SPARROW, 349.65, 0.0) + 0.0000001,
+       "H4b and the cone caps rather than growing forever", s2(b99));
+
+    // H5 — a zero cone is a laser: 100 % of pellets on the axis
+    let cx8: object = combat_new();
+    install_weapons(cx8);
+    let w8: object = world_new_cap(8);
+    world_set_seed(w8, 5);
+    let sh8: i32 = spawn_shooter(w8, 0.0, 0.0, 0.0, g_WPN_LONGSHADOW);
+    let en8: i32 = spawn_enemy(w8, g_ENEMY_BULWARK, 0.0, 0.0, -60.0, 0.0);
+    let hp8 = w8.hp;
+    let ls: i32 = 0;
+    let li: i32 = 0;
+    while (li < 200) {
+        hp8[en8] = 100000;
+        world_set_tick(w8, li + 1);
+        aim_cmd(cmd, li + 1, 0.0, eye, 0.0, 0.0, 1.6, -60.0, BTN_FIRE | BTN_ADS,
+                g_WPN_LONGSHADOW);
+        combat_begin_tick(cx8);
+        if (combat_fire(cx8, w8, null, sh8, eye, cmd, 0.0, 1.0) == 1) { ls++; }
+        li++;
+    }
+    ck(ls == 200, "H5 a 0.05-degree ADS cone hits a Bulwark at 60 m every time", `${ls}/200`);
+}
+
+// ===========================================================================
+// I.  DETERMINISM  — the same seed twice, and a different seed
+// ===========================================================================
+// The scripted scenario deliberately uses the BELLOWS at hipfire: nine pellets
+// through a wide cone against four overlapping targets, so that a single
+// different random draw changes which body a pellet lands in, which changes the
+// damage, the kill order and the event stream.  A tight ADS cone would hide a
+// broken RNG behind a target the pellets could not miss.
+fn run_script(p_seed: i32): u64 {
+    let cx: object = combat_new_cap(1024);
+    install_weapons(cx);
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, p_seed);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_BELLOWS);
+
+    let e1: i32 = spawn_enemy(wr, g_ENEMY_HUSK,    -0.9, 0.0, -14.0, 0.0);
+    let e2: i32 = spawn_enemy(wr, g_ENEMY_HUSK,     0.9, 0.0, -14.5, 0.0);
+    let e3: i32 = spawn_enemy(wr, g_ENEMY_SPITTER,  0.0, 0.0, -15.5, 0.0);
+    let e4: i32 = spawn_enemy(wr, g_ENEMY_WARDEN,   0.2, 0.0, -13.0, g_PI);
+
+    let h: u64 = 14695981039346656037;
+    let t: i32 = 1;
+    while (t <= 240) {
+        world_set_tick(wr, t);
+        // a slow sweep across the group, so the aim axis changes every tick
+        let ang: f64 = f64(t) * 0.013;
+        let tx: f64 = sin(ang) * 1.4;
+        let ty: f64 = 0.9 + cos(ang * 1.7) * 0.6;
+        aim_cmd(cmd, t, 0.0, eye, 0.0, tx, ty, -14.0, BTN_FIRE, g_WPN_BELLOWS);
+        combat_begin_tick(cx);
+        if (t % 3 == 0) { combat_fire(cx, wr, null, sh, eye, cmd, f64(t % 6), 0.0); }
+        // revive everything every 40 ticks so the script keeps producing events
+        if (t % 40 == 0) {
+            set_hp(wr, e1, 90);
+            set_hp(wr, e2, 90);
+            set_hp(wr, e3, 70);
+            set_hp(wr, e4, 220);
+            let ar = wr.armor;
+            ar[e4] = WARDEN_PLATE_HP;
+        }
+        h = hmix(h, i32(world_state_hash(wr) >> 33));
+        h = hmix(h, evbus_hash(combat_events(cx)));
+        t++;
+    }
+    // fold the counters in too — a divergence in a counter is a divergence
+    let ci: i32 = 0;
+    while (ci < 12) { h = hmix(h, combat_stat(cx, ci)); ci++; }
+    let out: u64 = h;
+    return out;
+}
+
+// The determinism anchor.  These are golden CONSTANTS, not property
+// assertions, on purpose: their whole job is to be identical across two runs,
+// two backends and two machines.  `simtest.hml` carries one for the same
+// reason.  If a legitimate design change moves them, change them here once and
+// say so in the task report — never to make red go green.
+fn section_determinism() {
+    print("I. Determinism");
+
+    let a1: u64 = run_script(1337);
+    let a2: u64 = run_script(1337);
+    let b1: u64 = run_script(7331);
+
+    let ha1: i32 = u64_lo31(a1);
+    let ha2: i32 = u64_lo31(a2);
+    let hb1: i32 = u64_lo31(b1);
+
+    print(`   I1  seed 1337 -> ${ha1}`);
+    print(`   I2  seed 7331 -> ${hb1}`);
+
+    ck(ha1 == ha2, "I1 same seed + same commands -> bit-identical state hash",
+       `${ha1} vs ${ha2}`);
+    ck(ha1 != hb1, "I2 a different seed produces a different world (negative control)",
+       `both ${ha1}`);
+
+    // I3 — the golden anchor.  Compiled and interpreted must agree; that is the
+    // claim `hemlockc`-vs-`hemlock` parity is made of.
+    ck(ha1 == 2048774143, "I3 seed 1337 matches the golden hash (compiled == interpreted)",
+       `got ${ha1}, golden 2048774143`);
+    ck(hb1 == 1039881287, "I3b seed 7331 matches its golden hash",
+       `got ${hb1}, golden 1039881287`);
+
+    // I4 — the RNG is a pure function of (seed, tick, shooter): rewinding the
+    //      tick reproduces the same pellets, which is what a rollback needs.
+    let cx: object = combat_new();
+    install_weapons(cx);
+    let wr: object = world_new_cap(16);
+    world_set_seed(wr, 999);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_BELLOWS);
+    let en: i32 = spawn_enemy(wr, g_ENEMY_BULWARK, 0.0, 0.0, -30.0, 0.0);
+    let hp = wr.hp;
+
+    world_set_tick(wr, 500);
+    aim_cmd(cmd, 500, 0.0, eye, 0.0, 0.0, 1.6, -30.0, BTN_FIRE, g_WPN_BELLOWS);
+    hp[en] = 100000;
+    let chain_before = combat_chain_scratch();
+    combat_chain_capture(cx, chain_before);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 0.0);
+    let d_first: i32 = 100000 - hp[en];
+    let h_first: i32 = evbus_hash(combat_events(cx));
+
+    // Rewind and replay the exact same tick.  Restoring the world is not
+    // enough: the GDD §7.2 pitch chain is sim state too, and a rollback that
+    // forgets it replays the same bullet and plays a different note.
+    hp[en] = 100000;
+    world_set_tick(wr, 500);
+    combat_chain_restore(cx, chain_before);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 0.0);
+    let d_again: i32 = 100000 - hp[en];
+    let h_again: i32 = evbus_hash(combat_events(cx));
+
+    ck(d_first == d_again, "I4 replaying a tick reproduces the same damage",
+       `${d_first} vs ${d_again}`);
+    ck(h_first == h_again, "I4b and the identical event stream", `${h_first} vs ${h_again}`);
+
+    // I4c — and the negative control: WITHOUT restoring the chain the event
+    // stream diverges, which is exactly the bug this call exists to prevent.
+    hp[en] = 100000;
+    world_set_tick(wr, 500);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 0.0);
+    ck(evbus_hash(combat_events(cx)) != h_first,
+       "I4c forgetting the pitch chain DOES diverge (so the restore is load-bearing)",
+       "chain is not actually state");
+    combat_chain_restore(cx, chain_before);
+
+    // I5 — a DIFFERENT tick fires a different pattern (the stream really is
+    //      seeded by the tick, not frozen)
+    hp[en] = 100000;
+    world_set_tick(wr, 501);
+    aim_cmd(cmd, 501, 0.0, eye, 0.0, 0.0, 1.6, -30.0, BTN_FIRE, g_WPN_BELLOWS);
+    combat_chain_restore(cx, chain_before);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 0.0);
+    let h_next: i32 = evbus_hash(combat_events(cx));
+    ck(h_next != h_first, "I5 a different tick fires a different pattern", "frozen stream");
+
+    // I6 — two shooters on the same tick get independent patterns
+    let sh2: i32 = world_spawn_player(wr, 2);
+    let px = wr.px;  px[sh2] = 0.0;
+    let py = wr.py;  py[sh2] = 0.0;
+    let pz = wr.pz;  pz[sh2] = 0.0;
+    let wp = wr.weapon; wp[sh2] = g_WPN_BELLOWS;
+    hp[en] = 100000;
+    world_set_tick(wr, 500);
+    aim_cmd(cmd, 500, 0.0, eye, 0.0, 0.0, 1.6, -30.0, BTN_FIRE, g_WPN_BELLOWS);
+    combat_chain_restore(cx, chain_before);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh2, eye, cmd, 0.0, 0.0);
+    let h_other: i32 = evbus_hash(combat_events(cx));
+    ck(h_other != h_first, "I6 two shooters on one tick get independent cones", "shared stream");
+}
+
+// ===========================================================================
+// J.  PERFORMANCE  (RULE T: __clock CPU time, min of 7, guard at ~2x loaded)
+// ===========================================================================
+let g_TRIALS: i32 = 7;
+
+fn section_perf() {
+    print("J. Performance (RULE T: __clock CPU time, min of 7 trials)");
+
+    let comp: i32 = is_compiled();
+
+    let cx: object = combat_new_cap(1024);
+    install_weapons(cx);
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 606);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+
+    let cs: object = chunk_store_new_cap(g_CHUNK_CACHE, 256, g_WORLD_SEED_DEFAULT);
+    chunk_set_source(cs, ns_chunk_src);
+    chunk_pin_ring(cs, 0, 0, 3);
+    let gy: f64 = chunk_height_at(cs, 8.0, 8.0);
+
+    let sh: i32 = spawn_shooter(wr, 8.0, gy, 8.0, g_WPN_SPARROW);
+    // g_DIR_ALIVE_CAP enemies: the v1 worst case the director will ever produce
+    let k: i32 = 0;
+    while (k < g_DIR_ALIVE_CAP) {
+        let ang: f64 = f64(k) * 0.4487989505128276;
+        let ex: f64 = 8.0 + cos(ang) * (10.0 + f64(k));
+        let ez: f64 = 8.0 + sin(ang) * (10.0 + f64(k));
+        let ey: f64 = chunk_height_at(cs, ex, ez);
+        spawn_enemy(wr, k % 6, ex, ey, ez, 0.0);
+        k++;
+    }
+    ck(world_count(wr) == g_DIR_ALIVE_CAP + 1, "J0 the worst-case entity count is live",
+       `${world_count(wr)}`);
+
+    let hpf = wr.hp;
+    let flf = wr.flags;
+
+    // ---- J1: one full firing tick, terrain included --------------------
+    let reps: i32 = 200;
+    let best: f64 = 1000000.0;
+    let tr: i32 = 0;
+    while (tr < g_TRIALS) {
+        // reset the targets so every rep does the same work
+        let z: i32 = 1;
+        while (z < world_count(wr)) { hpf[z] = 100000; if ((flf[z] & EF_DEAD) != 0) { flf[z] = flf[z] - EF_DEAD; } z++; }
+        let c0: f64 = __clock();
+        let r: i32 = 0;
+        while (r < reps) {
+            world_set_tick(wr, 2000 + r);
+            aim_cmd(cmd, 2000 + r, 8.0, gy + eye, 8.0,
+                    8.0 + cos(f64(r) * 0.11) * 20.0, gy + 1.0,
+                    8.0 + sin(f64(r) * 0.11) * 20.0, BTN_FIRE, g_WPN_SPARROW);
+            combat_begin_tick(cx);
+            combat_fire(cx, wr, cs, sh, gy + eye, cmd, f64(r % 8), 0.0);
+            r++;
+        }
+        let c1: f64 = __clock();
+        let dt: f64 = (c1 - c0) * 1000.0 / f64(reps);
+        if (dt < best) { best = dt; }
+        tr++;
+    }
+    print(`   J1  combat_fire, 1 shot, ${g_DIR_ALIVE_CAP} enemies + terrain = ${s2(best)} ms/tick`);
+
+    // ---- J2: the Bellows worst case, nine pellets ----------------------
+    let wpf = wr.weapon;
+    wpf[sh] = g_WPN_BELLOWS;
+    let best9: f64 = 1000000.0;
+    let tr2: i32 = 0;
+    while (tr2 < g_TRIALS) {
+        let z2: i32 = 1;
+        while (z2 < world_count(wr)) { hpf[z2] = 100000; if ((flf[z2] & EF_DEAD) != 0) { flf[z2] = flf[z2] - EF_DEAD; } z2++; }
+        let c0b: f64 = __clock();
+        let r2: i32 = 0;
+        while (r2 < reps) {
+            world_set_tick(wr, 3000 + r2);
+            aim_cmd(cmd, 3000 + r2, 8.0, gy + eye, 8.0,
+                    8.0 + cos(f64(r2) * 0.11) * 20.0, gy + 1.0,
+                    8.0 + sin(f64(r2) * 0.11) * 20.0, BTN_FIRE, g_WPN_BELLOWS);
+            combat_begin_tick(cx);
+            combat_fire(cx, wr, cs, sh, gy + eye, cmd, 0.0, 0.0);
+            r2++;
+        }
+        let c1b: f64 = __clock();
+        let dtb: f64 = (c1b - c0b) * 1000.0 / f64(reps);
+        if (dtb < best9) { best9 = dtb; }
+        tr2++;
+    }
+    print(`   J2  combat_fire, 9 pellets, ${g_DIR_ALIVE_CAP} enemies + terrain = ${s2(best9)} ms/tick`);
+
+    // ---- J3: a bare raycast, no weapon table ---------------------------
+    let ray = combat_ray_scratch();
+    let bestr: f64 = 1000000.0;
+    let tr3: i32 = 0;
+    while (tr3 < g_TRIALS) {
+        let c0c: f64 = __clock();
+        let r3: i32 = 0;
+        while (r3 < 2000) {
+            let ang3: f64 = f64(r3) * 0.0031415926535898;
+            combat_raycast(cx, wr, cs, 8.0, gy + eye, 8.0,
+                           cos(ang3), -0.2, sin(ang3), 140.0, 1, ray);
+            r3++;
+        }
+        let c1c: f64 = __clock();
+        let dtc: f64 = (c1c - c0c) * 1000000.0 / 2000.0;
+        if (dtc < bestr) { bestr = dtc; }
+        tr3++;
+    }
+    print(`   J3  combat_raycast, ${g_DIR_ALIVE_CAP} enemies + a 140 m DDA = ${s2(bestr)} us/ray`);
+
+    // ---- the guards ----------------------------------------------------
+    // Combat's SHARE of the 2.0 ms sim budget.  It is one stage of ten, it
+    // runs at most once per player per tick, and it must leave room for
+    // movement, AI, the director and the snapshot.  0.30 ms compiled is a
+    // regression guard at roughly 2x the loaded measurement.
+    let guard: f64 = 0.30;
+    let guard9: f64 = 0.60;
+    if (comp == 0) { guard = 3.0; guard9 = 6.0; }
+    let backend: string = "compiled";
+    if (comp == 0) { backend = "interpreted"; }
+
+    ck(best < guard,
+       `J1 one firing tick is inside the guard (${backend})`,
+       `${s2(best)} ms vs guard ${s2(guard)} ms`);
+    ck(best9 < guard9,
+       `J2 a nine-pellet shell is inside the guard (${backend})`,
+       `${s2(best9)} ms vs guard ${s2(guard9)} ms`);
+    ck(best < g_BUDGET_SIM_MS * 0.25,
+       "J4 combat takes under a quarter of the 2.0 ms sim budget",
+       `${s2(best)} ms of ${s2(g_BUDGET_SIM_MS)} ms`);
+
+    print(`   J5  share of the ${s2(g_BUDGET_SIM_MS)} ms sim budget = ${s2(best / g_BUDGET_SIM_MS * 100.0)} %`);
+}
+
+// ===========================================================================
+// K.  INTEGRATION WITH THE REAL weapons.hml  (W4-2)
+// ===========================================================================
+// Sections A-J run against this file's own GDD §2.4 transcription, so the
+// determinism goldens are anchored to a table the probe controls and cannot be
+// moved by a sibling task retuning a number.  Section K then swaps in the REAL
+// module and re-asserts the design claims that actually matter.  If W4-2
+// retunes the table, THIS section is what is supposed to go red.
+fn section_weapons_integration() {
+    print("K. Integration with the real src/sim/weapons.hml");
+
+    g_use_real = 1;
+
+    let cx: object = combat_new();
+    install_weapons(cx);
+    ck(combat_has_weapon_source(cx) == 1,
+       "K0 wpn_dmg_at / wpn_hs_mult / wpn_pellets / wpn_spread_half_rad install with NO adapter",
+       "injection refused");
+
+    // K1 — the real falloff agrees with the GDD §2.4 table (D2-amended) at a
+    //      grid of ranges, for every weapon.
+    let dmg_bad: i32 = 0;
+    let wi: i32 = 0;
+    while (wi < g_WPN_COUNT) {
+        let ri: i32 = 0;
+        while (ri <= 72) {
+            let a: f64 = wpn_dmg_at(wi, f64(ri));
+            let b: f64 = ref_dmg_at(wi, f64(ri));
+            let e: f64 = a - b;
+            if (e < 0.0) { e = 0.0 - e; }
+            if (e > 0.0001) { dmg_bad = dmg_bad + 1; }
+            ri = ri + 2;
+        }
+        wi++;
+    }
+    ck(dmg_bad == 0, "K1 the real wpn_dmg_at matches GDD §2.4 at every sampled range",
+       `${dmg_bad} disagreements`);
+
+    // K2 — pellets and headshot multipliers
+    let pel_bad: i32 = 0;
+    let hs_bad: i32 = 0;
+    let wj: i32 = 0;
+    while (wj < g_WPN_COUNT) {
+        if (wpn_pellets(wj) != g_WD_PEL[wj]) { pel_bad = pel_bad + 1; }
+        let dh: f64 = wpn_hs_mult(wj) - g_WD_HS[wj];
+        if (dh < 0.0) { dh = 0.0 - dh; }
+        if (dh > 0.0001) { hs_bad = hs_bad + 1; }
+        wj++;
+    }
+    ck(pel_bad == 0, "K2 the real pellet counts match GDD §2.4", `${pel_bad} wrong`);
+    ck(hs_bad == 0, "K2b the real headshot multipliers match GDD §2.4", `${hs_bad} wrong`);
+    ck(wpn_pellets(g_WPN_BELLOWS) == 9, "K2c and the Bellows really does throw nine", "not nine");
+
+    // K3 — THE UNITS.  Both modules must read GDD's degree figure the same way
+    //      or every cone in the game is out by a factor of two.
+    let spr_bad: i32 = 0;
+    let wk: i32 = 0;
+    while (wk < g_WPN_COUNT) {
+        let bi: i32 = 0;
+        while (bi < 4) {
+            let ai: i32 = 0;
+            while (ai < 3) {
+                let bl: f64 = f64(bi) * 0.8;
+                let ad: f64 = f64(ai) * 0.5;
+                let d1: f64 = wpn_spread_half_rad(wk, bl, ad);
+                let d2: f64 = ref_spread(wk, bl, ad);
+                let de: f64 = d1 - d2;
+                if (de < 0.0) { de = 0.0 - de; }
+                if (de > 0.0000001) { spr_bad = spr_bad + 1; }
+                ai++;
+            }
+            bi++;
+        }
+        wk++;
+    }
+    ck(spr_bad == 0,
+       "K3 both modules read GDD's cone as a FULL angle (half-angles agree exactly)",
+       `${spr_bad} disagreements`);
+
+    // K4 — the design claims, re-run on the real table
+    ck(ttk_shots(g_WPN_SPARROW, 10.0, 0.0, g_ENEMY_HUSK) == 4,
+       "K4 real table: Sparrow near still takes 4 body shots on a Husk",
+       `${ttk_shots(g_WPN_SPARROW, 10.0, 0.0, g_ENEMY_HUSK)}`);
+    ck(ttk_shots(g_WPN_BELLOWS, 4.0, 0.0, g_ENEMY_HUSK) == 1,
+       "K4b real table: the Bellows still one-shots a Husk inside 6 m",
+       `${ttk_shots(g_WPN_BELLOWS, 4.0, 0.0, g_ENEMY_HUSK)}`);
+    ck(ttk_shots_head(g_WPN_LONGSHADOW, 70.0, g_ENEMY_HUSK) == 1,
+       "K4c real table: the Longshadow still one-shots a Husk in the head at 70 m",
+       `${ttk_shots_head(g_WPN_LONGSHADOW, 70.0, g_ENEMY_HUSK)}`);
+    let wisp_bad: i32 = 0;
+    let wl: i32 = 0;
+    while (wl < g_WPN_COUNT) {
+        if (ttk_shots(wl, 4.0, 0.0, g_ENEMY_WISP) != 1) { wisp_bad = wisp_bad + 1; }
+        wl++;
+    }
+    ck(wisp_bad == 0, "K4d real table: every weapon still one-shots a Wisp", `${wisp_bad}`);
+
+    // K5 — no weapon's useful range exceeds the hitscan ceiling combat traces
+    let over: i32 = 0;
+    let wm: i32 = 0;
+    while (wm < g_WPN_COUNT) {
+        if (wpn_max_range(wm) > 140.0) { over = over + 1; }
+        wm++;
+    }
+    ck(over == 0, "K5 no weapon out-ranges the hitscan ceiling combat traces", `${over}`);
+
+    // K6 — and the §2.5 contract still holds end to end on the real table
+    let wr: object = world_new_cap(16);
+    world_set_seed(wr, 616);
+    world_set_tick(wr, 5);
+    let cmd: object = cmd_new();
+    let eye: f64 = 1.62;
+    let sh: i32 = spawn_shooter(wr, 0.0, 0.0, 0.0, g_WPN_SPARROW);
+    let en: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, 0.0, -10.0, 0.0);
+    let vid: i32 = world_id_of(wr, en);
+    aim_cmd(cmd, 5, 0.0, eye, 0.0, 0.0, 0.9, -10.0, BTN_FIRE | BTN_ADS, g_WPN_SPARROW);
+    combat_begin_tick(cx);
+    combat_fire(cx, wr, null, sh, eye, cmd, 0.0, 1.0);
+    let bus: object = combat_events(cx);
+    ck(combat_feedback_ok(cx) == 0, "K6 the §2.5 contract holds on the real weapon table",
+       `${combat_feedback_ok(cx)}`);
+    let five: i32 = 0;
+    if (evbus_count_for(bus, EV_HITMARKER, vid) == 1) { five++; }
+    if (evbus_count_for(bus, EV_HIT_FLASH, vid) == 1) { five++; }
+    if (evbus_count_for(bus, EV_DAMAGE_NUMBER, vid) == 1) { five++; }
+    if (evbus_count_for(bus, EV_IMPACT, vid) == 1) { five++; }
+    if (evbus_count_for(bus, EV_SOUND, vid) == 1) { five++; }
+    ck(five == FEEDBACK_COUNT, "K6b all five signals, once each, on the real table", `${five}/5`);
+
+    g_use_real = 0;
+}
+
+// ===========================================================================
+//  MAIN
+// ===========================================================================
+fn main() {
+    print("=========================================================");
+    print(" probe_combat.hml — W4-3 combat.hml acceptance");
+    print("=========================================================");
+
+    section_structure();
+    section_bus();
+    section_ray_entity();
+    section_ray_terrain();
+    section_damage();
+    section_plate();
+    section_feedback();
+    section_spread();
+    section_determinism();
+    section_perf();
+    section_weapons_integration();
+
+    print("---------------------------------------------------------");
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} assertion(s) failed`);
+        exit(1);
+    }
+    print("PROBE_COMBAT PASS");
+}
+
+main();

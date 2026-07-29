@@ -1,0 +1,1070 @@
+// =============================================================================
+//  movement.hml — the player movement model.        Nightshade W4-1, GDD §2.3.
+// =============================================================================
+//
+//  -----------------------------------------------------------------------
+//  THE IMPORT WALL (CLAUDE.md §3)
+//  -----------------------------------------------------------------------
+//  This file is inside `src/sim/**`. It imports ONLY `@stdlib/math`,
+//  `src/core/config.hml` and its `src/sim/**` siblings. No SDL, no
+//  wobbleweed, no renderer, no `@stdlib/random`, and — the one that matters
+//  most here — NO WALL CLOCK. `move_apply` never sees a measured delta: the
+//  step is `g_TICK_DT`, a compile-time constant (CLAUDE.md §7).
+//
+//  -----------------------------------------------------------------------
+//  DETERMINISM — the whole reason this module looks like this
+//  -----------------------------------------------------------------------
+//  Same `PredictedState` + same command sequence => bit-identical trajectory,
+//  interpreted or compiled. That requires four disciplines:
+//
+//   1. EVERY movement variable lives in `PredictedState` — the position, the
+//      velocity, the crouch blend, the coyote timer, the slide timer, the
+//      slide cooldown, the jump-buffer, the BHOP WINDOW, the mantle rails and
+//      the locked mantle aim. One variable outside and a replay diverges in
+//      exactly one movement state, which is a brutal bug to find.
+//   2. `PredictedState` is a flat `array<f64>` of `PS_FIELDS` scalars, index
+//      constants below. No object graph, no closure, no entity reference:
+//      it serializes by copying, which is what `predicted_capture` is.
+//   3. No RNG. Movement rolls no dice — not even for footsteps. There is
+//      nothing here for `rng.hml` to seed.
+//   4. All arithmetic is `f64` and `i32`. The only integer maths is on frame
+//      counters that cannot overflow.
+//
+//  -----------------------------------------------------------------------
+//  WHY THE VERTICAL INTEGRATOR IS TRAPEZOIDAL AND NOT SEMI-IMPLICIT EULER
+//  -----------------------------------------------------------------------
+//  GDD §2.3 states jump 6.6 m/s, g = 22 m/s^2, "apex 0.99 m, air time 0.60 s",
+//  and W4-1's acceptance reproduces those to 1 %. Semi-implicit Euler at
+//  1/60 s undershoots the apex by 5.5 % (0.935 m) because it drops the
+//  `+g*dt^2/8` term; that is not a tuning failure, it is the integrator.
+//  The trapezoid form
+//        vy' = vy - g*dt        py += 0.5*(vy + vy')*dt
+//  is EXACT for constant acceleration: apex 0.990000 m at tick 18, ground at
+//  tick 36 = 0.600000 s, on the nose, on both backends. It costs one add and
+//  one multiply per tick.
+//
+//  -----------------------------------------------------------------------
+//  WHAT COLLIDES WITH WHAT
+//  -----------------------------------------------------------------------
+//  * The heightfield (`chunk.hml`) is the floor and the cliffs. It is sampled
+//    through `chunk_height_at` / `chunk_normal_at`, which are bilinear inside
+//    one 4 m cell, so the terrain is C0-continuous and has NO vertical faces.
+//  * A caller-owned SOLID LIST — a flat `array<f64>` of AABBs, six numbers
+//    each — is the optional second collider, and it is EMPTY on the terrain-
+//    only path so it costs one length read. It exists because a 4 m bilinear
+//    grid cannot express a waist-high ledge (see the MANTLE note below) and
+//    because the world already has buildings the player currently walks
+//    through. `move_apply` is the terrain-only entry point; `move_apply_ex`
+//    takes the list.
+//  * The player is a vertical capsule, radius `g_CAPSULE_RADIUS` (0.40 m),
+//    height 1.75 m standing / 0.95 m crouched. Against a heightfield a
+//    capsule and a cylinder differ only in how the bottom cap rides a slope,
+//    and the step-up rule below subsumes that difference; the radius is used
+//    to inflate solids and to place mantle probes.
+//
+//  THE SWEEP. Horizontal motion is split into substeps of at most
+//  `MOVE_SUBSTEP_M` (0.20 m) so an 11 m/s chained slide-jump cannot tunnel
+//  through a ledge, and — the part that matters for FEEL — so the step-up is
+//  SPEED-INDEPENDENT: the same 0.35 m rise is judged over the same 0.20 m of
+//  travel whether you are walking or sliding. A per-tick test would let a
+//  slow walker climb a 78 degree wall and stop a sprinter on a kerb.
+//
+//  -----------------------------------------------------------------------
+//  MANTLE: AN HONEST NOTE (reported with the task, not hidden here)
+//  -----------------------------------------------------------------------
+//  GDD §2.3 mantles ledges 0.6-1.4 m. The shipping heightfield samples every
+//  4.0 m and interpolates bilinearly, so the steepest 1.0 m rise it can
+//  express is spread over 4 m — a 14 degree ramp you simply walk up. A
+//  waist-high ledge is GEOMETRICALLY IMPOSSIBLE in terrain alone. The mantle
+//  is therefore implemented against any collider and exercised in the probe
+//  against solids; on terrain it correctly never fires. It becomes reachable
+//  in play the moment buildings/props/`build.hml` publish a solid list.
+//
+//  Second honest note: GDD step-up is 0.35 m and GDD mantle starts at 0.60 m,
+//  so a ledge in [0.35, 0.60) is neither steppable nor mantleable — an
+//  invisible wall. That is a gap in the design numbers, not in this code, and
+//  W4-1 implements the numbers as written rather than quietly widening the
+//  mantle window. Both are in the task report.
+//
+//  -----------------------------------------------------------------------
+//  PERFORMANCE
+//  -----------------------------------------------------------------------
+//  One player, one call per tick. MEASURED, compiled -O1, min of 7, on the
+//  loaded box, against real worldgen terrain: 5.3 us/tick for one player =
+//  0.0053 ms = 0.27 % of the 2.0 ms sim budget; 32 players = 0.17 ms = 8.5 %.
+//  A quarter of that is `chunk_height_at` (660 ns/call, W3-2), of which this
+//  file makes two calls on a normal grounded tick and up to six when a sweep
+//  is blocked and has to try each axis alone.
+//  Hot-function discipline per CLAUDE.md §4: `p_` params copied into typed
+//  locals, copy-out returns, no closures, no `defer`, no `throw`, no
+//  allocation after `ps_new`.
+// =============================================================================
+
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import { g_TICK_DT,
+         g_SPEED_WALK, g_SPEED_SPRINT, g_SPEED_CROUCH, g_SPEED_ADS,
+         g_SPRINT_CONE_DEG, g_ACCEL_GROUND, g_FRICTION_GROUND, g_AIR_CONTROL,
+         g_GRAVITY, g_JUMP_IMPULSE,
+         g_HEIGHT_STAND, g_EYE_STAND, g_HEIGHT_CROUCH, g_EYE_CROUCH,
+         g_CROUCH_TIME_S, g_CAPSULE_RADIUS, g_STEP_UP_M,
+         g_SLIDE_MIN_SPEED, g_SLIDE_BURST, g_SLIDE_END_SPEED, g_SLIDE_TIME_S,
+         g_SLIDE_EYE, g_SLIDE_CD_S, g_SLIDEJUMP_KEEP,
+         g_MANTLE_MIN_M, g_MANTLE_MAX_M, g_MANTLE_TIME_S,
+         g_FALL_FREE_M, g_FALL_DMG_PER_M,
+         g_STEP_INTERVAL_WALK_S
+       } from "../core/config.hml";
+
+import { cmd_yaw, cmd_pitch, cmd_move_x, cmd_move_y, cmd_btn,
+         BTN_JUMP, BTN_CROUCH, BTN_SPRINT, BTN_ADS } from "./command.hml";
+
+import { chunk_height_at, chunk_normal_at, CHUNK_H_MISS } from "./chunk.hml";
+
+import { EF_GROUNDED } from "./world.hml";
+
+// ---------------------------------------------------------------------------
+// PREDICTED STATE — the field indices.  ADD FIELDS AT THE END, NEVER IN THE
+// MIDDLE: a saved/serialized state is positional.
+// ---------------------------------------------------------------------------
+export let PS_PX: i32 = 0;            // feet position, metres
+export let PS_PY: i32 = 1;            // FEET, not eye. Eye is PS_EYE above it.
+export let PS_PZ: i32 = 2;
+export let PS_VX: i32 = 3;            // metres/second
+export let PS_VY: i32 = 4;
+export let PS_VZ: i32 = 5;
+export let PS_YAW: i32 = 6;           // radians, from the command
+export let PS_PITCH: i32 = 7;         // radians, from the command
+export let PS_GROUNDED: i32 = 8;      // 0 / 1
+export let PS_CROUCH: i32 = 9;        // stance blend, 0 stand .. 1 crouched
+export let PS_EYE: i32 = 10;          // eye height above the feet, metres
+export let PS_SLIDE_T: i32 = 11;      // slide time REMAINING, s (0 = not sliding)
+export let PS_SLIDE_CD: i32 = 12;     // slide cooldown remaining, s
+export let PS_SLIDE_DX: i32 = 13;     // slide direction (unit, XZ)
+export let PS_SLIDE_DZ: i32 = 14;
+export let PS_COYOTE_T: i32 = 15;     // late-jump grace remaining, s
+export let PS_JUMP_BUF_T: i32 = 16;   // early-jump buffer remaining, s
+export let PS_BHOP_T: i32 = 17;       // THE BHOP WINDOW: friction-free s after a landing
+export let PS_JUMP_HELD: i32 = 18;    // edge detector, 0 / 1
+export let PS_CROUCH_HELD: i32 = 19;  // edge detector, 0 / 1
+export let PS_MANTLE_T: i32 = 20;     // mantle time remaining, s (0 = not mantling)
+export let PS_MANTLE_SX: i32 = 21;    // mantle rail: start
+export let PS_MANTLE_SY: i32 = 22;
+export let PS_MANTLE_SZ: i32 = 23;
+export let PS_MANTLE_TX: i32 = 24;    // mantle rail: target
+export let PS_MANTLE_TY: i32 = 25;
+export let PS_MANTLE_TZ: i32 = 26;
+export let PS_MANTLE_YAW: i32 = 27;   // aim LOCKED for the duration (GDD §2.3)
+export let PS_MANTLE_PITCH: i32 = 28;
+export let PS_LEDGE_T: i32 = 29;      // time held into a mantleable ledge, s
+export let PS_AIR_T: i32 = 30;        // time since leaving the ground, s
+export let PS_FALL_PEAK: i32 = 31;    // highest feet y since leaving the ground
+export let PS_FALL_DMG: i32 = 32;     // pending fall damage, HP (caller drains it)
+export let PS_LAND_VY: i32 = 33;      // vertical speed at the last landing (juice)
+export let PS_STEP_DIST: i32 = 34;    // ground distance since the last footstep
+export let PS_TICKS: i32 = 35;        // move_apply calls applied to this state
+export let PS_FIELDS: i32 = 36;
+
+// ---------------------------------------------------------------------------
+// EVENT BITS — the return value of `move_apply`.  These are what drive audio
+// and FX in `sim_effects()`; movement itself makes no sound (CLAUDE.md §7).
+// ---------------------------------------------------------------------------
+export let MOVE_EV_JUMP: i32 = 1;
+export let MOVE_EV_LAND: i32 = 2;
+export let MOVE_EV_SLIDE_START: i32 = 4;
+export let MOVE_EV_SLIDE_END: i32 = 8;
+export let MOVE_EV_SLIDEJUMP: i32 = 16;      // the protected skill tech
+export let MOVE_EV_MANTLE_START: i32 = 32;
+export let MOVE_EV_MANTLE_END: i32 = 64;
+export let MOVE_EV_FALL_DMG: i32 = 128;
+export let MOVE_EV_STEP: i32 = 256;
+export let MOVE_EV_BLOCKED: i32 = 512;
+export let MOVE_EV_STEP_UP: i32 = 1024;
+export let MOVE_EV_GROUND_MISS: i32 = 2048;  // no chunk under the player
+
+// ---------------------------------------------------------------------------
+// TUNABLES THAT ARE *NOT* IN THE GDD.  Every GDD number comes from
+// `src/core/config.hml`; these are the handful of implementation constants the
+// design does not name, kept here, named, and reported with the task rather
+// than buried as literals.
+// ---------------------------------------------------------------------------
+export let MOVE_COYOTE_S: f64 = 0.12;      // late jump after walking off an edge
+export let MOVE_JUMPBUF_S: f64 = 0.12;     // early jump before touching down
+export let MOVE_BHOP_S: f64 = 0.10;        // friction-free window after landing
+export let MOVE_STOP_SPEED: f64 = 1.0;     // friction floor, so you actually stop
+export let MOVE_SUBSTEP_M: f64 = 0.20;     // horizontal sweep granularity
+export let MOVE_SNAP_DOWN_M: f64 = 0.35;   // stay glued to a descending slope
+// THE MOVEMENT-TECH CEILING, and it is a DESIGN NUMBER, not a safety valve.
+// W4-1's acceptance says a chained downhill slide-jump reaches "~11 m/s". That
+// speed cannot emerge on its own: every jump injects 6.6 m/s of impulse and
+// every downhill flight converts height into speed, while the bhop window
+// waives the friction that would otherwise pay for it — so the chain is
+// energetically unbounded and its top speed IS a constant somebody chooses.
+// Choosing it here, in the open, with the number the design asked for, is the
+// honest form of that. It binds NOTHING else: the fastest designed state is
+// the 9.2 m/s slide burst, and sprint is 7.0.
+export let MOVE_SPEED_CAP: f64 = 11.0;
+export let MOVE_MANTLE_AUTO_S: f64 = 0.12; // hold into a ledge this long to vault
+export let MOVE_MANTLE_CLEAR_M: f64 = 0.25;// mantle lands this far past the lip
+
+// Derived, once, at module load.
+let g_MOVE_ACCEL_AIR: f64 = g_ACCEL_GROUND * g_AIR_CONTROL;          // 21.0 m/s^2
+let g_MOVE_SPRINT_TAN: f64 =
+        sin(g_SPRINT_CONE_DEG * 0.017453292519943295) /
+        cos(g_SPRINT_CONE_DEG * 0.017453292519943295);               // tan 40 deg
+// A footstep every 0.42 s at walk speed (config), expressed as DISTANCE so the
+// cadence is speed-correct and frame-rate independent by construction.
+let g_MOVE_STEP_M: f64 = g_SPEED_WALK * g_STEP_INTERVAL_WALK_S;      // 1.848 m
+let g_MOVE_EPS: f64 = 0.0001;
+let g_MOVE_NEG_INF: f64 = -1000000000.0;
+
+// Module scratch. Allocated ONCE (CLAUDE.md N6). Not state: every use writes
+// before it reads, so it can never carry a value between ticks.
+let g_move_nrm: array<f64> = [0.0, 0.0, 0.0];
+let g_move_hbuf: buffer = buffer(8);
+let g_move_no_solids: array<f64> = [];
+
+// Diagnostics. Never read by the sim; the probe and the tools assert on them.
+let g_move_ground_miss: i32 = 0;
+let g_move_calls: i32 = 0;
+
+export fn move_ground_miss_count(): i32 { let out: i32 = g_move_ground_miss; return out; }
+export fn move_call_count(): i32 { let out: i32 = g_move_calls; return out; }
+export fn move_reset_counters() { g_move_ground_miss = 0; g_move_calls = 0; }
+
+// ===========================================================================
+//  PREDICTED STATE
+// ===========================================================================
+
+// A zeroed state, standing, ungrounded, at the origin. Allocate these once.
+export fn ps_new(): array<f64> {
+    let ps: array<f64> = [];
+    let n: i32 = PS_FIELDS;
+    let i: i32 = 0;
+    while (i < n) { ps.push(0.0); i++; }
+    ps[PS_EYE] = g_EYE_STAND;
+    let out: array<f64> = ps;
+    return out;
+}
+
+// Copy `src` INTO `dst`. Both directions are the same operation on a flat
+// array — the two names exist because the CALLER's intent differs, and a
+// prediction bug is nearly always a capture/restore direction bug.
+// Returns the number of fields copied, 0 if either array is short.
+export fn predicted_capture(p_dst: array<f64>, p_src: array<f64>): i32 {
+    let dst = p_dst;
+    let src = p_src;
+    let n: i32 = PS_FIELDS;
+    if (dst.length < n) { return 0; }
+    if (src.length < n) { return 0; }
+    let i: i32 = 0;
+    while (i < n) { dst[i] = src[i]; i++; }
+    let out: i32 = n;
+    return out;
+}
+
+export fn predicted_restore(p_dst: array<f64>, p_src: array<f64>): i32 {
+    let out: i32 = predicted_capture(p_dst, p_src);
+    return out;
+}
+
+// A BIT-EXACT hash of the whole state: every field is reinterpreted through
+// its IEEE-754 bytes, so two states that differ by one ulp hash differently.
+// Rounding the numbers first — the tempting shortcut — would hide exactly the
+// divergence this is here to catch.
+export fn move_state_hash(p_ps: array<f64>): i32 {
+    let ps = p_ps;
+    let n: i32 = PS_FIELDS;
+    if (ps.length < n) { return 0; }
+    let b: buffer = g_move_hbuf;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < n) {
+        b.write_f64_le(0, ps[i]);
+        let lo: u64 = u64(b.read_u32_le(0));
+        let hi: u64 = u64(b.read_u32_le(4));
+        let bits: u64 = (hi << 32) | lo;
+        h = (h ^ bits) * 1099511628211;
+        h = h ^ (h >> 29);
+        i++;
+    }
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// ---- read-only accessors (the renderer and the HUD use these) -------------
+export fn move_px(p_ps: array<f64>): f64 { let ps = p_ps; let out: f64 = ps[PS_PX]; return out; }
+export fn move_py(p_ps: array<f64>): f64 { let ps = p_ps; let out: f64 = ps[PS_PY]; return out; }
+export fn move_pz(p_ps: array<f64>): f64 { let ps = p_ps; let out: f64 = ps[PS_PZ]; return out; }
+export fn move_eye_y(p_ps: array<f64>): f64 {
+    let ps = p_ps;
+    let out: f64 = ps[PS_PY] + ps[PS_EYE];
+    return out;
+}
+export fn move_grounded(p_ps: array<f64>): i32 {
+    let ps = p_ps;
+    let out: i32 = 0;
+    if (ps[PS_GROUNDED] > 0.5) { out = 1; }
+    return out;
+}
+export fn move_sliding(p_ps: array<f64>): i32 {
+    let ps = p_ps;
+    let out: i32 = 0;
+    if (ps[PS_SLIDE_T] > 0.0) { out = 1; }
+    return out;
+}
+export fn move_mantling(p_ps: array<f64>): i32 {
+    let ps = p_ps;
+    let out: i32 = 0;
+    if (ps[PS_MANTLE_T] > 0.0) { out = 1; }
+    return out;
+}
+export fn move_speed_h(p_ps: array<f64>): f64 {
+    let ps = p_ps;
+    let vx: f64 = ps[PS_VX];
+    let vz: f64 = ps[PS_VZ];
+    let out: f64 = sqrt(vx * vx + vz * vz);
+    return out;
+}
+export fn move_height(p_ps: array<f64>): f64 {
+    let ps = p_ps;
+    let out: f64 = g_HEIGHT_STAND + (g_HEIGHT_CROUCH - g_HEIGHT_STAND) * ps[PS_CROUCH];
+    return out;
+}
+
+// Drain the pending fall damage. The caller (combat/sim) applies it and this
+// returns to zero, so damage can never be applied twice.
+export fn move_take_fall_damage(p_ps: array<f64>): f64 {
+    let ps = p_ps;
+    let out: f64 = ps[PS_FALL_DMG];
+    ps[PS_FALL_DMG] = 0.0;
+    return out;
+}
+
+// ===========================================================================
+//  COLLISION QUERIES
+// ===========================================================================
+//
+//  A SOLID is six f64 in a flat array: minx, miny, minz, maxx, maxy, maxz.
+//  `solids.length / 6` is the count, so an empty list costs one length read.
+//  The capsule is modelled against them as a cylinder of radius r: the box
+//  footprint is inflated by r in x and z. That is the standard cheap
+//  approximation and at 0.40 m radius it is invisible at 320x240.
+
+export let MOVE_SOLID_STRIDE: i32 = 6;
+
+// Build a solid list from box corners. Tools and the (future) build system
+// call this; the sim path never allocates.
+export fn move_solids_new(): array<f64> {
+    let a: array<f64> = [];
+    let out: array<f64> = a;
+    return out;
+}
+
+export fn move_solids_add(p_sol: array<f64>, p_minx: f64, p_miny: f64, p_minz: f64,
+                          p_maxx: f64, p_maxy: f64, p_maxz: f64): i32 {
+    let sol = p_sol;
+    sol.push(p_minx); sol.push(p_miny); sol.push(p_minz);
+    sol.push(p_maxx); sol.push(p_maxy); sol.push(p_maxz);
+    let out: i32 = sol.length / MOVE_SOLID_STRIDE;
+    return out;
+}
+
+export fn move_solids_count(p_sol: array<f64>): i32 {
+    let sol = p_sol;
+    let out: i32 = sol.length / MOVE_SOLID_STRIDE;
+    return out;
+}
+
+// Terrain height under a column, in metres. A chunk that cannot be loaded is
+// NOT a hole in the world: the caller's current feet height is returned so the
+// player freezes on the spot instead of falling out of the universe, and the
+// miss is COUNTED so a streaming bug is visible rather than mysterious.
+fn terrain_h(p_cs: object, p_x: f64, p_z: f64, p_feet: f64): f64 {
+    let h: f64 = chunk_height_at(p_cs, p_x, p_z);
+    if (h <= CHUNK_H_MISS) {
+        g_move_ground_miss = g_move_ground_miss + 1;
+        let miss: f64 = p_feet;
+        return miss;
+    }
+    let out: f64 = h;
+    return out;
+}
+
+// The highest solid TOP under (x, z) that is at or below `p_ylimit` — i.e. the
+// surface you would stand on. `g_MOVE_NEG_INF` when there is none.
+fn solid_support(p_sol: array<f64>, p_x: f64, p_z: f64, p_ylimit: f64): f64 {
+    let sol = p_sol;
+    let n: i32 = sol.length;
+    if (n < MOVE_SOLID_STRIDE) { let none: f64 = g_MOVE_NEG_INF; return none; }
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let lim: f64 = p_ylimit;
+    let r: f64 = g_CAPSULE_RADIUS;
+    let best: f64 = g_MOVE_NEG_INF;
+    let i: i32 = 0;
+    while (i < n) {
+        let top: f64 = sol[i + 4];
+        if (top <= lim && top > best) {
+            if (x >= sol[i] - r && x <= sol[i + 3] + r &&
+                z >= sol[i + 2] - r && z <= sol[i + 5] + r) {
+                best = top;
+            }
+        }
+        i = i + MOVE_SOLID_STRIDE;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// The highest TOP among solids that OBSTRUCT the body span [ylo, yhi) at
+// (x, z) — a box whose bottom is below yhi and whose top is above ylo.
+// `g_MOVE_NEG_INF` when nothing obstructs. Doubles as the mantle probe: the
+// value it returns is the lip height.
+fn solid_obstruct(p_sol: array<f64>, p_x: f64, p_z: f64, p_ylo: f64, p_yhi: f64): f64 {
+    let sol = p_sol;
+    let n: i32 = sol.length;
+    if (n < MOVE_SOLID_STRIDE) { let none: f64 = g_MOVE_NEG_INF; return none; }
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let ylo: f64 = p_ylo;
+    let yhi: f64 = p_yhi;
+    let r: f64 = g_CAPSULE_RADIUS;
+    let best: f64 = g_MOVE_NEG_INF;
+    let i: i32 = 0;
+    while (i < n) {
+        let bot: f64 = sol[i + 1];
+        let top: f64 = sol[i + 4];
+        if (bot < yhi && top > ylo && top > best) {
+            if (x >= sol[i] - r && x <= sol[i + 3] + r &&
+                z >= sol[i + 2] - r && z <= sol[i + 5] + r) {
+                best = top;
+            }
+        }
+        i = i + MOVE_SOLID_STRIDE;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// The lowest solid BOTTOM strictly above `p_y` at (x, z) — the ceiling that
+// stops a jump. `g_MOVE_NEG_INF` when the sky is clear.
+fn solid_ceiling(p_sol: array<f64>, p_x: f64, p_z: f64, p_y: f64): f64 {
+    let sol = p_sol;
+    let n: i32 = sol.length;
+    if (n < MOVE_SOLID_STRIDE) { let none: f64 = g_MOVE_NEG_INF; return none; }
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let y: f64 = p_y;
+    let r: f64 = g_CAPSULE_RADIUS;
+    let best: f64 = g_MOVE_NEG_INF;
+    let i: i32 = 0;
+    while (i < n) {
+        let bot: f64 = sol[i + 1];
+        if (bot > y) {
+            if (x >= sol[i] - r && x <= sol[i + 3] + r &&
+                z >= sol[i + 2] - r && z <= sol[i + 5] + r) {
+                if (best <= g_MOVE_NEG_INF || bot < best) { best = bot; }
+            }
+        }
+        i = i + MOVE_SOLID_STRIDE;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// The surface the player stands on at (x, z): terrain, or a solid top the feet
+// could reach (within one step-up). This is the only "ground" the rest of the
+// module knows about.
+fn support_at(p_cs: object, p_sol: array<f64>, p_x: f64, p_z: f64,
+              p_feet: f64, p_ylimit: f64): f64 {
+    let h: f64 = terrain_h(p_cs, p_x, p_z, p_feet);
+    let s: f64 = solid_support(p_sol, p_x, p_z, p_ylimit);
+    if (s > h) { h = s; }
+    let out: f64 = h;
+    return out;
+}
+
+// ===========================================================================
+//  THE STEP
+// ===========================================================================
+
+// Place a state on the ground at (x, z), standing, at rest. Spawn, respawn,
+// teleport and every test course start here.
+export fn move_place(p_ps: array<f64>, p_cs: object, p_x: f64, p_z: f64): i32 {
+    let ps = p_ps;
+    let n: i32 = PS_FIELDS;
+    let i: i32 = 0;
+    while (i < n) { ps[i] = 0.0; i++; }
+    let h: f64 = chunk_height_at(p_cs, p_x, p_z);
+    if (h <= CHUNK_H_MISS) { h = 0.0; }
+    ps[PS_PX] = p_x;
+    ps[PS_PY] = h;
+    ps[PS_PZ] = p_z;
+    ps[PS_GROUNDED] = 1.0;
+    ps[PS_EYE] = g_EYE_STAND;
+    ps[PS_FALL_PEAK] = h;
+    let out: i32 = 1;
+    return out;
+}
+
+// Terrain-only step. This is what the game calls.
+export fn move_apply(p_ps: array<f64>, p_cs: object, p_cmd: object): i32 {
+    let out: i32 = move_apply_ex(p_ps, p_cs, p_cmd, g_move_no_solids);
+    return out;
+}
+
+// One fixed sim tick of movement. Pure with respect to the world: it reads the
+// command and the collision world, writes `PredictedState`, and returns event
+// bits. No sound, no particle, no print, no clock (CLAUDE.md §7).
+export fn move_apply_ex(p_ps: array<f64>, p_cs: object, p_cmd: object,
+                        p_solids: array<f64>): i32 {
+    let ps = p_ps;
+    let cs: object = p_cs;
+    let cmd: object = p_cmd;
+    let sol = p_solids;
+
+    let dt: f64 = g_TICK_DT;
+    let ev: i32 = 0;
+    g_move_calls = g_move_calls + 1;
+
+    // ---- state into typed locals (CLAUDE.md A1) ---------------------------
+    let px: f64 = ps[PS_PX];
+    let py: f64 = ps[PS_PY];
+    let pz: f64 = ps[PS_PZ];
+    let vx: f64 = ps[PS_VX];
+    let vy: f64 = ps[PS_VY];
+    let vz: f64 = ps[PS_VZ];
+    let grounded: i32 = 0;
+    if (ps[PS_GROUNDED] > 0.5) { grounded = 1; }
+
+    ps[PS_TICKS] = ps[PS_TICKS] + 1.0;
+
+    // =======================================================================
+    // 0. MANTLE — on rails, aim locked, everything else skipped (GDD §2.3)
+    // =======================================================================
+    let mant: f64 = ps[PS_MANTLE_T];
+    if (mant > 0.0) {
+        mant = mant - dt;
+        // The epsilon is load-bearing, not defensive. 0.35 s is exactly 21
+        // ticks, but subtracting 1/60 twenty-one times from 0.35 leaves a
+        // ~3e-17 residue in f64, which buys the vault a 22nd tick and turns
+        // the GDD's 0.35 s into a measured 0.367 s.
+        if (mant <= 0.000000001) {
+            px = ps[PS_MANTLE_TX];
+            py = ps[PS_MANTLE_TY];
+            pz = ps[PS_MANTLE_TZ];
+            vx = 0.0; vy = 0.0; vz = 0.0;
+            grounded = 1;
+            ps[PS_MANTLE_T] = 0.0;
+            ps[PS_COYOTE_T] = 0.0;
+            ps[PS_AIR_T] = 0.0;
+            ps[PS_FALL_PEAK] = py;          // GDD: no fall damage on a mantle
+            ev = ev | MOVE_EV_MANTLE_END;
+        } else {
+            // 0 at the start of the vault, 1 at the top of it.
+            let t: f64 = 1.0 - mant / g_MANTLE_TIME_S;
+            // Rise first (0 -> 0.6 of the window), translate second: the pull-up
+            // reads as a pull-up and the capsule never sweeps through the lip.
+            let tu: f64 = t / 0.6;
+            if (tu > 1.0) { tu = 1.0; }
+            let th: f64 = (t - 0.25) / 0.75;
+            if (th < 0.0) { th = 0.0; }
+            if (th > 1.0) { th = 1.0; }
+            let su: f64 = tu * tu * (3.0 - 2.0 * tu);
+            let sh: f64 = th * th * (3.0 - 2.0 * th);
+            px = ps[PS_MANTLE_SX] + (ps[PS_MANTLE_TX] - ps[PS_MANTLE_SX]) * sh;
+            py = ps[PS_MANTLE_SY] + (ps[PS_MANTLE_TY] - ps[PS_MANTLE_SY]) * su;
+            pz = ps[PS_MANTLE_SZ] + (ps[PS_MANTLE_TZ] - ps[PS_MANTLE_SZ]) * sh;
+            vx = 0.0; vy = 0.0; vz = 0.0;
+            grounded = 0;
+            ps[PS_MANTLE_T] = mant;
+        }
+        // Aim is LOCKED for the whole mantle: the command's angles are ignored.
+        ps[PS_PX] = px; ps[PS_PY] = py; ps[PS_PZ] = pz;
+        ps[PS_VX] = vx; ps[PS_VY] = vy; ps[PS_VZ] = vz;
+        ps[PS_YAW] = ps[PS_MANTLE_YAW];
+        ps[PS_PITCH] = ps[PS_MANTLE_PITCH];
+        ps[PS_GROUNDED] = f64(grounded);
+        let crm: f64 = ps[PS_CROUCH];
+        ps[PS_EYE] = g_EYE_STAND + (g_EYE_CROUCH - g_EYE_STAND) * crm;
+        let outm: i32 = ev;
+        return outm;
+    }
+
+    // =======================================================================
+    // 1. THE COMMAND.  Nine integers, already quantized (command.hml) — the
+    //    sim reads exactly what the wire carried, never the raw mouse.
+    // =======================================================================
+    let yaw: f64 = cmd_yaw(cmd);
+    let pitch: f64 = cmd_pitch(cmd);
+    let ax: f64 = cmd_move_x(cmd);          // strafe, + right
+    let az: f64 = cmd_move_y(cmd);          // forward, + forward
+    let b_jump: i32 = cmd_btn(cmd, BTN_JUMP);
+    let b_crouch: i32 = cmd_btn(cmd, BTN_CROUCH);
+    let b_sprint: i32 = cmd_btn(cmd, BTN_SPRINT);
+    let b_ads: i32 = cmd_btn(cmd, BTN_ADS);
+    ps[PS_YAW] = yaw;
+    ps[PS_PITCH] = pitch;
+
+    // Forward is (sin yaw, -cos yaw); right is (cos yaw, sin yaw). This is
+    // view.hml's basis (§view_build), and movement must not invent a second one.
+    let sy: f64 = sin(yaw);
+    let cy: f64 = cos(yaw);
+    let wx: f64 = sy * az + cy * ax;
+    let wz: f64 = (0.0 - cy) * az + sy * ax;
+    let wlen: f64 = sqrt(wx * wx + wz * wz);
+    let mag: f64 = wlen;
+    if (mag > 1.0) { mag = 1.0; }
+    if (wlen > g_MOVE_EPS) { wx = wx / wlen; wz = wz / wlen; } else { wx = 0.0; wz = 0.0; }
+
+    // ---- timers ----------------------------------------------------------
+    let slide_t: f64 = ps[PS_SLIDE_T];
+    let slide_cd: f64 = ps[PS_SLIDE_CD] - dt;
+    if (slide_cd < 0.0) { slide_cd = 0.0; }
+    let coyote: f64 = ps[PS_COYOTE_T];
+    let bhop: f64 = ps[PS_BHOP_T] - dt;
+    if (bhop < 0.0) { bhop = 0.0; }
+    let jbuf: f64 = ps[PS_JUMP_BUF_T] - dt;
+    if (jbuf < 0.0) { jbuf = 0.0; }
+
+    // ---- button edges ----------------------------------------------------
+    let jump_edge: i32 = 0;
+    if (b_jump == 1 && ps[PS_JUMP_HELD] < 0.5) { jump_edge = 1; }
+    ps[PS_JUMP_HELD] = f64(b_jump);
+    let crouch_edge: i32 = 0;
+    if (b_crouch == 1 && ps[PS_CROUCH_HELD] < 0.5) { crouch_edge = 1; }
+    ps[PS_CROUCH_HELD] = f64(b_crouch);
+    if (jump_edge == 1) { jbuf = MOVE_JUMPBUF_S; }
+
+    let speed: f64 = sqrt(vx * vx + vz * vz);
+
+    // =======================================================================
+    // 2. SLIDE START — GDD §2.3: crouch at >= 6.0 m/s bursts to 9.2 m/s.
+    //    Checked BEFORE the jump so crouch+jump on the same tick is a
+    //    slide-jump and not a crouch-jump. That ordering is the skill tech.
+    // =======================================================================
+    if (crouch_edge == 1 && grounded == 1 && slide_t <= 0.0 && slide_cd <= 0.0 &&
+        speed >= g_SLIDE_MIN_SPEED) {
+        let inv: f64 = 1.0 / speed;
+        let dx: f64 = vx * inv;
+        let dz: f64 = vz * inv;
+        ps[PS_SLIDE_DX] = dx;
+        ps[PS_SLIDE_DZ] = dz;
+        slide_t = g_SLIDE_TIME_S;
+        vx = dx * g_SLIDE_BURST;
+        vz = dz * g_SLIDE_BURST;
+        speed = g_SLIDE_BURST;
+        ev = ev | MOVE_EV_SLIDE_START;
+    }
+
+    // =======================================================================
+    // 3. JUMP.  Coyote time and the jump buffer both feed the same gate.
+    // =======================================================================
+    let can_jump: i32 = 0;
+    if (grounded == 1 || coyote > 0.0) { can_jump = 1; }
+    if (jbuf > 0.0 && can_jump == 1) {
+        if (slide_t > 0.0) {
+            // SLIDE-JUMP: keep 85 % of the CURRENT horizontal speed. Protect
+            // this. It is the one mechanic the movement skill ceiling rests on.
+            let keep: f64 = g_SLIDEJUMP_KEEP;
+            vx = vx * keep;
+            vz = vz * keep;
+            slide_t = 0.0;
+            slide_cd = g_SLIDE_CD_S;
+            ev = ev | MOVE_EV_SLIDEJUMP | MOVE_EV_SLIDE_END;
+        }
+        vy = g_JUMP_IMPULSE;
+        grounded = 0;
+        coyote = 0.0;
+        jbuf = 0.0;
+        bhop = 0.0;
+        ps[PS_AIR_T] = 0.0;
+        ps[PS_FALL_PEAK] = py;
+        ev = ev | MOVE_EV_JUMP;
+    }
+
+    // =======================================================================
+    // 4. HORIZONTAL VELOCITY: slide curve, or friction + acceleration.
+    // =======================================================================
+    if (slide_t > 0.0) {
+        // 9.2 -> 3.0 over 0.75 s, direction locked at the burst. The ramp is
+        // divided by (0.75 - dt), not 0.75, so the LAST tick of the slide is
+        // exactly 3.0 m/s: with the plain divisor the final applied sample is
+        // one step short (3.14 m/s) and the GDD's end speed never happens.
+        let u: f64 = (g_SLIDE_TIME_S - slide_t) / (g_SLIDE_TIME_S - dt);
+        if (u < 0.0) { u = 0.0; }
+        if (u > 1.0) { u = 1.0; }
+        let sp: f64 = g_SLIDE_BURST + (g_SLIDE_END_SPEED - g_SLIDE_BURST) * u;
+        vx = ps[PS_SLIDE_DX] * sp;
+        vz = ps[PS_SLIDE_DZ] * sp;
+        slide_t = slide_t - dt;
+        if (slide_t <= 0.0 || grounded == 0) {
+            slide_t = 0.0;
+            slide_cd = g_SLIDE_CD_S;
+            ev = ev | MOVE_EV_SLIDE_END;
+        }
+    } else {
+        // ---- wish speed (GDD §2.3 table) ---------------------------------
+        let wish: f64 = g_SPEED_WALK;
+        if (b_ads == 1) { wish = g_SPEED_ADS; }
+        if (b_crouch == 1) { wish = g_SPEED_CROUCH; }
+        // Sprint is a FORWARD cone of +-40 degrees, tested on the input axes:
+        // you may not sprint sideways or backwards.
+        let sprint_ok: i32 = 0;
+        if (b_sprint == 1 && b_crouch == 0 && b_ads == 0 && az > 0.0) {
+            let lx: f64 = ax;
+            if (lx < 0.0) { lx = 0.0 - lx; }
+            if (lx <= az * g_MOVE_SPRINT_TAN) { sprint_ok = 1; }
+        }
+        if (sprint_ok == 1) { wish = g_SPEED_SPRINT; }
+        wish = wish * mag;
+
+        if (grounded == 1) {
+            // Friction, unless we are inside the bhop window — the 0.10 s of
+            // forgiveness that makes a chained slide-jump land and leave with
+            // its speed intact instead of being taxed for one frame of ground
+            // contact.
+            if (bhop <= 0.0 && speed > 0.0) {
+                let ctl: f64 = speed;
+                if (ctl < MOVE_STOP_SPEED) { ctl = MOVE_STOP_SPEED; }
+                let drop: f64 = ctl * g_FRICTION_GROUND * dt;
+                let ns: f64 = speed - drop;
+                if (ns < 0.0) { ns = 0.0; }
+                let sc: f64 = ns / speed;
+                vx = vx * sc;
+                vz = vz * sc;
+            }
+            // Ground acceleration: 60 m/s^2 toward the wish direction, never
+            // past the wish speed along it (so it cannot cancel bhop speed).
+            let cur: f64 = vx * wx + vz * wz;
+            let add: f64 = wish - cur;
+            if (add > 0.0) {
+                let acc: f64 = g_ACCEL_GROUND * dt;
+                if (acc > add) { acc = add; }
+                vx = vx + wx * acc;
+                vz = vz + wz * acc;
+            }
+        } else {
+            // Air control: 0.35 x ground accel. Steers, never adds speed past
+            // the wish speed — that is what keeps a slide-jump's 7.8 m/s.
+            let cur2: f64 = vx * wx + vz * wz;
+            let add2: f64 = wish - cur2;
+            if (add2 > 0.0) {
+                let acc2: f64 = g_MOVE_ACCEL_AIR * dt;
+                if (acc2 > add2) { acc2 = add2; }
+                vx = vx + wx * acc2;
+                vz = vz + wz * acc2;
+            }
+        }
+    }
+
+    // Anti-runaway clamp. NOT a design speed: nothing in GDD §2.3 should ever
+    // reach it (the fastest designed state is the 9.2 m/s slide burst).
+    let hs: f64 = sqrt(vx * vx + vz * vz);
+    if (hs > MOVE_SPEED_CAP) {
+        let cl: f64 = MOVE_SPEED_CAP / hs;
+        vx = vx * cl;
+        vz = vz * cl;
+        hs = MOVE_SPEED_CAP;
+    }
+
+    // =======================================================================
+    // 5. HORIZONTAL SWEEP — substeps of <= 0.20 m, step-up, wall slide.
+    // =======================================================================
+    let body: f64 = g_HEIGHT_STAND + (g_HEIGHT_CROUCH - g_HEIGHT_STAND) * ps[PS_CROUCH];
+    let dx0: f64 = vx * dt;
+    let dz0: f64 = vz * dt;
+    let dist: f64 = sqrt(dx0 * dx0 + dz0 * dz0);
+    let blocked: i32 = 0;
+    let ledge_top: f64 = g_MOVE_NEG_INF;
+    let ledge_dx: f64 = 0.0;
+    let ledge_dz: f64 = 0.0;
+    let moved: f64 = 0.0;
+
+    if (dist > g_MOVE_EPS) {
+        let nsub: i32 = 1 + i32(dist / MOVE_SUBSTEP_M);
+        let stx: f64 = dx0 / f64(nsub);
+        let stz: f64 = dz0 / f64(nsub);
+        let idir: f64 = 1.0 / dist;
+        let dirx: f64 = dx0 * idir;
+        let dirz: f64 = dz0 * idir;
+        let k: i32 = 0;
+        while (k < nsub) {
+            let nx: f64 = px + stx;
+            let nz: f64 = pz + stz;
+            let lim: f64 = py + g_STEP_UP_M;
+            let sup: f64 = support_at(cs, sol, nx, nz, py, lim);
+            let obs: f64 = solid_obstruct(sol, nx, nz, py + g_STEP_UP_M, py + body);
+            let rise: f64 = sup - py;
+            if (rise <= g_STEP_UP_M && obs <= g_MOVE_NEG_INF) {
+                px = nx;
+                pz = nz;
+                moved = moved + sqrt(stx * stx + stz * stz);
+                if (grounded == 1 && rise > 0.0) {
+                    py = sup;
+                    ev = ev | MOVE_EV_STEP_UP;
+                }
+            } else {
+                // Blocked. Remember the lip for the mantle test, then try each
+                // axis alone so the capsule slides along the obstruction
+                // instead of sticking to it.
+                let lip: f64 = sup;
+                if (obs > lip) { lip = obs; }
+                if (lip > ledge_top) {
+                    ledge_top = lip;
+                    ledge_dx = dirx;
+                    ledge_dz = dirz;
+                }
+                blocked = 1;
+                let sxp: f64 = support_at(cs, sol, px + stx, pz, py, py + g_STEP_UP_M);
+                let oxp: f64 = solid_obstruct(sol, px + stx, pz, py + g_STEP_UP_M, py + body);
+                let okx: i32 = 0;
+                if (sxp - py <= g_STEP_UP_M && oxp <= g_MOVE_NEG_INF) { okx = 1; }
+                let szp: f64 = support_at(cs, sol, px, pz + stz, py, py + g_STEP_UP_M);
+                let ozp: f64 = solid_obstruct(sol, px, pz + stz, py + g_STEP_UP_M, py + body);
+                let okz: i32 = 0;
+                if (szp - py <= g_STEP_UP_M && ozp <= g_MOVE_NEG_INF) { okz = 1; }
+                if (okx == 1) {
+                    px = px + stx;
+                    if (grounded == 1 && sxp > py) { py = sxp; }
+                } else {
+                    vx = 0.0;
+                }
+                if (okz == 1) {
+                    pz = pz + stz;
+                    if (grounded == 1 && szp > py) { py = szp; }
+                } else {
+                    vz = 0.0;
+                }
+                if (okx == 0 && okz == 0) { k = nsub; }
+            }
+            k++;
+        }
+    }
+    if (blocked == 1) { ev = ev | MOVE_EV_BLOCKED; }
+
+    // =======================================================================
+    // 6. MANTLE TEST.  A blocked move whose lip sits 0.6-1.4 m above the feet
+    //    and has something standable behind it is a vault. Jump takes it
+    //    instantly; holding into it takes it after 0.12 s.
+    // =======================================================================
+    let ledge_t: f64 = ps[PS_LEDGE_T];
+    let started_mantle: i32 = 0;
+    if (blocked == 1 && ledge_top > g_MOVE_NEG_INF) {
+        // The GDD's 0.6-1.4 m window is INCLUSIVE at both ends, so the test
+        // carries an epsilon: a 0.60 m ledge computes as 0.5999999999999996
+        // and an exclusive compare would make the stated boundary a lie.
+        let rise2: f64 = ledge_top - py;
+        if (rise2 >= g_MANTLE_MIN_M - 0.000001 && rise2 <= g_MANTLE_MAX_M + 0.000001) {
+            // Where we would end up: past the lip by radius + clearance.
+            let reach: f64 = g_CAPSULE_RADIUS + MOVE_MANTLE_CLEAR_M;
+            let tx: f64 = px + ledge_dx * reach;
+            let tz: f64 = pz + ledge_dz * reach;
+            let tsup: f64 = support_at(cs, sol, tx, tz, ledge_top, ledge_top + 0.05);
+            let flat: f64 = tsup - ledge_top;
+            if (flat < 0.0) { flat = 0.0 - flat; }
+            let head: f64 = solid_ceiling(sol, tx, tz, tsup + g_MOVE_EPS);
+            let clear: i32 = 1;
+            if (head > g_MOVE_NEG_INF && head < tsup + g_HEIGHT_CROUCH) { clear = 0; }
+            // The top must be a SHELF, not the flank of a ramp: no more than a
+            // step-up of drift over the landing point.
+            if (flat <= g_STEP_UP_M && clear == 1) {
+                ledge_t = ledge_t + dt;
+                if (jump_edge == 1 || ledge_t >= MOVE_MANTLE_AUTO_S) {
+                    ps[PS_MANTLE_SX] = px;
+                    ps[PS_MANTLE_SY] = py;
+                    ps[PS_MANTLE_SZ] = pz;
+                    ps[PS_MANTLE_TX] = tx;
+                    ps[PS_MANTLE_TY] = tsup;
+                    ps[PS_MANTLE_TZ] = tz;
+                    ps[PS_MANTLE_YAW] = yaw;
+                    ps[PS_MANTLE_PITCH] = pitch;
+                    ps[PS_MANTLE_T] = g_MANTLE_TIME_S;
+                    ps[PS_LEDGE_T] = 0.0;
+                    vx = 0.0; vy = 0.0; vz = 0.0;
+                    grounded = 0;
+                    slide_t = 0.0;
+                    started_mantle = 1;
+                    ev = ev | MOVE_EV_MANTLE_START;
+                }
+            } else {
+                ledge_t = 0.0;
+            }
+        } else {
+            ledge_t = 0.0;
+        }
+    } else {
+        ledge_t = 0.0;
+    }
+    ps[PS_LEDGE_T] = ledge_t;
+
+    // =======================================================================
+    // 7. VERTICAL — trapezoidal gravity, ground snap, landing, fall damage.
+    // =======================================================================
+    if (started_mantle == 0) {
+        if (grounded == 1) {
+            // Glued to the ground: follow a descending slope down to
+            // MOVE_SNAP_DOWN_M rather than launching off every dip, which
+            // would otherwise fire a landing (and a slope boost) every tick.
+            let sup2: f64 = support_at(cs, sol, px, pz, py, py + g_STEP_UP_M);
+            let drop2: f64 = py - sup2;
+            if (drop2 <= MOVE_SNAP_DOWN_M) {
+                py = sup2;
+                vy = 0.0;
+                ps[PS_AIR_T] = 0.0;
+                ps[PS_FALL_PEAK] = py;
+                coyote = MOVE_COYOTE_S;
+            } else {
+                grounded = 0;
+                vy = 0.0;
+                ps[PS_FALL_PEAK] = py;
+                coyote = MOVE_COYOTE_S;   // walked off an edge: the grace starts here
+            }
+        }
+        if (grounded == 0) {
+            let py0: f64 = py;
+            let vy1: f64 = vy - g_GRAVITY * dt;
+            py = py + 0.5 * (vy + vy1) * dt;
+            vy = vy1;
+            ps[PS_AIR_T] = ps[PS_AIR_T] + dt;
+            if (coyote > 0.0) {
+                coyote = coyote - dt;
+                if (coyote < 0.0) { coyote = 0.0; }
+            }
+            if (py > ps[PS_FALL_PEAK]) { ps[PS_FALL_PEAK] = py; }
+
+            // Head bump against a solid ceiling.
+            if (vy > 0.0) {
+                let ceil: f64 = solid_ceiling(sol, px, pz, py0 + body);
+                if (ceil > g_MOVE_NEG_INF && ceil <= py + body) {
+                    py = ceil - body;
+                    vy = 0.0;
+                }
+            }
+
+            // Landing.
+            let sup3: f64 = support_at(cs, sol, px, pz, py0, py0 + g_MOVE_EPS);
+            if (py <= sup3) {
+                py = sup3;
+                grounded = 1;
+                ps[PS_LAND_VY] = vy;
+                let fall: f64 = ps[PS_FALL_PEAK] - py;
+                if (fall > g_FALL_FREE_M) {
+                    ps[PS_FALL_DMG] = ps[PS_FALL_DMG] + (fall - g_FALL_FREE_M) * g_FALL_DMG_PER_M;
+                    ev = ev | MOVE_EV_FALL_DMG;
+                }
+                // Slope projection: kill only the INTO-surface component, so
+                // arriving on a downslope converts descent into speed instead
+                // of throwing it away. This is what makes a chained slide-jump
+                // gain downhill, and it is exactly zero on flat ground.
+                chunk_normal_at(cs, px, pz, g_move_nrm);
+                let nx2: f64 = g_move_nrm[0];
+                let ny2: f64 = g_move_nrm[1];
+                let nz2: f64 = g_move_nrm[2];
+                let vdn: f64 = vx * nx2 + vy * ny2 + vz * nz2;
+                if (vdn < 0.0) {
+                    vx = vx - nx2 * vdn;
+                    vz = vz - nz2 * vdn;
+                }
+                vy = 0.0;
+                let hs2: f64 = sqrt(vx * vx + vz * vz);
+                if (hs2 > MOVE_SPEED_CAP) {
+                    let cl2: f64 = MOVE_SPEED_CAP / hs2;
+                    vx = vx * cl2;
+                    vz = vz * cl2;
+                }
+                ps[PS_AIR_T] = 0.0;
+                ps[PS_FALL_PEAK] = py;
+                coyote = 0.0;
+                bhop = MOVE_BHOP_S;        // the window opens on contact
+                ev = ev | MOVE_EV_LAND;
+            }
+        }
+    }
+
+    // =======================================================================
+    // 8. STANCE, EYE, FOOTSTEPS
+    // =======================================================================
+    let cr: f64 = ps[PS_CROUCH];
+    let want_cr: i32 = 0;
+    if (b_crouch == 1 || slide_t > 0.0) { want_cr = 1; }
+    let cstep: f64 = dt / g_CROUCH_TIME_S;
+    if (want_cr == 1) { cr = cr + cstep; } else { cr = cr - cstep; }
+    if (cr < 0.0) { cr = 0.0; }
+    if (cr > 1.0) { cr = 1.0; }
+    ps[PS_CROUCH] = cr;
+    let eye_lo: f64 = g_EYE_CROUCH;
+    if (slide_t > 0.0) { eye_lo = g_SLIDE_EYE; }
+    ps[PS_EYE] = g_EYE_STAND + (eye_lo - g_EYE_STAND) * cr;
+
+    if (grounded == 1 && moved > 0.0) {
+        let sd: f64 = ps[PS_STEP_DIST] + moved;
+        if (sd >= g_MOVE_STEP_M) {
+            sd = sd - g_MOVE_STEP_M;
+            ev = ev | MOVE_EV_STEP;
+        }
+        ps[PS_STEP_DIST] = sd;
+    }
+    if (grounded == 0) { ps[PS_STEP_DIST] = 0.0; }
+
+    // ---- write back -------------------------------------------------------
+    ps[PS_PX] = px;
+    ps[PS_PY] = py;
+    ps[PS_PZ] = pz;
+    ps[PS_VX] = vx;
+    ps[PS_VY] = vy;
+    ps[PS_VZ] = vz;
+    ps[PS_GROUNDED] = f64(grounded);
+    ps[PS_SLIDE_T] = slide_t;
+    ps[PS_SLIDE_CD] = slide_cd;
+    ps[PS_COYOTE_T] = coyote;
+    ps[PS_JUMP_BUF_T] = jbuf;
+    ps[PS_BHOP_T] = bhop;
+
+    let out: i32 = ev;
+    return out;
+}
+
+// ===========================================================================
+//  WORLD BRIDGE
+// ===========================================================================
+//  `world.hml` owns the replicated transform; `PredictedState` owns the
+//  movement variables that never go on the wire. These two functions are the
+//  only place the two meet, and they hoist the field arrays exactly as
+//  ARCHITECTURE §5.4 requires (never annotate the hoist).
+
+export fn move_from_world(p_w: object, p_slot: i32, p_ps: array<f64>): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    let ps = p_ps;
+    if (s < 0) { return 0; }
+    let pxa = w.px; let pya = w.py; let pza = w.pz;
+    let vxa = w.vx; let vya = w.vy; let vza = w.vz;
+    let ya = w.yaw; let pa = w.pitch; let fl = w.flags;
+    ps[PS_PX] = pxa[s]; ps[PS_PY] = pya[s]; ps[PS_PZ] = pza[s];
+    ps[PS_VX] = vxa[s]; ps[PS_VY] = vya[s]; ps[PS_VZ] = vza[s];
+    ps[PS_YAW] = ya[s]; ps[PS_PITCH] = pa[s];
+    let g: i32 = 0;
+    if ((fl[s] & EF_GROUNDED) != 0) { g = 1; }
+    ps[PS_GROUNDED] = f64(g);
+    let out: i32 = 1;
+    return out;
+}
+
+export fn move_to_world(p_w: object, p_slot: i32, p_ps: array<f64>): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    let ps = p_ps;
+    if (s < 0) { return 0; }
+    let pxa = w.px; let pya = w.py; let pza = w.pz;
+    let vxa = w.vx; let vya = w.vy; let vza = w.vz;
+    let ya = w.yaw; let pa = w.pitch; let fl = w.flags;
+    pxa[s] = ps[PS_PX]; pya[s] = ps[PS_PY]; pza[s] = ps[PS_PZ];
+    vxa[s] = ps[PS_VX]; vya[s] = ps[PS_VY]; vza[s] = ps[PS_VZ];
+    ya[s] = ps[PS_YAW]; pa[s] = ps[PS_PITCH];
+    let f2: i32 = fl[s] & (0 - 1 - EF_GROUNDED);
+    if (ps[PS_GROUNDED] > 0.5) { f2 = f2 | EF_GROUNDED; }
+    fl[s] = f2;
+    let out: i32 = 1;
+    return out;
+}

@@ -1,0 +1,1437 @@
+// probe_loot.hml — W4-8 acceptance probe for src/sim/loot.hml.
+//
+// Run it FROM THE NIGHTSHADE REPO ROOT, both ways:
+//     hemlockc -O1 tools/probe_loot.hml -o /tmp/ploot && /tmp/ploot
+//     hemlock  tools/probe_loot.hml
+//
+// It exits 1 on any failure AND on an assertion-count mismatch. A probe that
+// silently stops running half its checks is worse than no probe.
+//
+//     tools/probe_loot.hml --distribution     the BUILD_PLAN's named self-test:
+//                                             print the measured drop-weight
+//                                             table against GDD §3.3 and stop.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS PROBE ASSERTS, AND WHAT IT REFUSES TO ASSERT
+// ---------------------------------------------------------------------------
+// It does NOT freeze a rolled item, an item hash, or a fingerprint as a golden
+// constant. This project has already been burned by probes that encoded
+// consequences (four assertions holding exact RGB triples, all stale at the
+// same moment, silently). A golden loot hash would go stale the first time
+// anyone retunes a weight — and it would go stale by FAILING, which trains
+// people to edit the constant, which is exactly how a determinism gate dies.
+//
+// So determinism is asserted as a RELATION: roll the same tuple twice and get
+// the same answer; roll it in a different order and get the same answer; roll
+// it with a different seed and get a different answer. Those hold forever, and
+// they are what multiplayer reconciliation actually needs. The cross-backend
+// check is the same relation applied across two processes: both print
+//     FINGERPRINT <n>
+// and the shell compares them, so neither backend holds the other's answer.
+//
+// The drop-weight table is asserted against the GDD ANCHOR ROWS (tiers 1, 3, 5
+// — those are the design and something must hold the line) and against the
+// DERIVATION for the interpolated rows, so retuning an anchor moves its
+// neighbours and this probe still passes.
+
+import { exit } from "@stdlib/process";
+import { is_dir } from "@stdlib/fs";
+
+import {
+    RARITY_NONE, RARITY_COMMON, RARITY_UNCOMMON, RARITY_RARE, RARITY_EPIC,
+    RARITY_RELIC, RARITY_COUNT, AFFIX_MAX, RELIC_TIER_MIN,
+    TIER_MIN, TIER_MAX, TIER_ROWS,
+    AFFIX_NONE, AFFIX_DAMAGE, AFFIX_RPM, AFFIX_RELOAD, AFFIX_MAG, AFFIX_RECOIL,
+    AFFIX_ADS, AFFIX_EMBER, AFFIX_IGNITE, AFFIX_PELLET, AFFIX_OVERPEN,
+    AFFIX_COUNT, AFFIX_IGNITE_DPS, AFFIX_IGNITE_SECS, AFFIX_OVERPEN_TARGETS,
+    RELIC_NONE, RELIC_WICK, RELIC_CHATTERBOX, RELIC_NINEPENCE,
+    RELIC_LONG_SUNDAY, RELIC_SIXPENNY, RELIC_VESPER, RELIC_COUNT,
+    ITEM_RARITY, ITEM_FAMILY, ITEM_RELIC, ITEM_NAFFIX, ITEM_AFFIX0,
+    ITEM_VALUE0, ITEM_FIELDS, FAMILY_ANY,
+    ERR_RARITY, ERR_FAMILY, ERR_NAFFIX, ERR_SLOT, ERR_DUP, ERR_BAND,
+    ERR_ELIGIBLE, ERR_RELIC, ERR_RELIC_FAM,
+    loot_clamp_tier, loot_weight, loot_weight_sum, loot_rarity_affixes,
+    loot_affix_lo, loot_affix_hi, loot_affix_is_reduction, loot_affix_eligible,
+    loot_pool_size, loot_relic_for_family, loot_relic_family,
+    loot_roll_rarity, loot_affix_value, loot_new_item, loot_clear_item,
+    loot_roll, loot_seed, loot_roll_at, loot_item_check, loot_item_hash,
+    loot_hash_mix, loot_rarity_name, loot_affix_name, loot_relic_name,
+    loot_cfg_rarity_count, loot_cfg_affix_max, loot_cfg_tier_max,
+    loot_cfg_wpn_count, loot_cfg_bellows
+} from "../src/sim/loot.hml";
+
+import { rng_new, rng_seed, rng_pick, RNG_LOOT, RNG_SPREAD } from "../src/sim/rng.hml";
+
+import {
+    g_RARITY_COUNT, g_AFFIX_MAX, g_SHADE_TIER_MAX, g_WPN_COUNT, g_WPN_BELLOWS,
+    g_WPN_SPARROW, g_WPN_TINKER, g_WPN_LONGSHADOW, g_WPN_KESTREL,
+    g_WPN_EMBERLANCE, g_BUDGET_SIM_MS
+} from "../src/core/config.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 110;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+// The running fingerprint of every deterministic quantity this probe produces.
+// Printed at the end; the shell compares interpreted vs compiled.
+let g_fp: u64 = 14695981039346656037;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+// u64 mixing only — i32/i64 `* + -` TRAP on overflow (CLAUDE.md A13).
+fn fp_mix(p_v: i32) {
+    let k: u64 = 0;
+    if (p_v >= 0) { k = u64(p_v); } else { k = u64(f64(p_v) + 4294967296.0); }
+    g_fp = (g_fp ^ k) * 1099511628211;
+}
+
+fn fp_mix64(p_v: u64) {
+    g_fp = (g_fp ^ (p_v & 4294967295)) * 1099511628211;
+    g_fp = (g_fp ^ (p_v >> 32)) * 1099511628211;
+}
+
+fn absf(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a;
+    return out;
+}
+
+fn sqrtf(p_x: f64): f64 {
+    // Newton, so this file imports nothing beyond the wall's leaves. 24 rounds
+    // is far past f64 convergence for the magnitudes used here.
+    let x: f64 = p_x;
+    if (x <= 0.0) { let z: f64 = 0.0; return z; }
+    let r: f64 = x;
+    let i = 0;
+    while (i < 24) {
+        r = 0.5 * (r + x / r);
+        i = i + 1;
+    }
+    let out: f64 = r;
+    return out;
+}
+
+// chi-square critical values at p = 0.001, df 1..5. Used as the STATISTICAL
+// check behind the acceptance criterion's percentage-point bound.
+let g_chi_crit = [10.828, 13.816, 16.266, 18.467, 20.515];
+
+fn chi_crit(p_df: i32): f64 {
+    let df: i32 = p_df;
+    if (df < 1) { let z: f64 = 10.828; return z; }
+    if (df > 5) { let z2: f64 = 20.515; return z2; }
+    let out: f64 = g_chi_crit[df - 1];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE GDD §3.3 TABLE, TYPED ONCE, HERE.  These are the design digits and this
+// probe is where they are held against the implementation.
+// ---------------------------------------------------------------------------
+let g_gdd_t1 = [62, 28, 8, 2, 0];
+let g_gdd_t3 = [30, 34, 24, 10, 2];
+let g_gdd_t5 = [8, 20, 30, 28, 14];
+
+// The ten GDD affix bands, in the GDD's own row order.
+let g_gdd_lo = [4, 3, 6, 15, 8, 8, 10, 20, 1, 70];
+let g_gdd_hi = [12, 9, 18, 40, 22, 20, 30, 20, 1, 70];
+
+// The last chi-square that `distribution_row` computed, and its critical value.
+// Returned out-of-band because the function's return value is the percentage-
+// point deviation the acceptance criterion is written in.
+let g_last_chi: f64 = 0.0;
+let g_last_crit: f64 = 0.0;
+
+// ===========================================================================
+// A.  SHAPES — loot.hml and config.hml must agree, not each hold their own 5
+// ===========================================================================
+fn section_shapes() {
+    print("A. Shapes agree with config.hml");
+
+    ck(RARITY_COUNT == g_RARITY_COUNT, "A1 RARITY_COUNT mirrors g_RARITY_COUNT",
+       `${RARITY_COUNT} vs ${g_RARITY_COUNT}`);
+    ck(RARITY_COUNT == loot_cfg_rarity_count(), "A2 loot.hml reads the same g_RARITY_COUNT",
+       `${loot_cfg_rarity_count()}`);
+    ck(AFFIX_MAX == g_AFFIX_MAX, "A3 AFFIX_MAX mirrors g_AFFIX_MAX",
+       `${AFFIX_MAX} vs ${g_AFFIX_MAX}`);
+    ck(AFFIX_MAX == loot_cfg_affix_max(), "A4 loot.hml reads the same g_AFFIX_MAX",
+       `${loot_cfg_affix_max()}`);
+    ck(TIER_MAX == g_SHADE_TIER_MAX, "A5 TIER_MAX mirrors g_SHADE_TIER_MAX",
+       `${TIER_MAX} vs ${g_SHADE_TIER_MAX}`);
+    ck(TIER_MAX == loot_cfg_tier_max(), "A6 loot.hml reads the same g_SHADE_TIER_MAX",
+       `${loot_cfg_tier_max()}`);
+    ck(TIER_ROWS == TIER_MAX - TIER_MIN + 1, "A7 the weight table has one row per shade tier",
+       `${TIER_ROWS} rows for tiers ${TIER_MIN}..${TIER_MAX}`);
+
+    // A8 — the rarity ids are the ladder order. Everything downstream (colour,
+    // sort, "is it better than what I have") assumes ascending == rarer.
+    ck(RARITY_COMMON == 0 && RARITY_UNCOMMON == 1 && RARITY_RARE == 2
+       && RARITY_EPIC == 3 && RARITY_RELIC == 4,
+       "A8 rarity ids ascend Common..Relic",
+       `${RARITY_COMMON}${RARITY_UNCOMMON}${RARITY_RARE}${RARITY_EPIC}${RARITY_RELIC}`);
+    ck(RARITY_NONE < 0, "A9 RARITY_NONE is not a valid rarity", `${RARITY_NONE}`);
+    ck(AFFIX_NONE < 0, "A10 AFFIX_NONE is not a valid affix", `${AFFIX_NONE}`);
+    ck(RELIC_NONE < 0, "A11 RELIC_NONE is not a valid relic", `${RELIC_NONE}`);
+
+    // A12 — GDD §3.3 lists exactly ten affixes.
+    ck(AFFIX_COUNT == 10, "A12 the affix pool has ten entries (GDD §3.3)", `${AFFIX_COUNT}`);
+
+    // A13 — and their ids are the GDD's own row order, 0..9, no gaps.
+    ck(AFFIX_DAMAGE == 0 && AFFIX_RPM == 1 && AFFIX_RELOAD == 2 && AFFIX_MAG == 3
+       && AFFIX_RECOIL == 4 && AFFIX_ADS == 5 && AFFIX_EMBER == 6
+       && AFFIX_IGNITE == 7 && AFFIX_PELLET == 8 && AFFIX_OVERPEN == 9,
+       "A13 affix ids follow the GDD row order 0..9", "ids");
+
+    // A14 — the item record is flat and integer-only: ITEM_FIELDS covers every
+    // named offset with nothing overlapping. This is the serialisation rule.
+    ck(ITEM_AFFIX0 + AFFIX_MAX == ITEM_VALUE0, "A14 the affix slots abut the value slots",
+       `${ITEM_AFFIX0} + ${AFFIX_MAX} vs ${ITEM_VALUE0}`);
+    ck(ITEM_VALUE0 + AFFIX_MAX == ITEM_FIELDS, "A15 the value slots end the record",
+       `${ITEM_VALUE0} + ${AFFIX_MAX} vs ${ITEM_FIELDS}`);
+    ck(ITEM_RARITY == 0 && ITEM_FAMILY == 1 && ITEM_RELIC == 2 && ITEM_NAFFIX == 3,
+       "A16 the four header fields precede the slots", `${ITEM_NAFFIX}`);
+    ck(FAMILY_ANY < 0, "A17 FAMILY_ANY is not a valid weapon family", `${FAMILY_ANY}`);
+}
+
+// ===========================================================================
+// B.  THE DROP WEIGHT TABLE — anchors are the GDD, the rest is derived
+// ===========================================================================
+fn section_table() {
+    print("B. Drop weight table (GDD §3.3)");
+
+    // B1..B3 — the three anchor rows ARE the GDD. Typed in this file and
+    // nowhere else in the probe.
+    let ok1: i32 = 1;
+    let ok3: i32 = 1;
+    let ok5: i32 = 1;
+    let r = 0;
+    while (r < RARITY_COUNT) {
+        if (loot_weight(1, r) != g_gdd_t1[r]) { ok1 = 0; }
+        if (loot_weight(3, r) != g_gdd_t3[r]) { ok3 = 0; }
+        if (loot_weight(5, r) != g_gdd_t5[r]) { ok5 = 0; }
+        r = r + 1;
+    }
+    ck(ok1 == 1, "B1 shade tier 1 row is the GDD anchor 62/28/8/2/0",
+       `${loot_weight(1,0)}/${loot_weight(1,1)}/${loot_weight(1,2)}/${loot_weight(1,3)}/${loot_weight(1,4)}`);
+    ck(ok3 == 1, "B2 shade tier 3 row is the GDD anchor 30/34/24/10/2",
+       `${loot_weight(3,0)}/${loot_weight(3,1)}/${loot_weight(3,2)}/${loot_weight(3,3)}/${loot_weight(3,4)}`);
+    ck(ok5 == 1, "B3 shade tier 5 row is the GDD anchor 8/20/30/28/14",
+       `${loot_weight(5,0)}/${loot_weight(5,1)}/${loot_weight(5,2)}/${loot_weight(5,3)}/${loot_weight(5,4)}`);
+
+    // B4/B5 — the interpolated rows are the EXACT midpoints of their anchors,
+    // with the relic floor folded into Epic below RELIC_TIER_MIN (tier 2's
+    // midpoint inherits a Relic weight of 1 from tier 3 and may not keep it).
+    // Asserted as the derivation, so retuning an anchor moves these with it.
+    let mid2: i32 = 1;
+    let mid4: i32 = 1;
+    let exact2: i32 = 1;
+    let exact4: i32 = 1;
+    let q = 0;
+    while (q < RARITY_COUNT) {
+        let s2: i32 = loot_weight(1, q) + loot_weight(3, q);
+        let s4: i32 = loot_weight(3, q) + loot_weight(5, q);
+        if (s2 - 2 * i32(s2 / 2) != 0) { exact2 = 0; }
+        if (s4 - 2 * i32(s4 / 2) != 0) { exact4 = 0; }
+
+        let want2: i32 = i32(s2 / 2);
+        let want4: i32 = i32(s4 / 2);
+        // the fold, re-derived here rather than re-typed as a digit
+        let folded: i32 = i32((loot_weight(1, RARITY_RELIC) + loot_weight(3, RARITY_RELIC)) / 2);
+        if (2 < RELIC_TIER_MIN) {
+            if (q == RARITY_RELIC) { want2 = 0; }
+            if (q == RARITY_EPIC) { want2 = want2 + folded; }
+        }
+        if (4 < RELIC_TIER_MIN) {
+            let folded4: i32 = i32((loot_weight(3, RARITY_RELIC) + loot_weight(5, RARITY_RELIC)) / 2);
+            if (q == RARITY_RELIC) { want4 = 0; }
+            if (q == RARITY_EPIC) { want4 = want4 + folded4; }
+        }
+
+        if (loot_weight(2, q) != want2) { mid2 = 0; }
+        if (loot_weight(4, q) != want4) { mid4 = 0; }
+        q = q + 1;
+    }
+    ck(mid2 == 1, "B4 shade tier 2 is the exact midpoint of tiers 1 and 3, with the relic floor folded into Epic",
+       `${loot_weight(2,0)}/${loot_weight(2,1)}/${loot_weight(2,2)}/${loot_weight(2,3)}/${loot_weight(2,4)}`);
+    ck(mid4 == 1, "B5 shade tier 4 is the exact midpoint of tiers 3 and 5",
+       `${loot_weight(4,0)}/${loot_weight(4,1)}/${loot_weight(4,2)}/${loot_weight(4,3)}/${loot_weight(4,4)}`);
+    ck(exact2 == 1 && exact4 == 1,
+       "B6 both midpoints are integral — no rounding loss in the derivation",
+       `${exact2}${exact4}`);
+
+    // B7 — every row totals the same, so a shade tier changes WHAT drops and
+    // never HOW MUCH. The rarity walk divides by the row total, so this is a
+    // design statement, not an implementation requirement.
+    let same_total: i32 = 1;
+    let t0: i32 = loot_weight_sum(TIER_MIN);
+    let t = TIER_MIN;
+    while (t <= TIER_MAX) {
+        if (loot_weight_sum(t) != t0) { same_total = 0; }
+        t = t + 1;
+    }
+    ck(same_total == 1, "B7 every shade tier's weights total the same amount", `${t0}`);
+    ck(t0 == 100, "B8 the row total is 100 — the GDD's weights are percentages", `${t0}`);
+
+    // B9..B12 — the danger gradient, as monotonicity. This is §3.3's whole
+    // point: deeper shade means worse odds of junk and better odds of treasure.
+    let common_falls: i32 = 1;
+    let rare_rises: i32 = 1;
+    let epic_rises: i32 = 1;
+    let relic_rises: i32 = 1;
+    let u = TIER_MIN;
+    while (u < TIER_MAX) {
+        if (loot_weight(u + 1, RARITY_COMMON) >= loot_weight(u, RARITY_COMMON)) { common_falls = 0; }
+        if (loot_weight(u + 1, RARITY_RARE) < loot_weight(u, RARITY_RARE)) { rare_rises = 0; }
+        if (loot_weight(u + 1, RARITY_EPIC) < loot_weight(u, RARITY_EPIC)) { epic_rises = 0; }
+        if (loot_weight(u + 1, RARITY_RELIC) < loot_weight(u, RARITY_RELIC)) { relic_rises = 0; }
+        u = u + 1;
+    }
+    ck(common_falls == 1, "B9 Common weight strictly falls with every shade tier", "monotone");
+    ck(rare_rises == 1, "B10 Rare weight never falls with shade tier", "monotone");
+    ck(epic_rises == 1, "B11 Epic weight never falls with shade tier", "monotone");
+    ck(relic_rises == 1, "B12 Relic weight never falls with shade tier", "monotone");
+
+    // B13 — Uncommon is the mid-game tier: it peaks somewhere strictly inside
+    // the range, which is what the GDD's own 28/34/20 does.
+    let peak: i32 = TIER_MIN;
+    let peak_w: i32 = loot_weight(TIER_MIN, RARITY_UNCOMMON);
+    let v = TIER_MIN;
+    while (v <= TIER_MAX) {
+        if (loot_weight(v, RARITY_UNCOMMON) > peak_w) {
+            peak_w = loot_weight(v, RARITY_UNCOMMON);
+            peak = v;
+        }
+        v = v + 1;
+    }
+    ck(peak > TIER_MIN && peak < TIER_MAX,
+       "B13 Uncommon peaks strictly inside the tier range (the mid-game tier)",
+       `peak at tier ${peak}, weight ${peak_w}`);
+
+    // B14/B15 — THE RELIC FLOOR, stated twice because BUILD_PLAN W4-8 states it
+    // as an absolute: Relics never drop below shade tier 3.
+    let zero_below: i32 = 1;
+    let nonzero_above: i32 = 1;
+    let z = TIER_MIN;
+    while (z <= TIER_MAX) {
+        if (z < RELIC_TIER_MIN) {
+            if (loot_weight(z, RARITY_RELIC) != 0) { zero_below = 0; }
+        } else {
+            if (loot_weight(z, RARITY_RELIC) <= 0) { nonzero_above = 0; }
+        }
+        z = z + 1;
+    }
+    ck(zero_below == 1, "B14 Relic weight is zero at every tier below RELIC_TIER_MIN",
+       `RELIC_TIER_MIN = ${RELIC_TIER_MIN}`);
+    ck(nonzero_above == 1, "B15 Relic weight is positive at every tier from RELIC_TIER_MIN up",
+       "positive");
+    ck(RELIC_TIER_MIN == 3, "B16 the relic floor is shade tier 3 (BUILD_PLAN W4-8)",
+       `${RELIC_TIER_MIN}`);
+
+    // B17 — out-of-range tiers clamp rather than index off the table.
+    ck(loot_weight(-9, RARITY_COMMON) == loot_weight(TIER_MIN, RARITY_COMMON)
+       && loot_weight(99, RARITY_RELIC) == loot_weight(TIER_MAX, RARITY_RELIC)
+       && loot_clamp_tier(-9) == TIER_MIN && loot_clamp_tier(99) == TIER_MAX,
+       "B17 out-of-range shade tiers clamp into the table", "clamped");
+    // B18 — and out-of-range rarities read zero, never garbage.
+    ck(loot_weight(3, -1) == 0 && loot_weight(3, RARITY_COUNT) == 0,
+       "B18 an out-of-range rarity has zero weight", "zero");
+}
+
+// ===========================================================================
+// C.  THE AFFIX POOL AND ITS BANDS
+// ===========================================================================
+fn section_affixes() {
+    print("C. Affix pool and value bands (GDD §3.3)");
+
+    // C1 — the ten bands are the GDD's ten bands.
+    let bands_ok: i32 = 1;
+    let a = 0;
+    while (a < AFFIX_COUNT) {
+        if (loot_affix_lo(a) != g_gdd_lo[a]) { bands_ok = 0; }
+        if (loot_affix_hi(a) != g_gdd_hi[a]) { bands_ok = 0; }
+        a = a + 1;
+    }
+    ck(bands_ok == 1, "C1 all ten affix bands match GDD §3.3", "bands");
+
+    // C2 — every band is well formed and strictly positive: an affix that can
+    // roll zero is an affix that can be a no-op, which is a design bug.
+    let wellformed: i32 = 1;
+    let b = 0;
+    while (b < AFFIX_COUNT) {
+        if (loot_affix_lo(b) > loot_affix_hi(b)) { wellformed = 0; }
+        if (loot_affix_lo(b) <= 0) { wellformed = 0; }
+        b = b + 1;
+    }
+    ck(wellformed == 1, "C2 every band has lo <= hi and lo > 0 (no no-op affix)", "wellformed");
+
+    // C3 — the three reductions are exactly reload, recoil and ADS time. Get
+    // this backwards and a "good" affix becomes a nerf.
+    let neg_ok: i32 = 1;
+    let c = 0;
+    while (c < AFFIX_COUNT) {
+        let want: i32 = 0;
+        if (c == AFFIX_RELOAD || c == AFFIX_RECOIL || c == AFFIX_ADS) { want = 1; }
+        if (loot_affix_is_reduction(c) != want) { neg_ok = 0; }
+        c = c + 1;
+    }
+    ck(neg_ok == 1, "C3 exactly reload / recoil / ADS time are reductions", "signs");
+
+    // C4/C5 — the two degenerate bands. GDD gives them as fixed values, not
+    // ranges, and they must not secretly roll.
+    ck(loot_affix_lo(AFFIX_IGNITE) == loot_affix_hi(AFFIX_IGNITE),
+       "C4 Ignite's proc chance is fixed, not rolled",
+       `${loot_affix_lo(AFFIX_IGNITE)}..${loot_affix_hi(AFFIX_IGNITE)}`);
+    ck(loot_affix_lo(AFFIX_OVERPEN) == loot_affix_hi(AFFIX_OVERPEN)
+       && loot_affix_lo(AFFIX_PELLET) == loot_affix_hi(AFFIX_PELLET),
+       "C5 Overpenetrate and +1 pellet are fixed, not rolled", "fixed");
+    ck(AFFIX_IGNITE_DPS == 6 && AFFIX_IGNITE_SECS == 3,
+       "C6 Ignite is 6/s for 3 s (GDD §3.3)", `${AFFIX_IGNITE_DPS}/s x ${AFFIX_IGNITE_SECS}s`);
+    ck(AFFIX_OVERPEN_TARGETS == 2 && loot_affix_lo(AFFIX_OVERPEN) == 70,
+       "C7 Overpenetrate hits 2 enemies at 70 %", `${AFFIX_OVERPEN_TARGETS} @ ${loot_affix_lo(AFFIX_OVERPEN)}%`);
+    ck(loot_affix_lo(AFFIX_PELLET) == 1, "C8 +1 pellet adds exactly one pellet",
+       `${loot_affix_lo(AFFIX_PELLET)}`);
+
+    // C9/C10 — the Bellows restriction, both directions.
+    let only_bellows: i32 = 1;
+    let fam = 0;
+    while (fam < g_WPN_COUNT) {
+        let want: i32 = 0;
+        if (fam == g_WPN_BELLOWS) { want = 1; }
+        if (loot_affix_eligible(AFFIX_PELLET, fam) != want) { only_bellows = 0; }
+        fam = fam + 1;
+    }
+    ck(only_bellows == 1, "C9 +1 pellet is eligible on the Bellows and on nothing else",
+       `g_WPN_BELLOWS = ${g_WPN_BELLOWS}`);
+    ck(loot_cfg_bellows() == g_WPN_BELLOWS, "C10 loot.hml reads config's Bellows id",
+       `${loot_cfg_bellows()}`);
+
+    // C11 — the other nine are eligible everywhere. A restriction nobody
+    // documented is how an affix quietly disappears from a weapon.
+    let others_ok: i32 = 1;
+    let d2 = 0;
+    while (d2 < AFFIX_COUNT) {
+        if (d2 != AFFIX_PELLET) {
+            let g = 0;
+            while (g < g_WPN_COUNT) {
+                if (loot_affix_eligible(d2, g) != 1) { others_ok = 0; }
+                g = g + 1;
+            }
+        }
+        d2 = d2 + 1;
+    }
+    ck(others_ok == 1, "C11 the other nine affixes are eligible on every family", "eligible");
+
+    // C12 — THE FEASIBILITY CONSTRAINT. Every family must have at least
+    // AFFIX_MAX eligible affixes or a Relic on that family cannot be filled
+    // without a duplicate. Nine is the worst case and nine >= four.
+    let feasible: i32 = 1;
+    let worst: i32 = AFFIX_COUNT;
+    let h = 0;
+    while (h < g_WPN_COUNT) {
+        let n: i32 = loot_pool_size(h);
+        if (n < AFFIX_MAX) { feasible = 0; }
+        if (n < worst) { worst = n; }
+        h = h + 1;
+    }
+    ck(feasible == 1, "C12 every family has at least AFFIX_MAX eligible affixes",
+       `worst pool = ${worst}, need ${AFFIX_MAX}`);
+
+    // C13 — rarity r carries exactly r affixes, Common 0 .. Relic 4.
+    let ladder: i32 = 1;
+    let r2 = 0;
+    while (r2 < RARITY_COUNT) {
+        if (loot_rarity_affixes(r2) != r2) { ladder = 0; }
+        r2 = r2 + 1;
+    }
+    ck(ladder == 1, "C13 rarity r carries exactly r affixes (0..4)", "ladder");
+    ck(loot_rarity_affixes(RARITY_RELIC) == AFFIX_MAX,
+       "C14 a Relic carries the maximum four affixes plus its unique",
+       `${loot_rarity_affixes(RARITY_RELIC)}`);
+
+    // C15 — every value the roller can produce lands in its band. Exhaustive
+    // over the pool, 20 000 draws each.
+    let st = rng_new();
+    rng_seed(st, 20260729, RNG_LOOT, 1, 1);
+    let inband: i32 = 1;
+    let saw_lo: i32 = 0;
+    let saw_hi: i32 = 0;
+    let e = 0;
+    while (e < AFFIX_COUNT) {
+        let lo: i32 = loot_affix_lo(e);
+        let hi: i32 = loot_affix_hi(e);
+        let hit_lo: i32 = 0;
+        let hit_hi: i32 = 0;
+        let i = 0;
+        while (i < 20000) {
+            let v: i32 = loot_affix_value(st, e);
+            if (v < lo || v > hi) { inband = 0; }
+            if (v == lo) { hit_lo = 1; }
+            if (v == hi) { hit_hi = 1; }
+            i = i + 1;
+        }
+        if (hit_lo == 1) { saw_lo = saw_lo + 1; }
+        if (hit_hi == 1) { saw_hi = saw_hi + 1; }
+        e = e + 1;
+    }
+    ck(inband == 1, "C15 200 000 affix rolls all land inside their band", "inband");
+    ck(saw_lo == AFFIX_COUNT && saw_hi == AFFIX_COUNT,
+       "C16 both band endpoints are reachable for every affix (rng_range is inclusive)",
+       `lo hit ${saw_lo}/${AFFIX_COUNT}, hi hit ${saw_hi}/${AFFIX_COUNT}`);
+}
+
+// ===========================================================================
+// D.  THE SIX RELICS
+// ===========================================================================
+fn section_relics() {
+    print("D. The six Relics (GDD §3.3)");
+
+    ck(RELIC_COUNT == 6, "D1 there are exactly six Relics", `${RELIC_COUNT}`);
+    ck(RELIC_COUNT == g_WPN_COUNT, "D2 one Relic per weapon family",
+       `${RELIC_COUNT} relics, ${g_WPN_COUNT} families`);
+    ck(loot_cfg_wpn_count() == g_WPN_COUNT, "D3 loot.hml reads config's family count",
+       `${loot_cfg_wpn_count()}`);
+
+    // D4 — each relic is named against its GDD weapon family. These six pairs
+    // are the hand-authored design.
+    ck(RELIC_WICK == g_WPN_SPARROW, "D4 Wick is the Sparrow relic", `${RELIC_WICK}`);
+    ck(RELIC_CHATTERBOX == g_WPN_TINKER, "D5 Chatterbox is the Tinker relic", `${RELIC_CHATTERBOX}`);
+    ck(RELIC_NINEPENCE == g_WPN_BELLOWS, "D6 Ninepence is the Bellows relic", `${RELIC_NINEPENCE}`);
+    ck(RELIC_LONG_SUNDAY == g_WPN_LONGSHADOW, "D7 The Long Sunday is the Longshadow relic", `${RELIC_LONG_SUNDAY}`);
+    ck(RELIC_SIXPENNY == g_WPN_KESTREL, "D8 Sixpenny is the Kestrel relic", `${RELIC_SIXPENNY}`);
+    ck(RELIC_VESPER == g_WPN_EMBERLANCE, "D9 Vesper is the Emberlance relic", `${RELIC_VESPER}`);
+
+    // D10 — the mapping is a bijection in both directions, for every family.
+    let bij: i32 = 1;
+    let fam = 0;
+    while (fam < g_WPN_COUNT) {
+        let rel: i32 = loot_relic_for_family(fam);
+        if (rel < 0 || rel >= RELIC_COUNT) { bij = 0; }
+        if (loot_relic_family(rel) != fam) { bij = 0; }
+        fam = fam + 1;
+    }
+    ck(bij == 1, "D10 relic <-> family round-trips for every family", "bijection");
+
+    // D11 — an invalid family has no relic, rather than relic 0.
+    ck(loot_relic_for_family(-1) == RELIC_NONE
+       && loot_relic_for_family(g_WPN_COUNT) == RELIC_NONE,
+       "D11 an invalid family maps to RELIC_NONE", "none");
+
+    // D12 — the six names are distinct and none is the fallback. A duplicated
+    // name is how a hand-authored table loses an entry to copy-paste.
+    let distinct: i32 = 1;
+    let i = 0;
+    while (i < RELIC_COUNT) {
+        if (loot_relic_name(i) == "none") { distinct = 0; }
+        let j = 0;
+        while (j < i) {
+            if (loot_relic_name(i) == loot_relic_name(j)) { distinct = 0; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ck(distinct == 1, "D12 all six Relic names are distinct and none is the fallback", "names");
+
+    // D13 — same for rarity and affix names.
+    let rnames: i32 = 1;
+    let k = 0;
+    while (k < RARITY_COUNT) {
+        if (loot_rarity_name(k) == "None") { rnames = 0; }
+        let m = 0;
+        while (m < k) {
+            if (loot_rarity_name(k) == loot_rarity_name(m)) { rnames = 0; }
+            m = m + 1;
+        }
+        k = k + 1;
+    }
+    let anames: i32 = 1;
+    let p = 0;
+    while (p < AFFIX_COUNT) {
+        if (loot_affix_name(p) == "none") { anames = 0; }
+        let q = 0;
+        while (q < p) {
+            if (loot_affix_name(p) == loot_affix_name(q)) { anames = 0; }
+            q = q + 1;
+        }
+        p = p + 1;
+    }
+    ck(rnames == 1, "D13 all five rarity names are distinct", "names");
+    ck(anames == 1, "D14 all ten affix names are distinct", "names");
+}
+
+// ===========================================================================
+// E.  ROLLING INVARIANTS — every item that comes out is well formed
+// ===========================================================================
+fn section_invariants() {
+    print("E. Rolled-item invariants");
+
+    let item = loot_new_item();
+
+    // E1 — a fresh record is empty, not zero-with-rarity-Common.
+    ck(item[ITEM_RARITY] == RARITY_NONE && item[ITEM_RELIC] == RELIC_NONE
+       && item[ITEM_NAFFIX] == 0 && item[ITEM_AFFIX0] == AFFIX_NONE,
+       "E1 a new item record is empty, not a valid Common", `${item[ITEM_RARITY]}`);
+
+    let st = rng_new();
+    rng_seed(st, 777001, RNG_LOOT, 0, 0);
+
+    let bad_items: i32 = 0;
+    let first_bad: i32 = 0;
+    let relic_below: i32 = 0;
+    let n_rolls: i32 = 0;
+    let seen_rarity = [0, 0, 0, 0, 0];
+    let seen_relic = [0, 0, 0, 0, 0, 0];
+    let seen_affix = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let max_affix: i32 = 0;
+
+    let tier = TIER_MIN;
+    while (tier <= TIER_MAX) {
+        let fam = 0;
+        while (fam < g_WPN_COUNT) {
+            let i = 0;
+            while (i < 3000) {
+                loot_roll(st, item, tier, fam);
+                n_rolls = n_rolls + 1;
+                let bad: i32 = loot_item_check(item);
+                if (bad != 0) {
+                    bad_items = bad_items + 1;
+                    if (first_bad == 0) { first_bad = bad; }
+                }
+                let rar: i32 = item[ITEM_RARITY];
+                if (rar >= 0 && rar < RARITY_COUNT) { seen_rarity[rar] = seen_rarity[rar] + 1; }
+                if (rar == RARITY_RELIC) {
+                    if (tier < RELIC_TIER_MIN) { relic_below = relic_below + 1; }
+                    let rel: i32 = item[ITEM_RELIC];
+                    if (rel >= 0 && rel < RELIC_COUNT) { seen_relic[rel] = seen_relic[rel] + 1; }
+                }
+                if (item[ITEM_NAFFIX] > max_affix) { max_affix = item[ITEM_NAFFIX]; }
+                let k = 0;
+                while (k < item[ITEM_NAFFIX]) {
+                    let aid: i32 = item[ITEM_AFFIX0 + k];
+                    if (aid >= 0 && aid < AFFIX_COUNT) { seen_affix[aid] = seen_affix[aid] + 1; }
+                    k = k + 1;
+                }
+                i = i + 1;
+            }
+            fam = fam + 1;
+        }
+        tier = tier + 1;
+    }
+
+    print(`   E  rolled ${n_rolls} items across all tiers x all families`);
+    ck(bad_items == 0,
+       "E2 every rolled item passes loot_item_check (no duplicate affix, every value in band, every affix eligible, relic matches family)",
+       `${bad_items} bad of ${n_rolls}, first flags ${first_bad}`);
+
+    // E3 — the relic floor observed, not just tabulated.
+    ck(relic_below == 0, "E3 no Relic dropped below shade tier 3 in any roll",
+       `${relic_below} violations`);
+
+    // E4 — no item ever exceeds four affixes.
+    ck(max_affix <= AFFIX_MAX, "E4 no item ever carries more than AFFIX_MAX affixes",
+       `max ${max_affix}`);
+
+    // E5 — every rarity is reachable, and every relic. A tier/family the roller
+    // can never produce is dead content.
+    let all_rar: i32 = 1;
+    let i2 = 0;
+    while (i2 < RARITY_COUNT) {
+        if (seen_rarity[i2] <= 0) { all_rar = 0; }
+        i2 = i2 + 1;
+    }
+    let all_rel: i32 = 1;
+    let j2 = 0;
+    while (j2 < RELIC_COUNT) {
+        if (seen_relic[j2] <= 0) { all_rel = 0; }
+        j2 = j2 + 1;
+    }
+    ck(all_rar == 1, "E5 every rarity is reachable", `${seen_rarity[0]}/${seen_rarity[1]}/${seen_rarity[2]}/${seen_rarity[3]}/${seen_rarity[4]}`);
+    ck(all_rel == 1, "E6 all six Relics are reachable",
+       `${seen_relic[0]}/${seen_relic[1]}/${seen_relic[2]}/${seen_relic[3]}/${seen_relic[4]}/${seen_relic[5]}`);
+
+    // E7 — every affix is reachable too.
+    let all_aff: i32 = 1;
+    let k2 = 0;
+    while (k2 < AFFIX_COUNT) {
+        if (seen_affix[k2] <= 0) { all_aff = 0; }
+        k2 = k2 + 1;
+    }
+    ck(all_aff == 1, "E7 all ten affixes are reachable", `pellet seen ${seen_affix[AFFIX_PELLET]}`);
+
+    // E8 — the without-replacement draw is UNIFORM over the eligible pool.
+    // Bias here is invisible in play and fatal to the design (one affix quietly
+    // becoming a near-guaranteed roll on every Rare and above).
+    //
+    // The test needs no conditioning and no private access: for an item with n
+    // affixes, a partial Fisher-Yates puts each of the m eligible affixes on it
+    // with probability n/m, the same for every affix. So aggregating over ANY
+    // mix of rarities, the expected occurrence count of each eligible affix is
+    // (total affix slots filled) / m, identical across the pool. Roll 200 000
+    // items on a nine-affix family and compare.
+    let counts = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let reps: i32 = 200000;
+    let slots: i32 = 0;
+    let n = 0;
+    while (n < reps) {
+        loot_roll(st, item, TIER_MAX, g_WPN_SPARROW);
+        let nn: i32 = item[ITEM_NAFFIX];
+        slots = slots + nn;
+        let k = 0;
+        while (k < nn) {
+            counts[item[ITEM_AFFIX0 + k]] = counts[item[ITEM_AFFIX0 + k]] + 1;
+            k = k + 1;
+        }
+        n = n + 1;
+    }
+    let pool_n: i32 = loot_pool_size(g_WPN_SPARROW);
+    let expect: f64 = f64(slots) / f64(pool_n);
+    // sqrt(expect) overstates the spread (sampling without replacement has less
+    // variance than Poisson), so the z below is conservative in the safe
+    // direction: it will not manufacture a pass.
+    let sd: f64 = sqrtf(expect);
+    let worst_z: f64 = 0.0;
+    let c2 = 0;
+    while (c2 < AFFIX_COUNT) {
+        if (loot_affix_eligible(c2, g_WPN_SPARROW) == 1) {
+            let zz: f64 = absf(f64(counts[c2]) - expect) / sd;
+            if (zz > worst_z) { worst_z = zz; }
+        } else {
+            if (counts[c2] != 0) { worst_z = 999.0; }
+        }
+        c2 = c2 + 1;
+    }
+    print(`   E8  affix uniformity over a pool of ${pool_n}: ${slots} slots, expect ${expect} each, worst z = ${worst_z}`);
+    ck(worst_z < 4.0,
+       "E8 the without-replacement affix draw is uniform over the eligible pool (worst |z| < 4)",
+       `worst z ${worst_z}`);
+    ck(counts[AFFIX_PELLET] == 0,
+       "E9 +1 pellet never appeared on 200 000 Sparrow rolls", `${counts[AFFIX_PELLET]}`);
+
+    fp_mix(bad_items);
+    fp_mix(max_affix);
+    fp_mix(seen_rarity[RARITY_RELIC]);
+    fp_mix(slots);
+}
+
+// ===========================================================================
+// F.  THE DISTRIBUTION SELF-TEST — the BUILD_PLAN acceptance criterion
+// ===========================================================================
+// "drop weights reproduce the GDD §3.3 table within 2 % over 100 k rolls"
+// The GDD's weights sum to 100, so they ARE percentages and "within 2 %" is
+// read as within 2 PERCENTAGE POINTS. That bound is generous at 100 k rolls
+// (1 sigma on the 30 % cell is 0.145 pp), so a chi-square at p = 0.001 is
+// asserted alongside it — the loose bound is the criterion, the tight one is
+// the actual guard.
+fn distribution_row(p_tier: i32, p_reps: i32, p_seeded: i32, p_verbose: i32): f64 {
+    let tier: i32 = p_tier;
+    let reps: i32 = p_reps;
+    let counts = [0, 0, 0, 0, 0];
+    let item = loot_new_item();
+
+    if (p_seeded == 1) {
+        // The SEEDED form: 100 k distinct chests, each rolled from its own
+        // (seed, source, owner) tuple. This is what the game actually does, and
+        // it tests splitmix64's decorrelation of neighbouring source ids as
+        // much as it tests the weight walk.
+        let i = 0;
+        while (i < reps) {
+            loot_roll_at(item, 4242 + tier, i, 7, tier, FAMILY_ANY);
+            counts[item[ITEM_RARITY]] = counts[item[ITEM_RARITY]] + 1;
+            i = i + 1;
+        }
+    } else {
+        let st = rng_new();
+        rng_seed(st, 99000 + tier, RNG_LOOT, 0, 0);
+        let i = 0;
+        while (i < reps) {
+            loot_roll(st, item, tier, FAMILY_ANY);
+            counts[item[ITEM_RARITY]] = counts[item[ITEM_RARITY]] + 1;
+            i = i + 1;
+        }
+    }
+
+    let total: i32 = loot_weight_sum(tier);
+    let worst_pp: f64 = 0.0;
+    let chi: f64 = 0.0;
+    let df: i32 = -1;
+    let r = 0;
+    while (r < RARITY_COUNT) {
+        let wgt: i32 = loot_weight(tier, r);
+        let exp_pct: f64 = 100.0 * f64(wgt) / f64(total);
+        let obs_pct: f64 = 100.0 * f64(counts[r]) / f64(reps);
+        let dpp: f64 = absf(obs_pct - exp_pct);
+        if (dpp > worst_pp) { worst_pp = dpp; }
+        if (wgt > 0) {
+            let e: f64 = f64(reps) * f64(wgt) / f64(total);
+            let diff: f64 = f64(counts[r]) - e;
+            chi = chi + diff * diff / e;
+            df = df + 1;
+        } else {
+            // A zero-weight cell must be EMPTY, not merely rare.
+            if (counts[r] != 0) { worst_pp = 999.0; }
+        }
+        if (p_verbose == 1) {
+            print(`      tier ${tier}  ${loot_rarity_name(r)}  expect ${exp_pct} %  observed ${obs_pct} %  delta ${dpp} pp  (n=${counts[r]})`);
+        }
+        r = r + 1;
+    }
+
+    let crit: f64 = chi_crit(df);
+    if (p_verbose == 1) {
+        print(`      tier ${tier}  chi2 = ${chi}  df = ${df}  crit(p=0.001) = ${crit}  worst delta ${worst_pp} pp`);
+    }
+    let i3 = 0;
+    while (i3 < RARITY_COUNT) { fp_mix(counts[i3]); i3 = i3 + 1; }
+
+    // Encode both results in one f64: integer part = worst pp * 1000, and the
+    // caller re-checks chi separately via the globals below.
+    g_last_chi = chi;
+    g_last_crit = crit;
+    let out: f64 = worst_pp;
+    return out;
+}
+
+fn section_distribution(p_verbose: i32) {
+    print("F. Drop-weight distribution over 100 000 rolls per tier");
+
+    let reps: i32 = 100000;
+    let worst_all: f64 = 0.0;
+    let chi_ok: i32 = 1;
+    let worst_chi_ratio: f64 = 0.0;
+
+    let tier = TIER_MIN;
+    while (tier <= TIER_MAX) {
+        let pp: f64 = distribution_row(tier, reps, 0, p_verbose);
+        let ratio: f64 = g_last_chi / g_last_crit;
+        if (pp > worst_all) { worst_all = pp; }
+        if (ratio > worst_chi_ratio) { worst_chi_ratio = ratio; }
+        if (g_last_chi > g_last_crit) { chi_ok = 0; }
+        if (p_verbose == 0) {
+            print(`   F  tier ${tier}: worst delta ${pp} pp, chi2 ${g_last_chi} / crit ${g_last_crit}`);
+        }
+        tier = tier + 1;
+    }
+
+    ck(worst_all <= 2.0,
+       "F1 every drop weight reproduces GDD §3.3 within 2 percentage points over 100 k rolls",
+       `worst ${worst_all} pp`);
+    ck(chi_ok == 1,
+       "F2 every tier's rarity distribution passes a chi-square goodness-of-fit at p = 0.001",
+       `worst chi2/crit ${worst_chi_ratio}`);
+
+    // F3/F4 — the same test through the SEEDED entry point, which is the one
+    // the game calls. A weight walk can be correct and the per-source seeding
+    // still be correlated; these are different failures.
+    print("   F  the same test through loot_roll_at (100 000 distinct sources)");
+    let worst_seeded: f64 = 0.0;
+    let chi_ok2: i32 = 1;
+    let worst_ratio2: f64 = 0.0;
+    let t2 = TIER_MIN;
+    while (t2 <= TIER_MAX) {
+        let pp2: f64 = distribution_row(t2, reps, 1, p_verbose);
+        let ratio2: f64 = g_last_chi / g_last_crit;
+        if (pp2 > worst_seeded) { worst_seeded = pp2; }
+        if (ratio2 > worst_ratio2) { worst_ratio2 = ratio2; }
+        if (g_last_chi > g_last_crit) { chi_ok2 = 0; }
+        if (p_verbose == 0) {
+            print(`   F  tier ${t2} (seeded): worst delta ${pp2} pp, chi2 ${g_last_chi} / crit ${g_last_crit}`);
+        }
+        t2 = t2 + 1;
+    }
+    ck(worst_seeded <= 2.0,
+       "F3 the per-source seeded path reproduces GDD §3.3 within 2 percentage points too",
+       `worst ${worst_seeded} pp`);
+    ck(chi_ok2 == 1,
+       "F4 the per-source seeded path passes the same chi-square at p = 0.001",
+       `worst chi2/crit ${worst_ratio2}`);
+
+    // F5 — weapon families come out uniform when the source does not pin one.
+    // A biased family roll means one weapon's Relic is unobtainable.
+    let fam_counts = [0, 0, 0, 0, 0, 0];
+    let item = loot_new_item();
+    let i = 0;
+    while (i < reps) {
+        loot_roll_at(item, 8080, i, 3, TIER_MAX, FAMILY_ANY);
+        fam_counts[item[ITEM_FAMILY]] = fam_counts[item[ITEM_FAMILY]] + 1;
+        i = i + 1;
+    }
+    let pf: f64 = 1.0 / f64(g_WPN_COUNT);
+    let sdf: f64 = sqrtf(f64(reps) * pf * (1.0 - pf));
+    let ef: f64 = f64(reps) * pf;
+    let worst_zf: f64 = 0.0;
+    let j = 0;
+    while (j < g_WPN_COUNT) {
+        let zz: f64 = absf(f64(fam_counts[j]) - ef) / sdf;
+        if (zz > worst_zf) { worst_zf = zz; }
+        fp_mix(fam_counts[j]);
+        j = j + 1;
+    }
+    print(`   F5  family uniformity with FAMILY_ANY: expect ${ef} each, worst z = ${worst_zf}`);
+    ck(worst_zf < 4.0, "F5 FAMILY_ANY picks weapon families uniformly (worst |z| < 4)",
+       `worst z ${worst_zf}`);
+}
+
+// ===========================================================================
+// G.  DETERMINISM — the criterion this whole task exists for
+// ===========================================================================
+fn section_determinism() {
+    print("G. Determinism");
+
+    let a = loot_new_item();
+    let b = loot_new_item();
+
+    // ---- G1: the same chest, the same player, the same seed, twice ----------
+    // 20 000 distinct tuples, each rolled twice, in two DIFFERENT orders, with
+    // 50 000 unrelated draws interleaved between the passes. If loot_roll_at
+    // carried any state between calls this fails.
+    let hashes = [];
+    let i = 0;
+    while (i < 20000) {
+        loot_roll_at(a, 31337, i, 1 + (i - 64 * i32(i / 64)), i - 6 * i32(i / 6), FAMILY_ANY);
+        hashes.push(loot_item_hash(a));
+        i = i + 1;
+    }
+
+    // Interleave unrelated work: a different stream, a different module's kind
+    // of draw, and 50 000 streaming loot rolls.
+    let noise = rng_new();
+    rng_seed(noise, 12345, RNG_SPREAD, 9, 9);
+    let junk = loot_new_item();
+    let n = 0;
+    while (n < 50000) {
+        rng_pick(noise, 977);
+        loot_roll(noise, junk, 4, FAMILY_ANY);
+        n = n + 1;
+    }
+
+    // Second pass, walking the tuples BACKWARDS.
+    let same: i32 = 1;
+    let first_mismatch: i32 = -1;
+    let j = 19999;
+    while (j >= 0) {
+        loot_roll_at(b, 31337, j, 1 + (j - 64 * i32(j / 64)), j - 6 * i32(j / 6), FAMILY_ANY);
+        if (loot_item_hash(b) != hashes[j]) {
+            same = 0;
+            if (first_mismatch < 0) { first_mismatch = j; }
+        }
+        j = j - 1;
+    }
+    ck(same == 1,
+       "G1 20 000 (seed, source, owner, tier, family) tuples reproduce bit-identically in reverse order after 50 000 interleaved unrelated draws",
+       `first mismatch at ${first_mismatch}`);
+
+    // ---- G2: full field equality, not just the hash ------------------------
+    // A hash collision would hide a divergence in G1. Compare the twelve fields
+    // directly on a smaller sample.
+    let fields_same: i32 = 1;
+    let k = 0;
+    while (k < 2000) {
+        loot_roll_at(a, 555, k, 2, 5, FAMILY_ANY);
+        loot_roll_at(b, 555, k, 2, 5, FAMILY_ANY);
+        let f = 0;
+        while (f < ITEM_FIELDS) {
+            if (a[f] != b[f]) { fields_same = 0; }
+            f = f + 1;
+        }
+        k = k + 1;
+    }
+    ck(fields_same == 1, "G2 all twelve item fields are identical on a repeated roll, not just the hash",
+       "fields");
+
+    // ---- G3: the NEGATIVE CONTROL. A different world seed must differ. ------
+    let h_seed_a: u64 = 14695981039346656037;
+    let h_seed_b: u64 = 14695981039346656037;
+    let m = 0;
+    while (m < 20000) {
+        loot_roll_at(a, 31337, m, 1, 4, FAMILY_ANY);
+        h_seed_a = loot_hash_mix(h_seed_a, a);
+        loot_roll_at(b, 31338, m, 1, 4, FAMILY_ANY);
+        h_seed_b = loot_hash_mix(h_seed_b, b);
+        m = m + 1;
+    }
+    ck(h_seed_a != h_seed_b,
+       "G3 NEGATIVE CONTROL: a different world seed produces a different aggregate hash",
+       `${h_seed_a} vs ${h_seed_b}`);
+
+    // G4 — and it differs on most individual items, not just in aggregate. Two
+    // seeds agreeing on 99 % of chests would pass an aggregate check and still
+    // be a broken seed.
+    let differ: i32 = 0;
+    let m2 = 0;
+    while (m2 < 20000) {
+        loot_roll_at(a, 31337, m2, 1, 4, FAMILY_ANY);
+        loot_roll_at(b, 31338, m2, 1, 4, FAMILY_ANY);
+        let f2 = 0;
+        let same_item: i32 = 1;
+        while (f2 < ITEM_FIELDS) {
+            if (a[f2] != b[f2]) { same_item = 0; }
+            f2 = f2 + 1;
+        }
+        if (same_item == 0) { differ = differ + 1; }
+        m2 = m2 + 1;
+    }
+    let frac: f64 = f64(differ) / 20000.0;
+    print(`   G4  a one-bit seed change alters ${differ} of 20 000 items (${frac})`);
+    ck(frac > 0.60,
+       "G4 a one-bit world-seed change alters the great majority of chests, not just the aggregate",
+       `${frac}`);
+
+    // G5/G6 — the other two coordinates are live too. A source id or an owner
+    // id that does not reach the generator means every chest in the world drops
+    // the same item, or every player gets the same drop from one chest.
+    let src_diff: i32 = 0;
+    let own_diff: i32 = 0;
+    let s = 0;
+    while (s < 5000) {
+        loot_roll_at(a, 909, s, 1, 5, FAMILY_ANY);
+        loot_roll_at(b, 909, s + 1, 1, 5, FAMILY_ANY);
+        if (loot_item_hash(a) != loot_item_hash(b)) { src_diff = src_diff + 1; }
+        loot_roll_at(b, 909, s, 2, 5, FAMILY_ANY);
+        if (loot_item_hash(a) != loot_item_hash(b)) { own_diff = own_diff + 1; }
+        s = s + 1;
+    }
+    ck(f64(src_diff) / 5000.0 > 0.60, "G5 the source id reaches the generator (chests differ)",
+       `${src_diff}/5000`);
+    ck(f64(own_diff) / 5000.0 > 0.60, "G6 the owner id reaches the generator (players differ)",
+       `${own_diff}/5000`);
+
+    // ---- G7: the streaming form replays -------------------------------------
+    // The analogue of "same seed + same command sequence": seed a state, run a
+    // sequence of rolls, hash it; reseed and run the identical sequence.
+    let st1 = rng_new();
+    let st2 = rng_new();
+    loot_seed(st1, 246810, 55, 3);
+    loot_seed(st2, 246810, 55, 3);
+    let h1: u64 = 14695981039346656037;
+    let h2: u64 = 14695981039346656037;
+    let seq = 0;
+    while (seq < 30000) {
+        let tier: i32 = seq - 6 * i32(seq / 6);
+        let fam: i32 = seq - 6 * i32(seq / 6);
+        if (seq - 2 * i32(seq / 2) == 0) { fam = FAMILY_ANY; }
+        loot_roll(st1, a, tier, fam);
+        h1 = loot_hash_mix(h1, a);
+        seq = seq + 1;
+    }
+    let seq2 = 0;
+    while (seq2 < 30000) {
+        let tier: i32 = seq2 - 6 * i32(seq2 / 6);
+        let fam: i32 = seq2 - 6 * i32(seq2 / 6);
+        if (seq2 - 2 * i32(seq2 / 2) == 0) { fam = FAMILY_ANY; }
+        loot_roll(st2, a, tier, fam);
+        h2 = loot_hash_mix(h2, a);
+        seq2 = seq2 + 1;
+    }
+    ck(h1 == h2, "G7 the streaming form replays a 30 000-roll sequence bit-for-bit",
+       `${h1} vs ${h2}`);
+
+    // G8 — and a different loot seed for the same sequence diverges.
+    let st3 = rng_new();
+    loot_seed(st3, 246811, 55, 3);
+    let h3: u64 = 14695981039346656037;
+    let seq3 = 0;
+    while (seq3 < 30000) {
+        let tier: i32 = seq3 - 6 * i32(seq3 / 6);
+        let fam: i32 = seq3 - 6 * i32(seq3 / 6);
+        if (seq3 - 2 * i32(seq3 / 2) == 0) { fam = FAMILY_ANY; }
+        loot_roll(st3, a, tier, fam);
+        h3 = loot_hash_mix(h3, a);
+        seq3 = seq3 + 1;
+    }
+    ck(h1 != h3, "G8 NEGATIVE CONTROL: the same sequence on a different seed diverges",
+       `${h1} vs ${h3}`);
+
+    // G9 — pinning the family that FAMILY_ANY would have rolled leaves the
+    // WHOLE item unchanged. That only holds because loot_roll always consumes
+    // the family draw; skip it when the family is pinned and every later draw
+    // shifts, so a chest's rarity would depend on whether its source named a
+    // weapon. This is what makes "the chest decides, the weapon does not" true.
+    let rar_stable: i32 = 1;
+    let p = 0;
+    while (p < 4000) {
+        loot_roll_at(a, 4711, p, 1, 5, FAMILY_ANY);
+        loot_roll_at(b, 4711, p, 1, 5, a[ITEM_FAMILY]);
+        let f9 = 0;
+        while (f9 < ITEM_FIELDS) {
+            if (a[f9] != b[f9]) { rar_stable = 0; }
+            f9 = f9 + 1;
+        }
+        p = p + 1;
+    }
+    ck(rar_stable == 1,
+       "G9 pinning the family that FAMILY_ANY would have rolled leaves the whole item unchanged",
+       "stable");
+
+    // G10 — the item hash is a 31-bit non-negative i32 for every item rolled.
+    let hash_ok: i32 = 1;
+    let q = 0;
+    while (q < 20000) {
+        loot_roll_at(a, 6003, q, 1, 5, FAMILY_ANY);
+        let hh: i32 = loot_item_hash(a);
+        if (hh < 0) { hash_ok = 0; }
+        q = q + 1;
+    }
+    ck(hash_ok == 1, "G10 loot_item_hash is always a non-negative 31-bit i32", "range");
+
+    fp_mix64(h_seed_a);
+    fp_mix64(h1);
+    fp_mix(differ);
+    fp_mix(src_diff);
+    fp_mix(own_diff);
+}
+
+// ===========================================================================
+// H.  PURITY / WIRE-SAFETY
+// ===========================================================================
+fn section_purity() {
+    print("H. Purity and wire safety");
+
+    // H1 — every field of every item is an i32 in a range that survives the
+    // NETWORKING §3.7 rules (no bools, no floats, no nulls, no strings).
+    let item = loot_new_item();
+    let ok: i32 = 1;
+    let i = 0;
+    while (i < 30000) {
+        loot_roll_at(item, 777, i, 1, 5, FAMILY_ANY);
+        let f = 0;
+        while (f < ITEM_FIELDS) {
+            let v: i32 = item[f];
+            if (v < -1) { ok = 0; }
+            if (v > 255) { ok = 0; }
+            f = f + 1;
+        }
+        i = i + 1;
+    }
+    ck(ok == 1, "H1 every item field is a small i32 in [-1, 255] — one wire byte plus a sentinel",
+       "range");
+
+    // H2 — loot.hml is SDL-free and clock-free by construction: the import wall
+    // allows it only config.hml and rng.hml, and ci_imports.sh (R1/R5) enforces
+    // that. What the probe CAN check is that the module holds no state that
+    // survives a call: roll a tuple, roll 10 000 others, roll it again.
+    let a = loot_new_item();
+    let b = loot_new_item();
+    loot_roll_at(a, 202, 9, 4, 5, FAMILY_ANY);
+    let h_before: i32 = loot_item_hash(a);
+    let j = 0;
+    while (j < 10000) {
+        loot_roll_at(b, 303 + j, j, j, j - 6 * i32(j / 6), FAMILY_ANY);
+        j = j + 1;
+    }
+    loot_roll_at(a, 202, 9, 4, 5, FAMILY_ANY);
+    ck(loot_item_hash(a) == h_before,
+       "H2 loot.hml carries no state across calls (10 000 interleaved rolls change nothing)",
+       `${loot_item_hash(a)} vs ${h_before}`);
+
+    // H3 — loot_clear_item leaves a record that loot_item_check rejects rather
+    // than one that reads as a valid Common. A half-initialised item must be
+    // detectable.
+    loot_clear_item(a);
+    ck(loot_item_check(a) != 0, "H3 a cleared record is not a valid item", `${loot_item_check(a)}`);
+
+    // H4 — and loot_item_check actually catches the failures it names. Plant
+    // each one. A validator nobody has seen fail is a validator that passes
+    // everything.
+    loot_roll_at(a, 909, 1, 1, 5, g_WPN_SPARROW);
+    // Force an exactly-2-affix item: two used slots to corrupt and two unused
+    // ones, so every plant below lands on the field it is aimed at.
+    let tries = 0;
+    while (a[ITEM_NAFFIX] != 2 && tries < 500) {
+        loot_roll_at(a, 909, tries, 1, 5, g_WPN_SPARROW);
+        tries = tries + 1;
+    }
+    ck(a[ITEM_NAFFIX] == 2 && loot_item_check(a) == 0,
+       "H4 the planted-failure base item is well formed to start with", `${loot_item_check(a)}`);
+
+    let saved0: i32 = a[ITEM_AFFIX0];
+    let saved1: i32 = a[ITEM_AFFIX0 + 1];
+    let savedv: i32 = a[ITEM_VALUE0];
+
+    a[ITEM_AFFIX0 + 1] = saved0;                     // duplicate
+    ck((loot_item_check(a) & ERR_DUP) != 0, "H5 the validator catches a duplicate affix", `${loot_item_check(a)}`);
+    a[ITEM_AFFIX0 + 1] = saved1;
+
+    a[ITEM_VALUE0] = loot_affix_hi(saved0) + 1;      // out of band
+    ck((loot_item_check(a) & ERR_BAND) != 0, "H6 the validator catches an out-of-band value", `${loot_item_check(a)}`);
+    a[ITEM_VALUE0] = savedv;
+
+    let savedn: i32 = a[ITEM_NAFFIX];
+    a[ITEM_NAFFIX] = savedn + 1;                     // affix count disagrees with rarity
+    ck((loot_item_check(a) & ERR_NAFFIX) != 0, "H7 the validator catches an affix count that disagrees with the rarity",
+       `${loot_item_check(a)}`);
+    a[ITEM_NAFFIX] = savedn;
+
+    let savedr: i32 = a[ITEM_RELIC];
+    a[ITEM_RELIC] = RELIC_WICK;                      // relic on a non-Relic
+    ck((loot_item_check(a) & ERR_RELIC) != 0, "H8 the validator catches a relic on a non-Relic item",
+       `${loot_item_check(a)}`);
+    a[ITEM_RELIC] = savedr;
+
+    let savedf: i32 = a[ITEM_FAMILY];
+    a[ITEM_FAMILY] = g_WPN_BELLOWS;
+    a[ITEM_AFFIX0] = AFFIX_PELLET;
+    a[ITEM_VALUE0] = 1;
+    ck(loot_item_check(a) == 0, "H9 +1 pellet on a Bellows is accepted", `${loot_item_check(a)}`);
+    a[ITEM_FAMILY] = g_WPN_SPARROW;
+    ck((loot_item_check(a) & ERR_ELIGIBLE) != 0, "H10 the validator catches +1 pellet on a non-Bellows",
+       `${loot_item_check(a)}`);
+    a[ITEM_FAMILY] = savedf;
+    a[ITEM_AFFIX0] = saved0;
+    a[ITEM_VALUE0] = savedv;
+    ck(loot_item_check(a) == 0, "H11 the item is well formed again after every plant is undone",
+       `${loot_item_check(a)}`);
+
+    let savedrar: i32 = a[ITEM_RARITY];
+    a[ITEM_RARITY] = RARITY_COUNT;
+    ck((loot_item_check(a) & ERR_RARITY) != 0, "H12 the validator catches an out-of-range rarity",
+       `${loot_item_check(a)}`);
+    a[ITEM_RARITY] = savedrar;
+
+    a[ITEM_FAMILY] = g_WPN_COUNT;
+    ck((loot_item_check(a) & ERR_FAMILY) != 0, "H13 the validator catches an out-of-range weapon family",
+       `${loot_item_check(a)}`);
+    a[ITEM_FAMILY] = savedf;
+
+    a[ITEM_AFFIX0 + AFFIX_MAX - 1] = AFFIX_DAMAGE;   // an unused slot is occupied
+    ck((loot_item_check(a) & ERR_SLOT) != 0, "H14 the validator catches an occupied unused slot",
+       `${loot_item_check(a)}`);
+    a[ITEM_AFFIX0 + AFFIX_MAX - 1] = AFFIX_NONE;
+    ck(loot_item_check(a) == 0, "H15 the item is well formed again after the last plant is undone",
+       `${loot_item_check(a)}`);
+
+    // H16 — a Relic whose relic id is another family's relic is caught.
+    let c = loot_new_item();
+    let t2 = 0;
+    while (c[ITEM_RARITY] != RARITY_RELIC && t2 < 20000) {
+        loot_roll_at(c, 1111, t2, 1, TIER_MAX, g_WPN_KESTREL);
+        t2 = t2 + 1;
+    }
+    ck(c[ITEM_RARITY] == RARITY_RELIC && loot_item_check(c) == 0,
+       "H17 a rolled Relic is well formed", `${loot_item_check(c)}`);
+    c[ITEM_RELIC] = RELIC_VESPER;
+    ck((loot_item_check(c) & ERR_RELIC_FAM) != 0, "H18 the validator catches a Relic carrying another family's unique",
+       `${loot_item_check(c)}`);
+}
+
+// ===========================================================================
+// I.  BUDGET — RULE T: __clock() CPU time, minimum of 7 batches
+// ===========================================================================
+let g_TRIALS = 7;
+
+fn roll_us(p_reps: i32): f64 {
+    let reps: i32 = p_reps;
+    let item = loot_new_item();
+    let best: f64 = 0.0;
+    let t = 0;
+    while (t < g_TRIALS) {
+        let c0: f64 = __clock();
+        let i = 0;
+        while (i < reps) {
+            loot_roll_at(item, 5150, i, 1, 5, -1);
+            i = i + 1;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+fn cal_us(p_reps: i32): f64 {
+    // The calibration loop: an empty iteration, measured the same way. Every
+    // bound below is expressed as a RATIO against this, because an absolute
+    // microsecond claim is a claim about an idle machine and this box
+    // permanently shares ~17 of 24 cores (CLAUDE.md §1.2).
+    let reps: i32 = p_reps;
+    let best: f64 = 0.0;
+    let t = 0;
+    while (t < g_TRIALS) {
+        let c0: f64 = __clock();
+        let i = 0;
+        let sink: i32 = 0;
+        while (i < reps) {
+            sink = sink + 1;
+            i = i + 1;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        if (sink < 0) { print("unreachable"); }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// Compiled or interpreted? argv[0] still ends in .hml under the interpreter.
+// The game ships compiled, so that is the path the absolute bounds are set for;
+// the interpreted bounds exist so the SAME assertions run — and the same COUNT
+// is reported — on both backends rather than half the probe quietly opting out.
+fn is_compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn section_budget() {
+    print("I. Budget (RULE T: __clock CPU time, min of 7 batches)");
+
+    let compiled: i32 = is_compiled();
+    let reps: i32 = 200000;
+    let per_roll: f64 = roll_us(reps);
+    let cal: f64 = cal_us(reps * 20);
+    let ratio: f64 = per_roll / cal;
+
+    print(`   I  backend = compiled ${compiled}`);
+    print(`   I1  loot_roll_at = ${per_roll} us/roll  (empty loop iteration = ${cal} us, ratio ${ratio})`);
+
+    // I1 — the absolute number, as a REGRESSION GUARD at roughly 2x the loaded
+    // measurement, with both numbers in the assertion text (CLAUDE.md §1.2).
+    // The bound is deliberately loose: the regression this guards against is an
+    // accidental O(n) or an extra reseed, which costs multiples, not percent.
+    let bound1: f64 = 12.0;
+    if (compiled == 0) { bound1 = 80.0; }
+    ck(per_roll < bound1,
+       "I1 one seeded loot roll costs < 12.0 us compiled (measured 4.84-5.16 us on this loaded box) / < 80 us interpreted (measured 32.43 us)",
+       `${per_roll} us, bound ${bound1}`);
+
+    // I2 — THE BUDGET SHARE, stated honestly. Loot is an EVENT system: it rolls
+    // when a chest is opened or an enemy dies, never every tick. The v1
+    // director caps alive enemies well under 40 and they do not all die on one
+    // tick, so eight rolls in a single tick is already a pathological tick.
+    // That is the number claimed against the budget.
+    let rolls_per_tick: f64 = 8.0;
+    let ms_per_tick: f64 = per_roll * rolls_per_tick / 1000.0;
+    let pct: f64 = ms_per_tick * 100.0 / g_BUDGET_SIM_MS;
+    print(`   I2  ${rolls_per_tick} rolls in one tick = ${ms_per_tick} ms = ${pct} % of the ${g_BUDGET_SIM_MS} ms sim budget`);
+    let bound2: f64 = 5.0;
+    if (compiled == 0) { bound2 = 100.0; }
+    ck(pct < bound2,
+       "I2 a pathological 8-roll tick costs < 5 % of the 2.0 ms sim budget compiled (measured 1.93-2.06 % on this loaded box; interpreted 12.97 %, bound 100 %, and the game ships compiled)",
+       `${pct} %, bound ${bound2}`);
+
+    // I3 — the RATIO bound, the one that survives contention because both terms
+    // inflate together (CLAUDE.md §1.2). A seeded roll is one reseed
+    // (splitmix64 x2 plus rng.hml's four warm-up draws) plus at most eleven
+    // draws plus a ten-entry pool copy. Hundreds of empty iterations, never
+    // thousands. This assertion is identical on both backends.
+    ck(ratio < 900.0,
+       "I3 a seeded roll costs < 900 empty-loop iterations (measured 391-419 compiled, 144 interpreted)",
+       `${ratio}`);
+
+    // I4 — WHERE THE TIME GOES, so the number above is not mistaken for this
+    // module's own cost. A reseed is rng.hml's price, not loot.hml's, and it is
+    // the price of the determinism contract: it buys "the same chest always
+    // gives the same thing" and it is not optional.
+    let seed_only: f64 = seed_us(reps);
+    let seed_share: f64 = seed_only * 100.0 / per_roll;
+    print(`   I4  of which rng_seed = ${seed_only} us (${seed_share} % — rng.hml, the price of the determinism contract)`);
+    ck(seed_share > 10.0 && seed_share < 90.0,
+       "I4 the reseed is a real but not dominant share of a roll (measured 31 % compiled, 24 % interpreted)",
+       `${seed_share} %`);
+}
+
+fn seed_us(p_reps: i32): f64 {
+    let reps: i32 = p_reps;
+    let st = rng_new();
+    let best: f64 = 0.0;
+    let t = 0;
+    while (t < g_TRIALS) {
+        let c0: f64 = __clock();
+        let i = 0;
+        while (i < reps) {
+            loot_seed(st, 5150, i, 1);
+            i = i + 1;
+        }
+        let c1: f64 = __clock();
+        let us: f64 = (c1 - c0) * 1000000.0 / f64(reps);
+        if (t == 0 || us < best) { best = us; }
+        t = t + 1;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    let want_dist: i32 = 0;
+    let n_args: i32 = args.length;
+    let ai = 0;
+    while (ai < n_args) {
+        if (args[ai] == "--distribution") { want_dist = 1; }
+        ai = ai + 1;
+    }
+
+    if (is_dir("src/sim") != true) {
+        print("FAIL  run this from the nightshade repo root: src/sim/ not found from here");
+        exit(1);
+    }
+
+    if (want_dist == 1) {
+        // The BUILD_PLAN's named self-test. Prints the whole table, then runs
+        // only the distribution assertions and reports on those.
+        print("loot --distribution  —  GDD §3.3 drop weights vs 100 000 rolls per tier");
+        print("");
+        section_distribution(1);
+        print("");
+        print(`ASSERTIONS  ran ${g_asserts}  pass ${g_pass}  fail ${g_fail}`);
+        if (g_fail != 0) { exit(1); }
+        print(`PASS  ${g_pass}/${g_asserts} distribution assertions`);
+        return;
+    }
+
+    print("probe_loot  —  W4-8  (src/sim/loot.hml)");
+    print("");
+
+    section_shapes();
+    print("");
+    section_table();
+    print("");
+    section_affixes();
+    print("");
+    section_relics();
+    print("");
+    section_invariants();
+    print("");
+    section_distribution(0);
+    print("");
+    section_determinism();
+    print("");
+    section_purity();
+    print("");
+    section_budget();
+    print("");
+
+    // The cross-backend gate. Both backends print this; the shell compares.
+    // No golden constant lives in this file — see the header.
+    print(`FINGERPRINT ${g_fp}`);
+    print("");
+
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

@@ -1,0 +1,935 @@
+// =============================================================================
+//  director.hml — THE WAVE DIRECTOR.  W4-6.   GDD §2.6.
+// =============================================================================
+//
+//  This file is the game's dramatic engine. It does not spawn drama by feel; it
+//  spawns it on a schedule, from a seed, and the schedule is the deliverable.
+//
+//      dusk horn (T-2:00)  ->  you are at a lantern or you are prey
+//      nightfall           ->  THE HOLD: 3 waves, ~3:20, then the light holds
+//
+//  ---------------------------------------------------------------------------
+//  THE NUMBERS (GDD §2.6 — every one of them lives in core/config.hml §11)
+//  ---------------------------------------------------------------------------
+//      budget(tier, wave) = 60 + 45*tier + 18*wave      wave in 0..2
+//      alive_cap          = 14
+//      onscreen_cap       =  8      spawns that would exceed it are DEFERRED
+//      spawn_ring         = 24..40 m from the hold anchor, biased BEHIND view
+//      spawn_cadence      = 1.2 s   while under both caps
+//      wave_gap           = 8.0 s   the breather between waves
+//
+//  Not one of those six is typed in below. They are imported. Re-tuning the
+//  pacing is a one-line edit in the file that owns the number, and every probe
+//  assertion here is a PROPERTY ("the full budget is spent", "the caps hold",
+//  "70 % spawn behind you"), never a digit — the digits are allowed to move.
+//
+//  ---------------------------------------------------------------------------
+//  DESIGN 1 — THE DIRECTOR REQUESTS, IT DOES NOT SPAWN
+//  ---------------------------------------------------------------------------
+//  `director_step` writes SPAWN REQUESTS (kind, x, y, z) into a small queue.
+//  The caller — `sim.hml` stage (e) — drains the queue, calls `ai_spawn`, and
+//  reports the entity id back with `director_bind`. Three reasons:
+//
+//    * OWNERSHIP. `ai.hml` owns what an enemy IS (hp, steering, tells). The
+//      director owns WHEN and WHERE and HOW MANY. Neither file has to know the
+//      other's fields, and W4-5 and W4-6 could be built in the same wave.
+//    * FAILURE. `world_spawn` can return SLOT_NONE. `director_bind(d, i, 0)`
+//      refunds the cost, so a full world delays the wave instead of silently
+//      eating budget — "the full budget is always spent" survives the failure.
+//    * TEST. The whole director runs headless against a `World` and a stand-in
+//      spawner. No AI, no renderer, no clock.
+//
+//  ---------------------------------------------------------------------------
+//  DESIGN 2 — ALIVENESS IS OBSERVED, NOT NOTIFIED
+//  ---------------------------------------------------------------------------
+//  There is no `director_notify_death`. Each step the director walks its own
+//  roster (<= 32 ids) and asks `world_alive`. Whatever killed the enemy — a
+//  bullet, an AoE, dawn dissolving it, a despawn on chunk unload — the director
+//  sees it on the next tick with no cooperation from anybody. A notify API is
+//  one missed call away from a wave that never ends.
+//
+//  ---------------------------------------------------------------------------
+//  DESIGN 3 — THE RNG IS RESEEDED PER SPAWN, NEVER CARRIED
+//  ---------------------------------------------------------------------------
+//  Every spawn decision reseeds `RNG_DIRECTOR` from (world_seed, RNG_DIRECTOR,
+//  tick, spawn_seq). The generator lanes are therefore NOT part of director
+//  state, which makes the whole module rollback-safe: re-running tick 900 after
+//  a misprediction produces the identical spawn, because the seed tuple is the
+//  identical tuple. A carried lane state would make the second run differ.
+//
+//  ---------------------------------------------------------------------------
+//  DESIGN 4 — "THE FULL BUDGET IS ALWAYS SPENT" — WHAT THAT CAN MEAN
+//  ---------------------------------------------------------------------------
+//  It cannot mean "the remainder is exactly zero". Tier 3's pool costs are
+//  {2, 6, 8, 20, 90} — all even — and tier 3's budgets (195 / 213 / 231) are
+//  all odd. An exact zero remainder is arithmetically impossible there. So the
+//  contract implemented and asserted is the strongest one that is achievable:
+//
+//      the director never stops spawning while it can still afford ANY member
+//      of the tier pool  ->  0 <= remaining < min_cost(tier)   at wave end
+//
+//  which for tier 1 leaves at most 1 of 105 unspent (0.95 %), and for tier 5 at
+//  most 5 of 285 (1.8 %). `director_wave_remaining` exposes it so the probe can
+//  assert the bound rather than trust it.
+//
+//  ---------------------------------------------------------------------------
+//  DESIGN 5 — THE GUARANTEED BULWARK IS RESERVED, THEN SPAWNED LAST
+//  ---------------------------------------------------------------------------
+//  Tier 3 wave 3, and tier 4 waves 2 and 3, are each guaranteed one Bulwark
+//  (GDD §2.6). It is "the wave-3 punctuation", so it must arrive at the END of
+//  the wave, not the start — but if it is spawned from the leftovers there may
+//  be nothing left to spawn it with. So its 90 points are RESERVED off the top
+//  at wave start and it is spawned the instant the un-reserved budget runs out.
+//  It is the last thing that walks out of the dark, which is the point.
+//
+//  ---------------------------------------------------------------------------
+//  DESIGN 6 — WHY THE RING RADIUS IS THE PACING KNOB
+//  ---------------------------------------------------------------------------
+//  A tier-1 hold spawns ~110 enemies. At a 1.2 s cadence that is 132 s of
+//  spawning plus 16 s of gaps = 148 s, and if the player could delete each
+//  enemy the instant it appeared the hold would end there, at 2:28. It does not,
+//  because an enemy has to CROSS THE RING first: a Mote at 2.2 m/s spends ~12 s
+//  covering 24-40 m. That travel time — not the player's aim — is what carries
+//  a tier-1 hold from 2:28 to ~3:20, and it is set by `g_DIR_SPAWN_MIN_M` /
+//  `g_DIR_SPAWN_MAX_M`. If the hold ever feels short, move the ring out before
+//  you touch the budget. See `tools/probe_director.hml` for the measurement.
+//
+//  ---------------------------------------------------------------------------
+//  IMPORTS — the wall (CLAUDE.md §3): @stdlib/math, src/sim/**, src/core/**.
+//  No SDL, no wobbleweed, no @stdlib/random, no clock. Ever.
+// =============================================================================
+
+import { sin, cos, sqrt, TAU } from "@stdlib/math";
+
+import { g_TICK_HZ, g_FOV_HIP, g_FOG_FAR_CAP, g_SHADE_TIER_MAX,
+         g_DIR_BUDGET_BASE, g_DIR_BUDGET_PER_TIER, g_DIR_BUDGET_PER_WAVE,
+         g_DIR_ALIVE_CAP, g_DIR_ONSCREEN_CAP,
+         g_DIR_SPAWN_MIN_M, g_DIR_SPAWN_MAX_M,
+         g_DIR_SPAWN_CADENCE_S, g_DIR_WAVE_GAP_S, g_DIR_WAVES_PER_HOLD,
+         g_DIR_SPAWN_BEHIND_BIAS,
+         g_ENEMY_KIND_COUNT, g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK,
+         g_ENEMY_SPITTER, g_ENEMY_WARDEN, g_ENEMY_BULWARK } from "../core/config.hml";
+
+import { rng_new, rng_seed, rng_pick, rng_f01, RNG_DIRECTOR } from "./rng.hml";
+import { world_alive, world_slot_of } from "./world.hml";
+import { day_phase, day_horn_edge, PHASE_DAWN, PHASE_NIGHT } from "./daycycle.hml";
+
+// ---------------------------------------------------------------------------
+// STATES — the hold's state machine. Serializable as one i32.
+// ---------------------------------------------------------------------------
+export let DIR_IDLE: i32     = 0;   // day, or the hold is over
+export let DIR_ARMED: i32    = 1;   // the horn has sounded; night has not
+export let DIR_SPAWNING: i32 = 2;   // wave budget is draining
+export let DIR_CLEARING: i32 = 3;   // budget spent, waiting for the last body
+export let DIR_GAP: i32      = 4;   // the breather between waves
+export let DIR_DONE: i32     = 5;   // all three waves cleared; the light holds
+export let DIR_STATE_COUNT: i32 = 6;
+
+// ---------------------------------------------------------------------------
+// EVENTS — a bitmask, valid for exactly the tick that produced it.
+// `sim_effects` turns these into the horn, the ember rain and the XP toast.
+// The director itself never makes a sound; it has no way to (CLAUDE.md §7).
+// ---------------------------------------------------------------------------
+export let DIR_EV_NONE: i32       = 0;
+export let DIR_EV_HORN: i32       = 1;    // dusk horn, T-2:00
+export let DIR_EV_HOLD_START: i32 = 2;    // nightfall / lantern lit
+export let DIR_EV_WAVE_START: i32 = 4;
+export let DIR_EV_WAVE_CLEAR: i32 = 8;    // ember rain + XP toast + fog recolor
+export let DIR_EV_HOLD_DONE: i32  = 16;
+export let DIR_EV_DAWN: i32       = 32;   // the shades dissolve; hold aborted
+export let DIR_EV_SPAWN: i32      = 64;   // >=1 request was written this tick
+
+// ---------------------------------------------------------------------------
+// SIZES
+// ---------------------------------------------------------------------------
+export let DIR_ROSTER_CAP: i32 = 32;   // alive cap 14 + reserved bulwarks + slack
+export let DIR_REQ_CAP: i32    = 4;    // 1 spawn per cadence; 4 is headroom
+
+// Derived, once, at load. Ticks are the authority — a float timer would drift
+// and would not survive a rollback bit-for-bit (daycycle.hml DESIGN 1).
+export let DIR_CADENCE_TICKS: i32 = i32(g_DIR_SPAWN_CADENCE_S * f64(g_TICK_HZ) + 0.5);
+export let DIR_GAP_TICKS: i32     = i32(g_DIR_WAVE_GAP_S * f64(g_TICK_HZ) + 0.5);
+
+// The view cone used by the on-screen cap and by the "behind you" bias. Half of
+// the hip FOV, in radians, plus the draw distance beyond which nothing is on
+// screen at all. Both derived from config; neither is a director opinion.
+export let DIR_HALF_FOV: f64   = g_FOV_HIP * 0.5 * (TAU / 360.0);
+export let DIR_ONSCREEN_M: f64 = g_FOG_FAR_CAP;
+
+// ---------------------------------------------------------------------------
+// THE ENEMY SPAWN-BUDGET COSTS — GDD §2.2, last column.
+// ---------------------------------------------------------------------------
+// These are the DIRECTOR's numbers (the GDD calls them "spawn budget costs used
+// by the director"), which is why they live here and not in ai.hml: ai.hml owns
+// hp / speed / tells, the director owns what a body costs to put on the field.
+// Indexed by g_ENEMY_* .          Wisp Mote Husk Spitter Warden Bulwark
+let g_dir_cost: array<i32> = [        2,   3,   6,      8,    20,     90];
+
+// ---------------------------------------------------------------------------
+// THE FIVE COMPOSITION TABLES — GDD §2.6, verbatim, as integer percents.
+// ---------------------------------------------------------------------------
+// Flat [tier * 6 + kind]; every tier row sums to exactly 100, which
+// `director_table_ok` asserts so a typo is a test failure, not a silent bias.
+// Tier 0 is empty on purpose: a lit lantern forces tier 0 in its radius (GDD
+// §4) and tier 0 means the dark does not come.
+//                       Wisp Mote Husk Spit Ward Bulw
+let g_dir_w: array<i32> = [
+       0,   0,   0,   0,   0,   0,     // tier 0 — inside a lit lantern
+      40,  35,  25,   0,   0,   0,     // tier 1
+      25,  20,  40,  15,   0,   0,     // tier 2
+      15,   0,  40,  25,  20,   0,     // tier 3
+       5,   0,  35,  25,  35,   0,     // tier 4
+       0,   0,  25,  25,  40,  10      // tier 5
+];
+
+// Guaranteed Bulwarks, as a bitmask over wave index 0..2.
+// GDD: tier 3 "+1 Bulwark on wave 3"; tier 4 "+1 Bulwark on wave 2 and 3".
+// Wave 3 is index 2, wave 2 is index 1.
+let g_dir_bulwark: array<i32> = [0, 0, 0, 4, 6, 0];
+
+// ---------------------------------------------------------------------------
+// PURE TABLE QUERIES — no state, callable from anywhere, used by the probe.
+// ---------------------------------------------------------------------------
+
+// budget(tier, wave) = 60 + 45*tier + 18*wave. Wave is the INDEX, 0..2.
+export fn director_budget(p_tier: i32, p_wave: i32): i32 {
+    let t: i32 = p_tier;
+    let v: i32 = p_wave;
+    if (t < 0) { t = 0; }
+    if (t > g_SHADE_TIER_MAX) { t = g_SHADE_TIER_MAX; }
+    if (v < 0) { v = 0; }
+    let out: i32 = g_DIR_BUDGET_BASE + g_DIR_BUDGET_PER_TIER * t + g_DIR_BUDGET_PER_WAVE * v;
+    return out;
+}
+
+// Spawn-budget cost of one body of `p_kind`, or 0 for an unknown kind.
+export fn director_cost(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k < 0 || k >= g_ENEMY_KIND_COUNT) { let z: i32 = 0; return z; }
+    let c = g_dir_cost;
+    let out: i32 = c[k];
+    return out;
+}
+
+// Percent weight of `p_kind` in tier `p_tier`'s roll pool, 0..100.
+export fn director_weight(p_tier: i32, p_kind: i32): i32 {
+    let t: i32 = p_tier;
+    let k: i32 = p_kind;
+    if (t < 0 || t > g_SHADE_TIER_MAX) { let z: i32 = 0; return z; }
+    if (k < 0 || k >= g_ENEMY_KIND_COUNT) { let z2: i32 = 0; return z2; }
+    let w = g_dir_w;
+    let out: i32 = w[t * g_ENEMY_KIND_COUNT + k];
+    return out;
+}
+
+// Cheapest body in tier `p_tier`'s pool, or 0 if the pool is empty. This is the
+// bound in DESIGN 4: a wave ends with remaining < this.
+export fn director_min_cost(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    let w = g_dir_w;
+    let c = g_dir_cost;
+    let best: i32 = 0;
+    let k: i32 = 0;
+    while (k < g_ENEMY_KIND_COUNT) {
+        if (w[t * g_ENEMY_KIND_COUNT + k] > 0) {
+            let cc: i32 = c[k];
+            if (best == 0 || cc < best) { best = cc; }
+        }
+        k++;
+    }
+    let out: i32 = best;
+    return out;
+}
+
+// 1 if tier `p_tier` wave index `p_wave` is guaranteed a Bulwark.
+export fn director_bulwark_guaranteed(p_tier: i32, p_wave: i32): i32 {
+    let t: i32 = p_tier;
+    let v: i32 = p_wave;
+    if (t < 0 || t > g_SHADE_TIER_MAX) { let z: i32 = 0; return z; }
+    if (v < 0 || v > 30) { let z2: i32 = 0; return z2; }
+    let b = g_dir_bulwark;
+    let m: i32 = b[t];
+    let bit: i32 = 1 << v;
+    let out: i32 = 0;
+    if ((m & bit) != 0) { out = 1; }
+    return out;
+}
+
+// Every tier row sums to 100, or the tables are wrong. Returns the first
+// offending tier, or -1 if all six are sound. The probe asserts -1.
+export fn director_table_ok(): i32 {
+    let w = g_dir_w;
+    let t: i32 = 0;
+    while (t <= g_SHADE_TIER_MAX) {
+        let s: i32 = 0;
+        let k: i32 = 0;
+        while (k < g_ENEMY_KIND_COUNT) { s = s + w[t * g_ENEMY_KIND_COUNT + k]; k++; }
+        if (t == 0) {
+            if (s != 0) { let bad0: i32 = t; return bad0; }
+        }
+        if (t > 0) {
+            if (s != 100) { let bad: i32 = t; return bad; }
+        }
+        t++;
+    }
+    let out: i32 = -1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE COMPOSITION ROLL
+// ---------------------------------------------------------------------------
+// One weighted pick from a tier's table, restricted to kinds costing at most
+// `p_max_cost` (pass a large number for the unrestricted roll the GDD table
+// describes). Returns -1 when nothing in the pool is affordable.
+//
+// `rng_pick` is rejection-sampled, so the pick is EXACTLY uniform over the
+// weight total — no modulo bias. Restricting renormalises over the affordable
+// kinds, which preserves their relative weights; that is the behaviour the
+// distribution assertion is written against.
+export fn director_roll_kind(p_st: array, p_tier: i32, p_max_cost: i32): i32 {
+    let st: array = p_st;
+    let t: i32 = p_tier;
+    let mx: i32 = p_max_cost;
+    if (t < 0 || t > g_SHADE_TIER_MAX) { let z: i32 = -1; return z; }
+    let w = g_dir_w;
+    let c = g_dir_cost;
+    let base: i32 = t * g_ENEMY_KIND_COUNT;
+
+    let total: i32 = 0;
+    let k: i32 = 0;
+    while (k < g_ENEMY_KIND_COUNT) {
+        let ww: i32 = w[base + k];
+        if (ww > 0) {
+            if (c[k] <= mx) { total = total + ww; }
+        }
+        k++;
+    }
+    if (total <= 0) { let none: i32 = -1; return none; }
+
+    let r: i32 = rng_pick(st, total);
+    let acc: i32 = 0;
+    let j: i32 = 0;
+    while (j < g_ENEMY_KIND_COUNT) {
+        let ww2: i32 = w[base + j];
+        if (ww2 > 0) {
+            if (c[j] <= mx) {
+                acc = acc + ww2;
+                if (r < acc) { let out: i32 = j; return out; }
+            }
+        }
+        j++;
+    }
+    let last: i32 = -1;
+    return last;
+}
+
+// ---------------------------------------------------------------------------
+// THE DIRECTOR OBJECT
+// ---------------------------------------------------------------------------
+// Flat scalars and flat arrays only (CLAUDE.md §7 / NETWORKING §3): everything
+// below goes on a wire one day and every field is an i32, an f64 or an array of
+// those. No object graph, no closure, no reference to an entity.
+export fn director_new(): object {
+    let ros_id: array<i32>   = [];
+    let ros_kind: array<i32> = [];
+    let ros_wave: array<i32> = [];
+    let req_kind: array<i32> = [];
+    let req_bound: array<i32> = [];
+    let req_x: array<f64> = [];
+    let req_y: array<f64> = [];
+    let req_z: array<f64> = [];
+    let i: i32 = 0;
+    while (i < DIR_ROSTER_CAP) { ros_id.push(0); ros_kind.push(0); ros_wave.push(0); i++; }
+    let j: i32 = 0;
+    while (j < DIR_REQ_CAP) {
+        req_kind.push(0); req_bound.push(0);
+        req_x.push(0.0); req_y.push(0.0); req_z.push(0.0);
+        j++;
+    }
+
+    let d = {
+        // --- identity / determinism ---------------------------------------
+        seed: 0,
+        tier: 1,
+        rng: rng_new(),
+        spawn_seq: 0,          // monotone; the rng `entity` coordinate
+
+        // --- the hold ------------------------------------------------------
+        state: DIR_IDLE,
+        wave: 0,
+        budget: 0,             // this wave's total
+        spent: 0,              // of the un-reserved part
+        reserve: 0,            // 90 while a guaranteed Bulwark is pending
+        bulwark_pending: 0,
+        spawn_timer: 0,        // ticks until the next spawn is due
+        gap_timer: 0,
+        wave_spawned: 0,       // bodies put on the field this wave
+        hold_spawned: 0,
+        holds_done: 0,
+
+        // --- clock ---------------------------------------------------------
+        prev_tick: 0,
+        tick: 0,
+        hold_start_tick: 0,
+        wave_start_tick: 0,
+        hold_ticks: 0,         // duration of the last COMPLETED hold
+        events: 0,
+
+        // --- anchor (the lantern you are holding) ---------------------------
+        ax: 0.0, ay: 0.0, az: 0.0,
+
+        // --- observation ----------------------------------------------------
+        alive: 0,
+        onscreen: 0,
+        peak_alive: 0,
+        peak_onscreen: 0,
+        peak_onscreen_at_spawn: 0,
+
+        // --- deferral counters (pacing telemetry, not gameplay) --------------
+        defer_alive: 0,
+        defer_onscreen: 0,
+        spawn_fail: 0,
+
+        // --- the roster: director-spawned bodies still on the field ---------
+        n_ros: 0,
+        ros_id: ros_id,
+        ros_kind: ros_kind,
+        ros_wave: ros_wave,
+
+        // --- the request queue, drained by the caller every tick ------------
+        req_n: 0,
+        req_kind: req_kind,
+        req_bound: req_bound,
+        req_x: req_x,
+        req_y: req_y,
+        req_z: req_z
+    };
+    return d;
+}
+
+// Full reset. `p_tick` is the tick the director is being armed AT, so the very
+// first `director_step(d, .., p_tick, ..)` still sees that tick's horn edge.
+export fn director_reset(p_d: object, p_seed: i32, p_tick: i32) {
+    let d: object = p_d;
+    d.seed = p_seed;
+    d.spawn_seq = 0;
+    d.state = DIR_IDLE;
+    d.wave = 0;
+    d.budget = 0;
+    d.spent = 0;
+    d.reserve = 0;
+    d.bulwark_pending = 0;
+    d.spawn_timer = 0;
+    d.gap_timer = 0;
+    d.wave_spawned = 0;
+    d.hold_spawned = 0;
+    d.holds_done = 0;
+    d.prev_tick = p_tick - 1;
+    d.tick = p_tick;
+    d.hold_start_tick = 0;
+    d.wave_start_tick = 0;
+    d.hold_ticks = 0;
+    d.events = 0;
+    d.alive = 0;
+    d.onscreen = 0;
+    d.peak_alive = 0;
+    d.peak_onscreen = 0;
+    d.peak_onscreen_at_spawn = 0;
+    d.defer_alive = 0;
+    d.defer_onscreen = 0;
+    d.spawn_fail = 0;
+    d.n_ros = 0;
+    d.req_n = 0;
+}
+
+// The hold anchor — the lantern post you are defending. The ring is measured
+// from here, never from the player, so backing off the post does not drag the
+// spawns with you.
+export fn director_set_anchor(p_d: object, p_x: f64, p_y: f64, p_z: f64) {
+    let d: object = p_d;
+    d.ax = p_x;
+    d.ay = p_y;
+    d.az = p_z;
+}
+
+// Shade tier of the hold, 0..5 (worldgen distance band + day-cycle bonus, less
+// any lantern suppression). Tier 0 means no hold at all.
+export fn director_set_tier(p_d: object, p_tier: i32) {
+    let d: object = p_d;
+    let t: i32 = p_tier;
+    if (t < 0) { t = 0; }
+    if (t > g_SHADE_TIER_MAX) { t = g_SHADE_TIER_MAX; }
+    d.tier = t;
+}
+
+// ---------------------------------------------------------------------------
+// ACCESSORS — everything a caller, a snapshot or a HUD needs, and nothing more.
+// ---------------------------------------------------------------------------
+export fn director_wave_state(p_d: object): i32 { let d: object = p_d; let out: i32 = d.state; return out; }
+export fn director_wave(p_d: object): i32 { let d: object = p_d; let out: i32 = d.wave; return out; }
+export fn director_tier(p_d: object): i32 { let d: object = p_d; let out: i32 = d.tier; return out; }
+export fn director_events(p_d: object): i32 { let d: object = p_d; let out: i32 = d.events; return out; }
+export fn director_alive(p_d: object): i32 { let d: object = p_d; let out: i32 = d.alive; return out; }
+export fn director_onscreen(p_d: object): i32 { let d: object = p_d; let out: i32 = d.onscreen; return out; }
+export fn director_spawned(p_d: object): i32 { let d: object = p_d; let out: i32 = d.hold_spawned; return out; }
+export fn director_wave_spawned(p_d: object): i32 { let d: object = p_d; let out: i32 = d.wave_spawned; return out; }
+export fn director_hold_ticks(p_d: object): i32 { let d: object = p_d; let out: i32 = d.hold_ticks; return out; }
+export fn director_holds_done(p_d: object): i32 { let d: object = p_d; let out: i32 = d.holds_done; return out; }
+export fn director_defer_alive(p_d: object): i32 { let d: object = p_d; let out: i32 = d.defer_alive; return out; }
+export fn director_defer_onscreen(p_d: object): i32 { let d: object = p_d; let out: i32 = d.defer_onscreen; return out; }
+export fn director_peak_alive(p_d: object): i32 { let d: object = p_d; let out: i32 = d.peak_alive; return out; }
+export fn director_peak_onscreen(p_d: object): i32 { let d: object = p_d; let out: i32 = d.peak_onscreen; return out; }
+export fn director_peak_onscreen_at_spawn(p_d: object): i32 { let d: object = p_d; let out: i32 = d.peak_onscreen_at_spawn; return out; }
+
+// Budget still unspent in this wave, INCLUDING the reserved Bulwark. Between
+// waves this is 0. At wave end it is < director_min_cost(tier) (DESIGN 4).
+export fn director_wave_remaining(p_d: object): i32 {
+    let d: object = p_d;
+    let out: i32 = d.budget - d.spent;
+    return out;
+}
+
+export fn director_wave_budget(p_d: object): i32 { let d: object = p_d; let out: i32 = d.budget; return out; }
+
+// 1 while a hold is running (spawning, clearing or in the gap).
+export fn director_hold_active(p_d: object): i32 {
+    let d: object = p_d;
+    let s: i32 = d.state;
+    let out: i32 = 0;
+    if (s == DIR_SPAWNING || s == DIR_CLEARING || s == DIR_GAP) { out = 1; }
+    return out;
+}
+
+// The request queue, drained by the caller after every `director_step`.
+export fn director_req_count(p_d: object): i32 { let d: object = p_d; let out: i32 = d.req_n; return out; }
+export fn director_req_kind(p_d: object, p_i: i32): i32 { let d: object = p_d; let a = d.req_kind; let out: i32 = a[p_i]; return out; }
+export fn director_req_x(p_d: object, p_i: i32): f64 { let d: object = p_d; let a = d.req_x; let out: f64 = a[p_i]; return out; }
+export fn director_req_y(p_d: object, p_i: i32): f64 { let d: object = p_d; let a = d.req_y; let out: f64 = a[p_i]; return out; }
+export fn director_req_z(p_d: object, p_i: i32): f64 { let d: object = p_d; let a = d.req_z; let out: f64 = a[p_i]; return out; }
+
+// Roster inspection, for the snapshot and for tests.
+export fn director_roster_count(p_d: object): i32 { let d: object = p_d; let out: i32 = d.n_ros; return out; }
+export fn director_roster_id(p_d: object, p_i: i32): i32 { let d: object = p_d; let a = d.ros_id; let out: i32 = a[p_i]; return out; }
+export fn director_roster_kind(p_d: object, p_i: i32): i32 { let d: object = p_d; let a = d.ros_kind; let out: i32 = a[p_i]; return out; }
+
+// ---------------------------------------------------------------------------
+// BIND — the caller reports what it actually created.
+// ---------------------------------------------------------------------------
+// `p_id > 0` : the body exists, put it on the roster.
+// otherwise  : the spawn FAILED (world full). Refund the cost so the wave still
+//              spends its full budget, just later. This is the branch that
+//              keeps "the full budget is always spent" true under pressure.
+export fn director_bind(p_d: object, p_i: i32, p_id: i32): i32 {
+    let d: object = p_d;
+    let i: i32 = p_i;
+    let id: i32 = p_id;
+    if (i < 0 || i >= d.req_n) { let bad: i32 = 0; return bad; }
+    let bound = d.req_bound;
+    if (bound[i] != 0) { let dup: i32 = 0; return dup; }
+    bound[i] = 1;
+
+    let rk = d.req_kind;
+    let kind: i32 = rk[i];
+
+    if (id <= 0) {
+        // Refund. The reserved Bulwark goes back into reserve, not into spent.
+        let cost: i32 = director_cost(kind);
+        if (kind == g_ENEMY_BULWARK && d.reserve == 0 && director_bulwark_guaranteed(d.tier, d.wave) == 1) {
+            d.reserve = cost;
+            d.bulwark_pending = 1;
+        }
+        d.spent = d.spent - cost;
+        d.wave_spawned = d.wave_spawned - 1;
+        d.hold_spawned = d.hold_spawned - 1;
+        d.spawn_fail = d.spawn_fail + 1;
+        let fail: i32 = 0;
+        return fail;
+    }
+
+    let n: i32 = d.n_ros;
+    if (n >= DIR_ROSTER_CAP) { let full: i32 = 0; return full; }
+    let ri = d.ros_id;
+    let rkk = d.ros_kind;
+    let rw = d.ros_wave;
+    ri[n] = id;
+    rkk[n] = kind;
+    rw[n] = d.wave;
+    d.n_ros = n + 1;
+    let ok: i32 = 1;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// INTERNALS
+// ---------------------------------------------------------------------------
+
+// Drop roster entries whose entity is gone, and recount alive / on-screen.
+// Swap-with-last, exactly as world_despawn does — order on the roster carries
+// no meaning, so nothing is lost by it and it stays O(n).
+fn dir_observe(p_d: object, p_w: object, p_px: f64, p_pz: f64, p_yaw: f64) {
+    let d: object = p_d;
+    let w: object = p_w;
+    let px: f64 = p_px;
+    let pz: f64 = p_pz;
+    let yaw: f64 = p_yaw;
+
+    let fx: f64 = sin(yaw);
+    let fz: f64 = 0.0 - cos(yaw);
+    let cos_half: f64 = cos(DIR_HALF_FOV);
+    let far: f64 = DIR_ONSCREEN_M;
+
+    let ri = d.ros_id;
+    let rk = d.ros_kind;
+    let rw = d.ros_wave;
+    let wpx = w.px;
+    let wpz = w.pz;
+
+    let n: i32 = d.n_ros;
+    let on: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let id: i32 = ri[i];
+        let slot: i32 = world_slot_of(w, id);
+        if (slot < 0) {
+            n = n - 1;
+            ri[i] = ri[n];
+            rk[i] = rk[n];
+            rw[i] = rw[n];
+        }
+        if (slot >= 0) {
+            let dx: f64 = wpx[slot] - px;
+            let dz: f64 = wpz[slot] - pz;
+            let dd: f64 = dx * dx + dz * dz;
+            if (dd <= far * far) {
+                if (dd > 0.000001) {
+                    let inv: f64 = 1.0 / sqrt(dd);
+                    let c: f64 = (dx * fx + dz * fz) * inv;
+                    if (c >= cos_half) { on = on + 1; }
+                }
+                if (dd <= 0.000001) { on = on + 1; }
+            }
+            i++;
+        }
+    }
+    d.n_ros = n;
+    d.alive = n;
+    d.onscreen = on;
+    if (n > d.peak_alive) { d.peak_alive = n; }
+    if (on > d.peak_onscreen) { d.peak_onscreen = on; }
+}
+
+// Start wave `p_wave` of the current hold.
+fn dir_begin_wave(p_d: object, p_wave: i32) {
+    let d: object = p_d;
+    let v: i32 = p_wave;
+    let t: i32 = d.tier;
+    d.wave = v;
+    d.budget = director_budget(t, v);
+    d.spent = 0;
+    d.wave_spawned = 0;
+    d.wave_start_tick = d.tick;
+    d.spawn_timer = 0;                       // the first body is immediate
+    d.reserve = 0;
+    d.bulwark_pending = 0;
+    if (director_bulwark_guaranteed(t, v) == 1) {
+        let bc: i32 = director_cost(g_ENEMY_BULWARK);
+        if (bc <= d.budget) {
+            d.reserve = bc;
+            d.bulwark_pending = 1;
+        }
+    }
+    d.state = DIR_SPAWNING;
+    d.events = d.events | DIR_EV_WAVE_START;
+}
+
+// Write one spawn request. Returns 1 if a request was written.
+fn dir_emit_spawn(p_d: object, p_kind: i32, p_px: f64, p_pz: f64, p_yaw: f64): i32 {
+    let d: object = p_d;
+    let kind: i32 = p_kind;
+    let yaw: f64 = p_yaw;
+
+    let n: i32 = d.req_n;
+    if (n >= DIR_REQ_CAP) { let full: i32 = 0; return full; }
+
+    // Reseed per spawn: (world_seed, RNG_DIRECTOR, tick, spawn_seq). DESIGN 3.
+    let st: array = d.rng;
+    rng_seed(st, d.seed, RNG_DIRECTOR, d.tick, d.spawn_seq);
+    d.spawn_seq = d.spawn_seq + 1;
+
+    // Radius: uniform in the annulus AREA, so spawns are spatially even rather
+    // than crowding the inner edge. r = sqrt(r0^2 + u*(r1^2 - r0^2)).
+    let r0: f64 = g_DIR_SPAWN_MIN_M;
+    let r1: f64 = g_DIR_SPAWN_MAX_M;
+    let u: f64 = rng_f01(st);
+    let r: f64 = sqrt(r0 * r0 + u * (r1 * r1 - r0 * r0));
+
+    // Bearing relative to the player's forward axis. With probability
+    // g_DIR_SPAWN_BEHIND_BIAS the body walks out of the dark BEHIND the view
+    // cone; otherwise it comes from the front, so the bias is a tendency and
+    // not a rule the player can exploit by never turning around.
+    let ub: f64 = rng_f01(st);
+    let ua: f64 = rng_f01(st);
+    let half: f64 = DIR_HALF_FOV;
+    let bear: f64 = 0.0;
+    if (ub < g_DIR_SPAWN_BEHIND_BIAS) {
+        bear = half + ua * (TAU - 2.0 * half);   // sweeps the whole rear arc
+    }
+    if (ub >= g_DIR_SPAWN_BEHIND_BIAS) {
+        bear = 0.0 - half + ua * 2.0 * half;     // inside the cone
+    }
+
+    // forward = (sin yaw, -cos yaw); right = (cos yaw, sin yaw)  [view.hml]
+    // dir(bearing) = forward*cos + right*sin = (sin(yaw+b), -cos(yaw+b))
+    let a: f64 = yaw + bear;
+    let x: f64 = d.ax + r * sin(a);
+    let z: f64 = d.az - r * cos(a);
+
+    let rk = d.req_kind;
+    let rb = d.req_bound;
+    let rx = d.req_x;
+    let ry = d.req_y;
+    let rz = d.req_z;
+    rk[n] = kind;
+    rb[n] = 0;
+    rx[n] = x;
+    ry[n] = d.ay;      // the spawner snaps to terrain; the ring is 2-D
+    rz[n] = z;
+    d.req_n = n + 1;
+
+    d.spent = d.spent + director_cost(kind);
+    d.wave_spawned = d.wave_spawned + 1;
+    d.hold_spawned = d.hold_spawned + 1;
+    d.events = d.events | DIR_EV_SPAWN;
+    if (d.onscreen > d.peak_onscreen_at_spawn) { d.peak_onscreen_at_spawn = d.onscreen; }
+    let ok: i32 = 1;
+    return ok;
+}
+
+// Un-bound requests from the previous tick are failed spawns. Refund them.
+fn dir_reap_requests(p_d: object) {
+    let d: object = p_d;
+    let n: i32 = d.req_n;
+    let i: i32 = 0;
+    while (i < n) {
+        let b = d.req_bound;
+        if (b[i] == 0) { director_bind(d, i, 0); }
+        i++;
+    }
+    d.req_n = 0;
+}
+
+// Abort: dawn came, or the lantern was lit. The roster is dropped (the bodies
+// themselves are despawned by whoever owns them); no budget is carried.
+fn dir_abort(p_d: object) {
+    let d: object = p_d;
+    d.state = DIR_IDLE;
+    d.wave = 0;
+    d.budget = 0;
+    d.spent = 0;
+    d.reserve = 0;
+    d.bulwark_pending = 0;
+    d.n_ros = 0;
+    d.alive = 0;
+    d.onscreen = 0;
+}
+
+// ---------------------------------------------------------------------------
+// BEGIN — the hold starts here
+// ---------------------------------------------------------------------------
+// Called by the lantern channel completing (W5-6), or automatically at
+// nightfall by `director_step` when the horn has already armed the director.
+// Tier 0 refuses: a lit lantern's radius is tier 0 and tier 0 has no dark in it.
+export fn director_begin(p_d: object, p_tick: i32): i32 {
+    let d: object = p_d;
+    if (d.tier <= 0) { let no: i32 = 0; return no; }
+    if (director_hold_active(d) == 1) { let already: i32 = 0; return already; }
+    d.tick = p_tick;
+    d.hold_start_tick = p_tick;
+    d.hold_spawned = 0;
+    d.events = d.events | DIR_EV_HOLD_START;
+    dir_begin_wave(d, 0);
+    let ok: i32 = 1;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// THE STEP — once per sim tick, stage (e) of ARCHITECTURE §4.
+// ---------------------------------------------------------------------------
+// Returns the number of spawn requests written this tick (0 or 1 in practice).
+// The caller MUST drain them and `director_bind` each one before the next step;
+// anything left un-bound is treated as a failed spawn and refunded.
+export fn director_step(p_d: object, p_w: object, p_tick: i32,
+                        p_px: f64, p_pz: f64, p_yaw: f64): i32 {
+    let d: object = p_d;
+    let w: object = p_w;
+    let tick: i32 = p_tick;
+
+    dir_reap_requests(d);
+    d.events = 0;
+    d.prev_tick = d.tick;
+    d.tick = tick;
+
+    dir_observe(d, w, p_px, p_pz, p_yaw);
+
+    // --- the day cycle drives the frame around the hold ---------------------
+    let phase: i32 = day_phase(tick);
+    if (day_horn_edge(d.prev_tick, tick) > 0) {
+        d.events = d.events | DIR_EV_HORN;
+        if (d.state == DIR_IDLE) { d.state = DIR_ARMED; }
+        if (d.state == DIR_DONE) { d.state = DIR_ARMED; }
+    }
+    if (phase == PHASE_DAWN) {
+        if (d.state != DIR_IDLE) {
+            d.events = d.events | DIR_EV_DAWN;
+            dir_abort(d);
+        }
+        let dawn: i32 = 0;
+        return dawn;
+    }
+    if (d.state == DIR_ARMED) {
+        if (phase == PHASE_NIGHT) { director_begin(d, tick); }
+    }
+    if (director_hold_active(d) == 0) { let idle: i32 = 0; return idle; }
+
+    // --- the gap: the breather. Ember rains, ammo drops, no hitmarkers. -----
+    if (d.state == DIR_GAP) {
+        d.gap_timer = d.gap_timer - 1;
+        if (d.gap_timer <= 0) { dir_begin_wave(d, d.wave + 1); }
+        let gap: i32 = 0;
+        return gap;
+    }
+
+    // --- clearing: the budget is spent; the wave ends with the last body ----
+    if (d.state == DIR_CLEARING) {
+        if (d.alive <= 0) {
+            d.events = d.events | DIR_EV_WAVE_CLEAR;
+            if (d.wave + 1 >= g_DIR_WAVES_PER_HOLD) {
+                d.state = DIR_DONE;
+                d.holds_done = d.holds_done + 1;
+                d.hold_ticks = tick - d.hold_start_tick;
+                d.events = d.events | DIR_EV_HOLD_DONE;
+            }
+            if (d.state != DIR_DONE) {
+                d.state = DIR_GAP;
+                d.gap_timer = DIR_GAP_TICKS;
+            }
+        }
+        let clr: i32 = 0;
+        return clr;
+    }
+
+    // --- spawning ----------------------------------------------------------
+    if (d.spawn_timer > 0) { d.spawn_timer = d.spawn_timer - 1; }
+
+    let free_budget: i32 = d.budget - d.spent - d.reserve;
+    let mincost: i32 = director_min_cost(d.tier);
+
+    // Is anything left to put on the field this wave?
+    let done_spawning: i32 = 0;
+    if (d.bulwark_pending == 0) {
+        if (mincost <= 0 || free_budget < mincost) { done_spawning = 1; }
+    }
+    if (done_spawning == 1) {
+        d.state = DIR_CLEARING;
+        let sw: i32 = 0;
+        return sw;
+    }
+
+    if (d.spawn_timer > 0) { let wait: i32 = 0; return wait; }
+
+    // The two caps. Both DEFER — neither cancels, neither spends budget.
+    if (d.alive >= g_DIR_ALIVE_CAP) {
+        d.defer_alive = d.defer_alive + 1;
+        let ca: i32 = 0;
+        return ca;
+    }
+    if (d.onscreen >= g_DIR_ONSCREEN_CAP) {
+        d.defer_onscreen = d.defer_onscreen + 1;
+        let co: i32 = 0;
+        return co;
+    }
+
+    // Pick the body. The reserved Bulwark goes last: it is the punctuation.
+    let kind: i32 = -1;
+    if (free_budget < mincost) {
+        if (d.bulwark_pending == 1) {
+            kind = g_ENEMY_BULWARK;     // charged to `spent` by dir_emit_spawn
+            d.reserve = 0;
+            d.bulwark_pending = 0;
+        }
+    }
+    if (kind < 0) {
+        let st: array = d.rng;
+        rng_seed(st, d.seed, RNG_DIRECTOR, tick, 0 - 1 - d.spawn_seq);
+        kind = director_roll_kind(st, d.tier, free_budget);
+    }
+    if (kind < 0) {
+        d.state = DIR_CLEARING;
+        let none: i32 = 0;
+        return none;
+    }
+
+    let wrote: i32 = dir_emit_spawn(d, kind, p_px, p_pz, p_yaw);
+    if (wrote == 1) { d.spawn_timer = DIR_CADENCE_TICKS; }
+    let out: i32 = wrote;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE STATE FINGERPRINT — for the determinism gate and for replay.
+// ---------------------------------------------------------------------------
+// u64 throughout (CLAUDE.md A13: i32/i64 * + - TRAP on overflow). Covers every
+// field that decides a future spawn; the peak/deferral counters are telemetry
+// and are hashed too, because a director that reached the same state by a
+// different route is not the same director.
+fn dir_mix(p_h: u64, p_k: i32): u64 {
+    let h: u64 = p_h;
+    let k: i32 = p_k;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    h = h ^ u;
+    h = h * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+export fn director_hash(p_d: object): u64 {
+    let d: object = p_d;
+    let h: u64 = 14695981039346656037;
+    h = dir_mix(h, d.seed);
+    h = dir_mix(h, d.tier);
+    h = dir_mix(h, d.state);
+    h = dir_mix(h, d.wave);
+    h = dir_mix(h, d.budget);
+    h = dir_mix(h, d.spent);
+    h = dir_mix(h, d.reserve);
+    h = dir_mix(h, d.bulwark_pending);
+    h = dir_mix(h, d.spawn_timer);
+    h = dir_mix(h, d.gap_timer);
+    h = dir_mix(h, d.spawn_seq);
+    h = dir_mix(h, d.wave_spawned);
+    h = dir_mix(h, d.hold_spawned);
+    h = dir_mix(h, d.holds_done);
+    h = dir_mix(h, d.hold_ticks);
+    h = dir_mix(h, d.alive);
+    h = dir_mix(h, d.onscreen);
+    h = dir_mix(h, d.peak_alive);
+    h = dir_mix(h, d.peak_onscreen);
+    h = dir_mix(h, d.defer_alive);
+    h = dir_mix(h, d.defer_onscreen);
+    h = dir_mix(h, d.spawn_fail);
+    h = dir_mix(h, d.n_ros);
+    let ri = d.ros_id;
+    let rk = d.ros_kind;
+    let n: i32 = d.n_ros;
+    let i: i32 = 0;
+    while (i < n) {
+        h = dir_mix(h, ri[i]);
+        h = dir_mix(h, rk[i]);
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}

@@ -1,0 +1,1233 @@
+// =============================================================================
+//  probe_projectiles.hml — the W4-4 acceptance probe.
+// =============================================================================
+//
+//  Headless.  No SDL, no renderer, no wall clock beyond `__clock()` for the
+//  RULE T timing harness.  Exits 1 on any failure and asserts its own assertion
+//  COUNT, so a probe that quietly stops checking things fails.
+//
+//  WHAT IT PROVES, in the order the build plan asks for it:
+//
+//    A  the data table is the GDD's data table          (design, not digits)
+//    B  arc integration is frame-rate independent       — with a negative
+//       control proving the tolerance can actually fail
+//    C  the burn ticks exactly 5 times per second and deals exactly its total
+//    D  the blast hits everything inside 3.5 m and nothing outside
+//    E  flight collides with entities and with the real heightfield
+//    F  determinism: same seed twice -> identical hash, different seed differs,
+//       and the hash is PINNED so interpreted and compiled must agree
+//    G  cosmetics are suppressed while replaying and never enter the hash
+//    I  damage really goes through `combat.hml`'s `combat_apply_damage` — the
+//       Warden plate applies to a blast, the five signals reach the SHARED bus,
+//       and a burn tick never paints a hitmarker
+//    H  the tick cost, min-of-7 CPU time (RULE T)
+//
+//  Run both backends.  They must both print the same pinned hash:
+//     hemlock tools/probe_projectiles.hml
+//     hemlockc -O1 tools/probe_projectiles.hml -o /tmp/pp && /tmp/pp
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import { g_TICK_DT, g_TICK_HZ, g_BUDGET_SIM_MS, g_WPN_LONGSHADOW, g_WPN_SPARROW,
+         g_HEIGHT_STAND, g_CAPSULE_RADIUS } from "../src/core/config.hml";
+
+import { rng_new, rng_seed, rng_f01, rng_f11, RNG_AI } from "../src/sim/rng.hml";
+
+import { world_new_cap, world_spawn, world_spawn_player, world_slot_of,
+         world_count, world_set_tick, world_set_seed, world_set_replaying,
+         world_id_of, world_check, KIND_AI, EF_DEAD, SLOT_NONE,
+         ID_NONE } from "../src/sim/world.hml";
+
+import { chunk_store_new_cap, chunk_set_source, chunk_pin_ring, chunk_height_at,
+         CHUNK_H_MISS } from "../src/sim/chunk.hml";
+
+import { worldgen_chunk_at } from "../src/sim/worldgen.hml";
+
+import { combat_new, combat_events, combat_begin_tick, combat_plate_hp,
+         evbus_count, evbus_type, evbus_sub, evbus_target,
+         EV_HIT, EV_KILL, EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER,
+         EV_IMPACT, EV_SOUND, DMG_SUB_BASE, DMG_BURN,
+         DMG_EXPLOSION } from "../src/sim/combat.hml";
+
+import { proj_new, proj_new_cap, proj_reset, proj_set_chunks, proj_has_terrain,
+         proj_set_body, proj_spawn, proj_spawn_aim, proj_step, proj_count,
+         proj_aoe, proj_burn_apply, proj_burning, proj_burn_count,
+         proj_burn_remaining, proj_burn_dealt, proj_burn_total_after,
+         proj_burn_rate_exact, proj_burn_tick_count,
+         proj_speed, proj_gravity, proj_range, proj_impact_damage,
+         proj_aoe_radius, proj_burn_dps_x100, proj_burn_duration_ticks,
+         proj_body_radius,
+         proj_traj_y, proj_traj_axis, proj_integrate_pos, proj_integrate_vel,
+         proj_seg_sphere_t, proj_state_hash,
+         proj_event_count, proj_event_kind, proj_event_target,
+         proj_event_amount, proj_event_signals,
+         proj_event_x, proj_event_y, proj_event_z,
+         proj_tracer_due, proj_tracer_add, proj_tracer_count,
+         proj_tracer_suppressed,
+         proj_hit_count, proj_kill_count, proj_detonation_count,
+         proj_expiry_count, proj_spawn_fail_count, proj_burn_tick_total,
+         proj_id_at, proj_set_combat, proj_has_combat, proj_feedback_count,
+         PSIG_BURN, PSIG_HITMARK, PSIG_FLASH,
+         PROJ_EMBERLANCE, PROJ_SPITTER_BOLT, PROJ_TYPE_COUNT,
+         PROJ_BURN_HZ, PROJ_BURN_PERIOD, PROJ_TRACER_LIFE, PROJ_TRACER_EVERY,
+         PEV_BURN, PEV_HIT, PEV_KILL, PEV_BURST, PEV_LAUNCH, PEV_EXPIRE,
+         PSIG_ALL } from "../src/sim/projectiles.hml";
+
+// ---------------------------------------------------------------------------
+// HARNESS
+// ---------------------------------------------------------------------------
+let g_asserts: i32 = 0;
+let g_pass: i32 = 0;
+let g_SEED: i32 = 1337;
+let g_SEED_B: i32 = 90210;
+let g_TRIALS: i32 = 7;
+
+// The pinned determinism anchor.  Interpreted and compiled must BOTH produce
+// it — measured, they do — so if a toolchain change alters f64 arithmetic or a
+// backend diverges, it shows up HERE and not in a screenshot three waves later.
+let g_GOLDEN: u64 = 6518399207210074564;
+
+// RULE T regression guards.  Set at ~2x the LOADED min-of-7 measurement on this
+// box (llama-server holding ~17/24 cores): 0.0349 ms compiled, 0.3711 ms
+// interpreted, 8 bodies in flight against 14 targets with 14 burning, 600 ticks
+// per batch.  An idle box can only be faster, never slower, so a guard set from
+// a loaded measurement never false-fails on machine state.
+let g_MS_GUARD: f64        = 0.070;    // compiled     (2.01x of 0.0349)
+let g_MS_GUARD_INTERP: f64 = 0.750;    // interpreted  (2.02x of 0.3711)
+
+// The share of the 2.0 ms sim budget this system is allowed.  The game SHIPS
+// COMPILED (CLAUDE.md §2), so 10 % is the real claim; the interpreter runs
+// 10.6x slower here and gets its own, stated bound so the assertion still
+// asserts something on that backend instead of being skipped.
+let g_SHARE_MAX: f64        = 0.10;
+let g_SHARE_MAX_INTERP: f64 = 0.30;
+
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn ck(p_ok: i32, p_msg: string) {
+    g_asserts = g_asserts + 1;
+    if (p_ok == 1) { g_pass = g_pass + 1; }
+    else { print("  FAIL: " + p_msg); }
+}
+
+fn near(p_a: f64, p_b: f64, p_eps: f64): i32 {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let out: i32 = 0;
+    if (d <= p_eps) { out = 1; }
+    return out;
+}
+
+fn absf2(p_a: f64): f64 {
+    let a: f64 = p_a;
+    if (a < 0.0) { a = 0.0 - a; }
+    let out: f64 = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE HEIGHTFIELD — the real generator, through the documented adapter
+// ---------------------------------------------------------------------------
+// ARCHITECTURE §5.4b's injected-source contract, with the arguments in the
+// store's order.  `worldgen_chunk_at` writes straight into the arena, so this
+// needs no scratch buffers at all.
+fn ns_chunk_source(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                   p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    let out: i32 = worldgen_chunk_at(p_seed, p_cx, p_cz, p_hbuf, p_hoff, p_abuf, p_aoff);
+    return out;
+}
+
+fn make_chunks(p_seed: i32): object {
+    let cs: object = chunk_store_new_cap(64, 256, p_seed);
+    chunk_set_source(cs, ns_chunk_source);
+    chunk_pin_ring(cs, 0, 0, 2);
+    let out: object = cs;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SCENARIO BUILDERS
+// ---------------------------------------------------------------------------
+
+// A dummy target with a chosen HP at a chosen place.  Returns its entity id.
+fn put_target(p_w: object, p_x: f64, p_y: f64, p_z: f64, p_hp: i32, p_team: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = world_spawn(w, KIND_AI, 0);
+    if (s == SLOT_NONE) { let bad: i32 = ID_NONE; return bad; }
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let hp: array<i32> = w.hp;
+    let hm: array<i32> = w.hp_max;
+    let tm: array<i32> = w.team;
+    px[s] = p_x; py[s] = p_y; pz[s] = p_z;
+    hp[s] = p_hp; hm[s] = p_hp;
+    tm[s] = p_team;
+    let ids: array<i32> = w.id;
+    let out: i32 = ids[s];
+    return out;
+}
+
+fn hp_of(p_w: object, p_id: i32): i32 {
+    let s: i32 = world_slot_of(p_w, p_id);
+    if (s == SLOT_NONE) { let z: i32 = -1; return z; }
+    let w: object = p_w;
+    let hp: array<i32> = w.hp;
+    let out: i32 = hp[s];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE DETERMINISM SCENARIO
+// ---------------------------------------------------------------------------
+// A scripted "command sequence": every launch angle, every target position and
+// every firing tick comes out of `rng.hml` seeded from the world seed, so the
+// whole run is a pure function of (seed, ticks).  Same seed twice must produce
+// the identical hash; a different seed must not.
+fn scenario(p_seed: i32, p_ticks: i32, p_use_combat: i32): u64 {
+    let seed: i32 = p_seed;
+    let ticks: i32 = p_ticks;
+
+    let cs: object = make_chunks(seed);
+    let w: object = world_new_cap(128);
+    world_set_seed(w, seed);
+    let ps: object = proj_new();
+    proj_set_chunks(ps, cs);
+    let cxs: object = combat_new();
+    if (p_use_combat == 1) { proj_set_combat(ps, cxs); }
+
+    let rs: array = rng_new();
+    rng_seed(rs, seed, RNG_AI, 0, 0);
+
+    // the shooter
+    let h0: f64 = chunk_height_at(cs, 0.0, 0.0);
+    if (h0 == CHUNK_H_MISS) { h0 = 0.0; }
+    let pslot: i32 = world_spawn_player(w, 1);
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let hp: array<i32> = w.hp;
+    let tm: array<i32> = w.team;
+    px[pslot] = 0.0; py[pslot] = h0; pz[pslot] = h0 * 0.0;
+    hp[pslot] = 100;
+    tm[pslot] = 1;
+    let pid: i32 = world_id_of(w, pslot);
+
+    // twelve shades in a seeded ring
+    let k: i32 = 0;
+    while (k < 12) {
+        let ang: f64 = rng_f01(rs) * 6.283185307179586;
+        let rad: f64 = 6.0 + rng_f01(rs) * 12.0;
+        let tx: f64 = cos(ang) * rad;
+        let tz: f64 = sin(ang) * rad;
+        let th: f64 = chunk_height_at(cs, tx, tz);
+        if (th == CHUNK_H_MISS) { th = 0.0; }
+        put_target(w, tx, th, tz, 90, 2);
+        k++;
+    }
+
+    let h: u64 = 1469598103934665603;
+    let t: i32 = 0;
+    while (t < ticks) {
+        world_set_tick(w, t);
+        if (p_use_combat == 1) { combat_begin_tick(cxs); }
+        if (t % 17 == 0) {
+            let yaw: f64 = rng_f11(rs) * 3.141592653589793;
+            let pitch: f64 = 0.35 + rng_f01(rs) * 0.55;
+            proj_spawn_aim(ps, w, PROJ_EMBERLANCE, pid,
+                           0.0, h0 + 1.62, 0.0, yaw, pitch);
+        }
+        proj_step(ps, w);
+        t++;
+    }
+
+    // fold in the world's hit points too — the projectile hash covers flight
+    // and burn state, the world covers what the damage actually did.
+    let ph: u64 = proj_state_hash(ps, w);
+    let hpa: array<i32> = w.hp;
+    let n: i32 = world_count(w);
+    let i: i32 = 0;
+    let acc: u64 = ph;
+    while (i < n) {
+        let v: i32 = hpa[i];
+        let u: u64 = u64(v & 2147483647);
+        acc = acc ^ u;
+        acc = acc * 1099511628211;
+        acc = acc ^ (acc >> 29);
+        i++;
+    }
+    let out: u64 = acc;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE TIMED LOAD — the worst realistic tick this system will see
+// ---------------------------------------------------------------------------
+// GDD §2.6 caps 14 alive.  A tier-3 hold puts ~4 Spitters lobbing 9 s bolts in
+// the air at once and the player's Emberlance adds up to 3, so eight bodies in
+// flight against 14 targets, all 14 burning, is the ceiling and then some.
+let g_LOAD_PROJ: i32 = 8;
+let g_LOAD_ENT: i32  = 14;
+
+fn build_load(p_ps: object, p_w: object): i32 {
+    let w: object = p_w;
+    let ps: object = p_ps;
+    let pslot: i32 = world_spawn_player(w, 1);
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let hp: array<i32> = w.hp;
+    let tm: array<i32> = w.team;
+    px[pslot] = 0.0; py[pslot] = 0.0; pz[pslot] = 0.0;
+    hp[pslot] = 100; tm[pslot] = 1;
+    let pid: i32 = world_id_of(w, pslot);
+
+    let i: i32 = 0;
+    while (i < g_LOAD_ENT) {
+        let a: f64 = f64(i) * 0.4487989505128276;
+        let tid: i32 = put_target(w, cos(a) * 9.0, 0.0, sin(a) * 9.0, 100000, 2);
+        proj_burn_apply(ps, w, tid, pid, 1200, 3600);
+        i++;
+    }
+    let j: i32 = 0;
+    while (j < g_LOAD_PROJ) {
+        let a2: f64 = f64(j) * 0.7853981633974483;
+        proj_spawn_aim(ps, w, PROJ_EMBERLANCE, pid, 0.0, 1.62, 0.0, a2, 1.45);
+        j++;
+    }
+    let out: i32 = pid;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------------------------
+fn main() {
+    print("== probe_projectiles (W4-4) ==");
+    print("  backend     " + sv(compiled()) + "  (1 = compiled, 0 = interpreted)");
+
+    // =======================================================================
+    // A. THE DATA TABLE IS THE GDD'S DATA TABLE
+    // =======================================================================
+    let a_ok: i32 = 0;
+    if (near(proj_speed(PROJ_EMBERLANCE), 6.0, 1e-12) == 1) {
+        if (near(proj_range(PROJ_EMBERLANCE), 40.0, 1e-12) == 1) {
+            if (proj_impact_damage(PROJ_EMBERLANCE) == 60) {
+                if (near(proj_aoe_radius(PROJ_EMBERLANCE), 3.5, 1e-12) == 1) { a_ok = 1; }
+            }
+        }
+    }
+    ck(a_ok, "Emberlance row must be GDD 2.4: 6.0 m/s, 40 m, 60 impact, 3.5 m AoE; got "
+             + sv(proj_speed(PROJ_EMBERLANCE)) + " / " + sv(proj_range(PROJ_EMBERLANCE))
+             + " / " + sv(proj_impact_damage(PROJ_EMBERLANCE)) + " / "
+             + sv(proj_aoe_radius(PROJ_EMBERLANCE)));
+
+    let sp_ok: i32 = 0;
+    if (near(proj_speed(PROJ_SPITTER_BOLT), 4.5, 1e-12) == 1) {
+        if (near(proj_range(PROJ_SPITTER_BOLT), 30.0, 1e-12) == 1) {
+            if (proj_impact_damage(PROJ_SPITTER_BOLT) == 22) { sp_ok = 1; }
+        }
+    }
+    ck(sp_ok, "Spitter bolt row must be GDD 2.2: 4.5 m/s arc, 30 m, 22 dmg");
+
+    // The derived gravity is derived: a 45 deg lob at the published speed must
+    // reach exactly the published range.  Property, not a magic number.
+    let ge: i32 = 1;
+    let ti: i32 = 0;
+    while (ti < PROJ_TYPE_COUNT) {
+        let v: f64 = proj_speed(ti);
+        let g: f64 = proj_gravity(ti);
+        let rmax: f64 = v * v / g;
+        if (near(rmax, proj_range(ti), 1e-9) == 0) { ge = 0; }
+        ti++;
+    }
+    ck(ge, "projectile gravity must satisfy v^2/g == max range for every type "
+           + "(the only value at which the GDD's own speed reaches the GDD's own range)");
+
+    // 12 damage/s for 5 s, at exactly 5 ticks/s, summing to exactly 60.
+    let bd: i32 = proj_burn_dps_x100(PROJ_EMBERLANCE);
+    let bt: i32 = proj_burn_duration_ticks(PROJ_EMBERLANCE);
+    let nb: i32 = proj_burn_tick_count(bt);
+    let b_ok: i32 = 0;
+    if (bd == 1200) {
+        if (bt == 5 * g_TICK_HZ) {
+            if (nb == 25) {
+                if (proj_burn_total_after(bd, nb) == 60) { b_ok = 1; }
+            }
+        }
+    }
+    ck(b_ok, "GDD 2.4 burn: 12/s for 5 s == " + sv(nb) + " burn ticks summing to "
+             + sv(proj_burn_total_after(bd, nb)) + " (want 25 and 60)");
+
+    let rate_ok: i32 = 0;
+    if (proj_burn_rate_exact() == 1) {
+        if (PROJ_BURN_PERIOD * PROJ_BURN_HZ == g_TICK_HZ) { rate_ok = 1; }
+    }
+    ck(rate_ok, "5 burn ticks/second must be exactly representable on a "
+                + sv(g_TICK_HZ) + " Hz tick: " + sv(PROJ_BURN_PERIOD) + " * "
+                + sv(PROJ_BURN_HZ) + " must equal " + sv(g_TICK_HZ));
+
+    // The schedule never loses or invents a hit point at any prefix.
+    let mono: i32 = 1;
+    let prev: i32 = 0;
+    let kk: i32 = 1;
+    while (kk <= 25) {
+        let tot: i32 = proj_burn_total_after(1200, kk);
+        if (tot < prev) { mono = 0; }
+        if (tot > (12 * kk) / 5) { mono = 0; }
+        prev = tot;
+        kk++;
+    }
+    ck(mono, "the burn schedule must be monotone and never exceed dps*elapsed");
+
+    // =======================================================================
+    // B. THE INTEGRATOR IS FRAME-RATE INDEPENDENT
+    // =======================================================================
+    // Property: n steps of dt, 4n steps of dt/4, and the closed form all agree.
+    let g0: f64 = proj_gravity(PROJ_EMBERLANCE);
+    let vy0: f64 = 4.2426406871192848;
+    let y0: f64 = 1.62;
+    let steps: i32 = 240;                     // 4 s at 60 Hz
+    let dt1: f64 = g_TICK_DT;
+
+    let ya: f64 = y0; let va: f64 = vy0;
+    let s1: i32 = 0;
+    while (s1 < steps) {
+        ya = proj_integrate_pos(ya, va, 0.0 - g0, dt1);
+        va = proj_integrate_vel(va, 0.0 - g0, dt1);
+        s1++;
+    }
+    let dt4: f64 = dt1 * 0.25;
+    let yb: f64 = y0; let vb: f64 = vy0;
+    let s2: i32 = 0;
+    while (s2 < steps * 4) {
+        yb = proj_integrate_pos(yb, vb, 0.0 - g0, dt4);
+        vb = proj_integrate_vel(vb, 0.0 - g0, dt4);
+        s2++;
+    }
+    let tt: f64 = f64(steps) * dt1;
+    let yc: f64 = proj_traj_y(y0, vy0, g0, tt);
+
+    let e_ab: f64 = absf2(ya - yb);
+    let e_ac: f64 = absf2(ya - yc);
+    let fri_ok: i32 = 0;
+    if (e_ab < 1e-9) { if (e_ac < 1e-9) { fri_ok = 1; } }
+    ck(fri_ok, "arc integration must be identical at any tick count: |dt vs dt/4| = "
+               + sv(e_ab) + " m, |stepped vs closed form| = " + sv(e_ac)
+               + " m, both must be < 1e-9");
+
+    // NEGATIVE CONTROL.  Semi-implicit Euler over the same flight must FAIL the
+    // same tolerance by orders of magnitude, or the tolerance proves nothing.
+    let ye: f64 = y0; let ve: f64 = vy0;
+    let s3: i32 = 0;
+    while (s3 < steps) {
+        ve = ve - g0 * dt1;
+        ye = ye + ve * dt1;
+        s3++;
+    }
+    let e_euler: f64 = absf2(ye - yc);
+    let neg_ok: i32 = 0;
+    if (e_euler > 1e-4) { neg_ok = 1; }
+    ck(neg_ok, "negative control: naive Euler must MISS the closed form by > 1e-4 "
+               + "(measured " + sv(e_euler) + " m) or the 1e-9 tolerance above is vacuous");
+
+    // The same property through the full system: a body in flight with no
+    // terrain must sit exactly on its analytic arc at every tick.
+    let w2: object = world_new_cap(16);
+    let ps2: object = proj_new();
+    let sl2: i32 = world_spawn_player(w2, 1);
+    let w2px: array<f64> = w2.px;
+    let w2py: array<f64> = w2.py;
+    let w2pz: array<f64> = w2.pz;
+    let w2hp: array<i32> = w2.hp;
+    w2px[sl2] = 0.0; w2py[sl2] = 0.0; w2pz[sl2] = 0.0; w2hp[sl2] = 100;
+    let sid2: i32 = world_id_of(w2, sl2);
+    let sx: f64 = 0.0; let sy: f64 = 1.62; let sz: f64 = 0.0;
+    let ang45: f64 = 0.7853981633974483;
+    let id2: i32 = proj_spawn(ps2, w2, PROJ_EMBERLANCE, sid2, sx, sy, sz,
+                              cos(ang45), sin(ang45), 0.0);
+    let v0: f64 = proj_speed(PROJ_EMBERLANCE);
+    let vx0: f64 = cos(ang45) * v0;
+    let vyy0: f64 = sin(ang45) * v0;
+    let arc_ok: i32 = 1;
+    let worst_err: f64 = 0.0;
+    let n2: i32 = 0;
+    while (n2 < 300) {
+        proj_step(ps2, w2);
+        n2++;
+        let s: i32 = world_slot_of(w2, id2);
+        if (s == SLOT_NONE) { arc_ok = 0; }
+        else {
+            let te: f64 = f64(n2) * g_TICK_DT;
+            let ex: f64 = proj_traj_axis(sx, vx0, te);
+            let ey: f64 = proj_traj_y(sy, vyy0, g0, te);
+            let dxe: f64 = absf2(w2px[s] - ex);
+            let dye: f64 = absf2(w2py[s] - ey);
+            if (dxe > worst_err) { worst_err = dxe; }
+            if (dye > worst_err) { worst_err = dye; }
+        }
+    }
+    let sys_ok: i32 = 0;
+    if (arc_ok == 1) { if (worst_err < 1e-9) { sys_ok = 1; } }
+    ck(sys_ok, "a body in flight must sit on its analytic arc every tick for 300 ticks; "
+               + "worst deviation " + sv(worst_err) + " m (want < 1e-9)");
+
+    // =======================================================================
+    // C. THE BURN
+    // =======================================================================
+    let w3: object = world_new_cap(16);
+    let ps3: object = proj_new();
+    let sl3: i32 = world_spawn_player(w3, 1);
+    let w3hp: array<i32> = w3.hp;
+    let w3tm: array<i32> = w3.team;
+    w3hp[sl3] = 100; w3tm[sl3] = 1;
+    let src3: i32 = world_id_of(w3, sl3);
+    let tgt3: i32 = put_target(w3, 5.0, 0.0, 0.0, 100000, 2);
+    proj_burn_apply(ps3, w3, tgt3, src3, proj_burn_dps_x100(PROJ_EMBERLANCE),
+                    proj_burn_duration_ticks(PROJ_EMBERLANCE));
+
+    let hp_before: i32 = hp_of(w3, tgt3);
+    let per_second: array<i32> = [0, 0, 0, 0, 0, 0];
+    let after5: i32 = 0;
+    let tk: i32 = 0;
+    while (tk < 420) {
+        world_set_tick(w3, tk);
+        proj_step(ps3, w3);
+        let ne: i32 = proj_event_count(ps3);
+        let e: i32 = 0;
+        while (e < ne) {
+            if (proj_event_kind(ps3, e) == PEV_BURN) {
+                let sec: i32 = tk / g_TICK_HZ;
+                if (sec < 6) { per_second[sec] = per_second[sec] + 1; }
+                if (tk >= 300) { after5 = after5 + 1; }
+            }
+            e++;
+        }
+        tk++;
+    }
+    let five_ok: i32 = 1;
+    let si: i32 = 0;
+    while (si < 5) {
+        if (per_second[si] != PROJ_BURN_HZ) { five_ok = 0; }
+        si++;
+    }
+    ck(five_ok, "the burn must tick exactly " + sv(PROJ_BURN_HZ)
+                + " times in each of the 5 seconds; measured "
+                + sv(per_second[0]) + "," + sv(per_second[1]) + "," + sv(per_second[2])
+                + "," + sv(per_second[3]) + "," + sv(per_second[4]));
+
+    let stop_ok: i32 = 0;
+    if (after5 == 0) { if (per_second[5] == 0) { stop_ok = 1; } }
+    ck(stop_ok, "the burn must stop dead at 5 s; " + sv(after5) + " ticks fired past tick 300");
+
+    let dealt: i32 = hp_before - hp_of(w3, tgt3);
+    let tot_ok: i32 = 0;
+    if (dealt == 60) { tot_ok = 1; }
+    ck(tot_ok, "12/s for 5 s must remove exactly 60 HP with no rounding drift; removed "
+               + sv(dealt));
+
+    let gone_ok: i32 = 0;
+    if (proj_burning(ps3, tgt3) == 0) { if (proj_burn_count(ps3) == 0) { gone_ok = 1; } }
+    ck(gone_ok, "the burn record must be released when it expires");
+
+    // Refresh, not stack: re-applying mid-burn restarts the clock and never
+    // doubles the rate.
+    let w4: object = world_new_cap(16);
+    let ps4: object = proj_new();
+    let sl4: i32 = world_spawn_player(w4, 1);
+    let w4hp: array<i32> = w4.hp;
+    w4hp[sl4] = 100;
+    let src4: i32 = world_id_of(w4, sl4);
+    let tgt4: i32 = put_target(w4, 5.0, 0.0, 0.0, 100000, 2);
+    proj_burn_apply(ps4, w4, tgt4, src4, 1200, 300);
+    let r1: i32 = 0;
+    while (r1 < 150) { proj_step(ps4, w4); r1++; }
+    proj_burn_apply(ps4, w4, tgt4, src4, 1200, 300);
+    let refresh_ok: i32 = 0;
+    if (proj_burn_count(ps4) == 1) {
+        if (proj_burn_remaining(ps4, tgt4) == 300) { refresh_ok = 1; }
+    }
+    ck(refresh_ok, "re-igniting must REFRESH one record, not stack a second: count "
+                   + sv(proj_burn_count(ps4)) + ", remaining "
+                   + sv(proj_burn_remaining(ps4, tgt4)) + " (want 1 and 300)");
+
+    // =======================================================================
+    // D. THE BLAST: everything inside 3.5 m, nothing outside
+    // =======================================================================
+    let w5: object = world_new_cap(64);
+    let ps5: object = proj_new();
+    let sl5: i32 = world_spawn_player(w5, 1);
+    let w5hp: array<i32> = w5.hp;
+    let w5tm: array<i32> = w5.team;
+    w5hp[sl5] = 100; w5tm[sl5] = 1;
+    let src5: i32 = world_id_of(w5, sl5);
+
+    let by: f64 = 10.0;
+    let half: f64 = g_HEIGHT_STAND * 0.5;
+    let dists: array<f64> = [0.0, 1.0, 2.0, 3.4, 3.4999, 3.5, 3.5001, 3.6, 5.0, 12.0];
+    let want_hits: i32 = 0;
+    let ring: array<i32> = [];
+    let di: i32 = 0;
+    while (di < 10) {
+        let d: f64 = dists[di];
+        let tid: i32 = put_target(w5, d, by - half, 0.0, 500, 2);
+        ring.push(tid);
+        if (d <= 3.5) { want_hits = want_hits + 1; }
+        di++;
+    }
+    let hits: i32 = proj_aoe(ps5, w5, 0.0, by, 0.0, proj_aoe_radius(PROJ_EMBERLANCE),
+                             proj_impact_damage(PROJ_EMBERLANCE), src5, 1,
+                             proj_burn_dps_x100(PROJ_EMBERLANCE),
+                             proj_burn_duration_ticks(PROJ_EMBERLANCE));
+    let inout_ok: i32 = 1;
+    let ri: i32 = 0;
+    while (ri < 10) {
+        let d2: f64 = dists[ri];
+        let damaged: i32 = 0;
+        if (hp_of(w5, ring[ri]) < 500) { damaged = 1; }
+        let expect: i32 = 0;
+        if (d2 <= 3.5) { expect = 1; }
+        if (damaged != expect) { inout_ok = 0; }
+        ri++;
+    }
+    let cnt_ok: i32 = 0;
+    if (hits == want_hits) { cnt_ok = 1; }
+    ck(inout_ok, "the blast must damage every entity with centre distance <= 3.5 m "
+                 + "and none beyond, at 3.4999 / 3.5 / 3.5001 m too");
+    ck(cnt_ok, "proj_aoe must report " + sv(want_hits) + " entities hit, reported " + sv(hits));
+
+    let dmg_ok: i32 = 0;
+    if (hp_of(w5, ring[0]) == 500 - 60) { dmg_ok = 1; }
+    ck(dmg_ok, "an entity in the blast must take the full 60 impact damage; hp "
+               + sv(hp_of(w5, ring[0])) + " of 500");
+
+    let ign_ok: i32 = 1;
+    let gi: i32 = 0;
+    while (gi < 10) {
+        let burning: i32 = proj_burning(ps5, ring[gi]);
+        let expect2: i32 = 0;
+        if (dists[gi] <= 3.5) { expect2 = 1; }
+        if (burning != expect2) { ign_ok = 0; }
+        gi++;
+    }
+    ck(ign_ok, "everything the blast damages must also be ignited, and nothing else");
+
+    // The five-signal contract, on every damage event of the blast.
+    let five_sig: i32 = 1;
+    let dmg_events: i32 = 0;
+    let ne5: i32 = proj_event_count(ps5);
+    let ei: i32 = 0;
+    while (ei < ne5) {
+        if (proj_event_kind(ps5, ei) == PEV_HIT) {
+            dmg_events = dmg_events + 1;
+            if (proj_event_signals(ps5, ei) != PSIG_ALL) { five_sig = 0; }
+            if (proj_event_amount(ps5, ei) != 60) { five_sig = 0; }
+            if (proj_event_target(ps5, ei) == 0) { five_sig = 0; }
+        }
+        ei++;
+    }
+    if (dmg_events != want_hits) { five_sig = 0; }
+    ck(five_sig, "GDD 2.5: every hit must carry all five feedback signals in the SAME "
+                 + "tick — " + sv(dmg_events) + " damage events, each with signal mask "
+                 + sv(PSIG_ALL));
+
+    // Friendly fire: the shooter and its own team are never in the blast.
+    let w6: object = world_new_cap(16);
+    let ps6: object = proj_new();
+    let sl6: i32 = world_spawn_player(w6, 1);
+    let w6hp: array<i32> = w6.hp;
+    let w6tm: array<i32> = w6.team;
+    let w6px: array<f64> = w6.px;
+    let w6py: array<f64> = w6.py;
+    w6hp[sl6] = 100; w6tm[sl6] = 1;
+    w6px[sl6] = 0.0; w6py[sl6] = 10.0 - half;
+    let src6: i32 = world_id_of(w6, sl6);
+    let friend: i32 = put_target(w6, 1.0, 10.0 - half, 0.0, 500, 1);
+    let foe: i32 = put_target(w6, 1.0, 10.0 - half, 1.0, 500, 2);
+    proj_aoe(ps6, w6, 0.0, 10.0, 0.0, 3.5, 60, src6, 1, 0, 0);
+    let ff_ok: i32 = 0;
+    if (hp_of(w6, friend) == 500) {
+        if (hp_of(w6, foe) == 440) {
+            if (hp_of(w6, src6) == 100) { ff_ok = 1; }
+        }
+    }
+    ck(ff_ok, "a blast must never damage its own shooter or its own team; friend "
+              + sv(hp_of(w6, friend)) + ", foe " + sv(hp_of(w6, foe))
+              + ", shooter " + sv(hp_of(w6, src6)));
+
+    // A lethal blast emits a kill event and flags the body without despawning it.
+    let w7: object = world_new_cap(16);
+    let ps7: object = proj_new();
+    let sl7: i32 = world_spawn_player(w7, 1);
+    let w7hp: array<i32> = w7.hp;
+    let w7tm: array<i32> = w7.team;
+    w7hp[sl7] = 100; w7tm[sl7] = 1;
+    let src7: i32 = world_id_of(w7, sl7);
+    let weak: i32 = put_target(w7, 1.0, 10.0 - half, 0.0, 15, 2);   // a Wisp
+    proj_aoe(ps7, w7, 0.0, 10.0, 0.0, 3.5, 60, src7, 1, 0, 0);
+    let kills: i32 = 0;
+    let ne7: i32 = proj_event_count(ps7);
+    let e7: i32 = 0;
+    while (e7 < ne7) {
+        if (proj_event_kind(ps7, e7) == PEV_KILL) { kills = kills + 1; }
+        e7++;
+    }
+    let kill_ok: i32 = 0;
+    if (kills == 1) {
+        if (proj_kill_count(ps7) == 1) {
+            if (world_slot_of(w7, weak) != SLOT_NONE) {   // body kept for the dissolve
+                let ws: i32 = world_slot_of(w7, weak);
+                let w7fl: array<i32> = w7.flags;
+                if ((w7fl[ws] & EF_DEAD) != 0) { kill_ok = 1; }
+            }
+        }
+    }
+    ck(kill_ok, "a lethal blast must emit exactly one kill event and flag EF_DEAD "
+                + "without despawning the body (GDD 7.9 needs it for the dissolve)");
+
+    // =======================================================================
+    // E. FLIGHT COLLISION
+    // =======================================================================
+    // The segment test must catch a body that would pass clean through in one
+    // tick — the classic tunnelling bug a point test cannot see.
+    let tun: f64 = proj_seg_sphere_t(0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.5);
+    let tun_ok: i32 = 0;
+    if (tun <= 1.0) { if (near(tun, 9.5 / 20.0, 1e-12) == 1) { tun_ok = 1; } }
+    ck(tun_ok, "the sweep must catch a target the segment passes entirely through in "
+               + "one tick; t = " + sv(tun) + " (want 0.475)");
+
+    let miss_t: f64 = proj_seg_sphere_t(0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 10.0, 5.0, 0.0, 0.5);
+    let miss_ok: i32 = 0;
+    if (miss_t > 1.0) { miss_ok = 1; }
+    ck(miss_ok, "the sweep must report no intersection for a segment that misses");
+
+    // A body launched flat at a shade 5 m away must detonate on it.
+    let w8: object = world_new_cap(16);
+    let ps8: object = proj_new();
+    let sl8: i32 = world_spawn_player(w8, 1);
+    let w8hp: array<i32> = w8.hp;
+    let w8tm: array<i32> = w8.team;
+    w8hp[sl8] = 100; w8tm[sl8] = 1;
+    let src8: i32 = world_id_of(w8, sl8);
+    let husk: i32 = put_target(w8, 5.0, 1.62 - half, 0.0, 90, 2);
+    proj_spawn(ps8, w8, PROJ_EMBERLANCE, src8, 0.0, 1.62, 0.0, 1.0, 0.0, 0.0);
+    let flew: i32 = 0;
+    while (flew < 120) {
+        proj_step(ps8, w8);
+        flew++;
+        if (proj_detonation_count(ps8) > 0) { flew = 120; }
+    }
+    let direct_ok: i32 = 0;
+    if (proj_detonation_count(ps8) == 1) {
+        if (hp_of(w8, husk) == 30) {
+            if (proj_burning(ps8, husk) == 1) {
+                if (proj_count(ps8) == 0) { direct_ok = 1; }
+            }
+        }
+    }
+    ck(direct_ok, "a direct hit must detonate once, deal 60 (hp " + sv(hp_of(w8, husk))
+                  + " of 90), ignite the target, and leave nothing in flight");
+
+    // The Husk then dies to the burn.  This is the GDD 2.4 "1 + burn" line.
+    let burn_tick: i32 = 0;
+    let died_at: i32 = -1;
+    while (burn_tick < 400) {
+        proj_step(ps8, w8);
+        burn_tick++;
+        if (died_at < 0) { if (hp_of(w8, husk) <= 0) { died_at = burn_tick; } }
+    }
+    let ttk_ok: i32 = 0;
+    if (died_at > 0) { ttk_ok = 1; }
+    ck(ttk_ok, "GDD 2.4 'Husk: 1 + burn' — one Emberlance must kill a 90 HP Husk via "
+               + "the burn; died " + sv(died_at) + " ticks after impact ("
+               + sv(f64(died_at) / f64(g_TICK_HZ)) + " s)");
+
+    // Terrain: fired into the ground it must burst ON the ground, not below it.
+    let cs9: object = make_chunks(g_SEED);
+    let w9: object = world_new_cap(16);
+    let ps9: object = proj_new();
+    proj_set_chunks(ps9, cs9);
+    let sl9: i32 = world_spawn_player(w9, 1);
+    let w9hp: array<i32> = w9.hp;
+    w9hp[sl9] = 100;
+    let src9: i32 = world_id_of(w9, sl9);
+    let gh0: f64 = chunk_height_at(cs9, 0.0, 0.0);
+    proj_spawn(ps9, w9, PROJ_EMBERLANCE, src9, 0.0, gh0 + 4.0, 0.0, 0.30, -0.95, 0.0);
+    let bx: f64 = 0.0; let byy: f64 = 0.0; let bz: f64 = 0.0;
+    let got_burst: i32 = 0;
+    let ft: i32 = 0;
+    while (ft < 600) {
+        proj_step(ps9, w9);
+        let nn: i32 = proj_event_count(ps9);
+        let q: i32 = 0;
+        while (q < nn) {
+            if (proj_event_kind(ps9, q) == PEV_BURST) {
+                got_burst = 1;
+                bx = proj_event_x(ps9, q); byy = proj_event_y(ps9, q); bz = proj_event_z(ps9, q);
+            }
+            q++;
+        }
+        ft++;
+        if (got_burst == 1) { ft = 600; }
+    }
+    let surf: f64 = chunk_height_at(cs9, bx, bz);
+    let terr_ok: i32 = 0;
+    if (got_burst == 1) {
+        if (proj_has_terrain(ps9) == 1) {
+            if (near(byy, surf, 0.02) == 1) { terr_ok = 1; }
+        }
+    }
+    ck(terr_ok, "a body fired into the heightfield must burst ON the surface: burst y "
+                + sv(byy) + " vs ground " + sv(surf) + " (want within 0.02 m)");
+
+    // Out of range it fizzles: no blast, no damage, an EXPIRE event.
+    let w10: object = world_new_cap(16);
+    let ps10: object = proj_new();
+    let sl10: i32 = world_spawn_player(w10, 1);
+    let w10hp: array<i32> = w10.hp;
+    w10hp[sl10] = 100;
+    let src10: i32 = world_id_of(w10, sl10);
+    proj_spawn(ps10, w10, PROJ_EMBERLANCE, src10, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    let ex_ticks: i32 = 0;
+    while (ex_ticks < 3000) {
+        proj_step(ps10, w10);
+        ex_ticks++;
+        if (proj_count(ps10) == 0) { ex_ticks = 3000; }
+    }
+    let fizzle_ok: i32 = 0;
+    if (proj_expiry_count(ps10) == 1) {
+        if (proj_detonation_count(ps10) == 0) {
+            if (proj_count(ps10) == 0) { fizzle_ok = 1; }
+        }
+    }
+    ck(fizzle_ok, "past its max useful range a body must fizzle, never blast: expiries "
+                  + sv(proj_expiry_count(ps10)) + ", detonations "
+                  + sv(proj_detonation_count(ps10)));
+
+    // The in-flight cap is a hard cap and every refusal is counted.
+    let w11: object = world_new_cap(128);
+    let ps11: object = proj_new_cap(4, 8, 8);
+    let sl11: i32 = world_spawn_player(w11, 1);
+    let src11: i32 = world_id_of(w11, sl11);
+    let sp: i32 = 0;
+    while (sp < 10) {
+        proj_spawn(ps11, w11, PROJ_EMBERLANCE, src11, 0.0, 5.0, 0.0, 0.0, 1.0, 0.0);
+        sp++;
+    }
+    let cap_ok: i32 = 0;
+    if (proj_count(ps11) == 4) { if (proj_spawn_fail_count(ps11) == 6) { cap_ok = 1; } }
+    ck(cap_ok, "the in-flight cap must hold and count refusals: " + sv(proj_count(ps11))
+               + " live / " + sv(proj_spawn_fail_count(ps11)) + " refused (want 4 / 6)");
+
+    // =======================================================================
+    // F. DETERMINISM
+    // =======================================================================
+    let d_ticks: i32 = 1200;
+    let h1: u64 = scenario(g_SEED, d_ticks, 0);
+    let h2: u64 = scenario(g_SEED, d_ticks, 0);
+    let same_ok: i32 = 0;
+    if (h1 == h2) { same_ok = 1; }
+    ck(same_ok, "same seed + same command sequence must produce a bit-identical hash: "
+                + sv(h1) + " vs " + sv(h2));
+
+    let h3: u64 = scenario(g_SEED_B, d_ticks, 0);
+    let diff_ok: i32 = 0;
+    if (h3 != h1) { diff_ok = 1; }
+    ck(diff_ok, "NEGATIVE CONTROL: a different seed must produce a different hash; "
+                + "both were " + sv(h1));
+
+    // The same scenario with damage routed through `combat.hml` must also be
+    // deterministic.  Its hash is NOT pinned here: it is a joint property of two
+    // modules built in the same sub-wave, and pinning it would make this probe
+    // fail every time W4-3 legitimately retunes a damage rounding rule.  The
+    // pinned anchor below is this module's own state, which W4-4 owns.
+    let hc1: u64 = scenario(g_SEED, d_ticks, 1);
+    let hc2: u64 = scenario(g_SEED, d_ticks, 1);
+    let cdet_ok: i32 = 0;
+    if (hc1 == hc2) { if (hc1 != 0) { cdet_ok = 1; } }
+    ck(cdet_ok, "the combat-routed scenario must be deterministic too: "
+                + sv(hc1) + " vs " + sv(hc2));
+
+    let nz_ok: i32 = 0;
+    if (h1 != 0) { nz_ok = 1; }
+    ck(nz_ok, "the state hash must be non-zero (the scenario actually ran)");
+
+    // Projectile churn is the hardest thing anyone does to `world.hml`'s sparse
+    // set: 70 spawns and 70 despawns of short-lived ids in 1200 ticks, which is
+    // exactly the tombstone-reclamation path its own comments call out.  If the
+    // id -> slot map were being corrupted, the flight table would follow the
+    // wrong bodies and nothing else here would necessarily notice.
+    let wchk: object = world_new_cap(128);
+    let pchk: object = proj_new();
+    let cchk: object = make_chunks(g_SEED);
+    proj_set_chunks(pchk, cchk);
+    let schk: i32 = world_spawn_player(wchk, 1);
+    let chhp: array<i32> = wchk.hp;
+    chhp[schk] = 100;
+    let cid: i32 = world_id_of(wchk, schk);
+    let ct: i32 = 0;
+    while (ct < 1200) {
+        world_set_tick(wchk, ct);
+        if (ct % 17 == 0) {
+            proj_spawn_aim(pchk, wchk, PROJ_EMBERLANCE, cid, 0.0, 40.0, 0.0,
+                           f64(ct) * 0.11, 0.5);
+        }
+        proj_step(pchk, wchk);
+        ct++;
+    }
+    let churn_ok: i32 = 0;
+    if (world_check(wchk) == 0) {
+        if (proj_count(pchk) + 1 == world_count(wchk)) {
+            if (proj_detonation_count(pchk) + proj_expiry_count(pchk) > 30) { churn_ok = 1; }
+        }
+    }
+    ck(churn_ok, "the world's sparse set must survive projectile churn: world_check "
+                 + sv(world_check(wchk)) + " (want 0), " + sv(proj_count(pchk))
+                 + " in flight + 1 player vs " + sv(world_count(wchk)) + " entities, "
+                 + sv(proj_detonation_count(pchk) + proj_expiry_count(pchk))
+                 + " bodies retired");
+
+    let gold_ok: i32 = 0;
+    if (h1 == g_GOLDEN) { gold_ok = 1; }
+    ck(gold_ok, "PINNED hash mismatch: got " + sv(h1) + ", want " + sv(g_GOLDEN)
+                + ". Interpreted and compiled must both reach this number; if only one "
+                + "backend fails, that is a backend divergence, not a sim change.");
+
+    // =======================================================================
+    // G. COSMETICS ARE COSMETIC
+    // =======================================================================
+    let w12: object = world_new_cap(16);
+    let ps12: object = proj_new();
+    world_spawn_player(w12, 1);
+
+    // 1 in 3, and 1 in 1 for the Longshadow (GDD 7.6).
+    let sparrow_tr: i32 = 0;
+    let long_tr: i32 = 0;
+    let ts: i32 = 0;
+    while (ts < 9) {
+        sparrow_tr = sparrow_tr + proj_tracer_due(ps12, g_WPN_SPARROW);
+        long_tr = long_tr + proj_tracer_due(ps12, g_WPN_LONGSHADOW);
+        ts++;
+    }
+    let tr_rule_ok: i32 = 0;
+    if (sparrow_tr == 3) { if (long_tr == 9) { tr_rule_ok = 1; } }
+    ck(tr_rule_ok, "GDD 7.6 tracer cadence: 9 shots -> " + sv(sparrow_tr)
+                   + " tracers (want 3), Longshadow -> " + sv(long_tr) + " (want 9)");
+
+    let live_add: i32 = proj_tracer_add(ps12, w12, 0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0);
+    let h_before: u64 = proj_state_hash(ps12, w12);
+    world_set_replaying(w12, 1);
+    let rep_add: i32 = proj_tracer_add(ps12, w12, 0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0);
+    let rep_add2: i32 = proj_tracer_add(ps12, w12, 0, 1.0, 0.0, 0.0, 10.0, 0.0, 0.0);
+    let h_after: u64 = proj_state_hash(ps12, w12);
+    let rep_ok: i32 = 0;
+    if (live_add == 1) {
+        if (rep_add == 0) {
+            if (rep_add2 == 0) {
+                if (proj_tracer_count(ps12) == 1) {
+                    if (proj_tracer_suppressed(ps12) == 2) { rep_ok = 1; }
+                }
+            }
+        }
+    }
+    ck(rep_ok, "ARCHITECTURE 3: while world.replaying == 1 a tracer must be REFUSED "
+               + "(recorded " + sv(proj_tracer_count(ps12)) + ", suppressed "
+               + sv(proj_tracer_suppressed(ps12)) + ")");
+
+    let hash_pure_ok: i32 = 0;
+    if (h_before == h_after) { hash_pure_ok = 1; }
+    ck(hash_pure_ok, "cosmetics must never enter the authoritative state hash");
+
+    let ttl_ok: i32 = 0;
+    world_set_replaying(w12, 0);
+    let tstep: i32 = 0;
+    while (tstep < PROJ_TRACER_LIFE) { proj_step(ps12, w12); tstep++; }
+    if (proj_tracer_count(ps12) == 0) { ttl_ok = 1; }
+    ck(ttl_ok, "a tracer must expire after " + sv(PROJ_TRACER_LIFE)
+               + " ticks (0.045 s at 60 Hz); " + sv(proj_tracer_count(ps12)) + " left");
+
+    // =======================================================================
+    // I. INTEGRATION WITH combat.hml (W4-3) — the ONLY place HP changes
+    // =======================================================================
+    // `combat.hml` §2 names this module as a caller of `combat_apply_damage`,
+    // and its header calls that function "THE ONLY PLACE HP CHANGES".  These
+    // assertions are what stops this file from quietly becoming a second one.
+
+    // Both paths must leave the same world.  A plain target, one blast, twice.
+    let hp_plain: array<i32> = [0, 0];
+    let pass2: i32 = 0;
+    while (pass2 < 2) {
+        let wc: object = world_new_cap(16);
+        let psc: object = proj_new();
+        let cxc: object = combat_new();
+        if (pass2 == 1) { proj_set_combat(psc, cxc); }
+        let slc: i32 = world_spawn_player(wc, 1);
+        let wchp: array<i32> = wc.hp;
+        let wctm: array<i32> = wc.team;
+        wchp[slc] = 100; wctm[slc] = 1;
+        let srcc: i32 = world_id_of(wc, slc);
+        let tc: i32 = put_target(wc, 1.0, 10.0 - half, 0.0, 500, 2);
+        world_set_tick(wc, 7);
+        combat_begin_tick(cxc);
+        proj_aoe(psc, wc, 0.0, 10.0, 0.0, 3.5, 60, srcc, 1, 0, 0);
+        hp_plain[pass2] = hp_of(wc, tc);
+        pass2++;
+    }
+    let agree_ok: i32 = 0;
+    if (hp_plain[0] == hp_plain[1]) { if (hp_plain[0] == 440) { agree_ok = 1; } }
+    ck(agree_ok, "the standalone and combat-routed damage paths must leave the same "
+                 + "world: hp " + sv(hp_plain[0]) + " vs " + sv(hp_plain[1])
+                 + " (want both 440)");
+
+    // A blast that connects must put ALL FIVE §2.5 signals plus the
+    // authoritative EV_HIT on the shared bus, in the same tick.
+    let w13: object = world_new_cap(16);
+    let ps13: object = proj_new();
+    let cx13: object = combat_new();
+    proj_set_combat(ps13, cx13);
+    let sl13: i32 = world_spawn_player(w13, 1);
+    let w13hp: array<i32> = w13.hp;
+    let w13tm: array<i32> = w13.team;
+    w13hp[sl13] = 100; w13tm[sl13] = 1;
+    let src13: i32 = world_id_of(w13, sl13);
+    let t13: i32 = put_target(w13, 1.0, 10.0 - half, 0.0, 500, 2);
+    world_set_tick(w13, 11);
+    combat_begin_tick(cx13);
+    proj_aoe(ps13, w13, 0.0, 10.0, 0.0, 3.5, 60, src13, 1, 0, 0);
+    let bus13: object = combat_events(cx13);
+    let saw_hit: i32 = 0; let saw_mark: i32 = 0; let saw_flash: i32 = 0;
+    let saw_num: i32 = 0; let saw_imp: i32 = 0; let saw_snd: i32 = 0;
+    let nb13: i32 = evbus_count(bus13);
+    let bi13: i32 = 0;
+    while (bi13 < nb13) {
+        let ty13: i32 = evbus_type(bus13, bi13);
+        if (ty13 == EV_HIT) { saw_hit = 1; }
+        if (ty13 == EV_HITMARKER) { saw_mark = 1; }
+        if (ty13 == EV_HIT_FLASH) { saw_flash = 1; }
+        if (ty13 == EV_DAMAGE_NUMBER) { saw_num = 1; }
+        if (ty13 == EV_IMPACT) { saw_imp = 1; }
+        if (ty13 == EV_SOUND) { saw_snd = 1; }
+        bi13++;
+    }
+    let five_bus: i32 = 0;
+    if (saw_hit == 1) {
+        if (saw_mark + saw_flash + saw_num + saw_imp + saw_snd == 5) { five_bus = 1; }
+    }
+    ck(five_bus, "GDD 2.5 on the SHARED bus: a blast that connects must emit EV_HIT plus "
+                 + "all five feedback events in the same tick; saw hit=" + sv(saw_hit)
+                 + " marker=" + sv(saw_mark) + " flash=" + sv(saw_flash)
+                 + " number=" + sv(saw_num) + " impact=" + sv(saw_imp)
+                 + " sound=" + sv(saw_snd));
+
+    let fb_ok: i32 = 0;
+    if (proj_feedback_count(ps13) == 5) { fb_ok = 1; }
+    ck(fb_ok, "exactly 5 feedback events per connecting blast victim; pushed "
+              + sv(proj_feedback_count(ps13)));
+
+    // A BURN TICK IS NOT A HIT.  It must reach the bus as EV_HIT with the burn
+    // damage sub-code, and must NOT paint a hitmarker.
+    let w14: object = world_new_cap(16);
+    let ps14: object = proj_new();
+    let cx14: object = combat_new();
+    proj_set_combat(ps14, cx14);
+    let sl14: i32 = world_spawn_player(w14, 1);
+    let w14hp: array<i32> = w14.hp;
+    w14hp[sl14] = 100;
+    let src14: i32 = world_id_of(w14, sl14);
+    let t14: i32 = put_target(w14, 5.0, 0.0, 0.0, 100000, 2);
+    proj_burn_apply(ps14, w14, t14, src14, 1200, 300);
+    let burn_marks: i32 = 0;
+    let burn_hits: i32 = 0;
+    let burn_sig_ok: i32 = 1;
+    let bt14: i32 = 0;
+    while (bt14 < 60) {
+        world_set_tick(w14, bt14);
+        combat_begin_tick(cx14);
+        proj_step(ps14, w14);
+        let bus14: object = combat_events(cx14);
+        let n14: i32 = evbus_count(bus14);
+        let q14: i32 = 0;
+        while (q14 < n14) {
+            let tt14: i32 = evbus_type(bus14, q14);
+            if (tt14 == EV_HITMARKER) { burn_marks = burn_marks + 1; }
+            if (tt14 == EV_HIT) {
+                burn_hits = burn_hits + 1;
+                if (evbus_sub(bus14, q14) != DMG_SUB_BASE + DMG_BURN) { burn_sig_ok = 0; }
+            }
+            q14++;
+        }
+        let ne14: i32 = proj_event_count(ps14);
+        let r14: i32 = 0;
+        while (r14 < ne14) {
+            if (proj_event_kind(ps14, r14) == PEV_BURN) {
+                if (proj_event_signals(ps14, r14) != PSIG_BURN) { burn_sig_ok = 0; }
+                if ((proj_event_signals(ps14, r14) & PSIG_HITMARK) != 0) { burn_sig_ok = 0; }
+            }
+            r14++;
+        }
+        bt14++;
+    }
+    let burn_ok: i32 = 0;
+    if (burn_marks == 0) {
+        if (burn_hits == PROJ_BURN_HZ) { if (burn_sig_ok == 1) { burn_ok = 1; } }
+    }
+    ck(burn_ok, "a burn tick must reach the bus as EV_HIT/DMG_BURN and NEVER paint a "
+                + "hitmarker: " + sv(burn_hits) + " hits in 1 s (want "
+                + sv(PROJ_BURN_HZ) + "), " + sv(burn_marks) + " hitmarkers (want 0)");
+
+    // The Warden front plate applies to a blast, and this module does not
+    // implement it — combat.hml does.  Property: a plated Warden takes a
+    // quarter of what the same Warden takes with its plate broken.
+    let plate_dmg: array<i32> = [0, 0];
+    let pw: i32 = 0;
+    while (pw < 2) {
+        let ww: object = world_new_cap(16);
+        let psw: object = proj_new();
+        let cxw: object = combat_new();
+        proj_set_combat(psw, cxw);
+        let slw: i32 = world_spawn_player(ww, 1);
+        let wwhp: array<i32> = ww.hp;
+        let wwtm: array<i32> = ww.team;
+        wwhp[slw] = 100; wwtm[slw] = 1;
+        let srcw: i32 = world_id_of(ww, slw);
+        let wid: i32 = put_target(ww, 2.0, 10.0 - half, 0.0, 220, 2);
+        let ws2: i32 = world_slot_of(ww, wid);
+        let wmd: array<i32> = ww.model;
+        let war: array<i32> = ww.armor;
+        let wyw: array<f64> = ww.yaw;
+        wmd[ws2] = 4;                                  // g_ENEMY_WARDEN
+        wyw[ws2] = 0.0 - 1.5707963267948966;           // facing -x, into the blast
+        war[ws2] = 0;
+        if (pw == 1) { war[ws2] = combat_plate_hp(4); }
+        world_set_tick(ww, 3);
+        combat_begin_tick(cxw);
+        proj_aoe(psw, ww, 0.0, 10.0, 0.0, 3.5, 60, srcw, 1, 0, 0);
+        plate_dmg[pw] = 220 - hp_of(ww, wid);
+        pw++;
+    }
+    let plate_ok: i32 = 0;
+    if (plate_dmg[0] == 60) {
+        if (plate_dmg[1] * 4 == plate_dmg[0]) { plate_ok = 1; }
+    }
+    ck(plate_ok, "GDD 2.2: the Warden's front plate must reduce a blast to a quarter, "
+                 + "and it must be combat.hml doing it, not this file: unplated "
+                 + sv(plate_dmg[0]) + ", plated " + sv(plate_dmg[1]));
+
+    let has_ok: i32 = 0;
+    if (proj_has_combat(ps12) == 0) { if (proj_has_combat(ps13) == 1) { has_ok = 1; } }
+    ck(has_ok, "proj_has_combat must report honestly which damage path is live");
+
+    // =======================================================================
+    // H. TIMING — RULE T, __clock() CPU time, minimum of 7
+    // =======================================================================
+    let bench_ticks: i32 = 600;
+    let best: f64 = 1000000.0;
+    let worst: f64 = 0.0;
+    let trial: i32 = 0;
+    while (trial < g_TRIALS) {
+        let wb: object = world_new_cap(64);
+        let psb: object = proj_new();
+        build_load(psb, wb);
+        let t0: f64 = __clock();
+        let bt2: i32 = 0;
+        while (bt2 < bench_ticks) {
+            world_set_tick(wb, bt2);
+            proj_step(psb, wb);
+            bt2++;
+        }
+        let t1: f64 = __clock();
+        let ms: f64 = (t1 - t0) * 1000.0;
+        if (ms < best) { best = ms; }
+        if (ms > worst) { worst = ms; }
+        trial++;
+    }
+    let per_tick: f64 = best / f64(bench_ticks);
+
+    // A run at the same load to confirm the load is really there.
+    let wl: object = world_new_cap(64);
+    let psl: object = proj_new();
+    build_load(psl, wl);
+    let load_ok: i32 = 0;
+    if (proj_count(psl) == g_LOAD_PROJ) {
+        if (proj_burn_count(psl) == g_LOAD_ENT) { load_ok = 1; }
+    }
+    ck(load_ok, "the timed load must really be " + sv(g_LOAD_PROJ) + " bodies in flight "
+                + "and " + sv(g_LOAD_ENT) + " burning; measured " + sv(proj_count(psl))
+                + " / " + sv(proj_burn_count(psl)));
+
+    let guard: f64 = g_MS_GUARD_INTERP;
+    let bname: string = "interpreted";
+    if (compiled() == 1) { guard = g_MS_GUARD; bname = "compiled"; }
+    let perf_ok: i32 = 0;
+    if (per_tick < guard) { perf_ok = 1; }
+    ck(perf_ok, "projectile tick " + sv(per_tick) + " ms (" + bname
+                + ") exceeds the regression guard " + sv(guard)
+                + " ms. RULE T: the guard is ~2x the LOADED min-of-7 measurement on a box "
+                + "sharing ~17/24 cores with llama-server; an idle box is faster, never "
+                + "slower. The whole sim budget is " + sv(g_BUDGET_SIM_MS) + " ms/tick.");
+
+    let share_max: f64 = g_SHARE_MAX_INTERP;
+    if (compiled() == 1) { share_max = g_SHARE_MAX; }
+    let share_ok: i32 = 0;
+    if (per_tick < g_BUDGET_SIM_MS * share_max) { share_ok = 1; }
+    ck(share_ok, "W4-4's share of the " + sv(g_BUDGET_SIM_MS) + " ms sim budget must stay "
+                 + "under " + sv(share_max * 100.0) + " % of it (" + bname + "); measured "
+                 + sv(per_tick) + " ms/tick = " + sv(per_tick / g_BUDGET_SIM_MS * 100.0) + " %");
+
+    // =======================================================================
+    // REPORT
+    // =======================================================================
+    print("  --- data ------------------------------------------------------");
+    print("  emberlance  " + sv(proj_speed(PROJ_EMBERLANCE)) + " m/s, g "
+          + sv(proj_gravity(PROJ_EMBERLANCE)) + " m/s^2 (= v^2/range), "
+          + sv(proj_impact_damage(PROJ_EMBERLANCE)) + " impact, "
+          + sv(proj_aoe_radius(PROJ_EMBERLANCE)) + " m AoE");
+    print("  burn        " + sv(proj_burn_dps_x100(PROJ_EMBERLANCE) / 100) + "/s for "
+          + sv(f64(proj_burn_duration_ticks(PROJ_EMBERLANCE)) / f64(g_TICK_HZ))
+          + " s = " + sv(nb) + " ticks x 5/s, total "
+          + sv(proj_burn_total_after(bd, nb)));
+    print("  spitter     " + sv(proj_speed(PROJ_SPITTER_BOLT)) + " m/s, g "
+          + sv(proj_gravity(PROJ_SPITTER_BOLT)) + " m/s^2, "
+          + sv(proj_impact_damage(PROJ_SPITTER_BOLT)) + " dmg, no AoE");
+    print("  --- integration -----------------------------------------------");
+    print("  dt vs dt/4  " + sv(e_ab) + " m       (want < 1e-9)");
+    print("  vs closed   " + sv(e_ac) + " m       (want < 1e-9)");
+    print("  naive euler " + sv(e_euler) + " m    (negative control, want > 1e-4)");
+    print("  in-system   " + sv(worst_err) + " m worst over 300 ticks");
+    print("  --- ttk -------------------------------------------------------");
+    print("  husk 90 hp  1 impact + burn -> dead at " + sv(died_at) + " ticks = "
+          + sv(f64(died_at) / f64(g_TICK_HZ) * 1000.0) + " ms");
+    print("  --- determinism -----------------------------------------------");
+    print("  hash seed " + sv(g_SEED) + "  " + sv(h1));
+    print("  hash seed " + sv(g_SEED_B) + "  " + sv(h3));
+    print("  --- timing (RULE T: __clock CPU time, min of " + sv(g_TRIALS) + ") ------");
+    print("  load        " + sv(g_LOAD_PROJ) + " in flight, " + sv(g_LOAD_ENT)
+          + " targets, " + sv(g_LOAD_ENT) + " burning");
+    print("  min / max   " + sv(best) + " / " + sv(worst) + " ms per " + sv(bench_ticks)
+          + " ticks");
+    print("  per tick    " + sv(per_tick) + " ms  (" + bname + "), budget "
+          + sv(g_BUDGET_SIM_MS) + " ms for the WHOLE sim");
+    print("  share       " + sv(per_tick / g_BUDGET_SIM_MS * 100.0) + " % of the sim budget");
+
+    // ---- the assertion COUNT is itself an assertion ------------------------
+    let expect: i32 = 47;
+    let count_ok: i32 = 0;
+    if (g_asserts == expect) { count_ok = 1; }
+    g_asserts = g_asserts + 1;
+    if (count_ok == 1) { g_pass = g_pass + 1; }
+    else { print("  FAIL: assertion COUNT is " + sv(g_asserts - 1) + ", expected " + sv(expect)); }
+
+    print("PASS " + sv(g_pass) + "/" + sv(g_asserts));
+    if (g_pass != g_asserts) { exit(1); }
+}
+
+main();

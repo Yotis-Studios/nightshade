@@ -1,0 +1,1209 @@
+// ai.hml — enemy behaviour.  W4-5.  Steering only; there is no navmesh and no A*.
+//
+// ARCHITECTURE §5.4, BUILD_PLAN W4-5, GAME_DESIGN §2.2.
+//
+// -----------------------------------------------------------------------------
+// THE IMPORT WALL (CLAUDE.md §3)
+// -----------------------------------------------------------------------------
+// This file is inside `src/sim/**`. It imports only `src/core/**` and other
+// `src/sim/**`. No SDL, no wobbleweed, no renderer, no `@stdlib/random`, no wall
+// clock. `ai_step` takes no delta: `g_TICK_DT` is a compile-time constant and no
+// gameplay function ever sees a measured one (CLAUDE.md §7).
+//
+// -----------------------------------------------------------------------------
+// THE BEHAVIOUR, IN ONE PARAGRAPH — this is what the player must be able to read
+// -----------------------------------------------------------------------------
+// An agent walks where it looks. It picks the nearest living player inside its
+// aggro radius, turns toward it at a per-class rate, advances along its own
+// facing, and stops when it is inside attack range. Then it commits: it stands
+// still for a wind-up whose length is the class's TELL, and the tell is emitted
+// as an event on the tick it starts, so the audio and the animation have exactly
+// that many ticks of warning before the damage lands. If the target left the
+// range by the time the swing completes, the swing WHIFFS — a committed enemy
+// that cannot be dodged is not a fight. Husks alone fire whisker probes at ±35°
+// and slide around terrain they cannot climb. Everything else that looks like
+// intelligence is separation: agents shove each other apart so a crowd fans out
+// into a readable arc instead of a single stacked silhouette.
+//
+// Turn rate is the whole flanking language. A Warden turns at 2.2 rad/s and
+// advances along its facing, so walking around it genuinely works and its front
+// plate genuinely matters (GDD §2.2: "the flank prompt"). A Wisp turns at
+// 14 rad/s, so it does not.
+//
+// -----------------------------------------------------------------------------
+// WHERE THE STATE LIVES — nothing new is stored per agent
+// -----------------------------------------------------------------------------
+// The entire state machine fits in the three server-only fields `world.hml`
+// already has, so this module adds no per-entity storage, nothing new to
+// serialize, and nothing new to rewind:
+//
+//     w.ai_state[slot]      AI_ST_IDLE | SEEK | WINDUP | RECOVER
+//     w.ai_timer[slot]      seconds remaining in WINDUP / RECOVER
+//     w.ai_target_id[slot]  an i32 ID, never a reference (world.hml rule 2)
+//
+// The class index lives in `w.model[slot]`, which is a *state* field: the client
+// must know which enemy it is drawing, so the class cannot live in a server-only
+// field. `model == class` for every KIND_AI entity is this module's contract with
+// the renderer. Reported to ARCHITECTURE §5.
+//
+// Everything else — the jink of a Wisp, the per-agent steering jitter — is
+// recomputed each tick as a pure hash of `(world_seed, RNG_AI, tick-block, id)`,
+// so it is deterministic, costs no storage, and survives a rewind for free. See
+// `ai_h11` for why that is a hash rather than an `rng.hml` draw, with numbers.
+//
+// -----------------------------------------------------------------------------
+// SERVER-ONLY, AND WHY IT MATTERS (BUILD_PLAN W4-5)
+// -----------------------------------------------------------------------------
+// `ai_step` writes to KIND_AI entities and to nothing else. It never touches a
+// player's transform, velocity, health or flags, and it never returns a value a
+// client could predict. The damage an attack deals leaves this module as an
+// EVENT carrying (id, class, target, damage, position); `combat.hml` decides
+// whether and how it lands. That keeps the whole AI system on the far side of
+// the prediction boundary: a client can mispredict its own movement all day and
+// no AI decision changes, and a client that never sees `ai_*` cannot desync on
+// it. `probe_ai.hml` §G asserts this by hashing every player field before and
+// after a 600-tick run and requiring the two hashes to be equal.
+//
+// -----------------------------------------------------------------------------
+// THE NUMBERS — GDD §2.2 verbatim, and the six that are not
+// -----------------------------------------------------------------------------
+// HP, speed, damage, attack range, ember, XP and spawn cost are the GDD table.
+// The Husk's 0.45 s and the Spitter's 1.4 s tells are the GDD's. So are the
+// Wisp's 0.5 s chime and the Bulwark's 1.1 s crouch.
+//
+// Six numbers the GDD does not give, chosen here as *specific* guesses in the
+// spirit of GDD §0 and reported to the orchestrator so a designer can retune
+// them in one place:
+//
+//   TELL_S    Mote 0.35, Warden 0.90    ("plate glows before ram" has no number;
+//                                         0.90 sits between Husk and Spitter, so
+//                                         a ram is dodgeable but not casually)
+//   RECOVER_S all six (0.90 / 1.60 / 1.10 / 2.20 / 2.00 / 3.00) — the GDD gives
+//                                         no attack cadence at all
+//   TURN_RAD_S all six                  — the flank language above
+//   ACCEL     all six                   — how quickly an agent reaches its speed
+//   AGGRO_M   all six                   — bounded above by FOG_FAR so an enemy
+//                                         never reacts to something it cannot see
+//   CHARGE_M  Husk 14.0                 — the distance at which 3.0 m/s becomes
+//                                         5.2 m/s. The GDD gives both speeds and
+//                                         no switch.
+//
+// "Range 0" for Wisp and Mote in the GDD means *contact*, so their attack range
+// is `AI_CONTACT_M`, the sum of a player capsule (0.40 m) and an agent radius
+// plus a little slack.
+//
+// -----------------------------------------------------------------------------
+// OWNERSHIP NOTES — three tables this file shares a border with (reported, not
+// resolved; W4-3/W4-4/W4-6 are the same wave and none of us may edit another)
+// -----------------------------------------------------------------------------
+//  * `model == class` for KIND_AI. `combat.hml` (W4-3) arrived at the identical
+//    convention independently and reports it as the same §5 addition. Good.
+//  * `armor` at spawn. This file writes the Warden's 80-point plate from its own
+//    table; `combat.hml` exports `combat_plate_hp(cls)` with the same 80 and is
+//    the only thing that SPENDS it. One call would remove the duplicate; it is
+//    a cross-wave edit, so it is reported rather than made.
+//  * PER-CLASS CAPSULES DISAGREE, and this one matters. `projectiles.hml` (W4-4)
+//    says in as many words that it is waiting for "`ai.hml` (W4-5) to publish
+//    per-class capsules", which `ai_kind_params` / `ai_radius_of` /
+//    `ai_height_of` now do. `combat.hml` meanwhile carries its own `HB_R`/`HB_H`:
+//        ai.hml    r 0.35 0.40 0.45 0.42 0.55 0.90   h 0.90 1.00 1.80 1.70 2.20 3.00
+//        combat    r 0.35 0.45 0.40 0.45 0.65 1.10   h 0.70 0.90 1.85 1.60 2.30 3.20
+//    Neither set is in the GDD, and they differ by up to 0.20 m — which is the
+//    difference between a shot connecting and not. ONE of them has to win at the
+//    wave gate. ARCHITECTURE §5.4 gives `ai_kind_params` to this file and
+//    `projectiles.hml` already points here, so the recommendation is that
+//    `combat.hml` adopt these and delete its copy. Not done unilaterally.
+//  * `director.hml` (W4-6) keeps its own copy of the GDD spawn-cost column and
+//    documents why. The values agree exactly with `ai_cost_of` today; nothing
+//    checks that they still will tomorrow.
+//
+// -----------------------------------------------------------------------------
+// PERFORMANCE CONTRACT (BUILD_PLAN W4-5: 14 agents ≤ 0.5 ms/tick)
+// -----------------------------------------------------------------------------
+//  * `ai_new` allocates every array once. `ai_step` allocates nothing: no object
+//    literal, no array literal, no closure, no `defer`, no `try`, no template
+//    string on any path reached per tick (criterion D).
+//  * The world's field arrays are hoisted UNANNOTATED (`let px = w.px;`) —
+//    annotating the hoist costs an O(length) conversion walk per call
+//    (world.hml's performance contract).
+//  * Separation is O(n²) in *agents*, not entities. The director caps alive
+//    agents at 14 (config `g_DIR_ALIVE_CAP`), which is 91 pairs.
+//  * `chunk_height_at` costs 0.73-0.78 us/call (probe_chunk's own measurement),
+//    so terrain sampling is rationed: one per agent per tick for the ground
+//    clamp; ONE per Husk for the forward whisker, and the two ±35° flanks only
+//    when that one comes back blocked; `AI_LOS_STEPS` per Spitter only while it
+//    is in range and trying to fire.
+//  * Measured, compiled, 14 agents (7 Husks / 4 Wisps / 2 Spitters / 1 Warden),
+//    min of 7 under this box's permanent ~17-core load: **0.073 ms/tick**, which
+//    is 3.4 % of the 2.0 ms sim budget and 7x inside W4-5's 0.5 ms bound. The
+//    all-Wisp worst case (14 Wisps at 6.4 m/s, the densest crowd the separation
+//    solver ever sees) is 0.16 ms/tick. See `probe_ai.hml` §I; the asserted
+//    bound is a regression guard, not a certification of an idle box.
+//  * MEASURED AND REJECTED: rewriting all 71 `f64` locals in `ai_step` into the
+//    declare-then-assign form that makes `hemlockc` emit `double x = hml_to_f64`
+//    instead of `HmlValue x = hml_convert_to_type` (it does — verified in the
+//    emitted C, 208 unboxed vs 137 before) changed the measurement by **0.001 ms,
+//    inside the noise**. The cost here is calls and array indexing, not boxing.
+//    Reported so the next person does not re-run the experiment.
+
+import {
+    g_TICK_DT, g_TICK_HZ,
+    g_AI_SEPARATION_M, g_AI_WHISKER_DEG, g_AI_WHISKER_M,
+    g_MAX_ENTS
+} from "../core/config.hml";
+
+import { floori, xhash2 } from "../core/mathx.hml";
+
+import {
+    KIND_AI, KIND_PLAYER, EF_VISIBLE, EF_DEAD, SLOT_NONE, ID_NONE,
+    world_spawn, world_id_of, world_slot_of
+} from "./world.hml";
+
+import { chunk_height_at, CHUNK_H_MISS } from "./chunk.hml";
+
+// RNG_AI is imported as the STREAM SALT, not to draw a sequence. See the note
+// on `ai_h11` below for the measurement behind that choice.
+import { RNG_AI } from "./rng.hml";
+
+// ---------------------------------------------------------------------------
+// THE CLASS INDEX
+// ---------------------------------------------------------------------------
+// Re-exported from config so a caller that only imports ai.hml still has them.
+// These ARE `g_ENEMY_*`; the two names are the same six integers.
+export let AI_WISP    = 0;
+export let AI_MOTE    = 1;
+export let AI_HUSK    = 2;
+export let AI_SPITTER = 3;
+export let AI_WARDEN  = 4;
+export let AI_BULWARK = 5;
+export let AI_CLASS_COUNT = 6;
+
+// ---------------------------------------------------------------------------
+// THE STATE MACHINE  (stored in w.ai_state)
+// ---------------------------------------------------------------------------
+// Four states. If you need a fifth, ask whether the player would be able to
+// tell it apart from one of these four at 320x240 — if not, it is not a state.
+export let AI_ST_IDLE    = 0;   // no target: stand, decelerate, look bored
+export let AI_ST_SEEK    = 1;   // turn toward the target and advance
+export let AI_ST_WINDUP  = 2;   // committed. Standing still. The tell is out.
+export let AI_ST_RECOVER = 3;   // the swing is spent; cannot attack again yet
+export let AI_ST_COUNT   = 4;
+
+// ---------------------------------------------------------------------------
+// EVENTS  (the only thing this module tells the rest of the game)
+// ---------------------------------------------------------------------------
+// Drained by `sim.hml` in the same tick `ai_step` filled it. `ai_step` CLEARS
+// the log at entry, so the log is always exactly "what the AI did this tick"
+// and can never leak across ticks or grow without bound.
+export let AIEV_NONE   = 0;
+export let AIEV_ALERT  = 1;   // acquired a target. ival = target id. -> a bark
+export let AIEV_TELL   = 2;   // wind-up STARTED. ival = tell length, in TICKS
+export let AIEV_ATTACK = 3;   // the damage moment. ival = damage
+export let AIEV_WHIFF  = 4;   // the swing completed and the target had moved
+export let AIEV_ADDS   = 5;   // Bulwark slam: ival = how many Wisps to spawn
+export let AIEV_COUNT  = 6;
+
+// A tick of 14 agents cannot emit more than a few dozen events; 128 is four
+// times the worst case. Overflow DROPS THE NEWEST and counts it — a dropped
+// tell would be a silent gameplay bug, so it is visible in `ai_ev_dropped`.
+export let AI_EVENT_CAP = 128;
+
+// ---------------------------------------------------------------------------
+// `ai_kind_params` OUTPUT LAYOUT
+// ---------------------------------------------------------------------------
+export let AIP_HP        = 0;
+export let AIP_ARMOR     = 1;    // Warden front plate, 0 for everything else
+export let AIP_SPEED     = 2;    // m/s, the ordinary advance
+export let AIP_SPEED_HI  = 3;    // m/s, the charge (equal to SPEED unless Husk)
+export let AIP_DAMAGE    = 4;
+export let AIP_RANGE_M   = 5;
+export let AIP_TELL_S    = 6;
+export let AIP_RECOVER_S = 7;
+export let AIP_AGGRO_M   = 8;
+export let AIP_TURN      = 9;    // rad/s
+export let AIP_ACCEL     = 10;   // m/s^2
+export let AIP_RADIUS    = 11;   // m, horizontal
+export let AIP_HEIGHT    = 12;   // m, for combat.hml's AABB and the head volume
+export let AIP_EMBER     = 13;
+export let AIP_XP        = 14;
+export let AIP_COST      = 15;   // director spawn budget
+export let AIP_COUNT     = 16;
+
+// ---------------------------------------------------------------------------
+// STEERING CONSTANTS
+// ---------------------------------------------------------------------------
+// "Range 0" in the GDD table means contact: player capsule 0.40 + agent + slack.
+export let AI_CONTACT_M = 1.00;
+
+// The hard floor on agent-to-agent distance. Separation steering fans a crowd
+// out; this is the constraint that makes "agents never stack" a guarantee
+// rather than a tendency. The pairwise requirement is
+// `max(AI_HARD_SEP_M, radius_i + radius_j)`, so a Bulwark still gets its 1.8 m.
+export let AI_HARD_SEP_M   = 1.00;
+export let AI_SEP_PASSES   = 8;     // relaxation iterations; exits early when clean
+// Pairwise projection is Gauss-Seidel: separating (i,j) re-overlaps (i,k), so it
+// approaches the constraint asymptotically and a zero-tolerance loop runs its
+// full budget FOREVER. Measured with 14 agents crowding one player: 8 passes
+// every tick at 0.073 ms, converging to 0.9965 m. With a 5 mm tolerance it
+// settles in 2-3 passes and still holds 0.995 m — a hundred times the margin the
+// 0.9 m acceptance asks for, for a third of the cost.
+export let AI_SEP_EPS_M    = 0.005;
+
+// Whisker probes: BUILD_PLAN says ±35° for Husks, config owns the two numbers.
+export let AI_WHISKER_SLOPE = 0.60;  // rise/run a probe treats as a wall (~31°)
+
+// Spitter line-of-sight: samples along the ray, terrain only. A Spitter that
+// fires through a hill is the bug this prevents.
+export let AI_LOS_STEPS = 6;
+
+// A Wisp re-rolls its jink every AI_JINK_TICKS and holds it. 0.30 s reads as
+// "erratic" at 60 Hz without turning into per-tick noise nobody can track.
+export let AI_JINK_TICKS  = 18;
+export let AI_JINK_RAD    = 1.2217304763960306;   // 70 degrees
+// Every class gets a small held steering jitter so a crowd is not a rigid block.
+export let AI_WANDER_RAD  = 0.06981317007977318;  // 4 degrees
+export let AI_WANDER_TICKS = 60;
+
+// Target re-selection cadence, staggered by id so the cost never spikes.
+export let AI_RETARGET_TICKS = 15;
+// Hysteresis: an agent keeps a target out to this multiple of its aggro radius.
+export let AI_DEAGGRO_MULT = 1.5;
+
+// A swing whiffs if the target left range * this by the time it lands.
+export let AI_STRIKE_SLACK = 1.20;
+
+// Spitters hold a standoff band: they reposition rather than close.
+export let AI_STANDOFF_FRAC = 0.40;   // of attack range
+
+export let AI_TEAM_SHADE = 1;         // players are team 0
+
+let g_TAU: f64 = 6.283185307179586;
+let g_PI: f64  = 3.141592653589793;
+
+// ---------------------------------------------------------------------------
+// THE CLASS TABLE — GDD §2.2, one column per array, index = class
+// ---------------------------------------------------------------------------
+//                  Wisp   Mote   Husk   Spit   Ward   Bulw
+let g_ai_hp      = [   15,    30,    90,    70,   220,   900];
+let g_ai_armor   = [    0,     0,     0,     0,    80,     0];
+let g_ai_speed   = [  6.4,   2.2,   3.0,   2.6,   3.4,   2.8];
+let g_ai_speedhi = [  6.4,   2.2,   5.2,   2.6,   3.4,   2.8];
+let g_ai_dmg     = [    6,    12,    18,    22,    30,    40];
+let g_ai_range   = [ 1.00,  1.00,   1.8,  30.0,   2.2,   5.0];
+let g_ai_tell    = [ 0.50,  0.35,  0.45,  1.40,  0.90,  1.10];
+let g_ai_recover = [ 0.90,  1.60,  1.10,  2.20,  2.00,  3.00];
+let g_ai_aggro   = [ 45.0,  40.0,  60.0,  60.0,  70.0,  80.0];
+let g_ai_turn    = [ 14.0,   5.0,   7.0,   6.0,   2.2,   1.8];
+let g_ai_accel   = [ 26.0,   8.0,  18.0,  10.0,   9.0,   7.0];
+let g_ai_radius  = [ 0.35,  0.40,  0.45,  0.42,  0.55,  0.90];
+let g_ai_height  = [ 0.90,  1.00,  1.80,  1.70,  2.20,  3.00];
+let g_ai_ember   = [    1,     2,     4,     5,    12,    60];
+let g_ai_xp      = [    6,    12,    25,    30,    90,   400];
+let g_ai_cost    = [    2,     3,     6,     8,    20,    90];
+let g_ai_whisk   = [    0,     0,     1,     0,     0,     0];   // ±35° probes
+let g_ai_adds    = [    0,     0,     0,     0,     0,     4];   // Bulwark slam
+let g_ai_charge  = [  0.0,   0.0,  14.0,   0.0,   0.0,   0.0];   // Husk charge
+
+// ---------------------------------------------------------------------------
+// CONSTRUCTION
+// ---------------------------------------------------------------------------
+// One store, allocated once, for the whole process. It holds the event log, the
+// per-tick agent index scratch and one rng state. Nothing here grows.
+export fn ai_new(): object {
+    let cap: i32 = g_MAX_ENTS;
+    let out: object = ai_new_cap(cap);
+    return out;
+}
+
+export fn ai_new_cap(p_cap: i32): object {
+    let cap: i32 = p_cap;
+    if (cap < 1) { cap = 1; }
+    let ec: i32 = AI_EVENT_CAP;
+
+    let ai: object = {
+        cap: cap,
+        tick: 0,
+        agents: 0,          // agents stepped on the last ai_step
+        players: 0,
+        steps: 0,           // ai_step calls since construction
+        spawns: 0,
+        spawn_fail: 0,
+        relax_passes: 0,    // separation passes used on the last step
+        terrain_miss: 0,    // chunk_height_at returned CHUNK_H_MISS
+        attacks: 0,
+        whiffs: 0,
+        tells: 0,
+
+        // per-tick scratch: the live agent slots and their cached radii
+        idx: zeros_i(cap),
+        rad: zeros_f(cap),
+        pidx: zeros_i(cap),
+
+        // the event log
+        ev_n: 0,
+        ev_dropped: 0,
+        ev_type: zeros_i(ec),
+        ev_tick: zeros_i(ec),
+        ev_id: zeros_i(ec),
+        ev_class: zeros_i(ec),
+        ev_target: zeros_i(ec),
+        ev_i: zeros_i(ec),
+        ev_x: zeros_f(ec),
+        ev_y: zeros_f(ec),
+        ev_z: zeros_f(ec)
+    };
+    let o: object = ai;
+    return o;
+}
+
+fn zeros_i(p_n: i32): array {
+    let n: i32 = p_n;
+    let a: array = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array = a;
+    return out;
+}
+
+fn zeros_f(p_n: i32): array {
+    let n: i32 = p_n;
+    let a: array = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE CLASS TABLE, AS AN API
+// ---------------------------------------------------------------------------
+// Writes AIP_COUNT values into a caller-owned array. Returns 1, or 0 if the
+// class is out of range or the array is too short (never throws, never a null).
+export fn ai_kind_params(p_class: i32, p_out: array): i32 {
+    let c: i32 = p_class;
+    let out: array = p_out;
+    if (c < 0 || c >= AI_CLASS_COUNT) { let bad: i32 = 0; return bad; }
+    if (out.length < AIP_COUNT) { let small: i32 = 0; return small; }
+    out[AIP_HP]        = g_ai_hp[c];
+    out[AIP_ARMOR]     = g_ai_armor[c];
+    out[AIP_SPEED]     = g_ai_speed[c];
+    out[AIP_SPEED_HI]  = g_ai_speedhi[c];
+    out[AIP_DAMAGE]    = g_ai_dmg[c];
+    out[AIP_RANGE_M]   = g_ai_range[c];
+    out[AIP_TELL_S]    = g_ai_tell[c];
+    out[AIP_RECOVER_S] = g_ai_recover[c];
+    out[AIP_AGGRO_M]   = g_ai_aggro[c];
+    out[AIP_TURN]      = g_ai_turn[c];
+    out[AIP_ACCEL]     = g_ai_accel[c];
+    out[AIP_RADIUS]    = g_ai_radius[c];
+    out[AIP_HEIGHT]    = g_ai_height[c];
+    out[AIP_EMBER]     = g_ai_ember[c];
+    out[AIP_XP]        = g_ai_xp[c];
+    out[AIP_COST]      = g_ai_cost[c];
+    let ok: i32 = 1;
+    return ok;
+}
+
+// Single-value accessors. Cold; used by the director, progression and loot,
+// which each need one column and should not have to allocate an array for it.
+export fn ai_hp_of(p_c: i32): i32      { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: i32 = 0; return z; } let v: i32 = g_ai_hp[c]; return v; }
+export fn ai_damage_of(p_c: i32): i32  { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: i32 = 0; return z; } let v: i32 = g_ai_dmg[c]; return v; }
+export fn ai_cost_of(p_c: i32): i32    { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: i32 = 0; return z; } let v: i32 = g_ai_cost[c]; return v; }
+export fn ai_xp_of(p_c: i32): i32      { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: i32 = 0; return z; } let v: i32 = g_ai_xp[c]; return v; }
+export fn ai_ember_of(p_c: i32): i32   { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: i32 = 0; return z; } let v: i32 = g_ai_ember[c]; return v; }
+export fn ai_speed_of(p_c: i32): f64   { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: f64 = 0.0; return z; } let v: f64 = g_ai_speed[c]; return v; }
+export fn ai_range_of(p_c: i32): f64   { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: f64 = 0.0; return z; } let v: f64 = g_ai_range[c]; return v; }
+export fn ai_tell_s_of(p_c: i32): f64  { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: f64 = 0.0; return z; } let v: f64 = g_ai_tell[c]; return v; }
+export fn ai_radius_of(p_c: i32): f64  { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: f64 = 0.0; return z; } let v: f64 = g_ai_radius[c]; return v; }
+export fn ai_height_of(p_c: i32): f64  { let c: i32 = p_c; if (c < 0 || c >= AI_CLASS_COUNT) { let z: f64 = 0.0; return z; } let v: f64 = g_ai_height[c]; return v; }
+
+// The tell in TICKS, which is what an event carries and what a test asserts.
+// Rounded, not truncated: 0.45 s at 60 Hz is 27 ticks and must not become 26.
+export fn ai_tell_ticks_of(p_c: i32): i32 {
+    let c: i32 = p_c;
+    if (c < 0 || c >= AI_CLASS_COUNT) { let z: i32 = 0; return z; }
+    let s: f64 = g_ai_tell[c];
+    let t: i32 = floori(s * f64(g_TICK_HZ) + 0.5);
+    let out: i32 = t;
+    return out;
+}
+
+// The class of a live AI entity. `model` IS the class for KIND_AI (see header).
+export fn ai_class_of(p_w: object, p_slot: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    if (s < 0 || s >= w.count) { let bad: i32 = -1; return bad; }
+    let kind = w.kind;
+    if (kind[s] != KIND_AI) { let notai: i32 = -1; return notai; }
+    let model = w.model;
+    let out: i32 = model[s];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SPAWN
+// ---------------------------------------------------------------------------
+// Creates one KIND_AI entity of `p_class` at (x, y, z) facing `p_yaw`, fully
+// initialised from the class table. Returns its ID, or ID_NONE if the world is
+// full (never throws, never a null). The director calls this; nothing else
+// should.
+export fn ai_spawn(p_ai: object, p_w: object, p_class: i32,
+                   p_x: f64, p_y: f64, p_z: f64, p_yaw: f64): i32 {
+    let ai: object = p_ai;
+    let w: object = p_w;
+    let c: i32 = p_class;
+    if (c < 0 || c >= AI_CLASS_COUNT) {
+        ai.spawn_fail = ai.spawn_fail + 1;
+        let bad: i32 = ID_NONE;
+        return bad;
+    }
+    let slot: i32 = world_spawn(w, KIND_AI, 0);
+    if (slot == SLOT_NONE) {
+        ai.spawn_fail = ai.spawn_fail + 1;
+        let full: i32 = ID_NONE;
+        return full;
+    }
+
+    let px = w.px;   let py = w.py;   let pz = w.pz;
+    let vx = w.vx;   let vy = w.vy;   let vz = w.vz;
+    let yaw = w.yaw; let pitch = w.pitch;
+    let hp = w.hp;   let hpm = w.hp_max;  let armor = w.armor;
+    let team = w.team; let flags = w.flags; let model = w.model;
+    let anim = w.anim; let animt = w.anim_t;
+    let ais = w.ai_state; let ait = w.ai_target_id; let aim = w.ai_timer;
+
+    px[slot] = p_x;   py[slot] = p_y;   pz[slot] = p_z;
+    vx[slot] = 0.0;   vy[slot] = 0.0;   vz[slot] = 0.0;
+    yaw[slot] = wrap_tau(p_yaw);
+    pitch[slot] = 0.0;
+    hp[slot] = g_ai_hp[c];
+    hpm[slot] = g_ai_hp[c];
+    armor[slot] = g_ai_armor[c];
+    team[slot] = AI_TEAM_SHADE;
+    flags[slot] = EF_VISIBLE;
+    model[slot] = c;                 // model IS the class for KIND_AI
+    anim[slot] = AI_ST_IDLE;
+    animt[slot] = 0.0;
+    ais[slot] = AI_ST_IDLE;
+    ait[slot] = ID_NONE;
+    aim[slot] = 0.0;
+
+    ai.spawns = ai.spawns + 1;
+    let out: i32 = world_id_of(w, slot);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SMALL MATH — local, so the innermost loops call nothing they do not own
+// ---------------------------------------------------------------------------
+fn wrap_tau(p_a: f64): f64 {
+    let a: f64 = p_a;
+    let t: f64 = g_TAU;
+    while (a < 0.0) { a = a + t; }
+    while (a >= t) { a = a - t; }
+    let out: f64 = a;
+    return out;
+}
+
+fn wrap_pi(p_a: f64): f64 {
+    let a: f64 = p_a;
+    let t: f64 = g_TAU;
+    let p: f64 = g_PI;
+    while (a <= 0.0 - p) { a = a + t; }
+    while (a > p) { a = a - t; }
+    let out: f64 = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE PER-AGENT JITTER — a HASH, not a sequence, and here is the measurement
+// ---------------------------------------------------------------------------
+// Every random-looking number in this module is a *held* value: "what is agent
+// 1042's steering bias during tick-block 17". That is a pure function of four
+// coordinates, which is a hash question, not a stream question — and a hash is
+// strictly better here, because it is independent of call order, so adding a
+// class or reordering the agent loop cannot shift anyone else's jitter.
+//
+// `rng.hml` is the right tool for a *sequence* and it stays the sim's only PRNG.
+// It is the wrong tool for this, and the cost says so. Measured on v2.9.1,
+// compiled, min of 7, 200 000 calls:
+//
+//     rng_seed(st, seed, RNG_AI, block, id) + rng_f11(st)   1954 ns
+//     ai_h11(id, block, RNG_AI, seed)                         ~40 ns
+//
+// `rng_seed` is expensive by design: two splitmix64 rounds plus four warm-up
+// draws through a boxed 4-slot `array`. At 14 agents and 60 Hz that is 1.6 ms of
+// CPU per wall-clock second — 82 % of the entire per-tick sim budget — spent
+// entirely on a 4-degree steering wobble. So this module hashes.
+//
+// The recipe is `mathx.xhash2`'s, with the stream id folded in as a coordinate
+// so `RNG_AI` still separates this from every other consumer of the world seed,
+// and with all mixing in `u64` (A13: i32/i64 `* + -` TRAP on overflow).
+// Reported to the orchestrator: if a later task needs a real AI *sequence*
+// (a shuffled spawn order, say), it should use `rng.hml` and pay the 1954 ns
+// once per tick, not once per agent per tick.
+fn ai_h11(p_a: i32, p_b: i32, p_c: i32, p_seed: i32): f64 {
+    let a: u64 = u64(i64(p_a) & 4294967295);
+    let b: u64 = u64(i64(p_b) & 4294967295);
+    let c: u64 = u64(i64(p_c) & 4294967295);
+    let s: u64 = u64(i64(p_seed) & 4294967295);
+    let h: u64 = a * 2654435761 + b * 2246822519 + c * 3266489917 + s * 668265263 + 374761393;
+    h = (h ^ (h >> 15)) * 2246822507;
+    h = (h ^ (h >> 13)) * 3266489909;
+    h = (h ^ (h >> 16)) & 4294967295;
+    let out: f64 = f64(h) * 4.656612873077393e-10 - 1.0;   // (-1, 1), rng_f11's scale
+    return out;
+}
+
+// The project's yaw convention, from `src/render/view.hml`: at yaw 0 an entity
+// faces world -Z, and yaw increases turning right (clockwise seen from above).
+// So forward = (sin yaw, -cos yaw) and yaw = atan2(dx, -dz).
+export fn ai_yaw_of_dir(p_dx: f64, p_dz: f64): f64 {
+    let dx: f64 = p_dx;
+    let dz: f64 = p_dz;
+    let out: f64 = __atan2(dx, 0.0 - dz);
+    return out;
+}
+
+export fn ai_forward_x(p_yaw: f64): f64 { let y: f64 = p_yaw; let out: f64 = __sin(y); return out; }
+export fn ai_forward_z(p_yaw: f64): f64 { let y: f64 = p_yaw; let out: f64 = 0.0 - __cos(y); return out; }
+
+// ---------------------------------------------------------------------------
+// TERRAIN
+// ---------------------------------------------------------------------------
+// One height sample, or CHUNK_H_MISS if that chunk is not resident and cannot
+// be loaded (no source installed, or every slot pinned). Callers treat a miss
+// as "no information" and change nothing — an AI must never teleport to y=0
+// because a chunk was evicted.
+fn ground_at(p_cs: object, p_x: f64, p_z: f64): f64 {
+    let h: f64 = chunk_height_at(p_cs, p_x, p_z);
+    let out: f64 = h;
+    return out;
+}
+
+// A whisker probe. Returns 1 if the terrain `p_len` metres along (dx, dz) rises
+// more than AI_WHISKER_SLOPE per metre above the agent's feet — i.e. a wall it
+// cannot walk up. A miss returns 0: unknown terrain is not an obstacle.
+export fn ai_probe_blocked(p_cs: object, p_x: f64, p_y: f64, p_z: f64,
+                           p_dx: f64, p_dz: f64, p_len: f64): i32 {
+    let len: f64 = p_len;
+    let hx: f64 = p_x + p_dx * len;
+    let hz: f64 = p_z + p_dz * len;
+    let h: f64 = chunk_height_at(p_cs, hx, hz);
+    if (h == CHUNK_H_MISS) { let unknown: i32 = 0; return unknown; }
+    let rise: f64 = h - p_y;
+    let lim: f64 = AI_WHISKER_SLOPE * len;
+    let out: i32 = 0;
+    if (rise > lim) { out = 1; }
+    return out;
+}
+
+// Terrain line of sight between two points, AI_LOS_STEPS samples. Returns 1 if
+// nothing blocks. Used only to gate a Spitter's bolt.
+export fn ai_los_clear(p_cs: object, p_x0: f64, p_y0: f64, p_z0: f64,
+                       p_x1: f64, p_y1: f64, p_z1: f64): i32 {
+    let x0: f64 = p_x0; let y0: f64 = p_y0; let z0: f64 = p_z0;
+    let dx: f64 = p_x1 - x0;
+    let dy: f64 = p_y1 - y0;
+    let dz: f64 = p_z1 - z0;
+    let n: i32 = AI_LOS_STEPS;
+    let inv: f64 = 1.0 / f64(n + 1);
+    let i: i32 = 1;
+    while (i <= n) {
+        let t: f64 = f64(i) * inv;
+        let sx: f64 = x0 + dx * t;
+        let sy: f64 = y0 + dy * t;
+        let sz: f64 = z0 + dz * t;
+        let h: f64 = chunk_height_at(p_cs, sx, sz);
+        if (h != CHUNK_H_MISS) {
+            if (h > sy) { let blocked: i32 = 0; return blocked; }
+        }
+        i++;
+    }
+    let clear: i32 = 1;
+    return clear;
+}
+
+// ---------------------------------------------------------------------------
+// EVENTS
+// ---------------------------------------------------------------------------
+fn ai_emit(p_ai: object, p_type: i32, p_id: i32, p_class: i32, p_target: i32,
+           p_i: i32, p_x: f64, p_y: f64, p_z: f64) {
+    let ai: object = p_ai;
+    let n: i32 = ai.ev_n;
+    if (n >= AI_EVENT_CAP) {
+        ai.ev_dropped = ai.ev_dropped + 1;
+        return;
+    }
+    let et = ai.ev_type;   et[n] = p_type;
+    let ek = ai.ev_tick;   ek[n] = ai.tick;
+    let ei = ai.ev_id;     ei[n] = p_id;
+    let ec = ai.ev_class;  ec[n] = p_class;
+    let eg = ai.ev_target; eg[n] = p_target;
+    let ev = ai.ev_i;      ev[n] = p_i;
+    let ex = ai.ev_x;      ex[n] = p_x;
+    let ey = ai.ev_y;      ey[n] = p_y;
+    let ez = ai.ev_z;      ez[n] = p_z;
+    ai.ev_n = n + 1;
+}
+
+export fn ai_events_clear(p_ai: object) {
+    let ai: object = p_ai;
+    ai.ev_n = 0;
+}
+
+export fn ai_event_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.ev_n; return out; }
+export fn ai_event_dropped(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.ev_dropped; return out; }
+export fn ai_event_type(p_ai: object, p_i: i32): i32 { let ai: object = p_ai; let a = ai.ev_type; let out: i32 = a[p_i]; return out; }
+export fn ai_event_tick(p_ai: object, p_i: i32): i32 { let ai: object = p_ai; let a = ai.ev_tick; let out: i32 = a[p_i]; return out; }
+export fn ai_event_id(p_ai: object, p_i: i32): i32 { let ai: object = p_ai; let a = ai.ev_id; let out: i32 = a[p_i]; return out; }
+export fn ai_event_class(p_ai: object, p_i: i32): i32 { let ai: object = p_ai; let a = ai.ev_class; let out: i32 = a[p_i]; return out; }
+export fn ai_event_target(p_ai: object, p_i: i32): i32 { let ai: object = p_ai; let a = ai.ev_target; let out: i32 = a[p_i]; return out; }
+export fn ai_event_ival(p_ai: object, p_i: i32): i32 { let ai: object = p_ai; let a = ai.ev_i; let out: i32 = a[p_i]; return out; }
+export fn ai_event_x(p_ai: object, p_i: i32): f64 { let ai: object = p_ai; let a = ai.ev_x; let out: f64 = a[p_i]; return out; }
+export fn ai_event_y(p_ai: object, p_i: i32): f64 { let ai: object = p_ai; let a = ai.ev_y; let out: f64 = a[p_i]; return out; }
+export fn ai_event_z(p_ai: object, p_i: i32): f64 { let ai: object = p_ai; let a = ai.ev_z; let out: f64 = a[p_i]; return out; }
+
+// Counters — every refusal and every outcome is visible, never silent.
+export fn ai_agent_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.agents; return out; }
+export fn ai_step_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.steps; return out; }
+export fn ai_spawn_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.spawns; return out; }
+export fn ai_spawn_fail_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.spawn_fail; return out; }
+export fn ai_attack_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.attacks; return out; }
+export fn ai_whiff_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.whiffs; return out; }
+export fn ai_tell_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.tells; return out; }
+export fn ai_terrain_miss_count(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.terrain_miss; return out; }
+export fn ai_relax_passes(p_ai: object): i32 { let ai: object = p_ai; let out: i32 = ai.relax_passes; return out; }
+
+// ---------------------------------------------------------------------------
+// THE STEP
+// ---------------------------------------------------------------------------
+// One fixed tick of every live AI agent. Returns the number of agents stepped.
+//
+//   1. clear this tick's event log, gather the live agents and live players
+//   2. per agent: target, state machine, steering, facing, integrate
+//   3. separation relaxation over the agents (positional, XZ only)
+//   4. per agent: ground clamp
+//
+// The order is API in the same sense as `sim.hml`'s stage order: separation
+// runs AFTER integration so it corrects the tick's own overlaps, and the ground
+// clamp runs after separation so a shoved agent still stands on the terrain.
+export fn ai_step(p_ai: object, p_w: object, p_cs: object): i32 {
+    let ai: object = p_ai;
+    let w: object = p_w;
+    let cs: object = p_cs;
+
+    let tick: i32 = w.tick;
+    let seed: i32 = w.seed;
+    ai.tick = tick;
+    ai.ev_n = 0;
+    ai.steps = ai.steps + 1;
+
+    let dt: f64 = g_TICK_DT;
+
+    // ---- hoisted world fields (UNANNOTATED — world.hml's contract) --------
+    let px = w.px;   let py = w.py;   let pz = w.pz;
+    let vx = w.vx;   let vy = w.vy;   let vz = w.vz;
+    let yaw = w.yaw;
+    let hp = w.hp;   let flags = w.flags;  let model = w.model;
+    let kind = w.kind;
+    let anim = w.anim; let animt = w.anim_t;
+    let ais = w.ai_state; let ait = w.ai_target_id; let aim = w.ai_timer;
+
+    let idx = ai.idx;
+    let rad = ai.rad;
+    let pidx = ai.pidx;
+
+    let n: i32 = w.count;
+
+    // ---- 1. gather ---------------------------------------------------------
+    let na: i32 = 0;
+    let np: i32 = 0;
+    let s: i32 = 0;
+    while (s < n) {
+        let k: i32 = kind[s];
+        if (k == KIND_AI) {
+            if (hp[s] > 0) {
+                let fl: i32 = flags[s];
+                if ((fl & EF_DEAD) == 0) {
+                    idx[na] = s;
+                    let c: i32 = model[s];
+                    if (c < 0) { c = 0; }
+                    if (c >= AI_CLASS_COUNT) { c = 0; }
+                    rad[na] = g_ai_radius[c];
+                    na++;
+                }
+            }
+        } else {
+            if (k == KIND_PLAYER) {
+                if (hp[s] > 0) {
+                    let fl2: i32 = flags[s];
+                    if ((fl2 & EF_DEAD) == 0) { pidx[np] = s; np++; }
+                }
+            }
+        }
+        s++;
+    }
+    ai.agents = na;
+    ai.players = np;
+
+    // ---- 2. per agent ------------------------------------------------------
+    let a: i32 = 0;
+    while (a < na) {
+        let sl: i32 = idx[a];
+        let cls: i32 = model[sl];
+        if (cls < 0) { cls = 0; }
+        if (cls >= AI_CLASS_COUNT) { cls = 0; }
+
+        let ax: f64 = px[sl];
+        let ay: f64 = py[sl];
+        let az: f64 = pz[sl];
+        let myaw: f64 = yaw[sl];
+        let id: i32 = world_id_of(w, sl);
+
+        let aggro: f64 = g_ai_aggro[cls];
+        let rng_m: f64 = g_ai_range[cls];
+
+        // -- target: keep it while it lives and stays inside the hysteresis --
+        let tid: i32 = ait[sl];
+        let tsl: i32 = SLOT_NONE;
+        if (tid != ID_NONE) {
+            tsl = world_slot_of(w, tid);
+            if (tsl >= 0) {
+                if (hp[tsl] <= 0) { tsl = SLOT_NONE; }
+                else {
+                    let tdx: f64 = px[tsl] - ax;
+                    let tdz: f64 = pz[tsl] - az;
+                    let tdy: f64 = py[tsl] - ay;
+                    let dd: f64 = tdx * tdx + tdy * tdy + tdz * tdz;
+                    let keep: f64 = aggro * AI_DEAGGRO_MULT;
+                    if (dd > keep * keep) { tsl = SLOT_NONE; }
+                }
+            }
+        }
+        // Re-scan when we have nothing, or on this agent's staggered slot.
+        let want_scan: i32 = 0;
+        if (tsl == SLOT_NONE) { want_scan = 1; }
+        else {
+            let phase: i32 = (tick + id) % AI_RETARGET_TICKS;
+            if (phase == 0) { want_scan = 1; }
+        }
+        if (want_scan == 1) {
+            let best: f64 = aggro * aggro;
+            let bsl: i32 = SLOT_NONE;
+            let q: i32 = 0;
+            while (q < np) {
+                let ps: i32 = pidx[q];
+                let ddx: f64 = px[ps] - ax;
+                let ddy: f64 = py[ps] - ay;
+                let ddz: f64 = pz[ps] - az;
+                let d2: f64 = ddx * ddx + ddy * ddy + ddz * ddz;
+                if (d2 < best) { best = d2; bsl = ps; }
+                q++;
+            }
+            if (bsl != SLOT_NONE) {
+                if (tsl == SLOT_NONE) {
+                    // A fresh acquisition is a bark: the growl that tells the
+                    // player something has noticed them (audio bank 60/59).
+                    ai_emit(ai, AIEV_ALERT, id, cls, world_id_of(w, bsl), 0, ax, ay, az);
+                }
+                tsl = bsl;
+            }
+        }
+        if (tsl == SLOT_NONE) { ait[sl] = ID_NONE; }
+        else { ait[sl] = world_id_of(w, tsl); }
+
+        // -- the per-agent held jitter, recomputed, never stored -------------
+        // A pure function of (world_seed, RNG_AI, tick-block, id): identical on
+        // every backend, and a rewind reproduces it exactly with nothing to
+        // restore. See `ai_h11` for why this is a hash and not a draw.
+        let wblk: i32 = floori(f64(tick) / f64(AI_WANDER_TICKS));
+        let wander: f64 = ai_h11(id, wblk, RNG_AI, seed) * AI_WANDER_RAD;
+        let jink: f64 = 0.0;
+        if (cls == AI_WISP) {
+            let jblk: i32 = floori(f64(tick) / f64(AI_JINK_TICKS));
+            jink = ai_h11(id + 7777, jblk, RNG_AI, seed) * AI_JINK_RAD;
+        }
+
+        // -- the state machine ----------------------------------------------
+        let st: i32 = ais[sl];
+        let timer: f64 = aim[sl];
+        let dist: f64 = 0.0;
+        let dirx: f64 = 0.0;
+        let dirz: f64 = 0.0;
+        let have_target: i32 = 0;
+        if (tsl != SLOT_NONE) {
+            have_target = 1;
+            let dx: f64 = px[tsl] - ax;
+            let dy: f64 = py[tsl] - ay;
+            let dz: f64 = pz[tsl] - az;
+            dist = __sqrt(dx * dx + dy * dy + dz * dz);
+            let hlen: f64 = __sqrt(dx * dx + dz * dz);
+            if (hlen > 0.0001) { dirx = dx / hlen; dirz = dz / hlen; }
+            else { dirx = __sin(myaw); dirz = 0.0 - __cos(myaw); }
+        }
+
+        // Desired speed as a fraction of the class speed, decided by the state.
+        let speed: f64 = 0.0;
+        let want_yaw: f64 = myaw;
+
+        if (have_target == 0) {
+            st = AI_ST_IDLE;
+            timer = 0.0;
+            speed = 0.0;
+        } else if (st == AI_ST_WINDUP) {
+            // Committed. Standing still, still turning to track — slowly, so a
+            // sidestep during the wind-up actually pays off.
+            want_yaw = ai_yaw_of_dir(dirx, dirz);
+            speed = 0.0;
+            timer = timer - dt;
+            // Half a tick of slack. `timer` is an f64 counting down by 1/60,
+            // which is not exact in binary: after 27 subtractions from 0.45 the
+            // residue is ~1e-16, and `<= 0.0` would fire a 0.45 s tell one tick
+            // late roughly half the time. The tell length is a contract with
+            // the animation and the audio; it does not get to be approximate.
+            if (timer <= dt * 0.5) {
+                let strike: f64 = rng_m * AI_STRIKE_SLACK;
+                if (dist <= strike) {
+                    ai_emit(ai, AIEV_ATTACK, id, cls, ait[sl], g_ai_dmg[cls], ax, ay, az);
+                    ai.attacks = ai.attacks + 1;
+                    let adds: i32 = g_ai_adds[cls];
+                    if (adds > 0) {
+                        // The Bulwark's slam calls in Wisps. The director owns
+                        // the alive cap, so this is a request, not a spawn.
+                        ai_emit(ai, AIEV_ADDS, id, cls, ait[sl], adds, ax, ay, az);
+                    }
+                } else {
+                    ai_emit(ai, AIEV_WHIFF, id, cls, ait[sl], 0, ax, ay, az);
+                    ai.whiffs = ai.whiffs + 1;
+                }
+                st = AI_ST_RECOVER;
+                timer = g_ai_recover[cls];
+            }
+        } else if (st == AI_ST_RECOVER) {
+            want_yaw = ai_yaw_of_dir(dirx, dirz);
+            speed = 0.0;
+            timer = timer - dt;
+            if (timer <= dt * 0.5) { st = AI_ST_SEEK; timer = 0.0; }
+        } else {
+            // IDLE with a target, or SEEK: approach, hold a standoff, or swing.
+            st = AI_ST_SEEK;
+            let stand: f64 = rng_m * AI_STANDOFF_FRAC;
+            let mv: f64 = g_ai_speed[cls];
+            let chg: f64 = g_ai_charge[cls];
+            if (chg > 0.0) {
+                if (dist < chg) { mv = g_ai_speedhi[cls]; }
+            }
+
+            if (dist > rng_m) {
+                speed = mv;
+            } else if (dist < stand) {
+                // Too close for a ranged class: back off, still facing forward.
+                speed = 0.0 - mv;
+            } else {
+                speed = 0.0;
+            }
+
+            // May it swing? In range, off cooldown, and — for anything with a
+            // reach beyond arm's length — able to see the target.
+            if (dist <= rng_m) {
+                let can: i32 = 1;
+                if (rng_m > 3.0) {
+                    can = ai_los_clear(cs, ax, ay + g_ai_height[cls] * 0.7, az,
+                                       px[tsl], py[tsl] + 1.2, pz[tsl]);
+                }
+                if (can == 1) {
+                    st = AI_ST_WINDUP;
+                    timer = g_ai_tell[cls];
+                    speed = 0.0;
+                    let tt: i32 = ai_tell_ticks_of(cls);
+                    ai_emit(ai, AIEV_TELL, id, cls, ait[sl], tt, ax, ay, az);
+                    ai.tells = ai.tells + 1;
+                }
+            }
+
+            // The steering direction, before terrain: seek, plus separation,
+            // plus this agent's held jitter (and a Wisp's jink).
+            //
+            // NOTE the sign. An agent always FACES its target; `speed < 0` (a
+            // Spitter holding its standoff band) walks it BACKWARDS along that
+            // facing. Turning the facing around instead would have driven it
+            // straight at the thing it is retreating from, and a ranged enemy
+            // that cannot see you while kiting is not a ranged enemy.
+            let sx: f64 = dirx;
+            let sz: f64 = dirz;
+
+            // Separation steering. Soft: it fans the crowd out. The hard
+            // guarantee is the relaxation pass below, not this.
+            let sepx: f64 = 0.0;
+            let sepz: f64 = 0.0;
+            let b: i32 = 0;
+            while (b < na) {
+                if (b != a) {
+                    let os: i32 = idx[b];
+                    let ox: f64 = ax - px[os];
+                    let oz: f64 = az - pz[os];
+                    let od2: f64 = ox * ox + oz * oz;
+                    let want: f64 = g_AI_SEPARATION_M;
+                    if (od2 < want * want) {
+                        if (od2 > 0.000001) {
+                            let od: f64 = __sqrt(od2);
+                            let wgt: f64 = (want - od) / want;
+                            sepx = sepx + (ox / od) * wgt;
+                            sepz = sepz + (oz / od) * wgt;
+                        }
+                    }
+                }
+                b++;
+            }
+            sx = sx + sepx;
+            sz = sz + sepz;
+
+            let slen: f64 = __sqrt(sx * sx + sz * sz);
+            if (slen > 0.0001) { sx = sx / slen; sz = sz / slen; }
+            else { sx = dirx; sz = dirz; }
+
+            let base_yaw: f64 = ai_yaw_of_dir(sx, sz) + wander + jink;
+
+            // Whiskers: Husks only (BUILD_PLAN W4-5), ±35°, AI_WHISKER_M ahead.
+            //
+            // CENTRE FIRST. The forward probe is sampled alone, and the two
+            // flanks are only sampled when it comes back blocked. On open
+            // ground — which is where an agent spends nearly all of its life —
+            // that is ONE `chunk_height_at` per tick instead of three, and the
+            // measured cost of that call is 0.73-0.78 us (probe_chunk §perf), so
+            // the two saved samples are worth ~1.5 us per Husk per tick. It also
+            // stops a Husk twitching away from a wall it is merely walking past.
+            if (g_ai_whisk[cls] == 1) {
+                let wl: f64 = g_AI_WHISKER_M;
+                let wa: f64 = g_AI_WHISKER_DEG * 0.017453292519943295;
+                let cx0: f64 = __sin(base_yaw);
+                let cz0: f64 = 0.0 - __cos(base_yaw);
+                let bc: i32 = ai_probe_blocked(cs, ax, ay, az, cx0, cz0, wl);
+                if (bc == 1) {
+                    let lx: f64 = __sin(base_yaw - wa);
+                    let lz: f64 = 0.0 - __cos(base_yaw - wa);
+                    let rx: f64 = __sin(base_yaw + wa);
+                    let rz: f64 = 0.0 - __cos(base_yaw + wa);
+                    let bl: i32 = ai_probe_blocked(cs, ax, ay, az, lx, lz, wl);
+                    let br: i32 = ai_probe_blocked(cs, ax, ay, az, rx, rz, wl);
+                    // Steer toward the clear side; if both flanks are walls too,
+                    // pick one deterministically from the id, commit to it, and
+                    // slow down (an agent that dithers in a corner reads broken).
+                    let turn: f64 = 0.0;
+                    if (bl == 1) { if (br == 0) { turn = wa; } }
+                    if (br == 1) { if (bl == 0) { turn = 0.0 - wa; } }
+                    if (bl == br) {
+                        let h: u64 = xhash2(id, 0, 20250729);
+                        if ((h & 1) == 1) { turn = wa; } else { turn = 0.0 - wa; }
+                        if (bl == 1) { speed = speed * 0.35; }
+                    }
+                    base_yaw = base_yaw + turn;
+                }
+            }
+            want_yaw = base_yaw;
+        }
+
+        // -- facing: slew toward want_yaw at the class turn rate -------------
+        let dyaw: f64 = wrap_pi(want_yaw - myaw);
+        let maxd: f64 = g_ai_turn[cls] * dt;
+        if (dyaw > maxd) { dyaw = maxd; }
+        if (dyaw < 0.0 - maxd) { dyaw = 0.0 - maxd; }
+        let nyaw: f64 = wrap_tau(myaw + dyaw);
+        yaw[sl] = nyaw;
+
+        // -- locomotion: an agent walks WHERE IT LOOKS ----------------------
+        let fwx: f64 = __sin(nyaw);
+        let fwz: f64 = 0.0 - __cos(nyaw);
+        let tvx: f64 = fwx * speed;
+        let tvz: f64 = fwz * speed;
+        let acc: f64 = g_ai_accel[cls] * dt;
+        let cvx: f64 = vx[sl];
+        let cvz: f64 = vz[sl];
+        let ddx2: f64 = tvx - cvx;
+        let ddz2: f64 = tvz - cvz;
+        let dm: f64 = __sqrt(ddx2 * ddx2 + ddz2 * ddz2);
+        if (dm > acc) {
+            let k2: f64 = acc / dm;
+            cvx = cvx + ddx2 * k2;
+            cvz = cvz + ddz2 * k2;
+        } else {
+            cvx = tvx;
+            cvz = tvz;
+        }
+        vx[sl] = cvx;
+        vz[sl] = cvz;
+        vy[sl] = 0.0;
+        px[sl] = ax + cvx * dt;
+        pz[sl] = az + cvz * dt;
+
+        ais[sl] = st;
+        aim[sl] = timer;
+        // `anim` is a STATE field: the client animates from it. It mirrors the
+        // AI state on purpose — the wind-up pose is the tell, and the tell is
+        // the contract. It carries no information a client could predict with.
+        anim[sl] = st;
+        animt[sl] = timer;
+
+        a++;
+    }
+
+    // ---- 3. separation relaxation (positional, XZ) -------------------------
+    // The soft steering force above fans a crowd out; this is what makes
+    // "agents never stack" true rather than likely. Pairs closer than
+    // max(AI_HARD_SEP_M, r_i + r_j) are pushed apart by half the overlap each,
+    // in a fixed order, until a pass finds nothing (usually one or two).
+    let passes: i32 = 0;
+    let hard: f64 = AI_HARD_SEP_M;
+    let eps: f64 = AI_SEP_EPS_M;
+    let maxp: i32 = AI_SEP_PASSES;
+    let p: i32 = 0;
+    while (p < maxp) {
+        let moved: i32 = 0;
+        let i: i32 = 0;
+        while (i < na) {
+            let si: i32 = idx[i];
+            let ri: f64 = rad[i];
+            let j: i32 = i + 1;
+            while (j < na) {
+                let sj: i32 = idx[j];
+                let need: f64 = ri + rad[j];
+                if (need < hard) { need = hard; }
+                let lim: f64 = need - eps;
+                let dx3: f64 = px[sj] - px[si];
+                let dz3: f64 = pz[sj] - pz[si];
+                let d2: f64 = dx3 * dx3 + dz3 * dz3;
+                if (d2 < lim * lim) {
+                    let d: f64 = __sqrt(d2);
+                    if (d < 0.000001) {
+                        // Exactly coincident: pick a direction from the two
+                        // ids so the result is identical on every backend.
+                        let h2: u64 = xhash2(world_id_of(w, si), world_id_of(w, sj), 991);
+                        let ang: f64 = f64(h2 & 65535) * 0.00009587379924285257;  // /65536*TAU
+                        dx3 = __sin(ang);
+                        dz3 = __cos(ang);
+                        d = 1.0;
+                    } else {
+                        dx3 = dx3 / d;
+                        dz3 = dz3 / d;
+                    }
+                    let push: f64 = (need - d) * 0.5;
+                    px[si] = px[si] - dx3 * push;
+                    pz[si] = pz[si] - dz3 * push;
+                    px[sj] = px[sj] + dx3 * push;
+                    pz[sj] = pz[sj] + dz3 * push;
+                    moved = 1;
+                }
+                j++;
+            }
+            i++;
+        }
+        passes = passes + 1;
+        if (moved == 0) { p = maxp; } else { p++; }
+    }
+    ai.relax_passes = passes;
+
+    // ---- 4. ground clamp ---------------------------------------------------
+    // Feet on the terrain. A miss changes nothing: an evicted chunk must never
+    // drop an agent to y = 0.
+    let g: i32 = 0;
+    while (g < na) {
+        let gs: i32 = idx[g];
+        let h: f64 = ground_at(cs, px[gs], pz[gs]);
+        if (h == CHUNK_H_MISS) { ai.terrain_miss = ai.terrain_miss + 1; }
+        else { py[gs] = h; }
+        g++;
+    }
+
+    let out: i32 = na;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE FINGERPRINT
+// ---------------------------------------------------------------------------
+// A 31-bit hash of everything `ai_step` can touch: every live AI agent's
+// transform, its three server-only fields, and this tick's event log. Two runs
+// from the same seed and the same commands must produce the same sequence of
+// these, bit for bit, on both backends. All mixing is in `u64` (A13).
+//
+// Positions are quantized to millimetres and angles to milliradians before
+// they enter the hash — the same grid the wire uses — so the hash tests the
+// simulation rather than the last bit of an f64.
+export fn ai_hash(p_ai: object, p_w: object): i32 {
+    let ai: object = p_ai;
+    let w: object = p_w;
+    let h: u64 = 14695981039346656037;
+
+    let px = w.px; let py = w.py; let pz = w.pz;
+    let yaw = w.yaw; let kind = w.kind; let hp = w.hp; let model = w.model;
+    let ais = w.ai_state; let ait = w.ai_target_id; let aim = w.ai_timer;
+    let n: i32 = w.count;
+
+    let s: i32 = 0;
+    while (s < n) {
+        if (kind[s] == KIND_AI) {
+            h = mix64(h, world_id_of(w, s));
+            h = mix64(h, model[s]);
+            h = mix64(h, hp[s]);
+            h = mix64(h, qmm(px[s]));
+            h = mix64(h, qmm(py[s]));
+            h = mix64(h, qmm(pz[s]));
+            h = mix64(h, qmr(yaw[s]));
+            h = mix64(h, ais[s]);
+            h = mix64(h, ait[s]);
+            h = mix64(h, qms(aim[s]));
+        }
+        s++;
+    }
+
+    let en: i32 = ai.ev_n;
+    let et = ai.ev_type; let ek = ai.ev_tick; let ei = ai.ev_id;
+    let ec = ai.ev_class; let eg = ai.ev_target; let ev = ai.ev_i;
+    let e: i32 = 0;
+    while (e < en) {
+        h = mix64(h, et[e]);
+        h = mix64(h, ek[e]);
+        h = mix64(h, ei[e]);
+        h = mix64(h, ec[e]);
+        h = mix64(h, eg[e]);
+        h = mix64(h, ev[e]);
+        e++;
+    }
+    h = mix64(h, en);
+
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// millimetres, as a two's-complement i32
+fn qmm(p_v: f64): i32 {
+    let v: f64 = p_v * 1000.0;
+    if (v >= 0.0) { let a: i32 = i32(v + 0.5); return a; }
+    let b: i32 = 0 - i32(0.5 - v);
+    return b;
+}
+// milliradians
+fn qmr(p_v: f64): i32 {
+    let v: f64 = p_v * 1000.0;
+    if (v >= 0.0) { let a: i32 = i32(v + 0.5); return a; }
+    let b: i32 = 0 - i32(0.5 - v);
+    return b;
+}
+// milliseconds
+fn qms(p_v: f64): i32 {
+    let v: f64 = p_v * 1000.0;
+    if (v >= 0.0) { let a: i32 = i32(v + 0.5); return a; }
+    let b: i32 = 0 - i32(0.5 - v);
+    return b;
+}
+
+fn mix64(p_h: u64, p_k: i32): u64 {
+    let h: u64 = p_h;
+    let k: i64 = i64(p_k) & 4294967295;
+    let ku: u64 = u64(k);
+    h = (h ^ ku) * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}

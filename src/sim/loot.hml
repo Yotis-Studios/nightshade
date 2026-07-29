@@ -1,0 +1,754 @@
+// loot.hml — the five rarity tiers, the ten-affix pool, the six Relics.  W4-8.
+//
+// GAME_DESIGN.md §3.3 is the spec. This file is the only place those numbers
+// live (config.hml §0 explicitly delegates "the loot rarity/affix bands (§3.3)"
+// here, because a 6x5 table in a scalar file would be a second source of truth).
+//
+// ---------------------------------------------------------------------------
+// THE ONE PROPERTY THAT MATTERS MORE THAN ANY OTHER
+// ---------------------------------------------------------------------------
+// **The same chest, opened by the same player, on the same world seed, always
+// gives the same item.** Not "the same distribution" — the same item, the same
+// affixes, the same rolled values, on both backends, forever.
+//
+// That is not a nicety. Multiplayer reconciliation is impossible without it: a
+// client that predicts an open and a server that authorises it must agree, and
+// they cannot exchange a generator state mid-session. So the entry point every
+// gameplay caller should use is
+//
+//     loot_roll_at(item, world_seed, source_id, owner_id, shade_tier, family)
+//
+// which is a PURE FUNCTION OF ITS SIX ARGUMENTS. It reseeds from
+// `(world_seed, RNG_LOOT, source_id, owner_id)` before it draws, so it does not
+// matter what else drew this tick, in what order, or whether the tick was
+// replayed. `probe_loot` asserts exactly that by rolling the same tuple after
+// 10 000 unrelated draws and after a full re-shuffle of the call order.
+//
+// The streaming form `loot_roll(st, ...)` also exists, for the places that
+// legitimately want a sequence (a boss dropping five items, the distribution
+// self-test). It consumes a caller-owned state and is NOT position-independent.
+//
+// A WARNING TO WHOEVER BUILDS `poi.hml` AND THE CHEST ENTITY: `shade_tier` is
+// an ARGUMENT here, and GDD §4.2's tier includes `phase_bonus`, which changes
+// with the time of day. If you pass the tier sampled *at the moment of opening*,
+// the same chest opened at noon and at midnight rolls differently and the
+// property above is lost through your caller rather than through this module.
+// **Bake the source's tier when the source is created and store it.** Loot does
+// not and cannot enforce that from in here.
+//
+// ---------------------------------------------------------------------------
+// THE DROP WEIGHT TABLE  (GDD §3.3)
+// ---------------------------------------------------------------------------
+// The GDD gives three rows — shade tier 1, 3 and 5. The world has six tiers.
+// Rather than invent three more rows, tiers 2 and 4 are DERIVED at module load
+// as the exact midpoints of the anchors either side, which is why both come out
+// integral and still sum to 100:
+//
+//     tier   Common  Uncommon  Rare  Epic  Relic        source
+//       0      80       18       2     0     0          authored (see below)
+//       1      62       28       8     2     0          GDD anchor
+//       2      46       31      16     7     0          (t1 + t3) / 2, relic folded
+//       3      30       34      24    10     2          GDD anchor
+//       4      19       27      27    19     8          (t3 + t5) / 2
+//       5       8       20      30    28    14          GDD anchor
+//
+// The tier-2 midpoint inherits a Relic weight of 1 from tier 3, which the
+// relic floor below folds into Epic (6 -> 7). Row totals stay at 100.
+//
+// Tier 0 is the only hand-authored row, because linear extrapolation below the
+// tier-1 anchor produces negative Epic and Relic weights. Tier 0 is town and
+// lantern-light: it is authored to be the safest and the poorest, and it keeps
+// every column monotone with the three anchors (Common falls 80->8, Rare and
+// Epic and Relic rise, Uncommon peaks in the middle at tier 3 exactly as the
+// GDD's own three rows do).
+//
+// `probe_loot` asserts the ANCHOR ROWS against the GDD digits and asserts the
+// DERIVATION for the rest — so retuning tier 3 moves tiers 2 and 4 with it and
+// the probe still passes, while a typo in an anchor fails immediately.
+//
+// **Relics never drop below shade tier 3** (BUILD_PLAN W4-8). That is true twice
+// over: the weight is 0 in rows 0..2, and `loot_roll_rarity` demotes a Relic to
+// Epic if it ever sees one below `RELIC_TIER_MIN`. The second belt exists so a
+// future retune of the table cannot silently break the rule.
+//
+// ---------------------------------------------------------------------------
+// THE AFFIX POOL — ROLLED WITHOUT REPLACEMENT
+// ---------------------------------------------------------------------------
+// Ten affixes, GDD §3.3. `n` of them are chosen by a PARTIAL FISHER-YATES over
+// the eligible pool: swap-to-front, take the front. That is O(n), consumes
+// exactly `n` `rng_pick` calls plus `n` value draws, and **cannot** produce a
+// duplicate — not "is unlikely to", cannot, structurally. The rejection-sample
+// alternative ("draw, retry if seen") is the classic way to get a duplicate at
+// low probability and a non-terminating loop at high one.
+//
+// `+1 pellet` is Bellows-only (GDD), so the pool is filtered by weapon family
+// BEFORE the shuffle. Filtering after would either drop an affix (item comes out
+// with fewer than its rarity promises) or bias the remainder.
+//
+// Values roll inclusively inside their band with `rng_range`, in INTEGER PERCENT.
+// Integers because a float in the sim is a float on the wire (NETWORKING §3.7),
+// and 1 % granularity is finer than the player can perceive on a 4-12 % band.
+//
+// ---------------------------------------------------------------------------
+// THE ITEM RECORD — twelve i32s, flat, no object graph
+// ---------------------------------------------------------------------------
+// ARCHITECTURE §2.2 / the serialisation rule: everything here goes on a wire
+// later, so an item is a flat `array` of `ITEM_FIELDS` integers and nothing
+// else. No nested objects, no strings, no floats. `loot_item_hash` fingerprints
+// one in 31 bits for the determinism gates.
+//
+// ---------------------------------------------------------------------------
+// IMPORTS — the wall (CLAUDE.md §3)
+// ---------------------------------------------------------------------------
+// `src/core/config.hml` (shapes and caps) and `src/sim/rng.hml` (the ONLY source
+// of randomness). No @stdlib/random, no @stdlib/math, no wall clock, no SDL.
+
+import {
+    g_RARITY_COUNT, g_AFFIX_MAX, g_SHADE_TIER_MAX,
+    g_WPN_COUNT, g_WPN_BELLOWS
+} from "../core/config.hml";
+
+import {
+    rng_new, rng_seed, rng_pick, rng_range, RNG_LOOT
+} from "./rng.hml";
+
+// ===========================================================================
+// RARITY  (GDD §3.3)
+// ===========================================================================
+export let RARITY_NONE     = -1;
+export let RARITY_COMMON   = 0;
+export let RARITY_UNCOMMON = 1;
+export let RARITY_RARE     = 2;
+export let RARITY_EPIC     = 3;
+export let RARITY_RELIC    = 4;
+export let RARITY_COUNT    = 5;
+
+// The design's own invariant, stated as arithmetic instead of a table: rarity
+// r carries exactly r affixes. Common 0 .. Relic 4. Relic additionally carries
+// its unique, which is not an affix and does not occupy an affix slot.
+export let AFFIX_MAX = 4;
+
+// The lowest shade tier at which a Relic may drop (BUILD_PLAN W4-8).
+export let RELIC_TIER_MIN = 3;
+
+export let TIER_MIN = 0;
+export let TIER_MAX = 5;
+export let TIER_ROWS = 6;
+
+// ===========================================================================
+// THE AFFIX POOL  (GDD §3.3) — ten entries, bands in integer percent
+// ===========================================================================
+export let AFFIX_NONE     = -1;
+export let AFFIX_DAMAGE   = 0;   //  +4..12 %  damage
+export let AFFIX_RPM      = 1;   //  +3..9  %  rate of fire
+export let AFFIX_RELOAD   = 2;   //  -6..18 %  reload time
+export let AFFIX_MAG      = 3;   // +15..40 %  magazine size
+export let AFFIX_RECOIL   = 4;   //  -8..22 %  recoil
+export let AFFIX_ADS      = 5;   //  -8..20 %  ADS time
+export let AFFIX_EMBER    = 6;   // +10..30 %  ember from kills
+export let AFFIX_IGNITE   = 7;   //  20 % chance, 6/s for 3 s
+export let AFFIX_PELLET   = 8;   //  +1 pellet, BELLOWS ONLY
+export let AFFIX_OVERPEN  = 9;   //  hits a 2nd enemy at 70 %
+export let AFFIX_COUNT    = 10;
+
+// The two affixes whose GDD entry is not a range. Their "value" is the rolled
+// field (proc chance / carried damage) and their band is degenerate, so the
+// same `loot_affix_value` path serves them and nothing special-cases a roll.
+// The parts that are NOT rolled live here as named constants rather than as
+// magic numbers in combat.hml.
+export let AFFIX_IGNITE_DPS     = 6;    // damage per second
+export let AFFIX_IGNITE_SECS    = 3;    // seconds of burn
+export let AFFIX_OVERPEN_TARGETS = 2;   // the shooter's target plus one
+
+// ===========================================================================
+// THE SIX RELICS  (GDD §3.3) — one per weapon family, hand-authored
+// ===========================================================================
+// Relic id IS the weapon family id (config.hml's g_WPN_*). That identity is
+// deliberate and load-bearing: "one per weapon family" means the mapping is a
+// bijection, and a bijection between two 0..5 ranges should be the identity or
+// it is a lookup table waiting to go stale. Both directions are still exposed
+// as functions so callers depend on the API, not on the coincidence.
+export let RELIC_NONE        = -1;
+export let RELIC_WICK        = 0;   // Sparrow    — every 10th round is an igniting tracer
+export let RELIC_CHATTERBOX  = 1;   // Tinker     — +2 % RPM per consecutive hit, caps +40 %
+export let RELIC_NINEPENCE   = 2;   // Bellows    — missed pellets ricochet once toward the nearest enemy
+export let RELIC_LONG_SUNDAY = 3;   // Longshadow — headshots refund the round, +1.5 s streak timer
+export let RELIC_SIXPENNY    = 4;   // Kestrel    — the 6th chamber does 3x damage
+export let RELIC_VESPER      = 5;   // Emberlance — the burn spreads between enemies within 4 m
+export let RELIC_COUNT       = 6;
+
+// The hand-authored numbers inside the six uniques. Here so that whoever wires
+// them into weapons.hml/combat.hml imports them instead of retyping them.
+export let RELIC_WICK_EVERY        = 10;    // rounds
+export let RELIC_CHATTERBOX_STEP   = 2;     // % RPM per consecutive hit
+export let RELIC_CHATTERBOX_CAP    = 40;    // % RPM
+export let RELIC_NINEPENCE_BOUNCES = 1;
+export let RELIC_LONG_SUNDAY_MS    = 1500;  // added streak time, milliseconds
+export let RELIC_SIXPENNY_CHAMBER  = 6;
+export let RELIC_SIXPENNY_MULT     = 3;
+export let RELIC_VESPER_SPREAD_CM  = 400;   // 4.0 m, in centimetres (integer on the wire)
+
+// ===========================================================================
+// THE ITEM RECORD — twelve i32s
+// ===========================================================================
+export let ITEM_RARITY = 0;
+export let ITEM_FAMILY = 1;   // weapon family, config g_WPN_*
+export let ITEM_RELIC  = 2;   // RELIC_* or RELIC_NONE
+export let ITEM_NAFFIX = 3;   // 0..4, always == ITEM_RARITY
+export let ITEM_AFFIX0 = 4;   // 4..7   affix ids, AFFIX_NONE in unused slots
+export let ITEM_VALUE0 = 8;   // 8..11  the rolled value for the affix at the same index
+export let ITEM_FIELDS = 12;
+
+// `family` sentinel: "the source does not care, roll one".
+export let FAMILY_ANY = -1;
+
+// `loot_item_check` failure bits. Zero means a well-formed item.
+export let ERR_RARITY    = 1;
+export let ERR_FAMILY    = 2;
+export let ERR_NAFFIX    = 4;
+export let ERR_SLOT      = 8;    // a used slot is empty, or an unused one is not
+export let ERR_DUP       = 16;   // the same affix twice on one item
+export let ERR_BAND      = 32;   // a rolled value outside its band
+export let ERR_ELIGIBLE  = 64;   // an affix this weapon family may not carry
+export let ERR_RELIC     = 128;  // relic present without RARITY_RELIC, or vice versa
+export let ERR_RELIC_FAM = 256;  // the relic is not this family's relic
+
+// ===========================================================================
+// THE TABLES
+// ===========================================================================
+// Drop weights, TIER_ROWS x RARITY_COUNT, flat, row-major by shade tier.
+// The three GDD anchor rows are typed; rows 2 and 4 are derived below.
+let g_loot_w = [
+    80, 18,  2,  0,  0,     // tier 0  — authored: town and lantern light
+    62, 28,  8,  2,  0,     // tier 1  — GDD §3.3 anchor
+     0,  0,  0,  0,  0,     // tier 2  — derived, (t1 + t3) / 2
+    30, 34, 24, 10,  2,     // tier 3  — GDD §3.3 anchor
+     0,  0,  0,  0,  0,     // tier 4  — derived, (t3 + t5) / 2
+     8, 20, 30, 28, 14      // tier 5  — GDD §3.3 anchor
+];
+
+// Row totals, filled at load. Every row happens to sum to 100, but nothing
+// below assumes it: the rarity walk divides by the measured row total, so a
+// retune that does not sum to 100 stays correct instead of silently biasing.
+let g_loot_wsum = [0, 0, 0, 0, 0, 0];
+
+// Affix value bands, inclusive, integer percent. Two rows of AFFIX_COUNT.
+let g_affix_lo = [ 4,  3,  6, 15,  8,  8, 10, 20, 1, 70];
+let g_affix_hi = [12,  9, 18, 40, 22, 20, 30, 20, 1, 70];
+
+// 1 when the affix's value is a REDUCTION of the underlying stat (reload, ADS,
+// recoil) rather than an increase. The band is authored positive either way, so
+// a consumer must ask; getting this backwards makes a "good" affix a nerf.
+let g_affix_neg = [0, 0, 1, 0, 1, 1, 0, 0, 0, 0];
+
+// Module-owned scratch, allocated once (CLAUDE.md A8 / N6). NEITHER carries
+// state between calls: `g_loot_st` is reseeded at the top of every
+// `loot_roll_at`, and `g_loot_pool` is rebuilt at the top of every affix roll.
+// `probe_loot` proves it by interleaving unrelated rolls and re-checking.
+let g_loot_st = rng_new();
+let g_loot_pool = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+// The eligible affix pool per weapon family, precomputed at module load from
+// `loot_affix_eligible` so eligibility still has exactly one source of truth.
+// A roll copies its family's row instead of making AFFIX_COUNT predicate calls
+// — Hemlock calls cost ~10 ns per argument (CLAUDE.md A9b) and this was 10 of
+// them on the hot half of the roll.  g_pool_fam is g_WPN_COUNT rows of
+// AFFIX_COUNT, row-major; g_pool_len holds each row's length.
+let g_pool_fam = [];
+let g_pool_len = [];
+
+// ---- module load: derive rows 2 and 4, then total every row ----------------
+fn loot_derive_tables() {
+    let t = 0;
+    while (t < RARITY_COUNT) {
+        // `/` always yields f64 in Hemlock (CLAUDE.md §1 rule 9 / the API
+        // corrections), so the midpoint is taken back to i32 explicitly. Both
+        // midpoints are exactly integral — the probe asserts that rather than
+        // trusting the truncation.
+        g_loot_w[10 + t] = i32((g_loot_w[5 + t] + g_loot_w[15 + t]) / 2);
+        g_loot_w[20 + t] = i32((g_loot_w[15 + t] + g_loot_w[25 + t]) / 2);
+        t = t + 1;
+    }
+
+    // THE RELIC FLOOR, APPLIED TO THE TABLE. The tier-2 midpoint inherits a
+    // Relic weight of 1 from tier 3, which would make BUILD_PLAN W4-8's
+    // "Relics never drop below shade tier 3" false in the table and true only
+    // because `loot_roll_rarity` demotes the draw afterwards. A table that
+    // disagrees with the distribution it produces is exactly what the
+    // `--distribution` self-test exists to catch, so the fold is done here,
+    // by the same rule the roller uses: a Relic that may not drop is an Epic.
+    // Row totals are preserved, so a shade tier still changes WHAT drops and
+    // never HOW MUCH.
+    let f = 0;
+    while (f < RELIC_TIER_MIN) {
+        let moved: i32 = g_loot_w[f * RARITY_COUNT + RARITY_RELIC];
+        if (moved > 0) {
+            g_loot_w[f * RARITY_COUNT + RARITY_EPIC] =
+                g_loot_w[f * RARITY_COUNT + RARITY_EPIC] + moved;
+            g_loot_w[f * RARITY_COUNT + RARITY_RELIC] = 0;
+        }
+        f = f + 1;
+    }
+
+    let r = 0;
+    while (r < TIER_ROWS) {
+        let sum: i32 = 0;
+        let c = 0;
+        while (c < RARITY_COUNT) {
+            sum = sum + g_loot_w[r * RARITY_COUNT + c];
+            c = c + 1;
+        }
+        g_loot_wsum[r] = sum;
+        r = r + 1;
+    }
+}
+loot_derive_tables();
+
+
+// ===========================================================================
+// TABLE ACCESS
+// ===========================================================================
+
+// Clamp a shade tier into the table's row range. Out-of-range is a caller bug,
+// but the sim must never index off the end of a table over one.
+export fn loot_clamp_tier(p_tier: i32): i32 {
+    let tier: i32 = p_tier;
+    if (tier < TIER_MIN) { tier = TIER_MIN; }
+    if (tier > TIER_MAX) { tier = TIER_MAX; }
+    let out: i32 = tier;
+    return out;
+}
+
+// The GDD §3.3 drop weight for one (shade tier, rarity) cell.
+export fn loot_weight(p_tier: i32, p_rarity: i32): i32 {
+    let rarity: i32 = p_rarity;
+    if (rarity < 0) { let z: i32 = 0; return z; }
+    if (rarity >= RARITY_COUNT) { let z2: i32 = 0; return z2; }
+    let tier: i32 = loot_clamp_tier(p_tier);
+    let out: i32 = g_loot_w[tier * RARITY_COUNT + rarity];
+    return out;
+}
+
+// The row total. Divisor for the rarity walk; 100 for every shipped row.
+export fn loot_weight_sum(p_tier: i32): i32 {
+    let tier: i32 = loot_clamp_tier(p_tier);
+    let out: i32 = g_loot_wsum[tier];
+    return out;
+}
+
+// Rarity r carries exactly r affixes. The design as arithmetic, not a table.
+export fn loot_rarity_affixes(p_rarity: i32): i32 {
+    let rarity: i32 = p_rarity;
+    if (rarity < 0) { let z: i32 = 0; return z; }
+    if (rarity > AFFIX_MAX) { let c: i32 = AFFIX_MAX; return c; }
+    let out: i32 = rarity;
+    return out;
+}
+
+export fn loot_affix_lo(p_affix: i32): i32 {
+    let affix: i32 = p_affix;
+    if (affix < 0) { let z: i32 = 0; return z; }
+    if (affix >= AFFIX_COUNT) { let z2: i32 = 0; return z2; }
+    let out: i32 = g_affix_lo[affix];
+    return out;
+}
+
+export fn loot_affix_hi(p_affix: i32): i32 {
+    let affix: i32 = p_affix;
+    if (affix < 0) { let z: i32 = 0; return z; }
+    if (affix >= AFFIX_COUNT) { let z2: i32 = 0; return z2; }
+    let out: i32 = g_affix_hi[affix];
+    return out;
+}
+
+// 1 when the rolled value reduces the stat (reload / recoil / ADS time).
+export fn loot_affix_is_reduction(p_affix: i32): i32 {
+    let affix: i32 = p_affix;
+    if (affix < 0) { let z: i32 = 0; return z; }
+    if (affix >= AFFIX_COUNT) { let z2: i32 = 0; return z2; }
+    let out: i32 = g_affix_neg[affix];
+    return out;
+}
+
+// May weapon family `family` carry affix `affix`? Only +1 pellet is restricted
+// (GDD: "Bellows only"), but the question is asked through this function so a
+// second restriction is one line rather than an audit of every caller.
+export fn loot_affix_eligible(p_affix: i32, p_family: i32): i32 {
+    let affix: i32 = p_affix;
+    let family: i32 = p_family;
+    if (affix < 0) { let z: i32 = 0; return z; }
+    if (affix >= AFFIX_COUNT) { let z2: i32 = 0; return z2; }
+    if (affix == AFFIX_PELLET) {
+        let pellet_ok: i32 = 0;
+        if (family == g_WPN_BELLOWS) { pellet_ok = 1; }
+        return pellet_ok;
+    }
+    let out: i32 = 1;
+    return out;
+}
+
+// Precompute each family's eligible pool once, at module load, from the
+// predicate above — so eligibility still has exactly one source of truth and a
+// roll does not pay AFFIX_COUNT predicate calls (A9b: ~10 ns per argument).
+// Each row is the eligible affix ids packed at the front, -1 after them.
+fn loot_build_pools() {
+    let fam = 0;
+    while (fam < g_WPN_COUNT) {
+        let n: i32 = 0;
+        let a = 0;
+        while (a < AFFIX_COUNT) {
+            if (loot_affix_eligible(a, fam) == 1) {
+                g_pool_fam.push(a);
+                n = n + 1;
+            }
+            a = a + 1;
+        }
+        // pad the row out to AFFIX_COUNT so the stride is constant
+        let pad: i32 = n;
+        while (pad < AFFIX_COUNT) {
+            g_pool_fam.push(-1);
+            pad = pad + 1;
+        }
+        g_pool_len.push(n);
+        fam = fam + 1;
+    }
+}
+loot_build_pools();
+
+// How many of the ten affixes this family may carry. Never below AFFIX_MAX, or
+// a Relic could not be filled — asserted by the probe rather than assumed.
+export fn loot_pool_size(p_family: i32): i32 {
+    let family: i32 = p_family;
+    if (family < 0 || family >= g_WPN_COUNT) { let z: i32 = 0; return z; }
+    let out: i32 = g_pool_len[family];
+    return out;
+}
+
+// The two directions of the relic <-> family bijection.
+export fn loot_relic_for_family(p_family: i32): i32 {
+    let family: i32 = p_family;
+    if (family < 0) { let z: i32 = RELIC_NONE; return z; }
+    if (family >= RELIC_COUNT) { let z2: i32 = RELIC_NONE; return z2; }
+    let out: i32 = family;
+    return out;
+}
+
+export fn loot_relic_family(p_relic: i32): i32 {
+    let relic: i32 = p_relic;
+    if (relic < 0) { let z: i32 = -1; return z; }
+    if (relic >= RELIC_COUNT) { let z2: i32 = -1; return z2; }
+    let out: i32 = relic;
+    return out;
+}
+
+// ===========================================================================
+// THE ROLLS
+// ===========================================================================
+
+// Walk the shade tier's weight row. `rng_pick` is rejection-sampled, so the
+// walk is exactly uniform over the row total rather than modulo-biased — a
+// biased loot table is the classic silent RNG bug and it is unfalsifiable by
+// eye at 2 % weights.
+export fn loot_roll_rarity(p_st: array, p_tier: i32): i32 {
+    let st: array = p_st;
+    let tier: i32 = loot_clamp_tier(p_tier);
+    let total: i32 = g_loot_wsum[tier];
+    if (total <= 0) { let z: i32 = RARITY_COMMON; return z; }
+
+    let roll: i32 = rng_pick(st, total);
+    let base: i32 = tier * RARITY_COUNT;
+    let rarity: i32 = RARITY_COUNT - 1;
+    let acc: i32 = 0;
+    let r = 0;
+    while (r < RARITY_COUNT) {
+        acc = acc + g_loot_w[base + r];
+        if (roll < acc) {
+            rarity = r;
+            r = RARITY_COUNT;
+        } else {
+            r = r + 1;
+        }
+    }
+
+    // The second belt on "Relics never drop below shade tier 3". Unreachable
+    // with the shipped table (weight 0 in rows 0..2); it exists so a retune
+    // cannot break the rule silently.
+    if (rarity == RARITY_RELIC) {
+        if (tier < RELIC_TIER_MIN) { rarity = RARITY_EPIC; }
+    }
+
+    let out: i32 = rarity;
+    return out;
+}
+
+// One value inside one affix's band, inclusive at both ends.
+export fn loot_affix_value(p_st: array, p_affix: i32): i32 {
+    let st: array = p_st;
+    let affix: i32 = p_affix;
+    if (affix < 0) { let z: i32 = 0; return z; }
+    if (affix >= AFFIX_COUNT) { let z2: i32 = 0; return z2; }
+    let lo: i32 = g_affix_lo[affix];
+    let hi: i32 = g_affix_hi[affix];
+    let out: i32 = rng_range(st, lo, hi);
+    return out;
+}
+
+// A zeroed, well-formed empty item. Allocate at startup and reuse (N6).
+export fn loot_new_item(): array {
+    let item = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    loot_clear_item(item);
+    return item;
+}
+
+export fn loot_clear_item(p_item: array) {
+    let item: array = p_item;
+    item[ITEM_RARITY] = RARITY_NONE;
+    item[ITEM_FAMILY] = -1;
+    item[ITEM_RELIC] = RELIC_NONE;
+    item[ITEM_NAFFIX] = 0;
+    let k = 0;
+    while (k < AFFIX_MAX) {
+        item[ITEM_AFFIX0 + k] = AFFIX_NONE;
+        item[ITEM_VALUE0 + k] = 0;
+        k = k + 1;
+    }
+}
+
+// Partial Fisher-Yates over the eligible pool: `n` distinct affixes, O(n),
+// duplicate-free by construction. Consumes exactly 2n draws' worth of calls.
+fn loot_roll_affixes(p_st: array, p_item: array, p_n: i32, p_family: i32) {
+    let st: array = p_st;
+    let item: array = p_item;
+    let family: i32 = p_family;
+    let pool: array = g_loot_pool;
+    let src: array = g_pool_fam;
+
+    // Copy this family's precomputed row into the scratch that the shuffle
+    // permutes. The row itself is never permuted — it is the table.
+    let m: i32 = g_pool_len[family];
+    let base: i32 = family * AFFIX_COUNT;
+    let a = 0;
+    while (a < m) {
+        pool[a] = src[base + a];
+        a = a + 1;
+    }
+
+    let n: i32 = p_n;
+    if (n > m) { n = m; }
+
+    let k = 0;
+    while (k < n) {
+        let j: i32 = k + rng_pick(st, m - k);
+        let tmp: i32 = pool[k];
+        pool[k] = pool[j];
+        pool[j] = tmp;
+        let chosen: i32 = pool[k];
+        item[ITEM_AFFIX0 + k] = chosen;
+        item[ITEM_VALUE0 + k] = loot_affix_value(st, chosen);
+        k = k + 1;
+    }
+}
+
+// The STREAMING form. Draws from a caller-owned generator, so consecutive calls
+// give different items. Use this for a multi-drop, or a distribution test.
+// Returns 1 on a completed roll, 0 if the arguments were unusable.
+export fn loot_roll(p_st: array, p_item: array, p_tier: i32, p_family: i32): i32 {
+    let st: array = p_st;
+    let item: array = p_item;
+    let tier: i32 = loot_clamp_tier(p_tier);
+
+    loot_clear_item(item);
+
+    // Family first, so the affix pool filter and the relic identity both have
+    // it before anything else is decided.
+    //
+    // THE DRAW IS ALWAYS TAKEN, even when the caller pinned a family, and the
+    // result is then discarded. Skipping it would shift every later draw by
+    // one, so the same chest would roll a different RARITY depending on
+    // whether its source happened to pin a weapon family — a decision that has
+    // nothing to do with rarity. One discarded draw buys "the chest decides
+    // what it is; which weapon it turns out to be for does not change that",
+    // and `probe_loot` G9 asserts exactly that equivalence.
+    let rolled_family: i32 = rng_pick(st, g_WPN_COUNT);
+    let family: i32 = p_family;
+    if (family < 0 || family >= g_WPN_COUNT) {
+        family = rolled_family;
+    }
+
+    let rarity: i32 = loot_roll_rarity(st, tier);
+    let n: i32 = loot_rarity_affixes(rarity);
+
+    item[ITEM_RARITY] = rarity;
+    item[ITEM_FAMILY] = family;
+    item[ITEM_NAFFIX] = n;
+    if (rarity == RARITY_RELIC) {
+        item[ITEM_RELIC] = loot_relic_for_family(family);
+    }
+
+    loot_roll_affixes(st, item, n, family);
+
+    let out: i32 = 1;
+    return out;
+}
+
+// Reseed a caller-owned state for one loot source. `rng_seed`'s third and
+// fourth coordinates are named `tick` and `entity`; here they carry the SOURCE
+// id and the OWNER id, because what makes a loot draw unique is not when it
+// happened but which chest it was and whose it was. Splitmix64 folds all four,
+// so neighbouring source ids are decorrelated.
+export fn loot_seed(p_st: array, p_world_seed: i32, p_source_id: i32, p_owner_id: i32) {
+    rng_seed(p_st, p_world_seed, RNG_LOOT, p_source_id, p_owner_id);
+}
+
+// **THE ENTRY POINT GAMEPLAY SHOULD USE.** A pure function of its six
+// arguments: same seed + same source + same owner + same tier + same family ->
+// bit-identical item, on every backend, in any call order, on any tick, after
+// any number of unrelated draws, in a replay or on the server.
+export fn loot_roll_at(p_item: array, p_world_seed: i32, p_source_id: i32,
+                       p_owner_id: i32, p_tier: i32, p_family: i32): i32 {
+    let st: array = g_loot_st;
+    rng_seed(st, p_world_seed, RNG_LOOT, p_source_id, p_owner_id);
+    let out: i32 = loot_roll(st, p_item, p_tier, p_family);
+    return out;
+}
+
+// ===========================================================================
+// VALIDATION AND HASHING
+// ===========================================================================
+
+// Every structural invariant of an item record, as a bit field. 0 = well formed.
+// This is the property assertion the probe runs on every item it rolls: it
+// encodes the DESIGN (rarity r has r distinct legal affixes in band, relics are
+// their family's relic) rather than any particular rolled digit.
+export fn loot_item_check(p_item: array): i32 {
+    let item: array = p_item;
+    let bad: i32 = 0;
+
+    let rarity: i32 = item[ITEM_RARITY];
+    if (rarity < 0 || rarity >= RARITY_COUNT) { bad = bad | ERR_RARITY; return bad; }
+
+    let family: i32 = item[ITEM_FAMILY];
+    if (family < 0 || family >= g_WPN_COUNT) { bad = bad | ERR_FAMILY; }
+
+    let n: i32 = item[ITEM_NAFFIX];
+    if (n != loot_rarity_affixes(rarity)) { bad = bad | ERR_NAFFIX; }
+    if (n < 0 || n > AFFIX_MAX) { bad = bad | ERR_NAFFIX; return bad; }
+
+    let k = 0;
+    while (k < AFFIX_MAX) {
+        let a: i32 = item[ITEM_AFFIX0 + k];
+        if (k < n) {
+            if (a < 0 || a >= AFFIX_COUNT) {
+                bad = bad | ERR_SLOT;
+            } else {
+                let v: i32 = item[ITEM_VALUE0 + k];
+                if (v < g_affix_lo[a] || v > g_affix_hi[a]) { bad = bad | ERR_BAND; }
+                if (loot_affix_eligible(a, family) != 1) { bad = bad | ERR_ELIGIBLE; }
+                let j = 0;
+                while (j < k) {
+                    if (item[ITEM_AFFIX0 + j] == a) { bad = bad | ERR_DUP; }
+                    j = j + 1;
+                }
+            }
+        } else {
+            if (a != AFFIX_NONE) { bad = bad | ERR_SLOT; }
+            if (item[ITEM_VALUE0 + k] != 0) { bad = bad | ERR_SLOT; }
+        }
+        k = k + 1;
+    }
+
+    let relic: i32 = item[ITEM_RELIC];
+    if (rarity == RARITY_RELIC) {
+        if (relic == RELIC_NONE) { bad = bad | ERR_RELIC; }
+        else {
+            if (relic != loot_relic_for_family(family)) { bad = bad | ERR_RELIC_FAM; }
+        }
+    } else {
+        if (relic != RELIC_NONE) { bad = bad | ERR_RELIC; }
+    }
+
+    let out: i32 = bad;
+    return out;
+}
+
+// A 31-bit fingerprint of one item. FNV-1a-flavoured, mixed entirely in u64:
+// i32/i64 `* + -` TRAP on overflow in Hemlock (CLAUDE.md A13).
+export fn loot_item_hash(p_item: array): i32 {
+    let item: array = p_item;
+    let h: u64 = 14695981039346656037;
+    let i = 0;
+    while (i < ITEM_FIELDS) {
+        let raw: i32 = item[i];
+        let k: u64 = 0;
+        if (raw >= 0) { k = u64(raw); } else { k = u64(f64(raw) + 4294967296.0); }
+        h = (h ^ k) * 1099511628211;
+        i = i + 1;
+    }
+    h = h ^ (h >> 31);
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// Fold an item into a running u64 hash. The determinism gates chain thousands
+// of rolls through this and compare one number.
+export fn loot_hash_mix(p_h: u64, p_item: array): u64 {
+    let h: u64 = p_h;
+    let item: array = p_item;
+    let i = 0;
+    while (i < ITEM_FIELDS) {
+        let raw: i32 = item[i];
+        let k: u64 = 0;
+        if (raw >= 0) { k = u64(raw); } else { k = u64(f64(raw) + 4294967296.0); }
+        h = (h ^ k) * 1099511628211;
+        i = i + 1;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// ===========================================================================
+// COLD-PATH NAMES — report and HUD text only. Never called per frame (N3).
+// ===========================================================================
+export fn loot_rarity_name(p_rarity: i32): string {
+    let r: i32 = p_rarity;
+    if (r == RARITY_COMMON) { return "Common"; }
+    if (r == RARITY_UNCOMMON) { return "Uncommon"; }
+    if (r == RARITY_RARE) { return "Rare"; }
+    if (r == RARITY_EPIC) { return "Epic"; }
+    if (r == RARITY_RELIC) { return "Relic"; }
+    return "None";
+}
+
+export fn loot_affix_name(p_affix: i32): string {
+    let a: i32 = p_affix;
+    if (a == AFFIX_DAMAGE) { return "+% damage"; }
+    if (a == AFFIX_RPM) { return "+% RPM"; }
+    if (a == AFFIX_RELOAD) { return "-% reload time"; }
+    if (a == AFFIX_MAG) { return "+mag size"; }
+    if (a == AFFIX_RECOIL) { return "-% recoil"; }
+    if (a == AFFIX_ADS) { return "-% ADS time"; }
+    if (a == AFFIX_EMBER) { return "+% ember from kills"; }
+    if (a == AFFIX_IGNITE) { return "Ignite on hit"; }
+    if (a == AFFIX_PELLET) { return "+1 pellet"; }
+    if (a == AFFIX_OVERPEN) { return "Overpenetrate"; }
+    return "none";
+}
+
+export fn loot_relic_name(p_relic: i32): string {
+    let r: i32 = p_relic;
+    if (r == RELIC_WICK) { return "Wick"; }
+    if (r == RELIC_CHATTERBOX) { return "Chatterbox"; }
+    if (r == RELIC_NINEPENCE) { return "Ninepence"; }
+    if (r == RELIC_LONG_SUNDAY) { return "The Long Sunday"; }
+    if (r == RELIC_SIXPENNY) { return "Sixpenny"; }
+    if (r == RELIC_VESPER) { return "Vesper"; }
+    return "none";
+}
+
+// The shapes this module was sized against, re-exported so the probe can assert
+// that loot.hml and config.hml still agree rather than each holding its own 5.
+export fn loot_cfg_rarity_count(): i32 { let out: i32 = g_RARITY_COUNT; return out; }
+export fn loot_cfg_affix_max(): i32 { let out: i32 = g_AFFIX_MAX; return out; }
+export fn loot_cfg_tier_max(): i32 { let out: i32 = g_SHADE_TIER_MAX; return out; }
+export fn loot_cfg_wpn_count(): i32 { let out: i32 = g_WPN_COUNT; return out; }
+export fn loot_cfg_bellows(): i32 { let out: i32 = g_WPN_BELLOWS; return out; }

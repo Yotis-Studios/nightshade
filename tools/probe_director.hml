@@ -1,0 +1,1135 @@
+// =============================================================================
+//  probe_director.hml — W4-6's acceptance harness.   GDD §2.6.
+// =============================================================================
+//
+//  BUILD_PLAN W4-6 says "verified by `simtest.hml --course director`". simtest
+//  is W2-13's file and seven agents are in this tree right now, so this probe
+//  is a SEPARATE tool rather than an edit to a shared one (CLAUDE.md §3: edit
+//  the files your task lists and no others). Folding it into simtest as a
+//  `--course` is a one-line call at the wave gate; the assertions are the same
+//  assertions either way. Reported to the orchestrator.
+//
+//      hemlockc -O1 tools/probe_director.hml -o /tmp/probe_director
+//      /tmp/probe_director            # compiled — the shipping path
+//      hemlock  tools/probe_director.hml   # interpreted — parity
+//      nm /tmp/probe_director | grep -c SDL_    # MUST be 0
+//
+//  Exits 1 on any failed assertion, and asserts its own assertion COUNT so a
+//  section that silently stops running is a failure rather than a green run.
+//
+// -----------------------------------------------------------------------------
+//  THE REFERENCE NIGHT  — read this before you trust the pacing number
+// -----------------------------------------------------------------------------
+//  A hold's DURATION is not a property of the director alone. The director
+//  decides how many bodies walk out of the dark and how fast they are released;
+//  the player decides how fast they stop walking. To measure pacing at all you
+//  need a player, so this file contains one, and it is built ONLY from numbers
+//  that already exist in the design:
+//
+//    * enemy speed       -> `ai_speed_of` (GDD §2.2, ai.hml's table)
+//    * time-to-kill      -> the GDD §2.4 Sparrow-near shots-to-kill column,
+//                           at 690 RPM with a 30-round magazine and a 1.85 s
+//                           reload. Nothing rounded, nothing tuned.
+//    * engagement radius -> `g_DIR_SPAWN_MIN_M` (24 m). The fantasy is that you
+//                           DEFEND THE LIGHT; the reference player holds the
+//                           post and shoots what enters the ring. It does not
+//                           chase into the dark, because chasing into the dark
+//                           is how you die.
+//
+//  That leaves exactly ONE free parameter: `acq`, the seconds a player spends
+//  per body NOT shooting it — swinging the crosshair, reloading off-cycle,
+//  side-stepping a Spitter bolt, checking the flank. There is no number in the
+//  GDD for it, so this probe does not pick one and pretend. It SWEEPS it and
+//  prints the hold duration as a function of it, and reports which value the
+//  design's own "3:20" implies. That is the honest form of this measurement.
+//
+//  The reference player and the straight-line approach below are a STAND-IN,
+//  in the same sense as `simtest.hml`'s `st_tick`: no separation, no whiskers,
+//  no cover, one target at a time. It exists to exercise the director's caps,
+//  deferral and clear-detection paths against a moving world, not to be an AI.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sin, cos, sqrt, atan2, floor, TAU } from "@stdlib/math";
+
+import { g_TICK_DT, g_TICK_HZ, g_FOV_HIP, g_BUDGET_SIM_MS, g_SHADE_TIER_MAX,
+         g_DIR_ALIVE_CAP, g_DIR_ONSCREEN_CAP, g_DIR_SPAWN_MIN_M,
+         g_DIR_SPAWN_MAX_M, g_DIR_SPAWN_CADENCE_S, g_DIR_WAVE_GAP_S,
+         g_DIR_WAVES_PER_HOLD, g_DIR_SPAWN_BEHIND_BIAS,
+         g_DIR_BUDGET_BASE, g_DIR_BUDGET_PER_TIER, g_DIR_BUDGET_PER_WAVE,
+         g_ENEMY_KIND_COUNT, g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK,
+         g_ENEMY_SPITTER, g_ENEMY_WARDEN, g_ENEMY_BULWARK
+       } from "../src/core/config.hml";
+
+import { rng_new, rng_seed, RNG_DIRECTOR } from "../src/sim/rng.hml";
+
+import { world_new_cap, world_spawn, world_spawn_player, world_despawn,
+         world_slot_of, world_id_of, world_count, world_check, world_alive,
+         KIND_AI, SLOT_NONE } from "../src/sim/world.hml";
+
+import { day_phase, PHASE_TICK_NIGHT, PHASE_TICK_DUSK, HORN_TICK, DAY_TICKS,
+         PHASE_NIGHT, PHASE_DAWN } from "../src/sim/daycycle.hml";
+
+import { ai_cost_of, ai_speed_of, ai_hp_of } from "../src/sim/ai.hml";
+
+import { director_new, director_reset, director_set_anchor, director_set_tier,
+         director_step, director_bind, director_begin,
+         director_budget, director_cost, director_weight, director_min_cost,
+         director_bulwark_guaranteed, director_table_ok, director_roll_kind,
+         director_wave_state, director_wave, director_events, director_alive,
+         director_onscreen, director_spawned, director_wave_remaining,
+         director_wave_budget, director_hold_ticks, director_holds_done,
+         director_hold_active, director_peak_alive, director_peak_onscreen,
+         director_peak_onscreen_at_spawn, director_defer_alive,
+         director_defer_onscreen, director_req_count, director_req_kind,
+         director_req_x, director_req_y, director_req_z, director_hash,
+         director_roster_count, director_roster_id, director_roster_kind,
+         DIR_IDLE, DIR_ARMED, DIR_SPAWNING, DIR_CLEARING, DIR_GAP, DIR_DONE,
+         DIR_EV_HORN, DIR_EV_HOLD_START, DIR_EV_WAVE_START, DIR_EV_WAVE_CLEAR,
+         DIR_EV_HOLD_DONE, DIR_EV_DAWN, DIR_CADENCE_TICKS, DIR_GAP_TICKS,
+         DIR_HALF_FOV } from "../src/sim/director.hml";
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_PD_HOLDS: i32     = 100;    // the acceptance number, verbatim
+let g_PD_ROLLS: i32     = 1000;   // the acceptance number, verbatim
+let g_PD_ROLLS_BIG: i32 = 200000; // the real regression guard on the tables
+let g_PD_TRIALS: i32    = 7;      // RULE T: min-of-N CPU time
+let g_PD_SEED: i32      = 1337;
+let g_PD_MAX_TICKS: i32 = 60000;  // 16.6 min: a hold that runs longer is a bug
+
+// The one free parameter of the reference player (see the header). Swept.
+let g_PD_ACQ: f64       = 0.35;
+
+// RULE T guard. `director_step` at a FULL roster (14 alive, all in the view
+// cone, worst case for dir_observe) measured LOADED on this box — the machine
+// permanently shares ~17 of 24 cores with a llama-server. The guard is ~2x the
+// loaded number, which an idle box can only beat. Both numbers are in the
+// assertion text. The sim budget is g_BUDGET_SIM_MS = 2.0 ms for EVERYTHING;
+// the director's share is reported as a percentage of it.
+let g_PD_MS_GUARD: f64        = 0.0015;   // compiled   (2.0x of 0.742 us loaded)
+let g_PD_MS_GUARD_INTERP: f64 = 0.0130;   // interpreted (2.05x of 6.343 us loaded)
+
+// The determinism anchor. Compiled and interpreted must both print this.
+let g_PD_GOLDEN: u64 = 5144902878849827213;   // pinned; compiled == interpreted
+
+let g_PD_EXPECT_ASSERTS: i32 = 64;   // asserted against g_n at the bottom (62 + 2 GDD anchors)
+
+// ---------------------------------------------------------------------------
+// ASSERTIONS
+// ---------------------------------------------------------------------------
+fn sv(p_v): string {
+    let out: string = `${p_v}`;
+    return out;
+}
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn fabs(p_v: f64): f64 {
+    let v: f64 = p_v;
+    if (v < 0.0) { v = 0.0 - v; }
+    let out: f64 = v;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE REFERENCE PLAYER'S TIME-TO-KILL — GDD §2.4, Sparrow near, verbatim.
+// ---------------------------------------------------------------------------
+// Shots-to-kill straight off the GDD TTK matrix. Bulwark is not in that matrix
+// (900 HP / 26 = 35 shots) so it is computed the same way the matrix was.
+//                            Wisp Mote Husk Spit Ward Bulwark
+let g_pd_stk: array<i32> = [      1,   2,   4,   3,   9,     35];
+let g_PD_RPM: f64        = 690.0;
+let g_PD_MAG: i32        = 30;
+let g_PD_RELOAD_S: f64   = 1.85;
+
+fn ref_ttk(p_kind: i32): f64 {
+    let k: i32 = p_kind;
+    if (k < 0 || k >= g_ENEMY_KIND_COUNT) { let z: f64 = 0.0; return z; }
+    let s = g_pd_stk;
+    let n: i32 = s[k] - 1;                       // the first shot is free
+    let dt: f64 = 60.0 / g_PD_RPM;
+    let reloads: i32 = n / g_PD_MAG;
+    let out: f64 = f64(n) * dt + f64(reloads) * g_PD_RELOAD_S;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE REFERENCE NIGHT
+// ---------------------------------------------------------------------------
+// Out-array layout. Flat, because this is a report, not a value type.
+let g_RH_TICKS: i32     = 0;    // director-reported hold length, in ticks
+let g_RH_SPAWNS: i32    = 1;
+let g_RH_PK_ALIVE: i32  = 2;
+let g_RH_PK_SCREEN: i32 = 3;
+let g_RH_PK_SPAWN: i32  = 4;    // on-screen count at the moment of a spawn
+let g_RH_MAXREM: i32    = 5;    // worst unspent budget at a wave's end
+let g_RH_DEF_A: i32     = 6;
+let g_RH_DEF_S: i32     = 7;
+let g_RH_BEHIND: i32    = 8;    // spawns that landed outside the view cone
+let g_RH_RMIN: i32      = 9;
+let g_RH_RMAX: i32      = 10;
+let g_RH_CLEARS: i32    = 11;
+let g_RH_WAVES: i32     = 12;
+let g_RH_HASH: i32      = 13;
+let g_RH_TIMEOUT: i32   = 14;
+let g_RH_KIND0: i32     = 15;   // .. 15 + 6
+let g_RH_FIELDS: i32    = 21;
+
+fn ref_out_new(): array {
+    let a: array = [];
+    let i: i32 = 0;
+    while (i < g_RH_FIELDS) { a.push(0); i++; }
+    return a;
+}
+
+// Run one complete hold and fill `p_out`. Returns 1 if the hold completed.
+//
+//   p_seed  world seed
+//   p_tier  shade tier, 1..5
+//   p_acq   the reference player's per-body engagement overhead, seconds
+//   p_kill  1 = the player fights back; 0 = the player is a statue (cap test)
+fn ref_hold(p_seed: i32, p_tier: i32, p_acq: f64, p_kill: i32, p_out: array): i32 {
+    let seed: i32 = p_seed;
+    let tier: i32 = p_tier;
+    let acq: f64 = p_acq;
+    let kill: i32 = p_kill;
+    let out: array = p_out;
+
+    let i: i32 = 0;
+    while (i < g_RH_FIELDS) { out[i] = 0; i++; }
+    out[g_RH_RMIN] = 1.0e9;
+
+    let w: object = world_new_cap(128);
+    let d: object = director_new();
+
+    // Anchor the hold at the origin; the player holds the post.
+    let ax: f64 = 0.0;
+    let ay: f64 = 0.0;
+    let az: f64 = 0.0;
+
+    let pslot: i32 = world_spawn_player(w, 1);
+    let wpx = w.px;
+    let wpy = w.py;
+    let wpz = w.pz;
+    let wkind = w.kind;
+    let wmodel = w.model;
+    wpx[pslot] = ax; wpy[pslot] = ay; wpz[pslot] = az;
+
+    // Start one second before the dusk horn so the horn edge, the ARMED state
+    // and the automatic nightfall start are all exercised on the real clock.
+    let t0: i32 = HORN_TICK - 60;
+    director_reset(d, seed, t0);
+    director_set_anchor(d, ax, ay, az);
+    director_set_tier(d, tier);
+
+    let dt: f64 = g_TICK_DT;
+    let engage: f64 = g_DIR_SPAWN_MIN_M;
+    let stop_m: f64 = 1.8;                  // Husk swipe range: they stop here
+    let cos_half: f64 = cos(DIR_HALF_FOV);
+
+    let target: i32 = 0;                    // entity id, 0 = none
+    let kill_t: f64 = 0.0;
+    let yaw: f64 = 0.0;
+
+    let prev_state: i32 = DIR_IDLE;
+    let saw_horn: i32 = 0;
+    let saw_start: i32 = 0;
+    let done: i32 = 0;
+    let tick: i32 = t0;
+    let guard: i32 = 0;
+
+    while (guard < g_PD_MAX_TICKS) {
+        // ---- the reference player ---------------------------------------
+        if (kill == 1) {
+            if (target != 0) {
+                if (world_alive(w, target) == 0) { target = 0; }
+            }
+            if (target == 0) {
+                // Nearest body inside the ring. One target at a time.
+                let best: f64 = engage * engage;
+                let bid: i32 = 0;
+                let bk: i32 = 0;
+                let nr: i32 = director_roster_count(d);
+                let r: i32 = 0;
+                while (r < nr) {
+                    let eid: i32 = director_roster_id(d, r);
+                    let es: i32 = world_slot_of(w, eid);
+                    if (es >= 0) {
+                        let dx: f64 = wpx[es] - ax;
+                        let dz: f64 = wpz[es] - az;
+                        let dd: f64 = dx * dx + dz * dz;
+                        if (dd <= best) {
+                            best = dd;
+                            bid = eid;
+                            bk = wmodel[es];
+                        }
+                    }
+                    r++;
+                }
+                if (bid != 0) {
+                    target = bid;
+                    kill_t = acq + ref_ttk(bk);
+                }
+            }
+            if (target != 0) {
+                let ts: i32 = world_slot_of(w, target);
+                if (ts >= 0) {
+                    let dx2: f64 = wpx[ts] - ax;
+                    let dz2: f64 = wpz[ts] - az;
+                    yaw = atan2(dx2, 0.0 - dz2);
+                }
+                kill_t = kill_t - dt;
+                if (kill_t <= 0.0) {
+                    let ks: i32 = world_slot_of(w, target);
+                    if (ks >= 0) { world_despawn(w, ks); }
+                    target = 0;
+                }
+            }
+        }
+
+        // ---- the director ------------------------------------------------
+        director_step(d, w, tick, ax, az, yaw);
+
+        let ev: i32 = director_events(d);
+        if ((ev & DIR_EV_HORN) != 0) { saw_horn = 1; }
+        if ((ev & DIR_EV_HOLD_START) != 0) { saw_start = 1; }
+        if ((ev & DIR_EV_WAVE_START) != 0) { out[g_RH_WAVES] = out[g_RH_WAVES] + 1; }
+        if ((ev & DIR_EV_WAVE_CLEAR) != 0) { out[g_RH_CLEARS] = out[g_RH_CLEARS] + 1; }
+
+        // The unspent remainder is only meaningful at the instant a wave stops
+        // spawning; sample it exactly there (DESIGN 4).
+        let st_now: i32 = director_wave_state(d);
+        if (prev_state == DIR_SPAWNING) {
+            if (st_now == DIR_CLEARING) {
+                let rem: i32 = director_wave_remaining(d);
+                if (rem > out[g_RH_MAXREM]) { out[g_RH_MAXREM] = rem; }
+                if (rem < 0) { out[g_RH_MAXREM] = 1000000; }
+            }
+        }
+        prev_state = st_now;
+
+        // ---- drain the spawn queue ---------------------------------------
+        let nq: i32 = director_req_count(d);
+        let q: i32 = 0;
+        while (q < nq) {
+            let kd: i32 = director_req_kind(d, q);
+            let sx: f64 = director_req_x(d, q);
+            let sy: f64 = director_req_y(d, q);
+            let sz: f64 = director_req_z(d, q);
+
+            // Ring geometry, measured from the anchor, and the behind-bias.
+            let rdx: f64 = sx - ax;
+            let rdz: f64 = sz - az;
+            let rr: f64 = sqrt(rdx * rdx + rdz * rdz);
+            if (rr < out[g_RH_RMIN]) { out[g_RH_RMIN] = rr; }
+            if (rr > out[g_RH_RMAX]) { out[g_RH_RMAX] = rr; }
+            let fx: f64 = sin(yaw);
+            let fz: f64 = 0.0 - cos(yaw);
+            let cb: f64 = (rdx * fx + rdz * fz) / rr;
+            if (cb < cos_half) { out[g_RH_BEHIND] = out[g_RH_BEHIND] + 1; }
+
+            out[g_RH_SPAWNS] = out[g_RH_SPAWNS] + 1;
+            out[g_RH_KIND0 + kd] = out[g_RH_KIND0 + kd] + 1;
+
+            let es2: i32 = world_spawn(w, KIND_AI, 0);
+            if (es2 >= 0) {
+                wpx[es2] = sx; wpy[es2] = sy; wpz[es2] = sz;
+                wmodel[es2] = kd;
+                director_bind(d, q, world_id_of(w, es2));
+            }
+            if (es2 < 0) { director_bind(d, q, 0); }
+            q++;
+        }
+
+        // ---- the stand-in AI: seek the player, stop at swipe range --------
+        let nc: i32 = world_count(w);
+        let s: i32 = 0;
+        while (s < nc) {
+            if (wkind[s] == KIND_AI) {
+                let dx3: f64 = ax - wpx[s];
+                let dz3: f64 = az - wpz[s];
+                let dd3: f64 = sqrt(dx3 * dx3 + dz3 * dz3);
+                if (dd3 > stop_m) {
+                    let sp: f64 = ai_speed_of(wmodel[s]) * dt;
+                    let room: f64 = dd3 - stop_m;
+                    if (sp > room) { sp = room; }
+                    let inv: f64 = sp / dd3;
+                    wpx[s] = wpx[s] + dx3 * inv;
+                    wpz[s] = wpz[s] + dz3 * inv;
+                }
+            }
+            s++;
+        }
+
+        if (director_peak_alive(d) > out[g_RH_PK_ALIVE]) { out[g_RH_PK_ALIVE] = director_peak_alive(d); }
+        if (director_peak_onscreen(d) > out[g_RH_PK_SCREEN]) { out[g_RH_PK_SCREEN] = director_peak_onscreen(d); }
+
+        if ((ev & DIR_EV_HOLD_DONE) != 0) {
+            done = 1;
+            out[g_RH_TICKS] = director_hold_ticks(d);
+            guard = g_PD_MAX_TICKS;
+        }
+
+        tick = tick + 1;
+        guard = guard + 1;
+    }
+
+    out[g_RH_PK_SPAWN] = director_peak_onscreen_at_spawn(d);
+    out[g_RH_DEF_A] = director_defer_alive(d);
+    out[g_RH_DEF_S] = director_defer_onscreen(d);
+    out[g_RH_HASH] = i32(director_hash(d) >> 33);
+    if (done == 0) { out[g_RH_TIMEOUT] = 1; }
+    if (saw_horn == 0) { out[g_RH_TIMEOUT] = out[g_RH_TIMEOUT] + 2; }
+    if (saw_start == 0) { out[g_RH_TIMEOUT] = out[g_RH_TIMEOUT] + 4; }
+    let r2: i32 = done;
+    return r2;
+}
+
+// A whole-hold fingerprint that folds in the world, not just the director:
+// spawn counts per kind, the ring extremes quantized to mm, and the director's
+// own hash. This is what the determinism gate compares.
+fn ref_fingerprint(p_out: array): u64 {
+    let o: array = p_out;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < g_RH_FIELDS) {
+        let v: i32 = 0;
+        if (i == g_RH_RMIN || i == g_RH_RMAX) { v = i32(o[i] * 1000.0); }
+        if (i != g_RH_RMIN && i != g_RH_RMAX) { v = i32(o[i]); }
+        let u: u64 = u64(v & 2147483647);
+        if (v < 0) { u = u + 2147483648; }
+        h = h ^ u;
+        h = h * 1099511628211;
+        h = h ^ (h >> 29);
+        i++;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// ===========================================================================
+//  MAIN
+// ===========================================================================
+fn main() {
+    print("=========================================================");
+    print(" probe_director — W4-6, the wave director (GDD 2.6)");
+    print("=========================================================");
+    let comp: i32 = compiled();
+    if (comp == 1) { print(" build       COMPILED"); }
+    if (comp == 0) { print(" build       INTERPRETED"); }
+    print(" tick rate   " + sv(g_TICK_HZ) + " Hz");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- A. the tables ---------------------------------------");
+    // -----------------------------------------------------------------------
+    ck(director_table_ok() == -1, "every tier row must sum to 100 (tier " + sv(director_table_ok()) + " does not)");
+
+    // budget(tier, wave) = 60 + 45*tier + 18*wave, asserted as the FORMULA over
+    // the whole domain rather than as six memorised integers.
+    let bad_b: i32 = 0;
+    let t: i32 = 0;
+    while (t <= g_SHADE_TIER_MAX) {
+        let v: i32 = 0;
+        while (v < g_DIR_WAVES_PER_HOLD) {
+            let want: i32 = g_DIR_BUDGET_BASE + g_DIR_BUDGET_PER_TIER * t + g_DIR_BUDGET_PER_WAVE * v;
+            if (director_budget(t, v) != want) { bad_b = bad_b + 1; }
+            v++;
+        }
+        t++;
+    }
+    ck(bad_b == 0, "budget(tier,wave) must equal 60+45t+18w over all 18 cells");
+
+    // The budget must rise with tier and with wave — the escalation IS the drama.
+    let mono: i32 = 1;
+    let t2: i32 = 1;
+    while (t2 <= g_SHADE_TIER_MAX) {
+        if (director_budget(t2, 0) <= director_budget(t2 - 1, 0)) { mono = 0; }
+        let v2: i32 = 1;
+        while (v2 < g_DIR_WAVES_PER_HOLD) {
+            if (director_budget(t2, v2) <= director_budget(t2, v2 - 1)) { mono = 0; }
+            v2++;
+        }
+        t2++;
+    }
+    ck(mono == 1, "budget must increase strictly with both tier and wave");
+
+    // The director's cost table and ai.hml's must be the same six numbers.
+    // Two tables naming the same thing is exactly the failure ARCHITECTURE
+    // warns about; this assertion is what makes the duplication safe.
+    let bad_c: i32 = 0;
+    let k: i32 = 0;
+    while (k < g_ENEMY_KIND_COUNT) {
+        if (director_cost(k) != ai_cost_of(k)) { bad_c = bad_c + 1; }
+        k++;
+    }
+    ck(bad_c == 0, "director_cost must agree with ai_cost_of for all 6 classes");
+
+    // Costs must be strictly ordered by threat, or the budget means nothing.
+    let ord: i32 = 1;
+    let k2: i32 = 1;
+    while (k2 < g_ENEMY_KIND_COUNT) {
+        if (director_cost(k2) <= director_cost(k2 - 1)) { ord = 0; }
+        k2++;
+    }
+    ck(ord == 1, "spawn cost must increase strictly Wisp<Mote<Husk<Spitter<Warden<Bulwark");
+
+    // Tier 0 is the lit lantern: no pool, no hold.
+    let t0_empty: i32 = 1;
+    let k3: i32 = 0;
+    while (k3 < g_ENEMY_KIND_COUNT) {
+        if (director_weight(0, k3) != 0) { t0_empty = 0; }
+        k3++;
+    }
+    ck(t0_empty == 1, "tier 0 (inside a lit lantern) must have an empty pool");
+    ck(director_min_cost(0) == 0, "tier 0 has no cheapest body");
+
+    // Every guaranteed Bulwark must be affordable out of its wave's budget, or
+    // the guarantee is a lie. GDD: tier 3 wave 3; tier 4 waves 2 and 3.
+    let g_count: i32 = 0;
+    let bad_g: i32 = 0;
+    let t3: i32 = 0;
+    while (t3 <= g_SHADE_TIER_MAX) {
+        let v3: i32 = 0;
+        while (v3 < g_DIR_WAVES_PER_HOLD) {
+            if (director_bulwark_guaranteed(t3, v3) == 1) {
+                g_count = g_count + 1;
+                if (director_budget(t3, v3) < director_cost(g_ENEMY_BULWARK)) { bad_g = bad_g + 1; }
+            }
+            v3++;
+        }
+        t3++;
+    }
+    ck(g_count == 3, "exactly 3 guaranteed Bulwarks in the 18-cell table, got " + sv(g_count));
+    ck(bad_g == 0, "every guaranteed Bulwark must fit inside its wave budget");
+    ck(director_bulwark_guaranteed(3, 2) == 1, "tier 3 wave 3 is guaranteed a Bulwark");
+    ck(director_bulwark_guaranteed(4, 1) == 1, "tier 4 wave 2 is guaranteed a Bulwark");
+    ck(director_bulwark_guaranteed(4, 2) == 1, "tier 4 wave 3 is guaranteed a Bulwark");
+    ck(director_bulwark_guaranteed(1, 2) == 0, "tier 1 never sees a Bulwark");
+
+    // The escalation the five tables encode: the pool's mean cost must rise
+    // with tier. That is what "tier 5 is worse than tier 1" MEANS.
+    let prev_mean: f64 = 0.0;
+    let esc: i32 = 1;
+    let t4: i32 = 1;
+    while (t4 <= g_SHADE_TIER_MAX) {
+        let m: f64 = 0.0;
+        let k4: i32 = 0;
+        while (k4 < g_ENEMY_KIND_COUNT) {
+            m = m + f64(director_weight(t4, k4)) * f64(director_cost(k4)) * 0.01;
+            k4++;
+        }
+        if (m <= prev_mean) { esc = 0; }
+        prev_mean = m;
+        t4++;
+    }
+    ck(esc == 1, "mean pool cost must increase strictly with tier");
+
+    // Derived timers must match the config seconds exactly.
+    ck(DIR_CADENCE_TICKS == i32(g_DIR_SPAWN_CADENCE_S * f64(g_TICK_HZ) + 0.5),
+       "cadence ticks derived from g_DIR_SPAWN_CADENCE_S");
+    ck(DIR_GAP_TICKS == i32(g_DIR_WAVE_GAP_S * f64(g_TICK_HZ) + 0.5),
+       "gap ticks derived from g_DIR_WAVE_GAP_S");
+    print("  budget(1,0..2) " + sv(director_budget(1,0)) + " " + sv(director_budget(1,1)) + " " + sv(director_budget(1,2))
+        + "   budget(5,0..2) " + sv(director_budget(5,0)) + " " + sv(director_budget(5,1)) + " " + sv(director_budget(5,2)));
+    print("  cadence " + sv(DIR_CADENCE_TICKS) + " ticks   gap " + sv(DIR_GAP_TICKS) + " ticks");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- B. composition distribution -------------------------");
+    // -----------------------------------------------------------------------
+    // The GDD table describes the UNRESTRICTED roll, so that is what is
+    // measured: no budget filter. 1000 rolls is the acceptance number; the
+    // 200 000-roll pass at a 10x tighter bound is the real regression guard,
+    // because at 1000 rolls a 5 % window is ~3 sigma and would not catch a
+    // 3-point typo in the table.
+    let st: array = rng_new();
+    let cnt: array<i32> = [];
+    let z: i32 = 0;
+    while (z < g_ENEMY_KIND_COUNT) { cnt.push(0); z++; }
+
+    let worst_1k: f64 = 0.0;
+    let worst_big: f64 = 0.0;
+    let t5: i32 = 1;
+    while (t5 <= g_SHADE_TIER_MAX) {
+        // --- 1000 rolls, 5 % absolute (the BUILD_PLAN criterion) ------------
+        let j: i32 = 0;
+        while (j < g_ENEMY_KIND_COUNT) { cnt[j] = 0; j++; }
+        rng_seed(st, g_PD_SEED + t5, RNG_DIRECTOR, 0, 0);
+        let r: i32 = 0;
+        while (r < g_PD_ROLLS) {
+            let kk: i32 = director_roll_kind(st, t5, 1000000);
+            cnt[kk] = cnt[kk] + 1;
+            r++;
+        }
+        let line: string = "  tier " + sv(t5) + " @1k  ";
+        let k5: i32 = 0;
+        while (k5 < g_ENEMY_KIND_COUNT) {
+            let want: f64 = f64(director_weight(t5, k5));
+            let got: f64 = f64(cnt[k5]) * 100.0 / f64(g_PD_ROLLS);
+            let e: f64 = fabs(got - want);
+            if (e > worst_1k) { worst_1k = e; }
+            if (want > 0.0) { line = line + sv(i32(want)) + "%->" + sv(floor(got * 10.0) / 10.0) + "  "; }
+            k5++;
+        }
+        print(line);
+
+        // --- 200 000 rolls, 0.5 % absolute (the regression guard) -----------
+        let j2: i32 = 0;
+        while (j2 < g_ENEMY_KIND_COUNT) { cnt[j2] = 0; j2++; }
+        rng_seed(st, g_PD_SEED + 500 + t5, RNG_DIRECTOR, 7, 0);
+        let r2: i32 = 0;
+        while (r2 < g_PD_ROLLS_BIG) {
+            let kk2: i32 = director_roll_kind(st, t5, 1000000);
+            cnt[kk2] = cnt[kk2] + 1;
+            r2++;
+        }
+        let k6: i32 = 0;
+        while (k6 < g_ENEMY_KIND_COUNT) {
+            let want2: f64 = f64(director_weight(t5, k6));
+            let got2: f64 = f64(cnt[k6]) * 100.0 / f64(g_PD_ROLLS_BIG);
+            let e2: f64 = fabs(got2 - want2);
+            if (e2 > worst_big) { worst_big = e2; }
+            k6++;
+        }
+        t5++;
+    }
+    ck(worst_1k <= 5.0, "1000 rolls: worst deviation " + sv(worst_1k) + " pts must be <= 5.0");
+    ck(worst_big <= 0.5, "200k rolls: worst deviation " + sv(worst_big) + " pts must be <= 0.5");
+
+    // A kind with weight 0 must NEVER be rolled — a Mote at tier 3 would be a
+    // silent table-indexing bug that a percentage check could absorb.
+    rng_seed(st, g_PD_SEED, RNG_DIRECTOR, 11, 0);
+    let leak: i32 = 0;
+    let r3: i32 = 0;
+    while (r3 < 20000) {
+        let tt: i32 = 1 + (r3 % g_SHADE_TIER_MAX);
+        let kk3: i32 = director_roll_kind(st, tt, 1000000);
+        if (kk3 < 0) { leak = leak + 1; }
+        if (kk3 >= 0) {
+            if (director_weight(tt, kk3) == 0) { leak = leak + 1; }
+        }
+        r3++;
+    }
+    ck(leak == 0, "a zero-weight class must never be rolled (" + sv(leak) + " leaks)");
+
+    // The affordability filter must never return something it cannot pay for.
+    rng_seed(st, g_PD_SEED, RNG_DIRECTOR, 13, 0);
+    let over: i32 = 0;
+    let nonef: i32 = 0;
+    let r4: i32 = 0;
+    while (r4 < 20000) {
+        let tt2: i32 = 1 + (r4 % g_SHADE_TIER_MAX);
+        let cap: i32 = 1 + (r4 % 25);
+        let kk4: i32 = director_roll_kind(st, tt2, cap);
+        if (kk4 >= 0) {
+            if (director_cost(kk4) > cap) { over = over + 1; }
+        }
+        if (kk4 < 0) {
+            if (director_min_cost(tt2) <= cap) { nonef = nonef + 1; }
+        }
+        r4++;
+    }
+    ck(over == 0, "the affordability filter must never overspend (" + sv(over) + ")");
+    ck(nonef == 0, "the filter must find a body whenever one is affordable (" + sv(nonef) + ")");
+    print("  worst deviation: " + sv(floor(worst_1k * 100.0) / 100.0) + " pts @1k, "
+        + sv(floor(worst_big * 1000.0) / 1000.0) + " pts @200k");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- C. 100 simulated holds ------------------------------");
+    // -----------------------------------------------------------------------
+    // 20 holds at each of the five tiers. Caps, budget spend, the ring, the
+    // behind-bias, the wave count and termination are asserted across all 100.
+    let o: array = ref_out_new();
+    let n_done: i32 = 0;
+    let pk_alive: i32 = 0;
+    let pk_screen_spawn: i32 = 0;
+    let pk_screen_any: i32 = 0;
+    let max_rem: i32 = 0;
+    let rem_by_tier: array<i32> = [];
+    let rt: i32 = 0;
+    while (rt <= g_SHADE_TIER_MAX) { rem_by_tier.push(0); rt++; }
+    let bad_rem: i32 = 0;
+    let bad_waves: i32 = 0;
+    let bad_clear: i32 = 0;
+    let rmin: f64 = 1.0e9;
+    let rmax: f64 = 0.0;
+    let tot_spawn: i32 = 0;
+    let tot_behind: i32 = 0;
+    let tot_bulwark: i32 = 0;
+    let need_bulwark: i32 = 0;
+    let tot_defer_a: i32 = 0;
+    let tot_defer_s: i32 = 0;
+    let bad_flags: i32 = 0;
+
+    let h: i32 = 0;
+    while (h < g_PD_HOLDS) {
+        let tier: i32 = 1 + (h % g_SHADE_TIER_MAX);
+        // Half the holds run a FAST player (spawn-limited, the caps never
+        // bind) and half a SLOW one (kill-limited, the alive cap pins). A cap
+        // that is never reached is a cap that was never tested.
+        let acq_h: f64 = g_PD_ACQ;
+        if ((h % 2) == 1) { acq_h = 1.8; }
+        let ok: i32 = ref_hold(g_PD_SEED + h * 7919, tier, acq_h, 1, o);
+        n_done = n_done + ok;
+        if (o[g_RH_TIMEOUT] != 0) { bad_flags = bad_flags + 1; }
+        if (o[g_RH_PK_ALIVE] > pk_alive) { pk_alive = o[g_RH_PK_ALIVE]; }
+        if (o[g_RH_PK_SPAWN] > pk_screen_spawn) { pk_screen_spawn = o[g_RH_PK_SPAWN]; }
+        if (o[g_RH_PK_SCREEN] > pk_screen_any) { pk_screen_any = o[g_RH_PK_SCREEN]; }
+        if (o[g_RH_MAXREM] > max_rem) { max_rem = o[g_RH_MAXREM]; }
+        if (i32(o[g_RH_MAXREM]) >= director_min_cost(tier)) { bad_rem = bad_rem + 1; }
+        if (i32(o[g_RH_MAXREM]) > rem_by_tier[tier]) { rem_by_tier[tier] = i32(o[g_RH_MAXREM]); }
+        if (o[g_RH_WAVES] != g_DIR_WAVES_PER_HOLD) { bad_waves = bad_waves + 1; }
+        if (o[g_RH_CLEARS] != g_DIR_WAVES_PER_HOLD) { bad_clear = bad_clear + 1; }
+        if (o[g_RH_RMIN] < rmin) { rmin = o[g_RH_RMIN]; }
+        if (o[g_RH_RMAX] > rmax) { rmax = o[g_RH_RMAX]; }
+        tot_spawn = tot_spawn + i32(o[g_RH_SPAWNS]);
+        tot_behind = tot_behind + i32(o[g_RH_BEHIND]);
+        tot_bulwark = tot_bulwark + i32(o[g_RH_KIND0 + g_ENEMY_BULWARK]);
+        tot_defer_a = tot_defer_a + i32(o[g_RH_DEF_A]);
+        tot_defer_s = tot_defer_s + i32(o[g_RH_DEF_S]);
+        let vv: i32 = 0;
+        while (vv < g_DIR_WAVES_PER_HOLD) {
+            need_bulwark = need_bulwark + director_bulwark_guaranteed(tier, vv);
+            vv++;
+        }
+        h++;
+    }
+
+    ck(n_done == g_PD_HOLDS, "all " + sv(g_PD_HOLDS) + " holds must complete, got " + sv(n_done));
+    ck(bad_flags == 0, "every hold must see the horn, the start and the finish");
+    // ANCHOR THE DESIGN VALUES THEMSELVES, not just conformance to whatever the
+    // config happens to say. Gate 4a mutated g_DIR_ALIVE_CAP 14->15 and
+    // g_DIR_ONSCREEN_CAP 8->9 and EVERY probe stayed green, because every
+    // assertion was written relative to the config value. The game would
+    // silently retune and CI would never notice.
+    //
+    // This is "assert the design, not the digits" taken one level too far: the
+    // properties were pinned but the design ANCHOR came unpinned. Both forms are
+    // needed -- the literal below ties the config to GAME_DESIGN.md §2.6, and the
+    // relative assertions below tie behaviour to the config.
+    ck(g_DIR_ALIVE_CAP == 14, "GDD §2.6 anchor: alive cap is 14");
+    ck(g_DIR_ONSCREEN_CAP == 8, "GDD §2.6 anchor: on-screen cap is 8");
+    ck(pk_alive <= g_DIR_ALIVE_CAP, "alive cap " + sv(g_DIR_ALIVE_CAP) + " never exceeded (peak " + sv(pk_alive) + ")");
+    ck(pk_screen_spawn < g_DIR_ONSCREEN_CAP,
+       "no spawn is issued at or above the on-screen cap " + sv(g_DIR_ONSCREEN_CAP) + " (worst " + sv(pk_screen_spawn) + ")");
+    ck(bad_waves == 0, "every hold runs exactly " + sv(g_DIR_WAVES_PER_HOLD) + " waves");
+    ck(bad_clear == 0, "every wave ends with a clear event (the ember rain)");
+    // DESIGN 4: the full budget is spent down below the cheapest body in the
+    // tier's own pool. Asserted per tier against that tier's minimum, not
+    // against a global constant that tier 5 would hide behind.
+    ck(bad_rem == 0, "every wave spends its budget down below its tier's cheapest body ("
+       + sv(bad_rem) + " waves did not)");
+    ck(max_rem < 20, "unspent budget at a wave's end must be under a Warden (worst " + sv(max_rem) + ")");
+    ck(rmin >= g_DIR_SPAWN_MIN_M - 0.001, "no spawn inside the ring (" + sv(floor(rmin * 100.0) / 100.0) + " m)");
+    ck(rmax <= g_DIR_SPAWN_MAX_M + 0.001, "no spawn outside the ring (" + sv(floor(rmax * 100.0) / 100.0) + " m)");
+    ck(tot_bulwark >= need_bulwark, "every guaranteed Bulwark was delivered ("
+       + sv(tot_bulwark) + " >= " + sv(need_bulwark) + ")");
+
+    // The behind-bias, asserted as the design's tendency with a generous window
+    // rather than as a digit: 70 % intended, +/- 5 points over ~7000 spawns.
+    let behind_pct: f64 = f64(tot_behind) * 100.0 / f64(tot_spawn);
+    let want_pct: f64 = g_DIR_SPAWN_BEHIND_BIAS * 100.0;
+    ck(fabs(behind_pct - want_pct) <= 5.0,
+       "spawns behind the view cone " + sv(floor(behind_pct * 10.0) / 10.0) + "% vs " + sv(want_pct) + "% intended");
+
+    print("  holds " + sv(n_done) + "/" + sv(g_PD_HOLDS) + "   spawns " + sv(tot_spawn)
+        + "   peak alive " + sv(pk_alive) + "/" + sv(g_DIR_ALIVE_CAP));
+    print("  on-screen at spawn peak " + sv(pk_screen_spawn) + "/" + sv(g_DIR_ONSCREEN_CAP)
+        + "   (peak on screen at any time, AI-driven: " + sv(pk_screen_any) + ")");
+    print("  ring " + sv(floor(rmin * 100.0) / 100.0) + ".." + sv(floor(rmax * 100.0) / 100.0)
+        + " m   behind " + sv(floor(behind_pct * 10.0) / 10.0) + "%   worst unspent " + sv(max_rem));
+    ck(tot_defer_a + tot_defer_s > 0, "the caps must have deferred at least one spawn across 100 holds");
+    print("  deferrals: alive-cap " + sv(tot_defer_a) + " ticks, screen-cap " + sv(tot_defer_s) + " ticks");
+    print("  worst unspent by tier 1..5: " + sv(rem_by_tier[1]) + " " + sv(rem_by_tier[2]) + " "
+        + sv(rem_by_tier[3]) + " " + sv(rem_by_tier[4]) + " " + sv(rem_by_tier[5])
+        + "  (cheapest body: " + sv(director_min_cost(1)) + " " + sv(director_min_cost(2)) + " "
+        + sv(director_min_cost(3)) + " " + sv(director_min_cost(4)) + " " + sv(director_min_cost(5)) + ")");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- D. determinism --------------------------------------");
+    // -----------------------------------------------------------------------
+    let oa: array = ref_out_new();
+    let ob: array = ref_out_new();
+    let oc: array = ref_out_new();
+    ref_hold(g_PD_SEED, 3, g_PD_ACQ, 1, oa);
+    ref_hold(g_PD_SEED, 3, g_PD_ACQ, 1, ob);
+    ref_hold(g_PD_SEED + 1, 3, g_PD_ACQ, 1, oc);
+    let ha: u64 = ref_fingerprint(oa);
+    let hb: u64 = ref_fingerprint(ob);
+    let hc: u64 = ref_fingerprint(oc);
+    ck(ha == hb, "same seed + same commands -> bit-identical hold");
+    ck(ha != hc, "NEGATIVE CONTROL: a different seed must produce a different hold");
+
+    // Re-running the SAME tick range from a fresh director must reproduce the
+    // spawn stream exactly — that is what makes the director rollback-safe.
+    let od: array = ref_out_new();
+    ref_hold(g_PD_SEED, 3, g_PD_ACQ, 1, od);
+    ck(ref_fingerprint(od) == ha, "a third run reproduces the first");
+
+    // Tier is part of the state, not of the seed.
+    let oe: array = ref_out_new();
+    ref_hold(g_PD_SEED, 4, g_PD_ACQ, 1, oe);
+    ck(ref_fingerprint(oe) != ha, "a different tier must produce a different hold");
+
+    // The whole-suite fingerprint. Compiled and interpreted must print the same
+    // number; that is the backend-parity gate.
+    let gold: u64 = ha ^ (hc * 1099511628211) ^ (ref_fingerprint(oe) >> 7);
+    print("  hold hash   " + sv(ha));
+    print("  GOLDEN      " + sv(gold));
+    if (g_PD_GOLDEN != 0) {
+        ck(gold == g_PD_GOLDEN, "golden fingerprint drifted: got " + sv(gold) + " want " + sv(g_PD_GOLDEN));
+    }
+    if (g_PD_GOLDEN == 0) {
+        ck(gold != 0, "golden fingerprint is unpinned — see REPORT (printed above)");
+    }
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- E. pacing: the tier-1 night hold --------------------");
+    // -----------------------------------------------------------------------
+    // The acceptance criterion is 3:20 +/- 10 s. Duration is NOT the director's
+    // alone (header), so it is measured against the reference player and the
+    // one free parameter is swept rather than assumed.
+    let target_s: f64 = 200.0;
+    let sweep: array<f64> = [0.00, 0.35, 0.80, 1.20, 1.60, 2.00];
+    let ns: i32 = sweep.length;
+    let best_acq: f64 = -1.0;
+    let best_err: f64 = 1.0e9;
+    let floor_s: f64 = 0.0;
+    let at035: f64 = 0.0;
+    let means: array<f64> = [];
+    let mono_sweep: i32 = 1;
+    let si: i32 = 0;
+    while (si < ns) {
+        let acq: f64 = sweep[si];
+        let sum: f64 = 0.0;
+        let lo: f64 = 1.0e9;
+        let hi: f64 = 0.0;
+        let nh: i32 = 12;
+        let q: i32 = 0;
+        while (q < nh) {
+            let oo: array = ref_out_new();
+            ref_hold(g_PD_SEED + q * 104729, 1, acq, 1, oo);
+            let secs: f64 = f64(i32(oo[g_RH_TICKS])) / f64(g_TICK_HZ);
+            sum = sum + secs;
+            if (secs < lo) { lo = secs; }
+            if (secs > hi) { hi = secs; }
+            q++;
+        }
+        let mean: f64 = sum / f64(nh);
+        means.push(mean);
+        if (si > 0) { if (mean < means[si - 1] - 0.5) { mono_sweep = 0; } }
+        if (si == 0) { floor_s = mean; }
+        if (acq == 0.35) { at035 = mean; }
+        let e: f64 = fabs(mean - target_s);
+        if (e < best_err) { best_err = e; best_acq = acq; }
+        print("  acq " + sv(acq) + " s  ->  mean " + sv(floor(mean * 10.0) / 10.0)
+            + " s  (" + sv(floor(lo * 10.0) / 10.0) + ".." + sv(floor(hi * 10.0) / 10.0) + ")"
+            + "   = " + sv(i32(floor(mean / 60.0))) + ":" + sv(i32(mean) % 60));
+        si++;
+    }
+
+    // What the director OWNS, and can be asserted unconditionally:
+    //  * the spawn-limited floor — the shortest a tier-1 hold can possibly be,
+    //    reached only by a player who deletes every body on arrival.
+    let n_bodies: f64 = 0.0;
+    let mean_cost: f64 = 0.0;
+    let kf: i32 = 0;
+    while (kf < g_ENEMY_KIND_COUNT) {
+        mean_cost = mean_cost + f64(director_weight(1, kf)) * f64(director_cost(kf)) * 0.01;
+        kf++;
+    }
+    let tot_budget: f64 = f64(director_budget(1,0) + director_budget(1,1) + director_budget(1,2));
+    n_bodies = tot_budget / mean_cost;
+    let spawn_s: f64 = (n_bodies - 3.0) * g_DIR_SPAWN_CADENCE_S;
+    let gaps_s: f64 = f64(g_DIR_WAVES_PER_HOLD - 1) * g_DIR_WAVE_GAP_S;
+    let floor_pred: f64 = spawn_s + gaps_s;
+    print("  tier-1 budget " + sv(i32(tot_budget)) + " pts / mean cost "
+        + sv(floor(mean_cost * 100.0) / 100.0) + " = " + sv(i32(n_bodies)) + " bodies");
+    print("  spawn-limited floor: " + sv(i32(floor_pred)) + " s predicted, "
+        + sv(floor(floor_s * 10.0) / 10.0) + " s measured (acq = 0)");
+    print("  target " + sv(i32(target_s)) + " s (3:20) is reached at acq ~= " + sv(best_acq) + " s");
+
+    // --- what the director OWNS, asserted as hard regression guards --------
+    ck(fabs(floor_s - floor_pred) <= 25.0,
+       "the measured floor " + sv(floor(floor_s)) + " s must match the cadence+gap prediction "
+       + sv(i32(floor_pred)) + " s within 25 s");
+    ck(mono_sweep == 1,
+       "hold length must be non-decreasing in the player's engagement overhead");
+    // The design target must lie INSIDE the reachable band, or the director's
+    // numbers could not produce a 3:20 hold at any player skill.
+    let nlast: i32 = means.length - 1;
+    ck(means[0] < target_s, "the spawn-limited floor is below 3:20 ("
+       + sv(floor(means[0] * 10.0) / 10.0) + " s)");
+    ck(means[nlast] > target_s, "a slow player pushes the hold past 3:20 ("
+       + sv(floor(means[nlast] * 10.0) / 10.0) + " s)");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("*** ACCEPTANCE GAP — read this, it is not a passing result *******");
+    // -----------------------------------------------------------------------
+    // BUILD_PLAN W4-6: "a tier-1 hold lasts 3:20 +/- 10 s".
+    //
+    // That criterion is NOT a property of the director. Against a reference
+    // player built only from GDD numbers and given perfect aim and perfect
+    // information, the director's own six constants produce the duration
+    // printed above, and the sweep says 3:20 needs ~1.6 s of per-body
+    // engagement overhead. Two honest readings:
+    //
+    //   (a) the GDD's 3:20 assumes a HUMAN, not a solver, and 1.6 s of
+    //       repositioning / reloading / missing per body at 320x240 is
+    //       entirely ordinary. Then nothing is wrong and the criterion simply
+    //       cannot be closed from inside src/sim.
+    //   (b) if 3:20 is meant to be the director's own floor, ONE constant
+    //       closes it: g_DIR_SPAWN_CADENCE_S. The arithmetic is printed below.
+    //
+    // config.hml is not this task's file, so nothing is changed here. The
+    // number is printed on EVERY run so the gap cannot go quiet.
+    let spawn_part: f64 = floor_s - gaps_s;
+    let need_cadence: f64 = g_DIR_SPAWN_CADENCE_S * (target_s - gaps_s) / spawn_part;
+    print("  W4-6 wants   200 s +/- 10 (3:20)");
+    print("  measured     " + sv(floor(at035 * 10.0) / 10.0)
+        + " s at the reference player (acq = " + sv(g_PD_ACQ) + " s)   -> FAIL");
+    print("  floor        " + sv(floor(floor_s * 10.0) / 10.0)
+        + " s — a perfect player cannot finish faster than this");
+    print("  3:20 needs   acq ~= " + sv(best_acq) + " s per body,");
+    print("               OR g_DIR_SPAWN_CADENCE_S " + sv(g_DIR_SPAWN_CADENCE_S)
+        + " -> " + sv(floor(need_cadence * 100.0) / 100.0) + " s (config.hml, not this task's file)");
+    print("******************************************************************");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- F. the statue: caps under maximum pressure ----------");
+    // -----------------------------------------------------------------------
+    // A player who never fires. Every body lives, the alive cap pins at 14 and
+    // the director must defer forever rather than exceed it — and must NOT
+    // deadlock the sim doing so.
+    let os: array = ref_out_new();
+    ref_hold(g_PD_SEED, 1, g_PD_ACQ, 0, os);
+    ck(i32(os[g_RH_PK_ALIVE]) <= g_DIR_ALIVE_CAP,
+       "statue test: alive cap holds at " + sv(i32(os[g_RH_PK_ALIVE])) + "/" + sv(g_DIR_ALIVE_CAP));
+    ck(i32(os[g_RH_PK_SPAWN]) < g_DIR_ONSCREEN_CAP,
+       "statue test: no spawn at/above the on-screen cap (" + sv(i32(os[g_RH_PK_SPAWN])) + ")");
+    ck(i32(os[g_RH_DEF_A]) + i32(os[g_RH_DEF_S]) > 0,
+       "statue test: the caps must actually have deferred something");
+    ck(i32(os[g_RH_TIMEOUT]) != 0,
+       "statue test: a hold with no kills must NOT complete (it timed out, as designed)");
+    print("  statue: peak alive " + sv(i32(os[g_RH_PK_ALIVE])) + ", deferrals "
+        + sv(i32(os[g_RH_DEF_A])) + " alive-cap / " + sv(i32(os[g_RH_DEF_S])) + " screen-cap");
+
+    // The ON-SCREEN cap has its own defer branch and the reference night never
+    // reaches it (the behind-bias plus a player who only faces its current
+    // target keeps the cone below 8). A cap that is never hit is a cap that was
+    // never tested, so hit it directly: park every body dead ahead at 12 m and
+    // the roster must pin at the on-screen cap, not at the alive cap.
+    let wf: object = world_new_cap(64);
+    let df: object = director_new();
+    let pf: i32 = world_spawn_player(wf, 1);
+    let fpx = wf.px;
+    let fpz = wf.pz;
+    fpx[pf] = 0.0; fpz[pf] = 0.0;
+    director_reset(df, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_anchor(df, 0.0, 0.0, 0.0);
+    director_set_tier(df, 1);
+    director_begin(df, PHASE_TICK_NIGHT);
+    let tf: i32 = PHASE_TICK_NIGHT;
+    let ff: i32 = 0;
+    while (ff < 4000) {
+        director_step(df, wf, tf, 0.0, 0.0, 0.0);
+        let nqf: i32 = director_req_count(df);
+        let qf: i32 = 0;
+        while (qf < nqf) {
+            let ef: i32 = world_spawn(wf, KIND_AI, 0);
+            if (ef >= 0) {
+                fpx[ef] = 1.0; fpz[ef] = 0.0 - 12.0;   // dead ahead, on screen
+                director_bind(df, qf, world_id_of(wf, ef));
+            }
+            if (ef < 0) { director_bind(df, qf, 0); }
+            qf++;
+        }
+        tf = tf + 1;
+        ff = ff + 1;
+    }
+    ck(director_alive(df) == g_DIR_ONSCREEN_CAP,
+       "on-screen cap pins the roster at " + sv(g_DIR_ONSCREEN_CAP) + ", got " + sv(director_alive(df)));
+    ck(director_onscreen(df) == g_DIR_ONSCREEN_CAP,
+       "every one of them is counted as on screen");
+    ck(director_defer_onscreen(df) > 0,
+       "the on-screen cap must have deferred spawns (" + sv(director_defer_onscreen(df)) + " ticks)");
+    ck(director_defer_alive(df) == 0,
+       "the ALIVE cap must not be what stopped it (this is the screen-cap test)");
+    print("  head-on: roster " + sv(director_alive(df)) + "/" + sv(g_DIR_ONSCREEN_CAP)
+        + ", screen-cap deferrals " + sv(director_defer_onscreen(df)) + " ticks");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- G. the day cycle drives the hold --------------------");
+    // -----------------------------------------------------------------------
+    let w2: object = world_new_cap(64);
+    let d2: object = director_new();
+    world_spawn_player(w2, 1);
+    director_reset(d2, g_PD_SEED, PHASE_TICK_DUSK - 600);
+    director_set_anchor(d2, 0.0, 0.0, 0.0);
+    director_set_tier(d2, 2);
+
+    let seen_horn_tick: i32 = -1;
+    let seen_start_tick: i32 = -1;
+    let state_before_night: i32 = -1;
+    let tq: i32 = PHASE_TICK_DUSK - 600;
+    while (tq < PHASE_TICK_NIGHT + 10) {
+        director_step(d2, w2, tq, 0.0, 0.0, 0.0);
+        let e2: i32 = director_events(d2);
+        if ((e2 & DIR_EV_HORN) != 0) { if (seen_horn_tick < 0) { seen_horn_tick = tq; } }
+        if ((e2 & DIR_EV_HOLD_START) != 0) { if (seen_start_tick < 0) { seen_start_tick = tq; } }
+        if (tq == PHASE_TICK_NIGHT - 1) { state_before_night = director_wave_state(d2); }
+        // Drop every request on the floor so nothing accumulates.
+        let nq2: i32 = director_req_count(d2);
+        let q2: i32 = 0;
+        while (q2 < nq2) { director_bind(d2, q2, 0); q2++; }
+        tq++;
+    }
+    ck(seen_horn_tick == HORN_TICK, "the horn fires on the day cycle's horn tick");
+    ck(state_before_night == DIR_ARMED, "the director is ARMED through dusk, not spawning");
+    ck(seen_start_tick == PHASE_TICK_NIGHT, "the hold begins exactly at nightfall");
+
+    // Tier 0 — a lit lantern — refuses to hold at all.
+    let d3: object = director_new();
+    director_reset(d3, g_PD_SEED, PHASE_TICK_NIGHT - 1);
+    director_set_tier(d3, 0);
+    director_set_anchor(d3, 0.0, 0.0, 0.0);
+    let tq2: i32 = PHASE_TICK_NIGHT - 1;
+    let spawned0: i32 = 0;
+    while (tq2 < PHASE_TICK_NIGHT + 600) {
+        director_step(d3, w2, tq2, 0.0, 0.0, 0.0);
+        spawned0 = spawned0 + director_req_count(d3);
+        let nq3: i32 = director_req_count(d3);
+        let q3: i32 = 0;
+        while (q3 < nq3) { director_bind(d3, q3, 0); q3++; }
+        tq2++;
+    }
+    ck(spawned0 == 0, "tier 0 (a lit lantern) spawns nothing, ever");
+    ck(director_hold_active(d3) == 0, "tier 0 never enters a hold");
+    ck(world_check(w2) == 0, "the world is still consistent after the day-cycle runs");
+    print("  horn @" + sv(seen_horn_tick) + "  hold start @" + sv(seen_start_tick)
+        + "  (nightfall " + sv(PHASE_TICK_NIGHT) + ")");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- H. RULE T: director_step cost -----------------------");
+    // -----------------------------------------------------------------------
+    // Worst case: a full roster (statue player at tier 5), every body inside
+    // the view cone, so dir_observe walks all 14 and the on-screen test runs on
+    // every one of them. Min-of-7 CPU time.
+    let wb: object = world_new_cap(64);
+    let db: object = director_new();
+    let pb: i32 = world_spawn_player(wb, 1);
+    let bpx = wb.px;
+    let bpz = wb.pz;
+    bpx[pb] = 0.0; bpz[pb] = 0.0;
+    director_reset(db, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_anchor(db, 0.0, 0.0, 0.0);
+    director_set_tier(db, 1);
+    // The lantern-lit path: begin the hold explicitly, the way W5-6 will.
+    ck(director_begin(db, PHASE_TICK_NIGHT) == 1, "director_begin starts a hold on demand");
+    ck(director_begin(db, PHASE_TICK_NIGHT) == 0, "director_begin refuses to restart a live hold");
+    // Fill the roster: run until the alive cap pins.
+    let tb: i32 = PHASE_TICK_NIGHT;
+    let fill: i32 = 0;
+    while (fill < 4000) {
+        director_step(db, wb, tb, 0.0, 0.0, 0.0);
+        let nq4: i32 = director_req_count(db);
+        let q4: i32 = 0;
+        while (q4 < nq4) {
+            let es: i32 = world_spawn(wb, KIND_AI, 0);
+            if (es >= 0) {
+                // BEHIND the player, at 12 m: the alive cap (14) is the binding
+                // one, so dir_observe walks a full roster every tick. The
+                // distance and cone test run on all 14 either way — putting
+                // them in front would pin the roster at the on-screen cap (8)
+                // and under-measure the loop by 43 %.
+                bpx[es] = 6.0; bpz[es] = 12.0;
+                director_bind(db, q4, world_id_of(wb, es));
+            }
+            if (es < 0) { director_bind(db, q4, 0); }
+            q4++;
+        }
+        tb = tb + 1;
+        fill = fill + 1;
+    }
+    ck(director_alive(db) == g_DIR_ALIVE_CAP, "bench roster is full ("
+       + sv(director_alive(db)) + "/" + sv(g_DIR_ALIVE_CAP) + ")");
+
+    let iters: i32 = 20000;
+    let best_ms: f64 = 1.0e9;
+    let worst_ms: f64 = 0.0;
+    let trial: i32 = 0;
+    while (trial < g_PD_TRIALS) {
+        let c0: f64 = __clock();
+        let bi: i32 = 0;
+        while (bi < iters) {
+            director_step(db, wb, tb + bi, 0.0, 0.0, 0.0);
+            bi++;
+        }
+        let c1: f64 = __clock();
+        let ms: f64 = (c1 - c0) * 1000.0;
+        if (ms < best_ms) { best_ms = ms; }
+        if (ms > worst_ms) { worst_ms = ms; }
+        trial++;
+    }
+    let per: f64 = best_ms / f64(iters);
+    let guard: f64 = g_PD_MS_GUARD;
+    if (comp == 0) { guard = g_PD_MS_GUARD_INTERP; }
+    let share: f64 = per * 100.0 / g_BUDGET_SIM_MS;
+    print("  director_step @ full roster: " + sv(floor(per * 1000000.0) / 1000.0) + " us/tick"
+        + "  (spread " + sv(floor(worst_ms / best_ms * 100.0) / 100.0) + "x)");
+    print("  share of the " + sv(g_BUDGET_SIM_MS) + " ms sim budget: "
+        + sv(floor(share * 1000.0) / 1000.0) + " %");
+    ck(per <= guard, "director_step " + sv(floor(per * 1000000.0) / 1000.0)
+       + " us/tick must stay under the " + sv(guard * 1000.0) + " us regression guard"
+       + " (guard is ~2x the loaded measurement, not an idle-box certification)");
+    ck(per * f64(g_DIR_WAVES_PER_HOLD) < g_BUDGET_SIM_MS,
+       "the director must not eat the sim budget");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("=========================================================");
+    let want_n: i32 = g_PD_EXPECT_ASSERTS;
+    print(" assertions  " + sv(g_ok) + " / " + sv(g_n) + " passed");
+    let count_ok: i32 = 0;
+    if (g_n == want_n) { count_ok = 1; }
+    if (count_ok == 0) {
+        print("  FAIL assertion COUNT: ran " + sv(g_n) + ", expected " + sv(want_n)
+            + " — a section stopped running");
+    }
+    if (g_ok == g_n) {
+        if (count_ok == 1) {
+            print(" RESULT      PASS");
+            print("=========================================================");
+            return;
+        }
+    }
+    print(" RESULT      FAIL");
+    print("=========================================================");
+    exit(1);
+}
+
+main();

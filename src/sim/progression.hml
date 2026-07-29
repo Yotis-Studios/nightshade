@@ -1,0 +1,961 @@
+// progression.hml — the XP curve, the levels, the unlock ladder, the Wickmarks
+// and the three Ember Streaks.                                          W4-7.
+//
+// GDD §3.  This is the "30 hours" module: `movement.hml` and `weapons.hml` own
+// the 30 seconds, the world owns the 30 minutes, and this file owns the reason
+// a player comes back tomorrow.  It answers exactly one question per hour of
+// play — *what am I chasing?* — and GDD §3.4 gives the three answers:
+//
+//     hour 1   SURVIVAL     "can I survive a night?"      -> level 6-7
+//     hour 5   POWER        shade tier 3, first Bulwark   -> level ~12-15
+//     hour 20  COMPLETION   relic hunt, almanac, records  -> level 25-30+
+//
+// Those three are structurally different and the curve is shaped to keep all
+// three alive at once: levels come fast enough early that the unlock ladder
+// teaches the game (six unlocks in the first hour), slow enough by 20 that the
+// chase moves to loot and the almanac, and never stop, because past the level
+// 30 soft cap every 40 000 XP is a Wickmark.
+//
+// ---------------------------------------------------------------------------
+// SIM SIDE ONLY
+// ---------------------------------------------------------------------------
+// The import wall (CLAUDE.md §3) allows this directory `@stdlib/math`, other
+// `src/sim/**` and `src/core/**`.  This module needs only the last of those,
+// and only for the tunables.  There is no SDL symbol, no wobbleweed module, no
+// `@stdlib/random`, no wall clock and no `print` below, and there never will
+// be.  Everything here is integer arithmetic.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 1 — THE STATE IS A FLAT ARRAY OF i32, AND THAT IS THE SAVE FORMAT
+// ---------------------------------------------------------------------------
+// `prog_new()` returns an `array` of `PROG_FIELDS` integers and nothing else.
+// No object graph, no strings, no floats, no nested state.  That is not
+// austerity for its own sake — NETWORKING.md §7 lists "XP, level, unlocks,
+// challenge progress, currency" as the single most valuable thing in the game
+// to cheat, so this state has to move over a wire and be checked by a server,
+// and `save.hml` (W4-12) has to round-trip it byte-for-byte.  A flat i32 vector
+// serialises to `PROG_FIELDS * 4` bytes with no encoder at all.
+//
+// Slot 0 is `PROG_VERSION`, written by `prog_reset` and checked by
+// `prog_deserialize`, so a stale save is *rejected* rather than reinterpreted.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 2 — NO RNG.  NOT EVEN A SEEDED ONE.
+// ---------------------------------------------------------------------------
+// Progression draws no random numbers.  It is a pure function of the ordered
+// sequence of events applied to it, which is a *stronger* determinism claim
+// than "same seed, same result": there is no stream to desync, nothing to
+// reseed on rollback, and a client and a server that saw the same kills agree
+// without exchanging generator state.  (`loot.hml`, W4-8, is where `RNG_LOOT`
+// lives; rarity is random, XP is not.)
+//
+// Every function below is either pure, or a pure function of (state, event)
+// written into the state in place.  Applying the same event list twice from the
+// same starting state produces the identical `prog_hash`.  Allocation-free
+// after `prog_new`, so nothing here can hitch (CLAUDE.md N6).
+//
+// ---------------------------------------------------------------------------
+// DESIGN 3 — THE STREAKS ARE COUNT-EXACT EDGES, NOT THRESHOLDS
+// ---------------------------------------------------------------------------
+// GDD §3.2: Flare at 4 kills, Lantern Drone at 7, Dawnfall at 11.  Dawnfall is
+// named in the design as "the single biggest dopamine spike ... guard its
+// rarity", so it fires when the streak counter *equals* 11 and at no other
+// count.  It does not re-fire at 12, and it does not re-fire at 22 — you have
+// to die and rebuild the whole streak.  Reaching 11 twice in one life is
+// impossible by construction because the counter only ever moves by +1.
+//
+// Death resets the counter AND cancels every armed streak timer, because GDD
+// §3.2 says the streaks "do not carry between lives" and a Lantern Drone still
+// hovering after you respawned is exactly the carry it forbids.
+//
+// The streaks are additionally gated on their unlock level (Flare 5, Drone 9,
+// Dawnfall 16) because the same GDD section puts them on the unlock ladder.
+// `prog_streak_at(count)` is the *ungated* threshold function, so the "exactly
+// 11" property can be asserted without reference to a level at all.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 4 — WHAT IS DERIVED AND WHAT IS TYPED IN
+// ---------------------------------------------------------------------------
+// Typed in here: only the two GDD §3 data tables that config.hml deliberately
+// does not carry (per its own contract: "PER-ROW DATA TABLES ... live in their
+// owning modules") — the six per-enemy kill XP values and the level→unlock
+// ladder.  Everything else — the curve coefficients, the soft cap, the
+// Wickmark cost, the bonus multipliers, the flat XP sources, the streak
+// thresholds and durations — is READ from `config.hml` and never re-typed.
+// Retune the curve there and this file follows.
+//
+// ---------------------------------------------------------------------------
+// CONVENTIONS
+// ---------------------------------------------------------------------------
+//   * Booleans are i32 0/1.  The wire has no bool (CLAUDE.md §7).
+//   * XP is i32 and saturates at PROG_XP_MAX.  i32 `+` TRAPS on overflow in
+//     Hemlock (A13), and a 40-hour save must not be able to crash the game.
+//   * Every integer division goes through `idiv`, which truncates toward zero.
+//     Hemlock's `/` yields f64; the round-trip is exact for every magnitude
+//     this file can reach, and is identical on both backends.
+//   * Levels are 1-based.  Level 1 is a new character; `PROG_LEVEL` is never 0.
+
+import {
+    g_XP_BASE, g_XP_LINEAR, g_XP_QUAD,
+    g_LEVEL_SOFT_CAP, g_WICKMARK_XP,
+    g_XP_HEADSHOT_MULT, g_XP_POINTBLANK_MULT, g_XP_AIRBORNE_MULT,
+    g_XP_CHUNK, g_XP_POI, g_XP_LANTERN, g_XP_WAVE_PER_TIER,
+    g_XP_ALMANAC, g_XP_DONATE,
+    g_STREAK_FLARE, g_STREAK_DRONE, g_STREAK_DAWNFALL,
+    g_STREAK_FLARE_S, g_STREAK_DRONE_S, g_STREAK_DAWNFALL_S,
+    g_TICK_HZ, g_ENEMY_KIND_COUNT,
+    g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK,
+    g_ENEMY_SPITTER, g_ENEMY_WARDEN, g_ENEMY_BULWARK
+} from "../core/config.hml";
+
+// ===========================================================================
+// §1  THE STATE VECTOR
+// ===========================================================================
+// Slot ids are API: `save.hml`, `snapshot.hml` and the HUD index this array
+// directly.  APPEND ONLY, and bump PROG_VERSION when you do.
+
+export let PROG_VERSION: i32 = 1;      // save-format version, lives in slot 0
+
+export let PROG_VER: i32          = 0;   // == PROG_VERSION
+export let PROG_XP_TOTAL: i32     = 1;   // lifetime XP earned, saturating
+export let PROG_LEVEL: i32        = 2;   // 1 .. LEVEL_SOFT_CAP
+export let PROG_XP_INTO: i32      = 3;   // XP into the current level; at the
+                                         // soft cap, XP into the next Wickmark
+export let PROG_WICKMARKS: i32    = 4;   // prestige count past the soft cap
+export let PROG_STAT_POINTS: i32  = 5;   // +1 permanent point per Wickmark
+export let PROG_STREAK: i32       = 6;   // kills THIS LIFE
+export let PROG_STREAK_BEST: i32  = 7;   // best streak this life
+export let PROG_BEST_EVER: i32    = 8;   // best streak ever (the §3.4 record)
+export let PROG_KILLS: i32        = 9;   // lifetime kills
+export let PROG_DEATHS: i32       = 10;  // lifetime deaths
+export let PROG_T_FLARE: i32      = 11;  // ticks left on Flare, 0 = inactive
+export let PROG_T_DRONE: i32      = 12;
+export let PROG_T_DAWNFALL: i32   = 13;
+export let PROG_LAST_STREAK: i32  = 14;  // streak fired by the last kill
+export let PROG_LAST_LEVELS: i32  = 15;  // levels gained by the last XP award
+export let PROG_LAST_XP: i32      = 16;  // XP granted by the last award
+export let PROG_FIELDS: i32       = 17;
+
+// XP saturates here rather than trapping.  Two billion is ~200 000 levels of
+// Wickmark grinding past the soft cap; nobody reaches it, and the alternative
+// is an i32 overflow trap in a shipped build.
+export let PROG_XP_MAX: i32 = 2000000000;
+
+// ===========================================================================
+// §2  THE CURVE  (GDD §3.1)
+// ===========================================================================
+//     xp_to_next(L) = 500 + 250*L + 25*L*L        L = current level
+//
+// Cumulative XP to *be* at level L is the sum of that over 1..L-1, so
+// LEVEL_XP_CAP is the total to reach the soft cap:
+//
+//     1 -> 2      775          2 -> 3     1 100
+//     5 -> 6    2 375         10 -> 11    5 500
+//    20 -> 21   15 500        29 -> 30   28 150
+//
+// Argument clamps exist for one reason: `25*L*L` traps above L = 9260 and the
+// cumulative sum traps above L ~ 560.  Both caps are far past any reachable
+// level, and both make an out-of-range query return a defined number instead
+// of killing the process.
+export let LEVEL_MIN: i32 = 1;
+export let LEVEL_SOFT_CAP: i32 = g_LEVEL_SOFT_CAP;
+export let WICKMARK_XP: i32 = g_WICKMARK_XP;
+
+let g_XP_L_CAP: i32  = 4096;   // xp_to_next argument clamp (25*L*L stays i32)
+let g_XP_CUM_CAP: i32 = 512;   // xp_cumulative argument clamp (sum stays i32)
+
+// Truncating integer division, both backends, exact for every magnitude here
+// (|a| < 2^31 is exact in f64, and the quotient is exact when it is an
+// integer).  Hemlock's `/` always yields f64 except `a / 1`.
+fn idiv(p_a: i32, p_b: i32): i32 {
+    let a: f64 = f64(p_a);
+    let b: f64 = f64(p_b);
+    let out: i32 = i32(a / b);
+    return out;
+}
+
+fn cl(p_v: i32, p_lo: i32, p_hi: i32): i32 {
+    let v: i32 = p_v;
+    if (v < p_lo) { let a: i32 = p_lo; return a; }
+    if (v > p_hi) { let b: i32 = p_hi; return b; }
+    let out: i32 = v;
+    return out;
+}
+
+// GDD §3.1's `xp_to_next(L)`, verbatim, from config's three coefficients.
+// Pure: the same L gives the same answer forever, on both backends.
+export fn prog_xp_to_next(p_level: i32): i32 {
+    let l: i32 = cl(p_level, 0, g_XP_L_CAP);
+    let out: i32 = g_XP_BASE + g_XP_LINEAR * l + g_XP_QUAD * l * l;
+    return out;
+}
+
+// Total XP required to BE at level L.  prog_xp_cumulative(1) == 0.
+// Closed form of sum_{k=1}^{L-1} (base + lin*k + quad*k*k):
+//     base*n + lin*n(n+1)/2 + quad*n(n+1)(2n+1)/6      n = L-1
+// n(n+1) is always even and n(n+1)(2n+1) is always divisible by 6, so both
+// divisions are exact — no rounding step exists to disagree between backends.
+export fn prog_xp_cumulative(p_level: i32): i32 {
+    let l: i32 = cl(p_level, LEVEL_MIN, g_XP_CUM_CAP);
+    let n: i32 = l - 1;
+    if (n <= 0) { let z: i32 = 0; return z; }
+    let t1: i32 = idiv(n * (n + 1), 2);              // sum k
+    let t2: i32 = idiv(t1 * (2 * n + 1), 3);         // sum k*k
+    let out: i32 = g_XP_BASE * n + g_XP_LINEAR * t1 + g_XP_QUAD * t2;
+    return out;
+}
+
+// Total XP to reach the soft cap.  Nothing else in the game types this number.
+export let LEVEL_XP_CAP: i32 = prog_xp_cumulative(g_LEVEL_SOFT_CAP);
+
+// The level a given lifetime-XP total corresponds to, ignoring Wickmarks.
+// Loop-free is not worth it: at most LEVEL_SOFT_CAP-1 iterations, called on
+// load and in tools, never per tick.
+export fn prog_level_of_xp(p_xp: i32): i32 {
+    let rem: i32 = p_xp;
+    if (rem < 0) { rem = 0; }
+    let lv: i32 = LEVEL_MIN;
+    while (lv < LEVEL_SOFT_CAP) {
+        let need: i32 = prog_xp_to_next(lv);
+        if (rem < need) { break; }
+        rem = rem - need;
+        lv = lv + 1;
+    }
+    let out: i32 = lv;
+    return out;
+}
+
+// ===========================================================================
+// §3  THE XP SOURCE TABLE  (GDD §3.1)
+// ===========================================================================
+// Source ids are the event-log tag as well as the table index: the HUD's XP
+// popup and the almanac both want to say *why* you got it.
+
+export let XPS_KILL: i32     = 0;   // arg = enemy kind, use prog_xp_kill
+export let XPS_CHUNK: i32    = 1;   // new chunk discovered
+export let XPS_POI: i32      = 2;   // POI cleared
+export let XPS_LANTERN: i32  = 3;   // lantern lit, FIRST time only
+export let XPS_WAVE: i32     = 4;   // night wave survived, arg = tier
+export let XPS_ALMANAC: i32  = 5;   // almanac entry filled
+export let XPS_CONTRACT: i32 = 6;   // contract completed, arg = 0..6
+export let XPS_DONATE: i32   = 7;   // relic donated to the museum
+export let XPS_COUNT: i32    = 8;
+
+// The kill bonuses, as a bit set.  They stack additively on the base value.
+export let XPB_NONE: i32       = 0;
+export let XPB_HEADSHOT: i32   = 1;   // +25% of base
+export let XPB_POINTBLANK: i32 = 2;   // +15%, point-blank Bellows kill
+export let XPB_GRACE: i32      = 4;   // +20%, "Lamplighter's Grace" (slide/air)
+export let XPB_ALL: i32        = 7;
+
+// Contract rewards span 300..900 in seven steps (GDD §3.1).
+export let XPS_CONTRACT_MIN: i32   = 300;
+export let XPS_CONTRACT_MAX: i32   = 900;
+export let XPS_CONTRACT_STEPS: i32 = 7;
+
+// ---- the one row-per-enemy table this module owns -------------------------
+// GDD §3.1, in config.hml's g_ENEMY_* order (Wisp, Mote, Husk, Spitter,
+// Warden, Bulwark).  config.hml deliberately does not carry per-row tables.
+let g_xp_kill: array = [6, 12, 25, 30, 90, 400];
+
+// Bonuses in basis points, derived once from config's f64 multipliers so the
+// per-kill path is pure integer arithmetic.  `+ 0.5` rounds; i32() truncates.
+let g_bp_headshot: i32   = i32(g_XP_HEADSHOT_MULT * 10000.0 + 0.5);
+let g_bp_pointblank: i32 = i32(g_XP_POINTBLANK_MULT * 10000.0 + 0.5);
+let g_bp_grace: i32      = i32(g_XP_AIRBORNE_MULT * 10000.0 + 0.5);
+
+// Base XP for killing one enemy of `kind`, before bonuses.  Unknown kind -> 0,
+// never a trap: the director may grow a seventh enemy before this table does.
+export fn prog_xp_kill_base(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k < 0) { let z: i32 = 0; return z; }
+    if (k >= g_ENEMY_KIND_COUNT) { let z2: i32 = 0; return z2; }
+    let out: i32 = g_xp_kill[k];
+    return out;
+}
+
+// XP for one kill, with the three bonuses applied additively to the base.
+// Integer throughout: a headshot Wisp is floor(6 * 1.25) = 7, not 7.5, on
+// every backend, forever.  Truncation (never rounding up) is deliberate — XP
+// that inflates is XP that drifts a save away from a server's opinion of it.
+export fn prog_xp_kill(p_kind: i32, p_flags: i32): i32 {
+    let base: i32 = prog_xp_kill_base(p_kind);
+    if (base <= 0) { let z: i32 = 0; return z; }
+    let f: i32 = p_flags;
+    let bp: i32 = 10000;
+    if ((f & XPB_HEADSHOT) != 0)   { bp = bp + g_bp_headshot; }
+    if ((f & XPB_POINTBLANK) != 0) { bp = bp + g_bp_pointblank; }
+    if ((f & XPB_GRACE) != 0)      { bp = bp + g_bp_grace; }
+    let out: i32 = idiv(base * bp, 10000);
+    return out;
+}
+
+// XP for a non-kill source.  `p_arg` is the wave tier for XPS_WAVE and the
+// contract difficulty step (0..6) for XPS_CONTRACT; ignored otherwise.
+export fn prog_xp_source(p_src: i32, p_arg: i32): i32 {
+    let s: i32 = p_src;
+    if (s == XPS_CHUNK)   { let a: i32 = g_XP_CHUNK;   return a; }
+    if (s == XPS_POI)     { let b: i32 = g_XP_POI;     return b; }
+    if (s == XPS_LANTERN) { let c: i32 = g_XP_LANTERN; return c; }
+    if (s == XPS_ALMANAC) { let d: i32 = g_XP_ALMANAC; return d; }
+    if (s == XPS_DONATE)  { let e: i32 = g_XP_DONATE;  return e; }
+    if (s == XPS_WAVE) {
+        let t: i32 = cl(p_arg, 0, 8);
+        let w: i32 = g_XP_WAVE_PER_TIER * t;
+        return w;
+    }
+    if (s == XPS_CONTRACT) {
+        let q: i32 = cl(p_arg, 0, XPS_CONTRACT_STEPS - 1);
+        let span: i32 = XPS_CONTRACT_MAX - XPS_CONTRACT_MIN;
+        let k: i32 = XPS_CONTRACT_MIN + idiv(span * q, XPS_CONTRACT_STEPS - 1);
+        return k;
+    }
+    let z: i32 = 0;
+    return z;
+}
+
+// ===========================================================================
+// §4  THE UNLOCK LADDER  (GDD §3.2)
+// ===========================================================================
+// Twenty-five unlocks over levels 2..30, ORDERED BY LEVEL so the run of
+// unlocks at any level is contiguous and the "unlock card" can be enumerated
+// without allocating.  Ids are API — append at the end, never renumber, and
+// keep `g_unlock_level` sorted.
+
+export let UNLOCK_TINKER: i32          = 0;   // Lv 2  SMG
+export let UNLOCK_SLIDE: i32           = 1;   // Lv 2
+export let UNLOCK_LANTERN_T2: i32      = 2;   // Lv 3
+export let UNLOCK_ATTACH_1: i32        = 3;   // Lv 4
+export let UNLOCK_CHARM_1: i32         = 4;   // Lv 4
+export let UNLOCK_BELLOWS: i32         = 5;   // Lv 5  shotgun
+export let UNLOCK_STREAK_FLARE: i32    = 6;   // Lv 5
+export let UNLOCK_AMMO_BENCH: i32      = 7;   // Lv 6
+export let UNLOCK_MANTLE_VAULT: i32    = 8;   // Lv 7
+export let UNLOCK_LONGSHADOW: i32      = 9;   // Lv 8  marksman
+export let UNLOCK_ATTACH_2: i32        = 10;  // Lv 9
+export let UNLOCK_STREAK_DRONE: i32    = 11;  // Lv 9
+export let UNLOCK_CHARM_2: i32         = 12;  // Lv 11
+export let UNLOCK_WICK_2: i32          = 13;  // Lv 11
+export let UNLOCK_EMBERLANCE: i32      = 14;  // Lv 12
+export let UNLOCK_WICKLINE: i32        = 15;  // Lv 13 fast travel
+export let UNLOCK_LANTERN_T3: i32      = 16;  // Lv 14
+export let UNLOCK_STREAK_DAWNFALL: i32 = 17;  // Lv 16
+export let UNLOCK_ATTACH_3: i32        = 18;  // Lv 18
+export let UNLOCK_CHARM_3: i32         = 19;  // Lv 18
+export let UNLOCK_BUILD_WILD: i32      = 20;  // Lv 20
+export let UNLOCK_WICK_3: i32          = 21;  // Lv 22
+export let UNLOCK_LANTERN_T4: i32      = 22;  // Lv 25
+export let UNLOCK_SECOND_PRIMARY: i32  = 23;  // Lv 28
+export let UNLOCK_DEEPSHADE_KEY: i32   = 24;  // Lv 30 the endgame biome
+export let UNLOCK_COUNT: i32           = 25;
+
+let g_unlock_level: array = [
+     2,  2,  3,  4,  4,  5,  5,  6,  7,  8,
+     9,  9, 11, 11, 12, 13, 14, 16, 18, 18,
+    20, 22, 25, 28, 30
+];
+
+// Display names.  COLD — the unlock card fires once per level-up and the
+// tools print the ladder.  Never build a string per frame (CLAUDE.md N3).
+let g_unlock_name: array = [
+    "Tinker SMG", "Slide", "Lantern Tier 2", "Attachment slot 1",
+    "Charm slot 1", "Bellows shotgun", "Ember Streak: Flare", "Ammo bench",
+    "Mantle-and-vault", "Longshadow marksman", "Attachment slot 2",
+    "Ember Streak: Lantern Drone", "Charm slot 2", "Wick capacity 2",
+    "Emberlance", "Wick Line fast travel", "Lantern Tier 3",
+    "Ember Streak: Dawnfall", "Attachment slot 3", "Charm slot 3",
+    "Building in the wild", "Wick capacity 3", "Lantern Tier 4",
+    "Second primary slot", "Deepshade key"
+];
+
+// The level `p_unlock` becomes available at.  Out of range -> LEVEL_SOFT_CAP+1,
+// i.e. "never", which is the safe answer for a gate.
+export fn prog_unlock_level(p_unlock: i32): i32 {
+    let u: i32 = p_unlock;
+    if (u < 0) { let a: i32 = LEVEL_SOFT_CAP + 1; return a; }
+    if (u >= UNLOCK_COUNT) { let b: i32 = LEVEL_SOFT_CAP + 1; return b; }
+    let out: i32 = g_unlock_level[u];
+    return out;
+}
+
+export fn prog_unlock_name(p_unlock: i32): string {
+    let u: i32 = p_unlock;
+    if (u < 0) { let a: string = "?"; return a; }
+    if (u >= UNLOCK_COUNT) { let b: string = "?"; return b; }
+    let out: string = g_unlock_name[u];
+    return out;
+}
+
+// Is `p_unlock` available at `p_level`?  Level form, for tools and for gates
+// that hold a level rather than a state.
+export fn prog_unlocked_at(p_level: i32, p_unlock: i32): i32 {
+    let need: i32 = prog_unlock_level(p_unlock);
+    let out: i32 = 0;
+    if (p_level >= need) { out = 1; }
+    return out;
+}
+
+// How many unlocks land exactly on `p_level`, and the n-th of them.  Together
+// these drive the level-up card without allocating a list.
+export fn prog_unlock_count_at(p_level: i32): i32 {
+    let lv: i32 = p_level;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < UNLOCK_COUNT) {
+        if (g_unlock_level[i] == lv) { n = n + 1; }
+        i = i + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+export fn prog_unlock_at(p_level: i32, p_n: i32): i32 {
+    let lv: i32 = p_level;
+    let want: i32 = p_n;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < UNLOCK_COUNT) {
+        if (g_unlock_level[i] == lv) {
+            if (n == want) { let hit: i32 = i; return hit; }
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// ===========================================================================
+// §5  THE EMBER STREAKS  (GDD §3.2)
+// ===========================================================================
+export let STREAK_NONE: i32     = -1;
+export let STREAK_FLARE: i32    = 0;    // 4 kills, 12 s
+export let STREAK_DRONE: i32    = 1;    // 7 kills, 20 s
+export let STREAK_DAWNFALL: i32 = 2;    // 11 kills, 3 s
+export let STREAK_COUNT: i32    = 3;
+
+// Bit per streak, returned by prog_streak_step as an expiry edge set.
+export let STREAK_BIT_FLARE: i32    = 1;
+export let STREAK_BIT_DRONE: i32    = 2;
+export let STREAK_BIT_DAWNFALL: i32 = 4;
+
+let g_streak_kills: array = [g_STREAK_FLARE, g_STREAK_DRONE, g_STREAK_DAWNFALL];
+let g_streak_ticks: array = [
+    i32(g_STREAK_FLARE_S * f64(g_TICK_HZ) + 0.5),
+    i32(g_STREAK_DRONE_S * f64(g_TICK_HZ) + 0.5),
+    i32(g_STREAK_DAWNFALL_S * f64(g_TICK_HZ) + 0.5)
+];
+let g_streak_slot: array   = [PROG_T_FLARE, PROG_T_DRONE, PROG_T_DAWNFALL];
+let g_streak_bit: array    = [STREAK_BIT_FLARE, STREAK_BIT_DRONE, STREAK_BIT_DAWNFALL];
+let g_streak_unlock: array = [UNLOCK_STREAK_FLARE, UNLOCK_STREAK_DRONE, UNLOCK_STREAK_DAWNFALL];
+
+export fn prog_streak_kills(p_streak: i32): i32 {
+    let s: i32 = p_streak;
+    if (s < 0) { let a: i32 = 0; return a; }
+    if (s >= STREAK_COUNT) { let b: i32 = 0; return b; }
+    let out: i32 = g_streak_kills[s];
+    return out;
+}
+
+export fn prog_streak_duration(p_streak: i32): i32 {
+    let s: i32 = p_streak;
+    if (s < 0) { let a: i32 = 0; return a; }
+    if (s >= STREAK_COUNT) { let b: i32 = 0; return b; }
+    let out: i32 = g_streak_ticks[s];
+    return out;
+}
+
+export fn prog_streak_unlock(p_streak: i32): i32 {
+    let s: i32 = p_streak;
+    if (s < 0) { let a: i32 = -1; return a; }
+    if (s >= STREAK_COUNT) { let b: i32 = -1; return b; }
+    let out: i32 = g_streak_unlock[s];
+    return out;
+}
+
+// THE ungated threshold function: which streak a kill count of exactly
+// `p_kills` earns.  This is where "Dawnfall fires at exactly 11" lives, and it
+// mentions neither level nor state, so the property is assertable on its own.
+export fn prog_streak_at(p_kills: i32): i32 {
+    let k: i32 = p_kills;
+    let i: i32 = 0;
+    while (i < STREAK_COUNT) {
+        if (g_streak_kills[i] == k) { let hit: i32 = i; return hit; }
+        i = i + 1;
+    }
+    let miss: i32 = STREAK_NONE;
+    return miss;
+}
+
+// ===========================================================================
+// §6  LIFECYCLE
+// ===========================================================================
+
+// Zero a state in place: a brand-new character.  Allocation-free.
+export fn prog_reset(p_st: array) {
+    let st: array = p_st;
+    let i: i32 = 0;
+    while (i < PROG_FIELDS) { st[i] = 0; i = i + 1; }
+    st[PROG_VER] = PROG_VERSION;
+    st[PROG_LEVEL] = LEVEL_MIN;
+    st[PROG_LAST_STREAK] = STREAK_NONE;
+}
+
+// Allocate one progression state.  Once, at startup (CLAUDE.md N6).
+export fn prog_new(): array {
+    let st = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    prog_reset(st);
+    return st;
+}
+
+export fn prog_copy(p_dst: array, p_src: array) {
+    let dst: array = p_dst;
+    let src: array = p_src;
+    let i: i32 = 0;
+    while (i < PROG_FIELDS) { dst[i] = src[i]; i = i + 1; }
+}
+
+// ===========================================================================
+// §7  EARNING XP
+// ===========================================================================
+
+// Recompute level / into-level / Wickmarks from `PROG_XP_TOTAL`.  Used ONLY by
+// `prog_set_xp`, never by `prog_deserialize` — see §10 for why loading must not
+// silently rewrite state (spent stat points would be refunded).
+fn prog_rederive(p_st: array) {
+    let st: array = p_st;
+    let total: i32 = st[PROG_XP_TOTAL];
+    if (total < 0) { total = 0; }
+    let rem: i32 = total;
+    let lv: i32 = LEVEL_MIN;
+    while (lv < LEVEL_SOFT_CAP) {
+        let need: i32 = prog_xp_to_next(lv);
+        if (rem < need) { break; }
+        rem = rem - need;
+        lv = lv + 1;
+    }
+    let wick: i32 = 0;
+    if (lv >= LEVEL_SOFT_CAP) {
+        wick = idiv(rem, WICKMARK_XP);
+        rem = rem - wick * WICKMARK_XP;
+    }
+    st[PROG_LEVEL] = lv;
+    st[PROG_XP_INTO] = rem;
+    st[PROG_WICKMARKS] = wick;
+    st[PROG_STAT_POINTS] = wick;
+}
+
+// Set the lifetime total directly and rederive everything from it.  For load,
+// for tests and for the debug console.  Never call it from gameplay.
+export fn prog_set_xp(p_st: array, p_total: i32) {
+    let st: array = p_st;
+    let t: i32 = p_total;
+    if (t < 0) { t = 0; }
+    if (t > PROG_XP_MAX) { t = PROG_XP_MAX; }
+    st[PROG_XP_TOTAL] = t;
+    prog_rederive(st);
+}
+
+// THE entry point.  Award XP, level up as many times as it earns, convert the
+// overflow past the soft cap into Wickmarks.  Returns levels gained.
+//
+// Negative and zero awards are no-ops rather than errors: an event table that
+// grows a source with a zero reward must not be able to take XP away.
+export fn prog_add_xp(p_st: array, p_amount: i32): i32 {
+    let st: array = p_st;
+    let amount: i32 = p_amount;
+    st[PROG_LAST_LEVELS] = 0;
+    st[PROG_LAST_XP] = 0;
+    if (amount <= 0) { let z: i32 = 0; return z; }
+
+    // Saturate rather than trap (A13: i32 `+` throws on overflow).
+    let total: i32 = st[PROG_XP_TOTAL];
+    let room: i32 = PROG_XP_MAX - total;
+    if (amount > room) { amount = room; }
+    if (amount <= 0) { let z2: i32 = 0; return z2; }
+    st[PROG_XP_TOTAL] = total + amount;
+    st[PROG_LAST_XP] = amount;
+
+    let into: i32 = st[PROG_XP_INTO] + amount;
+    let lv: i32 = st[PROG_LEVEL];
+    let gained: i32 = 0;
+    while (lv < LEVEL_SOFT_CAP) {
+        let need: i32 = prog_xp_to_next(lv);
+        if (into < need) { break; }
+        into = into - need;
+        lv = lv + 1;
+        gained = gained + 1;
+    }
+    if (lv >= LEVEL_SOFT_CAP) {
+        let n: i32 = idiv(into, WICKMARK_XP);
+        if (n > 0) {
+            into = into - n * WICKMARK_XP;
+            st[PROG_WICKMARKS] = st[PROG_WICKMARKS] + n;
+            st[PROG_STAT_POINTS] = st[PROG_STAT_POINTS] + n;
+        }
+    }
+    st[PROG_LEVEL] = lv;
+    st[PROG_XP_INTO] = into;
+    st[PROG_LAST_LEVELS] = gained;
+    let out: i32 = gained;
+    return out;
+}
+
+// Convenience wrappers so callers never re-type an XP number.
+export fn prog_award(p_st: array, p_src: i32, p_arg: i32): i32 {
+    let xp: i32 = prog_xp_source(p_src, p_arg);
+    let out: i32 = prog_add_xp(p_st, xp);
+    return out;
+}
+
+// ===========================================================================
+// §8  KILLS, STREAKS, DEATH
+// ===========================================================================
+
+// Arm a streak: start its timer.  Re-arming restarts the timer, which cannot
+// happen at a fixed threshold but is the defined behaviour if it ever does.
+fn prog_arm(p_st: array, p_streak: i32) {
+    let st: array = p_st;
+    let s: i32 = p_streak;
+    st[g_streak_slot[s]] = g_streak_ticks[s];
+}
+
+// One kill: bump the streak, fire a streak if this count earns one AND the
+// streak is unlocked.  Returns the streak fired, or STREAK_NONE.
+// XP is NOT awarded here — `prog_on_kill` does both.
+export fn prog_streak_bump(p_st: array): i32 {
+    let st: array = p_st;
+    st[PROG_LAST_STREAK] = STREAK_NONE;
+    let k: i32 = st[PROG_STREAK] + 1;
+    st[PROG_STREAK] = k;
+    st[PROG_KILLS] = st[PROG_KILLS] + 1;
+    if (k > st[PROG_STREAK_BEST]) { st[PROG_STREAK_BEST] = k; }
+    if (k > st[PROG_BEST_EVER]) { st[PROG_BEST_EVER] = k; }
+
+    let s: i32 = prog_streak_at(k);
+    if (s == STREAK_NONE) { let z: i32 = STREAK_NONE; return z; }
+    // Gate on the ladder: Flare 5, Drone 9, Dawnfall 16 (GDD §3.2).
+    if (st[PROG_LEVEL] < prog_unlock_level(g_streak_unlock[s])) {
+        let z2: i32 = STREAK_NONE;
+        return z2;
+    }
+    prog_arm(st, s);
+    st[PROG_LAST_STREAK] = s;
+    let out: i32 = s;
+    return out;
+}
+
+// The combat-side one-liner: award the kill's XP and advance the streak.
+// Returns the streak fired, or STREAK_NONE.  Levels gained and XP granted are
+// readable afterwards from PROG_LAST_LEVELS / PROG_LAST_XP.
+export fn prog_on_kill(p_st: array, p_kind: i32, p_flags: i32): i32 {
+    let st: array = p_st;
+    let xp: i32 = prog_xp_kill(p_kind, p_flags);
+    prog_add_xp(st, xp);
+    let out: i32 = prog_streak_bump(st);
+    return out;
+}
+
+// Death.  The streak counter resets and every armed streak is cancelled: GDD
+// §3.2 says the streaks do not carry between lives, and a Drone that outlives
+// its owner is exactly that carry.  XP, level, Wickmarks and the lifetime
+// record are NOT touched — this is not a roguelike.
+export fn prog_on_death(p_st: array) {
+    let st: array = p_st;
+    st[PROG_STREAK] = 0;
+    st[PROG_STREAK_BEST] = 0;
+    st[PROG_T_FLARE] = 0;
+    st[PROG_T_DRONE] = 0;
+    st[PROG_T_DAWNFALL] = 0;
+    st[PROG_LAST_STREAK] = STREAK_NONE;
+    st[PROG_DEATHS] = st[PROG_DEATHS] + 1;
+}
+
+// Advance every armed streak timer by `p_ticks` and return the set of streaks
+// that EXPIRED during this step, as STREAK_BIT_* bits.
+//
+// An edge return rather than a remembered flag, for the same three reasons
+// `daycycle.hml` gives for the dusk horn: rollback re-runs a tick and a latch
+// would fire only on the first pass; the hub skips the clock forward by
+// thousands of ticks and an edge COUNT over a skipped interval is well
+// defined; and a latch is state that `save.hml` would have to remember.
+//
+// Called once per tick per player.  Three compares, no allocation, no call.
+export fn prog_streak_step(p_st: array, p_ticks: i32): i32 {
+    let st: array = p_st;
+    let d: i32 = p_ticks;
+    if (d <= 0) { let z: i32 = 0; return z; }
+    let bits: i32 = 0;
+
+    let t0: i32 = st[PROG_T_FLARE];
+    if (t0 > 0) {
+        t0 = t0 - d;
+        if (t0 <= 0) { t0 = 0; bits = bits + STREAK_BIT_FLARE; }
+        st[PROG_T_FLARE] = t0;
+    }
+    let t1: i32 = st[PROG_T_DRONE];
+    if (t1 > 0) {
+        t1 = t1 - d;
+        if (t1 <= 0) { t1 = 0; bits = bits + STREAK_BIT_DRONE; }
+        st[PROG_T_DRONE] = t1;
+    }
+    let t2: i32 = st[PROG_T_DAWNFALL];
+    if (t2 > 0) {
+        t2 = t2 - d;
+        if (t2 <= 0) { t2 = 0; bits = bits + STREAK_BIT_DAWNFALL; }
+        st[PROG_T_DAWNFALL] = t2;
+    }
+    let out: i32 = bits;
+    return out;
+}
+
+export fn prog_streak_ticks_left(p_st: array, p_streak: i32): i32 {
+    let s: i32 = p_streak;
+    if (s < 0) { let a: i32 = 0; return a; }
+    if (s >= STREAK_COUNT) { let b: i32 = 0; return b; }
+    let st: array = p_st;
+    let out: i32 = st[g_streak_slot[s]];
+    return out;
+}
+
+export fn prog_streak_active(p_st: array, p_streak: i32): i32 {
+    let t: i32 = prog_streak_ticks_left(p_st, p_streak);
+    let out: i32 = 0;
+    if (t > 0) { out = 1; }
+    return out;
+}
+
+// ===========================================================================
+// §9  ACCESSORS  (the HUD, the snapshot writer and the net layer read these)
+// ===========================================================================
+export fn prog_level(p_st: array): i32      { let st: array = p_st; let o: i32 = st[PROG_LEVEL];       return o; }
+export fn prog_xp_total(p_st: array): i32   { let st: array = p_st; let o: i32 = st[PROG_XP_TOTAL];    return o; }
+export fn prog_xp_into(p_st: array): i32    { let st: array = p_st; let o: i32 = st[PROG_XP_INTO];     return o; }
+export fn prog_wickmarks(p_st: array): i32  { let st: array = p_st; let o: i32 = st[PROG_WICKMARKS];   return o; }
+export fn prog_stat_points(p_st: array): i32{ let st: array = p_st; let o: i32 = st[PROG_STAT_POINTS]; return o; }
+export fn prog_streak(p_st: array): i32     { let st: array = p_st; let o: i32 = st[PROG_STREAK];      return o; }
+export fn prog_best_streak(p_st: array): i32{ let st: array = p_st; let o: i32 = st[PROG_BEST_EVER];   return o; }
+export fn prog_kills(p_st: array): i32      { let st: array = p_st; let o: i32 = st[PROG_KILLS];       return o; }
+export fn prog_deaths(p_st: array): i32     { let st: array = p_st; let o: i32 = st[PROG_DEATHS];      return o; }
+export fn prog_last_levels(p_st: array): i32{ let st: array = p_st; let o: i32 = st[PROG_LAST_LEVELS]; return o; }
+export fn prog_last_xp(p_st: array): i32    { let st: array = p_st; let o: i32 = st[PROG_LAST_XP];     return o; }
+
+// XP still needed for the next level, or for the next Wickmark at the soft
+// cap.  Never 0 — the bar always has a denominator.
+export fn prog_xp_needed(p_st: array): i32 {
+    let st: array = p_st;
+    let lv: i32 = st[PROG_LEVEL];
+    if (lv >= LEVEL_SOFT_CAP) { let w: i32 = WICKMARK_XP; return w; }
+    let out: i32 = prog_xp_to_next(lv);
+    return out;
+}
+
+// Is `p_unlock` available to this player?  The state form of prog_unlocked_at,
+// and the name ARCHITECTURE.md §5.4 reserves.
+export fn prog_unlocked(p_st: array, p_unlock: i32): i32 {
+    let st: array = p_st;
+    let out: i32 = prog_unlocked_at(st[PROG_LEVEL], p_unlock);
+    return out;
+}
+
+// How many of the 25 ladder entries this player has.  The §3.4 "hour 20"
+// completion read-out.
+export fn prog_unlock_total(p_st: array): i32 {
+    let st: array = p_st;
+    let lv: i32 = st[PROG_LEVEL];
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < UNLOCK_COUNT) {
+        if (g_unlock_level[i] <= lv) { n = n + 1; }
+        i = i + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// §10  SERIALISATION AND THE DETERMINISM HASH
+// ===========================================================================
+// The state IS the wire format: PROG_FIELDS little-endian i32.  These two
+// functions exist so that `save.hml` (W4-12) has a version check to fail on
+// and a single place to change if the vector ever grows.
+
+// Copy the state into `p_out` at `p_off`.  Returns the number of ints written.
+export fn prog_serialize(p_st: array, p_out: array, p_off: i32): i32 {
+    let st: array = p_st;
+    let out: array = p_out;
+    let off: i32 = p_off;
+    let i: i32 = 0;
+    while (i < PROG_FIELDS) { out[off + i] = st[i]; i = i + 1; }
+    let n: i32 = PROG_FIELDS;
+    return n;
+}
+
+// Read a state back.  Returns the number of ints consumed, or -1 if the
+// version word does not match — rejected cleanly, never reinterpreted.
+//
+// It copies VERBATIM and deliberately does not rederive from the XP total.
+// Rederiving looks safer and is not: `PROG_STAT_POINTS` is *spendable*, so
+// recomputing it from the Wickmark count would refund every point the player
+// has already spent, every time they load.  Tamper detection is a separate
+// question and it has a separate function — `prog_validate` — so the
+// authority can reject a save without the loading path silently rewriting it.
+export fn prog_deserialize(p_st: array, p_src: array, p_off: i32): i32 {
+    let st: array = p_st;
+    let src: array = p_src;
+    let off: i32 = p_off;
+    if (src[off + PROG_VER] != PROG_VERSION) { let bad: i32 = -1; return bad; }
+    let i: i32 = 0;
+    while (i < PROG_FIELDS) { st[i] = src[off + i]; i = i + 1; }
+    let n: i32 = PROG_FIELDS;
+    return n;
+}
+
+// Does this state agree with its own XP total?  0 = consistent, else a bit per
+// disagreement.  NETWORKING.md §7 names "XP, level, unlocks" the single most
+// valuable thing in the game to cheat, and the only field that cannot be
+// forged is `PROG_XP_TOTAL` — the authority knows how much XP it granted.
+// Everything else is derivable from it, so everything else is checkable.
+//
+// `PROG_STAT_POINTS` is NOT checked: it is spendable, so it is legitimately
+// below the Wickmark count.  It is checked for being *above* it, which is the
+// direction a cheat goes.
+export let PROGVAL_LEVEL: i32 = 1;
+export let PROGVAL_INTO: i32  = 2;
+export let PROGVAL_WICK: i32  = 4;
+export let PROGVAL_RANGE: i32 = 8;    // a field outside its legal range
+export let PROGVAL_STATS: i32 = 16;   // more stat points than Wickmarks earned
+
+export fn prog_validate(p_st: array): i32 {
+    let st: array = p_st;
+    let bad: i32 = 0;
+    let total: i32 = st[PROG_XP_TOTAL];
+    if (total < 0) { bad = bad + PROGVAL_RANGE; return bad; }
+    if (st[PROG_LEVEL] < LEVEL_MIN) { bad = bad + PROGVAL_RANGE; }
+    if (st[PROG_LEVEL] > LEVEL_SOFT_CAP) {
+        if ((bad & PROGVAL_RANGE) == 0) { bad = bad + PROGVAL_RANGE; }
+    }
+    if (st[PROG_XP_INTO] < 0) {
+        if ((bad & PROGVAL_RANGE) == 0) { bad = bad + PROGVAL_RANGE; }
+    }
+    if (st[PROG_WICKMARKS] < 0) {
+        if ((bad & PROGVAL_RANGE) == 0) { bad = bad + PROGVAL_RANGE; }
+    }
+
+    let rem: i32 = total;
+    let lv: i32 = LEVEL_MIN;
+    while (lv < LEVEL_SOFT_CAP) {
+        let need: i32 = prog_xp_to_next(lv);
+        if (rem < need) { break; }
+        rem = rem - need;
+        lv = lv + 1;
+    }
+    let wick: i32 = 0;
+    if (lv >= LEVEL_SOFT_CAP) {
+        wick = idiv(rem, WICKMARK_XP);
+        rem = rem - wick * WICKMARK_XP;
+    }
+    if (st[PROG_LEVEL] != lv)      { bad = bad + PROGVAL_LEVEL; }
+    if (st[PROG_XP_INTO] != rem)   { bad = bad + PROGVAL_INTO; }
+    if (st[PROG_WICKMARKS] != wick) { bad = bad + PROGVAL_WICK; }
+    if (st[PROG_STAT_POINTS] > wick) { bad = bad + PROGVAL_STATS; }
+    let out: i32 = bad;
+    return out;
+}
+
+// A 31-bit fingerprint of the whole state, for determinism gates, replay
+// comparison and the save round-trip assertion.  Order-sensitive: two states
+// that differ in any one slot hash differently.  All mixing in u64 — i32 and
+// i64 `* + -` TRAP on overflow in Hemlock (A13).
+export fn prog_hash(p_st: array): i32 {
+    let st: array = p_st;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < PROG_FIELDS) {
+        let v: i32 = st[i];
+        let u: u64 = 0;
+        if (v >= 0) { u = u64(v); } else { u = u64(f64(v) + 4294967296.0); }
+        h = (h ^ u) * 1099511628211;
+        h = h ^ (h >> 29);
+        i = i + 1;
+    }
+    h = h ^ (h >> 31);
+    h = h * 13787848793156543929;
+    h = h ^ (h >> 33);
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// §11  SELF-CHECK  (tools and CI; O(UNLOCK_COUNT), never called in play)
+// ===========================================================================
+// 0 = consistent.  Each bit names a broken invariant of the tables above, so a
+// bad edit to the ladder fails loudly at a named rule rather than showing up
+// three hours later as an unlock that arrives at the wrong level.
+export let PROGCHK_LADDER_ORDER: i32   = 1;   // g_unlock_level not ascending
+export let PROGCHK_LADDER_RANGE: i32   = 2;   // an unlock outside levels 2..cap
+export let PROGCHK_LADDER_LEN: i32     = 4;   // table lengths disagree
+export let PROGCHK_CURVE_MONO: i32     = 8;   // xp_to_next not strictly rising
+export let PROGCHK_CUM_SUM: i32        = 16;  // closed form != running sum
+export let PROGCHK_STREAK_ORDER: i32   = 32;  // streak thresholds not ascending
+export let PROGCHK_STREAK_UNLOCK: i32  = 64;  // a streak with no ladder entry
+
+export fn prog_selfcheck(): i32 {
+    let bad: i32 = 0;
+    if (g_unlock_level.length != UNLOCK_COUNT) { bad = bad + PROGCHK_LADDER_LEN; }
+    if (g_unlock_name.length != UNLOCK_COUNT) {
+        if ((bad & PROGCHK_LADDER_LEN) == 0) { bad = bad + PROGCHK_LADDER_LEN; }
+    }
+    let i: i32 = 0;
+    let prev: i32 = 0;
+    while (i < UNLOCK_COUNT) {
+        let lv: i32 = g_unlock_level[i];
+        if (lv < prev) {
+            if ((bad & PROGCHK_LADDER_ORDER) == 0) { bad = bad + PROGCHK_LADDER_ORDER; }
+        }
+        if (lv < LEVEL_MIN + 1) {
+            if ((bad & PROGCHK_LADDER_RANGE) == 0) { bad = bad + PROGCHK_LADDER_RANGE; }
+        }
+        if (lv > LEVEL_SOFT_CAP) {
+            if ((bad & PROGCHK_LADDER_RANGE) == 0) { bad = bad + PROGCHK_LADDER_RANGE; }
+        }
+        prev = lv;
+        i = i + 1;
+    }
+    // The curve must be strictly increasing across the whole reachable range,
+    // and the closed-form cumulative must equal the running sum exactly.
+    let run: i32 = 0;
+    let l: i32 = LEVEL_MIN;
+    while (l <= LEVEL_SOFT_CAP) {
+        if (prog_xp_cumulative(l) != run) {
+            if ((bad & PROGCHK_CUM_SUM) == 0) { bad = bad + PROGCHK_CUM_SUM; }
+        }
+        let a: i32 = prog_xp_to_next(l);
+        let b: i32 = prog_xp_to_next(l + 1);
+        if (b <= a) {
+            if ((bad & PROGCHK_CURVE_MONO) == 0) { bad = bad + PROGCHK_CURVE_MONO; }
+        }
+        run = run + a;
+        l = l + 1;
+    }
+    let s: i32 = 1;
+    while (s < STREAK_COUNT) {
+        if (g_streak_kills[s] <= g_streak_kills[s - 1]) {
+            if ((bad & PROGCHK_STREAK_ORDER) == 0) { bad = bad + PROGCHK_STREAK_ORDER; }
+        }
+        s = s + 1;
+    }
+    let u: i32 = 0;
+    while (u < STREAK_COUNT) {
+        let ul: i32 = g_streak_unlock[u];
+        if (ul < 0) {
+            if ((bad & PROGCHK_STREAK_UNLOCK) == 0) { bad = bad + PROGCHK_STREAK_UNLOCK; }
+        }
+        if (ul >= UNLOCK_COUNT) {
+            if ((bad & PROGCHK_STREAK_UNLOCK) == 0) { bad = bad + PROGCHK_STREAK_UNLOCK; }
+        }
+        u = u + 1;
+    }
+    let out: i32 = bad;
+    return out;
+}

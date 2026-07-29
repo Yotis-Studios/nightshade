@@ -1,0 +1,1878 @@
+// =============================================================================
+//  projectiles.hml — the arcing projectile, the blast, and the burn.    W4-4.
+// =============================================================================
+//
+//  SCOPE, STATED UP FRONT.  GAME_DESIGN.md §9.12 cuts bullet ballistics from
+//  v1 outright: "Weapon ballistics: bullet drop, travel time, penetration.
+//  **Hitscan only** (Emberlance is the one projectile, and it is slow and
+//  arcing on purpose)."  This file therefore contains NO bullet simulation and
+//  never will.  What it contains is everything the design DOES ask for that a
+//  hitscan ray cannot express:
+//
+//    1. THROWN / LOBBED BODIES.  Two exist in the GDD, and only two:
+//         * the Emberlance bolt   (§2.4, player)  6.0 m/s arc, 40 m useful
+//         * the Spitter bolt      (§2.2, enemy)   4.5 m/s arc, 30 m range, 22 dmg
+//       They are two rows of one data table, so a third thrown item is a row,
+//       not a code change.  No grenade is implemented: the GDD names none, and
+//       inventing damage/radius/fuse numbers for one would be exactly the
+//       "assert the digits you made up" failure this project has already paid
+//       for twice.
+//
+//    2. EXPLOSIONS.  `proj_aoe` is a standalone primitive — a burst point, a
+//       radius, a damage, a team.  The Emberlance uses it (3.5 m).  The
+//       Bulwark's 5 m slam (§2.2) and any future explosive use the same call,
+//       so there is one blast rule in the game, not three.
+//
+//    3. THE BURN DoT.  60 impact + 12/s for 5 s (§2.4).  Held as a general
+//       (dps, duration) status so the "Ignite on hit — 6/s for 3 s" affix
+//       (§3.3) and the Vesper relic's spreading burn (§3.4) plug into the same
+//       table without a second DoT system appearing next wave.
+//
+//    4. TRACER VISUAL DATA.  §7.6: a 2-tri quad from muzzle to impact, 0.045 s,
+//       1 shot in 3 (1 in 1 for the Longshadow).  The *geometry* of a tracer is
+//       a sim-side fact — muzzle and impact are both authoritative points — but
+//       a tracer is a pure cosmetic, so the ring here is EXCLUDED from the
+//       authoritative state hash and REFUSES to record while `world.replaying`
+//       is 1.  That is ARCHITECTURE §3's "replaying 8 commands produces zero
+//       cosmetics", enforced by the data structure rather than by a convention.
+//
+// -----------------------------------------------------------------------------
+//  DETERMINISM
+// -----------------------------------------------------------------------------
+//  * No RNG at all.  Nothing in a projectile's flight, blast or burn is random;
+//    the spread cone that aimed it is `weapons.hml`'s business (RNG_SPREAD) and
+//    arrives here as a direction vector.  A system with no draws cannot desync
+//    a stream, and the 1-in-3 tracer rule is a COUNTER, not a roll.
+//  * No wall clock.  `g_TICK_DT` only, a compile-time constant.
+//  * All hashing in u64 (CLAUDE.md A13 — i32/i64 `* + -` TRAP on overflow).
+//  * Every damage number is integer arithmetic.  The burn schedule in
+//    particular is integer, so 25 burn ticks sum to exactly 60 with no
+//    floating-point drift and no lost hit point.
+//
+// -----------------------------------------------------------------------------
+//  THE INTEGRATOR — why it is not Euler
+// -----------------------------------------------------------------------------
+//  Acceptance: "arc integration is frame-rate independent (identical at any
+//  tick count)".  Semi-implicit Euler is not: it accumulates 0.5*g*dt per unit
+//  time of height error, so a 1 s flight at 60 Hz lands 7.5 mm off a 1 s flight
+//  at 240 Hz.  The step used here is the exact constant-acceleration form
+//
+//      p += v*dt - 0.5*g*dt*dt          v -= g*dt
+//
+//  which telescopes: after n steps of dt, p == p0 + v0*T - 0.5*g*T*T with
+//  T = n*dt, EXACTLY, for every n and every dt.  Substepping, resimulating at a
+//  different rate, or comparing against the closed form all agree.  It costs
+//  one extra multiply-add per axis per tick.
+//
+// -----------------------------------------------------------------------------
+//  WHAT IS OWNED WHERE
+// -----------------------------------------------------------------------------
+//  A projectile IS a world entity (`KIND_PROJECTILE`), so `world.hml` owns its
+//  position and velocity, `history.hml` records it, `snapshot.hml` replicates
+//  it and the renderer sees it for free.  This module owns only the flight
+//  metadata that no other system needs: type, launch point, age, fuse.  Rows
+//  are followed by ID through `world_slot_of`, never by slot — `world_despawn`
+//  swaps with last, and a slot-keyed table would silently retarget.
+//
+//  IMPORT WALL (CLAUDE.md §3): `@stdlib/math`, `src/core/**`, `src/sim/**`.
+//  Nothing else.  This file links headless.
+// =============================================================================
+
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import { g_TICK_DT, g_TICK_HZ, g_MAX_TRACERS, g_CAPSULE_RADIUS, g_HEIGHT_STAND,
+         g_WPN_COUNT, g_WPN_LONGSHADOW, g_WPN_EMBERLANCE } from "../core/config.hml";
+
+import { world_spawn, world_despawn_id, world_slot_of, world_replaying,
+         KIND_PLAYER, KIND_AI, KIND_NPC, KIND_PROJECTILE,
+         EF_VISIBLE, EF_DEAD, EF_HIT_FLASH, SLOT_NONE, ID_NONE } from "./world.hml";
+
+import { chunk_height_at, CHUNK_H_MISS } from "./chunk.hml";
+
+// W4-3.  `combat.hml` §2 says in so many words: "`projectiles.hml` (W4-4) and
+// `ai.hml` (W4-5) call `combat_apply_damage` with these", and
+// `combat_apply_damage` is documented as THE ONLY PLACE HP CHANGES.  So a
+// combat context, once installed with `proj_set_combat`, is the path every hit
+// point this module removes takes — which is how the Warden's front plate, the
+// EF_INVULN check and the shared event bus apply to a blast without this file
+// owning a second copy of any of them.
+import { combat_apply_damage, combat_events, evbus_push, ev_q,
+         EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER, EV_IMPACT, EV_SOUND,
+         DMG_BURN, DMG_EXPLOSION, SURF_FLESH, SURF_TERRAIN,
+         SFX_IMPACT_WORLD, HM_KILL } from "./combat.hml";
+
+// ---------------------------------------------------------------------------
+// THE PROJECTILE TABLE — GDD §2.2 and §2.4, one row per thrown body
+// ---------------------------------------------------------------------------
+// Adding a thrown item means adding one entry to each array below and nothing
+// else.  Every number here is quoted from the GDD except where a comment says
+// otherwise, and every derived number shows its derivation as an expression so
+// the source numbers stay visible.
+export let PROJ_EMBERLANCE   = 0;   // the player's one projectile (§2.4)
+export let PROJ_SPITTER_BOLT = 1;   // the Spitter's lobbed bolt   (§2.2)
+export let PROJ_TYPE_COUNT   = 2;
+
+// Launch speed, m/s.  GDD §2.4 falloff table ("6.0 m/s projectile") and §2.2
+// ("lobbed bolt (4.5 m/s arc)").
+let PROJ_SPEED: array<f64> = [6.0, 4.5];
+
+// Maximum useful range, m.  GDD §2.4 ("40 (arc, 6.0 m/s projectile)") and §2.2
+// (Spitter range 30 m).
+let PROJ_RANGE: array<f64> = [40.0, 30.0];
+
+// PROJECTILE GRAVITY, m/s^2.  ***DERIVED, NOT QUOTED — see the task report.***
+// The GDD gives a launch speed and a maximum range and no gravity.  Those two
+// numbers pin it: a ballistic arc's maximum range at the optimal 45 deg launch
+// is R = v^2 / g, so g = v^2 / R is the ONLY value at which the design's own
+// speed reaches the design's own range.  Written as the expression so that
+// changing either published number moves gravity with it.
+//
+// The player-movement gravity (`g_GRAVITY`, 22 m/s^2) is deliberately NOT used:
+// at 22 m/s^2 a 6 m/s launch travels 1.6 m and the weapon does not exist.  This
+// tension between "6.0 m/s" and "40 m" is real and is reported upward, not
+// papered over — a 40 m lob at 6 m/s hangs in the air for ~9 s.
+let PROJ_G: array<f64> = [6.0 * 6.0 / 40.0, 4.5 * 4.5 / 30.0];
+
+// Impact damage.  GDD §2.4 ("60 impact") and §2.2 (Spitter 22).
+let PROJ_IMPACT: array<i32> = [60, 22];
+
+// Blast radius, m.  GDD §2.4 ("3.5 m AoE").  The Spitter's bolt is a single
+// target hit — §2.2 gives it no radius, so it has none.
+let PROJ_AOE_R: array<f64> = [3.5, 0.0];
+
+// Burn applied on detonation: damage per second x100, and duration in ticks.
+// GDD §2.4: "12/s burn 5 s".  x100 keeps the whole schedule in integers.
+let PROJ_BURN_DPS: array<i32> = [1200, 0];
+let PROJ_BURN_TICKS: array<i32> = [300, 0];      // 5.0 s * 60 Hz
+
+// The projectile's own collision radius, m.  ENGINEERING, not design: a thrown
+// body needs some width or it threads between entities on a 60 Hz segment.
+// 0.25 m is a fist-sized ember; it is small against the 3.5 m blast it triggers,
+// so it changes where the burst happens, never whether it happens.
+let PROJ_BODY_R: array<f64> = [0.25, 0.20];
+
+// Model index handed to the renderer.  The mesh registry lives in `src/art/`,
+// which cannot see this file; `PROJ_MODEL_BASE` is the agreed offset and is
+// reported as a signature that `ARCHITECTURE.md` §5 still owes us.
+export let PROJ_MODEL_BASE = 400;
+
+// ---------------------------------------------------------------------------
+// THE BURN CLOCK
+// ---------------------------------------------------------------------------
+// "Burn ticks exactly 5 times per second in sim time" (W4-4 acceptance).  At
+// 60 Hz that is one burn tick every 12 sim ticks, and 60 == 12 * 5 exactly, so
+// the rate is representable with no accumulator and no drift.  If the tick rate
+// ever stops being a multiple of 5, `proj_burn_rate_exact()` returns 0 and the
+// probe fails loudly rather than the burn quietly ticking 4.8 times a second.
+export let PROJ_BURN_HZ     = 5;
+export let PROJ_BURN_PERIOD = 12;                // g_TICK_HZ / PROJ_BURN_HZ
+
+// ---------------------------------------------------------------------------
+// EVENTS — what the tick produced, for `sim_effects` to turn into juice
+// ---------------------------------------------------------------------------
+// A per-tick ring, cleared at the top of `proj_step`, so a consumer reading it
+// in the same tick sees exactly this tick's events.  That is the mechanism
+// behind the §2.5 hit-feedback contract: an impact and its five signals are the
+// same event, in the same tick, or they are not emitted at all.
+//
+// This is a LOCAL bus.  `combat.hml` (W4-3) owns "the event bus" per the build
+// plan but publishes no signature for it; when it lands, `pj_ev` becomes a
+// forwarder and these accessors keep working.
+export let PEV_NONE   = 0;
+export let PEV_LAUNCH = 1;   // a projectile was spawned          (a = proj id)
+export let PEV_BURST  = 2;   // a projectile detonated            (a = proj id, i1 = type)
+export let PEV_HIT    = 3;   // an entity took blast damage       (b = target, i0 = dmg)
+export let PEV_BURN   = 4;   // an entity took a burn tick        (b = target, i0 = dmg)
+export let PEV_KILL   = 5;   // that damage was lethal            (b = target)
+export let PEV_EXPIRE = 6;   // a projectile fizzled, no damage   (a = proj id)
+
+// The five signals of the §2.5 contract, as one bitmask on the damage event.
+// One event carrying all five is exactly as consumable as five events and does
+// not let four of them drift away from the fifth.
+export let PSIG_HITMARK = 1;
+export let PSIG_FLASH   = 2;
+export let PSIG_NUMBER  = 4;
+export let PSIG_IMPACT  = 8;
+export let PSIG_AUDIO   = 16;
+export let PSIG_ALL     = 31;
+
+// A BURN TICK IS NOT A HIT.  `combat.hml` states the ruling — "a burn tick must
+// not paint a hitmarker" — and it is right for a second reason: a 5 Hz DoT that
+// fired a hitmarker, an impact billboard and an audio blip on every tick would
+// bury the gun, and GDD §7's mix rule is that the gun is the loudest thing in
+// the game, always.  A burn tick gets the enemy flash and nothing else.
+export let PSIG_BURN = 2;      // PSIG_FLASH
+
+// ---------------------------------------------------------------------------
+// TRACERS — cosmetic only (GDD §7.6)
+// ---------------------------------------------------------------------------
+export let PROJ_TRACER_LIFE = 3;    // ceil(0.045 s * 60 Hz)
+export let PROJ_TRACER_EVERY = 3;   // 1 shot in 3; 1 in 1 for the Longshadow
+
+// ---------------------------------------------------------------------------
+// CAPACITIES
+// ---------------------------------------------------------------------------
+// Emberlance: 3-round magazine, 40 RPM, 2.6 s reload, and the bolt is airborne
+// for seconds.  32 in flight is far past anything a lone player plus a wave's
+// worth of Spitters can produce, and it is a hard cap: over it, `proj_spawn`
+// refuses and increments a counter.  Nothing here ever grows an array.
+export let PROJ_CAP_DEFAULT   = 32;
+export let PROJ_BURN_CAP      = 64;    // > the director's 14 alive cap, by a lot
+export let PROJ_EVENT_CAP     = 64;
+export let PROJ_MISS          = -1;
+
+// ---------------------------------------------------------------------------
+// INTERNAL HELPERS
+// ---------------------------------------------------------------------------
+
+fn pj_zi(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn pj_zf(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// CONSTRUCTION
+// ---------------------------------------------------------------------------
+
+// One system state, allocated once at boot and never again (A8/N6).
+export fn proj_new(): object {
+    let out: object = proj_new_cap(PROJ_CAP_DEFAULT, PROJ_BURN_CAP, g_MAX_TRACERS);
+    return out;
+}
+
+export fn proj_new_cap(p_cap: i32, p_burn_cap: i32, p_tracer_cap: i32): object {
+    let cap: i32 = p_cap;
+    let bcap: i32 = p_burn_cap;
+    let tcap: i32 = p_tracer_cap;
+    if (cap < 1) { cap = 1; }
+    if (bcap < 1) { bcap = 1; }
+    if (tcap < 1) { tcap = 1; }
+
+    let ps: object = {
+        cap: cap,
+        n: 0,
+
+        // ---- in-flight bodies.  Position/velocity live in the WORLD. -----
+        p_id:    pj_zi(cap),      // entity id; the only durable handle
+        p_type:  pj_zi(cap),
+        p_owner: pj_zi(cap),      // shooter entity id
+        p_team:  pj_zi(cap),      // shooter team, captured at launch
+        p_age:   pj_zi(cap),      // ticks since launch
+        p_fuse:  pj_zi(cap),      // ticks remaining before it fizzles
+        p_x0:    pj_zf(cap),      // launch point, for the range cull
+        p_y0:    pj_zf(cap),
+        p_z0:    pj_zf(cap),
+
+        // ---- burning entities --------------------------------------------
+        burn_cap: bcap,
+        bn: 0,
+        b_id:  pj_zi(bcap),
+        b_src: pj_zi(bcap),       // who gets the kill credit
+        b_dps: pj_zi(bcap),       // damage per second x100
+        b_dur: pj_zi(bcap),       // total duration, ticks
+        b_el:  pj_zi(bcap),       // elapsed ticks
+        b_out: pj_zi(bcap),       // integer damage dealt so far
+
+        // ---- this tick's events ------------------------------------------
+        ev_cap: PROJ_EVENT_CAP,
+        ev_n: 0,
+        ev_drop: 0,
+        e_kind: pj_zi(PROJ_EVENT_CAP),
+        e_a:    pj_zi(PROJ_EVENT_CAP),
+        e_b:    pj_zi(PROJ_EVENT_CAP),
+        e_i0:   pj_zi(PROJ_EVENT_CAP),
+        e_i1:   pj_zi(PROJ_EVENT_CAP),
+        e_x:    pj_zf(PROJ_EVENT_CAP),
+        e_y:    pj_zf(PROJ_EVENT_CAP),
+        e_z:    pj_zf(PROJ_EVENT_CAP),
+
+        // ---- cosmetics: NOT hashed, NOT recorded while replaying ---------
+        tr_cap: tcap,
+        tr_n: 0,
+        t_ttl:  pj_zi(tcap),
+        t_kind: pj_zi(tcap),
+        t_x0: pj_zf(tcap), t_y0: pj_zf(tcap), t_z0: pj_zf(tcap),
+        t_x1: pj_zf(tcap), t_y1: pj_zf(tcap), t_z1: pj_zf(tcap),
+        shots: pj_zi(g_WPN_COUNT),   // per-weapon shot counter for the 1-in-3
+        tr_suppressed: 0,
+
+        // ---- the per-tick candidate list ---------------------------------
+        // Rebuilt once per tick, not once per projectile.  Without it the
+        // sweep's cost is (bodies in flight x EVERY entity in the world), and
+        // "every entity" includes props, pickups and lanterns — so a busy town
+        // would slow down a Spitter bolt.  With it the cost is (bodies x live
+        // damageable things), which is the thing the design actually caps at 14.
+        tgt_cap: 0,
+        tgt_n: 0,
+        tg_slot: pj_zi(0),
+        tg_id:   pj_zi(0),
+        tg_team: pj_zi(0),
+        tg_x: pj_zf(0), tg_y: pj_zf(0), tg_z: pj_zf(0),
+        tgt_grows: 0,
+
+        // ---- terrain source.  Optional: with none, bodies fly until fuse. --
+        terrain: 0,
+        cs: 0,
+
+        // ---- the combat context (W4-3).  Optional, injected. -------------
+        // Installed: every hit point goes through `combat_apply_damage` and
+        // every event onto the shared bus.  Not installed: the built-in
+        // fallback below runs, so this module is testable and runnable alone.
+        // The probe asserts the two paths agree on the same scenario.
+        combat: 0,
+        cx: 0,
+        fb_events: 0,
+
+        // ---- target body, until W4-5 publishes per-class capsules ---------
+        body_r: g_CAPSULE_RADIUS,
+        half_h: g_HEIGHT_STAND * 0.5,
+
+        // ---- counters.  Every refusal is visible. -------------------------
+        spawns: 0,
+        spawn_fail: 0,
+        detonations: 0,
+        expiries: 0,
+        hits: 0,
+        kills: 0,
+        burn_applied: 0,
+        burn_ticks: 0,
+        burn_fail: 0
+    };
+    let out: object = ps;
+    return out;
+}
+
+// Install the heightfield.  Without one, projectiles never collide with terrain
+// — they fly until their fuse or their range runs out.  That is a legal mode
+// (headless balance tests use it), never a silent one: `proj_has_terrain` says
+// which mode you are in.
+export fn proj_set_chunks(p_ps: object, p_cs: object): i32 {
+    let ps: object = p_ps;
+    ps.cs = p_cs;
+    ps.terrain = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn proj_clear_chunks(p_ps: object): i32 {
+    let ps: object = p_ps;
+    ps.terrain = 0;
+    ps.cs = 0;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn proj_has_terrain(p_ps: object): i32 {
+    let ps: object = p_ps;
+    let out: i32 = ps.terrain;
+    return out;
+}
+
+// Install W4-3's combat context.  Do this at boot, in the real game, always:
+// unrouted damage means the Warden's plate does not stop an Emberlance and the
+// renderer never hears about the blast.  The fallback exists so that this
+// module can be tested and benchmarked in isolation, not so that it can ship
+// that way — `proj_has_combat` reports which path is live.
+export fn proj_set_combat(p_ps: object, p_cx: object): i32 {
+    let ps: object = p_ps;
+    ps.cx = p_cx;
+    ps.combat = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn proj_clear_combat(p_ps: object): i32 {
+    let ps: object = p_ps;
+    ps.combat = 0;
+    ps.cx = 0;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn proj_has_combat(p_ps: object): i32 {
+    let ps: object = p_ps;
+    let out: i32 = ps.combat;
+    return out;
+}
+
+// How many §2.5 feedback events this module has pushed onto the shared bus.
+export fn proj_feedback_count(p_ps: object): i32 {
+    let ps: object = p_ps;
+    let out: i32 = ps.fb_events;
+    return out;
+}
+
+// The target capsule used by blast and body tests.  One pair of numbers until
+// `ai.hml` (W4-5) publishes per-class capsules; injected rather than hardcoded
+// so adopting them is a call, not an edit to this file.
+export fn proj_set_body(p_ps: object, p_radius: f64, p_half_height: f64): i32 {
+    let ps: object = p_ps;
+    ps.body_r = p_radius;
+    ps.half_h = p_half_height;
+    let out: i32 = 1;
+    return out;
+}
+
+// Drop every projectile, burn, event and tracer, keeping the allocation.
+// Does NOT despawn the world entities: the caller resets the world.
+export fn proj_reset(p_ps: object): i32 {
+    let ps: object = p_ps;
+    ps.n = 0;
+    ps.bn = 0;
+    ps.ev_n = 0;
+    ps.ev_drop = 0;
+    ps.tr_n = 0;
+    ps.tr_suppressed = 0;
+    ps.tgt_n = 0;
+    ps.fb_events = 0;
+    let sh: array<i32> = ps.shots;
+    let i: i32 = 0;
+    let ns: i32 = g_WPN_COUNT;
+    while (i < ns) { sh[i] = 0; i++; }
+    ps.spawns = 0;
+    ps.spawn_fail = 0;
+    ps.detonations = 0;
+    ps.expiries = 0;
+    ps.hits = 0;
+    ps.kills = 0;
+    ps.burn_applied = 0;
+    ps.burn_ticks = 0;
+    ps.burn_fail = 0;
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE DATA TABLE, READ-ONLY
+// ---------------------------------------------------------------------------
+// Exported so `weapons.hml`, the HUD's arc preview and the balance tests read
+// the same numbers this file integrates, rather than a second copy of them.
+
+fn pj_type_ok(p_t: i32): i32 {
+    let t: i32 = p_t;
+    let out: i32 = 0;
+    if (t >= 0) { if (t < PROJ_TYPE_COUNT) { out = 1; } }
+    return out;
+}
+
+export fn proj_speed(p_type: i32): f64 {
+    if (pj_type_ok(p_type) == 0) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = PROJ_SPEED;
+    let out: f64 = a[p_type];
+    return out;
+}
+
+export fn proj_gravity(p_type: i32): f64 {
+    if (pj_type_ok(p_type) == 0) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = PROJ_G;
+    let out: f64 = a[p_type];
+    return out;
+}
+
+export fn proj_range(p_type: i32): f64 {
+    if (pj_type_ok(p_type) == 0) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = PROJ_RANGE;
+    let out: f64 = a[p_type];
+    return out;
+}
+
+export fn proj_impact_damage(p_type: i32): i32 {
+    if (pj_type_ok(p_type) == 0) { let z: i32 = 0; return z; }
+    let a: array<i32> = PROJ_IMPACT;
+    let out: i32 = a[p_type];
+    return out;
+}
+
+export fn proj_aoe_radius(p_type: i32): f64 {
+    if (pj_type_ok(p_type) == 0) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = PROJ_AOE_R;
+    let out: f64 = a[p_type];
+    return out;
+}
+
+export fn proj_burn_dps_x100(p_type: i32): i32 {
+    if (pj_type_ok(p_type) == 0) { let z: i32 = 0; return z; }
+    let a: array<i32> = PROJ_BURN_DPS;
+    let out: i32 = a[p_type];
+    return out;
+}
+
+export fn proj_burn_duration_ticks(p_type: i32): i32 {
+    if (pj_type_ok(p_type) == 0) { let z: i32 = 0; return z; }
+    let a: array<i32> = PROJ_BURN_TICKS;
+    let out: i32 = a[p_type];
+    return out;
+}
+
+export fn proj_body_radius(p_type: i32): f64 {
+    if (pj_type_ok(p_type) == 0) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = PROJ_BODY_R;
+    let out: f64 = a[p_type];
+    return out;
+}
+
+// Is the burn rate exactly representable on this tick rate?  1 = yes.
+export fn proj_burn_rate_exact(): i32 {
+    let out: i32 = 0;
+    if (PROJ_BURN_PERIOD * PROJ_BURN_HZ == g_TICK_HZ) { out = 1; }
+    return out;
+}
+
+// The number of burn ticks a duration produces.  25 for the Emberlance.
+export fn proj_burn_tick_count(p_dur_ticks: i32): i32 {
+    let d: i32 = p_dur_ticks;
+    if (d < 0) { let z: i32 = 0; return z; }
+    let out: i32 = d / PROJ_BURN_PERIOD;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// TRAJECTORY — the closed form, exported because the arc is also a HUD preview
+// ---------------------------------------------------------------------------
+// The stepped integration below reproduces these two functions exactly; the
+// probe asserts that, which is what "frame-rate independent" means in practice.
+export fn proj_traj_axis(p_p0: f64, p_v0: f64, p_t: f64): f64 {
+    let p0: f64 = p_p0;
+    let v0: f64 = p_v0;
+    let t: f64 = p_t;
+    let out: f64 = p0 + v0 * t;
+    return out;
+}
+
+export fn proj_traj_y(p_y0: f64, p_vy0: f64, p_g: f64, p_t: f64): f64 {
+    let y0: f64 = p_y0;
+    let vy0: f64 = p_vy0;
+    let g: f64 = p_g;
+    let t: f64 = p_t;
+    let out: f64 = y0 + vy0 * t - 0.5 * g * t * t;
+    return out;
+}
+
+// One exact constant-acceleration step of a single axis.  This is THE
+// integrator; `proj_step` inlines the same three expressions per axis.
+export fn proj_integrate_pos(p_p: f64, p_v: f64, p_a: f64, p_dt: f64): f64 {
+    let p: f64 = p_p;
+    let v: f64 = p_v;
+    let a: f64 = p_a;
+    let dt: f64 = p_dt;
+    let out: f64 = p + v * dt + 0.5 * a * dt * dt;
+    return out;
+}
+
+export fn proj_integrate_vel(p_v: f64, p_a: f64, p_dt: f64): f64 {
+    let v: f64 = p_v;
+    let a: f64 = p_a;
+    let dt: f64 = p_dt;
+    let out: f64 = v + a * dt;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// GEOMETRY
+// ---------------------------------------------------------------------------
+// First intersection of segment a->b with the sphere (c, r), as the parameter
+// t in [0,1], or 2.0 for no intersection.  A segment test, not a point test:
+// at 6 m/s a body moves 0.1 m per tick, but a Spitter bolt hitting a sprinting
+// player closes 0.19 m, and point tests are how projectiles learn to tunnel.
+export fn proj_seg_sphere_t(p_ax: f64, p_ay: f64, p_az: f64,
+                            p_bx: f64, p_by: f64, p_bz: f64,
+                            p_cx: f64, p_cy: f64, p_cz: f64, p_r: f64): f64 {
+    let dx: f64 = p_bx - p_ax;
+    let dy: f64 = p_by - p_ay;
+    let dz: f64 = p_bz - p_az;
+    let mx: f64 = p_ax - p_cx;
+    let my: f64 = p_ay - p_cy;
+    let mz: f64 = p_az - p_cz;
+    let r: f64 = p_r;
+
+    let cc: f64 = mx * mx + my * my + mz * mz - r * r;
+    if (cc <= 0.0) {                       // already overlapping at t = 0
+        let z: f64 = 0.0;
+        return z;
+    }
+    let aa: f64 = dx * dx + dy * dy + dz * dz;
+    if (aa <= 0.0) {                       // zero-length segment, outside
+        let none: f64 = 2.0;
+        return none;
+    }
+    let bb: f64 = mx * dx + my * dy + mz * dz;
+    if (bb >= 0.0) {                       // moving away from the sphere
+        let away: f64 = 2.0;
+        return away;
+    }
+    let disc: f64 = bb * bb - aa * cc;
+    if (disc < 0.0) {
+        let miss: f64 = 2.0;
+        return miss;
+    }
+    let t: f64 = (0.0 - bb - sqrt(disc)) / aa;
+    if (t > 1.0) {
+        let late: f64 = 2.0;
+        return late;
+    }
+    if (t < 0.0) { t = 0.0; }
+    let out: f64 = t;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE EVENT RING
+// ---------------------------------------------------------------------------
+
+fn pj_ev(p_ps: object, p_kind: i32, p_a: i32, p_b: i32, p_i0: i32, p_i1: i32,
+         p_x: f64, p_y: f64, p_z: f64) {
+    let ps: object = p_ps;
+    let n: i32 = ps.ev_n;
+    if (n >= ps.ev_cap) { ps.ev_drop = ps.ev_drop + 1; return; }
+    let ek: array<i32> = ps.e_kind;
+    let ea: array<i32> = ps.e_a;
+    let eb: array<i32> = ps.e_b;
+    let e0: array<i32> = ps.e_i0;
+    let e1: array<i32> = ps.e_i1;
+    let ex: array<f64> = ps.e_x;
+    let ey: array<f64> = ps.e_y;
+    let ez: array<f64> = ps.e_z;
+    ek[n] = p_kind;
+    ea[n] = p_a;
+    eb[n] = p_b;
+    e0[n] = p_i0;
+    e1[n] = p_i1;
+    ex[n] = p_x;
+    ey[n] = p_y;
+    ez[n] = p_z;
+    ps.ev_n = n + 1;
+}
+
+export fn proj_event_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.ev_n; return out; }
+export fn proj_event_dropped(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.ev_drop; return out; }
+
+export fn proj_event_kind(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: i32 = PEV_NONE; return z; }
+    let a: array<i32> = ps.e_kind;
+    let out: i32 = a[p_i];
+    return out;
+}
+export fn proj_event_a(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: i32 = 0; return z; }
+    let a: array<i32> = ps.e_a;
+    let out: i32 = a[p_i];
+    return out;
+}
+export fn proj_event_target(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: i32 = 0; return z; }
+    let a: array<i32> = ps.e_b;
+    let out: i32 = a[p_i];
+    return out;
+}
+export fn proj_event_amount(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: i32 = 0; return z; }
+    let a: array<i32> = ps.e_i0;
+    let out: i32 = a[p_i];
+    return out;
+}
+// For PEV_HIT / PEV_BURN this is the §2.5 signal mask; for PEV_BURST, the type.
+export fn proj_event_signals(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: i32 = 0; return z; }
+    let a: array<i32> = ps.e_i1;
+    let out: i32 = a[p_i];
+    return out;
+}
+export fn proj_event_x(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.e_x;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_event_y(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.e_y;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_event_z(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.ev_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.e_z;
+    let out: f64 = a[p_i];
+    return out;
+}
+
+export fn proj_events_clear(p_ps: object): i32 {
+    let ps: object = p_ps;
+    ps.ev_n = 0;
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// TRACERS — cosmetic, replay-suppressed, never hashed
+// ---------------------------------------------------------------------------
+
+// GDD §7.6: 1 shot in 3 carries a tracer, 1 in 1 for the Longshadow.  A COUNTER,
+// not a roll: a cosmetic must never consume an RNG stream, or turning tracers
+// off would move every subsequent spread cone.
+export fn proj_tracer_due(p_ps: object, p_weapon: i32): i32 {
+    let ps: object = p_ps;
+    let wp: i32 = p_weapon;
+    if (wp < 0 || wp >= g_WPN_COUNT) { let z: i32 = 0; return z; }
+    let sh: array<i32> = ps.shots;
+    let k: i32 = sh[wp] + 1;
+    sh[wp] = k;
+    if (wp == g_WPN_LONGSHADOW) { let always: i32 = 1; return always; }
+    let out: i32 = 0;
+    if (k % PROJ_TRACER_EVERY == 0) { out = 1; }
+    return out;
+}
+
+// Record a muzzle->impact tracer.  Returns 1 if recorded, 0 if refused.
+// Refused while `world.replaying == 1`: that is the structural half of
+// ARCHITECTURE §3's "replaying 8 commands produces zero cosmetics".
+export fn proj_tracer_add(p_ps: object, p_w: object, p_kind: i32,
+                          p_x0: f64, p_y0: f64, p_z0: f64,
+                          p_x1: f64, p_y1: f64, p_z1: f64): i32 {
+    let ps: object = p_ps;
+    if (world_replaying(p_w) == 1) {
+        ps.tr_suppressed = ps.tr_suppressed + 1;
+        let sup: i32 = 0;
+        return sup;
+    }
+    let n: i32 = ps.tr_n;
+    if (n >= ps.tr_cap) { let full: i32 = 0; return full; }
+    let tt: array<i32> = ps.t_ttl;
+    let tk: array<i32> = ps.t_kind;
+    let x0: array<f64> = ps.t_x0;
+    let y0: array<f64> = ps.t_y0;
+    let z0: array<f64> = ps.t_z0;
+    let x1: array<f64> = ps.t_x1;
+    let y1: array<f64> = ps.t_y1;
+    let z1: array<f64> = ps.t_z1;
+    tt[n] = PROJ_TRACER_LIFE;
+    tk[n] = p_kind;
+    x0[n] = p_x0; y0[n] = p_y0; z0[n] = p_z0;
+    x1[n] = p_x1; y1[n] = p_y1; z1[n] = p_z1;
+    ps.tr_n = n + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn proj_tracer_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.tr_n; return out; }
+export fn proj_tracer_suppressed(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.tr_suppressed; return out; }
+
+export fn proj_tracer_ttl(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: i32 = 0; return z; }
+    let a: array<i32> = ps.t_ttl;
+    let out: i32 = a[p_i];
+    return out;
+}
+export fn proj_tracer_ax(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.t_x0;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_tracer_ay(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.t_y0;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_tracer_az(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.t_z0;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_tracer_bx(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.t_x1;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_tracer_by(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.t_y1;
+    let out: f64 = a[p_i];
+    return out;
+}
+export fn proj_tracer_bz(p_ps: object, p_i: i32): f64 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.tr_n) { let z: f64 = 0.0; return z; }
+    let a: array<f64> = ps.t_z1;
+    let out: f64 = a[p_i];
+    return out;
+}
+
+// Age every tracer one tick and drop the dead ones.  Swap-with-last.
+fn pj_tracers_step(p_ps: object) {
+    let ps: object = p_ps;
+    let tt: array<i32> = ps.t_ttl;
+    let tk: array<i32> = ps.t_kind;
+    let x0: array<f64> = ps.t_x0;
+    let y0: array<f64> = ps.t_y0;
+    let z0: array<f64> = ps.t_z0;
+    let x1: array<f64> = ps.t_x1;
+    let y1: array<f64> = ps.t_y1;
+    let z1: array<f64> = ps.t_z1;
+    let n: i32 = ps.tr_n;
+    let i: i32 = 0;
+    while (i < n) {
+        tt[i] = tt[i] - 1;
+        if (tt[i] <= 0) {
+            let last: i32 = n - 1;
+            if (i != last) {
+                tt[i] = tt[last]; tk[i] = tk[last];
+                x0[i] = x0[last]; y0[i] = y0[last]; z0[i] = z0[last];
+                x1[i] = x1[last]; y1[i] = y1[last]; z1[i] = z1[last];
+            }
+            n = last;
+        } else {
+            i++;
+        }
+    }
+    ps.tr_n = n;
+}
+
+// ---------------------------------------------------------------------------
+// DAMAGE
+// ---------------------------------------------------------------------------
+
+// Is slot `s` something a blast may damage?
+//
+// FRIENDLY FIRE RULE, stated once: team 0 means "unaffiliated", so a source on
+// team 0 damages everything but itself.  Two entities on the SAME NON-ZERO team
+// never damage each other.  That single rule covers the v1 cases (players vs
+// shades) without inventing a team enum this module does not own.
+fn pj_targetable(p_w: object, p_s: i32, p_src: i32, p_team: i32): i32 {
+    let w: object = p_w;
+    let s: i32 = p_s;
+    let kd: array<i32> = w.kind;
+    let k: i32 = kd[s];
+    if (k != KIND_AI) {
+        if (k != KIND_PLAYER) {
+            if (k != KIND_NPC) { let no: i32 = 0; return no; }
+        }
+    }
+    let ids: array<i32> = w.id;
+    if (ids[s] == p_src) { let mine: i32 = 0; return mine; }
+    let fl: array<i32> = w.flags;
+    if ((fl[s] & EF_DEAD) != 0) { let dead: i32 = 0; return dead; }
+    let hp: array<i32> = w.hp;
+    if (hp[s] <= 0) { let gone: i32 = 0; return gone; }
+    let st: i32 = p_team;
+    if (st != 0) {
+        let tm: array<i32> = w.team;
+        if (tm[s] == st) { let friend: i32 = 0; return friend; }
+    }
+    let out: i32 = 1;
+    return out;
+}
+
+// Push the four cosmetic-derivation events plus the audio blip onto the shared
+// bus.  Called ONLY for blast damage: an explosion that connects is a hit and
+// GDD §2.5 requires all five signals in the same tick.  A burn tick is not a
+// hit and deliberately does not come through here (see PSIG_BURN).
+fn pj_feedback(p_ps: object, p_w: object, p_src: i32, p_vid: i32, p_dmg: i32,
+               p_lethal: i32, p_x: f64, p_y: f64, p_z: f64) {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let cx: object = ps.cx;
+    let bus: object = combat_events(cx);
+    let tick: i32 = w.tick;
+    let xq: i32 = ev_q(p_x);
+    let yq: i32 = ev_q(p_y);
+    let zq: i32 = ev_q(p_z);
+    let hm: i32 = 0;
+    if (p_lethal == 1) { hm = HM_KILL; }
+    let dn: i32 = p_dmg;
+    if (dn > 255) { dn = 255; }
+    evbus_push(bus, tick, EV_HITMARKER,     hm,              p_src, p_vid, xq, yq, zq);
+    evbus_push(bus, tick, EV_HIT_FLASH,     0,               p_src, p_vid, xq, yq, zq);
+    evbus_push(bus, tick, EV_DAMAGE_NUMBER, dn,              p_src, p_vid, xq, yq, zq);
+    evbus_push(bus, tick, EV_IMPACT,        SURF_FLESH,      p_src, p_vid, xq, yq, zq);
+    evbus_push(bus, tick, EV_SOUND,         SFX_IMPACT_WORLD, p_src, p_vid, xq, yq, zq);
+    ps.fb_events = ps.fb_events + 5;
+}
+
+// Apply integer damage to a live slot.  Returns 1 if the damage was lethal.
+//
+// EVERY hit point this module removes comes through here, and when a combat
+// context is installed here forwards to `combat_apply_damage` — W4-3's "THE
+// ONLY PLACE HP CHANGES".  That is what gets the Warden's 75 % front plate, the
+// EF_INVULN check, the overkill accounting and the authoritative EV_HIT/EV_KILL
+// records applied to a blast without this file owning a second copy of any of
+// them.  The plate is directional, so an explosion passes the XZ direction from
+// the burst to the victim and a burn tick passes (0,0) — a body already on fire
+// is not being shot from anywhere, and combat's arc test correctly declines.
+//
+// The fallback below runs only when no context is installed (isolated tests and
+// benchmarks).  The probe runs the same scenario down both paths and asserts
+// they leave the world in the same state.
+fn pj_damage(p_ps: object, p_w: object, p_slot: i32, p_dmg: i32, p_src: i32,
+             p_kind: i32, p_dirx: f64, p_dirz: f64,
+             p_x: f64, p_y: f64, p_z: f64): i32 {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let s: i32 = p_slot;
+    let d: i32 = p_dmg;
+    if (d < 0) { d = 0; }
+
+    let hp: array<i32> = w.hp;
+    let fl: array<i32> = w.flags;
+    let ids: array<i32> = w.id;
+    let vid: i32 = ids[s];
+    let before: i32 = hp[s];
+
+    let sig: i32 = PSIG_ALL;
+    if (p_kind == PEV_BURN) { sig = PSIG_BURN; }
+
+    let dealt: i32 = 0;
+    if (ps.combat == 1) {
+        let cx: object = ps.cx;
+        let dk: i32 = DMG_EXPLOSION;
+        if (p_kind == PEV_BURN) { dk = DMG_BURN; }
+        dealt = combat_apply_damage(cx, w, p_src, s, f64(d), g_WPN_EMBERLANCE, dk, 0,
+                                    p_dirx, p_dirz, p_x, p_y, p_z);
+    } else {
+        // --- fallback: no combat context installed -------------------------
+        if ((fl[s] & EF_DEAD) != 0) { let gone: i32 = 0; return gone; }
+        let lh: array<i32> = w.last_hit_by;
+        let after: i32 = before - d;
+        if (after < 0) { after = 0; }
+        hp[s] = after;
+        lh[s] = p_src;
+        fl[s] = fl[s] | EF_HIT_FLASH;         // §7.3, a state bit the renderer reads
+        dealt = before - after;
+        if (after == 0) { if (before > 0) { fl[s] = fl[s] | EF_DEAD; } }
+    }
+
+    // A connection that removed no HP is not a hit.  `combat_apply_damage`
+    // returns 0 for an EF_INVULN or already-dead victim (the 1.5 s Wick i-frames
+    // of GDD §2.1 are exactly this case), and a hitmarker for damage that did
+    // not land is the single most-complained-about bug in every shooter.
+    if (dealt <= 0) { let none: i32 = 0; return none; }
+
+    ps.hits = ps.hits + 1;
+
+    // The local ring, always.  One event carrying its whole signal mask —
+    // splitting the five is how four of five end up implemented.
+    pj_ev(ps, p_kind, p_src, vid, dealt, sig, p_x, p_y, p_z);
+
+    let lethal: i32 = 0;
+    if (before > 0) {
+        if (hp[s] == 0) {
+            lethal = 1;
+            ps.kills = ps.kills + 1;
+            // Death is FLAGGED, never despawned here: the dissolve (§7.9) needs
+            // the body, and stage (f) of ARCHITECTURE §4.3 owns removal.
+            pj_ev(ps, PEV_KILL, p_src, vid, 0, 0, p_x, p_y, p_z);
+        }
+    }
+
+    if (ps.combat == 1) {
+        if (p_kind == PEV_HIT) {
+            if (dealt > 0) { pj_feedback(ps, w, p_src, vid, dealt, lethal, p_x, p_y, p_z); }
+        }
+    }
+    let out: i32 = lethal;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE BURN
+// ---------------------------------------------------------------------------
+
+fn pj_burn_find(p_ps: object, p_id: i32): i32 {
+    let ps: object = p_ps;
+    let bi: array<i32> = ps.b_id;
+    let n: i32 = ps.bn;
+    let i: i32 = 0;
+    while (i < n) {
+        if (bi[i] == p_id) { let hit: i32 = i; return hit; }
+        i++;
+    }
+    let out: i32 = PROJ_MISS;
+    return out;
+}
+
+// Set an entity alight.  `p_dps_x100` is damage per second times 100; the whole
+// schedule is integer, so a 12/s burn for 5 s deals exactly 60 in exactly 25
+// ticks and no hit point is ever lost to rounding.
+//
+// Reapplying to an already-burning entity REFRESHES: the timer restarts and the
+// dps becomes the stronger of the two.  Stacking instances is the alternative
+// and it turns a 3-round magazine into a 180-damage-per-second blender.
+export fn proj_burn_apply(p_ps: object, p_w: object, p_target: i32, p_src: i32,
+                          p_dps_x100: i32, p_ticks: i32): i32 {
+    let ps: object = p_ps;
+    let dps: i32 = p_dps_x100;
+    let dur: i32 = p_ticks;
+    if (dps <= 0 || dur <= 0) { let z: i32 = 0; return z; }
+    if (dps > 1000000) { dps = 1000000; }        // keeps dps*k inside i32
+    if (dur > 3600) { dur = 3600; }
+    let s: i32 = world_slot_of(p_w, p_target);
+    if (s == SLOT_NONE) { ps.burn_fail = ps.burn_fail + 1; let miss: i32 = 0; return miss; }
+
+    let bi: array<i32> = ps.b_id;
+    let bs: array<i32> = ps.b_src;
+    let bd: array<i32> = ps.b_dps;
+    let bu: array<i32> = ps.b_dur;
+    let be: array<i32> = ps.b_el;
+    let bo: array<i32> = ps.b_out;
+
+    let at: i32 = pj_burn_find(ps, p_target);
+    if (at != PROJ_MISS) {
+        if (dps > bd[at]) { bd[at] = dps; }
+        bu[at] = dur;
+        be[at] = 0;
+        bo[at] = 0;
+        bs[at] = p_src;
+        let refreshed: i32 = 1;
+        return refreshed;
+    }
+
+    let n: i32 = ps.bn;
+    if (n >= ps.burn_cap) { ps.burn_fail = ps.burn_fail + 1; let full: i32 = 0; return full; }
+    bi[n] = p_target;
+    bs[n] = p_src;
+    bd[n] = dps;
+    bu[n] = dur;
+    be[n] = 0;
+    bo[n] = 0;
+    ps.bn = n + 1;
+    ps.burn_applied = ps.burn_applied + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn proj_burning(p_ps: object, p_id: i32): i32 {
+    let at: i32 = pj_burn_find(p_ps, p_id);
+    let out: i32 = 0;
+    if (at != PROJ_MISS) { out = 1; }
+    return out;
+}
+
+export fn proj_burn_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.bn; return out; }
+
+// Ticks of burn left on an entity, or 0.
+export fn proj_burn_remaining(p_ps: object, p_id: i32): i32 {
+    let ps: object = p_ps;
+    let at: i32 = pj_burn_find(ps, p_id);
+    if (at == PROJ_MISS) { let z: i32 = 0; return z; }
+    let bu: array<i32> = ps.b_dur;
+    let be: array<i32> = ps.b_el;
+    let out: i32 = bu[at] - be[at];
+    return out;
+}
+
+// Total damage this burn has already dealt.
+export fn proj_burn_dealt(p_ps: object, p_id: i32): i32 {
+    let ps: object = p_ps;
+    let at: i32 = pj_burn_find(ps, p_id);
+    if (at == PROJ_MISS) { let z: i32 = 0; return z; }
+    let bo: array<i32> = ps.b_out;
+    let out: i32 = bo[at];
+    return out;
+}
+
+// The exact schedule: total integer damage after `k` burn ticks at `dps_x100`.
+// Exported so a test can assert the schedule without reaching into the table.
+//   total(k) = floor(dps_x100 * k / (100 * BURN_HZ))
+export fn proj_burn_total_after(p_dps_x100: i32, p_k: i32): i32 {
+    let dps: i32 = p_dps_x100;
+    let k: i32 = p_k;
+    if (dps <= 0 || k <= 0) { let z: i32 = 0; return z; }
+    let out: i32 = (dps * k) / (100 * PROJ_BURN_HZ);
+    return out;
+}
+
+// One tick of every burn.  Damage lands only on burn ticks — every 12th sim
+// tick of that instance's own life, i.e. exactly 5 times a second, phased from
+// when it was applied rather than from a global clock.
+fn pj_burn_step(p_ps: object, p_w: object) {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let bi: array<i32> = ps.b_id;
+    let bs: array<i32> = ps.b_src;
+    let bd: array<i32> = ps.b_dps;
+    let bu: array<i32> = ps.b_dur;
+    let be: array<i32> = ps.b_el;
+    let bo: array<i32> = ps.b_out;
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let hp: array<i32> = w.hp;
+    let fl: array<i32> = w.flags;
+
+    let period: i32 = PROJ_BURN_PERIOD;
+    let n: i32 = ps.bn;
+    let i: i32 = 0;
+    while (i < n) {
+        let id: i32 = bi[i];
+        let s: i32 = world_slot_of(w, id);
+        let drop: i32 = 0;
+
+        if (s == SLOT_NONE) {
+            drop = 1;                                   // the body left the world
+        } else {
+            if (hp[s] <= 0) { drop = 1; }
+            if ((fl[s] & EF_DEAD) != 0) { drop = 1; }
+        }
+
+        if (drop == 0) {
+            let el: i32 = be[i] + 1;
+            be[i] = el;
+            if (el % period == 0) {
+                let k: i32 = el / period;
+                let total: i32 = (bd[i] * k) / (100 * PROJ_BURN_HZ);
+                let d: i32 = total - bo[i];
+                bo[i] = total;
+                if (d > 0) {
+                    ps.burn_ticks = ps.burn_ticks + 1;
+                    // (0,0) direction: a body already alight is not being shot
+                    // from anywhere, so the Warden's directional plate does not
+                    // apply to it.  That is deliberate, not an omission.
+                    let lethal: i32 = pj_damage(ps, w, s, d, bs[i], PEV_BURN, 0.0, 0.0,
+                                                px[s], py[s], pz[s]);
+                    if (lethal == 1) { drop = 1; }
+                }
+            }
+            if (be[i] >= bu[i]) { drop = 1; }
+        }
+
+        if (drop == 1) {
+            let last: i32 = n - 1;
+            if (i != last) {
+                bi[i] = bi[last]; bs[i] = bs[last]; bd[i] = bd[last];
+                bu[i] = bu[last]; be[i] = be[last]; bo[i] = bo[last];
+            }
+            n = last;
+        } else {
+            i++;
+        }
+    }
+    ps.bn = n;
+}
+
+// ---------------------------------------------------------------------------
+// THE BLAST — the shared explosion primitive
+// ---------------------------------------------------------------------------
+// Everything that explodes in this game calls this: the Emberlance's 3.5 m, the
+// Bulwark's 5 m slam (§2.2), any future explosive.  One blast rule, one place.
+//
+// DAMAGE IS FLAT INSIDE THE RADIUS.  The GDD gives "60 impact" and "3.5 m AoE"
+// and no falloff curve, and the acceptance criterion is binary — "hits every
+// entity within 3.5 m and none beyond".  Inventing a falloff exponent here
+// would be inventing a design number.  If one is authored later it belongs on
+// this one function, and every explosive in the game inherits it at once.
+//
+// The membership test is `d2 <= r*r` on the entity's CENTRE (feet + half
+// height), squared, so it is exact at the rim and never takes a square root.
+export fn proj_aoe(p_ps: object, p_w: object,
+                   p_x: f64, p_y: f64, p_z: f64, p_r: f64,
+                   p_dmg: i32, p_src: i32, p_team: i32,
+                   p_burn_dps: i32, p_burn_ticks: i32): i32 {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let bx: f64 = p_x;
+    let by: f64 = p_y;
+    let bz: f64 = p_z;
+    let r: f64 = p_r;
+    if (r <= 0.0) { let z: i32 = 0; return z; }
+    let r2: f64 = r * r;
+    let hh: f64 = ps.half_h;
+
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+    let ids: array<i32> = w.id;
+
+    let hit: i32 = 0;
+    let n: i32 = w.count;
+    let i: i32 = 0;
+    while (i < n) {
+        if (pj_targetable(w, i, p_src, p_team) == 1) {
+            let dx: f64 = px[i] - bx;
+            let dy: f64 = (py[i] + hh) - by;
+            let dz: f64 = pz[i] - bz;
+            let d2: f64 = dx * dx + dy * dy + dz * dz;
+            if (d2 <= r2) {
+                let id: i32 = ids[i];
+                // The blast direction for THIS victim: outward from the burst
+                // on XZ, normalized.  A Warden hit in the back by a blast that
+                // went off behind it does not get its front plate.
+                let dl: f64 = sqrt(dx * dx + dz * dz);
+                let ndx: f64 = 0.0;
+                let ndz: f64 = 0.0;
+                if (dl > 0.0) { ndx = dx / dl; ndz = dz / dl; }
+                pj_damage(ps, w, i, p_dmg, p_src, PEV_HIT, ndx, ndz,
+                          px[i], py[i] + hh, pz[i]);
+                hit++;
+                if (p_burn_dps > 0) {
+                    proj_burn_apply(ps, w, id, p_src, p_burn_dps, p_burn_ticks);
+                }
+                // pj_damage may have killed it, but it never despawns, so the
+                // slot indices below `i` cannot move and the walk stays linear.
+            }
+        }
+        i++;
+    }
+    ps.detonations = ps.detonations + 1;
+    let out: i32 = hit;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// SPAWNING
+// ---------------------------------------------------------------------------
+
+// Launch a projectile of `p_type` from (x,y,z) along the UNIT direction
+// (dx,dy,dz).  Returns the new entity id, or ID_NONE if the world or the
+// projectile table is full.  The direction is taken as given: aiming, spread
+// and recoil are `weapons.hml`'s job, and a projectile that re-derives its own
+// aim is a projectile that disagrees with the crosshair.
+export fn proj_spawn(p_ps: object, p_w: object, p_type: i32, p_owner: i32,
+                     p_x: f64, p_y: f64, p_z: f64,
+                     p_dx: f64, p_dy: f64, p_dz: f64): i32 {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let ty: i32 = p_type;
+    if (pj_type_ok(ty) == 0) { ps.spawn_fail = ps.spawn_fail + 1; let bad: i32 = ID_NONE; return bad; }
+    if (ps.n >= ps.cap) { ps.spawn_fail = ps.spawn_fail + 1; let full: i32 = ID_NONE; return full; }
+
+    // Normalize defensively: a caller handing us a non-unit vector would scale
+    // the muzzle velocity and silently rebalance the weapon.
+    let dx: f64 = p_dx;
+    let dy: f64 = p_dy;
+    let dz: f64 = p_dz;
+    let len: f64 = sqrt(dx * dx + dy * dy + dz * dz);
+    if (len <= 0.0) { ps.spawn_fail = ps.spawn_fail + 1; let nodir: i32 = ID_NONE; return nodir; }
+    let inv: f64 = 1.0 / len;
+    dx = dx * inv;
+    dy = dy * inv;
+    dz = dz * inv;
+
+    // The owner's team travels with the shot, so a projectile still resolves
+    // correctly after its shooter has died and left the world.
+    let oteam: i32 = 0;
+    let os: i32 = world_slot_of(w, p_owner);
+    let ownslot: i32 = 0;
+    if (os != SLOT_NONE) {
+        let tm: array<i32> = w.team;
+        oteam = tm[os];
+        if (p_owner >= 1) { if (p_owner <= 64) { ownslot = p_owner; } }
+    }
+
+    let s: i32 = world_spawn(w, KIND_PROJECTILE, ownslot);
+    if (s == SLOT_NONE) { ps.spawn_fail = ps.spawn_fail + 1; let nospace: i32 = ID_NONE; return nospace; }
+
+    let sp: array<f64> = PROJ_SPEED;
+    let v: f64 = sp[ty];
+
+    let wx: array<f64> = w.px;
+    let wy: array<f64> = w.py;
+    let wz: array<f64> = w.pz;
+    let vx: array<f64> = w.vx;
+    let vy: array<f64> = w.vy;
+    let vz: array<f64> = w.vz;
+    let fl: array<i32> = w.flags;
+    let md: array<i32> = w.model;
+    let tm2: array<i32> = w.team;
+    let hp: array<i32> = w.hp;
+    let hpm: array<i32> = w.hp_max;
+
+    wx[s] = p_x; wy[s] = p_y; wz[s] = p_z;
+    vx[s] = dx * v; vy[s] = dy * v; vz[s] = dz * v;
+    fl[s] = EF_VISIBLE;
+    md[s] = PROJ_MODEL_BASE + ty;
+    tm2[s] = oteam;
+    hp[s] = 1;
+    hpm[s] = 1;
+
+    let ids: array<i32> = w.id;
+    let id: i32 = ids[s];
+
+    // The fuse is an engineering backstop, not a design number: the range cull
+    // below normally ends the flight first.  Sized from the type's own numbers
+    // — twice the hang time of a 45 deg maximum-range lob, 2*sqrt(2)*v/g.
+    let gr: array<f64> = PROJ_G;
+    let g: f64 = gr[ty];
+    let hang: f64 = 2.828427124746190 * v / g;
+    let fuse: i32 = i32(hang * 2.0 * f64(g_TICK_HZ)) + 1;
+
+    let n: i32 = ps.n;
+    let ai: array<i32> = ps.p_id;
+    let at: array<i32> = ps.p_type;
+    let ao: array<i32> = ps.p_owner;
+    let ate: array<i32> = ps.p_team;
+    let ag: array<i32> = ps.p_age;
+    let af: array<i32> = ps.p_fuse;
+    let ax: array<f64> = ps.p_x0;
+    let ay: array<f64> = ps.p_y0;
+    let az: array<f64> = ps.p_z0;
+    ai[n] = id;
+    at[n] = ty;
+    ao[n] = p_owner;
+    ate[n] = oteam;
+    ag[n] = 0;
+    af[n] = fuse;
+    ax[n] = p_x; ay[n] = p_y; az[n] = p_z;
+    ps.n = n + 1;
+    ps.spawns = ps.spawns + 1;
+
+    pj_ev(ps, PEV_LAUNCH, id, p_owner, ty, 0, p_x, p_y, p_z);
+    let out: i32 = id;
+    return out;
+}
+
+// Launch from an aim angle instead of a vector.  The basis is the engine's,
+// verbatim from `src/render/view.hml`:
+//     fwd = ( sin(yaw)*cos(pitch),  sin(pitch),  -cos(yaw)*cos(pitch) )
+// It is duplicated rather than imported because `src/sim/**` may not import
+// `src/render/**` — and the sim, not the renderer, is authoritative for it.
+export fn proj_spawn_aim(p_ps: object, p_w: object, p_type: i32, p_owner: i32,
+                         p_x: f64, p_y: f64, p_z: f64,
+                         p_yaw: f64, p_pitch: f64): i32 {
+    let cp: f64 = cos(p_pitch);
+    let dx: f64 = sin(p_yaw) * cp;
+    let dy: f64 = sin(p_pitch);
+    let dz: f64 = 0.0 - cos(p_yaw) * cp;
+    let out: i32 = proj_spawn(p_ps, p_w, p_type, p_owner, p_x, p_y, p_z, dx, dy, dz);
+    return out;
+}
+
+export fn proj_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.n; return out; }
+export fn proj_spawn_fail_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.spawn_fail; return out; }
+export fn proj_detonation_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.detonations; return out; }
+export fn proj_expiry_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.expiries; return out; }
+export fn proj_hit_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.hits; return out; }
+export fn proj_kill_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.kills; return out; }
+export fn proj_burn_tick_total(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.burn_ticks; return out; }
+
+// The entity id of in-flight projectile `p_i`, or ID_NONE.
+export fn proj_id_at(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.n) { let z: i32 = ID_NONE; return z; }
+    let a: array<i32> = ps.p_id;
+    let out: i32 = a[p_i];
+    return out;
+}
+
+export fn proj_age_at(p_ps: object, p_i: i32): i32 {
+    let ps: object = p_ps;
+    if (p_i < 0 || p_i >= ps.n) { let z: i32 = 0; return z; }
+    let a: array<i32> = ps.p_age;
+    let out: i32 = a[p_i];
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE PER-TICK CANDIDATE LIST
+// ---------------------------------------------------------------------------
+// Everything a projectile could hit, gathered once instead of once per body.
+// Without it the sweep costs (bodies in flight x EVERY entity in the world) —
+// and "every entity" includes props, pickups and lanterns, so walking into a
+// built-up town would slow down a Spitter bolt.  With it the cost is (bodies x
+// live damageable things), which is what the director caps at 14.
+//
+// It is REBUILT after every despawn.  `world_despawn` swaps with last, so a
+// cached slot index is only valid until the next removal; the alternative — a
+// stale slot silently addressing a different body — is precisely the class of
+// bug `world.hml`'s "follow ids, never slots" rule exists to prevent.
+fn pj_build_targets(p_ps: object, p_w: object) {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let cnt: i32 = w.count;
+    if (ps.tgt_cap < cnt) {
+        // One-time growth to the world's high-water mark.  Not a per-frame
+        // allocation (N6): in the shipping game this fires once, at boot.
+        ps.tg_slot = pj_zi(cnt);
+        ps.tg_id   = pj_zi(cnt);
+        ps.tg_team = pj_zi(cnt);
+        ps.tg_x = pj_zf(cnt);
+        ps.tg_y = pj_zf(cnt);
+        ps.tg_z = pj_zf(cnt);
+        ps.tgt_cap = cnt;
+        ps.tgt_grows = ps.tgt_grows + 1;
+    }
+    let tg_slot: array<i32> = ps.tg_slot;
+    let tg_id: array<i32> = ps.tg_id;
+    let tg_team: array<i32> = ps.tg_team;
+    let tg_x: array<f64> = ps.tg_x;
+    let tg_y: array<f64> = ps.tg_y;
+    let tg_z: array<f64> = ps.tg_z;
+    let hh: f64 = ps.half_h;
+
+    let kd: array<i32> = w.kind;
+    let idv: array<i32> = w.id;
+    let fl: array<i32> = w.flags;
+    let hp: array<i32> = w.hp;
+    let tm: array<i32> = w.team;
+    let px: array<f64> = w.px;
+    let py: array<f64> = w.py;
+    let pz: array<f64> = w.pz;
+
+    let m: i32 = 0;
+    let j: i32 = 0;
+    while (j < cnt) {
+        let k: i32 = kd[j];
+        let ok: i32 = 0;
+        if (k == KIND_AI) { ok = 1; }
+        if (k == KIND_PLAYER) { ok = 1; }
+        if (k == KIND_NPC) { ok = 1; }
+        if (ok == 1) {
+            if ((fl[j] & EF_DEAD) != 0) { ok = 0; }
+            else { if (hp[j] <= 0) { ok = 0; } }
+        }
+        if (ok == 1) {
+            tg_slot[m] = j;
+            tg_id[m] = idv[j];
+            tg_team[m] = tm[j];
+            tg_x[m] = px[j];
+            tg_y[m] = py[j] + hh;      // capsule centre, not feet
+            tg_z[m] = pz[j];
+            m++;
+        }
+        j++;
+    }
+    ps.tgt_n = m;
+}
+
+export fn proj_target_count(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.tgt_n; return out; }
+export fn proj_target_grows(p_ps: object): i32 { let ps: object = p_ps; let out: i32 = ps.tgt_grows; return out; }
+
+// ---------------------------------------------------------------------------
+// DETONATION AND REMOVAL
+// ---------------------------------------------------------------------------
+
+// Remove row `p_i` from the flight table and despawn its world entity.
+fn pj_retire(p_ps: object, p_w: object, p_i: i32) {
+    let ps: object = p_ps;
+    let i: i32 = p_i;
+    let ai: array<i32> = ps.p_id;
+    let at: array<i32> = ps.p_type;
+    let ao: array<i32> = ps.p_owner;
+    let ate: array<i32> = ps.p_team;
+    let ag: array<i32> = ps.p_age;
+    let af: array<i32> = ps.p_fuse;
+    let ax: array<f64> = ps.p_x0;
+    let ay: array<f64> = ps.p_y0;
+    let az: array<f64> = ps.p_z0;
+    world_despawn_id(p_w, ai[i]);
+    let last: i32 = ps.n - 1;
+    if (i != last) {
+        ai[i] = ai[last]; at[i] = at[last]; ao[i] = ao[last]; ate[i] = ate[last];
+        ag[i] = ag[last]; af[i] = af[last];
+        ax[i] = ax[last]; ay[i] = ay[last]; az[i] = az[last];
+    }
+    ps.n = last;
+}
+
+// Burst at (x,y,z): blast if the type has a radius, otherwise a single-target
+// hit on whatever it struck.
+fn pj_detonate(p_ps: object, p_w: object, p_i: i32,
+               p_x: f64, p_y: f64, p_z: f64, p_direct_slot: i32) {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let i: i32 = p_i;
+    let at: array<i32> = ps.p_type;
+    let ao: array<i32> = ps.p_owner;
+    let ate: array<i32> = ps.p_team;
+    let ai: array<i32> = ps.p_id;
+    let ty: i32 = at[i];
+    let src: i32 = ao[i];
+    let team: i32 = ate[i];
+    let pid: i32 = ai[i];
+
+    let dmg_t: array<i32> = PROJ_IMPACT;
+    let aoe_t: array<f64> = PROJ_AOE_R;
+    let bd_t: array<i32> = PROJ_BURN_DPS;
+    let bt_t: array<i32> = PROJ_BURN_TICKS;
+    let dmg: i32 = dmg_t[ty];
+    let r: f64 = aoe_t[ty];
+    let bdps: i32 = bd_t[ty];
+    let bticks: i32 = bt_t[ty];
+
+    pj_ev(ps, PEV_BURST, pid, src, ty, ty, p_x, p_y, p_z);
+
+    // The burst itself, onto the shared bus: an EV_IMPACT the fx layer turns
+    // into the spark billboard and particle burst of GDD §7.7.  It is emitted
+    // whether or not anything was hit — a body that lands in the dirt still
+    // makes a crater.
+    if (ps.combat == 1) {
+        let cxb: object = ps.cx;
+        let bus: object = combat_events(cxb);
+        let surf: i32 = SURF_TERRAIN;
+        if (p_direct_slot != SLOT_NONE) { surf = SURF_FLESH; }
+        evbus_push(bus, w.tick, EV_IMPACT, surf, src, pid,
+                   ev_q(p_x), ev_q(p_y), ev_q(p_z));
+    }
+
+    if (r > 0.0) {
+        proj_aoe(ps, w, p_x, p_y, p_z, r, dmg, src, team, bdps, bticks);
+    } else {
+        if (p_direct_slot != SLOT_NONE) {
+            let ids: array<i32> = w.id;
+            let px: array<f64> = w.px;
+            let pz: array<f64> = w.pz;
+            let tid: i32 = ids[p_direct_slot];
+            // Direction of travel on XZ, for the Warden plate arc.
+            let ddx: f64 = px[p_direct_slot] - p_x;
+            let ddz: f64 = pz[p_direct_slot] - p_z;
+            let dl: f64 = sqrt(ddx * ddx + ddz * ddz);
+            let ndx: f64 = 0.0;
+            let ndz: f64 = 0.0;
+            if (dl > 0.0) { ndx = ddx / dl; ndz = ddz / dl; }
+            pj_damage(ps, w, p_direct_slot, dmg, src, PEV_HIT, ndx, ndz, p_x, p_y, p_z);
+            if (bdps > 0) { proj_burn_apply(ps, w, tid, src, bdps, bticks); }
+        }
+        ps.detonations = ps.detonations + 1;
+    }
+    pj_retire(ps, w, i);
+}
+
+// ---------------------------------------------------------------------------
+// THE STEP
+// ---------------------------------------------------------------------------
+// Stage (d) of ARCHITECTURE §4.3.  Runs after movement and weapons, before AI.
+//
+// The order inside it is API too, and it is:
+//     1. clear this tick's events
+//     2. burn ticks           (a burn applied this tick starts NEXT tick)
+//     3. flight: integrate, collide, detonate
+//     4. age tracers
+// Burn before flight so that a body detonating this tick cannot also deal its
+// first burn tick this tick — otherwise the 5 s burn would deal 26 ticks the
+// once and 25 every other time, depending on arrival phase.
+//
+// Returns the number of bodies that left the air this tick.
+export fn proj_step(p_ps: object, p_w: object): i32 {
+    let ps: object = p_ps;
+    let w: object = p_w;
+
+    ps.ev_n = 0;
+    pj_burn_step(ps, w);
+
+    let dt: f64 = g_TICK_DT;
+    let half_dt2: f64 = 0.5 * dt * dt;
+
+    let wx: array<f64> = w.px;
+    let wy: array<f64> = w.py;
+    let wz: array<f64> = w.pz;
+    let wvx: array<f64> = w.vx;
+    let wvy: array<f64> = w.vy;
+    let wvz: array<f64> = w.vz;
+
+    let ai: array<i32> = ps.p_id;
+    let at: array<i32> = ps.p_type;
+    let ao: array<i32> = ps.p_owner;
+    let ate: array<i32> = ps.p_team;
+    let ag: array<i32> = ps.p_age;
+    let af: array<i32> = ps.p_fuse;
+    let ax0: array<f64> = ps.p_x0;
+    let az0: array<f64> = ps.p_z0;
+
+    let gtab: array<f64> = PROJ_G;
+    let rtab: array<f64> = PROJ_RANGE;
+    let brtab: array<f64> = PROJ_BODY_R;
+
+    let body_r: f64 = ps.body_r;
+    let hh: f64 = ps.half_h;
+    let terrain: i32 = ps.terrain;
+
+    // The sweep is the only hot thing in this file: bodies in flight x live
+    // targets, every tick.  Two measured optimisations apply to it, and both
+    // are in CLAUDE.md §4 (A9b "pass an index, not ten arguments"; N2 "a free
+    // function beats a method per element"):
+    //   * gather the candidates ONCE per tick, not once per body   (below)
+    //   * hand-inline `pj_targetable` and `proj_seg_sphere_t` into the loop
+    // Measured together on this box, 8 bodies / 14 targets / 14 burning,
+    // min-of-7 compiled: 0.0852 -> 0.0247 ms per tick, 3.4x.
+    //
+    // The two inline copies must stay in step with the two named functions.
+    // `pj_targetable` is still what `proj_aoe` uses; `proj_seg_sphere_t` is
+    // exported and is what the probe's tunnelling assertions exercise, while
+    // its in-flight collision assertions come through this loop — so the two
+    // implementations are tested against the same expectations and a divergence
+    // between them fails the probe.
+    pj_build_targets(ps, w);
+    let tg_slot: array<i32> = ps.tg_slot;
+    let tg_id: array<i32> = ps.tg_id;
+    let tg_team: array<i32> = ps.tg_team;
+    let tg_x: array<f64> = ps.tg_x;
+    let tg_y: array<f64> = ps.tg_y;
+    let tg_z: array<f64> = ps.tg_z;
+
+    let retired: i32 = 0;
+    let i: i32 = 0;
+    while (i < ps.n) {
+        let pid: i32 = ai[i];
+        let s: i32 = world_slot_of(w, pid);
+        if (s == SLOT_NONE) {
+            // Something outside this module removed the body.  Drop the row
+            // without despawning (there is nothing left to despawn).
+            let last: i32 = ps.n - 1;
+            if (i != last) {
+                ai[i] = ai[last]; at[i] = at[last]; ao[i] = ao[last];
+                ate[i] = ate[last]; ag[i] = ag[last]; af[i] = af[last];
+                let ay0: array<f64> = ps.p_y0;
+                ax0[i] = ax0[last]; ay0[i] = ay0[last]; az0[i] = az0[last];
+            }
+            ps.n = last;
+        } else {
+            let ty: i32 = at[i];
+            let g: f64 = gtab[ty];
+
+            let px: f64 = wx[s];
+            let py: f64 = wy[s];
+            let pz: f64 = wz[s];
+            let vx: f64 = wvx[s];
+            let vy: f64 = wvy[s];
+            let vz: f64 = wvz[s];
+
+            // THE INTEGRATOR — exact for constant acceleration at any dt.
+            let nx: f64 = px + vx * dt;
+            let ny: f64 = py + vy * dt - g * half_dt2;
+            let nz: f64 = pz + vz * dt;
+            let nvy: f64 = vy - g * dt;
+
+            // ---- entity sweep along this tick's segment -------------------
+            let rr: f64 = body_r + brtab[ty];
+            let best_t: f64 = 2.0;
+            let best_s: i32 = SLOT_NONE;
+            let src: i32 = ao[i];
+            let team: i32 = ate[i];
+            let tgt_n: i32 = ps.tgt_n;
+            let sdx: f64 = nx - px;
+            let sdy: f64 = ny - py;
+            let sdz: f64 = nz - pz;
+            let saa: f64 = sdx * sdx + sdy * sdy + sdz * sdz;
+            let rr2: f64 = rr * rr;
+            let j: i32 = 0;
+            while (j < tgt_n) {
+                // --- the owner / friendly-fire half of pj_targetable -------
+                // (kind, liveness and the capsule centre were resolved when the
+                // candidate list was gathered, once for the whole tick)
+                let ok: i32 = 1;
+                if (tg_id[j] == src) { ok = 0; }
+                else { if (team != 0) { if (tg_team[j] == team) { ok = 0; } } }
+                if (ok == 1) {
+                    // --- proj_seg_sphere_t, inlined ------------------------
+                    let mx: f64 = px - tg_x[j];
+                    let my: f64 = py - tg_y[j];
+                    let mz: f64 = pz - tg_z[j];
+                    let ccq: f64 = mx * mx + my * my + mz * mz - rr2;
+                    if (ccq <= 0.0) {
+                        if (0.0 < best_t) { best_t = 0.0; best_s = tg_slot[j]; }
+                    } else {
+                        let bbq: f64 = mx * sdx + my * sdy + mz * sdz;
+                        if (bbq < 0.0) {
+                            if (saa > 0.0) {
+                                let disc: f64 = bbq * bbq - saa * ccq;
+                                if (disc >= 0.0) {
+                                    let t: f64 = (0.0 - bbq - sqrt(disc)) / saa;
+                                    if (t <= 1.0) {
+                                        if (t < 0.0) { t = 0.0; }
+                                        if (t < best_t) { best_t = t; best_s = tg_slot[j]; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                j++;
+            }
+
+            let hit_x: f64 = nx;
+            let hit_y: f64 = ny;
+            let hit_z: f64 = nz;
+            let boom: i32 = 0;
+
+            if (best_s != SLOT_NONE) {
+                hit_x = px + (nx - px) * best_t;
+                hit_y = py + (ny - py) * best_t;
+                hit_z = pz + (nz - pz) * best_t;
+                boom = 1;
+            }
+
+            // ---- terrain ---------------------------------------------------
+            if (boom == 0) {
+                if (terrain == 1) {
+                    let cs: object = ps.cs;
+                    let h: f64 = chunk_height_at(cs, nx, nz);
+                    if (h != CHUNK_H_MISS) {
+                        if (ny <= h) {
+                            // Six fixed bisections for the crossing point.  A
+                            // fixed count keeps it deterministic; the residual
+                            // is under 2 mm at 0.1 m/tick.
+                            let lo: f64 = 0.0;
+                            let hi: f64 = 1.0;
+                            let k: i32 = 0;
+                            while (k < 6) {
+                                let mid: f64 = (lo + hi) * 0.5;
+                                let mxp: f64 = px + (nx - px) * mid;
+                                let myp: f64 = py + (ny - py) * mid;
+                                let mzp: f64 = pz + (nz - pz) * mid;
+                                let mh: f64 = chunk_height_at(cs, mxp, mzp);
+                                if (mh == CHUNK_H_MISS) { mh = h; }
+                                if (myp <= mh) { hi = mid; } else { lo = mid; }
+                                k++;
+                            }
+                            hit_x = px + (nx - px) * hi;
+                            hit_y = py + (ny - py) * hi;
+                            hit_z = pz + (nz - pz) * hi;
+                            let gh: f64 = chunk_height_at(cs, hit_x, hit_z);
+                            if (gh != CHUNK_H_MISS) { hit_y = gh; }
+                            boom = 1;
+                        }
+                    }
+                }
+            }
+
+            if (boom == 1) {
+                pj_detonate(ps, w, i, hit_x, hit_y, hit_z, best_s);
+                // The blast may have killed bodies and the retire despawned one,
+                // which swaps a slot: every cached candidate index is stale now.
+                pj_build_targets(ps, w);
+                retired++;
+            } else {
+                wx[s] = nx;
+                wy[s] = ny;
+                wz[s] = nz;
+                wvy[s] = nvy;
+                ag[i] = ag[i] + 1;
+                af[i] = af[i] - 1;
+
+                // ---- range cull and fuse: a fizzle, never a free blast -----
+                let ddx: f64 = nx - ax0[i];
+                let ddz: f64 = nz - az0[i];
+                let range: f64 = rtab[ty];
+                let over: i32 = 0;
+                if (ddx * ddx + ddz * ddz > range * range) { over = 1; }
+                if (af[i] <= 0) { over = 1; }
+                if (over == 1) {
+                    pj_ev(ps, PEV_EXPIRE, pid, src, ty, 0, nx, ny, nz);
+                    ps.expiries = ps.expiries + 1;
+                    pj_retire(ps, w, i);
+                    pj_build_targets(ps, w);      // the despawn swapped a slot
+                    retired++;
+                } else {
+                    i++;
+                }
+            }
+        }
+    }
+
+    pj_tracers_step(ps);
+    let out: i32 = retired;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE STATE HASH — authoritative state only
+// ---------------------------------------------------------------------------
+// Cosmetics (tracers, per-weapon shot counters, the event ring) are DELIBERATELY
+// excluded: they are never replicated, and folding them in would make a client
+// that draws fewer tracers look like a desync.
+//
+// All mixing in u64 (A13).  Positions are quantized to millimetres so the hash
+// is a statement about the simulation, not about the last bit of an f64.
+fn pj_mix(p_h: u64, p_k: i32): u64 {
+    let h: u64 = p_h;
+    let k: i32 = p_k;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    h = h ^ u;
+    h = h * 1099511628211;
+    h = h ^ (h >> 29);
+    let out: u64 = h;
+    return out;
+}
+
+export fn proj_state_hash(p_ps: object, p_w: object): u64 {
+    let ps: object = p_ps;
+    let w: object = p_w;
+    let h: u64 = 14695981039346656037;
+
+    let ai: array<i32> = ps.p_id;
+    let at: array<i32> = ps.p_type;
+    let ao: array<i32> = ps.p_owner;
+    let ag: array<i32> = ps.p_age;
+    let wx: array<f64> = w.px;
+    let wy: array<f64> = w.py;
+    let wz: array<f64> = w.pz;
+    let wvx: array<f64> = w.vx;
+    let wvy: array<f64> = w.vy;
+    let wvz: array<f64> = w.vz;
+
+    let n: i32 = ps.n;
+    h = pj_mix(h, n);
+    let i: i32 = 0;
+    while (i < n) {
+        h = pj_mix(h, ai[i]);
+        h = pj_mix(h, at[i]);
+        h = pj_mix(h, ao[i]);
+        h = pj_mix(h, ag[i]);
+        let s: i32 = world_slot_of(w, ai[i]);
+        if (s != SLOT_NONE) {
+            h = pj_mix(h, i32(wx[s] * 1000.0));
+            h = pj_mix(h, i32(wy[s] * 1000.0));
+            h = pj_mix(h, i32(wz[s] * 1000.0));
+            h = pj_mix(h, i32(wvx[s] * 1000.0));
+            h = pj_mix(h, i32(wvy[s] * 1000.0));
+            h = pj_mix(h, i32(wvz[s] * 1000.0));
+        }
+        i++;
+    }
+
+    let bi: array<i32> = ps.b_id;
+    let bd: array<i32> = ps.b_dps;
+    let bu: array<i32> = ps.b_dur;
+    let be: array<i32> = ps.b_el;
+    let bo: array<i32> = ps.b_out;
+    let bn: i32 = ps.bn;
+    h = pj_mix(h, bn);
+    let k: i32 = 0;
+    while (k < bn) {
+        h = pj_mix(h, bi[k]);
+        h = pj_mix(h, bd[k]);
+        h = pj_mix(h, bu[k]);
+        h = pj_mix(h, be[k]);
+        h = pj_mix(h, bo[k]);
+        k++;
+    }
+
+    h = pj_mix(h, ps.spawns);
+    h = pj_mix(h, ps.detonations);
+    h = pj_mix(h, ps.expiries);
+    h = pj_mix(h, ps.hits);
+    h = pj_mix(h, ps.kills);
+    h = pj_mix(h, ps.burn_ticks);
+    let out: u64 = h;
+    return out;
+}

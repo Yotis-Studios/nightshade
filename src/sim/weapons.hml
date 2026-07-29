@@ -1,0 +1,1070 @@
+// weapons.hml — the GDD §2.4 arsenal, as DATA.
+//
+// W4-2. Owner: the sim. Imports only `src/core/config.hml` (the ids and the two
+// non-per-weapon model constants) and other `src/sim/**`. No SDL, no renderer,
+// no wall clock, no `@stdlib/random`.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS FILE IS A TABLE AND NOT A SWITCH STATEMENT
+// ---------------------------------------------------------------------------
+// Balance is retuned constantly. A `switch (weapon) { case SPARROW: ... }` makes
+// every retune a code change in six places and makes "print the whole table"
+// impossible. Everything here is a **parallel array indexed by weapon id**, so:
+//   - a retune is one number on one line,
+//   - the TTK matrix is a double loop, not six hand-written cases,
+//   - adding a seventh weapon is six pushes and nothing else,
+//   - and `tools/probe_weapons.hml --ttk` can print the design back at you.
+// ARCHITECTURE §5.4 and CLAUDE.md A5/A7 both say the same thing: parallel
+// `array`s, never objects, never a `define` struct.
+//
+// ---------------------------------------------------------------------------
+// THE D2 AMENDMENT — Longshadow
+// ---------------------------------------------------------------------------
+// GDD §2.4 gives Longshadow falloff r0/r1 = 55/110 m and "max useful 140 m".
+// ARCHITECTURE.md §0 decision **D2** caps `FOG_FAR` at 72 m — you cannot see,
+// let alone shoot, past the fog. Per D2 the falloff is amended here to
+// **r0 = 34 m, r1 = 68 m, max useful 72 m**, which keeps the *shape* of the
+// weapon (it is the only gun whose falloff starts beyond every other gun's max
+// range) inside a world that ends at 72 m. Every other weapon's max useful range
+// was already under the cap. This is the ONLY deviation from the printed table
+// and it is a documented decision, not a silent retune.
+//
+// ---------------------------------------------------------------------------
+// RECOIL IS DETERMINISTIC, AND IT IS *AIM*, NOT *VIEW*
+// ---------------------------------------------------------------------------
+// Each shot adds `(kick_v, kick_h)` degrees to an aim offset that decays toward
+// zero at `recover °/s`, starting `g_RECOIL_SETTLE_S` (0.16 s) after the last
+// shot. The vertical column is FIXED — the pattern is meant to be learned. Only
+// `kick_h` carries randomness, and that randomness comes from `src/sim/rng.hml`
+// seeded from (world_seed, RNG_SPREAD, tick, entity). Never a wall clock, never
+// `@stdlib/random`: the same seed and the same commands must reproduce the same
+// bullet, bit for bit, on the client's prediction and on the server.
+//
+// The offset this module maintains is **`recoil_aim`** — it moves the bullet, so
+// per NETWORKING.md §12.2 the client adds it into the `yaw_q`/`pitch_q` it sends,
+// and the server verifies it against this very table. `recoil_view` (the camera
+// kick, the viewmodel punch, the shake) is a CLIENT-ONLY cosmetic that lives in
+// `src/render/view.hml` and appears nowhere in this file.
+//
+// ---------------------------------------------------------------------------
+// FOUR NUMBERS THE GDD DOES NOT GIVE — declared, not smuggled
+// ---------------------------------------------------------------------------
+// §2.4 specifies bloom *per shot* and the hipfire cap, but not how bloom
+// recovers; and it gives the recoil pattern's length but not when the pattern
+// index resets. Those are needed to have a working gun, so they are defined
+// HERE, in the open, as named constants:
+//   g_BLOOM_RECOVER_S   0.35 s  base<-cap recovery, starting after the settle
+//   g_PATTERN_RESET_S   0.40 s  of not firing resets the recoil pattern index
+//   (the pattern index also resets on reload and on weapon swap — note that
+//    every pattern's length is EXACTLY its weapon's magazine size, 30 and 32,
+//    which is the GDD telling you the pattern is per-magazine)
+//   g_SWAP_READY_FRAC   1.0     a swap is not fireable until fully "in"
+// Reported to the orchestrator. If design disagrees, they are one line each.
+
+import { sqrt } from "@stdlib/math";
+
+import { g_TICK_DT, g_RECOIL_SETTLE_S, g_WPN_COUNT,
+         g_WPN_SPARROW, g_WPN_TINKER, g_WPN_BELLOWS,
+         g_WPN_LONGSHADOW, g_WPN_KESTREL, g_WPN_EMBERLANCE
+       } from "../core/config.hml";
+
+import { rng_f11 } from "./rng.hml";
+
+// ---------------------------------------------------------------------------
+// WEAPON IDS — mirrored from config.hml under the names ARCHITECTURE §5.4 lists.
+// config.hml owns the values; these are the sim-side spelling. The probe asserts
+// the two agree, so a renumber in either place is a red test, never a silent
+// off-by-one in a parallel array index.
+// ---------------------------------------------------------------------------
+export let WPN_NONE       = -1;
+export let WPN_SPARROW    = 0;
+export let WPN_TINKER     = 1;
+export let WPN_BELLOWS    = 2;
+export let WPN_LONGSHADOW = 3;
+export let WPN_KESTREL    = 4;
+export let WPN_EMBERLANCE = 5;
+export let WPN_COUNT      = 6;
+
+// ---------------------------------------------------------------------------
+// THE TABLE — 24 parallel arrays, index = weapon id.
+//                Sparrow Tinker  Bellows Longshadow Kestrel Emberlance
+// ---------------------------------------------------------------------------
+
+// -- damage ------------------------------------------------------------------
+// Per PELLET. Bellows fires 9 of them; every other weapon fires 1.
+export let g_wpn_dmg_near  = [ 26.0,  19.0,  13.0,  78.0,  45.0,  60.0 ];
+export let g_wpn_dmg_far   = [ 18.0,  11.0,   5.0,  68.0,  30.0,  60.0 ];
+export let g_wpn_hs_mult   = [  1.50,  1.40,  1.25,  2.10,  1.50,  1.00 ];
+export let g_wpn_pellets   = [  1,     1,     9,     1,     1,     1    ];
+
+// -- range falloff -----------------------------------------------------------
+// dmg(r) = lerp(near, far, clamp((r - r0) / (r1 - r0), 0, 1))
+// Emberlance has no falloff (r1 == r0 -> t is pinned at 0 -> always dmg_near).
+// Longshadow: 34/68, amended per D2. See the header.
+export let g_wpn_r0        = [ 22.0,   9.0,   6.0,  34.0,  14.0,   0.0 ];
+export let g_wpn_r1        = [ 46.0,  22.0,  14.0,  68.0,  30.0,   0.0 ];
+export let g_wpn_max_range = [ 70.0,  35.0,  18.0,  72.0,  45.0,  40.0 ];
+
+// -- Emberlance only ---------------------------------------------------------
+// Kept in the table (as zeroes elsewhere) rather than in a special case, so
+// projectiles.hml reads them the same way it reads everything else.
+export let g_wpn_burn_dps  = [  0.0,   0.0,   0.0,   0.0,   0.0,  12.0 ];
+export let g_wpn_burn_s    = [  0.0,   0.0,   0.0,   0.0,   0.0,   5.0 ];
+export let g_wpn_aoe_m     = [  0.0,   0.0,   0.0,   0.0,   0.0,   3.5 ];
+export let g_wpn_proj_mps  = [  0.0,   0.0,   0.0,   0.0,   0.0,   6.0 ];
+
+// -- rate of fire and ammo ---------------------------------------------------
+export let g_wpn_rpm       = [690.0, 900.0,  75.0,  75.0, 200.0,  40.0 ];
+export let g_wpn_mag       = [ 30,    32,     6,     8,     6,     3   ];
+export let g_wpn_reserve   = [210,   256,    42,    56,    48,    12   ];
+
+// Reload. `shell` weapons reload one round at a time and are interruptible;
+// for them `reload` is the PER-SHELL time and `reload_empty` is the same.
+export let g_wpn_reload    = [  1.85,  1.55,  0.55,  2.30,  2.10,  2.60 ];
+export let g_wpn_reload_e  = [  2.40,  2.05,  0.55,  2.85,  2.10,  2.60 ];
+export let g_wpn_shell     = [  0,     0,     1,     0,     0,     0    ];
+
+// -- handling ----------------------------------------------------------------
+export let g_wpn_ads_s     = [  0.24,  0.19,  0.30,  0.38,  0.22,  0.34 ];
+export let g_wpn_stf_s     = [  0.22,  0.18,  0.28,  0.34,  0.20,  0.30 ];
+export let g_wpn_swap_in   = [  0.55,  0.45,  0.62,  0.75,  0.35,  0.70 ];
+export let g_wpn_swap_out  = [  0.40,  0.32,  0.48,  0.55,  0.25,  0.50 ];
+// Longshadow's "forced 0.35 s re-settle before ADS is true again".
+export let g_wpn_resettle  = [  0.0,   0.0,   0.0,   0.35,  0.0,   0.0  ];
+
+// -- spread, in DEGREES (cone half-angle) ------------------------------------
+// Bellows and Emberlance have a fixed cone: base == cap, bloom == 0.
+export let g_wpn_spr_base  = [  3.2,   4.0,   6.5,   9.0,   3.6,   2.5  ];
+export let g_wpn_spr_cap   = [  6.0,   7.5,   6.5,   9.0,   6.5,   2.5  ];
+export let g_wpn_spr_bloom = [  0.35,  0.30,  0.0,   1.20,  0.55,  0.0  ];
+export let g_wpn_spr_ads   = [  0.25,  0.55,  4.5,   0.05,  0.20,  1.0  ];
+
+// -- recoil ------------------------------------------------------------------
+export let g_wpn_recover   = [  7.0,   9.0,   5.0,   4.0,   8.0,   6.0  ];
+// Extra symmetric jitter added to kick_h ONLY. Never to kick_v: the vertical
+// column is the thing the player learns.
+export let g_wpn_jitter    = [  0.06,  0.10,  0.0,   0.0,   0.0,   0.0  ];
+
+// ---------------------------------------------------------------------------
+// THE RECOIL PATTERNS — one flat run-length-expanded table, base + length per
+// weapon, exactly as §2.4 prints them.
+//
+//   rc_v[i]     fixed vertical kick, degrees          (never randomised)
+//   rc_h[i]     fixed horizontal kick, degrees        (the learnable drift)
+//   rc_r[i]     symmetric random horizontal amplitude (the "+/-" entries)
+//
+// kick_h = rc_h[i] + U(-rc_r[i], +rc_r[i]) + U(-jitter, +jitter)
+//
+// Note the lengths: Sparrow 30 == its magazine, Tinker 32 == its magazine. The
+// pattern is per-magazine by construction.
+// ---------------------------------------------------------------------------
+export let g_rc_v = [];
+export let g_rc_h = [];
+export let g_rc_r = [];
+export let g_wpn_rc_base = [ 0, 0, 0, 0, 0, 0 ];
+export let g_wpn_rc_len  = [ 0, 0, 0, 0, 0, 0 ];
+
+// Append `n` identical (v, h, r) entries. Cold: runs once, at module load.
+fn rc_run(n: i32, v: f64, h: f64, r: f64) {
+    let i = 0;
+    while (i < n) {
+        g_rc_v.push(v);
+        g_rc_h.push(h);
+        g_rc_r.push(r);
+        i = i + 1;
+    }
+}
+
+fn rc_begin(w: i32) {
+    g_wpn_rc_base[w] = g_rc_v.length;
+}
+
+fn rc_end(w: i32) {
+    g_wpn_rc_len[w] = g_rc_v.length - g_wpn_rc_base[w];
+}
+
+fn build_recoil_tables() {
+    // Sparrow (recover 7.0 °/s, jitter +/-0.06°)
+    //   shot 1-3   : (0.62, 0.00) (0.60, -0.06) (0.58, +0.10)
+    //   shot 4-8   : (0.42, +0.22)     drifts right
+    //   shot 9-15  : (0.30, -0.18)     hooks left
+    //   shot 16-30 : (0.26, +/-0.20 random)
+    rc_begin(0);
+    rc_run(1,  0.62,  0.00, 0.00);
+    rc_run(1,  0.60, -0.06, 0.00);
+    rc_run(1,  0.58,  0.10, 0.00);
+    rc_run(5,  0.42,  0.22, 0.00);
+    rc_run(7,  0.30, -0.18, 0.00);
+    rc_run(15, 0.26,  0.00, 0.20);
+    rc_end(0);
+
+    // Tinker (recover 9.0 °/s, jitter +/-0.10°)
+    //   shot 1-5   : (0.38, +0.05)
+    //   shot 6-14  : (0.34, +0.26)     hard right climb
+    //   shot 15-32 : (0.30, -0.30)     whips left
+    rc_begin(1);
+    rc_run(5,  0.38,  0.05, 0.00);
+    rc_run(9,  0.34,  0.26, 0.00);
+    rc_run(18, 0.30, -0.30, 0.00);
+    rc_end(1);
+
+    // The four single-shot patterns. Their "+/-" IS the randomness, so it goes
+    // in rc_r and their jitter column is 0 — one source of horizontal noise per
+    // weapon, never two stacked by accident.
+    rc_begin(2); rc_run(1, 2.40, 0.00, 0.30); rc_end(2);   // Bellows
+    rc_begin(3); rc_run(1, 2.90, 0.00, 0.15); rc_end(3);   // Longshadow
+    rc_begin(4); rc_run(1, 1.35, 0.00, 0.25); rc_end(4);   // Kestrel
+    rc_begin(5); rc_run(1, 1.80, 0.00, 0.00); rc_end(5);   // Emberlance
+}
+
+build_recoil_tables();
+
+// ---------------------------------------------------------------------------
+// THE FOUR CONSTANTS THE GDD DOES NOT SPECIFY — see the header.
+// ---------------------------------------------------------------------------
+export let g_BLOOM_RECOVER_S = 0.35;   // cap -> base, after the settle window
+export let g_PATTERN_RESET_S = 0.40;   // idle time that resets the pattern index
+export let g_SWAP_READY_FRAC = 1.0;    // swap must fully complete before firing
+export let g_ADS_EPS         = 0.0001; // ads fraction below this counts as hip
+
+// Timer epsilon, in seconds. A duration is "elapsed" when less than this much
+// remains. Without it, `1.85 - 111 * (1/60)` leaves 1.1e-16 s on the clock and
+// EVERY Sparrow reload silently costs a 112th tick — a 0.9 % balance drift on
+// every timed value in the game, invisible in the source and impossible to spot
+// in play. 1e-9 s is 6 000 000x smaller than a tick, so it can never swallow a
+// real remainder, and it is a constant, so it is identical on both backends.
+export let g_T_EPS = 1.0e-9;
+
+// ===========================================================================
+//  QUERIES — pure functions of the table. No state, no allocation.
+// ===========================================================================
+
+// 1 when `w` names a real weapon. Every query below returns a safe zero for a
+// bad id rather than trapping: a bad weapon id is a bug upstream, and crashing
+// the authoritative server on it is worse than firing a 0-damage blank.
+export fn wpn_valid(p_w: i32): i32 {
+    let w: i32 = p_w;
+    let out: i32 = 0;
+    if (w >= 0) { if (w < 6) { out = 1; } }
+    return out;
+}
+
+// Per-PELLET damage at range r, before the headshot multiplier.
+export fn wpn_dmg_at(p_w: i32, p_r: f64): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let dn: f64 = g_wpn_dmg_near[w];
+    let df: f64 = g_wpn_dmg_far[w];
+    let r0: f64 = g_wpn_r0[w];
+    let r1: f64 = g_wpn_r1[w];
+    let t: f64 = 0.0;
+    if (r1 > r0) {
+        t = (p_r - r0) / (r1 - r0);
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+    }
+    let out: f64 = dn + (df - dn) * t;
+    return out;
+}
+
+// Damage a single connecting PELLET deals at range r. `p_head` is 0/1.
+export fn wpn_dmg_hit(p_w: i32, p_r: f64, p_head: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let d: f64 = wpn_dmg_at(w, p_r);
+    if (p_head != 0) { d = d * g_wpn_hs_mult[w]; }
+    let out: f64 = d;
+    return out;
+}
+
+// Damage of one full trigger pull with EVERY pellet connecting. This is the
+// number the TTK matrix is built from; combat.hml resolves pellets one at a
+// time and will usually land fewer.
+export fn wpn_dmg_shot(p_w: i32, p_r: f64, p_head: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let d: f64 = wpn_dmg_hit(w, p_r, p_head);
+    let out: f64 = d * f64(g_wpn_pellets[w]);
+    return out;
+}
+
+export fn wpn_rpm(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_rpm[w];
+    return out;
+}
+
+// Seconds between shots. The design number, 60/RPM — the SIM quantizes firing
+// to the 1/60 s tick, so measured RPM in game is this rounded up to a tick
+// boundary. That is a property of a fixed timestep, not of this table.
+export fn wpn_shot_interval(p_w: i32): f64 {
+    let r: f64 = wpn_rpm(p_w);
+    if (r <= 0.0) { let z: f64 = 0.0; return z; }
+    let out: f64 = 60.0 / r;
+    return out;
+}
+
+export fn wpn_mag(p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: i32 = 0; return z; }
+    if (w > 5) { let z: i32 = 0; return z; }
+    let out: i32 = g_wpn_mag[w];
+    return out;
+}
+
+export fn wpn_reserve(p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: i32 = 0; return z; }
+    if (w > 5) { let z: i32 = 0; return z; }
+    let out: i32 = g_wpn_reserve[w];
+    return out;
+}
+
+export fn wpn_pellets(p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: i32 = 0; return z; }
+    if (w > 5) { let z: i32 = 0; return z; }
+    let out: i32 = g_wpn_pellets[w];
+    return out;
+}
+
+// Reload duration. `p_empty` 0/1 picks the empty-magazine variant. For a shell
+// loader this is the per-shell time and both variants are equal.
+export fn wpn_reload_time(p_w: i32, p_empty: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_reload[w];
+    if (p_empty != 0) { out = g_wpn_reload_e[w]; }
+    return out;
+}
+
+export fn wpn_is_shell_reload(p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: i32 = 0; return z; }
+    if (w > 5) { let z: i32 = 0; return z; }
+    let out: i32 = g_wpn_shell[w];
+    return out;
+}
+
+export fn wpn_ads_time(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_ads_s[w];
+    return out;
+}
+
+export fn wpn_sprint_to_fire(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_stf_s[w];
+    return out;
+}
+
+export fn wpn_swap_in(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_swap_in[w];
+    return out;
+}
+
+export fn wpn_swap_out(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_swap_out[w];
+    return out;
+}
+
+export fn wpn_max_range(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_max_range[w];
+    return out;
+}
+
+// The GDD §2.4 spread figure for the current stance, in DEGREES, read as the
+// FULL cone angle — §2.4 writes "6.5° cone (fixed)" and "4.5° cone", and a
+// "cone" is its apex angle. `wpn_spread_half_rad` below is the half-angle a
+// ray-cone test actually wants; DO NOT feed this function's output to one.
+//
+// The reading is load-bearing, not a rounding choice: as a HALF-angle the
+// Bellows' pellet disc is 1.37 m across at 6 m — wider than a Husk — and "the
+// Bellows one-shots a Husk inside 6 m", the entire reason to play Ashwood,
+// stops being true. `src/sim/combat.hml` (W4-3) reached the same conclusion
+// independently and its injected adapter is `deg * 0.5 * PI/180`, identical to
+// `wpn_spread_half_rad`. Both are REPORTED: §2.4 does not say which it is.
+//
+//   p_bloom  accumulated bloom in degrees (0 for a rested weapon)
+//   p_ads01  0 = hip, 1 = fully aimed, fractions during the ADS lerp
+export fn wpn_spread(p_w: i32, p_bloom: f64, p_ads01: f64): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let base: f64 = g_wpn_spr_base[w];
+    let cap: f64 = g_wpn_spr_cap[w];
+    let hip: f64 = base + p_bloom;
+    if (hip > cap) { hip = cap; }
+    let a: f64 = p_ads01;
+    if (a < 0.0) { a = 0.0; }
+    if (a > 1.0) { a = 1.0; }
+    let ads: f64 = g_wpn_spr_ads[w];
+    // The two-term form, NOT `hip + (ads - hip) * a`: at a == 1.0 that leaves
+    // 7e-17 of the hip value behind and the aimed cone is not exactly the
+    // table's ADS number. This form is exact at both endpoints.
+    let out: f64 = hip * (1.0 - a) + ads * a;
+    return out;
+}
+
+// The same cone as `wpn_spread`, converted once, here, into the HALF-ANGLE IN
+// RADIANS that a ray-vs-cone test needs. One conversion in one place — every
+// consumer that rolls its own is a chance to disagree by a factor of two.
+export fn wpn_spread_half_rad(p_w: i32, p_bloom: f64, p_ads01: f64): f64 {
+    let deg: f64 = wpn_spread(p_w, p_bloom, p_ads01);
+    let out: f64 = deg * 0.008726646259971648;      // * 0.5 * PI / 180
+    return out;
+}
+
+// The GDD §2.4 headshot multiplier column. Exported as an accessor because
+// `combat.hml` (W4-3) needs it as an injected function value and a table array
+// cannot be injected as one.
+export fn wpn_hs_mult(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 1.0; return z; }
+    if (w > 5) { let z: f64 = 1.0; return z; }
+    let out: f64 = g_wpn_hs_mult[w];
+    return out;
+}
+
+// Accumulated bloom in DEGREES after `p_n` shots, clamped at the weapon's cap.
+// The bridge between a caller that counts shots (combat.hml's injected
+// `spread(wpn, ads, bloom: i32)`) and this module, which carries bloom as the
+// continuous degree value its recovery curve needs.
+export fn wpn_bloom_for_shots(p_w: i32, p_n: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let n: i32 = p_n;
+    if (n < 0) { n = 0; }
+    let b: f64 = f64(n) * g_wpn_spr_bloom[w];
+    let bmax: f64 = g_wpn_spr_cap[w] - g_wpn_spr_base[w];
+    if (b > bmax) { b = bmax; }
+    let out: f64 = b;
+    return out;
+}
+
+export fn wpn_bloom_per_shot(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_spr_bloom[w];
+    return out;
+}
+
+export fn wpn_bloom_max(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_spr_cap[w] - g_wpn_spr_base[w];
+    return out;
+}
+
+export fn wpn_recover(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_recover[w];
+    return out;
+}
+
+export fn wpn_jitter(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_jitter[w];
+    return out;
+}
+
+export fn wpn_pattern_len(p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: i32 = 0; return z; }
+    if (w > 5) { let z: i32 = 0; return z; }
+    let out: i32 = g_wpn_rc_len[w];
+    return out;
+}
+
+// Flat index into g_rc_*, clamped to the last entry of the weapon's pattern.
+// Past the end the pattern REPEATS ITS LAST ENTRY rather than wrapping: a mag
+// extended by an affix must not restart the climb halfway through a spray.
+fn rc_index(p_w: i32, p_shot: i32): i32 {
+    let w: i32 = p_w;
+    let n: i32 = g_wpn_rc_len[w];
+    let s: i32 = p_shot;
+    if (s < 0) { s = 0; }
+    if (s >= n) { s = n - 1; }
+    let out: i32 = g_wpn_rc_base[w] + s;
+    return out;
+}
+
+// The FIXED vertical kick of shot `p_shot` (0-based). Never randomised.
+export fn wpn_recoil_v(p_w: i32, p_shot: i32): f64 {
+    if (wpn_valid(p_w) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_rc_v[rc_index(p_w, p_shot)];
+    return out;
+}
+
+// The FIXED horizontal component of shot `p_shot`, jitter excluded.
+export fn wpn_recoil_h(p_w: i32, p_shot: i32): f64 {
+    if (wpn_valid(p_w) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_rc_h[rc_index(p_w, p_shot)];
+    return out;
+}
+
+// The symmetric random horizontal amplitude of shot `p_shot` (the "+/-" cells).
+export fn wpn_recoil_rand(p_w: i32, p_shot: i32): f64 {
+    if (wpn_valid(p_w) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_rc_r[rc_index(p_w, p_shot)];
+    return out;
+}
+
+// THE recoil draw. Writes `p_out[0] = kick_v`, `p_out[1] = kick_h` in degrees
+// and returns 1. Consumes 0, 1 or 2 draws from `p_st` depending on the weapon —
+// a fixed, weapon-determined count, so two clients stepping the same weapon
+// consume the same amount of the same stream and stay in lock-step.
+//
+// `p_st` must already be seeded by the caller with (world_seed, RNG_SPREAD,
+// tick, entity). This function never seeds and never reads a clock.
+export fn wpn_recoil(p_w: i32, p_shot: i32, p_st: array, p_out: array): i32 {
+    let w: i32 = p_w;
+    if (wpn_valid(w) == 0) {
+        p_out[0] = 0.0;
+        p_out[1] = 0.0;
+        let z: i32 = 0;
+        return z;
+    }
+    let i: i32 = rc_index(w, p_shot);
+    let kv: f64 = g_rc_v[i];
+    let kh: f64 = g_rc_h[i];
+    let rr: f64 = g_rc_r[i];
+    if (rr > 0.0) { kh = kh + rng_f11(p_st) * rr; }
+    let jt: f64 = g_wpn_jitter[w];
+    if (jt > 0.0) { kh = kh + rng_f11(p_st) * jt; }
+    p_out[0] = kv;
+    p_out[1] = kh;
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// TTK — the §2.4 matrix, computed rather than copied.
+// ---------------------------------------------------------------------------
+
+// Smallest n with n * dmg >= hp. Positive arguments only.
+//
+// NOT `i32(hp / d) + 1`: f64 division of two exact decimals can land a ULP
+// either side of an integer, and this function decides whether a Bellows
+// one-shots a Husk. The quotient is only a starting guess; the answer is
+// settled by comparison, walking up and then down until n is minimal.
+fn ceil_div_f(p_hp: f64, p_dmg: f64): i32 {
+    let hp: f64 = p_hp;
+    let d: f64 = p_dmg;
+    if (d <= 0.0) { let z: i32 = 0; return z; }
+    let n: i32 = i32(hp / d);
+    if (n < 0) { n = 0; }
+    while (f64(n) * d < hp) { n = n + 1; }
+    let done: i32 = 0;
+    while (done == 0) {
+        if (n > 0) {
+            if (f64(n - 1) * d >= hp) { n = n - 1; } else { done = 1; }
+        } else {
+            done = 1;
+        }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// Shots to kill `p_hp` at range `p_r`, every pellet connecting.
+export fn wpn_ttk_shots(p_w: i32, p_hp: f64, p_r: f64, p_head: i32): i32 {
+    let d: f64 = wpn_dmg_shot(p_w, p_r, p_head);
+    let out: i32 = ceil_div_f(p_hp, d);
+    return out;
+}
+
+// Total damage one application of a weapon's burn DoT deals over its lifetime.
+// 0 for every weapon but the Emberlance.
+export fn wpn_burn_total(p_w: i32): f64 {
+    let w: i32 = p_w;
+    if (w < 0) { let z: f64 = 0.0; return z; }
+    if (w > 5) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_wpn_burn_dps[w] * g_wpn_burn_s[w];
+    return out;
+}
+
+// Shots to kill INCLUDING the burn DoT. The burn REFRESHES rather than stacks,
+// so a target eats `n` impacts plus exactly ONE full burn — which is the only
+// model that reproduces the whole GDD §2.4 Emberlance row (1/1/1+burn/1+burn/3).
+// Identical to `wpn_ttk_shots` for every weapon with no burn.
+export fn wpn_ttk_shots_dot(p_w: i32, p_hp: f64, p_r: f64, p_head: i32): i32 {
+    let burn: f64 = wpn_burn_total(p_w);
+    if (burn <= 0.0) {
+        let n0: i32 = wpn_ttk_shots(p_w, p_hp, p_r, p_head);
+        return n0;
+    }
+    let hp: f64 = p_hp - burn;
+    if (hp <= 0.0) { let one: i32 = 1; return one; }
+    let d: f64 = wpn_dmg_shot(p_w, p_r, p_head);
+    let out: i32 = ceil_div_f(hp, d);
+    if (out < 1) { out = 1; }
+    return out;
+}
+
+// Time to kill, in MILLISECONDS: (shots - 1) intervals. The first shot lands at
+// t = 0, which is why every one-shot kill in the GDD matrix reads "1 / 0".
+export fn wpn_ttk_ms(p_w: i32, p_hp: f64, p_r: f64, p_head: i32): f64 {
+    let n: i32 = wpn_ttk_shots(p_w, p_hp, p_r, p_head);
+    if (n <= 1) { let z: f64 = 0.0; return z; }
+    let rpm: f64 = wpn_rpm(p_w);
+    if (rpm <= 0.0) { let z: f64 = 0.0; return z; }
+    let out: f64 = f64(n - 1) * 60000.0 / rpm;
+    return out;
+}
+
+// ===========================================================================
+//  WEAPON RUNTIME STATE — a FLAT array, serialisable, no object graph.
+//
+//  One slot is WS_FIELDS numbers. `wpn_state_new(n)` allocates n slots in one
+//  array and every function takes the base offset `p_o = slot * WS_FIELDS`, so
+//  a 64-player server holds ONE array and the whole thing goes on a wire as a
+//  run of doubles (NETWORKING §3.7). No per-player object, no closure, nothing
+//  that cannot be snapshotted or rewound.
+// ===========================================================================
+
+export let WS_CUR        = 0;    // current weapon id, or WPN_NONE
+export let WS_PENDING    = 1;    // weapon being swapped to, or WPN_NONE
+export let WS_FIRE_T     = 2;    // s until the next shot is allowed
+export let WS_RELOAD_T   = 3;    // s remaining in the current reload, 0 = none
+export let WS_RELOAD_ON  = 4;    // 0 idle, 1 tactical, 2 empty, 3 shell
+export let WS_SWAP_T     = 5;    // s remaining in the current swap
+export let WS_SWAP_PH    = 6;    // 0 idle, 1 stowing, 2 raising
+export let WS_ADS        = 7;    // ADS fraction, 0 hip .. 1 aimed
+export let WS_STF_T      = 8;    // s of sprint-to-fire lockout remaining
+export let WS_SETTLE_T   = 9;    // s of forced re-settle remaining (Longshadow)
+export let WS_BLOOM      = 10;   // accumulated hipfire bloom, degrees
+export let WS_SHOT_IDX   = 11;   // recoil pattern index (shots since reset)
+export let WS_IDLE_T     = 12;   // s since the last shot
+export let WS_RC_V       = 13;   // recoil_aim pitch offset, degrees (up = +)
+export let WS_RC_H       = 14;   // recoil_aim yaw offset, degrees (right = +)
+export let WS_SHOTS      = 15;   // lifetime shot counter, for events/telemetry
+export let WS_MAG0       = 16;   // .. WS_MAG0 + 5, rounds in each magazine
+export let WS_RES0       = 22;   // .. WS_RES0 + 5, rounds in each reserve
+export let WS_FIELDS     = 28;
+
+// Allocate `p_slots` weapon states, all loaded and idle on WPN_KESTREL — the
+// sidearm you never lose (GDD §2.4). Allocation happens ONCE, at startup.
+export fn wpn_state_new(p_slots: i32): array {
+    let n: i32 = p_slots;
+    if (n < 1) { n = 1; }
+    let st = [];
+    let i = 0;
+    while (i < n * 28) { st.push(0.0); i = i + 1; }
+    let s = 0;
+    while (s < n) {
+        wpn_state_reset(st, s * 28, 4);
+        s = s + 1;
+    }
+    return st;
+}
+
+// Reset one slot: full magazines, full reserves, no timers, weapon `p_w` in hand.
+export fn wpn_state_reset(p_st: array, p_o: i32, p_w: i32) {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let w: i32 = p_w;
+    if (wpn_valid(w) == 0) { w = 4; }
+    let i = 0;
+    while (i < 28) { st[o + i] = 0.0; i = i + 1; }
+    st[o + 0] = f64(w);          // WS_CUR
+    st[o + 1] = -1.0;            // WS_PENDING
+    let k = 0;
+    while (k < 6) {
+        st[o + 16 + k] = f64(g_wpn_mag[k]);
+        st[o + 22 + k] = f64(g_wpn_reserve[k]);
+        k = k + 1;
+    }
+    return;
+}
+
+export fn wpn_cur(p_st: array, p_o: i32): i32 {
+    let out: i32 = i32(p_st[p_o + 0]);
+    return out;
+}
+
+export fn wpn_ammo(p_st: array, p_o: i32, p_w: i32): i32 {
+    if (wpn_valid(p_w) == 0) { let z: i32 = 0; return z; }
+    let out: i32 = i32(p_st[p_o + 16 + p_w]);
+    return out;
+}
+
+export fn wpn_reserve_ammo(p_st: array, p_o: i32, p_w: i32): i32 {
+    if (wpn_valid(p_w) == 0) { let z: i32 = 0; return z; }
+    let out: i32 = i32(p_st[p_o + 22 + p_w]);
+    return out;
+}
+
+// The recoil_aim offsets, in degrees. THESE ARE THE ONES THAT MOVE THE BULLET:
+// the client adds them to the aim it quantizes into `InputCommand.pitch_q` /
+// `yaw_q` (NETWORKING §12.2), and the server re-derives them from this same
+// table to verify. `recoil_view` is a different number owned by view.hml and it
+// appears nowhere in this file.
+export fn wpn_recoil_aim_pitch(p_st: array, p_o: i32): f64 {
+    let out: f64 = p_st[p_o + 13];
+    return out;
+}
+
+export fn wpn_recoil_aim_yaw(p_st: array, p_o: i32): f64 {
+    let out: f64 = p_st[p_o + 14];
+    return out;
+}
+
+// Current cone half-angle in degrees, given the slot's bloom and ADS fraction.
+export fn wpn_cur_spread(p_st: array, p_o: i32): f64 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let out: f64 = wpn_spread(i32(st[o + 0]), st[o + 10], st[o + 7]);
+    return out;
+}
+
+// 0/1: is this slot able to pull the trigger THIS tick?
+export fn wpn_can_fire(p_st: array, p_o: i32): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let w: i32 = i32(st[o + 0]);
+    if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    if (st[o + 2] > 0.0) { let z: i32 = 0; return z; }    // cooldown
+    if (st[o + 5] > 0.0) { let z: i32 = 0; return z; }    // mid-swap
+    if (st[o + 8] > 0.0) { let z: i32 = 0; return z; }    // sprint-to-fire
+    if (st[o + 3] > 0.0) {
+        // A shell reload is interruptible: firing cancels it. A magazine reload
+        // is not. GDD §2.4, "0.55 s/shell (interruptible)".
+        if (g_wpn_shell[w] == 0) { let z: i32 = 0; return z; }
+    }
+    if (st[o + 16 + w] < 1.0) { let z: i32 = 0; return z; }
+    let out: i32 = 1;
+    return out;
+}
+
+// Pull the trigger. Returns 1 if a shot left the barrel, else 0.
+//
+// `p_rng` must be seeded by the caller for THIS (tick, entity) before the call;
+// this function draws 0-2 values from it for the horizontal recoil and nothing
+// else. Consuming a fixed, weapon-determined number of draws is what keeps a
+// re-simulated tick on the client identical to the server's.
+export fn wpn_fire(p_st: array, p_o: i32, p_rng: array, p_out: array): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    if (wpn_can_fire(st, o) == 0) {
+        let z: i32 = 0;
+        return z;
+    }
+    let w: i32 = i32(st[o + 0]);
+
+    // A shell reload is cancelled by firing.
+    if (st[o + 3] > 0.0) {
+        st[o + 3] = 0.0;
+        st[o + 4] = 0.0;
+    }
+
+    // Ammo and cooldown. The interval is ADDED to whatever debt is on the clock
+    // rather than assigned, so the fractional remainder carries: 690 RPM is
+    // 5.217 ticks, and a weapon that SET its cooldown would fire every 6th tick
+    // and lose 13 % of its rate of fire to the timestep. `wpn_step` bounds the
+    // debt at one tick, so the carry can never bank a double shot.
+    st[o + 16 + w] = st[o + 16 + w] - 1.0;
+    st[o + 2] = st[o + 2] + 60.0 / g_wpn_rpm[w];
+    st[o + 15] = st[o + 15] + 1.0;
+    st[o + 12] = 0.0;
+    st[o + 9] = g_wpn_resettle[w];
+
+    // Recoil, from the pattern + the seeded stream. Vertical is never random.
+    let idx: i32 = i32(st[o + 11]);
+    wpn_recoil(w, idx, p_rng, p_out);
+    st[o + 13] = st[o + 13] + p_out[0];
+    st[o + 14] = st[o + 14] + p_out[1];
+    st[o + 11] = st[o + 11] + 1.0;
+
+    // Hipfire bloom, clamped at the weapon's cap.
+    let bmax: f64 = g_wpn_spr_cap[w] - g_wpn_spr_base[w];
+    let b: f64 = st[o + 10] + g_wpn_spr_bloom[w];
+    if (b > bmax) { b = bmax; }
+    st[o + 10] = b;
+
+    let out: i32 = 1;
+    return out;
+}
+
+// Begin a reload. Returns 1 if one started. A shell loader starts one shell.
+export fn wpn_reload_begin(p_st: array, p_o: i32): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let w: i32 = i32(st[o + 0]);
+    if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    if (st[o + 3] > 0.0) { let z: i32 = 0; return z; }     // already reloading
+    if (st[o + 5] > 0.0) { let z: i32 = 0; return z; }     // mid-swap
+    let mag: f64 = st[o + 16 + w];
+    if (mag >= f64(g_wpn_mag[w])) { let z: i32 = 0; return z; }
+    if (st[o + 22 + w] < 1.0) { let z: i32 = 0; return z; }  // no reserve
+    if (g_wpn_shell[w] != 0) {
+        st[o + 3] = g_wpn_reload[w];
+        st[o + 4] = 3.0;
+        let one: i32 = 1;
+        return one;
+    }
+    let empty: i32 = 0;
+    if (mag <= 0.0) { empty = 1; }
+    st[o + 3] = g_wpn_reload[w];
+    st[o + 4] = 1.0;
+    if (empty != 0) {
+        st[o + 3] = g_wpn_reload_e[w];
+        st[o + 4] = 2.0;
+    }
+    let out: i32 = 1;
+    return out;
+}
+
+// Request a weapon swap. Returns 1 if one started. Stow-then-raise: the swap-out
+// of the old weapon, then the swap-in of the new one.
+export fn wpn_swap_begin(p_st: array, p_o: i32, p_w: i32): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let w: i32 = p_w;
+    if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    let cur: i32 = i32(st[o + 0]);
+    if (w == cur) { let z: i32 = 0; return z; }
+    if (st[o + 5] > 0.0) { let z: i32 = 0; return z; }
+    st[o + 1] = f64(w);
+    st[o + 5] = g_wpn_swap_out[cur];
+    st[o + 6] = 1.0;
+    st[o + 3] = 0.0;     // a swap cancels a reload
+    st[o + 4] = 0.0;
+    let out: i32 = 1;
+    return out;
+}
+
+// Advance one slot by exactly ONE FIXED TICK. There is no `dt` parameter on
+// purpose: CLAUDE.md §7 — TICK_DT is a compile-time constant and no gameplay
+// function ever sees a measured delta. Pass the stance, not a clock.
+//   p_ads    1 while the ADS button is held
+//   p_sprint 1 while sprinting (arms the sprint-to-fire lockout)
+export fn wpn_step(p_st: array, p_o: i32, p_ads: i32, p_sprint: i32) {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let dt: f64 = g_TICK_DT;
+    let w: i32 = i32(st[o + 0]);
+    if (w < 0) { return; }
+    if (w > 5) { return; }
+
+    // --- fire cooldown ------------------------------------------------------
+    // Allowed to run ONE TICK negative and no further: that residue is the
+    // rate-of-fire carry (see wpn_fire); a deeper debt would bank shots.
+    let ft: f64 = st[o + 2] - dt;
+    if (ft < 0.0 - dt) { ft = 0.0 - dt; }
+    st[o + 2] = ft;
+
+    // --- swap: stow, then raise --------------------------------------------
+    let sw: f64 = st[o + 5];
+    if (sw > 0.0) {
+        sw = sw - dt;
+        if (sw > g_T_EPS) {
+            st[o + 5] = sw;
+        } else {
+            st[o + 5] = 0.0;
+            let phase: f64 = st[o + 6];
+            st[o + 6] = 0.0;
+            if (phase == 1.0) {
+                // stow finished; raise the pending weapon
+                let nw: i32 = i32(st[o + 1]);
+                if (wpn_valid(nw) != 0) {
+                    st[o + 0] = f64(nw);
+                    w = nw;
+                    st[o + 5] = g_wpn_swap_in[nw];
+                    st[o + 6] = 2.0;
+                    // a fresh weapon starts its recoil pattern from shot 1
+                    st[o + 11] = 0.0;
+                }
+            }
+            if (st[o + 6] == 0.0) { st[o + 1] = -1.0; }
+        }
+    }
+
+    // --- sprint-to-fire -----------------------------------------------------
+    if (p_sprint != 0) {
+        st[o + 8] = g_wpn_stf_s[w];
+    } else {
+        let lt: f64 = st[o + 8] - dt;
+        if (lt < g_T_EPS) { lt = 0.0; }
+        st[o + 8] = lt;
+    }
+
+    // --- ADS fraction -------------------------------------------------------
+    // Frame-rate independent by construction: a fixed step over a fixed
+    // duration, never a measured delta.
+    let ads: f64 = st[o + 7];
+    let at: f64 = g_wpn_ads_s[w];
+    let step: f64 = 1.0;
+    if (at > 0.0) { step = dt / at; }
+    if (p_ads != 0) {
+        if (st[o + 5] > 0.0) {
+            ads = ads - step;            // cannot aim mid-swap
+        } else {
+            ads = ads + step;
+        }
+    } else {
+        ads = ads - step;
+    }
+    if (ads < 0.0) { ads = 0.0; }
+    if (ads > 1.0) { ads = 1.0; }
+    st[o + 7] = ads;
+
+    // --- forced re-settle (Longshadow) -------------------------------------
+    let rs: f64 = st[o + 9] - dt;
+    if (rs < g_T_EPS) { rs = 0.0; }
+    st[o + 9] = rs;
+
+    // --- reload -------------------------------------------------------------
+    let rt: f64 = st[o + 3];
+    if (rt > 0.0) {
+        rt = rt - dt;
+        if (rt <= g_T_EPS) {
+            let kind: f64 = st[o + 4];
+            if (kind == 3.0) {
+                // one shell in, then keep going if there is room and reserve
+                let mag: f64 = st[o + 16 + w];
+                let res: f64 = st[o + 22 + w];
+                if (res >= 1.0) {
+                    if (mag < f64(g_wpn_mag[w])) {
+                        st[o + 16 + w] = mag + 1.0;
+                        st[o + 22 + w] = res - 1.0;
+                        mag = mag + 1.0;
+                        res = res - 1.0;
+                    }
+                }
+                st[o + 3] = 0.0;
+                st[o + 4] = 0.0;
+                if (res >= 1.0) {
+                    if (mag < f64(g_wpn_mag[w])) {
+                        st[o + 3] = g_wpn_reload[w];
+                        st[o + 4] = 3.0;
+                    }
+                }
+                st[o + 11] = 0.0;
+            } else {
+                let cap: i32 = g_wpn_mag[w];
+                let mag: f64 = st[o + 16 + w];
+                let res: f64 = st[o + 22 + w];
+                let want: f64 = f64(cap) - mag;
+                if (want > res) { want = res; }
+                st[o + 16 + w] = mag + want;
+                st[o + 22 + w] = res - want;
+                st[o + 3] = 0.0;
+                st[o + 4] = 0.0;
+                st[o + 11] = 0.0;         // pattern resets with the magazine
+            }
+        } else {
+            st[o + 3] = rt;
+        }
+    }
+
+    // --- idle time, recoil recovery, bloom recovery -------------------------
+    let idle: f64 = st[o + 12] + dt;
+    st[o + 12] = idle;
+
+    if (idle > g_RECOIL_SETTLE_S) {
+        // The offset decays toward zero at `recover` deg/s, direction preserved.
+        let rv: f64 = st[o + 13];
+        let rh: f64 = st[o + 14];
+        let len: f64 = sqrt(rv * rv + rh * rh);
+        if (len > 0.0) {
+            let d: f64 = g_wpn_recover[w] * dt;
+            if (d >= len) {
+                st[o + 13] = 0.0;
+                st[o + 14] = 0.0;
+            } else {
+                let k: f64 = (len - d) / len;
+                st[o + 13] = rv * k;
+                st[o + 14] = rh * k;
+            }
+        }
+        // Bloom walks back to base over g_BLOOM_RECOVER_S.
+        let bmax: f64 = g_wpn_spr_cap[w] - g_wpn_spr_base[w];
+        let b: f64 = st[o + 10];
+        if (b > 0.0) {
+            if (bmax > 0.0) {
+                b = b - bmax * dt / g_BLOOM_RECOVER_S;
+            } else {
+                b = 0.0;
+            }
+            if (b < 0.0) { b = 0.0; }
+            st[o + 10] = b;
+        }
+    }
+
+    // The recoil pattern index resets after a pause. (It also resets on reload
+    // and on swap, above.) See the header: the GDD gives the pattern's length
+    // but not its reset rule; this is the declared choice.
+    if (idle >= g_PATTERN_RESET_S) {
+        st[o + 11] = 0.0;
+    }
+    return;
+}
+
+// ---------------------------------------------------------------------------
+// A 31-bit fingerprint of one slot, for the determinism gate and replay hashes.
+// Floats are folded through a 2^20 fixed-point grid so the hash is a function of
+// the simulated value, not of a last-bit rounding difference between backends.
+// All mixing is in u64 (CLAUDE.md A13 — i32/i64 `*` TRAPS on overflow).
+// ---------------------------------------------------------------------------
+fn hash_f(p_h: u64, p_v: f64): u64 {
+    let v: f64 = p_v * 1048576.0 + 4503599627370496.0;
+    if (v < 0.0) { v = 0.0; }
+    if (v > 9007199254740992.0) { v = 9007199254740992.0; }
+    let u: u64 = u64(v);
+    let out: u64 = (p_h ^ u) * 1099511628211;
+    return out;
+}
+
+export fn wpn_state_hash(p_st: array, p_o: i32): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let h: u64 = 14695981039346656037;
+    let i = 0;
+    while (i < 28) {
+        h = hash_f(h, st[o + i]);
+        i = i + 1;
+    }
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// Fingerprint of every slot in the array. `p_slots` slots of WS_FIELDS each.
+export fn wpn_hash_all(p_st: array, p_slots: i32): i32 {
+    let st: array = p_st;
+    let n: i32 = p_slots;
+    let h: u64 = 14695981039346656037;
+    let s = 0;
+    while (s < n) {
+        h = (h ^ u64(wpn_state_hash(st, s * 28))) * 1099511628211;
+        s = s + 1;
+    }
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
