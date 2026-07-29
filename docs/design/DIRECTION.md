@@ -180,3 +180,28 @@ score *within* that sampling.
    settlement; spread over four towns that is four people each, which is thin. Prefer a
    **per-settlement cap** over a per-world one — the density that matters is "is the town I am
    standing in alive". Open for the owner.
+
+### 8a. Weapons come from settlement development — and multi-settlement makes that SPATIAL
+
+Confirmed by the owner. This was already the spine (`DIRECTION.md` §3: lighting the world is the
+weapon tech tree). Multiple walkable settlements sharpen it from a tier check into a **place**:
+
+- **Village-tier weapons** (bolt-action, revolver, pump, pipe-SMG) are bench-crafted at *any*
+  settlement you have raised to Village. Available wherever you have built.
+- **Manufactured weapons** (Sparrow, Tinker, LMG) and brass exist **at the one town you grew into a
+  City**. Your loadout therefore depends on where you are relative to your capital, and **resupply is
+  a journey, not a menu.**
+
+Three consequences, all free:
+
+1. **Your City becomes your capital the way capitals actually happen** — because the industry is
+   there and the lit roads lead to it. Nobody designs it; it emerges from where the players chose to
+   concentrate light.
+2. **Which town becomes the City is a collective decision** in multiplayer. Players sharing a world
+   must converge on where to spend effort. A real social dynamic with no systems behind it.
+3. **Entropy gives it teeth at range.** Let the capital's Wick chain lapse and the Foundry browns
+   out — and you feel it out on the frontier when the good ammunition stops arriving. The failure is
+   local; the consequence travels.
+
+Pairs with §7: carry capacity means you leave the capital with what you can hold, so distance from
+industry is felt as a packing decision every time you set out.
