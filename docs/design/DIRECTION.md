@@ -205,3 +205,50 @@ Three consequences, all free:
 
 Pairs with §7: carry capacity means you leave the capital with what you can hold, so distance from
 industry is felt as a packing decision every time you set out.
+
+---
+
+## 9. Skill trees and assignable stat points
+
+> Owner: *"skill trees and like assigning stat points for stuff would be cool too"*
+
+**Approved — and it completes two things already decided rather than adding a parallel system.**
+
+1. **§7 needs something to gate on.** We decided skill governs *effectiveness*, not access — a
+   low-level character fights an AR's recoil and sway. That decision implies stats; right now there
+   is nothing to hang it on but character level.
+2. **Party composition needs build divergence.** Without it, "good party composition" is just "more
+   people". Trees are what make four players into four *different* players.
+
+### The stats, derived from what the game already measures
+
+| Stat | Governs | Ties to |
+|---|---|---|
+| **Handling** | recoil, sway, ADS time, reload speed | the §7 effectiveness gate |
+| **Capacity** | carry weight, ammunition, materials | the §7 logistics gate |
+| **Lantern** | light radius, channel speed, maintenance cost | CIVIC LIGHT / entropy |
+| **Vitality** | health, revive, stagger resistance | combat survivability |
+| **Attunement** | spell slots, potency, cooldown | `MAGIC_KINETIC.md` |
+
+**The Lantern stat is the important one.** It lets a player spec into being a better *lamplighter*
+rather than a better shooter — cheaper maintenance, wider light, faster channel. That gives the
+Minecraft and Animal Crossing halves of the game real mechanical support, and makes a **support build
+genuinely viable**: a player whose contribution is that the grid never lapses. Party composition then
+emerges without inventing roles — a lamplighter holding the grid, a gunner, a caster, and a mule with
+the capacity to haul brass to the frontier.
+
+### ⚠ THE TRAP — do not let trees and the unlock ladder do the same job
+`GAME_DESIGN` §3.2 already has a 25-row unlock ladder. Keep the line absolutely clean:
+
+> **Unlocks decide WHAT YOU HAVE. Stats decide HOW WELL YOU USE IT.**
+
+If both gate access they will fight, and the two will be tuned against each other forever. This is
+the same failure mode the CIVIC LIGHT unification avoided by refusing to invent a second currency.
+
+### Open for the owner
+1. **Respec — free, costly, or unavailable?** This matters more here than in most games: entropy
+   means worlds are long-lived, so builds go stale and playstyles drift over months.
+2. **Tree size.** It must be legible at 320x240 with a chunky pixel font. A sprawling
+   Path-of-Exile lattice will not render — think a handful of short branches per stat, not a web.
+3. Do stats travel with the character between worlds? (Presumed yes, per `MULTIPLAYER.md`'s
+   character-travels rule — but worth confirming, since it interacts with §7's twinking answer.)
