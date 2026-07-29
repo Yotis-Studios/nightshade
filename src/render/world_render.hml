@@ -734,11 +734,155 @@ fn emit_world_quad(p_b, p_tex,
 // Read the block above before touching it.
 let g_SKY_SHEAR: f64 = 0.0009765625;   // 1/1024 px
 
+// ---------------------------------------------------------------------------
+// THE HAZARD COUNTER — the shear is load-bearing, so it is also MEASURED.
+// ---------------------------------------------------------------------------
+// `sw_rect_claims` replays SDL_SW_RenderGeometryRaw's is_quad test on the six
+// f32 vertices sky_quad_uv just wrote — AFTER the f64 -> f32 narrowing that the
+// vertex buffer performs, which is the only rounding stage between here and
+// SDL. It returns 1 when SDL would throw the pair away and issue
+// SDL_RenderCopyF, which is the state that produced the white cells.
+//
+// It replays SDL's WHOLE state machine over the sky batch, not one quad at a
+// time: when SDL rejects a pair it emits only the FIRST triangle and keeps the
+// second as `prev`, so triangle 2 of one quad is next tested against triangle 1
+// of the NEXT quad, and a per-quad check misses that pairing entirely.
+//
+// Off by default — one branch at the end of sky_emit, once a frame. A harness
+// turns it on with `sky_diag_set(1)` and reads `sky_rect_hits()` after
+// frame_render(); frame_begin() zeroes it. It exists so "the shear still holds
+// at this camera position" is a NUMBER and not an argument. MEASURED with it:
+// 0 of 34 408 poses, against 57 of 5 400 before the pole fix.
+let g_sky_diag: i32 = 0;
+let g_sky_rect_hits: i32 = 0;
+
+export fn sky_diag_set(p_on: i32) { g_sky_diag = p_on; }
+export fn sky_rect_hits(): i32 { let out: i32 = g_sky_rect_hits; return out; }
+
+fn vf32(p_buf: ptr, p_off: i32): f64 {
+    let out: f64 = ptr_deref_f32(ptr_offset(p_buf, p_off, 1));
+    return out;
+}
+
+// The four colour bytes, compared byte by byte: SDL compares them as one int,
+// but an i32 built from four bytes overflows in Hemlock (rule A13).
+fn vceq(p_buf: ptr, p_i: i32, p_j: i32): i32 {
+    let b: ptr = p_buf;
+    let i: i32 = p_i;
+    let j: i32 = p_j;
+    for (let k = 8; k < 12; k++) {
+        if (ptr_deref_u8(ptr_offset(b, i + k, 1))
+         != ptr_deref_u8(ptr_offset(b, j + k, 1))) { let n: i32 = 0; return n; }
+    }
+    let y: i32 = 1;
+    return y;
+}
+
+// SDL's remap_one_indice: a vertex of the second triangle collapses onto one
+// of the first triangle's when position, colour AND uv are all bit-identical.
+fn vsame(p_buf: ptr, p_a: i32, p_b: i32): i32 {
+    let b: ptr = p_buf;
+    let i: i32 = p_a;
+    let j: i32 = p_b;
+    if (vf32(b, i) != vf32(b, j)) { let n0: i32 = 0; return n0; }
+    if (vf32(b, i + 4) != vf32(b, j + 4)) { let n1: i32 = 0; return n1; }
+    if (vceq(b, i, j) == 0) { let n2: i32 = 0; return n2; }
+    if (vf32(b, i + 12) != vf32(b, j + 12)) { let n3: i32 = 0; return n3; }
+    if (vf32(b, i + 16) != vf32(b, j + 16)) { let n4: i32 = 0; return n4; }
+    let y: i32 = 1;
+    return y;
+}
+
+// One PAIR of consecutive triangles, exactly as SDL sees them: `p_pv` is the
+// byte offset of the previous triangle's first vertex, `p_cur` the current
+// one's. Returns 1 when SDL replaces the pair with SDL_RenderCopyF.
+fn sw_rect_claims(p_buf: ptr, p_pv: i32, p_cur: i32): i32 {
+    let b: ptr = p_buf;
+    let v: i32 = p_pv;
+    let c: i32 = p_cur;
+    let k0: i32 = c; let k1: i32 = c + 20; let k2: i32 = c + 40;
+    if (vsame(b, k0, v) == 1) { k0 = v; }
+    else if (vsame(b, k0, v + 20) == 1) { k0 = v + 20; }
+    else if (vsame(b, k0, v + 40) == 1) { k0 = v + 40; }
+    if (vsame(b, k1, v) == 1) { k1 = v; }
+    else if (vsame(b, k1, v + 20) == 1) { k1 = v + 20; }
+    else if (vsame(b, k1, v + 40) == 1) { k1 = v + 40; }
+    if (vsame(b, k2, v) == 1) { k2 = v; }
+    else if (vsame(b, k2, v + 20) == 1) { k2 = v + 20; }
+    else if (vsame(b, k2, v + 40) == 1) { k2 = v + 40; }
+    // exactly two shared vertices, or SDL renders triangles
+    let cnt: i32 = 0;
+    for (let j = 0; j < 3; j++) {
+        let p: i32 = v + j * 20;
+        if (p == k0 || p == k1 || p == k2) { cnt = cnt + 1; }
+    }
+    if (cnt != 2) { let z: i32 = 0; return z; }
+    let x0: f64 = vf32(b, k0); let y0: f64 = vf32(b, k0 + 4);
+    let x1: f64 = vf32(b, k1); let y1: f64 = vf32(b, k1 + 4);
+    let x2: f64 = vf32(b, k2); let y2: f64 = vf32(b, k2 + 4);
+    // top-left
+    let A: i32 = k2;
+    if (x0 <= x1 && y0 <= y1) { if (x0 <= x2 && y0 <= y2) { A = k0; } }
+    else { if (x1 <= x2 && y1 <= y2) { A = k1; } }
+    // bottom-right
+    let B: i32 = k2;
+    if (x0 >= x1 && y0 >= y1) { if (x0 >= x2 && y0 >= y2) { B = k0; } }
+    else { if (x1 >= x2 && y1 >= y2) { B = k1; } }
+    let C: i32 = k2;
+    if (k0 != A && k0 != B) { C = k0; }
+    else if (k1 != A && k1 != B) { C = k1; }
+    let C2: i32 = v + 40;
+    if (v != A && v != B) { C2 = v; }
+    else if (v + 20 != A && v + 20 != B) { C2 = v + 20; }
+    let ax: f64 = vf32(b, A); let ay: f64 = vf32(b, A + 4);
+    let bx: f64 = vf32(b, B); let by: f64 = vf32(b, B + 4);
+    let cx: f64 = vf32(b, C); let cy: f64 = vf32(b, C + 4);
+    if ((ax == cx && by == cy) || (ay == cy && bx == cx)) { }
+    else { let z2: i32 = 0; return z2; }
+    let dx: f64 = vf32(b, C2); let dy: f64 = vf32(b, C2 + 4);
+    if ((ax == dx && by == dy) || (ay == dy && bx == dx)) { }
+    else { let z3: i32 = 0; return z3; }
+    // uniformly coloured
+    if (vceq(b, A, B) == 0 || vceq(b, A, C) == 0 || vceq(b, A, C2) == 0) {
+        let z4: i32 = 0; return z4;
+    }
+    let hit: i32 = 1;
+    return hit;
+}
+
+// Replay SDL_SW_RenderGeometryRaw's WHOLE state machine over the sky batch in
+// flush order. The pairing is NOT quad-aligned: when a pair is rejected SDL
+// emits only the FIRST triangle and keeps the second as `prev`, so triangle 2
+// of one quad is next tested against triangle 1 of the NEXT quad. A per-quad
+// check misses exactly that case, which is where the residual flicker lived.
+fn sky_rect_scan(p_b): i32 {
+    let n: i32 = batch_count(p_b);
+    if (n < 2) { let z: i32 = 0; return z; }
+    let buf: ptr = batch_vbuf(p_b);
+    let hits: i32 = 0;
+    let has_prev: i32 = 0;
+    let pv: i32 = 0;
+    for (let t = 0; t < n; t++) {
+        let cur: i32 = t * 60;
+        if (has_prev == 0) { pv = cur; has_prev = 1; }
+        else if (sw_rect_claims(buf, pv, cur) == 1) { hits = hits + 1; has_prev = 0; }
+        else { pv = cur; }
+    }
+    let out: i32 = hits;
+    return out;
+}
+
 // One screen-space quad with four independent UVs. Written straight through
 // batch_write_vertex — the reference encoder for the 20-byte SDL_Vertex. The
 // sky panorama needs per-corner UVs, so the rect form is not enough.
+// FOUR INDEPENDENT CORNERS, not a rect. The seam cut is a slanted line (the
+// panorama's u = 1 iso-line crosses a screen-aligned cell diagonally at any
+// non-zero pitch), so the two halves it produces are TRAPEZOIDS. Forcing them
+// into an axis-aligned rect is what used to leave a corner sampling the wrong
+// side of the seam; see THE SEAM below.
 fn sky_quad_uv(p_b, p_tex,
-               p_x0: f64, p_y0: f64, p_x1: f64, p_y1: f64,
+               p_xa: f64, p_ya: f64, p_xb: f64, p_yb: f64,
+               p_xc: f64, p_yc: f64, p_xd: f64, p_yd: f64,
                p_ua: f64, p_va: f64, p_ub: f64, p_vb: f64,
                p_uc: f64, p_vc: f64, p_ud: f64, p_vd: f64,
                p_r: i32, p_g: i32, p_bl: i32, p_a: i32, p_depth: f64): i32 {
@@ -748,13 +892,13 @@ fn sky_quad_uv(p_b, p_tex,
     // Bottom-left only, and POSITIVE: it is the one corner whose x the rect
     // test compares against the top-left, and a positive nudge can never
     // truncate into the pixel to the left.
-    let xbl: f64 = p_x0 + g_SKY_SHEAR;
-    batch_write_vertex(buf, cur, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
-    batch_write_vertex(buf, cur + 20, p_x1, p_y0, p_r, p_g, p_bl, p_a, p_ub, p_vb);
-    batch_write_vertex(buf, cur + 40, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
-    batch_write_vertex(buf, cur + 60, p_x0, p_y0, p_r, p_g, p_bl, p_a, p_ua, p_va);
-    batch_write_vertex(buf, cur + 80, p_x1, p_y1, p_r, p_g, p_bl, p_a, p_uc, p_vc);
-    batch_write_vertex(buf, cur + 100, xbl, p_y1, p_r, p_g, p_bl, p_a, p_ud, p_vd);
+    let xbl: f64 = p_xd + g_SKY_SHEAR;
+    batch_write_vertex(buf, cur, p_xa, p_ya, p_r, p_g, p_bl, p_a, p_ua, p_va);
+    batch_write_vertex(buf, cur + 20, p_xb, p_yb, p_r, p_g, p_bl, p_a, p_ub, p_vb);
+    batch_write_vertex(buf, cur + 40, p_xc, p_yc, p_r, p_g, p_bl, p_a, p_uc, p_vc);
+    batch_write_vertex(buf, cur + 60, p_xa, p_ya, p_r, p_g, p_bl, p_a, p_ua, p_va);
+    batch_write_vertex(buf, cur + 80, p_xc, p_yc, p_r, p_g, p_bl, p_a, p_uc, p_vc);
+    batch_write_vertex(buf, cur + 100, xbl, p_yd, p_r, p_g, p_bl, p_a, p_ud, p_vd);
     batch_commit(p_b, cur, p_tex, p_depth);
     batch_commit(p_b, cur + 60, p_tex, p_depth);
     let out: i32 = 2;
@@ -923,49 +1067,174 @@ fn sky_emit(p_depth: f64): i32 {
             // the no-seam-at-the-skyline contract is built on (ART_BIBLE
             // §11.5, §6.6). Removing it makes that contract hold exactly.
             //
+            // -----------------------------------------------------------
+            // THE POLE. u ASCENDS WITH SCREEN X ONLY WHILE THE POLE IS
+            // OUTSIDE THE FRUSTUM — AND THE SPLIT MUST SURVIVE THAT.
+            // -----------------------------------------------------------
+            // The vertical half-fov is 35 deg, so from |pitch| >= 55 the
+            // zenith (or nadir) is INSIDE the frame and the azimuth of a view
+            // ray stops being monotonic in screen x: at the pole every azimuth
+            // meets, and past it the azimuth reverses. A reversed u is FINE to
+            // draw — `SDL_SW_BlitTriangle` handles either winding, and MIRRORED
+            // UVs below is about the rect path, not the rasterizer — but every
+            // piece of arithmetic below that assumed "left corner smallest,
+            // right corner largest" was wrong there:
+            //
+            //  * `lo` was taken from the left pair and `hi` from the right
+            //    pair, so a cell whose extreme u sat on the OTHER pair got the
+            //    wrong whole-turn shift and ran off the panorama.
+            //  * `(1 - ua) / (ub - ua)` was evaluated whenever `hi` exceeded 1,
+            //    including on the pole row where ub == ua EXACTLY. That is a
+            //    division by zero: the cut column came out +-inf and the
+            //    cell's vertices were non-finite. MEASURED over yaw 0..360 x
+            //    pitch +-89.5 in 64 620 poses: 230 quads in 50 poses, all at
+            //    pitch = +-55.0, where the frame edge lands exactly on the
+            //    pole. Those 50 poses are also the only ones where SDL's
+            //    software rect fast path still claimed a sky quad — the inf
+            //    coordinates, not the 1/1024 shear failing.
+            //  * even when it was finite, nothing bounded `t` to [0,1], so the
+            //    "left" half's right edge could land PAST the cell's own right
+            //    edge and the "right" half came out inverted.
+            //
+            // Everything below is now written to be indifferent to the
+            // direction u runs: lo/hi are over all four corners, and a cut is
+            // only taken on an edge that demonstrably ASCENDS through 1.0,
+            // which makes `t` in (0,1) by construction and can never divide by
+            // zero.
+
             // Shift into [0,1): a negative u is not a wrap. `(int)(u * 512)`
             // truncates toward zero, so a negative u indexes off the front of
-            // the panorama.
+            // the panorama. lo/hi are over ALL FOUR corners — taking lo from
+            // the left pair and hi from the right pair assumed the same
+            // monotonicity the pole breaks.
             let lo: f64 = ua;
+            if (ub < lo) { lo = ub; }
+            if (uc < lo) { lo = uc; }
             if (ud < lo) { lo = ud; }
             let sh: f64 = floor(lo);
             ua = ua - sh; ub = ub - sh; uc = uc - sh; ud = ud - sh;
-            let hi: f64 = ub;
+            let hi: f64 = ua;
+            if (ub > hi) { hi = ub; }
             if (uc > hi) { hi = uc; }
+            if (ud > hi) { hi = ud; }
             if (hi > 1.0) {
-                // This is the one column that straddles the panorama seam.
-                // Split it there rather than letting it run off the texture.
+                // -------------------------------------------------------
+                // THE SEAM. The cell straddles the panorama's +-180 cut.
+                // -------------------------------------------------------
+                // The seam is the u = 1 iso-line of the cell's own uv field,
+                // and at any non-zero pitch that line is SLANTED — it enters
+                // one edge and leaves another. Cutting the cell with a
+                // VERTICAL line at the top edge's crossing (which is what
+                // this did) is only right when the line happens to be
+                // vertical, i.e. at pitch 0. Everywhere else the bottom
+                // corners kept the un-wrapped value, so the right half was
+                // handed `uc - 1.0` < 0 — a negative u, straight into the
+                // "indexes off the front of the panorama" case above.
+                // MEASURED over the same 64 620 poses: 84 012 quads carried
+                // a negative u, in 27 778 poses, at EVERY pitch including 0;
+                // the overshoot reached 5.9 texels at |pitch| <= 20, 20.7 at
+                // 40 and 253 at the pole.
                 //
-                // The 1 px stripe this used to leave over a ~7-degree window of
-                // yaw — pure white on one side of the cut, clear colour on the
-                // other — was never the split's fault. It was the rect path in
+                // So cut along the seam itself. Both halves are trapezoids,
+                // which is why sky_quad_uv now takes four independent
+                // corners. Two cases cover it exactly:
+                //   TOP+BOTTOM crossing -> a near-vertical cut,
+                //   LEFT+RIGHT crossing -> a near-horizontal cut,
+                // and v is interpolated onto the cut, which the vertical-only
+                // version also skipped.
+                //
+                // KEPT FROM THE OLD SPLIT, STILL LOAD-BEARING. The 1 px white
+                // stripe this used to leave over a ~7-degree window of yaw —
+                // pure white on one side of the cut, clear colour on the other
+                // — was never the split's fault. It was the rect path in
                 // sky_quad_uv: `s.x = (int)(1.0 * 512)` is column 512 of a
-                // 512-wide panorama, and the float cut column `xc` was covered
-                // by two RenderCopyF rects that rounded apart. The triangle
-                // path fixes both ends. `SDL_SW_BlitTriangle` decrements
-                // whichever source corner sits on its own bounding-box maximum
-                // before interpolating, so the u = 1.0 edge samples texel 511;
-                // and both halves truncate `xc` to the same whole pixel, so the
-                // top-left fill rule hands that column to exactly one of them.
-                // Measured, ridge_golden 01:24, yaw swept -6..+6 in 0.125 steps
-                // at six pitches (582 frames): 206 frames / 272888 pure-white
-                // pixels before, 0 frames / 0 pixels after.
-                let t: f64 = (1.0 - ua) / (ub - ua);
-                let xc: f64 = x0 + (x1 - x0) * t;
-                tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, xc, y1,
-                                          ua, va, 1.0, vb, 1.0, vc, ud, vd,
-                                          255, 255, 255, 255, p_depth);
-                tris = tris + sky_quad_uv(g_bsky, g_tex_sky, xc, y0, x1, y1,
-                                          0.0, va, ub - 1.0, vb,
-                                          uc - 1.0, vc, 0.0, vd,
-                                          255, 255, 255, 255, p_depth);
-                continue;
+                // 512-wide panorama, and the float cut column was covered by
+                // two RenderCopyF rects that rounded apart. The triangle path
+                // fixes both ends, and the cut edges below still rely on it:
+                // `SDL_SW_BlitTriangle` decrements whichever source corner
+                // sits on its own bounding-box maximum before interpolating,
+                // so the u = 1.0 edge samples texel 511 and not 512; and both
+                // halves truncate the cut column to the same whole pixel, so
+                // the top-left fill rule hands that column to exactly one of
+                // them. Measured, ridge_golden 01:24, yaw swept -6..+6 in
+                // 0.125 steps at six pitches (582 frames): 206 frames /
+                // 272 888 pure-white pixels before, 0 frames / 0 pixels after.
+                let tT: f64 = -1.0;
+                let tB: f64 = -1.0;
+                let tL: f64 = -1.0;
+                let tR: f64 = -1.0;
+                if (ua < 1.0 && ub > 1.0) { tT = (1.0 - ua) / (ub - ua); }
+                if (ud < 1.0 && uc > 1.0) { tB = (1.0 - ud) / (uc - ud); }
+                if (ua < 1.0 && ud > 1.0) { tL = (1.0 - ua) / (ud - ua); }
+                if (ub < 1.0 && uc > 1.0) { tR = (1.0 - ub) / (uc - ub); }
+                if (tT >= 0.0 && tB >= 0.0) {
+                    let xt: f64 = x0 + (x1 - x0) * tT;
+                    let xb: f64 = x0 + (x1 - x0) * tB;
+                    let vt: f64 = va + (vb - va) * tT;
+                    let vbo: f64 = vd + (vc - vd) * tB;
+                    tris = tris + sky_quad_uv(g_bsky, g_tex_sky,
+                                              x0, y0, xt, y0, xb, y1, x0, y1,
+                                              clampf(ua, 0.0, 1.0), va,
+                                              1.0, vt, 1.0, vbo,
+                                              clampf(ud, 0.0, 1.0), vd,
+                                              255, 255, 255, 255, p_depth);
+                    tris = tris + sky_quad_uv(g_bsky, g_tex_sky,
+                                              xt, y0, x1, y0, x1, y1, xb, y1,
+                                              0.0, vt,
+                                              clampf(ub - 1.0, 0.0, 1.0), vb,
+                                              clampf(uc - 1.0, 0.0, 1.0), vc,
+                                              0.0, vbo,
+                                              255, 255, 255, 255, p_depth);
+                    continue;
+                }
+                if (tL >= 0.0 && tR >= 0.0) {
+                    let yl: f64 = y0 + (y1 - y0) * tL;
+                    let yr: f64 = y0 + (y1 - y0) * tR;
+                    let vl: f64 = va + (vd - va) * tL;
+                    let vr: f64 = vb + (vc - vb) * tR;
+                    tris = tris + sky_quad_uv(g_bsky, g_tex_sky,
+                                              x0, y0, x1, y0, x1, yr, x0, yl,
+                                              clampf(ua, 0.0, 1.0), va,
+                                              clampf(ub, 0.0, 1.0), vb,
+                                              1.0, vr, 1.0, vl,
+                                              255, 255, 255, 255, p_depth);
+                    tris = tris + sky_quad_uv(g_bsky, g_tex_sky,
+                                              x0, yl, x1, yr, x1, y1, x0, y1,
+                                              0.0, vl, 0.0, vr,
+                                              clampf(uc - 1.0, 0.0, 1.0), vc,
+                                              clampf(ud - 1.0, 0.0, 1.0), vd,
+                                              255, 255, 255, 255, p_depth);
+                    continue;
+                }
+                // The seam clips a CORNER off the cell — it enters and leaves
+                // through two adjacent edges, so neither cut is a quad split.
+                // Take the whole-turn shift that leaves the least to clamp
+                // (i.e. keep the side of the seam that owns most of the cell)
+                // and clamp the rest. The clamped corners are by construction
+                // the ones nearest the seam, so the error is bounded by how
+                // far into the cell the corner reaches: MEASURED worst case
+                // 46.0 texels of 512 at |pitch| <= 50, and every larger value
+                // is on a panorama row that is one flat colour (row 0 at the
+                // zenith, row 159 = FOG_TINT_MUL below the skyline).
+                let over: f64 = 0.0;
+                let under: f64 = 0.0;
+                if (ua > 1.0) { over = over + ua - 1.0; } else { under = under + 1.0 - ua; }
+                if (ub > 1.0) { over = over + ub - 1.0; } else { under = under + 1.0 - ub; }
+                if (uc > 1.0) { over = over + uc - 1.0; } else { under = under + 1.0 - uc; }
+                if (ud > 1.0) { over = over + ud - 1.0; } else { under = under + 1.0 - ud; }
+                if (under < over) {
+                    ua = ua - 1.0; ub = ub - 1.0; uc = uc - 1.0; ud = ud - 1.0;
+                }
+                ua = clampf(ua, 0.0, 1.0); ub = clampf(ub, 0.0, 1.0);
+                uc = clampf(uc, 0.0, 1.0); ud = clampf(ud, 0.0, 1.0);
             }
-            tris = tris + sky_quad_uv(g_bsky, g_tex_sky, x0, y0, x1, y1,
+            tris = tris + sky_quad_uv(g_bsky, g_tex_sky,
+                                      x0, y0, x1, y0, x1, y1, x0, y1,
                                       ua, va, ub, vb, uc, vc, ud, vd,
                                       255, 255, 255, 255, p_depth);
         }
     }
+    if (g_sky_diag != 0) { g_sky_rect_hits = sky_rect_scan(g_bsky); }
     let out: i32 = tris;
     return out;
 }
@@ -981,6 +1250,7 @@ export fn frame_begin() {
     emit_stats_reset();
     mesh_reset_counters();
     billboard_reset_counters();
+    g_sky_rect_hits = 0;
 }
 
 // STAGES 8..23. The caller has already run stage 6 (tod_eval into frame_env())
