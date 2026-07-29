@@ -108,3 +108,42 @@ content at a different grid state.
 3. **Shared night hold, or per-player?** (§B). Shared is far stronger and needs scope, not systems.
 4. **Twinking: gate, block, or embrace?** (§2)
 5. Is there a **home world** concept — one seed a character is bound to, with others visitable?
+
+---
+
+# ENTROPY: ACCEPTED, with the owner's gradient
+
+> Owner: *"maybe the settlement as it grows can be safe and maintenance costs get cheaper closer and
+> durability higher as you get closer to the settlement"*
+
+That refinement is what makes entropy **humane instead of a chore**, and it solves the "nobody should
+log in to a dead home" problem structurally rather than by special-casing the town.
+
+It also creates the thing the world was missing: **a frontier.** A legible spatial structure of
+safe core → maintained ring → frontier → dark. The frontier is where the game happens, and it MOVES
+as the settlement grows.
+
+## THE UNIFICATION — one field drives four systems
+
+Call it **CIVIC LIGHT**: a scalar field over the world, highest at the settlement core, falling off
+with distance and rising with the density of maintained lanterns around it.
+
+| System | Driven by civic light how |
+|---|---|
+| **Entropy rate** | Lantern decay is inversely proportional. Near-zero at the core, fast at the frontier. |
+| **Durability** | A lantern's resistance to the dark scales with the civic light around it. |
+| **Danger** | Enemy tier and density scale inversely. Dark IS dangerous — no separate difficulty dial. |
+| **Settlement tier** | Total integrated civic light drives village → town → city. |
+| **Industry** | City tier plus core civic light gates manufactured weapons and ammunition (`DIRECTION.md` §3). |
+
+**Why this is worth doing as one field rather than five systems:** the player has exactly one verb —
+light and maintain lanterns — and that verb raises one number, and that number *is* progression,
+safety, difficulty and the tech tree. Nothing needs to be explained to the player in a tutorial
+because it is all spatially visible: you can see how far your influence reaches.
+
+It also means **expansion has a real cost curve.** Pushing the frontier out is expensive to maintain
+until the settlement grows enough to support it, which paces expansion naturally instead of with
+artificial gates.
+
+And it gives the danger gradient (§C) for free: a young world has a small bright core and a vast
+dark everywhere, and a mature world has to be *sought out* for danger.
