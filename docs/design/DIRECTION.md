@@ -252,3 +252,53 @@ the same failure mode the CIVIC LIGHT unification avoided by refusing to invent 
    Path-of-Exile lattice will not render — think a handful of short branches per stat, not a web.
 3. Do stats travel with the character between worlds? (Presumed yes, per `MULTIPLAYER.md`'s
    character-travels rule — but worth confirming, since it interacts with §7's twinking answer.)
+
+---
+
+## 10. Melee weapons — club, spear, sword
+
+> Owner: *"we also need melee weapons lol, wood club, spear, sword"*
+
+**More load-bearing than it looks, because of §7.** Carry capacity means you *can* run out of brass on
+the frontier. A melee weapon is the thing that **always works** — no ammo, no resupply, no walk back
+to the capital. That is a permanent role in the loadout, not a starter-weapon afterthought, and it
+grows more important the further the player pushes from their City.
+
+It also completes the kinetic ladder downward:
+
+| Tier | Weapons | Source |
+|---|---|---|
+| **0 — melee** | wood club -> spear -> sword | scavenged, then crafted, then forged |
+| 1 — primitive | bolt-action, revolver, pump shotgun, pipe-SMG | bench-crafted or traded at a Village |
+| 2 — manufactured | Sparrow, Tinker, LMG | the Foundry, at your City (`§8a`) |
+
+A lamplighter's first night with **nothing but a stick and a lantern** is a far better opening image
+than one holding a rifle. The club must stay genuinely viable rather than a joke to discard — that is
+what makes the ladder read as progress instead of a tutorial.
+
+### Differentiation — roles, not damage numbers
+- **Club** — fastest, cheapest, high stagger. Buys **space** rather than kills. Scavenged; available
+  from the first minute.
+- **Spear** — **reach.** Hits before they close, excellent against anything that charges, keeps the
+  player out of the swing arc. Crafted from wood plus a point.
+- **Sword** — balanced, highest melee damage, needs worked metal. A genuine Village-tier craft: the
+  first weapon the player *makes* rather than finds.
+
+All three are KINETIC for `MAGIC_KINETIC.md` affinity purposes — which is precisely when a
+light-affinity enemy pushes the player toward the lantern and spells.
+
+### NO DURABILITY on melee
+Reliability is its whole identity: the weapon that never fails when the ammunition is gone. Breakage
+would delete the reason it exists. (Firearms may still jam or need maintenance if that is ever
+wanted; melee may not.)
+
+### THIS SETTLES THE VIEWMODEL QUESTION
+`DIRECTION.md` §2 left open whether spells and weapons are held simultaneously or swapped. Melee
+answers it:
+
+> **The lantern lives permanently in the OFF-HAND. Everything else — club, spear, sword, rifle,
+> spell — is MAIN-HAND and swaps.**
+
+That is how a person actually carries a lantern, it reads instantly at 320x240, club-plus-lantern is
+a strong silhouette, and **the light never leaves the player**, which is the fantasy. The viewmodel
+budget stays roughly as today (lantern 122 tris + one main-hand item ~120).
