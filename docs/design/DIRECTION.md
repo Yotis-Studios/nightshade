@@ -114,3 +114,69 @@ and a town that feels inhabited.
 billboard beyond that. Target roughly **40 triangles at conversational distance**, at which point a
 town of 30 becomes affordable. Silhouette must still read instantly at 320x240 per `ART_BIBLE` §6 —
 a villager the player cannot tell from a Husk at 20 m is a bug, not a saving.
+
+---
+
+## 7. Ammo does NOT become world-bound — gate on skill and carry capacity instead
+
+`SETTLEMENT.md` proposed solving twinking by making manufactured ammunition world-bound: the gun
+travels, the brass does not. **The owner rejected this, correctly:**
+
+> *"i would rather gate weapons on skill to use it effectively and like having inventory space or
+> equipment to hold ammo. doesnt make sense you can take your guns and clothes to other worlds but
+> not ammo"*
+
+It is an internal inconsistency — if a rifle and a coat travel, brass has no business being special.
+Replace it with two gates that are **continuous and diegetic** rather than binary:
+
+1. **Skill gates EFFECTIVENESS, not access.** A low-level character holding a manufactured AR fights
+   recoil, sway, slower reloads and worse handling. The gun is not locked, it is *wasted* on them.
+   Self-explaining — nobody needs a tooltip saying "you may not buy this" — and it rewards the
+   existing 25-row unlock ladder rather than duplicating it.
+2. **Carry capacity is equipment.** Bandoliers, pouches, a pack. You bring what you can hold, so
+   twinking is bounded by **logistics rather than forbidden by decree.**
+
+Capacity does something the hard gate could not: **every expedition becomes a packing decision.** You
+leave the lit town with what you can carry, and the further you push the more that choice costs. That
+is squarely on-fantasy, and it re-frames the city as **cheap resupply** rather than the sole source of
+ammunition — which is a better reason to keep the Foundry lit than a lockout.
+
+**Supersedes** `SETTLEMENT.md`'s twinking answer and `MULTIPLAYER.md` problem §2.
+
+## 8. MULTIPLE settlements per world, walkable on foot
+
+> Owner: *"is it possible for settlements to be travelable by foot? i think that would be neat but
+> you would need to have logic to prevent the seed from putting places too close"*
+
+**Yes, and it upgrades the topology.** A world stops being *a town* and becomes **a region.**
+
+- **Wick Lines between settlements become the endgame project.** Lighting the road between two towns
+  is a large, visible, collective goal using the verb the player already has.
+- **Settlements sit at different tiers within one world** — a city, two villages, a camp on the
+  frontier — which gives a world internal geography and a reason to travel *inside* it.
+- **Walking dark wild between lit towns is the fantasy, stated literally.**
+
+### Separation, derived from the movement numbers
+Player walk 4.4 m/s, sprint 7.0 m/s (`GAME_DESIGN` §2.3). A City ring is 320 m (`SETTLEMENT.md`).
+
+| Separation | Walk | Sprint |
+|---|---|---|
+| 800 m | 3.0 min | 1.9 min |
+| **1200 m (typical target)** | **4.5 min** | **2.9 min** |
+| 2000 m | 7.6 min | 4.8 min |
+
+**Minimum separation ~1000 m** guarantees real wild between two settlements even at full City growth
+(320 + 320 = 640 m of rings). ~1200 m typical makes the trip a journey without becoming a commute.
+
+Site selection becomes deterministic **blue-noise / Poisson-disc sampling** with a minimum radius,
+seeded — cheap and reproducible. `SETTLEMENT.md` §1's single-site scoring becomes the per-candidate
+score *within* that sampling.
+
+### Two knock-ons
+1. **Travel has two scales now.** *Within* a world: walk, or fast-travel along **lit** Wick Lines
+   between your own settlements — so fast travel is something you **build**, not something you are
+   given. *Between* worlds: the seed teleport. Better structure than one flat teleport.
+2. **Concurrency must be re-derived.** `SETTLEMENT.md`'s cap of 16 assumed everyone shares one
+   settlement; spread over four towns that is four people each, which is thin. Prefer a
+   **per-settlement cap** over a per-world one — the density that matters is "is the town I am
+   standing in alive". Open for the owner.

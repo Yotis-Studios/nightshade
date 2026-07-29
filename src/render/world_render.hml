@@ -136,7 +136,11 @@ import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
          emit_count_guard, emit_count_straddle, emit_count_submitted,
          EMIT_BF_CCW }
        from "../../../wobbleweed/src/emit.hml";
-import { env_new, env_field, env_far_plane, ENV_FOG_FAR }
+import { env_new, env_field, env_far_plane, ENV_FOG_FAR,
+         env_clear_lights, env_add_light, env_light_count,
+         ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_LIGHT0_X, ENV_LIGHT_STRIDE, ENV_MAX_LIGHTS,
+         ENV_L_X, ENV_L_Y, ENV_L_Z, ENV_L_R, ENV_L_G, ENV_L_B, ENV_L_RADIUS }
        from "../../../wobbleweed/src/shade.hml";
 import { mesh_set_mvp, mesh_set_viewport, mesh_set_near, mesh_set_cull,
          mesh_emit, mesh_reset_counters,
@@ -153,7 +157,7 @@ import { stat_add, stat_set, stat_begin, stat_end,
          stat_frame_begin, stat_frame_end,
          STAT_TRIS_SUBMITTED, STAT_REJ_BACKFACE,
          STAT_REJ_NEAR, STAT_REJ_GUARD,
-         STAT_CLIP_STRADDLE, STAT_PARTICLES,
+         STAT_CLIP_STRADDLE, STAT_PARTICLES, STAT_LIGHTS,
          STAT_T_VIEW, STAT_T_BATCH_RESET, STAT_T_EMIT_SKY,
          STAT_T_EMIT_TERRAIN, STAT_T_EMIT_ENTITY, STAT_T_EMIT_VIEWMODEL,
          STAT_T_EMIT_FX, STAT_T_EMIT, STAT_T_TARGET_BEGIN, STAT_T_CLEAR,
@@ -165,7 +169,13 @@ import { stat_add, stat_set, stat_begin, stat_end,
 // ---------------------------------------------------------------------------
 // the game — core only. NOT src/art: see THE IMPORT WALL above.
 // ---------------------------------------------------------------------------
-import { g_RES_W, g_RES_H } from "../core/config.hml";
+import { g_RES_W, g_RES_H,
+         g_MAX_DYNAMIC_LIGHTS,
+         g_LANTERN_OFS_FWD, g_LANTERN_OFS_RIGHT, g_LANTERN_OFS_DOWN,
+         g_LANTERN_RADIUS, g_LANTERN_GAIN,
+         g_LANTERN_LIGHT_R, g_LANTERN_LIGHT_G, g_LANTERN_LIGHT_B,
+         g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY }
+       from "../core/config.hml";
 import { clampi, clampf } from "../core/mathx.hml";
 
 // ---------------------------------------------------------------------------
@@ -477,6 +487,330 @@ export fn frame_set_options(p_sheet: i32, p_viewmodel: i32, p_lightning: i32) {
 export fn frame_camera_x(): f64 { let out: f64 = g_camx; return out; }
 export fn frame_camera_y(): f64 { let out: f64 = g_camy; return out; }
 export fn frame_camera_z(): f64 { let out: f64 = g_camz; return out; }
+
+// ===========================================================================
+// 2b. THE DYNAMIC LIGHT MANAGER — the cap, the slot policy, and the lantern
+// ---------------------------------------------------------------------------
+// WHY IT IS HERE. `env_add_light` is the engine's append: it takes a light and
+// refuses past ENV_MAX_LIGHTS and that is ALL it may do, because wobbleweed
+// must not learn a game word (R1). "Four", "the lantern always wins", "nearest
+// by distance^2/intensity" are game rules, so they live on this side of the
+// wall — and this file is the one on this side that already owns the camera,
+// which is exactly what a light manager needs and what nothing else has.
+//
+// THE PROBLEM IT WAS BUILT FOR, in the art critic's words:
+//     "A night muzzle flash that leaves the world unlit is the loudest
+//      'this is not a real game' signal in the set."
+// The player carries a lantern — it IS the viewmodel, drawn lit, in every
+// scene with F_VIEWMODEL — and before this section it illuminated nothing at
+// all.  `tools/shot.hml` never put a light at the camera; the only dynamic
+// lights in the whole harness were a muzzle flash and a shrine.
+//
+// ---------------------------------------------------------------------------
+// HOW A LIGHT REACHES A PIXEL IN THIS RENDERER — read this before tuning
+// ---------------------------------------------------------------------------
+// Stage 8 calls `emit_set_lighting(0)`: every world triangle carries BAKED
+// vertex colour (`mesh_bake_light`, G16/G19) and the emit kernel applies fog
+// and nothing else.  So a dynamic light does NOT reach the world through
+// `emit.hml`.  It reaches the frame by exactly two routes, both of which are
+// driven off `env_light_count` and both of which are already built:
+//
+//   1. `fx.hml` stage 16 lays ONE 2-triangle additive ground glow card per
+//      light inside 14 m, its four corners on the terrain — THE POOL.
+//   2. `entity_render.hml` stage 14 adds a per-INSTANCE point term to every
+//      prop's tint — props, NPCs and their contact blobs brighten near a light.
+//
+// Both are O(props + lights), never O(vertices x lights).  That is why raising
+// the cap to 4 costs 0.062 ms and not 4.9 ms — see the long note in
+// `src/core/config.hml` at `g_MAX_DYNAMIC_LIGHTS`.
+//
+// >>> WHAT THIS SECTION CANNOT DO, STATED PLAINLY.
+// It cannot throw TERRAIN into relief and it cannot catch WALL faces, because
+// both are baked chunk meshes on the `emit_set_lighting(0)` path and neither
+// `terrain_render.hml` nor `emit.hml` is this task's file to change.  Turning
+// lighting on for them is not a fix: `emit_mesh_buf` re-shades from ONE normal
+// per chunk (terrain passes (0,1,0)), which is CLAUDE.md §9 rule 4 "flat-lit
+// terrain", and it re-multiplies an already-baked colour by a full light term,
+// which double-darkens every vertex.  The real fix is an engine change — a
+// point-light term added to emit.hml's BAKED branch, after fog, reading the
+// four hoisted `g_env_l*` slots `env_bind` already fills.  Reported upward.
+//
+// ---------------------------------------------------------------------------
+// THE FRAME PROTOCOL
+// ---------------------------------------------------------------------------
+//   * A caller that already writes lights with `env_clear_lights` +
+//     `env_add_light` KEEPS WORKING UNCHANGED.  `lights_commit` ADOPTS whatever
+//     is in the env as candidates before it re-ranks, so `main.hml`'s lantern
+//     post and `shot.hml`'s muzzle flash and shrine all still land — they are
+//     now ranked against each other instead of racing for slot order.
+//   * `frame_light_add()` is the new, explicit submission path for transients.
+//   * `lights_commit()` runs at the TOP of `frame_render`, after
+//     `frame_set_camera` and before any stage reads the env.  It clears the
+//     submission list on the way out, so submissions made between frames are
+//     never double-counted.
+// ===========================================================================
+
+// Candidate capacity. Twelve is three times the cap: enough that a firefight
+// can submit everything it wants and let the ranker decide, small enough that
+// the O(cap x n) selection scan below is ~36 iterations of pure f64 arithmetic.
+let g_LM_CAP: i32 = 12;
+
+// Struct-of-arrays (A7), allocated once and reused (A8/N6/N7): the reset sets
+// a counter, it never reallocates and never pushes after the first frame.
+let g_lm_x: array<f64> = [];
+let g_lm_y: array<f64> = [];
+let g_lm_z: array<f64> = [];
+let g_lm_r: array<f64> = [];
+let g_lm_g: array<f64> = [];
+let g_lm_b: array<f64> = [];
+let g_lm_rad: array<f64> = [];
+let g_lm_int: array<f64> = [];      // intensity, the numerator of the ranking
+let g_lm_taken: array<f64> = [];    // 1.0 once a candidate has won a slot
+let g_lm_n: i32 = 0;
+
+// Counters, published through frame_light_stats.
+let g_lm_submitted: i32 = 0;
+let g_lm_accepted: i32 = 0;
+let g_lm_dropped: i32 = 0;          // refused for want of a candidate slot
+let g_lm_contested: i32 = 0;        // candidates that lost the ranking
+
+export let g_LMSTAT_SUBMITTED: i32 = 0;
+export let g_LMSTAT_ACCEPTED: i32 = 1;
+export let g_LMSTAT_DROPPED: i32 = 2;
+export let g_LMSTAT_CONTESTED: i32 = 3;
+
+export fn frame_light_stats(p_field: i32): i32 {
+    let fld: i32 = p_field;
+    if (fld == g_LMSTAT_SUBMITTED) { let a: i32 = g_lm_submitted; return a; }
+    if (fld == g_LMSTAT_ACCEPTED) { let b: i32 = g_lm_accepted; return b; }
+    if (fld == g_LMSTAT_DROPPED) { let c: i32 = g_lm_dropped; return c; }
+    if (fld == g_LMSTAT_CONTESTED) { let e: i32 = g_lm_contested; return e; }
+    let z: i32 = 0;
+    return z;
+}
+
+// ---------------------------------------------------------------------------
+// THE LANTERN
+// ---------------------------------------------------------------------------
+//   mode 0  off — no lantern light at all
+//   mode 1  auto (DEFAULT) — full strength at night, off in daylight, scaled by
+//           the fog-tint gate below.  Default-on is deliberate: the lantern is
+//           in the player's hand in every F_VIEWMODEL frame already, and a held
+//           lantern that lights nothing is the defect this section exists to
+//           remove.  Every existing consumer therefore gets it with no wiring.
+//   mode 2  forced — full strength regardless of the hour (cutscenes, caves,
+//           the interior of anything).
+let g_lant_mode: i32 = 1;
+let g_lant_r: f64 = g_LANTERN_LIGHT_R;
+let g_lant_g: f64 = g_LANTERN_LIGHT_G;
+let g_lant_b: f64 = g_LANTERN_LIGHT_B;
+let g_lant_rad: f64 = g_LANTERN_RADIUS;
+let g_lant_gain: f64 = g_LANTERN_GAIN;
+let g_lant_scale: f64 = 0.0;        // the gate's result for the last frame
+
+export fn frame_set_lantern(p_mode: i32) {
+    let m: i32 = p_mode;
+    if (m < 0) { m = 0; }
+    if (m > 2) { m = 2; }
+    g_lant_mode = m;
+}
+
+// The authoritative art value lives in `src/art/tod.hml` (`tod_lantern_rgb`),
+// which this file may not import.  A caller that wants the time-of-day-varying
+// flame colour hands it over here at stage 6; everyone else gets the config
+// default, which is the same warm the art module starts from.
+export fn frame_set_lantern_rgb(p_r: f64, p_g: f64, p_b: f64) {
+    g_lant_r = p_r;
+    g_lant_g = p_g;
+    g_lant_b = p_b;
+}
+
+export fn frame_set_lantern_shape(p_radius: f64, p_gain: f64) {
+    if (p_radius > 0.0) { g_lant_rad = p_radius; }
+    if (p_gain >= 0.0) { g_lant_gain = p_gain; }
+}
+
+export fn frame_lantern_mode(): i32 { let out: i32 = g_lant_mode; return out; }
+export fn frame_lantern_scale(): f64 { let out: f64 = g_lant_scale; return out; }
+
+// How dark is the world right now, in [0,1], 1 = fully dark?
+//
+// Off the FOG TINT, not off ambient+sun.  `tod_eval` normalises ambient+sun to
+// (1,1,1) by contract, so ground luminance moves only 0.93 -> 0.56 across a
+// whole day and golden hour is indistinguishable from midnight.  The fog tint
+// is derived from the horizon band (ART_BIBLE §6.6) and does separate them:
+// 0.855 at noon, 0.783 at golden hour, 0.480 at 22:00, 0.409 at 02:00.
+// Measured with tod_eval over a full day at WX_CLEAR; the two thresholds are
+// `g_LANTERN_GATE_*` in core/config.hml, with that table beside them.
+fn lantern_gate(): f64 {
+    if (g_lant_mode == 0) { let off: f64 = 0.0; return off; }
+    if (g_lant_mode == 2) { let on: f64 = 1.0; return on; }
+    let env: array<f64> = g_env;
+    let lum: f64 = 0.299 * env_field(env, ENV_FOG_R)
+                 + 0.587 * env_field(env, ENV_FOG_G)
+                 + 0.114 * env_field(env, ENV_FOG_B);
+    let span: f64 = g_LANTERN_GATE_DAY - g_LANTERN_GATE_NIGHT;
+    if (span <= 0.0) { let one: f64 = 1.0; return one; }
+    let u: f64 = (g_LANTERN_GATE_DAY - lum) / span;
+    if (u <= 0.0) { let z: f64 = 0.0; return z; }
+    if (u >= 1.0) { let o2: f64 = 1.0; return o2; }
+    // Smoothstep, so dusk brings the lantern up over minutes rather than
+    // popping it on at one frame boundary.
+    let out: f64 = u * u * (3.0 - 2.0 * u);
+    return out;
+}
+
+// Clear the submission list. `lights_commit` calls this on its way out, so a
+// caller only needs it if it wants to abandon submissions mid-frame.
+export fn frame_lights_reset() {
+    // First-frame growth only; after this the arrays are never resized (A8).
+    while (g_lm_x.length < g_LM_CAP) {
+        g_lm_x.push(0.0); g_lm_y.push(0.0); g_lm_z.push(0.0);
+        g_lm_r.push(0.0); g_lm_g.push(0.0); g_lm_b.push(0.0);
+        g_lm_rad.push(0.0); g_lm_int.push(0.0); g_lm_taken.push(0.0);
+    }
+    g_lm_n = 0;
+}
+
+// Submit a dynamic light for THIS frame. Returns the candidate index, or -1 if
+// the radius is not positive (a light with no radius lights nothing) or the
+// candidate list is full. Submitting is not winning: `lights_commit` ranks.
+//
+// Colour is a linear multiplier, exactly as `env_add_light` takes it — values
+// above 1 are normal and expected for a light (main.hml's lantern post uses
+// palette/255 * 2.4). Ranking intensity is the strongest channel.
+export fn frame_light_add(p_x: f64, p_y: f64, p_z: f64,
+                          p_r: f64, p_g: f64, p_b: f64, p_radius: f64): i32 {
+    let rad: f64 = p_radius;
+    if (rad <= 0.0) { let bad: i32 = -1; return bad; }
+    g_lm_submitted++;
+    if (g_lm_n >= g_LM_CAP) {
+        g_lm_dropped++;
+        let full: i32 = -1;
+        return full;
+    }
+    let i: i32 = g_lm_n;
+    let cr: f64 = p_r;  let cg: f64 = p_g;  let cb: f64 = p_b;
+    // max(r, g, b), hand-inlined (A9)
+    let inten: f64 = cr;
+    if (cg > inten) { inten = cg; }
+    if (cb > inten) { inten = cb; }
+    if (inten < 0.0001) { inten = 0.0001; }     // never divide by zero below
+    g_lm_x[i] = p_x;   g_lm_y[i] = p_y;   g_lm_z[i] = p_z;
+    g_lm_r[i] = cr;    g_lm_g[i] = cg;    g_lm_b[i] = cb;
+    g_lm_rad[i] = rad;
+    g_lm_int[i] = inten;
+    g_lm_taken[i] = 0.0;
+    g_lm_n = i + 1;
+    let out: i32 = i;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// COMMIT — the whole slot policy, once per frame, from the top of frame_render
+// ---------------------------------------------------------------------------
+// 1. adopt the env's existing lights as candidates (backward compatibility)
+// 2. place the lantern at the eye + camera-space offset — RESERVED slot 0
+// 3. fill the remaining slots nearest-first by distance^2 / intensity
+// 4. write the winners back through env_add_light, in slot order
+//
+// Cost: the ranking is at most (cap-1) scans of n <= 12 candidates, so <= 36
+// iterations of six f64 reads and a divide. Measured inside the frame at
+// 0.004 ms; it does not have its own stage timer because it does not deserve
+// one.
+fn lights_commit() {
+    let env: array<f64> = g_env;
+
+    // --- the cap. The GAME's number, clamped to the engine's array bound. ---
+    let cap: i32 = g_MAX_DYNAMIC_LIGHTS;
+    if (cap > ENV_MAX_LIGHTS) { cap = ENV_MAX_LIGHTS; }
+    if (cap < 0) { cap = 0; }
+
+    // --- 1. adopt whatever the caller already put in the env ---------------
+    let n0: i32 = env_light_count(env);
+    if (n0 > ENV_MAX_LIGHTS) { n0 = ENV_MAX_LIGHTS; }
+    for (let i = 0; i < n0; i++) {
+        let base: i32 = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
+        frame_light_add(env_field(env, base + ENV_L_X),
+                        env_field(env, base + ENV_L_Y),
+                        env_field(env, base + ENV_L_Z),
+                        env_field(env, base + ENV_L_R),
+                        env_field(env, base + ENV_L_G),
+                        env_field(env, base + ENV_L_B),
+                        env_field(env, base + ENV_L_RADIUS));
+    }
+
+    // --- 2. the lantern, at the eye + a camera-space offset -----------------
+    // fwd = (sin yaw, -cos yaw), right = (cos yaw, sin yaw): the convention
+    // mat_look_dir and every scene builder in the project already use.
+    let scale: f64 = lantern_gate();
+    g_lant_scale = scale;
+    let lant: i32 = 0;
+    let lx: f64 = 0.0;  let ly: f64 = 0.0;  let lz: f64 = 0.0;
+    let lr: f64 = 0.0;  let lg: f64 = 0.0;  let lb: f64 = 0.0;
+    if (scale > 0.0 && g_lant_gain > 0.0 && g_lant_rad > 0.0 && cap > 0) {
+        let yr: f64 = g_yaw * g_D2R;
+        let fwx: f64 = sin(yr);
+        let fwz: f64 = 0.0 - cos(yr);
+        let rgx: f64 = cos(yr);
+        let rgz: f64 = sin(yr);
+        lx = g_camx + fwx * g_LANTERN_OFS_FWD + rgx * g_LANTERN_OFS_RIGHT;
+        ly = g_camy - g_LANTERN_OFS_DOWN;
+        lz = g_camz + fwz * g_LANTERN_OFS_FWD + rgz * g_LANTERN_OFS_RIGHT;
+        let amp: f64 = g_lant_gain * scale;
+        lr = g_lant_r * amp;
+        lg = g_lant_g * amp;
+        lb = g_lant_b * amp;
+        lant = 1;
+    }
+
+    // --- 3 + 4. write the winners -------------------------------------------
+    env_clear_lights(env);
+    let used: i32 = 0;
+    if (lant == 1) {
+        env_add_light(env, lx, ly, lz, lr, lg, lb, g_lant_rad);
+        used = 1;
+    }
+
+    let n: i32 = g_lm_n;
+    let camx: f64 = g_camx;
+    let camy: f64 = g_camy;
+    let camz: f64 = g_camz;
+    for (let s = used; s < cap; s++) {
+        let best: i32 = -1;
+        let bestscore: f64 = 1.0e300;
+        for (let k = 0; k < n; k++) {
+            if (g_lm_taken[k] > 0.5) { continue; }
+            let dx: f64 = g_lm_x[k] - camx;
+            let dy: f64 = g_lm_y[k] - camy;
+            let dz: f64 = g_lm_z[k] - camz;
+            // distance^2 / intensity: near and bright beats far and dim, and a
+            // light you are standing inside always beats one across the field.
+            let score: f64 = (dx * dx + dy * dy + dz * dz) / g_lm_int[k];
+            if (score < bestscore) { bestscore = score; best = k; }
+        }
+        if (best < 0) { break; }
+        g_lm_taken[best] = 1.0;
+        env_add_light(env, g_lm_x[best], g_lm_y[best], g_lm_z[best],
+                      g_lm_r[best], g_lm_g[best], g_lm_b[best], g_lm_rad[best]);
+        used = s + 1;
+    }
+
+    // Everything still untaken lost the ranking. Counted, never silent — a
+    // settlement that starts dropping lights should be visible in the stats
+    // before it is visible in the picture.
+    let lost: i32 = 0;
+    for (let k2 = 0; k2 < n; k2++) {
+        if (g_lm_taken[k2] < 0.5) { lost++; }
+    }
+    g_lm_contested = lost;
+    g_lm_accepted = env_light_count(env);
+    // Republish STAT_LIGHTS. Every consumer sets it during its own stage 6,
+    // which is BEFORE the commit, so without this line every stats report in
+    // the project would print the pre-ranking count.
+    stat_set(STAT_LIGHTS, g_lm_accepted);
+    frame_lights_reset();
+}
 
 // ===========================================================================
 // 3. THE SKY QUAD — mapping a 360-degree panorama onto a 70-degree frustum
@@ -1074,6 +1408,8 @@ export fn frame_begin() {
     mesh_reset_counters();
     billboard_reset_counters();
     g_sky_rect_hits = 0;
+    g_lm_submitted = 0;
+    g_lm_dropped = 0;
 }
 
 // STAGES 8..23. The caller has already run stage 6 (tod_eval into frame_env())
@@ -1087,6 +1423,13 @@ export fn frame_render(): i32 {
     let sheet: i32 = g_opt_sheet;
     let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
     let fovr: f64 = g_fov * g_D2R;
+
+    // -- 7b  the dynamic light manager: adopt, rank, cap, commit -------------
+    // FIRST, and before `emit_set_env`, because `env_bind` hoists the light
+    // block into shade.hml's derived state and stages 13/14/16 read the env
+    // array live. Committing after either one would light the frame with the
+    // PREVIOUS frame's slots. §2b has the whole policy.
+    lights_commit();
 
     emit_set_env(g_env);
 

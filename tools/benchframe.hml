@@ -15,6 +15,10 @@
 //     (none)      bench + gate. exits 1 on any failure.   <- the CI form
 //     --quick     fewer frames; a smoke test, still gated
 //     --ablate    stage ablation: what each optional stage actually costs
+//     --sweep     THE TRIANGLE-CEILING SWEEP. scales the drawn triangle count
+//                 through the real frame path and reports the marginal cost per
+//                 triangle and the count at which the frame crosses 16.67 ms,
+//                 with read_pixels_rect excluded. See section 7b.
 //     --csv       machine-readable stage table on top of the human one
 //     --frames N  frames per trial (default 90)
 //     --trials N  trials (default 7, RULE T)
@@ -674,6 +678,17 @@ let g_opt_fx: i32 = 1;
 let g_opt_props: i32 = 1;
 let g_fog_alpha_override: f64 = -1.0;
 
+// --- the triangle-ceiling sweep's two knobs (section 7b) --------------------
+// g_villagers is the ONE independent variable of the sweep: N extra 220-triangle
+// NPC instances, fanned across the frustum so every one of them is DRAWN rather
+// than culled. It is the settlement case the ceiling exists for — "how many
+// named villagers fit" is literally this number.
+// g_fog_far_override shrinks the terrain ring, and is used ONLY to reach the
+// low end of the ladder (500-1000 triangles), which no amount of villager
+// subtraction can reach because zero is the floor.
+let g_villagers: i32 = 0;
+let g_fog_far_override: f64 = -1.0;
+
 // The __clock() column, in seconds, accumulated over a trial.
 let g_cpu_frame: f64 = 0.0;
 let g_cpu_sim: f64 = 0.0;
@@ -686,6 +701,7 @@ fn tod_step() {
     let fnear: f64 = env_field(env, ENV_FOG_NEAR);
     let ffar: f64 = env_field(env, ENV_FOG_FAR);
     if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (g_fog_far_override > 0.0) { ffar = g_fog_far_override; }
     if (ffar < 14.0) { ffar = 14.0; }
     if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
     let amax: f64 = env_field(env, ENV_FOG_ALPHA_MAX);
@@ -747,6 +763,38 @@ fn world_rebuild() {
         world_prop_add(npc, npc, npc, 20.0, g_LOD_FOG_CARD, nrad,
                        ex[e], ey[e], ez[e], eyaw[e] * 57.29577951308232, 1.0,
                        255, 235, 210, 0.9, MESH_NPC);
+    }
+    // -- the sweep's villagers ----------------------------------------------
+    // N extra NPC instances, fanned across the frustum in five columns that
+    // widen with depth so EVERY one of them survives the frustum test. A ring
+    // around the camera would have been simpler and would have been wrong: at a
+    // 70-degree FOV four fifths of a ring is culled, so the independent variable
+    // would have been "instances offered" rather than "triangles drawn", and it
+    // would have wobbled as the camera turned.
+    //
+    // They also go THROUGH world_prop_add, i.e. through the same distance-LOD,
+    // bounding-sphere, per-instance-light, fog and mandatory-contact-blob path
+    // every real prop takes. This is not a synthetic triangle firehose.
+    if (g_villagers > 0) {
+        let vn: i32 = g_villagers;
+        let yr: f64 = g_yaw * g_D2R;
+        // view.hml: forward is (sin yaw, *, -cos yaw); right is (cos yaw, *, sin yaw).
+        let fwx: f64 = sin(yr);
+        let fwz: f64 = 0.0 - cos(yr);
+        let rgx: f64 = cos(yr);
+        let rgz: f64 = sin(yr);
+        for (let v = 0; v < vn; v++) {
+            let col: f64 = f64(v % 5) - 2.0;
+            let rowi: i32 = v / 5;
+            let dd: f64 = 7.0 + f64(rowi) * 3.4 + f64(v % 3) * 0.6;
+            let lat: f64 = col * (1.1 + dd * 0.10);
+            let vx: f64 = g_camx + fwx * dd + rgx * lat;
+            let vz: f64 = g_camz + fwz * dd + rgz * lat;
+            world_prop_add(npc, npc, npc, 20.0, g_LOD_FOG_CARD, nrad,
+                           vx, terrain_h(vx, vz), vz,
+                           f64(v) * 37.0, 1.0,
+                           255, 235, 210, 0.9, MESH_NPC);
+        }
     }
     if (g_opt_fx != 0) {
         // Ember motes on a deterministic drift + a rain band. The FX layer is
@@ -966,6 +1014,20 @@ let g_peak_draw: i32 = 0;
 let g_peak_hud: i32 = 0;
 let g_peak_fx: i32 = 0;
 let g_ovf_total: i32 = 0;
+// Per-sweep-point counters. The globals above are running maxima over the WHOLE
+// process, which is what the gate wants and exactly what a sweep must not use:
+// point 7's peak would leak into point 1's row.
+let g_sw_peak: i32 = 0;
+let g_sw_sum: f64 = 0.0;
+let g_sw_n: i32 = 0;
+let g_sw_ovf: i32 = 0;
+// SOURCE triangles — the ones the transform kernel actually ran on. It is
+// `drawn` plus the three PER-TRIANGLE rejections emit makes AFTER transforming
+// the vertices (backface, near, guard); the per-OBJECT rejections (frustum
+// sphere, distance) never reach the kernel and are correctly excluded.
+// This column is the one that matters: emit is 90 % of the marginal cost and
+// emit is paid per SOURCE triangle, not per drawn one.
+let g_sw_src: f64 = 0.0;
 let g_last_c: array<i32> = [];
 let g_hash_first: u64 = 0;
 let g_hash_last: u64 = 0;
@@ -1004,7 +1066,15 @@ fn trial_run(p_frames: i32) {
         if (drawn > g_peak_drawn) { g_peak_drawn = drawn; }
         let dc: i32 = stat_get(STAT_DRAW_CALLS);
         if (dc > g_peak_draw) { g_peak_draw = dc; }
-        g_ovf_total = g_ovf_total + stat_get(STAT_BATCH_OVERFLOW);
+        let ovf: i32 = stat_get(STAT_BATCH_OVERFLOW);
+        g_ovf_total = g_ovf_total + ovf;
+        if (drawn > g_sw_peak) { g_sw_peak = drawn; }
+        g_sw_sum = g_sw_sum + f64(drawn);
+        g_sw_src = g_sw_src + f64(drawn + stat_get(STAT_REJ_BACKFACE)
+                                  + stat_get(STAT_REJ_NEAR)
+                                  + stat_get(STAT_REJ_GUARD));
+        g_sw_n = g_sw_n + 1;
+        g_sw_ovf = g_sw_ovf + ovf;
         f++;
     }
     let fm: f64 = f64(p_frames);
@@ -1129,6 +1199,262 @@ fn csv_row(p_name: string, p_ms: f64) {
 }
 
 // ===========================================================================
+//  7b. THE TRIANGLE-CEILING SWEEP
+// ---------------------------------------------------------------------------
+//  WHAT IS MEASURED, AND WHY IT IS NOT THE FRAME TIME THE TABLE ABOVE PRINTS
+//
+//  `read_pixels_rect(320x240 ARGB8888)` in frame_present() costs 2.5 ms and the
+//  interactive game NEVER PAYS IT — only shot.hml's PNG path reads those pixels.
+//  It is measured by subtraction (the residual attribution above closes to
+//  99.7 %), and this sweep reports frame time with it removed. Every triangle
+//  budget derived before now was derived against a frame that carried a
+//  screenshot readback, which is a third of the frame at rest.
+//
+//  THE INDEPENDENT VARIABLE IS MEASURED, NOT NOMINAL. Each row prints the mean
+//  and the peak of STAT_TRIS_DRAWN over every frame of every trial, and the
+//  regression is fitted against the mean. "I asked for 3000" is not data.
+//
+//  THE CEILING IS A HARD WALL AT g_CAP_WORLD, NOT A SOFT ONE AT 16.67 ms.
+//  `batch_reserve` refuses past LAYER_WORLD's capacity and the whole mesh is
+//  skipped BEFORE any transform runs, so a row past the cap measures a cheaper
+//  frame drawing fewer triangles. Rows with overflow are marked OVF and are
+//  excluded from the fit — they are evidence about the cap, not about cost.
+// ===========================================================================
+
+let g_fit_x: array<f64> = [];   // mean triangles drawn
+let g_fit_y: array<f64> = [];   // frame ms, readback excluded
+let g_fit_s: array<f64> = [];   // mean SOURCE triangles (drawn + per-tri rejects)
+
+fn sweep_reset_counters() {
+    g_sw_peak = 0; g_sw_sum = 0.0; g_sw_n = 0; g_sw_ovf = 0; g_sw_src = 0.0;
+}
+
+// One sweep point, measured EXACTLY as the headline number is: rewind the
+// camera to frame 0 of the lap, warm, then min-of-trials (RULE T).
+fn sweep_point(p_frames: i32, p_trials: i32) {
+    acc_init();
+    g_frame_i = 0;
+    for (let w = 0; w < g_WARM; w++) { frame_once(); }
+    sweep_reset_counters();
+    let t: i32 = 0;
+    while (t < p_trials) {
+        g_frame_i = 0;
+        trial_run(p_frames);
+        t++;
+    }
+}
+
+fn sweep_mean_tris(): f64 {
+    if (g_sw_n == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_sw_sum / f64(g_sw_n);
+    return out;
+}
+
+fn sweep_mean_src(): f64 {
+    if (g_sw_n == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_sw_src / f64(g_sw_n);
+    return out;
+}
+
+// frame time with read_pixels_rect subtracted out — the number the GAME pays.
+fn sweep_net_ms(): f64 {
+    let n: f64 = g_best[STAT_T_FRAME] - ms_readback();
+    if (n < 0.0) { n = 0.0; }
+    let out: f64 = n;
+    return out;
+}
+
+fn sweep_row(p_label: string, p_csv: i32, p_fit: i32) {
+    let mean: f64 = sweep_mean_tris();
+    let net: f64 = sweep_net_ms();
+    let fps: f64 = 0.0;
+    if (net > 0.0) { fps = 1000.0 / net; }
+    let flag: string = "   ";
+    if (g_sw_ovf > 0) { flag = "OVF"; }
+    // Hemlock does not nest template strings — build the two integer columns first.
+    let cpk: string = `${g_sw_peak}`;
+    let src: f64 = sweep_mean_src();
+    let usd: f64 = 0.0;
+    let uss: f64 = 0.0;
+    if (mean > 0.0) { usd = net / mean * 1000.0; }
+    if (src > 0.0) { uss = net / src * 1000.0; }
+    print(`  ${pad(p_label, 11)} ${padl(f1(mean), 7)} ${padl(cpk, 6)} ${padl(f1(src), 7)}  ${padl(f3(g_best[STAT_T_EMIT]), 7)} ${padl(f3(ms_sort()), 6)} ${padl(f3(ms_flush()), 6)} ${padl(f3(g_best[STAT_T_PRESENT]), 7)} ${padl(f3(g_best[STAT_T_HUD]), 5)}  ${padl(f3(net), 7)} ${padl(f1(fps), 6)} ${padl(f3(usd), 7)} ${padl(f3(uss), 7)} ${flag}`);
+    if (p_csv == 1) {
+        print(`CSV,sweep,${p_label},${f1(mean)},${g_sw_peak},${f1(src)},${f3(g_best[STAT_T_EMIT])},${f3(ms_sort())},${f3(ms_flush())},${f3(g_best[STAT_T_PRESENT])},${f3(g_best[STAT_T_HUD])},${f3(g_best[STAT_T_SIM])},${f3(net)},${f3(g_best[STAT_T_FRAME])},${f3(ms_readback())},${g_sw_ovf}`);
+    }
+    if (g_sw_ovf == 0 && p_fit == 1) {
+        g_fit_x.push(mean); g_fit_y.push(net); g_fit_s.push(src);
+    }
+}
+
+// Ordinary least squares over the overflow-free rows. Returns slope in
+// ms/triangle; the intercept is left in g_fit_b.
+let g_fit_b: f64 = 0.0;
+fn sweep_fit(p_x: array<f64>): f64 {
+    let xs: array<f64> = p_x;
+    let n: i32 = xs.length;
+    if (n < 2) { g_fit_b = 0.0; let z: f64 = 0.0; return z; }
+    let sx: f64 = 0.0; let sy: f64 = 0.0; let sxy: f64 = 0.0; let sxx: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        let fx: f64 = xs[i];
+        let fy: f64 = g_fit_y[i];
+        sx = sx + fx; sy = sy + fy; sxy = sxy + fx * fy; sxx = sxx + fx * fx;
+    }
+    let fn2: f64 = f64(n);
+    let den: f64 = fn2 * sxx - sx * sx;
+    if (den == 0.0) { g_fit_b = 0.0; let z2: f64 = 0.0; return z2; }
+    let slp: f64 = (fn2 * sxy - sx * sy) / den;
+    g_fit_b = (sy - slp * sx) / fn2;
+    let out: f64 = slp;
+    return out;
+}
+
+// R^2 of the fit — this is the "does it stay linear?" number.
+fn sweep_r2(p_x: array<f64>, p_m: f64, p_b: f64): f64 {
+    let xs: array<f64> = p_x;
+    let n: i32 = xs.length;
+    if (n < 3) { let z: f64 = 1.0; return z; }
+    let sy: f64 = 0.0;
+    for (let i = 0; i < n; i++) { sy = sy + g_fit_y[i]; }
+    let ybar: f64 = sy / f64(n);
+    let ssr: f64 = 0.0; let sst: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        let pred: f64 = p_m * xs[i] + p_b;
+        let d: f64 = g_fit_y[i] - pred;
+        let e: f64 = g_fit_y[i] - ybar;
+        ssr = ssr + d * d;
+        sst = sst + e * e;
+    }
+    if (sst == 0.0) { let z2: f64 = 1.0; return z2; }
+    let out: f64 = 1.0 - ssr / sst;
+    return out;
+}
+
+fn sweep_run(p_csv: i32) {
+    print("===========================================================================");
+    print(" TRIANGLE-CEILING SWEEP — the real frame path, read_pixels_rect EXCLUDED");
+    print("===========================================================================");
+    print(" The independent variable is `g_villagers`: extra 220-triangle NPC instances");
+    print(" fanned across the frustum, added through world_prop_add so they take the");
+    print(" same LOD / sphere-cull / per-instance-light / fog / contact-blob path every");
+    print(" real prop takes. The three PROPS-OFF+fog rows reach the low end, which no");
+    print(" villager count can. `tris` is MEASURED (STAT_TRIS_DRAWN), not requested.");
+    print("");
+    print("  point         tris   peak     src     emit   sort  flush  present   hud    frame*    fps  us/drw us/src");
+    print("  -------------------------------------------------------------------------------------------------------");
+
+    let sf: i32 = g_FRAMES;
+    let st: i32 = g_TRIALS;
+
+    // ---- low end: shrink the terrain ring. Props off, villagers zero,
+    //      because zero villagers is the floor and the ladder cannot reach 500
+    //      any other way. DIFFERENT COMPOSITION from the ladder, so these rows
+    //      are printed but NOT fitted: mixing two levers into one regression is
+    //      how a slope stops meaning anything.
+    g_opt_props = 0;
+    g_villagers = 0;
+    g_fog_far_override = 18.0; sweep_point(sf, st); sweep_row("fog18 v0", p_csv, 0);
+    g_fog_far_override = 26.0; sweep_point(sf, st); sweep_row("fog26 v0", p_csv, 0);
+    g_fog_far_override = 38.0; sweep_point(sf, st); sweep_row("fog38 v0", p_csv, 0);
+    g_fog_far_override = -1.0;
+
+    // ---- THE LADDER: full fog, props off, one lever, run to the wall -------
+    let ladder: array<i32> = [0, 6, 12, 18, 24, 30, 36, 42, 48, 56, 64];
+    let ln: i32 = ladder.length;
+    for (let i = 0; i < ln; i++) {
+        g_villagers = ladder[i];
+        sweep_point(sf, st);
+        let lab: string = `v${ladder[i]}`;
+        sweep_row(lab, p_csv, 1);
+    }
+    g_villagers = 0;
+    g_opt_props = 1;
+
+    // ---- the shipping scene, as a cross-check off the ladder ---------------
+    print("  -------------------------------------------------------------------------------------------------------");
+    g_villagers = 0;  sweep_point(sf, st); sweep_row("SHIPPING", p_csv, 0);
+    g_villagers = 12; sweep_point(sf, st); sweep_row("SHIP + v12", p_csv, 0);
+    g_villagers = 24; sweep_point(sf, st); sweep_row("SHIP + v24", p_csv, 0);
+    g_villagers = 36; sweep_point(sf, st); sweep_row("SHIP + v36", p_csv, 0);
+    g_villagers = 0;
+
+    print("");
+    print("  * `frame` is the whole frame MINUS read_pixels_rect, which the game never");
+    print("    pays. `src` is DRAWN + the per-triangle rejections the kernel makes after");
+    print("    transforming (backface, near, guard) — the work emit actually did.");
+    print("    CLIP has no column because it has no stage timer: the accept path is");
+    print("    INLINE in emit_mesh_buf, so clip cost is inside `emit`. probe_clip");
+    print("    measures it separately at 188.6 ns/triangle.");
+    print("    OVF marks a row where batch_reserve refused triangles at LAYER_WORLD's");
+    print("    capacity; those rows are excluded from the fit.");
+    print("");
+
+    // ---- the fit -----------------------------------------------------------
+    let slope_d: f64 = sweep_fit(g_fit_x);
+    let icept_d: f64 = g_fit_b;
+    let r2d: f64 = sweep_r2(g_fit_x, slope_d, icept_d);
+    let usd: f64 = slope_d * 1000.0;
+    let slope_s: f64 = sweep_fit(g_fit_s);
+    let icept_s: f64 = g_fit_b;
+    let r2s: f64 = sweep_r2(g_fit_s, slope_s, icept_s);
+    print("===========================================================================");
+    print(" MARGINAL COST AND THE CROSSING POINT");
+    print("===========================================================================");
+    print(`  ordinary least squares over ${g_fit_x.length} overflow-free ladder points.`);
+    print("");
+    print("  (a) against DRAWN triangles — the unit the budget is written in:");
+    print(`      frame_ms = ${f3(usd)} us/tri x drawn + ${f3(icept_d)} ms fixed     R^2 = ${f3(r2d)}`);
+    print("  (b) against SOURCE triangles — the unit the transform kernel is paid in:");
+    print(`      frame_ms = ${f3(slope_s * 1000.0)} us/tri x source + ${f3(icept_s)} ms fixed     R^2 = ${f3(r2s)}`);
+    print("");
+    if (usd > 0.0) {
+        let cross: f64 = (16.67 - icept_d) / slope_d;
+        print(`  the DRAWN fit crosses 16.67 ms at ${f1(cross)} drawn triangles`);
+        let c60: f64 = (16.67 * 0.60 - icept_d) / slope_d;
+        print(`  60 % of the budget: ${f1(c60)} drawn triangles`);
+    }
+    if (slope_s > 0.0) {
+        let crs: f64 = (16.67 - icept_s) / slope_s;
+        print(`  the SOURCE fit crosses 16.67 ms at ${f1(crs)} source triangles`);
+    }
+    print("");
+
+    // ---- WHERE LINEARITY BREAKS -------------------------------------------
+    // A single R^2 hides a slow bend. The segment slopes do not: if fill or
+    // overdraw is growing faster than the transform, the last segments are
+    // steeper than the first, and the number below says by how much.
+    print("  segment slopes between consecutive ladder points, in BOTH units. A single");
+    print("  R^2 averages a slow bend away; these do not. If the drawn-unit column");
+    print("  climbs while the source-unit column stays flat, the bend is in the");
+    print("  CONTENT's drawn/source ratio and not in the renderer.");
+    let np: i32 = g_fit_x.length;
+    let smin: f64 = 1000000.0;
+    let smax: f64 = -1000000.0;
+    let qmin: f64 = 1000000.0;
+    let qmax: f64 = -1000000.0;
+    for (let i = 1; i < np; i++) {
+        let seg_dd: f64 = g_fit_x[i] - g_fit_x[i - 1];
+        let seg_dsrc: f64 = g_fit_s[i] - g_fit_s[i - 1];
+        if (seg_dd <= 0.0 || seg_dsrc <= 0.0) { continue; }
+        let seg_dms: f64 = g_fit_y[i] - g_fit_y[i - 1];
+        let seg_ud: f64 = seg_dms / seg_dd * 1000.0;
+        let seg_us: f64 = seg_dms / seg_dsrc * 1000.0;
+        if (seg_ud < smin) { smin = seg_ud; }
+        if (seg_ud > smax) { smax = seg_ud; }
+        if (seg_us < qmin) { qmin = seg_us; }
+        if (seg_us > qmax) { qmax = seg_us; }
+        print(`    drawn ${padl(f1(g_fit_x[i - 1]), 7)} -> ${padl(f1(g_fit_x[i]), 7)} : ${padl(f3(seg_ud), 7)} us/drawn     src ${padl(f1(g_fit_s[i - 1]), 7)} -> ${padl(f1(g_fit_s[i]), 7)} : ${padl(f3(seg_us), 7)} us/src`);
+    }
+    if (smax > smin && smin > 0.0) {
+        print(`  per DRAWN triangle : ${f3(smin)} to ${f3(smax)} us — spread ${f1((smax / smin - 1.0) * 100.0)} %`);
+    }
+    if (qmax > qmin && qmin > 0.0) {
+        print(`  per SOURCE triangle: ${f3(qmin)} to ${f3(qmax)} us — spread ${f1((qmax / qmin - 1.0) * 100.0)} %`);
+    }
+    print("");
+}
+
+// ===========================================================================
 //  9. MAIN
 // ===========================================================================
 
@@ -1143,6 +1469,8 @@ fn usage() {
     print("  --trials N   trials             (default 7, RULE T)");
     print("  --quick      24 frames x 3 trials, still gated");
     print("  --ablate     what each optional stage actually costs");
+    print("  --sweep      the triangle-ceiling sweep: cost per triangle and the");
+    print("               count at which the frame crosses 16.67 ms");
     print("  --csv        machine-readable stage rows as well as the table");
     print("  --no-gate    print, never exit 1. Never use this in CI.");
     print("  --help");
@@ -1167,6 +1495,7 @@ fn main() {
 
     let want_ablate: i32 = 0;
     let want_csv: i32 = 0;
+    let want_sweep: i32 = 0;
     let i: i32 = 1;
     while (i < args.length) {
         let a: string = args[i];
@@ -1179,6 +1508,7 @@ fn main() {
         }
         else if (a == "--quick") { g_FRAMES = 24; g_TRIALS = 3; }
         else if (a == "--ablate") { want_ablate = 1; }
+        else if (a == "--sweep") { want_sweep = 1; }
         else if (a == "--csv") { want_csv = 1; }
         else if (a == "--no-gate") { g_gate = 0; }
         else { eprint(`benchframe: unknown option '${a}'`); usage(); exit(2); }
@@ -1410,6 +1740,23 @@ fn main() {
         for (let rw = 0; rw < g_WARM; rw++) { frame_once(); }
         let rt: i32 = 0;
         while (rt < g_TRIALS) { trial_run(g_FRAMES); rt++; }
+        frame = g_best[STAT_T_FRAME];
+    }
+
+    // ---- the triangle-ceiling sweep ---------------------------------------
+    if (want_sweep == 1) {
+        sweep_run(want_csv);
+        // Restore the shipping measurement for the residual attribution and the
+        // gate below — same discipline as --ablate. The sweep's last point left
+        // g_best holding a configuration that is not the shipping one.
+        g_opt_props = 1;
+        g_villagers = 0;
+        g_fog_far_override = -1.0;
+        acc_init();
+        g_frame_i = 0;
+        for (let sw2 = 0; sw2 < g_WARM; sw2++) { frame_once(); }
+        let st2: i32 = 0;
+        while (st2 < g_TRIALS) { trial_run(g_FRAMES); st2++; }
         frame = g_best[STAT_T_FRAME];
     }
 

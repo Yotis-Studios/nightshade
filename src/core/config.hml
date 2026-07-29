@@ -38,14 +38,16 @@
 // WHERE THE NUMBERS COME FROM
 // ---------------------------------------------------------------------------
 //   ARCHITECTURE.md §8 + §2.4  budgets, batch caps, layer sizes
-//   BUDGET_ACTUAL.md           the MEASURED budget, and the 2-light cap
+//   BUDGET_ACTUAL.md           the MEASURED budget (its 2-light cap SUPERSEDED,
+//                              see g_MAX_DYNAMIC_LIGHTS below for the re-measure)
 //   ARCHITECTURE.md D1 D2 D6   2500 tris; FOG_FAR <= 72 m; the 16-minute day
 //   GAME_DESIGN.md §2 §3 §4    movement, vitals, director, XP, world
 //   ART_BIBLE.md §2.6 §6 §7    fog, texel density, tile rules
 //   HOST_FACTS.md              the verified SDL2_mixer device spec
 //
 // Two whole-project caps are load-bearing and are called out where they live:
-//   g_MAX_DYNAMIC_LIGHTS = 2   RATIFIED (BUDGET_ACTUAL) — 4 lights cost 4.9 ms
+//   g_MAX_DYNAMIC_LIGHTS = 4   RE-MEASURED 2026-07-29 — the 4.9 ms figure timed
+//                              a code path the shipping renderer never runs
 //   g_FOG_FAR_CAP     = 72.0   RULE T6 — fog distance IS the triangle budget
 
 // ===========================================================================
@@ -219,17 +221,124 @@ export let g_FOG_ALPHA_T: f64 = 0.85;
 // Ground mist (ART_BIBLE §6.4): MIST_TOP = terrain + this.
 export let g_MIST_HEIGHT: f64 = 1.6;
 
-// >>> RATIFIED CAP (BUDGET_ACTUAL.md).  DYNAMIC POINT LIGHTS ARE CAPPED AT 2.
-// 4 lights measured 8.47 ms of emit (93 % of the render budget); 2 measured
-// ~6.0 ms (70 %).  Everything else — lanterns, windows, fires, signage — is
-// baked into vertex colour at mesh-build time and costs zero per frame.
-// The RenderEnv keeps 4 slots; we simply never fill more than 2.  The cap is
-// enforced HERE and in the game's light manager, never inside the engine (R1).
-// Reserve the two slots for what genuinely must move: muzzle flash, and
-// explosions/fire.  When more than two want a slot, nearest wins, ranked by
-// distance^2 / intensity, re-evaluated every frame.
-export let g_MAX_DYNAMIC_LIGHTS: i32 = 2;
+// ===========================================================================
+// >>> DYNAMIC POINT LIGHTS ARE CAPPED AT 4.   (was 2; raised 2026-07-29)
+// ---------------------------------------------------------------------------
+// BUDGET_ACTUAL.md capped this at 2 on the strength of one measurement:
+//
+//     fog + sun only ................................  3.57 ms emit
+//     + 2 dynamic lights ............................ ~6.00 ms emit
+//     + 4 dynamic lights ............................  8.47 ms emit
+//
+// THAT MEASUREMENT IS OF A CODE PATH THIS GAME DOES NOT RUN.  Those three
+// numbers come from `emit.hml`'s LIT path — `emit_set_lighting(1)`, full G16
+// per vertex.  `world_render.hml` stage 8 calls `emit_set_lighting(0)` and has
+// done since G19: every world triangle carries BAKED vertex colour and the
+// emit kernel applies fog and nothing else.  In the baked path a dynamic light
+// never touches `emit.hml` at all, so its per-vertex cost is not 1.2 ms — it
+// is ZERO, at any count, and the whole 2-vs-4 tradeoff evaporates.
+//
+// What a dynamic light actually costs in the shipping renderer, and it is the
+// only thing it costs:
+//   * `entity_render.hml` per-INSTANCE point lighting — one loop over lights
+//     per prop.  O(props x lights), NOT O(vertices x lights).
+//   * `fx.hml` lays ONE 2-triangle additive ground glow card per light within
+//     14 m of the camera.
+//
+// Re-measured on this box (RULE T: __clock CPU time, min of 7), `tools/shot.hml`
+// `--scene muzzle_fog`, native 320x240, stages 8..28, lights forced 0 -> 4:
+//
+//     0 lights   6.898 ms          2 lights   6.925 ms
+//     1 light    6.905 ms          3 lights   6.943 ms
+//                                  4 lights   6.960 ms
+//
+// 0.062 ms from 0 to 4 lights — 0.37 % of the 16.67 ms frame, 15.5 us per
+// light.  The regression guard in `tools/shot.hml` is 14.0 ms.  Four lights
+// are affordable by a factor of ~150; two was never the real ceiling.
+//
+// >>> WHAT DID NOT CHANGE, AND MUST NOT: STATIC LIGHTS STAY BAKED.
+// `mesh_bake_light` folds a static light into vertex colour at build time for
+// zero per-frame cost.  A settlement full of lit windows must not consume
+// dynamic slots — the village -> town -> city growth design depends on it, and
+// four slots do not change that arithmetic by one window.
+//
+// >>> SLOT POLICY, enforced in the light manager (`src/render/world_render.hml`
+// >>> `lights_commit`), never inside the engine — R1: wobbleweed takes a count
+// >>> and stays generic.  `env_add_light` also refuses past ENV_MAX_LIGHTS, but
+// >>> that is the engine's array bound, not the game's budget.
+//   slot 0        the player's lantern.  RESERVED — it is never ranked and
+//                 never loses, because a lantern that flickers out when a
+//                 grenade goes off is worse than no lantern.
+//   slots 1..3    contested.  Nearest-wins, ranked by distance^2 / intensity
+//                 from the camera, re-evaluated every frame.  A muzzle flash
+//                 0.6 m from the eye scores 0.14 and therefore always takes
+//                 one transiently, with no special case in the ranker.
+//                 Explosions, fire and spell effects fight over the other two.
+//
+// The RenderEnv reserves 4 slots (ENV_MAX_LIGHTS), so this is a CAP change and
+// not a layout change: nothing in emit.hml or shade.hml moved.
+export let g_MAX_DYNAMIC_LIGHTS: i32 = 4;
 export let g_ENV_LIGHT_SLOTS: i32 = 4;               // the engine's array size
+
+// ---------------------------------------------------------------------------
+// THE PLAYER'S LANTERN, as a real light.
+// ---------------------------------------------------------------------------
+// The lantern is the viewmodel: it is in the player's hand in every scene that
+// carries F_VIEWMODEL, drawn lit, with a flame that clears luminance 220 and
+// anchors the frame (§8).  Until 2026-07-29 it illuminated NOTHING.
+//
+// Offsets are metres in CAMERA space, applied to the eye by the light manager
+// every frame, so the light travels with the player for free.  They put the
+// light where the viewmodel's flame actually is — low, right, and a little
+// ahead — so the ground pool is centred where the picture says it should be.
+export let g_LANTERN_OFS_FWD: f64 = 0.62;            // ahead of the eye
+export let g_LANTERN_OFS_RIGHT: f64 = 0.34;          // toward the held hand
+export let g_LANTERN_OFS_DOWN: f64 = 0.58;           // below the eye
+
+// A believable radius for an oil lantern: it reaches the ground you are
+// standing on and the wall you are next to, and it does not light a field.
+// 7 m puts the pool's visible edge at ~4.3 m (fx.hml draws the ground card at
+// radius * 0.62), which at eye height 1.7 m and pitch 0 lands in the lower
+// third of the frame — where a lantern pool belongs.
+export let g_LANTERN_RADIUS: f64 = 7.0;
+
+// The lantern's LIGHT colour, linear, as a multiplier — not a surface colour,
+// so palette.hml is not its owner (CLAUDE.md §8 governs albedo; light colour is
+// authored in src/art/tod.hml alongside TOD_LIGHTNING_AMB_*).  It lives HERE
+// because `src/render/**` may not import `src/art/**` (the import wall) and the
+// light manager needs a correct warm default with no caller wiring.
+// tod.hml imports these three so there is exactly ONE copy of the numbers, and
+// `tod_lantern_rgb` is the authoritative art-side accessor that applies the
+// time-of-day curve on top.
+//
+// Derived from palette g_WINDOW_LIGHT (255, 216, 160) normalised to
+// (1.000, 0.847, 0.627) and warmed one step toward g_EMBER (255, 138, 42):
+// a lantern flame is warmer than a lit window and cooler than an ember.
+export let g_LANTERN_LIGHT_R: f64 = 1.00;
+export let g_LANTERN_LIGHT_G: f64 = 0.78;
+export let g_LANTERN_LIGHT_B: f64 = 0.52;
+
+// Gain on the colour above.  2.4 matches the multiplier main.hml already uses
+// for the world lantern post, so a held lantern and a lit lantern post read as
+// the same kind of light.
+export let g_LANTERN_GAIN: f64 = 2.4;
+
+// >>> THE DAYLIGHT GATE.  A lantern pool on sunlit grass is a bug.
+// The light manager scales the lantern by how dark the world actually is,
+// measured off the env's FOG TINT luminance — which ART_BIBLE §6.6 / CLAUDE.md
+// §9.3 derive from the horizon band, making it the one number in the env that
+// tracks perceived darkness.  Measured across a full day (tod_eval, WX_CLEAR):
+//
+//     clock  11.9  18.25  19.50  22.00  02.00  05.50
+//     foglum 0.855 0.783  0.542  0.480  0.409  0.845
+//
+// Ambient+sun luminance is NOT usable for this: tod_eval normalises amb+sun to
+// (1,1,1), so ground luminance only moves 0.93 -> 0.56 over a whole day and
+// golden hour is indistinguishable from midnight.  The fog tint separates them
+// cleanly.  Full lantern at or below NIGHT, none at or above DAY, smoothstep
+// between: golden hour (0.783) gets nothing, 22:00 (0.480) gets all of it.
+export let g_LANTERN_GATE_NIGHT: f64 = 0.52;
+export let g_LANTERN_GATE_DAY: f64 = 0.72;
 
 // Field of view (GDD §2.3).  Degrees.
 export let g_FOV_HIP: f64 = 70.0;
