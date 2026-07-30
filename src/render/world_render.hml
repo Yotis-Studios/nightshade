@@ -115,7 +115,7 @@
 // harness, the walkaround and the game keep the import they already have.
 // ===========================================================================
 
-import { sin, cos, sqrt, floor, atan2, asin } from "@stdlib/math";
+import { sin, cos, sqrt, floor, atan2, asin, divi } from "@stdlib/math";
 
 // ---------------------------------------------------------------------------
 // the engine
@@ -134,8 +134,9 @@ import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
          emit_set_backface, emit_set_lighting,
          emit_stats_reset, emit_count_backface, emit_count_near,
          emit_count_guard, emit_count_straddle, emit_count_submitted,
-         EMIT_BF_CCW }
+         emit_quad_world, EMIT_BF_CCW }
        from "../../../wobbleweed/src/emit.hml";
+import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
 import { env_new, env_field, env_far_plane, ENV_FOG_FAR,
          env_clear_lights, env_add_light, env_light_count,
          ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
@@ -174,7 +175,9 @@ import { g_RES_W, g_RES_H,
          g_LANTERN_OFS_FWD, g_LANTERN_OFS_RIGHT, g_LANTERN_OFS_DOWN,
          g_LANTERN_RADIUS, g_LANTERN_GAIN,
          g_LANTERN_LIGHT_R, g_LANTERN_LIGHT_G, g_LANTERN_LIGHT_B,
-         g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY }
+         g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY,
+         g_LANTERN_POOL_DIV, g_LANTERN_POOL_SPAN, g_LANTERN_POOL_SCALE,
+         g_LANTERN_POOL_HDIV, g_LANTERN_POOL_LIFT }
        from "../core/config.hml";
 import { clampi, clampf } from "../core/mathx.hml";
 
@@ -568,6 +571,49 @@ let g_lm_int: array<f64> = [];      // intensity, the numerator of the ranking
 let g_lm_taken: array<f64> = [];    // 1.0 once a candidate has won a slot
 let g_lm_n: i32 = 0;
 
+// ---------------------------------------------------------------------------
+// >>> THE ECHO, and why adoption needs two more arrays.
+// ---------------------------------------------------------------------------
+// `lights_commit` adopts the env's lights as candidates so a caller that still
+// writes `env_clear_lights` + `env_add_light` keeps working. But the commit
+// also WRITES the winners back into that same env — so on the next frame it
+// re-adopts its own output. Measured before this was fixed, `--scene
+// muzzle_fog`, one flash posted at stage 6 and never moved:
+//
+//     frame 1   env=[flash]                        -> writes [lantern, flash]
+//     frame 2   adopts lantern+flash               -> writes [lantern, L', flash]
+//     frame 3   adopts lantern+L'+flash            -> writes 4, cap reached
+//     steady    submitted=4  lights=4  contested=1
+//
+// Three of the four slots were STALE COPIES OF THE LANTERN. The cap was full
+// of one light, so the two slots the slot policy reserves for explosions and
+// fire did not exist, and a moving player would have dragged a comet tail of
+// last-frame lanterns behind them.
+//
+// The fix is not "don't adopt" — main.hml, shot.hml and walk.hml all post
+// through the env and none of them is this task's file. It is to notice when
+// the env still holds OUR OWN OUTPUT untouched, and in that case re-adopt the
+// caller's candidates FROM LAST FRAME instead of from the env:
+//
+//   * `g_lm_shadow`  the exact light block we wrote last commit
+//   * `g_lm_saved`   the caller candidates we adopted last commit
+//
+// If the env matches the shadow bit for bit, nobody wrote lights this frame and
+// `g_lm_saved` is the caller's true intent. If it differs by so much as a
+// radius, the caller rewrote the block and the env is authoritative again.
+// Seven f64 per slot, four slots: 28 compares, once a frame.
+//
+// This is the case that makes index-matching wrong, and it is why the compare
+// is on the WHOLE block: with the lantern gated off in daylight the commit
+// writes the caller's own flash back into slot 0, so "env slot i equals shadow
+// slot i" would make a re-posted flash look like an echo and delete it.
+let g_LM_FIELDS: i32 = 7;
+let g_lm_shadow: array<f64> = [];
+let g_lm_shadow_n: i32 = -1;        // -1 = nothing written yet
+let g_lm_saved: array<f64> = [];
+let g_lm_saved_n: i32 = 0;
+let g_lm_echoed: i32 = 0;           // 1 if this frame re-used g_lm_saved
+
 // Counters, published through frame_light_stats.
 let g_lm_submitted: i32 = 0;
 let g_lm_accepted: i32 = 0;
@@ -578,6 +624,7 @@ export let g_LMSTAT_SUBMITTED: i32 = 0;
 export let g_LMSTAT_ACCEPTED: i32 = 1;
 export let g_LMSTAT_DROPPED: i32 = 2;
 export let g_LMSTAT_CONTESTED: i32 = 3;
+export let g_LMSTAT_ECHOED: i32 = 4;    // 1 if the env held only our own output
 
 export fn frame_light_stats(p_field: i32): i32 {
     let fld: i32 = p_field;
@@ -585,6 +632,7 @@ export fn frame_light_stats(p_field: i32): i32 {
     if (fld == g_LMSTAT_ACCEPTED) { let b: i32 = g_lm_accepted; return b; }
     if (fld == g_LMSTAT_DROPPED) { let c: i32 = g_lm_dropped; return c; }
     if (fld == g_LMSTAT_CONTESTED) { let e: i32 = g_lm_contested; return e; }
+    if (fld == g_LMSTAT_ECHOED) { let ech: i32 = g_lm_echoed; return ech; }
     let z: i32 = 0;
     return z;
 }
@@ -662,13 +710,21 @@ fn lantern_gate(): f64 {
 
 // Clear the submission list. `lights_commit` calls this on its way out, so a
 // caller only needs it if it wants to abandon submissions mid-frame.
-export fn frame_lights_reset() {
-    // First-frame growth only; after this the arrays are never resized (A8).
+// First-frame growth only; after this the arrays are never resized (A8/N6).
+// Called from BOTH ends of the frame: `frame_light_add` may be the very first
+// thing that touches the manager, and it indexes rather than pushes.
+fn lm_ensure() {
     while (g_lm_x.length < g_LM_CAP) {
         g_lm_x.push(0.0); g_lm_y.push(0.0); g_lm_z.push(0.0);
         g_lm_r.push(0.0); g_lm_g.push(0.0); g_lm_b.push(0.0);
         g_lm_rad.push(0.0); g_lm_int.push(0.0); g_lm_taken.push(0.0);
     }
+    let need: i32 = ENV_MAX_LIGHTS * g_LM_FIELDS;
+    while (g_lm_shadow.length < need) { g_lm_shadow.push(0.0); g_lm_saved.push(0.0); }
+}
+
+export fn frame_lights_reset() {
+    lm_ensure();
     g_lm_n = 0;
 }
 
@@ -683,6 +739,7 @@ export fn frame_light_add(p_x: f64, p_y: f64, p_z: f64,
                           p_r: f64, p_g: f64, p_b: f64, p_radius: f64): i32 {
     let rad: f64 = p_radius;
     if (rad <= 0.0) { let bad: i32 = -1; return bad; }
+    if (g_lm_x.length < g_LM_CAP) { lm_ensure(); }
     g_lm_submitted++;
     if (g_lm_n >= g_LM_CAP) {
         g_lm_dropped++;
@@ -726,18 +783,52 @@ fn lights_commit() {
     if (cap > ENV_MAX_LIGHTS) { cap = ENV_MAX_LIGHTS; }
     if (cap < 0) { cap = 0; }
 
-    // --- 1. adopt whatever the caller already put in the env ---------------
+    // --- 1. adopt whatever the caller put in the env, NOT our own echo ------
+    // See THE ECHO above `g_lm_shadow`. If the env still holds the exact block
+    // this function wrote last frame, no caller has touched it, so the honest
+    // candidate set is the one we adopted last frame — not our own winners.
+    lm_ensure();
     let n0: i32 = env_light_count(env);
     if (n0 > ENV_MAX_LIGHTS) { n0 = ENV_MAX_LIGHTS; }
-    for (let i = 0; i < n0; i++) {
-        let base: i32 = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
-        frame_light_add(env_field(env, base + ENV_L_X),
-                        env_field(env, base + ENV_L_Y),
-                        env_field(env, base + ENV_L_Z),
-                        env_field(env, base + ENV_L_R),
-                        env_field(env, base + ENV_L_G),
-                        env_field(env, base + ENV_L_B),
-                        env_field(env, base + ENV_L_RADIUS));
+    let echo: i32 = 0;
+    if (n0 == g_lm_shadow_n) {
+        echo = 1;
+        for (let i = 0; i < n0; i++) {
+            let base: i32 = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
+            let o: i32 = i * g_LM_FIELDS;
+            if (env_field(env, base + ENV_L_X) != g_lm_shadow[o]) { echo = 0; }
+            if (env_field(env, base + ENV_L_Y) != g_lm_shadow[o + 1]) { echo = 0; }
+            if (env_field(env, base + ENV_L_Z) != g_lm_shadow[o + 2]) { echo = 0; }
+            if (env_field(env, base + ENV_L_R) != g_lm_shadow[o + 3]) { echo = 0; }
+            if (env_field(env, base + ENV_L_G) != g_lm_shadow[o + 4]) { echo = 0; }
+            if (env_field(env, base + ENV_L_B) != g_lm_shadow[o + 5]) { echo = 0; }
+            if (env_field(env, base + ENV_L_RADIUS) != g_lm_shadow[o + 6]) { echo = 0; }
+        }
+    }
+    g_lm_echoed = echo;
+    if (echo == 1) {
+        for (let i = 0; i < g_lm_saved_n; i++) {
+            let o2: i32 = i * g_LM_FIELDS;
+            frame_light_add(g_lm_saved[o2], g_lm_saved[o2 + 1], g_lm_saved[o2 + 2],
+                            g_lm_saved[o2 + 3], g_lm_saved[o2 + 4], g_lm_saved[o2 + 5],
+                            g_lm_saved[o2 + 6]);
+        }
+    } else {
+        g_lm_saved_n = n0;
+        for (let i = 0; i < n0; i++) {
+            let base: i32 = ENV_LIGHT0_X + i * ENV_LIGHT_STRIDE;
+            let o3: i32 = i * g_LM_FIELDS;
+            g_lm_saved[o3] = env_field(env, base + ENV_L_X);
+            g_lm_saved[o3 + 1] = env_field(env, base + ENV_L_Y);
+            g_lm_saved[o3 + 2] = env_field(env, base + ENV_L_Z);
+            g_lm_saved[o3 + 3] = env_field(env, base + ENV_L_R);
+            g_lm_saved[o3 + 4] = env_field(env, base + ENV_L_G);
+            g_lm_saved[o3 + 5] = env_field(env, base + ENV_L_B);
+            g_lm_saved[o3 + 6] = env_field(env, base + ENV_L_RADIUS);
+            frame_light_add(g_lm_saved[o3], g_lm_saved[o3 + 1], g_lm_saved[o3 + 2],
+                            g_lm_saved[o3 + 3], g_lm_saved[o3 + 4], g_lm_saved[o3 + 5],
+                            g_lm_saved[o3 + 6]);
+        }
     }
 
     // --- 2. the lantern, at the eye + a camera-space offset -----------------
@@ -805,11 +896,293 @@ fn lights_commit() {
     }
     g_lm_contested = lost;
     g_lm_accepted = env_light_count(env);
+
+    // Remember EXACTLY what we wrote, so next frame can tell our own echo from
+    // a caller's fresh post. Four slots x seven fields, unconditionally.
+    g_lm_shadow_n = g_lm_accepted;
+    for (let s2 = 0; s2 < g_lm_shadow_n; s2++) {
+        let sb: i32 = ENV_LIGHT0_X + s2 * ENV_LIGHT_STRIDE;
+        let so: i32 = s2 * g_LM_FIELDS;
+        g_lm_shadow[so] = env_field(env, sb + ENV_L_X);
+        g_lm_shadow[so + 1] = env_field(env, sb + ENV_L_Y);
+        g_lm_shadow[so + 2] = env_field(env, sb + ENV_L_Z);
+        g_lm_shadow[so + 3] = env_field(env, sb + ENV_L_R);
+        g_lm_shadow[so + 4] = env_field(env, sb + ENV_L_G);
+        g_lm_shadow[so + 5] = env_field(env, sb + ENV_L_B);
+        g_lm_shadow[so + 6] = env_field(env, sb + ENV_L_RADIUS);
+    }
+
     // Republish STAT_LIGHTS. Every consumer sets it during its own stage 6,
     // which is BEFORE the commit, so without this line every stats report in
     // the project would print the pre-ranking count.
     stat_set(STAT_LIGHTS, g_lm_accepted);
     frame_lights_reset();
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 16b — THE LANTERN'S GROUND POOL
+// ---------------------------------------------------------------------------
+// `fx.hml` already lays one additive ground card per dynamic light and it is
+// the right idea in the right place. It has never drawn one for a light near
+// the camera, and the reason is geometric, not numeric: the card is a SINGLE
+// QUAD centred ON THE LIGHT, so a lantern in the player's hand puts two of its
+// four corners behind the near plane and `emit_quad_world` rejects the whole
+// thing as a straddle. Measured, `--scene muzzle_fog`, adding the lantern:
+//
+//     tris.drawn      1082 -> 1082      (the card contributed NOTHING)
+//     clip.straddle    123 ->  125      (+2: the card, rejected)
+//
+// A grid fixes it exactly: the cells behind the near plane are rejected one by
+// one and the cells in front of it survive. Same glow cell, same additive
+// blend, same `light_rgb * 96` — the UVs are just interpolated across the
+// footprint instead of pinned to four corners.
+//
+// >>> THIS BELONGS IN `src/render/fx.hml`, which owns stage 16 and the glow
+// >>> card (§5.6). It is here because fx.hml is not this task's file to change
+// >>> (CLAUDE.md §3) and the pool is the whole point of the task. When fx.hml
+// >>> is next opened, move this in and delete the single-quad card: nothing
+// >>> else in the project draws a ground pool, so there is no third copy.
+//
+// Reserved: DIV*DIV*2 triangles. Drawn: whatever survives the near plane and
+// the frustum, typically a third of that, because most of a pool centred on
+// the player is behind the player.
+let g_lp_h: array<f64> = [];        // (HDIV+1)^2 terrain heights, sampled lazily
+let g_lp_ok: array<f64> = [];       // 1.0 once the matching height is computed
+let g_lp_uv: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_lp_dep: array<f64> = [0.0, 0.0];
+let g_lp_tris: i32 = 0;
+let g_lp_calls: i32 = 0;            // terrain_h calls this frame, for the probe
+
+// The coarse height grid's own frame state, set by `lantern_pool_emit` before
+// it walks the cells. Module-level rather than parameters because `pool_hy` is
+// called four times per drawn cell and Hemlock charges ~10 ns per argument
+// (CLAUDE.md A9b) — seven of these as arguments would cost more than the
+// bilinear it exists to do.
+let g_lp_x0: f64 = 0.0;
+let g_lp_z0: f64 = 0.0;
+let g_lp_hstep: f64 = 1.0;
+let g_lp_hside: i32 = 1;
+let g_lp_rep: i32 = 1;
+
+export fn frame_pool_tris(): i32 { let out: i32 = g_lp_tris; return out; }
+export fn frame_pool_terrain_calls(): i32 { let out: i32 = g_lp_calls; return out; }
+
+// One coarse sample, computed once per frame per grid point.
+fn pool_coarse(p_ci: i32, p_cj: i32): f64 {
+    let idx: i32 = p_cj * g_lp_hside + p_ci;
+    if (g_lp_ok[idx] > 0.5) { let hit: f64 = g_lp_h[idx]; return hit; }
+    let hv: f64 = t_terrain_h(g_lp_x0 + f64(p_ci) * g_lp_hstep,
+                              g_lp_z0 + f64(p_cj) * g_lp_hstep)
+                + g_LANTERN_POOL_LIFT;
+    g_lp_h[idx] = hv;
+    g_lp_ok[idx] = 1.0;
+    g_lp_calls++;
+    let out: f64 = hv;
+    return out;
+}
+
+// The height of colour-grid vertex (gi, gj), bilinear over the coarse grid.
+fn pool_hy(p_gi: i32, p_gj: i32): f64 {
+    let rep: i32 = g_lp_rep;
+    let gi: i32 = p_gi;   let gj: i32 = p_gj;
+    // `divi`, not `/`: Hemlock's `/` ALWAYS yields f64 (CLAUDE.md §4, "API
+    // corrections"), and an f64 quotient assigned into an `i32` local is one
+    // of the two ways this function used to walk off the end of the grid.
+    //
+    // The other is the FAR EDGE. The bilinear below always reads (ci+1, cj+1),
+    // so a colour vertex sitting exactly on the last coarse line indexes one
+    // row past the array. Clamping to the last CELL and setting the fraction
+    // to 1.0 evaluates to the same height and stays in bounds. Without it,
+    // POOL_DIV=8 died with "Array index 26 out of bounds (length 25)" and
+    // POOL_DIV=12 survived only because the cells that would have tripped it
+    // are the four corners of the bounding square, which the disc test always
+    // rejects. A latent out-of-bounds that one constant edit away from firing
+    // is not a bug that gets to stay.
+    let last: i32 = g_lp_hside - 1;
+    let ci: i32 = divi(gi, rep);   let mi: i32 = gi - ci * rep;
+    if (ci >= last) { ci = last - 1; mi = rep; }
+    let cj: i32 = divi(gj, rep);   let mj: i32 = gj - cj * rep;
+    if (cj >= last) { cj = last - 1; mj = rep; }
+    if (mi == 0 && mj == 0) { let exact: f64 = pool_coarse(ci, cj); return exact; }
+    let inv: f64 = 1.0 / f64(rep);
+    let fi: f64 = f64(mi) * inv;
+    let fj: f64 = f64(mj) * inv;
+    let h00: f64 = pool_coarse(ci, cj);
+    let h10: f64 = pool_coarse(ci + 1, cj);
+    let h01: f64 = pool_coarse(ci, cj + 1);
+    let h11: f64 = pool_coarse(ci + 1, cj + 1);
+    let a: f64 = h00 + (h10 - h00) * fi;
+    let b: f64 = h01 + (h11 - h01) * fi;
+    let out: f64 = a + (b - a) * fj;
+    return out;
+}
+
+// Emits into the FX batch. Returns the triangles actually drawn.
+// Called from stage 16, after `fx_emit`, so the pool sorts against the
+// particles rather than being unconditionally under or over them.
+fn lantern_pool_emit(): i32 {
+    g_lp_tris = 0;
+    if (g_lant_scale <= 0.0) { let z: i32 = 0; return z; }
+    if (g_atlas_fx == null) { let z2: i32 = 0; return z2; }
+    let div: i32 = g_LANTERN_POOL_DIV;
+    if (div < 1) { let z3: i32 = 0; return z3; }
+    if (div > 16) { div = 16; }
+
+    // --- the footprint, centred on the lantern (which is at the eye) --------
+    let amp: f64 = g_lant_gain * g_lant_scale;
+    let span: f64 = g_lant_rad * g_LANTERN_POOL_SPAN;
+    let yr: f64 = g_yaw * g_D2R;
+    let fwx: f64 = sin(yr);
+    let fwz: f64 = 0.0 - cos(yr);
+    let rgx: f64 = cos(yr);
+    let rgz: f64 = sin(yr);
+    let ox: f64 = g_camx + fwx * g_LANTERN_OFS_FWD + rgx * g_LANTERN_OFS_RIGHT;
+    let oz: f64 = g_camz + fwz * g_LANTERN_OFS_FWD + rgz * g_LANTERN_OFS_RIGHT;
+    let x0: f64 = ox - span;
+    let z0: f64 = oz - span;
+    let step: f64 = (span * 2.0) / f64(div);
+
+    // --- colour ------------------------------------------------------------
+    // >>> `p_rgb` IS `r | g<<8 | b<<16`. emit.hml's `emit_tri_world` reads it
+    // >>> that way (`br = rgb & 255`), and `src/render/fx.hml` packs its ground
+    // >>> card the OTHER way round, `(r<<16) | (g<<8) | b`. That is a real bug
+    // >>> in fx.hml — a warm lantern comes out cyan — and it has been invisible
+    // >>> for exactly the reason above: the card it packs has never once been
+    // >>> drawn. Reported, not fixed (fx.hml is not this task's file).
+    // >>> Copying fx.hml's line is how this pool first rendered ice blue.
+    let peak: f64 = amp * g_LANTERN_POOL_SCALE;
+    let cr: f64 = g_lant_r * peak;
+    let cg: f64 = g_lant_g * peak;
+    let cb: f64 = g_lant_b * peak;
+    if (cr < 1.0 && cg < 1.0 && cb < 1.0) { let z4: i32 = 0; return z4; }
+
+    // --- the height grid: COARSE, and sampled LAZILY ------------------------
+    // Both halves of that are measurements, not taste. `terrain_h` costs
+    // 3.234 us a call (see core/config.hml at POOL_HDIV), so:
+    //
+    //   eager, one sample per colour vertex, 169 calls .... emit.fx  0.90 ms
+    //   lazy,  one sample per colour vertex, ~120 calls ... emit.fx  0.73 ms
+    //   lazy,  coarse HDIV 6 grid, ~30 calls .............. emit.fx  0.19 ms
+    //
+    // COARSE cuts the count; LAZY cuts it again, because the pool is centred on
+    // the eye and the half of it behind the player is never drawn.
+    let hdiv: i32 = g_LANTERN_POOL_HDIV;
+    if (hdiv < 1) { hdiv = 1; }
+    if (hdiv > div) { hdiv = div; }
+    // HDIV must divide DIV or `pool_hy`'s integer split does not tile. Walk
+    // down to the nearest divisor rather than trusting the two constants to
+    // stay compatible after someone edits one of them.
+    //
+    // >>> `divi`, NOT `/`. This loop was written with `/` and therefore never
+    // >>> ran: `div / hdiv` is an f64 quotient, so `div - (div/hdiv)*hdiv` is
+    // >>> algebraically 0.0 for EVERY pair and the divisor walk exited on its
+    // >>> first test. DIV 12 / HDIV 6 happened to be a legal pair, so the bug
+    // >>> was invisible until DIV was set to 8, which then indexed the coarse
+    // >>> grid at 64 of 49 and killed the process. Measured, `--scene
+    // >>> muzzle_fog --lantern 1`, POOL_DIV=8: crash before, 7.28 ms after.
+    while (div - divi(div, hdiv) * hdiv != 0) { hdiv = hdiv - 1; }
+    g_lp_rep = divi(div, hdiv);
+    g_lp_hside = hdiv + 1;
+    g_lp_hstep = (span * 2.0) / f64(hdiv);
+    g_lp_x0 = x0;
+    g_lp_z0 = z0;
+    let need: i32 = g_lp_hside * g_lp_hside;
+    while (g_lp_h.length < need) { g_lp_h.push(0.0); g_lp_ok.push(0.0); }
+    for (let iz = 0; iz < need; iz++) { g_lp_ok[iz] = 0.0; }
+    g_lp_calls = 0;
+
+    // --- the texture is a CONSTANT WHITE TEXEL, and that is a measurement ----
+    // The obvious implementation stretches the glow cell across the pool and
+    // lets the affine UV interpolate the falloff per pixel. It does not work,
+    // and the cell says why. Dumped, FX_GLOW_L, 16x16, luminance x alpha
+    // normalised to 0..10 along the centre row:
+    //
+    //     0.0  0.0  0.1  0.5  5.5  9.8  9.8  9.8  9.8  9.8  9.8  5.5  0.6  0.1  0.0
+    //
+    // That is a SATURATED PLATEAU ~7 texels across with a ONE-TEXEL CLIFF to
+    // near zero, which is exactly right for a 1.9 m billboard with a white
+    // heart (fxgen `cell_glow` argues the case) and exactly wrong stretched
+    // over a 14 m pool: the plateau covers the first 3 m flat and the cliff
+    // becomes a hard bright ring on the ground at 3-4 m. That is what this
+    // stage rendered before this comment existed.
+    //
+    // So the cell is sampled at ITS CENTRE — one texel, the plateau, a neutral
+    // white multiplier — and the whole radial profile lives in the per-cell
+    // vertex colour below, where it is a curve we control. The FX atlas has no
+    // smooth radial ramp and `src/art/fxgen.hml` is not this task's file.
+    atlas_cell_uv(g_atlas_fx, g_cell_glow, g_lp_uv, 0);
+    let uc: f64 = (g_lp_uv[0] + g_lp_uv[2]) * 0.5;
+    let vc: f64 = (g_lp_uv[1] + g_lp_uv[3]) * 0.5;
+
+    // --- the grid. One reservation per cell so a rejected cell costs nothing.
+    let drawn: i32 = 0;
+    let bfx = g_bfx;
+    let vb: ptr = batch_vbuf(bfx);
+    for (let jz2 = 0; jz2 < div; jz2++) {
+        let za: f64 = z0 + f64(jz2) * step;
+        let zb: f64 = za + step;
+        for (let ix2 = 0; ix2 < div; ix2++) {
+            let xa: f64 = x0 + f64(ix2) * step;
+            let xb: f64 = xa + step;
+            // The radial profile, per cell. `emit_quad_world` writes ONE rgb to
+            // all four vertices (emit.hml's kernel takes a single `p_rgb` and
+            // hands the same br/bg/bb to `pack_v` three times), so a cell is
+            // flat-shaded and the pool is a stepped ramp. `g_LANTERN_POOL_DIV`
+            // is what buys the steps down: the step between adjacent rings is
+            // 4(1-d)/DIV of peak, so DIV 6 steps ~28 % and DIV 12 steps ~14 %.
+            //
+            // The curve is (1 - d/r)^2 -- the SAME one shade.hml's point light
+            // uses -- so the pool on the ground and the tint on a prop standing
+            // in it agree instead of arguing about where the light ends.
+            //
+            // Cells whose centre is outside the disc are skipped: they would
+            // cost two triangles each to add a value that is already zero.
+            let mcx: f64 = xa + step * 0.5 - ox;
+            let mcz: f64 = za + step * 0.5 - oz;
+            let d2: f64 = mcx * mcx + mcz * mcz;
+            if (d2 > span * span) { continue; }
+            // BEHIND THE PLAYER IS NOT DRAWN, and testing it here is what makes
+            // the stage affordable: the pool is centred on the eye, so half of
+            // it is always outside the frustum, and every one of those cells
+            // would otherwise pay four `terrain_h` calls and a 24-argument
+            // `emit_quad_world` before being rejected at the near plane.
+            // The -1.5 m margin keeps the row straddling the camera, which is
+            // the row whose FAR edge is still on screen.
+            if (mcx * fwx + mcz * fwz < 0.0 - 1.5) { continue; }
+            let att: f64 = 1.0 - __sqrt(d2) / span;
+            att = att * att;
+            let rgb: i32 = clampi(i32(cr * att), 0, 255)
+                         | (clampi(i32(cg * att), 0, 255) << 8)
+                         | (clampi(i32(cb * att), 0, 255) << 16);
+            if (rgb == 0) { continue; }
+            let cur: i32 = batch_reserve(bfx, 2);
+            if (cur < 0) { continue; }
+            // Corner heights off the COARSE grid, bilinear, computed on demand
+            // and remembered for the neighbouring cells that share them.
+            // `pool_hy` takes COLOUR-grid indices and does the HDIV split.
+            let ya0: f64 = pool_hy(ix2, jz2);
+            let ya1: f64 = pool_hy(ix2 + 1, jz2);
+            let yb1: f64 = pool_hy(ix2 + 1, jz2 + 1);
+            let yb0: f64 = pool_hy(ix2, jz2 + 1);
+            // Wound so the quad faces UP: (xa,za) (xb,za) (xb,zb) (xa,zb) with
+            // the normal handed in as +Y, exactly as fx.hml's card is.
+            let n: i32 = emit_quad_world(vb, cur, g_lp_dep, 0,
+                                         xa, ya0, za,
+                                         xb, ya1, za,
+                                         xb, yb1, zb,
+                                         xa, yb0, zb,
+                                         uc, vc, uc, vc, uc, vc, uc, vc,
+                                         0.0, 1.0, 0.0, rgb);
+            bfx.n = bfx.n - (2 - n);
+            for (let k = 0; k < n; k++) {
+                batch_commit(bfx, cur + k * 60, g_tex_fx, g_lp_dep[k]);
+            }
+            drawn = drawn + n;
+        }
+    }
+    g_lp_tris = drawn;
+    let out: i32 = drawn;
+    return out;
 }
 
 // ===========================================================================
@@ -1574,6 +1947,13 @@ export fn frame_render(): i32 {
     if (sheet == 0) {
         nfx = fx_emit(g_bfx, g_tex_fx, g_atlas_fx, g_env, g_cell_glow,
                       g_camx, g_camz);
+        // -- 16b  the lantern's ground pool. See the long note at its
+        // definition: fx.hml's single-quad card cannot survive the near plane
+        // for a light in the player's hand, and this is the whole reason the
+        // lantern lit nothing.
+        lantern_pool_emit();
+    } else {
+        g_lp_tris = 0;
     }
     stat_set(STAT_PARTICLES, nfx);
     stat_end(STAT_T_EMIT_FX);

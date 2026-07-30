@@ -26,7 +26,7 @@
 // the stage timer measures what it measured before the split.
 // ===========================================================================
 
-import { sqrt } from "@stdlib/math";
+import { sqrt, floor } from "@stdlib/math";
 
 import { mesh_emit_yaw } from "../../../wobbleweed/src/mesh.hml";
 import { frustum_sphere } from "../../../wobbleweed/src/frustum.hml";
@@ -68,13 +68,15 @@ let g_pr_tg: array<i32> = [];
 let g_pr_tb: array<i32> = [];
 let g_pr_shadow: array<f64> = [];
 let g_pr_tag: array<i32> = [];      // opaque to this file; the caller's class
+let g_pr_key: array<i32> = [];      // stable LOD-hysteresis identity, 0 = derive
 
 export fn entity_prop_clear() {
     g_pr_m0 = []; g_pr_m1 = []; g_pr_m2 = [];
     g_pr_d1 = []; g_pr_d2 = []; g_pr_rad = [];
     g_pr_x = []; g_pr_y = []; g_pr_z = [];
     g_pr_yaw = []; g_pr_s = []; g_pr_tr = []; g_pr_tg = []; g_pr_tb = [];
-    g_pr_shadow = []; g_pr_tag = [];
+    g_pr_shadow = []; g_pr_tag = []; g_pr_key = [];
+    g_hy_frame++;
 }
 
 // p_m0/p_m1/p_m2 are the three LOD meshes (pass the same handle three times for
@@ -94,8 +96,29 @@ export fn entity_prop_add(p_m0, p_m1, p_m2, p_d1: f64, p_d2: f64, p_rad: f64,
     g_pr_tr.push(p_tr); g_pr_tg.push(p_tg); g_pr_tb.push(p_tb);
     g_pr_shadow.push(p_shadow);
     g_pr_tag.push(p_tag);
+    g_pr_key.push(0);
     let out: i32 = idx;
     return out;
+}
+
+// Give an instance a STABLE identity for the LOD hysteresis below. Optional:
+// with no key the tier memory is addressed by the instance's own quantized
+// position, which is exact for anything that does not move and good enough for
+// anything that does (see `hy_slot`). A caller that already has a stable id —
+// `main.hml` has `client_ent_id` for every entity — should hand it over:
+//
+//     let i = world_prop_add(...);
+//     entity_prop_key(i, id);
+//
+// It is a no-op on an out-of-range index so a caller cannot crash the frame by
+// keying a prop it failed to add.
+export fn entity_prop_key(p_i: i32, p_key: i32) {
+    let i: i32 = p_i;
+    if (i < 0) { return; }
+    if (i >= g_pr_key.length) { return; }
+    let k: i32 = p_key;
+    if (k == 0) { k = 1; }          // 0 is the "derive it" sentinel
+    g_pr_key[i] = k;
 }
 
 export fn entity_prop_count(): i32 { let out: i32 = g_pr_m0.length; return out; }
@@ -122,10 +145,222 @@ export fn entity_prop_scale(p_i: i32): f64 { let out: f64 = g_pr_s[p_i]; return 
 // So the threshold is where linear fog leaves under 8 % of the albedo, with a
 // 46 m floor that keeps every short-fog scene (26 m, 20 m) on exactly the LODs
 // it had. This can only cost triangles in the deep scenes that showed the bug.
-fn lod_pick(p_env: array<f64>, p_i: i32, p_dist: f64) {
+// ===========================================================================
+// 1b. LOD HYSTERESIS — why a bare distance compare is not enough
+// ===========================================================================
+// A villager standing at 26.0 m with the tier boundary at 26.0 m switches mesh
+// on ANY camera motion. The player is never still: idle sway, the walk bob,
+// mouse jitter and the entity's own idle motion all move `d` by a few
+// centimetres per frame, and every crossing swaps a 38-triangle mesh for a
+// 12-triangle one and back. That is the single most visible artefact LOD has,
+// it is worse than either mesh on its own, and it gets worse the more bodies
+// there are — which is exactly what this task is adding.
+//
+// So the tier a prop was on LAST frame is remembered, and going FINER costs
+// more distance than going COARSER:
+//
+//     tier 0 -> 1  at  d1                tier 1 -> 0  at  d1 - h1
+//     tier 1 -> 2  at  d2                tier 2 -> 1  at  d2 - h2
+//     h = max(6 % of the threshold, 0.75 m)
+//
+// The band is one-sided ON PURPOSE: the coarse tier wins ties, so hysteresis
+// never costs triangles, it only ever saves them. 6 % of 18 m is 1.08 m and 6 %
+// of 9 m floors to 0.75 m — one to two orders of magnitude more than the
+// centimetres of sway that cause the flicker, and small enough that a player
+// walking at 5 m/s spends 0.15 s in the band, which is below the threshold at
+// which anyone notices a mesh arriving late.
+//
+// A far threshold that is FOG-RELATIVE (`g_LOD_FOG_CARD`) moves as the time of
+// day scrubs, so it needs this even when nothing else does.
+//
+// ---------------------------------------------------------------------------
+// THE IDENTITY PROBLEM, and the answer.
+// ---------------------------------------------------------------------------
+// Hysteresis needs to know which prop it is looking at, and the registry is
+// CLEARED AND REBUILT EVERY FRAME (`world_clear` -> `world_prop_add` x N, in
+// `main.hml`'s `world_rebuild`), so the registry index `k` is not an identity —
+// it changes as chunks page in and entities come and go.
+//
+// The memory therefore lives in a small open-addressed table keyed by either
+//   (a) an explicit caller key (`entity_prop_key`), which is what an entity
+//       with a real sim id should use, or
+//   (b) the instance's own position quantized to 0.5 m, plus its tag.
+//
+// (b) is EXACT for anything static — trees, rocks, lanterns, a villager
+// standing at a market stall, which is most of what is on screen — and for
+// anything moving it degrades gracefully rather than failing: on a miss the
+// eight neighbouring cells are probed and the entry MIGRATES, so a body moving
+// under 0.5 m per frame (30 m/s; nothing in this game is close) keeps its
+// memory. Only a genuine cold miss falls back to the plain thresholds, which is
+// the behaviour this file had before, so the worst case is the old behaviour.
+//
+// Two props inside the same 0.5 m cell with the same tag can share an entry.
+// They are within 0.5 m of each other, so they want the same tier anyway.
+// ===========================================================================
+
+let g_HY_BITS: i32 = 10;
+let g_HY_N: i32 = 1024;            // 1 << g_HY_BITS
+let g_HY_PROBE: i32 = 8;
+let g_HY_STALE: i32 = 120;         // frames before an entry is reusable
+
+let g_hy_key: array<i32> = [];
+let g_hy_tier: array<i32> = [];
+let g_hy_stamp: array<i32> = [];
+let g_hy_frame: i32 = 0;
+let g_hy_ready: i32 = 0;
+
+// switch bookkeeping — this is how a probe PROVES the hysteresis works
+let g_hy_switches: i32 = 0;
+let g_hy_switches_total: i32 = 0;
+let g_hy_held: i32 = 0;            // frames a prop sat inside the band and did
+                                   // NOT switch: the flicker that did not happen
+
+export let g_HSTAT_SWITCHES: i32 = 0;
+export let g_HSTAT_TOTAL: i32 = 1;
+export let g_HSTAT_HELD: i32 = 2;
+
+export fn entity_lod_stats(p_field: i32): i32 {
+    let f: i32 = p_field;
+    if (f == g_HSTAT_SWITCHES) { let a: i32 = g_hy_switches; return a; }
+    if (f == g_HSTAT_TOTAL) { let b: i32 = g_hy_switches_total; return b; }
+    if (f == g_HSTAT_HELD) { let c: i32 = g_hy_held; return c; }
+    let z: i32 = 0;
+    return z;
+}
+
+// Drop every remembered tier. Call on a teleport or a scene change if you want
+// the next frame to pick tiers from scratch; nothing in the frame path needs it,
+// because a tier more than one step from the plain answer snaps immediately.
+export fn entity_lod_reset() {
+    let i: i32 = 0;
+    let n: i32 = g_hy_key.length;
+    while (i < n) { g_hy_key[i] = 0; g_hy_tier[i] = 0; g_hy_stamp[i] = 0; i++; }
+    g_hy_switches = 0; g_hy_switches_total = 0; g_hy_held = 0;
+}
+
+fn hy_init() {
+    if (g_hy_ready == 1) { return; }
+    let i: i32 = 0;
+    while (i < g_HY_N) { g_hy_key.push(0); g_hy_tier.push(0); g_hy_stamp.push(0); i++; }
+    g_hy_ready = 1;
+}
+
+// A 32-bit mix in i64 with an explicit mask (CLAUDE.md A13: i32 * + - THROW on
+// overflow, so every product is taken in i64 and masked back).
+//
+// ⚠ EVERY MULTIPLIER HERE IS UNDER 2^27 AND THAT IS LOAD-BEARING. i64 throws on
+// overflow too. The first draft used the textbook 2654435761 (2^31.3) on a
+// value already masked to 32 bits, which is 1.1e19 — past i64's 9.2e18 — and it
+// threw `Integer overflow: i64 multiplication` on the FIRST hash of the first
+// frame. Masked to 32 bits, a multiplier must stay below 2^31 for the product
+// to fit; these three are 2^26.1, 2^24.2 and 2^26.3.
+fn hy_mix(p_a: i32, p_b: i32, p_c: i32): i32 {
+    let a: i64 = i64(p_a) & 0xFFFFFFFF;
+    let b: i64 = i64(p_b) & 0xFFFFFFFF;
+    let c: i64 = i64(p_c) & 0xFFFFFFFF;
+    let hsh: i64 = (a * 73856093) & 0xFFFFFFFF;
+    hsh = (hsh ^ ((b * 19349663) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+    hsh = (hsh ^ ((c * 83492791) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+    hsh = (hsh ^ (hsh >> 15)) & 0xFFFFFFFF;
+    hsh = (hsh * 0x45D9F3B) & 0xFFFFFFFF;
+    hsh = (hsh ^ (hsh >> 13)) & 0xFFFFFFFF;
+    let out: i32 = i32(hsh & 0x3FFFFFFF);
+    if (out == 0) { let one: i32 = 1; return one; }
+    return out;
+}
+
+// Find the table slot holding p_key, or -1. Never inserts.
+fn hy_find(p_key: i32): i32 {
+    let key: i32 = p_key;
+    let idx: i32 = key & (g_HY_N - 1);
+    let p: i32 = 0;
+    while (p < g_HY_PROBE) {
+        let s: i32 = (idx + p) & (g_HY_N - 1);
+        let k: i32 = g_hy_key[s];
+        if (k == key) {
+            if (g_hy_frame - g_hy_stamp[s] <= g_HY_STALE) { let out: i32 = s; return out; }
+        }
+        p++;
+    }
+    let miss: i32 = -1;
+    return miss;
+}
+
+// Find a slot for p_key, inserting if necessary. Prefers an exact match, then
+// an empty or stale slot, and finally evicts the oldest of the probed slots.
+fn hy_slot_for(p_key: i32): i32 {
+    let key: i32 = p_key;
+    let idx: i32 = key & (g_HY_N - 1);
+    let best: i32 = -1;
+    let best_age: i32 = -1;
+    let p: i32 = 0;
+    while (p < g_HY_PROBE) {
+        let s: i32 = (idx + p) & (g_HY_N - 1);
+        let k: i32 = g_hy_key[s];
+        if (k == key) { let out: i32 = s; return out; }
+        let age: i32 = g_hy_frame - g_hy_stamp[s];
+        if (k == 0) { age = 1000000; }
+        if (age > best_age) { best_age = age; best = s; }
+        p++;
+    }
+    let out2: i32 = best;
+    return out2;
+}
+
+// The identity of registry entry i, and the tier it was on last time, or -1.
+// A moving body's cell changes; the eight neighbours are probed so the entry
+// MIGRATES with it instead of losing its memory every half metre.
+fn hy_recall(p_i: i32, p_key_out: array<i32>): i32 {
+    let i: i32 = p_i;
+    let explicit: i32 = g_pr_key[i];
+    if (explicit != 0) {
+        let key: i32 = hy_mix(explicit, 0, 0);
+        p_key_out[0] = key;
+        let s: i32 = hy_find(key);
+        if (s < 0) { let miss: i32 = -1; return miss; }
+        let t: i32 = g_hy_tier[s];
+        return t;
+    }
+    let tag: i32 = g_pr_tag[i];
+    let qx: i32 = i32(floor(g_pr_x[i] * 2.0));
+    let qz: i32 = i32(floor(g_pr_z[i] * 2.0));
+    let key2: i32 = hy_mix(qx, qz, tag);
+    p_key_out[0] = key2;
+    let s2: i32 = hy_find(key2);
+    if (s2 >= 0) { let t2: i32 = g_hy_tier[s2]; return t2; }
+    // migrate: the same body, half a metre along
+    let dz: i32 = -1;
+    while (dz <= 1) {
+        let dx: i32 = -1;
+        while (dx <= 1) {
+            if (dx != 0 || dz != 0) {
+                let nk: i32 = hy_mix(qx + dx, qz + dz, tag);
+                let s3: i32 = hy_find(nk);
+                if (s3 >= 0) {
+                    let t3: i32 = g_hy_tier[s3];
+                    g_hy_key[s3] = 0;            // vacate the old cell
+                    return t3;
+                }
+            }
+            dx++;
+        }
+        dz++;
+    }
+    let miss2: i32 = -1;
+    return miss2;
+}
+
+let g_hy_scratch: array<i32> = [0];
+
+// The tier decision, whole. `lod_pick` is a two-line wrapper over it and
+// `entity_lod_tier` is the same call with no mesh lookup, so a probe can drive
+// the hysteresis over a synthetic camera sway and get EXACTLY the answer the
+// frame would have got — no reimplementation, no drift.
+fn lod_tier(p_env: array<f64>, p_i: i32, p_dist: f64): i32 {
+    hy_init();
     let i: i32 = p_i;
     let d: f64 = p_dist;
-    if (d < g_pr_d1[i]) { let m0 = g_pr_m0[i]; return m0; }
+    let d1: f64 = g_pr_d1[i];
     let d2: f64 = g_pr_d2[i];
     if (d2 < 0.0) {
         let fnear: f64 = env_field(p_env, ENV_FOG_NEAR);
@@ -133,7 +368,62 @@ fn lod_pick(p_env: array<f64>, p_i: i32, p_dist: f64) {
         d2 = fnear + (ffar - fnear) * 0.92;
         if (d2 < 46.0) { d2 = 46.0; }
     }
-    if (d < d2) { let m1 = g_pr_m1[i]; return m1; }
+
+    let prev: i32 = hy_recall(i, g_hy_scratch);
+    let key: i32 = g_hy_scratch[0];
+
+    // The two boundaries, pulled IN by the hysteresis band whenever the prop is
+    // already on the coarser side of them.
+    let t1: f64 = d1;
+    let t2: f64 = d2;
+    if (prev >= 1) {
+        let h1: f64 = d1 * 0.06;
+        if (h1 < 0.75) { h1 = 0.75; }
+        t1 = d1 - h1;
+    }
+    if (prev >= 2) {
+        let h2: f64 = d2 * 0.06;
+        if (h2 < 0.75) { h2 = 0.75; }
+        t2 = d2 - h2;
+    }
+    let tier: i32 = 0;
+    if (d >= t1) { tier = 1; }
+    if (d >= t2) { tier = 2; }
+
+    if (prev >= 0) {
+        if (tier != prev) {
+            g_hy_switches++;
+            g_hy_switches_total++;
+        } else {
+            // sitting inside a band it would have crossed without the memory
+            let plain: i32 = 0;
+            if (d >= d1) { plain = 1; }
+            if (d >= d2) { plain = 2; }
+            if (plain != tier) { g_hy_held++; }
+        }
+    }
+
+    let s: i32 = hy_slot_for(key);
+    if (s >= 0) {
+        g_hy_key[s] = key;
+        g_hy_tier[s] = tier;
+        g_hy_stamp[s] = g_hy_frame;
+    }
+
+    let out: i32 = tier;
+    return out;
+}
+
+export fn entity_lod_tier(p_env: array<f64>, p_i: i32, p_dist: f64): i32 {
+    let out: i32 = lod_tier(p_env, p_i, p_dist);
+    return out;
+}
+
+fn lod_pick(p_env: array<f64>, p_i: i32, p_dist: f64) {
+    let i: i32 = p_i;
+    let tier: i32 = lod_tier(p_env, i, p_dist);
+    if (tier == 0) { let m0 = g_pr_m0[i]; return m0; }
+    if (tier == 1) { let m1 = g_pr_m1[i]; return m1; }
     let m2 = g_pr_m2[i];
     return m2;
 }
@@ -169,6 +459,7 @@ export fn entity_emit(p_b, p_tex, p_env: array<f64>, p_frustum: array<f64>,
     let env: array<f64> = p_env;
     let fr: array<f64> = p_frustum;
     let etested: i32 = 0; let eculled: i32 = 0; let edrawn: i32 = 0;
+    g_hy_switches = 0;
     let np: i32 = g_pr_m0.length;
     let ftr: f64 = env_field(env, ENV_FOG_R);
     let ftg2: f64 = env_field(env, ENV_FOG_G);

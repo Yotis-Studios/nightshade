@@ -15,10 +15,15 @@
 //     (none)      bench + gate. exits 1 on any failure.   <- the CI form
 //     --quick     fewer frames; a smoke test, still gated
 //     --ablate    stage ablation: what each optional stage actually costs
+//     --passes N  --sweep only: interleaved ladder passes (default 3)
 //     --sweep     THE TRIANGLE-CEILING SWEEP. scales the drawn triangle count
 //                 through the real frame path and reports the marginal cost per
 //                 triangle and the count at which the frame crosses 16.67 ms,
 //                 with read_pixels_rect excluded. See section 7b.
+//     --burst     peak/mean DRAWN over whole 360-frame camera laps, per ladder
+//                 point. The sweep times frames 0..89 only, so its own peak
+//                 column never sees the ridge at frame 252; this mode does.
+//                 The steady/clamp pair is divided by THIS number.
 //     --csv       machine-readable stage table on top of the human one
 //     --frames N  frames per trial (default 90)
 //     --trials N  trials (default 7, RULE T)
@@ -83,6 +88,7 @@
 
 import { exit } from "@stdlib/process";
 import { open_fd } from "@stdlib/fs";
+import { write_png } from "../../wobbleweed/src/png.hml";
 import { sin, cos, sqrt, floor } from "@stdlib/math";
 
 // ---------------------------------------------------------------------------
@@ -146,6 +152,7 @@ import { frame_init, frame_render, frame_present, frame_begin,
 // the game — core
 // ---------------------------------------------------------------------------
 import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_TRIS_CLAMP,
+         g_TRIS_CEILING,
          g_FOG_FAR_CAP, g_MIST_HEIGHT, g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS,
          g_UPSCALE_DEFAULT, g_FRAME_BUDGET_MS, g_TICK_MS,
          g_BUDGET_RENDER_MS, g_BUDGET_SIM_MS, g_BUDGET_IO_MS,
@@ -310,6 +317,12 @@ let g_VERSION: string = "benchframe.hml W4-13";
 let g_FRAMES: i32 = 90;          // frames per trial
 let g_TRIALS: i32 = 7;           // RULE T
 let g_WARM: i32 = 12;            // frames discarded before every trial
+let g_PASSES: i32 = 3;           // --sweep only: interleaved passes over the ladder
+let g_SHOT: string = "";         // --shot PATH: write one PNG and exit
+let g_SHOT_VIL: i32 = 0;         // --shot-villagers N
+let g_SHOT_COLS: i32 = 5;        // --shot-cols N: fan width, so the WIDE fan
+                                 // the high ladder uses can actually be LOOKED at
+let g_vsync_rc: i32 = 0;         // set_vsync's return: -1 = SOFTWARE renderer
 
 // 16 m chunks of 4x4 four-metre quads = 32 triangles each. NOT walk.hml's 32 m
 // chunk: `world_render.hml`'s terrain path has no LOD, so the chunk edge IS the
@@ -686,7 +699,46 @@ let g_fog_alpha_override: f64 = -1.0;
 // g_fog_far_override shrinks the terrain ring, and is used ONLY to reach the
 // low end of the ladder (500-1000 triangles), which no amount of villager
 // subtraction can reach because zero is the floor.
+//
+// g_fan_cols is the THIRD knob, and it exists because the 5-column fan SATURATES.
+// Measured: past ~88 villagers the fan's rows (dd = 7 + 3.4*floor(v/5) m) walk
+// out past FOG_FAR and the extra bodies never reach the kernel — v88 / v104 /
+// v120 all returned an IDENTICAL 4629.4 drawn. A 5-wide fan therefore CANNOT be
+// driven above ~4600 drawn triangles no matter how many villagers are asked for,
+// and 4600 is below the counts this sweep exists to answer questions about.
+// Widening the fan spends the frustum's WIDTH instead of its DEPTH: at 11
+// columns, 112 villagers sit between 7 m and 41 m, all inside a 70-degree FOV
+// (lateral reach 26 m against a 28.7 m half-width at 41 m) and all inside fog.
+//
+// It is a DIFFERENT CONTENT MIX, not just more of the same one — a wide fan is
+// closer, so a larger fraction of it stays off the g_LOD_FOG_CARD path and the
+// drawn/source ratio rises. That is the point: it is a town square rather than a
+// queue receding into the fog, and it is fitted as its OWN ladder (FIT == 2) so
+// its slope can be compared against the narrow one rather than averaged into it.
 let g_villagers: i32 = 0;
+let g_fan_cols: i32 = 5;
+
+// THE CONTENTION DERATE — set from measurement, and it must be re-measured
+// whenever this box's background load changes character.
+//
+// CLAUDE.md §1.2 states as fact that a llama-server PERMANENTLY holds ~17 of 24
+// cores. On 2026-07-29 that was not true: `pgrep llama` was empty and loadavg
+// sat at ~2.1 for the whole of this wave's measurement. Every number this file
+// printed today is therefore a NEAR-IDLE number, and a triangle budget sized on
+// a quiet box is a budget that breaks the day the server comes back.
+//
+// Rather than assume BUDGET_ACTUAL's historical 29 %, the inflation was measured
+// directly: the same binary, the same scene, run with and without 17 synthetic
+// busy cores. The ratio is below and the working is in the task report. The
+// steady/clamp pair is divided by it, which is the conservative direction.
+// MEASURED 2026-07-29, tools/benchframe.hml default gate, min-of-7 x 90 frames,
+// idle vs 17 synthetic busy cores, two independent repetitions:
+//     run 1   idle 7.541 ms   loaded 9.549 ms   x1.266
+//     run 2   idle 7.682 ms   loaded 9.865 ms   x1.284
+//   corroborated per stage on run 1: EMIT x1.282, RENDER total x1.281
+// Rounded UP to 1.28. This lands within a point of BUDGET_ACTUAL's historical
+// 29 %, which is reassuring but was NOT assumed — it was re-derived.
+let g_LOAD_DERATE: f64 = 1.28;
 let g_fog_far_override: f64 = -1.0;
 
 // The __clock() column, in seconds, accumulated over a trial.
@@ -783,10 +835,18 @@ fn world_rebuild() {
         let fwz: f64 = 0.0 - cos(yr);
         let rgx: f64 = cos(yr);
         let rgz: f64 = sin(yr);
+        let fc: i32 = g_fan_cols;
+        if (fc < 1) { fc = 1; }
+        let cmid: f64 = f64(fc - 1) * 0.5;
+        // A wider fan is also a SHALLOWER one, so the row pitch tightens with the
+        // column count: 5 columns step 3.4 m and 11 columns step 3.1 m, which
+        // keeps the deepest row of a 112-body fan at 41 m rather than 76 m.
+        let rowpitch: f64 = 3.4;
+        if (fc > 5) { rowpitch = 3.1; }
         for (let v = 0; v < vn; v++) {
-            let col: f64 = f64(v % 5) - 2.0;
-            let rowi: i32 = v / 5;
-            let dd: f64 = 7.0 + f64(rowi) * 3.4 + f64(v % 3) * 0.6;
+            let col: f64 = f64(v % fc) - cmid;
+            let rowi: i32 = v / fc;
+            let dd: f64 = 7.0 + f64(rowi) * rowpitch + f64(v % 3) * 0.6;
             let lat: f64 = col * (1.1 + dd * 0.10);
             let vx: f64 = g_camx + fwx * dd + rgx * lat;
             let vz: f64 = g_camz + fwz * dd + rgz * lat;
@@ -1198,6 +1258,32 @@ fn csv_row(p_name: string, p_ms: f64) {
     print(`CSV,stage,${p_name},${f3(p_ms)}`);
 }
 
+// ---------------------------------------------------------------------------
+// --shot: write ONE frame as a PNG so a human can LOOK at what the sweep is
+// benching. A triangle-count bench that nobody has looked at is a bench of
+// numbers, not of a frame — the villager fan could be spawning inside the
+// terrain or behind the camera and every column in the table would still look
+// reasonable. `g_fb` already holds the frame: world_render.hml's
+// frame_present() reads the render target into it every frame.
+// ---------------------------------------------------------------------------
+fn shot_write(p_path: string) {
+    let w: i32 = g_RES_W;
+    let h: i32 = g_RES_H;
+    let out: buffer = buffer(w * h * 3);
+    let op: ptr = buffer_ptr(out);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let si: i32 = (y * w + x) * 4;      // ARGB8888 = B,G,R,A in memory
+            let di: i32 = (y * w + x) * 3;
+            ptr_write_u8(ptr_offset(op, di, 1), ptr_deref_u8(ptr_offset(g_fb, si + 2, 1)));
+            ptr_write_u8(ptr_offset(op, di + 1, 1), ptr_deref_u8(ptr_offset(g_fb, si + 1, 1)));
+            ptr_write_u8(ptr_offset(op, di + 2, 1), ptr_deref_u8(ptr_offset(g_fb, si, 1)));
+        }
+    }
+    write_png(p_path, out, w, h);
+    print(`  shot            ${p_path}   ${g_SHOT_VIL} villagers, ${stat_get(STAT_TRIS_DRAWN)} triangles drawn, ${stat_get(STAT_ENTS_DRAWN)} instances`);
+}
+
 // ===========================================================================
 //  7b. THE TRIANGLE-CEILING SWEEP
 // ---------------------------------------------------------------------------
@@ -1214,6 +1300,42 @@ fn csv_row(p_name: string, p_ms: f64) {
 //  and the peak of STAT_TRIS_DRAWN over every frame of every trial, and the
 //  regression is fitted against the mean. "I asked for 3000" is not data.
 //
+//  ⚠ CAPACITY IS NOT FREE. THE BUDGET PAYS FOR HEADROOM IT NEVER USES.
+//
+//  `g_CAP_WORLD` is the `cap` handed to `batch_new`, and raising it costs frame
+//  time AT UNCHANGED OCCUPANCY. Measured with this file, --quick, minimum of
+//  three interleaved passes, six binaries differing in exactly one integer
+//  literal and nothing else (`diff -rq` confirmed), all drawing the same 1839
+//  triangles of the same frame:
+//
+//      g_CAP_WORLD   emit.terrain   FRAME (incl. readback)
+//           3500       1.550 ms        7.939 ms      <- shipping
+//           4500       1.702 ms        8.068 ms      +0.13
+//           6000       1.908 ms        8.452 ms      +0.51
+//           8000       2.224 ms        8.795 ms      +0.86
+//          12000       2.834 ms        9.671 ms      +1.73
+//          20000       4.038 ms       11.130 ms      +3.19
+//
+//  ~0.19 ms per 1000 triangles of DECLARED CAPACITY, whether or not a single
+//  one of them is used. Nothing in the frame path is O(cap): `batch_reset` is
+//  three field writes, `batch_reserve` is a compare, `batch_commit` writes one
+//  array slot. It is a memory-footprint effect, and it needs BOTH halves of the
+//  batch to be large — two more binaries, one with the 20000-triangle `alloc`
+//  arenas but the depth/tex/order arrays pinned at 3500 entries, one with the
+//  arrays at 20000 and the arenas at 3500, BOTH measured 1.54 ms / 7.80 ms,
+//  i.e. no tax at all. Only the combination is expensive, which points at a
+//  total-live-heap threshold in the runtime rather than at either allocation.
+//
+//  TWO CONSEQUENCES, and the second one is the load-bearing one:
+//    1. Do not "buy safety" by over-sizing the clamp. A 20000-triangle clamp
+//       makes the EMPTY frame 3.19 ms more expensive and buys nothing, because
+//       the frame runs out of TIME thousands of triangles before it runs out of
+//       capacity.
+//    2. Any ceiling measured on an over-sized batch is measured on a pessimized
+//       renderer. The first version of this sweep ran at cap 20000 and reported
+//       a crossing point of 3131 drawn triangles; the same sweep at cap 4500
+//       reports the real one. That mistake is the reason this comment exists.
+//
 //  THE CEILING IS A HARD WALL AT g_CAP_WORLD, NOT A SOFT ONE AT 16.67 ms.
 //  `batch_reserve` refuses past LAYER_WORLD's capacity and the whole mesh is
 //  skipped BEFORE any transform runs, so a row past the cap measures a cheaper
@@ -1224,6 +1346,22 @@ fn csv_row(p_name: string, p_ms: f64) {
 let g_fit_x: array<f64> = [];   // mean triangles drawn
 let g_fit_y: array<f64> = [];   // frame ms, readback excluded
 let g_fit_s: array<f64> = [];   // mean SOURCE triangles (drawn + per-tri rejects)
+// The SECONDARY fit: every overflow-free row, whatever lever produced it. The
+// primary fit answers "what does one more villager cost"; this one answers
+// "does the cost per triangle depend on WHICH triangles" — if the two slopes
+// agree, the frame is paying for triangles and not for a particular kind of
+// content, which is the claim a budget in triangles is actually making.
+let g_all_x: array<f64> = [];
+let g_all_y: array<f64> = [];
+let g_all_s: array<f64> = [];   // source triangles, for the two-term fit
+// The HIGH ladder (FIT == 2): the 11-column fan, 4000-8000 drawn. This is the
+// only group that has points ON BOTH SIDES of the interesting region, so it is
+// the group that turns "where does the frame cross 16.67 ms" from an
+// extrapolation into an interpolation. Empty in the shipping binary, where every
+// one of its rows overflows g_CAP_WORLD.
+let g_hi_x: array<f64> = [];
+let g_hi_y: array<f64> = [];
+let g_hi_s: array<f64> = [];
 
 fn sweep_reset_counters() {
     g_sw_peak = 0; g_sw_sum = 0.0; g_sw_n = 0; g_sw_ovf = 0; g_sw_src = 0.0;
@@ -1264,40 +1402,228 @@ fn sweep_net_ms(): f64 {
     return out;
 }
 
-fn sweep_row(p_label: string, p_csv: i32, p_fit: i32) {
-    let mean: f64 = sweep_mean_tris();
+// ---------------------------------------------------------------------------
+// THE LADDER, declared once as data. Every pass walks the same points in the
+// same order, so a point's minimum is taken over samples SPREAD ACROSS the
+// whole run rather than over seven consecutive trials that a single load spike
+// can poison together. That is not a refinement — measured on this box, one
+// agent's compile landing on top of points v48..v64 inflated the
+// triangle-INDEPENDENT stages (`present`, `hud`) by 50 % and turned a smooth
+// 5 us/tri segment into a 16 us/tri one. `present` is the tell: it must not
+// move with triangle count, and where it does, the row is contention.
+// ---------------------------------------------------------------------------
+// The ladder spans the counts the task asks about — roughly 500, 1000, 1500,
+// 1840 (SHIPPING), 2300, 3000, 3600, 4100, 5000, 6100, 7200, 8100, 9400,
+// 10700 DRAWN triangles — because "how many villagers fit" is a question about
+// 4000-10000, not about 2500.
+//
+// THE TOP OF THIS LADDER DOES NOT FIT IN THE SHIPPING BATCH. `g_CAP_WORLD` in
+// world_render.hml is 3500, so every row above it is marked OVF, drops
+// triangles at `batch_reserve` and is excluded from the fit. That is not a
+// defect in the ladder, it is the FIRST measured finding: today's ceiling is a
+// HARD WALL AT 3500 IN A CONSTANT, reached long before the frame runs out of
+// time. Raising `g_TRIS_CLAMP` without raising `g_CAP_WORLD` changes nothing.
+// ONE VILLAGER IS NOT 220 DRAWN TRIANGLES. Measured on the ladder below, an
+// extra villager adds **222.0 SOURCE** triangles (the mesh, exactly, plus its
+// mandatory 2-triangle contact blob) and only **~55 DRAWN** ones. The other
+// three quarters die in the kernel: backface cull takes ~63 % of a closed mesh
+// (BUDGET_ACTUAL), and the far rows of the fan fall past `g_LOD_FOG_CARD` and
+// collapse to a 2-triangle card. That 4:1 ratio is why the ladder runs to 120
+// villagers to reach 8000 drawn, and it is the single most useful number in
+// this file for anyone sizing a settlement.
+//
+// AND THEN A SECOND LADDER ABOVE IT. The narrow fan tops out at ~4600 drawn, so
+// rows W* below re-reach the same question with an 11-column fan and carry the
+// sweep to ~8000 DRAWN — the top of the range the task asks about. They are
+// FIT == 2: fitted as their own ladder, never averaged into the narrow one.
+// EVERY W* ROW OVERFLOWS THE SHIPPING BATCH (g_CAP_WORLD = 3500) and is marked
+// OVF in the shipping binary. To measure them you must raise that constant; this
+// file reports what it sees and never pretends an OVF row is a cost measurement.
+let g_SW_LAB: array = ["fog18 np", "fog26 np", "fog38 np",
+                       "SHIP v0", "v2", "v5", "v8", "v10", "v14",
+                       "v19", "v24", "v28", "v34", "v40",
+                       "v48", "v56", "v72",
+                       "np v24", "np v40",
+                       "W v16", "W v32", "W v48", "W v64", "W v80",
+                       "W v96", "W v112", "W v132"];
+let g_SW_PROPS: array<i32> = [0, 0, 0,
+                              1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                              1, 1, 1,
+                              0, 0,
+                              1, 1, 1, 1, 1, 1, 1, 1];
+let g_SW_FOG: array<f64> = [18.0, 26.0, 38.0,
+                            -1.0, -1.0, -1.0, -1.0, -1.0, -1.0,
+                            -1.0, -1.0, -1.0, -1.0, -1.0,
+                            -1.0, -1.0, -1.0,
+                            -1.0, -1.0,
+                            -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0];
+let g_SW_VIL: array<i32> = [0, 0, 0,
+                            0, 2, 5, 8, 10, 14, 19, 24, 28, 34, 40,
+                            48, 56, 72,
+                            24, 40,
+                            16, 32, 48, 64, 80, 96, 112, 132];
+let g_SW_COLS: array<i32> = [5, 5, 5,
+                             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+                             5, 5, 5,
+                             5, 5,
+                             11, 11, 11, 11, 11, 11, 11, 11];
+// THE LADDER STOPS AT 72 BECAUSE THE FAN SATURATES ABOVE IT, and a saturated
+// row is a duplicate point that an OLS will happily average into a slope.
+// Measured at g_CAP_WORLD = 20000, v88 / v104 / v120 returned IDENTICAL
+// 4629.4 drawn and 21598.1 source triangles: past ~88 the extra bodies land
+// outside the frustum or past the distance cull and never reach the kernel.
+// They were in an earlier version of this ladder and they dragged the drawn-
+// unit fit visibly. Three points that are the same point are not three points.
+// Which points enter the PRIMARY regression: only the one-lever,
+// one-composition villager ladder, where the ONLY thing that changes between
+// rows is how many 220-triangle bodies are standing in the frustum. The three
+// fog rows reach the low end by shrinking the terrain ring and the two `np`
+// rows drop the prop mix; both are printed, both enter the SECONDARY
+// all-points fit, and neither belongs in the primary slope.
+let g_SW_FIT: array<i32> = [0, 0, 0,
+                            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                            1, 1, 1,
+                            0, 0,
+                            2, 2, 2, 2, 2, 2, 2, 2];
+
+// Per-point best-so-far, one slot per ladder point.
+let g_pt_net: array<f64> = [];
+let g_pt_tris: array<f64> = [];
+let g_pt_peak: array<i32> = [];
+let g_pt_src: array<f64> = [];
+let g_pt_emit: array<f64> = [];
+let g_pt_sort: array<f64> = [];
+let g_pt_flsh: array<f64> = [];
+let g_pt_pres: array<f64> = [];
+let g_pt_hud: array<f64> = [];
+let g_pt_ovf: array<i32> = [];
+let g_pt_burst: array<f64> = [];   // FULL-LAP peak/mean drawn, see burst_run
+
+fn sweep_slots_init() {
+    let n: i32 = g_SW_VIL.length;
+    g_pt_net = []; g_pt_tris = []; g_pt_peak = []; g_pt_src = [];
+    g_pt_emit = []; g_pt_sort = []; g_pt_flsh = []; g_pt_pres = [];
+    g_pt_hud = []; g_pt_ovf = []; g_pt_burst = [];
+    for (let i = 0; i < n; i++) {
+        g_pt_net.push(1000000.0); g_pt_tris.push(0.0); g_pt_peak.push(0);
+        g_pt_src.push(0.0); g_pt_emit.push(0.0); g_pt_sort.push(0.0);
+        g_pt_flsh.push(0.0); g_pt_pres.push(0.0); g_pt_hud.push(0.0);
+        g_pt_ovf.push(0); g_pt_burst.push(1.0);
+    }
+}
+
+// One untimed lap for point p_i, purely to learn peak/mean DRAWN over the WHOLE
+// camera loop. See burst_run's comment for why the timed window cannot answer
+// this: it sees frames 0..89 of 360 and the worst frame of the lap is #252.
+fn sweep_lap_burst(p_i: i32): f64 {
+    g_frame_i = 0;
+    for (let w = 0; w < g_WARM; w++) { frame_once(); }
+    let lsum: f64 = 0.0;
+    let lpk: i32 = 0;
+    g_frame_i = 0;
+    for (let f = 0; f < g_PATH_N; f++) {
+        frame_once();
+        let d: i32 = stat_get(STAT_TRIS_DRAWN);
+        lsum = lsum + f64(d);
+        if (d > lpk) { lpk = d; }
+    }
+    let lmean: f64 = lsum / f64(g_PATH_N);
+    let out: f64 = 1.0;
+    if (lmean > 0.0) { out = f64(lpk) / lmean; }
+    return out;
+}
+
+// Keep this pass's result for point p_i if it is the cheapest frame seen for
+// that point. The WHOLE ROW moves together — mixing the emit column from one
+// pass with the frame column from another would produce a table whose rows do
+// not add up.
+fn sweep_slot(p_i: i32) {
+    let i: i32 = p_i;
     let net: f64 = sweep_net_ms();
+    if (net >= g_pt_net[i]) { return; }
+    g_pt_net[i] = net;
+    g_pt_tris[i] = sweep_mean_tris();
+    g_pt_peak[i] = g_sw_peak;
+    g_pt_src[i] = sweep_mean_src();
+    g_pt_emit[i] = g_best[STAT_T_EMIT];
+    g_pt_sort[i] = ms_sort();
+    g_pt_flsh[i] = ms_flush();
+    g_pt_pres[i] = g_best[STAT_T_PRESENT];
+    g_pt_hud[i] = g_best[STAT_T_HUD];
+    g_pt_ovf[i] = g_sw_ovf;
+}
+
+fn sweep_row(p_i: i32, p_csv: i32) {
+    let i: i32 = p_i;
+    let lab: string = g_SW_LAB[i];
+    let mean: f64 = g_pt_tris[i];
+    let net: f64 = g_pt_net[i];
+    let src: f64 = g_pt_src[i];
     let fps: f64 = 0.0;
     if (net > 0.0) { fps = 1000.0 / net; }
+    // SATURATION, and why it has to be detected rather than assumed away.
+    //
+    // MEASURED, cap 3500, 5-column fan: v40 3483.1 drawn -> v48 3717.4 -> v56
+    // 3780.1 -> v72 3783.3, while SOURCE over the same rows went 11382 ->
+    // 13130 -> 14731 -> 17892. The last sixteen villagers added 3161 source
+    // triangles and THREE drawn ones. `batch_overflow` is 0 throughout, so this
+    // is NOT the batch cap refusing work — every one of those bodies is
+    // transformed in full and then rejected, because a fan that reaches its
+    // triangle count by getting DEEPER eventually puts its bodies far enough
+    // away that the whole mesh dies in the kernel.
+    //
+    // Such a row is a real measurement of a real frame, and it is USELESS AS A
+    // COST-PER-DRAWN-TRIANGLE POINT: the denominator stopped moving. Left in,
+    // the three of them dragged the drawn-unit slope from ~3.8 to 4.570 us/tri
+    // and the drawn-unit R^2 down to 0.938, while the SOURCE-unit fit over the
+    // same rows stayed at 0.997. That gap is the tell, and it was the whole
+    // reason the drawn-unit fit looked non-linear.
+    //
+    // So: a row whose mean drawn count is less than 2 % above the previous row
+    // of the SAME ladder is marked SAT and excluded from every fit, exactly as
+    // OVF rows are. It is still printed, because "the narrow fan cannot be
+    // pushed past ~3780 drawn" is itself a finding worth reading.
+    let sat: i32 = 0;
+    if (i > 0 && g_SW_FIT[i] != 0 && g_SW_FIT[i] == g_SW_FIT[i - 1]) {
+        let prev: f64 = g_pt_tris[i - 1];
+        if (prev > 0.0 && mean < prev * 1.02) { sat = 1; }
+    }
     let flag: string = "   ";
-    if (g_sw_ovf > 0) { flag = "OVF"; }
-    // Hemlock does not nest template strings — build the two integer columns first.
-    let cpk: string = `${g_sw_peak}`;
-    let src: f64 = sweep_mean_src();
+    if (sat == 1) { flag = "SAT"; }
+    if (g_pt_ovf[i] > 0) { flag = "OVF"; }
+    // Hemlock does not nest template strings — build the integer column first.
+    let cpk: string = `${g_pt_peak[i]}`;
     let usd: f64 = 0.0;
     let uss: f64 = 0.0;
     if (mean > 0.0) { usd = net / mean * 1000.0; }
     if (src > 0.0) { uss = net / src * 1000.0; }
-    print(`  ${pad(p_label, 11)} ${padl(f1(mean), 7)} ${padl(cpk, 6)} ${padl(f1(src), 7)}  ${padl(f3(g_best[STAT_T_EMIT]), 7)} ${padl(f3(ms_sort()), 6)} ${padl(f3(ms_flush()), 6)} ${padl(f3(g_best[STAT_T_PRESENT]), 7)} ${padl(f3(g_best[STAT_T_HUD]), 5)}  ${padl(f3(net), 7)} ${padl(f1(fps), 6)} ${padl(f3(usd), 7)} ${padl(f3(uss), 7)} ${flag}`);
+    print(`  ${pad(lab, 11)} ${padl(f1(mean), 7)} ${padl(cpk, 6)} ${padl(f1(src), 7)}  ${padl(f3(g_pt_emit[i]), 7)} ${padl(f3(g_pt_sort[i]), 6)} ${padl(f3(g_pt_flsh[i]), 6)} ${padl(f3(g_pt_pres[i]), 7)} ${padl(f3(g_pt_hud[i]), 5)}  ${padl(f3(net), 7)} ${padl(f1(fps), 6)} ${padl(f3(usd), 7)} ${padl(f3(uss), 7)} ${flag}`);
     if (p_csv == 1) {
-        print(`CSV,sweep,${p_label},${f1(mean)},${g_sw_peak},${f1(src)},${f3(g_best[STAT_T_EMIT])},${f3(ms_sort())},${f3(ms_flush())},${f3(g_best[STAT_T_PRESENT])},${f3(g_best[STAT_T_HUD])},${f3(g_best[STAT_T_SIM])},${f3(net)},${f3(g_best[STAT_T_FRAME])},${f3(ms_readback())},${g_sw_ovf}`);
+        print(`CSV,sweep,${lab},${f1(mean)},${g_pt_peak[i]},${f1(src)},${f3(g_pt_emit[i])},${f3(g_pt_sort[i])},${f3(g_pt_flsh[i])},${f3(g_pt_pres[i])},${f3(g_pt_hud[i])},${f3(net)},${g_pt_ovf[i]},${sat}`);
     }
-    if (g_sw_ovf == 0 && p_fit == 1) {
-        g_fit_x.push(mean); g_fit_y.push(net); g_fit_s.push(src);
+    if (g_pt_ovf[i] == 0 && sat == 0) {
+        g_all_x.push(mean); g_all_y.push(net); g_all_s.push(src);
+        if (g_SW_FIT[i] == 1) {
+            g_fit_x.push(mean); g_fit_y.push(net); g_fit_s.push(src);
+        }
+        if (g_SW_FIT[i] == 2) {
+            g_hi_x.push(mean); g_hi_y.push(net); g_hi_s.push(src);
+        }
     }
 }
 
 // Ordinary least squares over the overflow-free rows. Returns slope in
 // ms/triangle; the intercept is left in g_fit_b.
 let g_fit_b: f64 = 0.0;
-fn sweep_fit(p_x: array<f64>): f64 {
+fn sweep_fit(p_x: array<f64>, p_y: array<f64>): f64 {
     let xs: array<f64> = p_x;
+    let ys: array<f64> = p_y;
     let n: i32 = xs.length;
     if (n < 2) { g_fit_b = 0.0; let z: f64 = 0.0; return z; }
     let sx: f64 = 0.0; let sy: f64 = 0.0; let sxy: f64 = 0.0; let sxx: f64 = 0.0;
     for (let i = 0; i < n; i++) {
         let fx: f64 = xs[i];
-        let fy: f64 = g_fit_y[i];
+        let fy: f64 = ys[i];
         sx = sx + fx; sy = sy + fy; sxy = sxy + fx * fy; sxx = sxx + fx * fx;
     }
     let fn2: f64 = f64(n);
@@ -1309,19 +1635,130 @@ fn sweep_fit(p_x: array<f64>): f64 {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+//  THE TWO-TERM COST MODEL — the one that actually fits.
+//
+//  A budget written in ONE number cannot describe this frame, and every
+//  single-variable fit above is a compromise between two different costs:
+//
+//     TRANSFORM is paid per SOURCE triangle. Every triangle the kernel touches
+//        is projected, lit and fogged before anything decides whether it
+//        survives. A backface-culled triangle costs almost as much as a drawn
+//        one right up to the moment it is thrown away.
+//     FILL is paid per DRAWN triangle. Only survivors are sorted, packed into
+//        the arena and handed to SDL_RenderGeometry to be rasterized.
+//
+//  Fitting only DRAWN makes the cost per triangle appear to CLIMB (3.4 -> 6.0
+//  us across the high ladder) purely because denser content has a worse
+//  drawn/source ratio; fitting only SOURCE makes it appear to FALL. Neither is
+//  a renderer effect. Fit both and the bend disappears:
+//
+//     MEASURED, cap 9000, software, 27 rows spanning 513-7971 drawn and
+//     551-31810 source, across THREE different content levers (fog ring, prop
+//     mix, and two fan geometries):
+//
+//        frame_ms = 0.636 us x SOURCE + 1.492 us x DRAWN + 1.670 ms
+//        R^2 = 0.9996, worst residual 0.334 ms over a 15x range
+//
+//  THE FRAME IS LINEAR. It was never non-linear; it was mis-parameterised.
+//  That is the single most useful result in this file, because it means a
+//  triangle budget MUST carry a drawn/source ratio to mean anything: at the
+//  shipping mix (r = 0.52) a drawn triangle costs 2.7 us all-in, and in a dense
+//  near-field crowd (r = 0.35) the same drawn triangle costs 3.3 us.
+//
+//  Solved by normal equations + Gauss-Jordan on a 3x3. Cold code, called once.
+// ---------------------------------------------------------------------------
+let g_m2_src: f64 = 0.0;    // ms per source triangle
+let g_m2_drw: f64 = 0.0;    // ms per drawn triangle
+let g_m2_fix: f64 = 0.0;    // ms fixed
+let g_m2_r2: f64 = 0.0;
+let g_m2_worst: f64 = 0.0;
+let g_m2_ok: i32 = 0;
+
+fn fit2(p_s: array<f64>, p_d: array<f64>, p_y: array<f64>) {
+    let ss: array<f64> = p_s;
+    let dd: array<f64> = p_d;
+    let yy: array<f64> = p_y;
+    let n: i32 = ss.length;
+    g_m2_ok = 0;
+    if (n < 4) { return; }
+    // Normal equations for [source, drawn, 1] -> augmented 3x4.
+    let m: array<f64> = [];
+    for (let i = 0; i < 12; i++) { m.push(0.0); }
+    for (let k = 0; k < n; k++) {
+        let a0: f64 = ss[k];
+        let a1: f64 = dd[k];
+        let a2: f64 = 1.0;
+        let yv: f64 = yy[k];
+        m[0] = m[0] + a0 * a0;  m[1] = m[1] + a0 * a1;  m[2] = m[2] + a0 * a2;  m[3] = m[3] + a0 * yv;
+        m[4] = m[4] + a1 * a0;  m[5] = m[5] + a1 * a1;  m[6] = m[6] + a1 * a2;  m[7] = m[7] + a1 * yv;
+        m[8] = m[8] + a2 * a0;  m[9] = m[9] + a2 * a1;  m[10] = m[10] + a2 * a2; m[11] = m[11] + a2 * yv;
+    }
+    // Gauss-Jordan with partial pivoting.
+    for (let c = 0; c < 3; c++) {
+        let piv: i32 = c;
+        let best: f64 = m[c * 4 + c];
+        if (best < 0.0) { best = 0.0 - best; }
+        for (let r = c + 1; r < 3; r++) {
+            let v: f64 = m[r * 4 + c];
+            if (v < 0.0) { v = 0.0 - v; }
+            if (v > best) { best = v; piv = r; }
+        }
+        if (best == 0.0) { return; }
+        if (piv != c) {
+            for (let j = 0; j < 4; j++) {
+                let t: f64 = m[c * 4 + j];
+                m[c * 4 + j] = m[piv * 4 + j];
+                m[piv * 4 + j] = t;
+            }
+        }
+        let dv: f64 = m[c * 4 + c];
+        for (let j = 0; j < 4; j++) { m[c * 4 + j] = m[c * 4 + j] / dv; }
+        for (let r = 0; r < 3; r++) {
+            if (r == c) { continue; }
+            let f: f64 = m[r * 4 + c];
+            for (let j = 0; j < 4; j++) { m[r * 4 + j] = m[r * 4 + j] - f * m[c * 4 + j]; }
+        }
+    }
+    g_m2_src = m[3];
+    g_m2_drw = m[7];
+    g_m2_fix = m[11];
+    let sy: f64 = 0.0;
+    for (let i = 0; i < n; i++) { sy = sy + yy[i]; }
+    let ybar: f64 = sy / f64(n);
+    let sst: f64 = 0.0;
+    let ssr: f64 = 0.0;
+    let wr: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        let pred: f64 = g_m2_src * ss[i] + g_m2_drw * dd[i] + g_m2_fix;
+        let e: f64 = yy[i] - pred;
+        let ae: f64 = e;
+        if (ae < 0.0) { ae = 0.0 - ae; }
+        if (ae > wr) { wr = ae; }
+        ssr = ssr + e * e;
+        let t2: f64 = yy[i] - ybar;
+        sst = sst + t2 * t2;
+    }
+    g_m2_worst = wr;
+    g_m2_r2 = 0.0;
+    if (sst > 0.0) { g_m2_r2 = 1.0 - ssr / sst; }
+    g_m2_ok = 1;
+}
+
 // R^2 of the fit — this is the "does it stay linear?" number.
-fn sweep_r2(p_x: array<f64>, p_m: f64, p_b: f64): f64 {
+fn sweep_r2(p_x: array<f64>, p_y: array<f64>, p_m: f64, p_b: f64): f64 {
     let xs: array<f64> = p_x;
+    let ys: array<f64> = p_y;
     let n: i32 = xs.length;
     if (n < 3) { let z: f64 = 1.0; return z; }
     let sy: f64 = 0.0;
-    for (let i = 0; i < n; i++) { sy = sy + g_fit_y[i]; }
+    for (let i = 0; i < n; i++) { sy = sy + ys[i]; }
     let ybar: f64 = sy / f64(n);
     let ssr: f64 = 0.0; let sst: f64 = 0.0;
     for (let i = 0; i < n; i++) {
         let pred: f64 = p_m * xs[i] + p_b;
-        let d: f64 = g_fit_y[i] - pred;
-        let e: f64 = g_fit_y[i] - ybar;
+        let d: f64 = ys[i] - pred;
+        let e: f64 = ys[i] - ybar;
         ssr = ssr + d * d;
         sst = sst + e * e;
     }
@@ -1330,7 +1767,171 @@ fn sweep_r2(p_x: array<f64>, p_m: f64, p_b: f64): f64 {
     return out;
 }
 
-fn sweep_run(p_csv: i32) {
+// Segment-by-segment marginal cost for one ladder. Printing the segments is the
+// only way to see a slow bend: an R^2 of 0.99 is perfectly compatible with a
+// last segment twice as steep as the first, and it is the LAST segment that
+// decides whether a budget set at the top of the range is honest.
+fn sweep_segments(p_x: array<f64>, p_s: array<f64>, p_y: array<f64>, p_lab: string) {
+    let xs: array<f64> = p_x;
+    let ss: array<f64> = p_s;
+    let ys: array<f64> = p_y;
+    let nseg: i32 = xs.length;
+    if (nseg < 2) { return; }
+    print("");
+    print(`  -- ${p_lab} --`);
+    let smin: f64 = 1000000.0;
+    let smax: f64 = -1000000.0;
+    let qmin: f64 = 1000000.0;
+    let qmax: f64 = -1000000.0;
+    for (let i = 1; i < nseg; i++) {
+        let seg_dd: f64 = xs[i] - xs[i - 1];
+        let seg_dsrc: f64 = ss[i] - ss[i - 1];
+        if (seg_dd <= 0.0 || seg_dsrc <= 0.0) { continue; }
+        let seg_dms: f64 = ys[i] - ys[i - 1];
+        let seg_ud: f64 = seg_dms / seg_dd * 1000.0;
+        let seg_us: f64 = seg_dms / seg_dsrc * 1000.0;
+        if (seg_ud < smin) { smin = seg_ud; }
+        if (seg_ud > smax) { smax = seg_ud; }
+        if (seg_us < qmin) { qmin = seg_us; }
+        if (seg_us > qmax) { qmax = seg_us; }
+        print(`    drawn ${padl(f1(xs[i - 1]), 7)} -> ${padl(f1(xs[i]), 7)} : ${padl(f3(seg_ud), 7)} us/drawn     src ${padl(f1(ss[i - 1]), 7)} -> ${padl(f1(ss[i]), 7)} : ${padl(f3(seg_us), 7)} us/src`);
+    }
+    if (smax > smin && smin > 0.0) {
+        print(`  per DRAWN triangle : ${f3(smin)} to ${f3(smax)} us — spread ${f1((smax / smin - 1.0) * 100.0)} %`);
+    }
+    if (qmax > qmin && qmin > 0.0) {
+        print(`  per SOURCE triangle: ${f3(qmin)} to ${f3(qmax)} us — spread ${f1((qmax / qmin - 1.0) * 100.0)} %`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  --burst: THE BURST FACTOR, OVER A WHOLE CAMERA LAP.
+//
+//  THIS EXISTS BECAUSE THE SWEEP'S OWN peak/mean IS MEASURED ON A QUARTER OF THE
+//  WORLD. `sweep_point` rewinds to frame 0 and times `g_FRAMES` (90) frames, and
+//  the camera loop is `g_PATH_N` (360) frames long — so every timed window sees
+//  frames 0..89 and NEVER sees the ridge at frame 252 where the worst frame of
+//  the lap actually is. Measured, shipping content: the 90-frame window reports
+//  mean 1295.8 / peak 1451 = 1.12, while the FULL LAP peaks at 2255 against the
+//  same mean — a burst of 1.74. Sizing a steady budget on 1.12 when the truth is
+//  1.74 overstates it by 55 %, and the frames it would drop are exactly the
+//  cresting-a-ridge frames a player notices.
+//
+//  Staggering the timed windows across the lap instead would have been wrong: a
+//  minimum taken over windows that see DIFFERENT WORLD is a minimum over content,
+//  not over noise, and it would bias the cost down. So the timing window stays
+//  where it is and the burst factor is measured separately, here, over the whole
+//  lap — untimed, because it is a property of the CONTENT and not of the clock.
+// ---------------------------------------------------------------------------
+fn burst_run() {
+    print("===========================================================================");
+    print(" BURST FACTOR — peak/mean DRAWN over one whole 360-frame camera lap");
+    print("===========================================================================");
+    print(" The sweep times frames 0..89. The camera loop is 360 frames long, so the");
+    print(" timed window never sees the worst frame of the lap. This pass renders the");
+    print(" WHOLE lap for every ladder point and reports what the peak really is.");
+    print(" No timing here on purpose — burst is a property of the content.");
+    print("");
+    print("  point        lapmean  lappeak  burst   winmean  winpeak  winburst");
+    print("  ---------------------------------------------------------------------");
+    let np: i32 = g_SW_VIL.length;
+    let worst: f64 = 1.0;
+    for (let i = 0; i < np; i++) {
+        g_opt_props = g_SW_PROPS[i];
+        g_fog_far_override = g_SW_FOG[i];
+        g_villagers = g_SW_VIL[i];
+        g_fan_cols = g_SW_COLS[i];
+        // warm, so the chunk cache and the sim are in the same state the timed
+        // sweep sees them in
+        g_frame_i = 0;
+        for (let w = 0; w < g_WARM; w++) { frame_once(); }
+        let lsum: f64 = 0.0;
+        let lpk: i32 = 0;
+        let wsum: f64 = 0.0;
+        let wpk: i32 = 0;
+        g_frame_i = 0;
+        for (let f = 0; f < g_PATH_N; f++) {
+            frame_once();
+            let d: i32 = stat_get(STAT_TRIS_DRAWN);
+            lsum = lsum + f64(d);
+            if (d > lpk) { lpk = d; }
+            if (f < g_FRAMES) {
+                wsum = wsum + f64(d);
+                if (d > wpk) { wpk = d; }
+            }
+        }
+        let lmean: f64 = lsum / f64(g_PATH_N);
+        let wmean: f64 = 0.0;
+        if (g_FRAMES > 0) { wmean = wsum / f64(g_FRAMES); }
+        let bf: f64 = 0.0;
+        if (lmean > 0.0) { bf = f64(lpk) / lmean; }
+        let wbf: f64 = 0.0;
+        if (wmean > 0.0) { wbf = f64(wpk) / wmean; }
+        if (g_SW_FIT[i] != 0 && bf > worst) { worst = bf; }
+        let s1: string = `${lpk}`;
+        let s2: string = `${wpk}`;
+        print(`  ${pad(g_SW_LAB[i], 11)} ${padl(f1(lmean), 8)} ${padl(s1, 8)} ${padl(f3(bf), 6)}  ${padl(f1(wmean), 8)} ${padl(s2, 8)} ${padl(f3(wbf), 8)}`);
+    }
+    g_opt_props = 1;
+    g_fog_far_override = -1.0;
+    g_villagers = 0;
+    g_fan_cols = 5;
+    print("");
+    print(`  WORST FULL-LAP BURST over the villager ladders: ${f3(worst)}`);
+    print("  This is the number the steady/clamp pair must be divided by. Anything");
+    print("  measured on the 90-frame window understates it.");
+    print("");
+}
+
+// ---------------------------------------------------------------------------
+//  THE WORST FRAME OF A LAP — the only statistic that actually says "60 fps".
+//
+//  Every other number in this file is a MIN-OF-N MEAN, which RULE T is right to
+//  demand for a COST and which cannot answer a DEADLINE question. "133 fps
+//  average" is compatible with a 20 ms hitch every time the camera crests the
+//  ridge at frame 252, and a hitch is precisely what a player notices.
+//
+//  The estimator here is MIN-OVER-LAPS OF THE MAX-WITHIN-A-LAP. The max inside
+//  one lap is the content's worst frame; taking the minimum of that across
+//  several laps strips the scheduler spikes that a bare max would report as
+//  content. Both halves are necessary: a bare max measures this box's noise, and
+//  a mean measures a frame nobody is waiting on.
+// ---------------------------------------------------------------------------
+let g_worst_raw: f64 = 0.0;     // incl. readback, as measured
+let g_worst_net: f64 = 0.0;     // readback subtracted — what the game pays
+let g_worst_at: i32 = -1;
+let g_worst_tris: i32 = 0;
+
+fn worst_frame_run(p_laps: i32) {
+    let laps: i32 = p_laps;
+    let best_max: f64 = 1000000.0;
+    let best_at: i32 = -1;
+    let best_tris: i32 = 0;
+    g_frame_i = 0;
+    for (let w = 0; w < g_WARM; w++) { frame_once(); }
+    let l: i32 = 0;
+    while (l < laps) {
+        g_frame_i = 0;
+        let mx: f64 = 0.0;
+        let at: i32 = -1;
+        let tr: i32 = 0;
+        for (let f = 0; f < g_PATH_N; f++) {
+            frame_once();
+            let ms: f64 = stat_ms(STAT_T_FRAME);
+            if (ms > mx) { mx = ms; at = f; tr = stat_get(STAT_TRIS_DRAWN); }
+        }
+        if (mx < best_max) { best_max = mx; best_at = at; best_tris = tr; }
+        l++;
+    }
+    g_worst_raw = best_max;
+    g_worst_at = best_at;
+    g_worst_tris = best_tris;
+    let n: f64 = best_max - ms_readback();
+    if (n < 0.0) { n = 0.0; }
+    g_worst_net = n;
+}
+
+fn sweep_run(p_csv: i32, p_passes: i32) {
     print("===========================================================================");
     print(" TRIANGLE-CEILING SWEEP — the real frame path, read_pixels_rect EXCLUDED");
     print("===========================================================================");
@@ -1339,44 +1940,53 @@ fn sweep_run(p_csv: i32) {
     print(" same LOD / sphere-cull / per-instance-light / fog / contact-blob path every");
     print(" real prop takes. The three PROPS-OFF+fog rows reach the low end, which no");
     print(" villager count can. `tris` is MEASURED (STAT_TRIS_DRAWN), not requested.");
+    print(` Every point is the MINIMUM over ${p_passes} interleaved passes x ${g_TRIALS} trials x ${g_FRAMES} frames.`);
     print("");
-    print("  point         tris   peak     src     emit   sort  flush  present   hud    frame*    fps  us/drw us/src");
-    print("  -------------------------------------------------------------------------------------------------------");
 
     let sf: i32 = g_FRAMES;
     let st: i32 = g_TRIALS;
+    let np: i32 = g_SW_VIL.length;
+    sweep_slots_init();
 
-    // ---- low end: shrink the terrain ring. Props off, villagers zero,
-    //      because zero villagers is the floor and the ladder cannot reach 500
-    //      any other way. DIFFERENT COMPOSITION from the ladder, so these rows
-    //      are printed but NOT fitted: mixing two levers into one regression is
-    //      how a slope stops meaning anything.
-    g_opt_props = 0;
-    g_villagers = 0;
-    g_fog_far_override = 18.0; sweep_point(sf, st); sweep_row("fog18 v0", p_csv, 0);
-    g_fog_far_override = 26.0; sweep_point(sf, st); sweep_row("fog26 v0", p_csv, 0);
-    g_fog_far_override = 38.0; sweep_point(sf, st); sweep_row("fog38 v0", p_csv, 0);
-    g_fog_far_override = -1.0;
-
-    // ---- THE LADDER: full fog, props off, one lever, run to the wall -------
-    let ladder: array<i32> = [0, 6, 12, 18, 24, 30, 36, 42, 48, 56, 64];
-    let ln: i32 = ladder.length;
-    for (let i = 0; i < ln; i++) {
-        g_villagers = ladder[i];
-        sweep_point(sf, st);
-        let lab: string = `v${ladder[i]}`;
-        sweep_row(lab, p_csv, 1);
+    // One untimed lap per point FIRST, for the burst factor. Untimed, so it can
+    // run once rather than once per pass, and so a compile landing on top of it
+    // costs nothing.
+    for (let i = 0; i < np; i++) {
+        g_opt_props = g_SW_PROPS[i];
+        g_fog_far_override = g_SW_FOG[i];
+        g_villagers = g_SW_VIL[i];
+        g_fan_cols = g_SW_COLS[i];
+        g_pt_burst[i] = sweep_lap_burst(i);
     }
-    g_villagers = 0;
-    g_opt_props = 1;
 
-    // ---- the shipping scene, as a cross-check off the ladder ---------------
-    print("  -------------------------------------------------------------------------------------------------------");
-    g_villagers = 0;  sweep_point(sf, st); sweep_row("SHIPPING", p_csv, 0);
-    g_villagers = 12; sweep_point(sf, st); sweep_row("SHIP + v12", p_csv, 0);
-    g_villagers = 24; sweep_point(sf, st); sweep_row("SHIP + v24", p_csv, 0);
-    g_villagers = 36; sweep_point(sf, st); sweep_row("SHIP + v36", p_csv, 0);
+    let pass: i32 = 0;
+    while (pass < p_passes) {
+        for (let i = 0; i < np; i++) {
+            g_opt_props = g_SW_PROPS[i];
+            g_fog_far_override = g_SW_FOG[i];
+            g_villagers = g_SW_VIL[i];
+            g_fan_cols = g_SW_COLS[i];
+            sweep_point(sf, st);
+            sweep_slot(i);
+        }
+        pass++;
+    }
+    g_opt_props = 1;
+    g_fog_far_override = -1.0;
     g_villagers = 0;
+    g_fan_cols = 5;
+
+    print("  point         tris   peak     src     emit   sort  flush  present   hud    frame*    fps  us/drw us/src");
+    print("  -------------------------------------------------------------------------------------------------------");
+    // Rule the table wherever the FIT GROUP changes rather than at a hardcoded
+    // index — the row count moved once already and a literal 17 would have
+    // silently drawn the line in the wrong place.
+    for (let i = 0; i < np; i++) {
+        if (i > 0 && g_SW_FIT[i] != g_SW_FIT[i - 1]) {
+            print("  -------------------------------------------------------------------------------------------------------");
+        }
+        sweep_row(i, p_csv);
+    }
 
     print("");
     print("  * `frame` is the whole frame MINUS read_pixels_rect, which the game never");
@@ -1387,16 +1997,26 @@ fn sweep_run(p_csv: i32) {
     print("    measures it separately at 188.6 ns/triangle.");
     print("    OVF marks a row where batch_reserve refused triangles at LAYER_WORLD's");
     print("    capacity; those rows are excluded from the fit.");
+    print("    SAT marks a row whose DRAWN count stopped moving (< 2 % above the row");
+    print("    before it) while its SOURCE count kept climbing — the fan ran out of");
+    print("    frustum, not the renderer out of time. Also excluded from the fit; see");
+    print("    the comment in sweep_row for the three rows that made this necessary.");
+    print("    `present` is triangle-INDEPENDENT by construction. If it climbs down the");
+    print("    table, that row was measured under contention and nothing else in it");
+    print("    should be trusted either.");
     print("");
 
     // ---- the fit -----------------------------------------------------------
-    let slope_d: f64 = sweep_fit(g_fit_x);
+    let slope_d: f64 = sweep_fit(g_fit_x, g_fit_y);
     let icept_d: f64 = g_fit_b;
-    let r2d: f64 = sweep_r2(g_fit_x, slope_d, icept_d);
+    let r2d: f64 = sweep_r2(g_fit_x, g_fit_y, slope_d, icept_d);
     let usd: f64 = slope_d * 1000.0;
-    let slope_s: f64 = sweep_fit(g_fit_s);
+    let slope_s: f64 = sweep_fit(g_fit_s, g_fit_y);
     let icept_s: f64 = g_fit_b;
-    let r2s: f64 = sweep_r2(g_fit_s, slope_s, icept_s);
+    let r2s: f64 = sweep_r2(g_fit_s, g_fit_y, slope_s, icept_s);
+    let slope_a: f64 = sweep_fit(g_all_x, g_all_y);
+    let icept_a: f64 = g_fit_b;
+    let r2a: f64 = sweep_r2(g_all_x, g_all_y, slope_a, icept_a);
     print("===========================================================================");
     print(" MARGINAL COST AND THE CROSSING POINT");
     print("===========================================================================");
@@ -1406,6 +2026,14 @@ fn sweep_run(p_csv: i32) {
     print(`      frame_ms = ${f3(usd)} us/tri x drawn + ${f3(icept_d)} ms fixed     R^2 = ${f3(r2d)}`);
     print("  (b) against SOURCE triangles — the unit the transform kernel is paid in:");
     print(`      frame_ms = ${f3(slope_s * 1000.0)} us/tri x source + ${f3(icept_s)} ms fixed     R^2 = ${f3(r2s)}`);
+    print(`  (c) SECONDARY fit over ALL ${g_all_x.length} overflow-free rows, every lever mixed`);
+    print("      (villagers, terrain ring, prop mix). If (c) agrees with (a), the frame");
+    print("      is paying for TRIANGLES and not for a particular kind of content —");
+    print("      which is the claim a budget denominated in triangles is making:");
+    print(`      frame_ms = ${f3(slope_a * 1000.0)} us/tri x drawn + ${f3(icept_a)} ms fixed     R^2 = ${f3(r2a)}`);
+    if (usd > 0.0 && slope_a > 0.0) {
+        print(`      (a) vs (c) slope disagreement: ${f1((slope_a / slope_d - 1.0) * 100.0)} %`);
+    }
     print("");
     if (usd > 0.0) {
         let cross: f64 = (16.67 - icept_d) / slope_d;
@@ -1419,6 +2047,172 @@ fn sweep_run(p_csv: i32) {
     }
     print("");
 
+    // ---- (d) THE HIGH LADDER, 4000-8000 DRAWN ------------------------------
+    // The slope that actually decides the budget. (a) is fitted entirely below
+    // 3500 drawn and every number derived from it above 3500 is an
+    // EXTRAPOLATION; this group brackets the crossing point instead.
+    let slope_h: f64 = 0.0;
+    let icept_h: f64 = 0.0;
+    let hi_n: i32 = g_hi_x.length;
+    if (hi_n >= 2) {
+        slope_h = sweep_fit(g_hi_x, g_hi_y);
+        icept_h = g_fit_b;
+        let r2h: f64 = sweep_r2(g_hi_x, g_hi_y, slope_h, icept_h);
+        let hlo: f64 = g_hi_x[0];
+        let hhi: f64 = g_hi_x[hi_n - 1];
+        print(`  (d) THE HIGH LADDER — ${hi_n} wide-fan rows spanning ${f1(hlo)} to ${f1(hhi)} drawn.`);
+        print("      This is the group that decides the budget: (a) is fitted entirely");
+        print("      below the shipping cap, so every number (a) implies above it is an");
+        print("      EXTRAPOLATION. These rows bracket the crossing point.");
+        print(`      frame_ms = ${f3(slope_h * 1000.0)} us/tri x drawn + ${f3(icept_h)} ms fixed     R^2 = ${f3(r2h)}`);
+        if (slope_d > 0.0 && slope_h > 0.0) {
+            print(`      HIGH vs LOW slope: ${f3(slope_h * 1000.0)} vs ${f3(usd)} us/tri = ${f1((slope_h / slope_d - 1.0) * 100.0)} % steeper`);
+            print("      A positive number here IS the non-linearity. It is the honest");
+            print("      answer to 'does it stay linear', and it is why the budget below");
+            print("      is derived from (d) and not from (a).");
+        }
+        if (slope_h > 0.0) {
+            let crh: f64 = (16.67 - icept_h) / slope_h;
+            let inside: string = "EXTRAPOLATED";
+            if (crh <= hhi && crh >= hlo) { inside = "MEASURED, inside the ladder"; }
+            print(`      crosses 16.67 ms at ${f1(crh)} drawn triangles   [${inside}]`);
+        }
+        print("");
+    } else {
+        print("  (d) THE HIGH LADDER — NO DATA. Every wide-fan row overflowed");
+        print(`      g_CAP_WORLD (${g_CAP_WORLD}) and was excluded. The crossing point below is`);
+        print("      an EXTRAPOLATION from rows measured entirely under 3500 drawn.");
+        print("      Raise g_CAP_WORLD in src/render/world_render.hml to measure it.");
+        print("");
+    }
+
+    // ---- (e) THE TWO-TERM MODEL -------------------------------------------
+    fit2(g_all_s, g_all_x, g_all_y);
+    print("===========================================================================");
+    print(" (e) THE TWO-TERM MODEL — transform is paid per SOURCE, fill per DRAWN");
+    print("===========================================================================");
+    if (g_m2_ok == 1) {
+        print(`  frame_ms = ${f3(g_m2_src * 1000.0)} us x SOURCE + ${f3(g_m2_drw * 1000.0)} us x DRAWN + ${f3(g_m2_fix)} ms`);
+        print(`  over ${g_all_x.length} rows   R^2 = ${f3(g_m2_r2)}   worst residual ${f3(g_m2_worst)} ms`);
+        print("");
+        print("  COMPARE THAT R^2 WITH (a)'s. The frame is NOT non-linear in triangle");
+        print("  count — it is linear in TWO variables and was being fitted against one.");
+        print("  Per-drawn cost only appears to climb because denser content has a worse");
+        print("  drawn/source ratio, and the kernel pays full transform for every");
+        print("  triangle it later rejects.");
+        print("");
+        print("  What one DRAWN triangle costs, all-in, at a given drawn/source ratio r:");
+        let rr: array<f64> = [0.90, 0.70, 0.52, 0.40, 0.35, 0.25];
+        let nrr: i32 = rr.length;
+        for (let i = 0; i < nrr; i++) {
+            let r: f64 = rr[i];
+            let cpd: f64 = g_m2_src / r + g_m2_drw;
+            let tag: string = "";
+            if (r == 0.52) { tag = "  <- the SHIPPING mix, measured"; }
+            if (r == 0.35) { tag = "  <- a dense near-field crowd, measured (W v48)"; }
+            print(`      r = ${f3(r)}   ${f3(cpd * 1000.0)} us per drawn triangle${tag}`);
+        }
+        print("");
+    } else {
+        print("  NOT ENOUGH ROWS TO FIT.");
+        print("");
+    }
+
+    // ---- THE SAFETY MARGIN, DERIVED RATHER THAN CHOSEN ---------------------
+    // A budget set at the crossing point is a budget that misses 60 fps half
+    // the time, for two measured reasons and one structural one:
+    //
+    //  (1) THE FRAME TIME IS A MINIMUM. RULE T's min-of-N is the right estimator
+    //      for a COST, and the wrong one for a DEADLINE. What ships has to hold
+    //      on the frame that is not the cheapest one.
+    //  (2) THE TRIANGLE COUNT IS A MEAN. Every row's `peak` column is above its
+    //      `tris` column, because a camera walking a lap crests a ridge and sees
+    //      more world. The burst factor below is that ratio, measured, worst
+    //      over the ladder — NOT assumed.
+    //  (3) benchframe does not carry audio, net or input. ARCHITECTURE §8 gives
+    //      those 0.3 ms (net) and the balance of the 1.0 ms input+audio+HUD line
+    //      that `hud` does not already spend, and requires >= 1.3 ms of slack.
+    //
+    // So: the CLAMP is the count a PEAK frame may reach and still fit inside the
+    // reserved deadline, and the STEADY budget is the MEAN count whose peaks
+    // land on the clamp. Both fall out of the two measured numbers.
+    // (4) THIS BOX IS NOT ALWAYS THE BOX THE NUMBER WAS MEASURED ON. CLAUDE.md
+    //     §1.2 says a llama-server permanently holds ~17 of 24 cores; when it is
+    //     absent the same binary measures materially faster, and a budget sized
+    //     on the quiet box breaks when the server comes back. g_LOAD_DERATE is
+    //     that factor, MEASURED (see --loadcheck in the task report), not assumed.
+    let burst: f64 = 1.0;
+    let burst_lab: string = "full-lap peak/mean";
+    let nfr: i32 = g_SW_VIL.length;
+    for (let i = 0; i < nfr; i++) {
+        if (g_pt_ovf[i] != 0) { continue; }
+        if (g_SW_FIT[i] == 0) { continue; }     // both villager ladders, not the levers
+        let bf: f64 = g_pt_burst[i];
+        if (bf > burst) { burst = bf; }
+    }
+    // Fall back to the (understated) window ratio only if the lap pass produced
+    // nothing, so the number is never silently 1.0.
+    if (burst <= 1.0) {
+        burst_lab = "90-frame WINDOW peak/mean — UNDERSTATED, lap pass produced nothing";
+        for (let i = 0; i < nfr; i++) {
+            if (g_pt_ovf[i] != 0) { continue; }
+            if (g_SW_FIT[i] == 0) { continue; }
+            let mn: f64 = g_pt_tris[i];
+            if (mn <= 0.0) { continue; }
+            let bf2: f64 = f64(g_pt_peak[i]) / mn;
+            if (bf2 > burst) { burst = bf2; }
+        }
+    }
+    let hud_left: f64 = 1.0 - g_pt_hud[3];
+    if (hud_left < 0.0) { hud_left = 0.0; }
+    let reserve: f64 = 1.3 + 0.3 + hud_left;
+    let deadline: f64 = 16.67 - reserve;
+    print("===========================================================================");
+    print(" THE SAFETY MARGIN, AND THE STEADY / CLAMP PAIR");
+    print("===========================================================================");
+    print(`  worst burst factor           ${f3(burst)}   (${burst_lab})`);
+    print(`  reserved, not benched        1.30 slack + 0.30 net + ${f3(hud_left)} audio/input = ${f3(reserve)} ms`);
+    print(`  contention derate            x${f3(g_LOAD_DERATE)} — this box's llama-server is INTERMITTENT;`);
+    print("                               CLAUDE.md §1.2 says it is permanent. Measured, not assumed.");
+    let deadline_d: f64 = deadline / g_LOAD_DERATE;
+    print(`  deadline this bench must hit (16.67 - ${f3(reserve)}) / ${f3(g_LOAD_DERATE)} = ${f3(deadline_d)} ms`);
+    print("");
+
+    // THE BUDGET IS A FUNCTION OF THE CONTENT MIX, and pretending otherwise is
+    // what made the old 2500 wrong in both directions at once. Solve the
+    // two-term model for DRAWN at a given drawn/source ratio r:
+    //
+    //     deadline = (src_us / r + drw_us) * D / 1000 + fixed
+    //  => D = (deadline - fixed) * 1000 / (src_us / r + drw_us)
+    if (g_m2_ok == 1) {
+        print("  STEADY / CLAMP as a function of the content's drawn/source ratio.");
+        print("  Solved from (e), the only model that fits, at the derated deadline:");
+        print("");
+        print("     r      us/drawn    CLAMP(peak)   STEADY(mean)   what has this ratio");
+        print("     ---------------------------------------------------------------------");
+        let rr2: array<f64> = [0.70, 0.52, 0.40, 0.35, 0.25];
+        let nn2: i32 = rr2.length;
+        for (let i = 0; i < nn2; i++) {
+            let r: f64 = rr2[i];
+            let cpd: f64 = g_m2_src / r + g_m2_drw;
+            let clamp_t: f64 = 0.0;
+            if (cpd > 0.0) { clamp_t = (deadline_d - g_m2_fix) / cpd; }
+            let steady_t: f64 = clamp_t / burst;
+            let what: string = "";
+            if (r == 0.70) { what = "open terrain, few props"; }
+            if (r == 0.52) { what = "THE SHIPPING FRAME, measured"; }
+            if (r == 0.40) { what = "a settlement with buildings"; }
+            if (r == 0.35) { what = "a dense near-field crowd (W v48)"; }
+            if (r == 0.25) { what = "a deep receding crowd (v72)"; }
+            print(`     ${f3(r)}   ${padl(f3(cpd * 1000.0), 7)}    ${padl(f1(clamp_t), 8)}      ${padl(f1(steady_t), 8)}     ${what}`);
+        }
+        print("");
+        print("  PICK THE BUDGET OFF THE ROW THE GAME ACTUALLY IS, and round DOWN. A");
+        print("  budget with three significant figures pretends to a precision that a");
+        print("  +/-30 % contention floor does not support (CLAUDE.md §1.2).");
+    }
+    print("");
+
     // ---- WHERE LINEARITY BREAKS -------------------------------------------
     // A single R^2 hides a slow bend. The segment slopes do not: if fill or
     // overdraw is growing faster than the transform, the last segments are
@@ -1427,30 +2221,8 @@ fn sweep_run(p_csv: i32) {
     print("  R^2 averages a slow bend away; these do not. If the drawn-unit column");
     print("  climbs while the source-unit column stays flat, the bend is in the");
     print("  CONTENT's drawn/source ratio and not in the renderer.");
-    let np: i32 = g_fit_x.length;
-    let smin: f64 = 1000000.0;
-    let smax: f64 = -1000000.0;
-    let qmin: f64 = 1000000.0;
-    let qmax: f64 = -1000000.0;
-    for (let i = 1; i < np; i++) {
-        let seg_dd: f64 = g_fit_x[i] - g_fit_x[i - 1];
-        let seg_dsrc: f64 = g_fit_s[i] - g_fit_s[i - 1];
-        if (seg_dd <= 0.0 || seg_dsrc <= 0.0) { continue; }
-        let seg_dms: f64 = g_fit_y[i] - g_fit_y[i - 1];
-        let seg_ud: f64 = seg_dms / seg_dd * 1000.0;
-        let seg_us: f64 = seg_dms / seg_dsrc * 1000.0;
-        if (seg_ud < smin) { smin = seg_ud; }
-        if (seg_ud > smax) { smax = seg_ud; }
-        if (seg_us < qmin) { qmin = seg_us; }
-        if (seg_us > qmax) { qmax = seg_us; }
-        print(`    drawn ${padl(f1(g_fit_x[i - 1]), 7)} -> ${padl(f1(g_fit_x[i]), 7)} : ${padl(f3(seg_ud), 7)} us/drawn     src ${padl(f1(g_fit_s[i - 1]), 7)} -> ${padl(f1(g_fit_s[i]), 7)} : ${padl(f3(seg_us), 7)} us/src`);
-    }
-    if (smax > smin && smin > 0.0) {
-        print(`  per DRAWN triangle : ${f3(smin)} to ${f3(smax)} us — spread ${f1((smax / smin - 1.0) * 100.0)} %`);
-    }
-    if (qmax > qmin && qmin > 0.0) {
-        print(`  per SOURCE triangle: ${f3(qmin)} to ${f3(qmax)} us — spread ${f1((qmax / qmin - 1.0) * 100.0)} %`);
-    }
+    sweep_segments(g_fit_x, g_fit_s, g_fit_y, "LOW ladder, 5-column fan");
+    sweep_segments(g_hi_x, g_hi_s, g_hi_y, "HIGH ladder, 11-column fan");
     print("");
 }
 
@@ -1471,6 +2243,12 @@ fn usage() {
     print("  --ablate     what each optional stage actually costs");
     print("  --sweep      the triangle-ceiling sweep: cost per triangle and the");
     print("               count at which the frame crosses 16.67 ms");
+    print("  --shot-cols N  fan width for --shot (default 5; the high ladder uses 11).");
+    print("  --burst      peak/mean drawn over WHOLE camera laps, every ladder point.");
+    print("               The sweep times 90 of 360 frames; this sees the other 270.");
+    print("  --passes N   --sweep only: interleaved passes over the ladder (default 3).");
+    print("               Per-point minima are taken across passes, so a load spike");
+    print("               cannot poison one point's seven consecutive trials.");
     print("  --csv        machine-readable stage rows as well as the table");
     print("  --no-gate    print, never exit 1. Never use this in CI.");
     print("  --help");
@@ -1496,6 +2274,7 @@ fn main() {
     let want_ablate: i32 = 0;
     let want_csv: i32 = 0;
     let want_sweep: i32 = 0;
+    let want_burst: i32 = 0;
     let i: i32 = 1;
     while (i < args.length) {
         let a: string = args[i];
@@ -1509,6 +2288,17 @@ fn main() {
         else if (a == "--quick") { g_FRAMES = 24; g_TRIALS = 3; }
         else if (a == "--ablate") { want_ablate = 1; }
         else if (a == "--sweep") { want_sweep = 1; }
+        else if (a == "--burst") { want_burst = 1; }
+        else if (a == "--shot" && i + 1 < args.length) { i++; g_SHOT = args[i]; }
+        else if (a == "--shot-villagers" && i + 1 < args.length) {
+            i++; g_SHOT_VIL = clampi(i32(num_or(args[i], 0.0)), 0, 200);
+        }
+        else if (a == "--shot-cols" && i + 1 < args.length) {
+            i++; g_SHOT_COLS = clampi(i32(num_or(args[i], 5.0)), 1, 24);
+        }
+        else if (a == "--passes" && i + 1 < args.length) {
+            i++; g_PASSES = clampi(i32(num_or(args[i], 3.0)), 1, 32);
+        }
         else if (a == "--csv") { want_csv = 1; }
         else if (a == "--no-gate") { g_gate = 0; }
         else { eprint(`benchframe: unknown option '${a}'`); usage(); exit(2); }
@@ -1529,7 +2319,16 @@ fn main() {
         eprint("            headless? run under SDL_VIDEODRIVER=dummy");
         exit(3);
     }
-    set_vsync(g_win, 0);            // a bench must never be paced by the display
+    // A bench must never be paced by the display. The RETURN CODE is also the
+    // cheapest honest answer to "which renderer am I benching?", and the
+    // triangle ceiling depends on the answer: SDL_RenderSetVSync returns -1 on
+    // a SOFTWARE renderer and 0 on an accelerated one (CLAUDE.md §5). Under
+    // SDL_VIDEODRIVER=dummy, sdl.hml's window_open_ex passes flags=0, and SDL
+    // then has no accelerated driver to choose — so **the headless CI number
+    // IS the software-renderer number**, which is the pessimistic one. Printed
+    // rather than assumed, because a budget that silently holds only on an
+    // accelerated renderer is a budget that breaks in CI.
+    g_vsync_rc = set_vsync(g_win, 0);
     g_target = target_new(g_win, g_RES_W, g_RES_H, g_UPSCALE_DEFAULT);
     // RSS with the video driver up and a render target allocated, but before a
     // single byte of game data exists. Everything below this line is OURS; a
@@ -1599,9 +2398,23 @@ fn main() {
     print(` terrain         ${g_cc_mesh.length} chunks of ${g_CHUNK_Q * g_CHUNK_Q * 2} tris   props ${g_pr_kind.length}`);
     print(` meshes          npc ${mesh_tri_count(meshgen_mesh(MESH_NPC))} tris   tree0 ${mesh_tri_count(meshgen_mesh(MESH_TREE0))}   rock ${mesh_tri_count(meshgen_mesh(MESH_ROCK))}   viewmodel ${mesh_tri_count(meshgen_mesh(MESH_SPARROW_VM))}   blob ${mesh_tri_count(meshgen_mesh(MESH_BLOB))}`);
     print(` resolution      ${g_RES_W}x${g_RES_H} at x${g_UPSCALE_DEFAULT}`);
+    let rname: string = "ACCELERATED (SDL_RenderSetVSync accepted)";
+    if (g_vsync_rc != 0) { rname = "SOFTWARE (SDL_RenderSetVSync returned -1)"; }
+    print(` renderer        ${rname}`);
     print(` camera          a ${f1(g_PATH_R)} m closed loop, exactly ${g_PATH_N} frames per lap`);
     print(` timing          min of ${g_TRIALS} trials x ${g_FRAMES} frames (RULE T), warm ${g_WARM}`);
     print("");
+
+    // ---- --shot: one PNG of the sweep's own content, then out -------------
+    if (g_SHOT.length > 0) {
+        g_villagers = g_SHOT_VIL;
+        g_fan_cols = g_SHOT_COLS;
+        for (let w = 0; w < 30; w++) { frame_once(); }
+        shot_write(g_SHOT);
+        target_free(g_target);
+        window_close(g_win);
+        exit(0);
+    }
 
     // ---- warm, then the trials -------------------------------------------
     // ---- the budget sweep: one whole lap, for the worst-case counters -----
@@ -1642,6 +2455,11 @@ fn main() {
     g_hash_last = sim_hash(g_sim);
     let rss2: i32 = rss_kb();
     let frame: f64 = g_best[STAT_T_FRAME];
+
+    // The worst frame of a lap. Runs AFTER the trials because it subtracts
+    // ms_readback(), which is only populated once g_best is. Three laps: enough
+    // for the min-of-max to shed a scheduler spike, cheap enough for CI.
+    worst_frame_run(3);
 
     // ---- the table --------------------------------------------------------
     print("===========================================================================");
@@ -1743,9 +2561,24 @@ fn main() {
         frame = g_best[STAT_T_FRAME];
     }
 
+    // ---- the burst factor, over whole laps --------------------------------
+    if (want_burst == 1) {
+        burst_run();
+        g_opt_props = 1;
+        g_villagers = 0;
+        g_fog_far_override = -1.0;
+        g_fan_cols = 5;
+        acc_init();
+        g_frame_i = 0;
+        for (let w = 0; w < g_WARM; w++) { frame_once(); }
+        let bt: i32 = 0;
+        while (bt < g_TRIALS) { trial_run(g_FRAMES); bt++; }
+        frame = g_best[STAT_T_FRAME];
+    }
+
     // ---- the triangle-ceiling sweep ---------------------------------------
     if (want_sweep == 1) {
-        sweep_run(want_csv);
+        sweep_run(want_csv, g_PASSES);
         // Restore the shipping measurement for the residual attribution and the
         // gate below — same discipline as --ablate. The sweep's last point left
         // g_best holding a configuration that is not the shipping one.
@@ -1863,7 +2696,8 @@ fn main() {
     print("===========================================================================");
     print(" Guards are ~2x the number measured under this box's permanent ~17/24-core");
     print(" load (CLAUDE.md §1.2). They catch regressions; they do not certify an idle");
-    print(" machine. The design ANCHORS — 2500 triangles, 16.67 ms, 11.0 ms render,");
+    print(" machine. The design ANCHORS — 3000 triangles (BUDGET_ACTUAL §T), 16.67 ms,");
+    print(" 11.0 ms render,");
     print(" 2.0 ms sim — are literals from ARCHITECTURE §8 and BUDGET_ACTUAL.md.");
     print("");
 
@@ -1872,9 +2706,24 @@ fn main() {
     ok(`FRAME <= 16.67 ms (60 fps floor, ARCHITECTURE §8): measured ${f3(frame)} ms, ${f1(fps)} fps`,
        frame <= 16.67);
     ok(`config's frame budget is still the doc's 16.67 ms`, g_FRAME_BUDGET_MS == 16.67);
-    ok(`TRIANGLES peak <= 2500 steady (ARCHITECTURE §8): peak ${g_peak_drawn} DRAWN (tris.submitted reads ${g_peak_tris} and under-counts — see the notes)`,
-       g_peak_drawn <= 2500);
-    ok(`config's steady triangle budget is still the doc's 2500`, g_TRIS_STEADY == 2500);
+    // 60 fps WHILE PLAYING, not on average. See worst_frame_run's comment: this
+    // is the min-over-laps of the max-within-a-lap, i.e. the content's worst
+    // frame with the scheduler's noise taken back out. The mean above cannot
+    // fail on a hitch; this can.
+    ok(`WORST FRAME of a lap <= 16.67 ms (60 fps while PLAYING, not standing still): ${f3(g_worst_raw)} ms incl. readback at frame #${g_worst_at}, ${g_worst_tris} tris; ${f3(g_worst_net)} ms is what the GAME pays`,
+       g_worst_net <= 16.67);
+    ok(`WORST FRAME, readback excluded, still inside the steady budget's own deadline of 14.22 ms (BUDGET_ACTUAL §T.5): ${f3(g_worst_net)} ms`,
+       g_worst_net <= 14.22);
+    // The steady budget is 3000 as of 2026-07-29 (BUDGET_ACTUAL §T). It is
+    // asserted against PEAK drawn, which is what the pair means here: STEADY is
+    // the comfortable peak, CLAMP the hard one. The literal below is the DOC
+    // ANCHOR — it exists so config.hml and BUDGET_ACTUAL.md cannot drift apart
+    // silently, and changing one without the other is meant to turn this red.
+    ok(`TRIANGLES peak <= ${g_TRIS_STEADY} steady (BUDGET_ACTUAL §T): peak ${g_peak_drawn} DRAWN (tris.submitted reads ${g_peak_tris} and under-counts — see the notes)`,
+       g_peak_drawn <= g_TRIS_STEADY);
+    ok(`config's steady triangle budget is still the doc's 3000 (BUDGET_ACTUAL §T.5)`, g_TRIS_STEADY == 3000);
+    ok(`config's triangle CEILING is still the doc's 3500 — 5000 crashes, see BUDGET_ACTUAL §T.7`,
+       g_TRIS_CEILING == 3500);
     ok(`TRIANGLES peak <= 3500 hard clamp: peak ${g_peak_drawn} DRAWN`, g_peak_drawn <= 3500);
     ok(`DRAW CALLS <= 8 (BUILD_PLAN W3-7): peak ${g_peak_draw}`, g_peak_draw <= 8);
     // The guard is 2 MB over 540 frames. Very little of it is slack for us:
@@ -1935,8 +2784,29 @@ fn main() {
     print(`  timed stages ${f3(accounted)} ms of a ${f3(frame)} ms frame = ${f1(cover)} % covered; residual ${f3(residual)} ms`);
     ok(`the stage table has no NEGATIVE residual (a negative one means a timer double-counts): ${f3(residual)} ms`,
        residual >= -0.05);
-    ok(`the residual is ACCOUNTED FOR, not unexplained: readback ${f3(ms_readback())} ms + untimed-in-8..23 ${f3(ms_untimed_render())} ms explains ${f1(rb_best_ratio() * 100.0)} % of the ${f3(residual)} ms residual`,
-       rb_best_ratio() >= 0.85 && rb_best_ratio() <= 1.15);
+    // A RATIO ASSERTION NEEDS A FLOOR ON ITS DENOMINATOR.
+    //
+    // This check exists to catch a timer that double-counts or a stage that
+    // escapes the table, and "explains 85-115 % of the residual" is the right
+    // shape for that — on the SOFTWARE renderer, where the residual is ~2.5 ms
+    // because `read_pixels_rect` dominates it. On the ACCELERATED renderer the
+    // same readback costs 0.233 ms instead of 2.482, the whole residual collapses
+    // to ~0.3 ms, and the ratio starts measuring clock jitter: measured across
+    // three consecutive runs of one binary, two explained >90 % and one explained
+    // 84.5 % of a 0.313 ms residual — a 0.048 ms miss, failing a gate over less
+    // than a twentieth of a millisecond.
+    //
+    // So the bound now passes when EITHER the ratio is right OR the unexplained
+    // part is negligible in absolute terms. 0.15 ms is ~1 % of the frame budget
+    // and far below anything a real double-count could hide in. Per CLAUDE.md
+    // §1.2: a guard that false-fails trains everyone to ignore red, which costs
+    // more than the bug it was watching for.
+    let unexplained: f64 = residual * (1.0 - rb_best_ratio());
+    if (unexplained < 0.0) { unexplained = 0.0 - unexplained; }
+    let resid_ok: bool = (rb_best_ratio() >= 0.85 && rb_best_ratio() <= 1.15)
+                      || unexplained <= 0.15;
+    ok(`the residual is ACCOUNTED FOR, not unexplained: readback ${f3(ms_readback())} ms + untimed-in-8..23 ${f3(ms_untimed_render())} ms explains ${f1(rb_best_ratio() * 100.0)} % of the ${f3(residual)} ms residual (${f3(unexplained)} ms unexplained; passes on ratio 0.85-1.15 OR <= 0.15 ms absolute)`,
+       resid_ok);
     ok(`the timed stages cover >= 55 % of the frame: ${f1(cover)} %`, cover >= 55.0);
 
     // -- the bench measured what it claims to have measured ------------------

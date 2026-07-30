@@ -533,7 +533,7 @@ static**; nothing else about it depends on the wiring.
 
 | `fxgen.hml` | `ATLAS_FX` (128×128, 16×16 cells): muzzle ×3, tracer, sparks, explosion ×6, ember, smoke ×3, glow cards ×2, enemy eye, loot beam, rain streak, lightning, dust, splash, XP mote. | `fxgen_build_atlas, FX_MUZZLE_0, FX_TRACER, FX_GLOW_S, FX_GLOW_L, …` |
 | `hudgen.hml` | `ATLAS_HUD` (128×128): `FONT_MICRO` 4×6 and `FONT_BIG` 8×12 as packed bitfields, icons, crosshair parts, minimap chrome, vignette gradient strip. **`hudgen_uv` returns WHOLE-TEXEL uv edges, not `atlas_rect_uv`'s half-texel inset** — ATLAS_HUD is blitted 1:1, and at 1:1 the inset drops a texel of the mandatory §9.1 outline off every sprite (measured; `hudgen_selftest` asserts the whole-texel form). | `hudgen_build_atlas, hud_font_micro, hud_font_big, hudgen_rect, hudgen_uv, hudgen_xh_place, HUD_XH_GAP, HUD_XH_LEN, HUD_ICON_*` |
-| `meshgen.hml` | The procedural mesh DSL and every world mesh: tree LOD0/1/2, bush, rock, crate, barrel, lantern post, contact blob, enemy ×6 × 3 LODs (rigid parts), NPC, the LANTERN viewmodel (slot 28, the only one the renderer is bound to) and five retained gun viewmodels — **34 meshes, 2494 triangles, built in ~29 ms**. Bakes vertex colour + creased AO at build time, then applies a soft luminance floor of 72 (`MG_LUM_FLOOR`) so no vertex in the game is darker than the atlas minimum. UVs are bound per MATERIAL, not per atlas cell: `assets.hml` calls `meshgen_set_material_uv(MG_MAT_*, u0,v0,u1,v1)` with texgen's `CELL_*` rects **before** `meshgen_build_all()`. | `mg_box, mg_box_ex, mg_prism, mg_taper, mg_fan_disc, mg_lathe, mg_spike, mg_panel, mg_ground_quad, mg_set_jitter, meshgen_build_all, meshgen_bake_all, meshgen_set_material_uv, meshgen_set_sun_azimuth, meshgen_mesh, meshgen_name, meshgen_tris, meshgen_budget, meshgen_kind, meshgen_radius, meshgen_view_yaw, meshgen_count, meshgen_enemy_mesh, mg_head_shoulder, mg_head_width, mg_shoulder_width, mg_protrusion, mg_protrusion_axis, MESH_TREE0/1/2, MESH_BUSH, MESH_ROCK, MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_WISP0..MESH_BULWARK2 (class ×3 LODs), MESH_NPC, MESH_LANTERN_VM (= MESH_SPARROW_VM, the alias), MESH_TINKER_VM..MESH_EMBERLANCE_VM, MESH_COUNT, ENEMY_WISP..ENEMY_BULWARK, MG_MAT_*, MG_KIND_*, MG_LUM_FLOOR, MG_VM_LUM_FLOOR, meshgen_vm_bob` |
+| `meshgen.hml` | The procedural mesh DSL and every world mesh: tree LOD0/1/2, bush, rock, crate, barrel, lantern post, contact blob, enemy ×6 × 3 LODs (rigid parts), NPC, the LANTERN viewmodel (slot 28, the only one the renderer is bound to) and five retained gun viewmodels — **36 meshes, 2570 triangles, built in ~29 ms** (the villager gained LOD1/LOD2 and the four humanoid enemies gained a violet chest panel at every tier; the six viewmodel slots moved 28..33 → 30..35, symbolically, nothing names them by number). Bakes vertex colour + creased AO at build time, then applies a soft luminance floor of 72 (`MG_LUM_FLOOR`) so no vertex in the game is darker than the atlas minimum. UVs are bound per MATERIAL, not per atlas cell: `assets.hml` calls `meshgen_set_material_uv(MG_MAT_*, u0,v0,u1,v1)` with texgen's `CELL_*` rects **before** `meshgen_build_all()`. | `mg_box, mg_box_ex, mg_prism, mg_taper, mg_fan_disc, mg_lathe, mg_spike, mg_panel, mg_ground_quad, mg_set_jitter, meshgen_build_all, meshgen_bake_all, meshgen_set_material_uv, meshgen_set_sun_azimuth, meshgen_mesh, meshgen_name, meshgen_tris, meshgen_budget, meshgen_kind, meshgen_radius, meshgen_view_yaw, meshgen_count, meshgen_enemy_mesh, mg_head_shoulder, mg_head_width, mg_shoulder_width, mg_protrusion, mg_protrusion_axis, MESH_TREE0/1/2, MESH_BUSH, MESH_ROCK, MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB, MESH_WISP0..MESH_BULWARK2 (class ×3 LODs), meshgen_npc_mesh, MESH_NPC0 (= MESH_NPC), MESH_NPC1, MESH_NPC2, MG_NPC_LOD1_M, MG_NPC_LOD2_M, MESH_LANTERN_VM (= MESH_SPARROW_VM, the alias), MESH_TINKER_VM..MESH_EMBERLANCE_VM, MESH_COUNT, ENEMY_WISP..ENEMY_BULWARK, MG_MAT_*, MG_KIND_*, MG_LUM_FLOOR, MG_VM_LUM_FLOOR, meshgen_vm_bob` |
 | `biome.hml` | Per-biome palettes, texture cell selection, prop density, `FOG_FAR` override, triangle-budget policy. (Wave 4.) | `biome_of, biome_params, BIOME_HOLLOWFIELD..BIOME_DEEPSHADE` |
 | `weather.hml` | Weather state machine + rain/snow/fog-bank emitters. (Wave 4.) | `weather_step, weather_emit` |
 | `hubgen.hml` | Ember Hollow's modular building meshes and layout. (Wave 4.) | `hubgen_build, hub_layout` |
@@ -991,7 +991,7 @@ disappears instead of dissolving.
 | `view.hml` | Camera basis from yaw/pitch (never `mat_look_at`), FOV lerp (70 hip / 58 ADS / 78 sprint), screen shake, `recoil_view` (which **never leaves the client**), the MVP. | `view_new, view_build, view_shake, view_mvp, view_eye` |
 | `chunkmesh.hml` | Chunk → cached flat vertex arena (LOD0 128 tris / LOD1 32 / LOD2 8) with baked per-vertex lighting, AO in creases, biome tint, and low-frequency value patchiness. Rebuilt only when dirty. | `cmesh_build, cmesh_get, cmesh_invalidate, cmesh_budget_step` |
 | `terrain_render.hml` | Ring walk, per-chunk frustum sphere test, LOD selection by distance, skirts, `emit_mesh_buf` per chunk. | `terrain_emit, terrain_stats` |
-| `entity_render.hml` | Entities/props/pickups → mesh instances with LOD, hit-flash tint, dissolve scale, **one contact-shadow quad each (mandatory)**, emissive markers into `LAYER_FX`. | `entity_emit` |
+| `entity_render.hml` | Entities/props/pickups → mesh instances with LOD, hit-flash tint, dissolve scale, **one contact-shadow quad each (mandatory)**, emissive markers into `LAYER_FX`. Owns the **LOD tier hysteresis** (see 5.6d). | `entity_emit, entity_emit_none, entity_prop_clear, entity_prop_add, entity_prop_key, entity_prop_count, entity_prop_tag/x/y/z/scale, entity_lod_tier, entity_lod_stats, entity_lod_reset, entity_stats, g_LOD_FOG_CARD, g_ESTAT_*, g_HSTAT_*` |
 | `viewmodel.hml` | First-person weapon: idle sway, footstep bob, fire kick, reload stages, sprint tilt, ADS lerp. `depth = 0.05`, fog `f = 0`. | `vm_new, vm_step, vm_emit, vm_fire, vm_reload_stage` |
 | `fx.hml` | Client-only particle SoA (cap 512, negative ids), tracers, muzzle flashes, impact bursts, ember motes, damage numbers, decals, glow cards. | `fx_new, fx_update, fx_emit, fx_spawn_muzzle, fx_spawn_impact, fx_spawn_tracer, fx_spawn_number, fx_spawn_dissolve` |
 | `hud.hml` | ART_BIBLE §9 verbatim: crosshair with real spread bloom, hitmarker, health, ammo, compass, minimap, killfeed, XP bar, popups, damage vignette, hit-direction arcs, reload bar, interact prompt. ≤ 250 tris, hard-capped. | `hud_new, hud_build, hud_event, hud_set_tri_cap` |
@@ -999,6 +999,36 @@ disappears instead of dissolving.
 | `world_render.hml` | The frame-graph orchestrator: owns the four batches, the RenderEnv, the view/MVP/frustum, the sky mapping and the render-world registry; runs **stages 8–23 (`frame_render`) and 25–28 (`frame_present`)** of §4 in order. **The only file that knows the layer order.** Stage 6 (`tod_eval`), stage 7 (skygen) and stage 24 (the HUD) are the CALLER's — see 5.6b. | `frame_init, frame_batches, frame_begin, frame_render, frame_present, frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets, frame_set_camera, frame_set_clear, frame_set_sheet_clear, frame_set_options, frame_set_hud_solid_uv, frame_set_vignette_colour, frame_set_flash_colour, frame_env, frame_mvp, frame_frustum, frame_batch_sky/world/fx/hud, frame_camera_x/y/z, world_clear, world_chunk_add, world_prop_add, world_fx_add, world_chunk_count, world_chunk_mesh, world_prop_count, world_prop_tag/x/y/z/scale, world_fx_count, terrain_set, terrain_seed, terrain_ridge, terrain_h, vnoise2, h2, sky_basis, sky_uv_at, sky_u, sky_v, g_D2R, g_NEAR, g_GUARD, g_CAP_*, g_FXK_SPRITE/RAIN/TRACER, g_LOD_FOG_CARD` |
 | `map.hml` | The world map screen: lit lanterns, Wick Lines, discovered chunks, the obelisk records. (Wave 4.) | `map_build, map_toggle` |
 | `menu.hml` | Title, pause, level-up card, unlock card, settings. (Wave 4.) | `menu_build, menu_input, menu_state` |
+
+#### 5.6d LOD tier hysteresis — exact signatures (added by the npc-lod task)
+
+`entity_render.hml` remembers which LOD tier each instance was on last frame and
+makes going FINER cost more distance than going COARSER, so a body parked on a
+tier boundary does not swap mesh every time the camera sways. Measured, 8 bodies
+parked on the boundary under a +-12 cm sway for 600 frames: **188 mesh switches
+without it, 0 with it.**
+
+```
+entity_prop_key(i: i32, key: i32)          // OPTIONAL stable identity for entry i,
+                                           // as returned by world_prop_add. With no
+                                           // key the tier memory is addressed by the
+                                           // instance's own position quantized to
+                                           // 0.5 m plus its tag, which is exact for
+                                           // anything static and migrates across
+                                           // neighbouring cells for anything moving.
+entity_lod_tier(env: array<f64>, i: i32, dist: f64): i32     // 0/1/2, the real decision
+entity_lod_stats(field: i32): i32          // g_HSTAT_SWITCHES | _TOTAL | _HELD
+entity_lod_reset()                         // forget every tier (teleport, scene change)
+```
+
+Band: coarsen at `d1`/`d2`, refine at `d1 - h1`/`d2 - h2`, where
+`h = max(0.06 * threshold, 0.75 m)`. One-sided on purpose — the coarse tier wins
+ties, so hysteresis never costs triangles.
+
+**`world_render.hml` does not forward `entity_prop_key`.** A caller that wants to
+key a moving entity by its sim id imports it from `entity_render.hml` directly
+(`src/game/**` may import everything) and calls it with the index
+`world_prop_add` returned.
 
 #### 5.6a `view.hml` — exact signatures (added by W3-5)
 

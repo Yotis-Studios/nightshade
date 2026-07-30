@@ -95,12 +95,55 @@ export let g_UPSCALE_MAX: i32 = 4;
 // ===========================================================================
 // 3. THE TRIANGLE BUDGET  (ARCHITECTURE D1 + §2.4 + §8)
 // ===========================================================================
-// 2500 steady / 3500 hard clamp / 5000 renderer ceiling.  Measured at 2.88 us
-// marginal per triangle on the shipping pipeline including sort, clip and fill.
-
-export let g_TRIS_STEADY: i32 = 2500;
+// RE-DERIVED FROM MEASUREMENT 2026-07-29.  Full working, every dataset and the
+// reproduce command: BUDGET_ACTUAL.md §T.  Swept 513 -> 7971 DRAWN triangles
+// through the real frame path with `benchframe.hml --sweep`, screenshot readback
+// excluded (the game never runs it; it was a third of the frame it was hiding in).
+//
+// >>> THE OLD "2.88 us MARGINAL PER TRIANGLE" IS WITHDRAWN.  There is no such
+// >>> number, because the frame is NOT linear in one triangle count.  Measured
+// >>> over 27 rows spanning a 15x range and three independent content levers:
+// >>>
+// >>>     frame_ms = 0.636 us x SOURCE  +  1.492 us x DRAWN  +  1.670 ms
+// >>>     R^2 = 0.9996, worst residual 0.334 ms
+// >>>
+// >>> TRANSFORM is paid per SOURCE triangle (everything the kernel touches,
+// >>> including what it later backface-culls); FILL is paid per DRAWN triangle.
+// >>> So a drawn triangle costs 2.20 us in open terrain and 4.03 us in a deep
+// >>> crowd, and a budget quoted without its drawn/source ratio means nothing.
+// >>> At the SHIPPING mix (r = 0.52, measured) it is 2.714 us.
+//
+// Where the numbers below come from (BUDGET_ACTUAL §T.5 shows every term):
+//   16.670 ms deadline - 1.30 slack - 0.30 net - 0.852 audio/input = 14.218 ms
+//   for the part benchframe actually times, then / 1.28 for this box's
+//   MEASURED contention inflation (re-measured, not inherited: idle 7.541 ->
+//   loaded 9.549 ms with 17 busy cores).
+//     CLAMP  = 100 % of that deadline at r = 0.52  ->  3477  ->  3500 (unchanged)
+//     STEADY =  90 % of it                         ->  3068  ->  3000 (was 2500)
+//   Checked against the deadline rather than trusting the algebra:
+//     peak 3000 drawn ->  9.812 ms idle net -> x1.28 + 2.452 = 15.01 ms,  90 %
+//     peak 3500 drawn -> 11.169 ms          -> x1.28 + 2.452 = 16.75 ms, 100 % (the wall)
+// Both are bounds on PEAK drawn triangles, which is what benchframe asserts.
+// Sizing content by its TYPICAL frame instead?  Divide by the measured full-lap
+// burst factor of 1.70 (worst over the ladder, and it is the SHIPPING frame that
+// sets it: lap mean 1409.6 drawn against a lap peak of 2401).  A mean of 2000
+// drawn peaks at ~3400; conversely a 3500 peak clamp lets the MEAN sit at ~2060.
+export let g_TRIS_STEADY: i32 = 3000;
 export let g_TRIS_CLAMP: i32 = 3500;
-export let g_TRIS_CEILING: i32 = 5000;
+
+// >>> CORRECTED 5000 -> 3500, AND THIS ONE IS A SAFETY FIX, NOT A TUNING CHANGE.
+// 5000 was never executed.  Reaching it requires g_CAP_WORLD (world_render.hml)
+// above its shipping 3500, and raising that constant makes frame_render() throw
+// `Type mismatch in typed array` on the ACCELERATED renderer at the peak-geometry
+// frame (~3750-3900 drawn).  Reproduced at cap 5000 and 9000; absent at 3500;
+// absent on the software renderer at every cap.  It is not a batch overflow —
+// STAT_BATCH_OVERFLOW is 0 at the throw.  BUDGET_ACTUAL §T.7 has the repro.
+//
+// So the ceiling is currently set by a BUG, not by frame time: the timing says
+// ~4800 drawn is reachable on a quiet box and ~3600 on a loaded one.  Until
+// world_render.hml's owner fixes the throw, nothing may plan against >3500, and
+// no code should carry a ceiling constant that has never survived a frame.
+export let g_TRIS_CEILING: i32 = 3500;
 
 // Per-layer pool capacities (ARCHITECTURE §2.4).  These are the `cap` handed to
 // batch_new; batch_reserve returns -1 past them and increments a drop counter.
@@ -128,6 +171,15 @@ export let g_NB_BUCKETS: i32 = 2048;
 // ===========================================================================
 // These are the *budgets*, not the measurements.  Measured at 2500 tris:
 // emit 3.57 + clip 0.47 + sort 0.40 + flush 0.85 = 5.3 ms against 11.0.
+//
+// RE-MEASURED 2026-07-29 on the whole frame (BUDGET_ACTUAL §T), software
+// renderer, readback excluded, idle box:  the SHIPPING frame's net cost is
+// 5.0-5.5 ms at 1296 drawn / 2502 source, and RENDER total is 4.28 ms of the
+// 11.0 budgeted.  The 11.0 / 2.0 / 0.3 / 1.0 / 1.3 split below is unchanged and
+// is what §T.5 reserves against — it is an allocation, not a measurement, and
+// the 2.452 ms of it that benchframe cannot see (net + audio + input) is
+// exactly why the triangle budget is 3000 and not the ~4800 the raw crossing
+// point suggests.
 
 export let g_BUDGET_RENDER_MS: f64 = 11.0;
 export let g_BUDGET_SIM_MS: f64 = 2.0;
@@ -245,16 +297,41 @@ export let g_MIST_HEIGHT: f64 = 1.6;
 //   * `fx.hml` lays ONE 2-triangle additive ground glow card per light within
 //     14 m of the camera.
 //
-// Re-measured on this box (RULE T: __clock CPU time, min of 7), `tools/shot.hml`
-// `--scene muzzle_fog`, native 320x240, stages 8..28, lights forced 0 -> 4:
+// Re-measured on this box (RULE T: __clock CPU time, min of 7 frames, then the
+// MINIMUM over 9 whole process runs), a shot.hml-derived harness, `--scene
+// budget_worst --tod 22.0`, native 320x240, 2536 triangles drawn, 34 prop
+// instances, lantern on, extra contested lights posted through `env_add_light`:
 //
-//     0 lights   6.898 ms          2 lights   6.925 ms
-//     1 light    6.905 ms          3 lights   6.943 ms
-//                                  4 lights   6.960 ms
+//     2 lights  12.268 ms      3 lights  12.384 ms      4 lights  12.485 ms
 //
-// 0.062 ms from 0 to 4 lights — 0.37 % of the 16.67 ms frame, 15.5 us per
-// light.  The regression guard in `tools/shot.hml` is 14.0 ms.  Four lights
-// are affordable by a factor of ~150; two was never the real ceiling.
+// **0.217 ms from 2 lights to 4 — 1.3 % of the 16.67 ms frame, 0.109 ms per
+// light.**  (Those totals include the 2.5 ms `read_pixels_rect` that only the
+// screenshot path pays; the DELTA does not, and the delta is the number here.)
+//
+// >>> An earlier revision of this comment claimed 15.5 us per light off a
+// >>> `--scene muzzle_fog` sweep.  That is 7x too cheap and it does not
+// >>> reproduce: muzzle_fog is a 1082-triangle 13-instance frame, and the cost
+// >>> is O(props x lights) plus a `terrain_h`-sampled glow card per light
+// >>> (4 x 3.234 us each), so it scales with the SCENE, not with nothing.
+// >>> Priced on the densest legal frame instead, which is the frame the budget
+// >>> is written against.
+//
+// Corroborated in the WALKING benchmark, which is the honest test — a
+// `tools/benchframe.hml` copy moved to 22:00, `--sweep`, villager ladder,
+// `read_pixels_rect` excluded by the harness, min over 3 passes x 3 trials:
+//
+//     drawn tris    lantern off    + lantern    + lantern & 4 lights
+//        789/791       3.170 ms      3.717 ms          3.775 ms
+//       2092/2094      7.348 ms      7.857 ms          7.779 ms
+//       2544/2546      9.266 ms      9.605 ms          9.640 ms
+//       2898/2901     10.801 ms     11.267 ms         11.367 ms   = 88.0 fps
+//
+// At the fog-limited ceiling of ~2900 DRAWN triangles, with four dynamic
+// lights and the lantern lit, the frame is **11.367 ms — 88 fps, 5.30 ms under
+// the 60 fps floor**, on a box permanently sharing 17 of 24 cores.  The
+// marginal cost is 3.92 us per drawn triangle, so the 60 fps floor is not
+// reached until roughly **4250 drawn triangles**.  Four lights and a raised
+// triangle budget are not in competition; neither has to give.
 //
 // >>> WHAT DID NOT CHANGE, AND MUST NOT: STATIC LIGHTS STAY BAKED.
 // `mesh_bake_light` folds a static light into vertex colour at build time for
@@ -339,6 +416,93 @@ export let g_LANTERN_GAIN: f64 = 2.4;
 // between: golden hour (0.783) gets nothing, 22:00 (0.480) gets all of it.
 export let g_LANTERN_GATE_NIGHT: f64 = 0.52;
 export let g_LANTERN_GATE_DAY: f64 = 0.72;
+
+// >>> THE GROUND POOL, and why it needs its own emitter.
+// `fx.hml` already lays one 2-triangle additive card per dynamic light inside
+// 14 m, its four corners on the terrain.  For every light in the game so far
+// that card WAS NEVER DRAWN, and the reason is structural rather than a bug in
+// the numbers: the card is centred ON THE LIGHT and spans +/- radius, so a
+// light near the camera puts two of its four corners BEHIND THE NEAR PLANE and
+// the whole quad is rejected as a straddle.  Measured on `muzzle_fog`, adding
+// the lantern moved `clip.straddle` from 123 to 125 — exactly the two triangles
+// of the card — and `tris.drawn` did not move at all.
+//
+// A lantern in the player's hand is the worst case for that: its pool is
+// centred exactly where the near plane is.  So the pool is emitted as a GRID,
+// stage 16b in `world_render.hml`: the cells behind the near plane are rejected
+// individually and the cells in front of it survive.  DIV x DIV quads over the
+// footprint, UVs interpolated across the same glow cell fx.hml uses, so the
+// picture is the card fx.hml intended and never managed to draw.
+//
+// >>> DIV IS THE PRICE OF A SMOOTH POOL, AND HERE IS THE PRICE LIST.
+// Measured `--scene budget_worst --tod 22.0`, native 320x240, min over 7 whole
+// runs of a min-of-7 __clock frame; baseline is the same binary with the
+// lantern forced off (11.391 ms).  Only DIV changed between rows:
+//
+//     DIV=4    11.815 ms   +0.424   10 tris drawn   17 terrain_h calls
+//     DIV=6    11.962 ms   +0.571   21 tris         27 calls
+//     DIV=8    11.917 ms   +0.526   38 tris         22 calls
+//     DIV=12   12.236 ms   +0.845   81 tris         36 calls   <- shipping
+//     DIV=16   12.718 ms   +1.327  158 tris         22 calls
+//
+// (Drawn is far below the DIV*DIV*2 reserved because the pool is centred on
+// the eye, so most of it is behind the player and never leaves the near plane.
+// The terrain_h count does not rise monotonically with DIV because HDIV walks
+// down to the nearest divisor of DIV — DIV 8 and 16 get a 4-cell height grid.)
+//
+// LOOKED at all three of 6, 8 and 12 at 320x240 on a real display.  The cells
+// are FLAT-SHADED — `emit_quad_world` takes one rgb for all four vertices — so
+// DIV is literally the number of steps in the falloff ramp, ~4/DIV of peak per
+// step.  DIV 6 and DIV 8 both put a visible rectangular block of brighter
+// ground at the pool's edge; DIV 12 does not, and on flat ground it reads as a
+// continuous pool with no cell structure at all.  0.32 ms over DIV 8 buys that,
+// against 5.3 ms of headroom at the triangle ceiling.  Worth it — but if the
+// budget ever tightens, **DIV 8 is where to go first**: same cost as DIV 6,
+// twice the tessellation, and it is one constant.
+//
+// >>> DIV AND HDIV MUST BE COMPATIBLE AND THE CODE NOW ENFORCES IT.  Until the
+// >>> `divi` fix in `world_render.hml`'s `pool_hy`, DIV=8 CRASHED ("Array index
+// >>> 26 out of bounds (length 25)") and DIV=12 survived only by luck.  Any
+// >>> value 4..16 is now safe; that is what the sweep above is evidence of.
+export let g_LANTERN_POOL_DIV: i32 = 12;
+
+// >>> THE HEIGHT GRID IS COARSER THAN THE COLOUR GRID, and the reason is one
+// >>> measured number: `terrain_render.hml`'s `terrain_h` costs
+// >>> **3.234 us per call** (three octaves of value noise = twelve u64 hash
+// >>> mixes; micro-benchmarked at 200 000 calls, min of 7, __clock CPU time).
+// A (DIV+1)^2 = 169-point height grid is therefore 0.55 ms of terrain sampling
+// for a glow card — measured as 0.90 ms of `emit.fx` on `muzzle_fog`, 5 % of
+// the frame, which a glow card does not get to charge.
+//
+// The colour grid has to be fine (it carries the falloff, see POOL_DIV). The
+// HEIGHT grid does not: it only has to follow the ground. So heights are taken
+// on an HDIV grid and bilinearly interpolated up to the colour grid.
+//
+// HDIV 6 over a 14 m pool is 2.33 m spacing. terrain_h's octaves are 32 m
+// (+/-2.6 m), 11 m (+/-0.95 m) and 4.6 m (+/-0.28 m); 2.33 m samples the first
+// two exactly and the third at Nyquist, so the worst deviation from the true
+// surface is ~0.1 m — covered by POOL_LIFT below. HDIV must divide DIV.
+export let g_LANTERN_POOL_HDIV: i32 = 6;
+
+// How far the pool floats above the terrain, in metres. fx.hml's card uses
+// 0.06 and samples the ground exactly at its own four corners; this one
+// interpolates, so it needs enough clearance to never sink THROUGH the ground
+// (there is no depth buffer — a sunken card does not z-fight, it disappears
+// behind the hill it is inside). 0.15 covers the ~0.1 m interpolation error and
+// is under a fifth of a texel at the 3-7 m the pool is actually seen from.
+export let g_LANTERN_POOL_LIFT: f64 = 0.15;
+
+// Footprint as a multiple of the light's radius.  1.0 = the pool reaches
+// exactly as far as the light does, which is what makes the additive card and
+// the per-instance prop lighting agree at the edge.  (fx.hml uses 0.62 for its
+// single card; at 0.62 the pool's visible edge lands at 4.3 m and the nearest
+// ground the camera can see at eye height 2.1 m and pitch -3 is 4.0 m, so
+// almost none of it is on screen.)
+export let g_LANTERN_POOL_SPAN: f64 = 1.0;
+
+// Additive brightness per unit of light colour, matching fx.hml's own card so
+// the two cannot drift: `rgb = clamp(light_rgb * 96, 0, 255)`.
+export let g_LANTERN_POOL_SCALE: f64 = 42.0;
 
 // Field of view (GDD §2.3).  Degrees.
 export let g_FOV_HIP: f64 = 70.0;
