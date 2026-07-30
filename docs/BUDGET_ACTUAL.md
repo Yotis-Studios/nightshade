@@ -18,10 +18,17 @@ Supersedes the projected figures in `ARCHITECTURE.md` §8 where they disagree.
 > * **`g_TRIS_STEADY` moves 2500 → 3000. `g_TRIS_CLAMP` stays at 3500.**
 >   **`g_TRIS_CEILING` moves 5000 → 3500 because 5000 CRASHES** (§T.7).
 > * The reason the gain is +20 % and not +200 % is that **the 9.35 ms of
->   "headroom" was never spendable**: 2.48 ms of it is a screenshot readback the
->   game does not run, and most of the rest is the reserve `ARCHITECTURE` §8
->   already allocated to net, audio, input and slack. §T.5 shows the arithmetic.
+>   "headroom" was never spendable**: 2.48 ms of it is a readback
+>   ~~the game does not run~~ **[CORRECTED — §T.10. The game DID run it, every
+>   frame. And on the software renderer removing it saves nothing, because SDL
+>   just pays the same cost in `target_present` instead.]**, and most of the rest
+>   is the reserve `ARCHITECTURE` §8 already allocated to net, audio, input and
+>   slack. §T.5 shows the arithmetic.
 > * **A budget above 3500 is currently blocked by a crash, not by milliseconds.**
+> * **2026-07-30: read §T.10 before quoting any "readback excluded" number in
+>   this section.** The exclusion was legitimate on the accelerated renderer and
+>   wrong by ~2.5 ms on the software one, so §T.3's software crossing is ~450–1000
+>   drawn triangles optimistic. The accelerated numbers are unaffected.
 
 > ### ⚠ HOW TO TIME ANYTHING ON THIS MACHINE — READ BEFORE WRITING A PERF ASSERTION
 >
@@ -76,7 +83,7 @@ Supersedes the projected figures in `ARCHITECTURE.md` §8 where they disagree.
 
 > **SUPERSEDED IN PART, 2026-07-29 — see §T.** The verdict stands (the budget
 > holds), but the stage table below is a *2500-triangle* snapshot taken against a
-> frame that still carried the 2.48 ms screenshot readback, and its "≈ 5.7 ms of
+> frame that still carried the 2.48 ms readback (**not a screenshot cost — §T.10**), and its "≈ 5.7 ms of
 > headroom" is not spendable on triangles: §T.5 itemises where it goes. The
 > steady budget is now **3000** and the per-triangle cost is **two numbers, not
 > one** (§T.2).
@@ -204,6 +211,16 @@ output.
 
 Everything in this section was measured with `tools/benchframe.hml --sweep` on
 Hemlock v2.9.1, `hemlockc -O1`, native 320×240, `read_pixels_rect` **excluded**.
+
+> **⚠ THAT EXCLUSION IS THE ONE THING IN THIS SECTION THAT WAS WRONG — read §T.10
+> (2026-07-30) before quoting a triangle count from T.2–T.5.** The exclusion was
+> justified with "the game does not run the readback". The game ran it on every
+> frame, and on the software rasteriser the 2.48 ms is not the readback's own cost
+> at all: it is the cost of moving the render target's pixels, which SDL pays once
+> per frame whether you read them or present them. Excluding it from a *software*
+> frame therefore deleted 2.5 ms of real work. **Accelerated numbers stand;
+> software crossings in T.3 are ~450–1000 drawn triangles optimistic.**
+
 Reproduce with:
 
 ```sh
@@ -222,7 +239,7 @@ wrong, and they do not all push the same way:
 
 | What was wrong | Direction |
 |---|---|
-| The frame carried a 2.48 ms readback the game never runs | budget was too **low** |
+| The frame carried a 2.48 ms readback ~~the game never runs~~ — **wrong, see §T.10: the game ran it every frame, and on software it is not saveable** | budget was too **low** on accelerated, **correct as measured** on software |
 | Cost was expressed per DRAWN triangle only | budget was **meaningless without a content ratio** |
 | `g_TRIS_CEILING = 5000` was never executed — it crashes | budget was dangerously too **high** |
 
@@ -327,7 +344,27 @@ Software renderer, idle box, `read_pixels_rect` excluded, no reserve applied:
 | 5-column fan, `v56` | **3 983.2** | 14 934 | **16.862 ms** |
 
 **The crossing is 3 900–4 600 drawn triangles, and *which* number depends on the
-content, not on the renderer.** Note the two rows: `W v48` and `v48` draw the
+content, not on the renderer.**
+
+> **CORRECTION, 2026-07-30 (§T.10).** *"Not on the renderer"* is exactly the part
+> that does not survive. Both rows above have 2.5 ms of software present cost
+> removed from them by the `read_pixels_rect excluded` convention. Re-measured on
+> a binary whose readback is genuinely off, so that its `frame` column is the
+> whole frame (loadavg 0.93, `--sweep --quick --passes 1`):
+>
+> | Content | drawn | source | frame, SOFTWARE, nothing excluded |
+> |---|---|---|---|
+> | `v34` | 3 382.8 | 10 334 | **15.884 ms** |
+> | `v40` | 3 608.0 | 11 666 | **17.041 ms** ← already past the line |
+>
+> **The software crossing is ~3 450–3 600 drawn, not 3 900–4 600.** The
+> accelerated crossing is the higher one — the same content that costs 7.40 ms
+> software costs 4.47 ms accelerated — so the number really does depend on the
+> renderer, by about a thousand triangles. `g_TRIS_CLAMP = 3500` is still the
+> right clamp; it is now the clamp for the *software* wall rather than a derated
+> accelerated one, which is if anything a better reason for it.
+
+Note the two rows: `W v48` and `v48` draw the
 same 13 158 SOURCE triangles, but the wide fan draws 4 595 of them against the
 narrow fan's 3 746 — and costs 16.650 ms against 15.540 ms. Same transform
 bill, 850 more survivors, 1.11 ms more. That 1.31 µs/survivor is the fill term
@@ -501,6 +538,13 @@ The readback collapsing from 2.482 ms to 0.225 ms is the bulk of the difference,
 and it is a cost only `shot.hml` pays. **The budget is not
 accelerated-renderer-dependent: it was derived on the slower of the two.**
 
+> **CORRECTION, 2026-07-30 (§T.10).** *"A cost only `shot.hml` pays"* was false.
+> `read_pixels_rect` was called **unconditionally** inside `frame_present()`, so
+> the walkaround, the bench and the game all paid it on every frame. It is now
+> opt-in (`frame_set_capture`, default off). The rest of the table is right, and
+> the 11.0× ratio is the honest reason the fix is worth ~0.2 ms on the renderer
+> players use and **worth nothing at all** on the software one.
+
 **What is missing:** the accelerated *sweep* could not be run — it dies at
 `W v16` on the T.7 crash, because reaching those counts requires the raised cap.
 So the claim "fill scales linearly to 8 000 drawn" is **verified on the software
@@ -533,3 +577,117 @@ that for real-world scaling and it is still a 2× ceiling.
 austerity is designed into the settlement.** It is a larger, cheaper win than
 every triangle-shaving measure in `SETTLEMENT.md` §7 combined. Not implemented
 here; out of scope for this task.
+
+---
+
+## T.10 ⚠ THE READBACK — 2026-07-30. THE CLAIM WAS FALSE, AND THE FIX IS WORTH LESS THAN THE CLAIM IMPLIED.
+
+Three places in this document, plus `benchframe.hml`'s own comment block, said
+the 2.48 ms `read_pixels_rect` was *"a screenshot readback the game does not
+run"*. **Both halves of that were wrong, in opposite directions.**
+
+### T.10.1 The game ran it. Every frame. There was no flag.
+
+`read_pixels_rect(320×240, ARGB8888)` sat **unconditionally** in
+`frame_present()` — `src/render/world_render.hml`, between stage 25's HUD flush
+and stage 26's `target_end`, with no branch and no caller opt-in. All four
+consumers of the frame graph paid it on every frame: `shot.hml`, `walk.hml`,
+`benchframe.hml` **and `src/game/main.hml`**. Only `shot.hml` ever looked at the
+pixels. The walkaround and the game read them only on the frame someone pressed
+**P**, and the bench read them only for `--shot`.
+
+**Fixed.** It is now opt-in per frame:
+
+```hemlock
+frame_set_capture(on)        // src/render/world_render.hml, DEFAULT OFF
+frame_capture(): i32         // what the flag currently is
+```
+
+`frame_present()` reads pixels only when the flag is set **and** `g_fb != null`.
+`shot.hml` sets it once at init and leaves it on; `walk.hml` and `main.hml` arm
+it for exactly the frame the screenshot key was pressed on and clear it after
+writing the PNG.
+
+### T.10.2 On the SOFTWARE renderer the saving is ZERO. The cost moves.
+
+This is the part nobody had measured, and it is the reason the 2.48 ms was never
+the prize it looked like. `benchframe` default gate, `SDL_VIDEODRIVER=dummy`,
+same binary except for the flag's default, three interleaved runs each,
+min-of-three reported, **loadavg 0.69–1.26**:
+
+| | readback ON (before) | readback OFF (after) |
+|---|---|---|
+| `read_pixels_rect`, by subtraction | **2.466 ms** | **0.003 ms** |
+| stage 26-27 `present` | **0.446 ms** | **2.954 ms** |
+| `frame_present()` wall | 2.926 ms | 2.971 ms |
+| **whole frame** | **7.359 ms** | **7.398 ms** |
+
+**The 2.5 ms did not go away. It moved into `target_present`.** SDL's renderer
+defers work and flushes it on the first call that needs finished pixels;
+`SDL_RenderReadPixels` was that call, so it was being *charged* for work
+`SDL_RenderPresent` now does instead. On the software rasteriser, getting the
+320×240 render **target**'s pixels anywhere at all costs ~2.5 ms, and SDL pays it
+exactly once per frame no matter who triggers it.
+
+Confirmed across the whole sweep ladder, software, `--sweep --quick --passes 1`:
+stage `present` was a flat **0.446–0.450 ms at every triangle count** with the
+readback on, and **2.711 ms at 495 drawn rising to only 3.427 ms at 3 608 drawn**
+with it off. So the migrated cost is ~2.7 ms of triangle-**independent** target
+traffic plus ~0.23 µs/drawn of deferred fill — not the fill bill, the blit bill.
+
+### T.10.3 On the ACCELERATED renderer it is a real, if modest, win.
+
+Same binaries, `DISPLAY=:0`, three interleaved runs each, min-of-three,
+**loadavg 0.81–2.53**:
+
+| | before | after | delta |
+|---|---|---|---|
+| `read_pixels_rect`, by subtraction | 0.220 ms | 0.002 ms | |
+| stage 26-27 `present` | 0.008 ms | 0.022 ms | +0.014 |
+| `frame_present()` wall | **0.240 ms** | **0.035 ms** | **−0.205 ms** |
+| whole frame | **4.712 ms** | **4.473 ms** | **−0.239 ms (−5.1 %)** |
+
+Here the cost does **not** migrate: the GPU flush is nearly free, and the 0.22 ms
+was the genuine texture download. Corroborated end-to-end on the game itself,
+`main.hml --demo 15` on `DISPLAY=:0`, three runs each, **loadavg 0.81–1.37**:
+
+```
+  render CPU, RULE T min-of-7 :  before 7.7 / 7.8 / 7.9 ms   after 7.3 / 7.3 / 7.5 ms
+  worst frame of the demo     :  before 17.0 ms              after 15.3 ms
+  frames over 16.67 ms        :  before 1 of 1278            after 0 of 1279
+```
+
+The game's end-to-end gain (~0.4 ms) is larger than the isolated call cost
+(0.205 ms) because the readback is also a pipeline sync point.
+
+### T.10.4 What this does to the numbers in T.2–T.5
+
+* **Accelerated: nothing.** The sweep's `read_pixels_rect excluded` convention
+  removed ~0.22 ms from a frame that no longer pays it. T.2's fit, T.5's
+  arithmetic and `g_TRIS_STEADY = 3000` all stand for the renderer players use.
+* **Software: T.3's crossing is ~450–1 000 drawn triangles optimistic**, because
+  the convention removed 2.5 ms the software renderer pays regardless. Measured
+  directly rather than re-fitted, the software 16.67 ms crossing is
+  **~3 450–3 600 drawn** (`v34` 3 383 drawn / 15.884 ms, `v40` 3 608 / 17.041 ms).
+  `g_TRIS_CLAMP = 3500` lands inside that band, so **no budget constant moves**.
+* T.2's model is still the right *shape*; its **intercept is renderer-specific**.
+  For software, add ~2.7 ms to the 1.670 ms intercept and ~0.23 µs to the drawn
+  slope. Re-fitting properly belongs to whoever next owns `benchframe.hml`.
+* **The honest one-line summary: this change buys ~0.2 ms of frame time on the
+  accelerated renderer and 0 ms on the software one. It buys correctness
+  everywhere — the frame graph no longer does I/O nobody asked for — and it
+  retires a false sentence that four documents were reasoning from.**
+
+### T.10.5 `benchframe.hml` needs two changes. Not owned by this task; reported.
+
+1. **`--shot` now writes an all-black PNG.** It builds the image from `g_fb`,
+   which nothing fills any more. Reproduced:
+   `SDL_VIDEODRIVER=dummy /tmp/bf --shot /tmp/a.png --quick --no-gate` → 320×240
+   of pure black, where the same command on the previous binary wrote the frame.
+   One-line fix: `frame_set_capture(1)` before the shot frame and `(0)` after.
+   Until then **`--shot` is not evidence of anything**, which is precisely the
+   failure mode its own comment block was written to prevent.
+2. **Every note that says the readback costs 2.5 ms and that only `shot.hml` pays
+   it is now stale**, including §7b's header (*"read_pixels_rect EXCLUDED"*), the
+   gate line *"incl. readback"*, `net_frame()`'s subtraction (now a no-op), and
+   the recommendation *"(2) make it opt-in"* — which is done.

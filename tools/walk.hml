@@ -129,6 +129,7 @@ import { stat_get, stat_ms, stat_set, stat_begin, stat_end,
 import { frame_init, frame_render, frame_present, frame_begin,
          frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
          frame_set_camera, frame_set_clear, frame_set_options,
+         frame_set_capture,
          frame_set_hud_solid_uv, frame_set_vignette_colour,
          frame_set_flash_colour, frame_env, frame_batch_hud,
          world_clear, world_chunk_add, world_prop_add, world_fx_add,
@@ -2104,7 +2105,7 @@ fn frame_once(p_dt: f64, p_t: f64) {
     hud_build();
     stat_end(STAT_T_HUD);
 
-    // -- 25..28  flush, readback, present, stats -----------------------------
+    // -- 25..28  flush, present, stats (readback only if shot_request armed it)
     frame_present();
     g_frames++;
 }
@@ -2131,10 +2132,41 @@ fn framebuffer_to_rgb(): buffer {
 
 let g_shot_dir: string = "";
 
-fn screenshot(p_tag: string) {
+// ---------------------------------------------------------------------------
+// A SCREENSHOT IS NOW TWO HALVES, BECAUSE THE READBACK IS OPT-IN.
+// ---------------------------------------------------------------------------
+// `read_pixels_rect` used to run inside every `frame_present()`, so this file
+// asked SDL for pixels it looked at only when somebody pressed P — 0.22 ms/frame
+// on a real display, and 2.47 ms headless (of which nothing is saveable: see
+// BUDGET_ACTUAL.md §T.10.2, the software cost migrates into `target_present`).
+// It is now a per-frame flag that defaults to off (world_render.hml stage 25b),
+// so a screenshot is:
+//
+//     shot_request(tag)   BEFORE frame_once()  -> arms the readback
+//     shot_flush()        AFTER  frame_once()  -> writes the PNG, disarms it
+//
+// Both halves are called from the same loop iteration, so the pixels written are
+// the frame the key was pressed on. That is a one-frame IMPROVEMENT on the old
+// behaviour, which read `g_fb` from `handle_keys` — i.e. before this frame's
+// present — and therefore wrote the PREVIOUS frame. The demo's timed shots are
+// unchanged: the request is made before `frame_once` and the write after it, so
+// the image and the stats line both describe the same frame they always did.
+let g_shot_pending: i32 = 0;
+let g_shot_tag: string = "";
+
+fn shot_request(p_tag: string) {
     if (g_shot_dir.length == 0) { return; }
+    g_shot_pending = 1;
+    g_shot_tag = p_tag;
+    frame_set_capture(1);
+}
+
+fn shot_flush() {
+    if (g_shot_pending == 0) { return; }
+    g_shot_pending = 0;
+    frame_set_capture(0);
     let img: buffer = framebuffer_to_rgb();
-    let path: string = `${g_shot_dir}/walk_${g_shot_seq}_${p_tag}.png`;
+    let path: string = `${g_shot_dir}/walk_${g_shot_seq}_${g_shot_tag}.png`;
     write_png(path, img, g_RES_W, g_RES_H);
     print(`walk: wrote ${path}   tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  dc ${stat_get(STAT_DRAW_CALLS)}  frame ${f1(stat_ms(STAT_T_FRAME))} ms`);
     g_shot_seq++;
@@ -2261,7 +2293,7 @@ fn handle_keys(p_dt: f64) {
     if (input_pressed(inp, SC_T)) { g_time_running = 1 - g_time_running; }
     if (input_pressed(inp, SC_H)) { g_hud_on = g_hud_on + 1; if (g_hud_on > 2) { g_hud_on = 0; } }
     if (input_pressed(inp, SC_G)) { g_vm_on = 1 - g_vm_on; }
-    if (input_pressed(inp, SC_P)) { screenshot("key"); }
+    if (input_pressed(inp, SC_P)) { shot_request("key"); }
     if (input_pressed(inp, SC_V)) {
         g_wx = g_wx + 1;
         if (g_wx >= WX_COUNT) { g_wx = 0; }
@@ -2407,9 +2439,23 @@ fn run_loop() {
         while (g_day_t >= 1.0) { g_day_t = g_day_t - 1.0; }
         while (g_day_t < 0.0) { g_day_t = g_day_t + 1.0; }
 
+        // The demo's timed screenshots are ARMED here, before the frame, and
+        // written below, after it — so the PNG is this frame's pixels and its
+        // stats line is this frame's stats, exactly as before the readback
+        // became opt-in.
+        if (g_demo_s > 0.0 && g_shot_dir.length > 0 && t >= next_shot) {
+            shot_request(`t${i32(t)}`);
+            next_shot = next_shot + 2.5;
+        }
+
         let cpu0: f64 = __clock();
         frame_once(dt, t);
         let cpu_ms: f64 = (__clock() - cpu0) * 1000.0;
+        // The PNG write sits OUTSIDE the __clock() bracket on purpose: the PNG
+        // encode is not frame cost. The readback itself IS inside, because on a
+        // capture frame it genuinely is part of that frame — which is the whole
+        // point of making it opt-in, and RULE T's min-of-7 discards it anyway.
+        shot_flush();
         cpu_acc = cpu_acc + cpu_ms;
         cpu_batch = cpu_batch + cpu_ms;
         cpu_bn++;
@@ -2452,10 +2498,6 @@ fn run_loop() {
 
         if (t > g_hud_at + 0.25) { hud_strings(); g_hud_at = t; }
 
-        if (g_demo_s > 0.0 && g_shot_dir.length > 0 && t >= next_shot) {
-            screenshot(`t${i32(t)}`);
-            next_shot = next_shot + 2.5;
-        }
         if (g_demo_s > 0.0 && t >= report_at) {
             print(`  t=${i32(t)}s  frame ${f1(g_frame_ms)} ms  wall ${f1(g_wall_ms)} ms  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  dc ${stat_get(STAT_DRAW_CALLS)}  ch ${stat_get(STAT_CHUNKS_DRAWN)}  pr ${stat_get(STAT_ENTS_DRAWN)}  meshed ${g_ring_built}`);
             report_at = report_at + 1.0;
@@ -2493,7 +2535,7 @@ fn run_loop() {
         print(`      24 hud             ${f1(pf_hud / n)}`);
         print(`      25 flush hud       ${f1(pf_fhud / n)}`);
         print(`   26-27 present         ${f1(pf_pres / n)}`);
-        print(`         UNACCOUNTED     ${f1(pf_other / n)}   <- frame_present's readback lives here`);
+        print(`         UNACCOUNTED     ${f1(pf_other / n)}   <- untimed odds and ends; the readback is OPT-IN now and off`);
         print("");
         print(`walk: ${ms_n} frames in ${f1(t)} s`);
         print(`      render, wall  (stat_ms STAT_T_FRAME, stages 6..28)`);

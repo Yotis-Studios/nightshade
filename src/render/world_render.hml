@@ -82,7 +82,7 @@
 //          ... caller: stage 6 tod, stage 7 skygen ...
 //          frame_render()                    stages 8..23  (ends with postfx)
 //          ... caller: stage 24, its own HUD, into frame_batch_hud() ...
-//          frame_present()                   stages 25..28 + readback
+//          frame_present()                   stages 25..28 (+ readback IF ASKED)
 //
 //      That hole is the ONLY structural difference from the Wave-2 function.
 //      Insertion order inside LAYER_HUD is identical, so the pixels are.
@@ -268,6 +268,7 @@ export let g_LOD_FOG_CARD: f64 = e_lod_fog_card;
 let g_win = null;
 let g_target = null;
 let g_fb = null;                        // ARGB8888 readback destination (ptr)
+let g_capture: i32 = 0;                 // stage 25b: read g_fb back THIS frame?
 
 let g_tex_world = null;
 let g_tex_fx = null;
@@ -376,7 +377,8 @@ export fn frame_batches(): i32 {
 
 // p_fb is the caller's ARGB8888 readback buffer, RES_W * RES_H * 4 bytes. It
 // stays the caller's because the caller is the one that turns it into a PNG or
-// blits it; the frame graph only fills it.
+// blits it; the frame graph only fills it — and only on the frames the caller
+// asks for, see `frame_set_capture` below.
 export fn frame_init(p_win, p_target, p_fb: ptr): i32 {
     g_win = p_win;
     g_target = p_target;
@@ -487,6 +489,53 @@ export fn frame_set_options(p_sheet: i32, p_viewmodel: i32, p_lightning: i32) {
     g_opt_lightning = p_lightning;
 }
 
+// ---------------------------------------------------------------------------
+// STAGE 25b — THE FRAMEBUFFER READBACK IS OPT-IN, AND IT DEFAULTS TO OFF.
+// ---------------------------------------------------------------------------
+// `read_pixels_rect` used to run UNCONDITIONALLY in `frame_present()`, on every
+// frame of every consumer. Three documents (BUDGET_ACTUAL.md §T, benchframe's
+// own comment block, and every triangle budget derived from either) described it
+// as "a cost only shot.hml pays". THAT WAS FALSE — the *pixels* were unused by
+// the walkaround and by the game, but the *call* was paid by both, every frame.
+//
+// WHAT IT ACTUALLY COSTS, MEASURED BOTH WAYS (BUDGET_ACTUAL.md §T.10):
+//
+//   accelerated renderer, a real display : 0.240 -> 0.035 ms in frame_present,
+//       a REAL saving of 0.205 ms/frame. The 0.22 ms was a genuine GPU->CPU
+//       texture download and it is now gone.
+//   software rasteriser, SDL_VIDEODRIVER=dummy : NO SAVING AT ALL. The 2.47 ms
+//       reappears in stage 26-27 (present goes 0.446 -> 2.954 ms) and the whole
+//       frame is unchanged, 7.359 -> 7.398 ms. SDL defers work and flushes it on
+//       the first call that needs finished pixels; RenderReadPixels was merely
+//       being CHARGED for the target blit that RenderPresent now does instead.
+//
+// So do not gate anything on "we saved 2.5 ms". The reason this flag exists is
+// that the frame graph should not do I/O nobody asked for, plus 0.2 ms on the
+// renderer players actually run. Both statements are the measured ones.
+//
+//   * OFF by default. A consumer that never wants pixels never pays for them,
+//     and a consumer that FORGETS to ask gets a fast frame and a stale buffer
+//     rather than a slow frame and pixels it ignores. That is the right way
+//     round for a default.
+//   * `tools/shot.hml` turns it on once, at init, and leaves it on: writing a
+//     PNG is the entire reason that binary exists.
+//   * `tools/walk.hml` and `src/game/main.hml` turn it on for EXACTLY the frame
+//     the screenshot key was pressed on and off again after the PNG is written.
+//   * `g_fb == null` is also a refusal, so a consumer that passed no readback
+//     buffer to `frame_init` cannot make the graph write through a null.
+//
+// The readback still happens in the same place — between stage 25's HUD flush
+// and stage 26's `target_end` — because that is the only window in which the
+// RES_W x RES_H target is complete AND still bound. Moving it would change the
+// pixels; gating it does not. All nine `shot.hml` scenes are byte-identical
+// across this change (numbers in the task report).
+export fn frame_set_capture(p_on: i32) {
+    g_capture = 0;
+    if (p_on != 0) { g_capture = 1; }
+}
+
+export fn frame_capture(): i32 { let out: i32 = g_capture; return out; }
+
 export fn frame_camera_x(): f64 { let out: f64 = g_camx; return out; }
 export fn frame_camera_y(): f64 { let out: f64 = g_camy; return out; }
 export fn frame_camera_z(): f64 { let out: f64 = g_camz; return out; }
@@ -530,13 +579,49 @@ export fn frame_camera_z(): f64 { let out: f64 = g_camz; return out; }
 // >>> WHAT THIS SECTION CANNOT DO, STATED PLAINLY.
 // It cannot throw TERRAIN into relief and it cannot catch WALL faces, because
 // both are baked chunk meshes on the `emit_set_lighting(0)` path and neither
-// `terrain_render.hml` nor `emit.hml` is this task's file to change.  Turning
-// lighting on for them is not a fix: `emit_mesh_buf` re-shades from ONE normal
-// per chunk (terrain passes (0,1,0)), which is CLAUDE.md §9 rule 4 "flat-lit
-// terrain", and it re-multiplies an already-baked colour by a full light term,
-// which double-darkens every vertex.  The real fix is an engine change — a
-// point-light term added to emit.hml's BAKED branch, after fog, reading the
-// four hoisted `g_env_l*` slots `env_bind` already fills.  Reported upward.
+// `terrain_render.hml` nor `emit.hml` is this task's file to change.  The real
+// fix is an engine change — a point-light term added to emit.hml's BAKED
+// branch, after fog, reading the four hoisted `g_env_l*` slots `env_bind`
+// already fills.  Reported upward.
+//
+// >>> CORRECTION, 2026-07-30, MEASURED.  The paragraph above used to continue
+// >>> "turning lighting on for them is not a fix", for two reasons.  One is
+// >>> right and one is exactly backwards, and the difference decides whether
+// >>> the inverted night model is buildable, so it is worth being precise.
+//
+//   * RIGHT: `emit_mesh_buf` re-shades from ONE normal per mesh (terrain passes
+//     (0,1,0)), so the lit path's cosine factor is per-chunk.  Per-vertex
+//     normals do exist, in `m.nrm`; the kernel simply is not given them.  For a
+//     ground pool a fixed +Y is acceptable; for walls it is not.
+//   * BACKWARDS: "it re-multiplies an already-baked colour by a full light term,
+//     which double-darkens every vertex."  That second multiply is not a bug to
+//     avoid — **it is the only per-frame, per-vertex, positional handle on
+//     baked terrain that this engine has**, and a controlled version of it is
+//     precisely the inverted night model: bind a SECOND env for the terrain
+//     pass whose ambient is the night floor and whose sun/bounce/rim are zero,
+//     leave the committed lights in place, and terrain becomes
+//     `bake * min(1, floor + sum(lights)) * fog_tint` — dark unlit, back at its
+//     baked value inside a pool, with the modelling still coming entirely from
+//     the bake's real per-vertex normals because the veil env contributes no
+//     directional term at all.  So CLAUDE.md §9 rule 4 is NOT violated.
+//
+// That was built, swept and looked at.  It works and it is still not shippable,
+// for reasons that are outside this file:
+//     cost   `emit_mesh_buf`'s lit branch CALLS `env_vertex_rgba` per vertex
+//            (413 ns/vertex, shade.hml §7).  Min-of-7 `__clock`, loadavg 1.0-1.6:
+//            muzzle_fog 22:00 emit.terrain 1.393 -> 1.972 ms; budget_worst
+//            22:00 frame-minus-sky 11.673 -> 12.923 ms of a 16.67 ms budget.
+//            A fused term in the baked branch is ~0.2 ms for the same work.
+//     props  the veil reaches terrain and built chunks only.  `mesh.hml` has no
+//            lit path and `entity_render.hml`'s per-instance `plr` starts at
+//            1.0, so trees, NPCs and blobs keep their baked value while the
+//            ground darkens.  LOOKED AT: daytime-bright canopies over a veiled
+//            field, worse than the frame it replaces.
+//     gains  the point term is `colour * (1 - d/r)^2 * max(0.25, N.L)`, which on
+//            flat ground at 5 m is 0.06 * colour.  Every light in the project is
+//            authored around 2.4; denting a 0.45 floor at that range wants ~7.5.
+// Full write-up, the swept ceiling (+20.9 against a +25 target) and the engine
+// items E1..E4: `src/art/tod.hml`, "THE INVERTED NIGHT MODEL".
 //
 // ---------------------------------------------------------------------------
 // THE FRAME PROTOCOL
@@ -2021,16 +2106,25 @@ export fn frame_render(): i32 {
 // into frame_batch_hud() — stage 24 of §4, hard-capped at 250 triangles.
 //
 // The authoritative image is the RES_W x RES_H target, read back while it is
-// still bound. Stages 26-27 still run, so the present path is exercised even
-// when the caller only wants the pixels.
+// still bound — ON THE FRAMES THE CALLER ASKED FOR, see `frame_set_capture`.
+// Stages 26-27 still run either way, so the present path is exercised whether
+// or not the caller wanted the pixels.
+//
+// Returns 0 on a frame that captured nothing, and `read_pixels_rect`'s status
+// otherwise — so a non-zero return still means "the capture you asked for
+// failed", exactly as it did when the call was unconditional.
 export fn frame_present(): i32 {
     // -- 25  HUD flush, insertion order --------------------------------------
     stat_begin(STAT_T_FLUSH_HUD);
     batch_flush(g_win, g_bhud);
     stat_end(STAT_T_FLUSH_HUD);
 
-    let rc: i32 = read_pixels_rect(g_win, 0, 0, g_RES_W, g_RES_H,
-                                   FMT_ARGB8888, g_fb, g_RES_W * 4);
+    // -- 25b  the OPT-IN readback -------------------------------------------
+    let rc: i32 = 0;
+    if (g_capture == 1 && g_fb != null) {
+        rc = read_pixels_rect(g_win, 0, 0, g_RES_W, g_RES_H,
+                              FMT_ARGB8888, g_fb, g_RES_W * 4);
+    }
 
     // -- 26  target_end + integer upscale present with the shake offset ------
     stat_begin(STAT_T_PRESENT);

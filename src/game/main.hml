@@ -115,6 +115,7 @@ import { stat_get, stat_ms, stat_set, stat_begin, stat_end,
 import { frame_init, frame_render, frame_present, frame_begin,
          frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
          frame_set_camera, frame_set_clear, frame_set_options,
+         frame_set_capture,
          frame_set_hud_solid_uv, frame_set_vignette_colour,
          frame_set_flash_colour, frame_env, frame_mvp, frame_batch_hud,
          world_clear, world_chunk_add, world_prop_add, world_fx_add,
@@ -1887,7 +1888,7 @@ fn read_input(p_dt: f64) {
         g_vm_mode = g_vm_mode + 1;
         if (g_vm_mode > 2) { g_vm_mode = 0; }
     }
-    if (input_pressed(inp, SC_P)) { screenshot("key"); }
+    if (input_pressed(inp, SC_P)) { shot_request("key"); }
 }
 
 fn b01(p_b: bool): i32 {
@@ -1982,10 +1983,39 @@ fn framebuffer_to_rgb(): buffer {
     return r;
 }
 
-fn screenshot(p_tag: string) {
+// ---------------------------------------------------------------------------
+// A SCREENSHOT IS TWO HALVES, BECAUSE THE READBACK IS OPT-IN AND OFF BY DEFAULT.
+// ---------------------------------------------------------------------------
+// `read_pixels_rect` used to run inside every `frame_present()`, which meant THE
+// GAME paid it 60 times a second for pixels nothing in this file read unless P
+// was pressed. Measured (BUDGET_ACTUAL.md §T.10): 0.205 ms/frame of real saving
+// on the accelerated renderer — 0.4 ms end-to-end on `--demo 15`, and the worst
+// frame of that demo fell 17.0 -> 15.3 ms — and ZERO on the software one, where
+// the 2.47 ms simply moves into `target_present`. It is now `frame_set_capture`
+// (world_render.hml stage 25b) and the game arms it for exactly one frame:
+//
+//     shot_request(tag)   before frame_once()  -> arm
+//     shot_flush()        after  frame_once()  -> write the PNG, disarm
+//
+// Both halves run in the same loop iteration, so the PNG is the frame the key
+// was pressed on. The old code called the writer straight out of `read_input`,
+// which runs BEFORE the frame, so it actually wrote the previous frame's pixels.
+let g_shot_pending: i32 = 0;
+let g_shot_tag: string = "";
+
+fn shot_request(p_tag: string) {
     if (g_shot_dir.length == 0) { return; }
+    g_shot_pending = 1;
+    g_shot_tag = p_tag;
+    frame_set_capture(1);
+}
+
+fn shot_flush() {
+    if (g_shot_pending == 0) { return; }
+    g_shot_pending = 0;
+    frame_set_capture(0);
     let img: buffer = framebuffer_to_rgb();
-    let path: string = `${g_shot_dir}/ns_${g_shot_seq}_${p_tag}.png`;
+    let path: string = `${g_shot_dir}/ns_${g_shot_seq}_${g_shot_tag}.png`;
     write_png(path, img, g_RES_W, g_RES_H);
     print(`nightshade: wrote ${path}  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  hud ${g_hud_tris}  vm ${g_vm_tris}  dc ${stat_get(STAT_DRAW_CALLS)}  beat ${server_beat_name(server_beat(g_sv))}  pos ${i32(client_px(g_cl))},${i32(client_pz(g_cl))}  d ${i32(client_lantern_dist(g_cl))}  hp ${client_hp(g_cl)} ammo ${client_ammo(g_cl)}/${client_reserve(g_cl)} rl ${f1(client_reloading(g_cl))} alive ${client_alive(g_cl)} ctl ${client_has_control(g_cl)} fog ${i32(g_fog_far)} h ${f1(tod_clock_hours(g_day_t))} camy ${f1(g_camy)} gy ${f1(g_ground_y)} p ${i32(g_pitch_deg)}`);
     g_shot_seq++;
@@ -2087,10 +2117,22 @@ fn run_loop() {
         if (vm_take_clack(g_vm) == 1) { }
         audio_drain();
 
+        // The `--shots` timer arms the readback BEFORE the frame and the PNG is
+        // written after it, so the image and its stats line describe the same
+        // frame they always did.
+        if (g_shot_dir.length > 0 && t >= g_next_shot) {
+            shot_request(`t${i32(t)}`);
+            g_next_shot = g_next_shot + g_shot_every;
+        }
+
         // -- 5..28  the frame ----------------------------------------------
         let cpu0: f64 = __clock();
         frame_once(dt, t);
         let cpu_ms: f64 = (__clock() - cpu0) * 1000.0;
+        // Outside the bracket: the PNG encode is not frame cost. The readback
+        // itself is inside, because on a capture frame it really is part of that
+        // frame — and RULE T's min-of-7 discards the one slow batch.
+        shot_flush();
         cpu_acc = cpu_acc + cpu_ms;
         cpu_batch = cpu_batch + cpu_ms;
         cpu_bn++;
@@ -2115,10 +2157,6 @@ fn run_loop() {
         if (g_vm_tris > vm_peak) { vm_peak = g_vm_tris; }
 
         if (t > hud_at + 0.25) { hud_strings(); hud_at = t; }
-        if (g_shot_dir.length > 0 && t >= g_next_shot) {
-            screenshot(`t${i32(t)}`);
-            g_next_shot = g_next_shot + g_shot_every;
-        }
 
         // The 60 fps pace. vsync does it on a real display; this keeps the
         // dummy driver from spinning a core and keeps the pace honest when
