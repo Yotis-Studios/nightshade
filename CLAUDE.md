@@ -297,9 +297,16 @@ draw-call batching (**2000 draw calls cost 0.3 ms more than 1** — do not archi
 
 ## 5. SDL RULES
 
-- **The runtime is SDL 2.0.18. The headers and `pkg-config` say 2.0.20 and are lying.**
-  Never bind a symbol added after 2.0.18. Check the `\version` line in the header doc-comment and
-  smoke-test that the symbol resolves. `SDL_RenderGeometry` is exactly at the boundary.
+- **The runtime is SDL 2.0.20, and so are the headers.** `SDL_GetVersion()` returns `2.0.20` at
+  runtime; `pkg-config` agrees. An earlier version of this bullet claimed the runtime was 2.0.18 and
+  the headers were lying — that was wrong, and it was wrong for an instructive reason: the claim was
+  inferred from the **soname** `libSDL2-2.0.so.0.18.0`, whose ABI-version field is deliberately
+  offset from the release version. **Never infer a library's version from its filename; call its
+  version function.** See `docs/recon/HOST_FACTS.md` for the full retraction.
+  **We still cap ourselves at 2.0.18 symbols**, by choice rather than necessity — it costs nothing
+  (the newest symbols we bind, `SDL_RenderGeometry` and `SDL_RenderSetVSync`, are both 2.0.18) and it
+  keeps the build portable to the older runtimes players actually have. Check the `\version` line in
+  the header doc-comment and smoke-test that the symbol resolves.
 - Prefer API calls to `SDL_Event` byte offsets. Use `SDL_GetRelativeMouseState`, `SDL_GetMouseState`,
   `SDL_GetKeyboardState`. The offsets are verified but an API call cannot silently break.
 - `SDL_RenderCopyEx`'s `angle` is a C `double`. Pass `0.0`, never `0`. This is the easiest way to

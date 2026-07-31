@@ -362,9 +362,17 @@ Workaround: group each library's externs directly under its own `import`.
 
 ## Environment gotcha (not Hemlock's fault, but it will bite someone)
 
-SDL2 **headers are 2.0.20** while the **runtime `.so` is 2.0.18**, and
-`pkg-config --modversion sdl2` reports 2.0.20. A symbol can exist in the header
-and still fail to resolve at runtime. Do not bind any SDL API newer than 2.0.18.
+**RETRACTED.** This section used to say the headers were 2.0.20 while the
+runtime `.so` was 2.0.18, so a symbol could exist in the header and fail to
+resolve. **That was wrong.** `SDL_GetVersion()` returns **2.0.20** at runtime,
+matching the headers and `pkg-config`. The false claim came from reading the
+soname `libSDL2-2.0.so.0.18.0` — whose ABI-version field is deliberately offset
+from the release version — instead of calling the version function.
+**Never infer a library's version from its filename.**
+
+We still cap ourselves at 2.0.18 symbols by choice: it costs nothing (the
+newest we bind, `SDL_RenderGeometry` and `SDL_RenderSetVSync`, are both 2.0.18)
+and it keeps the build portable to older runtimes.
 
 ---
 

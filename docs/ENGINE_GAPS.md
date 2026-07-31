@@ -11,9 +11,11 @@ a specific colour. The engine exposes *parameters*; the game supplies *values*.
 1. **`hemlockc` is the only ground truth.** The interpreter emits different geometry and different
    pixels for the same scene (wobbleweed-api §11.2: 404 vs 425 triangles). Every acceptance
    criterion below is evaluated on a `hemlockc`-compiled binary. Interpreted runs are for tooling.
-2. **SDL runtime is 2.0.18**, headers are 2.0.20, and `pkg-config` lies. **Never bind a symbol added
-   after 2.0.18.** Check the `\version` line in the header doc-comment and smoke-test that the symbol
-   resolves. `SDL_RenderGeometry` (2.0.18) is exactly at the boundary.
+2. **SDL runtime and headers are both 2.0.20** — verified with `SDL_GetVersion()`, not inferred from
+   the soname (the earlier "runtime is 2.0.18, the headers lie" claim was retracted; see
+   `docs/recon/HOST_FACTS.md`). **We still never bind a symbol added after 2.0.18**, as a portability
+   choice rather than a necessity. Check the `\version` line in the header doc-comment and smoke-test
+   that the symbol resolves. `SDL_RenderGeometry` (2.0.18) is exactly at that self-imposed boundary.
 
 ---
 
@@ -495,7 +497,7 @@ not).
 | **`spawn`/`join` parallel emit** | ARCHITECTURE D10. `spawn()` deep-copies objects; 2500 tris fits single-threaded. The escape hatch if a measured breach cannot be solved by `FOG_FAR`. |
 | **`define` structs for hot data** | Measured at 223 ns for 7 fields — identical to a plain object. They are FFI layout descriptors, not value types. |
 | **`@inline`** | A literal no-op: it emits `always_inline` on a function gcc then refuses to inline, and you get a build warning. If you need it inlined, write it inline. |
-| **Any SDL symbol newer than 2.0.18** | The runtime is 2.0.18; the headers and `pkg-config` say 2.0.20 and are lying. A symbol can exist in the header and fail to resolve at runtime. |
+| **Any SDL symbol newer than 2.0.18** | A **portability** cap, not a hard limit. Runtime and headers are both 2.0.20 (`SDL_GetVersion()`); the old "runtime is 2.0.18 and the headers are lying" claim was retracted — it was inferred from the soname rather than measured. Capping at 2.0.18 costs nothing and keeps the build portable. |
 
 ---
 
