@@ -855,9 +855,41 @@ export let WS_IDLE_T     = 12;   // s since the last shot
 export let WS_RC_V       = 13;   // recoil_aim pitch offset, degrees (up = +)
 export let WS_RC_H       = 14;   // recoil_aim yaw offset, degrees (right = +)
 export let WS_SHOTS      = 15;   // lifetime shot counter, for events/telemetry
-export let WS_MAG0       = 16;   // .. WS_MAG0 + 7, rounds in each magazine
-export let WS_RES0       = 24;   // .. WS_RES0 + 7, rounds in each reserve
-export let WS_FIELDS     = 32;   // 16 + 8 magazines + 8 reserves
+// ---------------------------------------------------------------------------
+//  W7-3 — OWNERSHIP, AND THE EDGE THAT MAKES A GRANT STICK.
+// ---------------------------------------------------------------------------
+//  THREE COLUMNS, AND THEY GO IN THE HEADER BLOCK, NOT ON THE END.  The two
+//  ammunition blocks are eight wide, adjacent, and they END the slot; that
+//  invariant is asserted, by relation and not by literal, in
+//  `probe_village.hml` F-section (`WS_RES0 == WS_MAG0 + 8 &&
+//  WS_FIELDS == WS_RES0 + 8`).  Appending 32/33/34 would have made that
+//  assertion false in a file this task does not own, so the header grew from
+//  16 to 19 and BOTH ammunition blocks slid with it.  `WS_MAG0` 16 -> 19,
+//  `WS_RES0` 24 -> 27, `WS_FIELDS` 32 -> 35 — the same open cost W6-6 paid to
+//  go 28 -> 32, and for the same reason: everything outside this file already
+//  spells those three as imported constants.  Inside this file they were
+//  LITERALS (`st[o + 16 + w]`, `st[o + 24 + w]`, `s * 32`) and every one of
+//  them moved with the constant.  CLAUDE.md's rule 8, applied to the code
+//  instead of to a test.
+//
+//  WHY OWNERSHIP IS STATE AND NOT A CLIENT OPINION.  Before this, `sim.hml`
+//  honoured `command.weapon_sel` with NO check at all: a client could ask for
+//  the Emberlance on its first tick and be handed it.  That is the authority
+//  taking a client at its word about what it is holding, which
+//  `MULTIPLAYER.md` says the server must never do.  It is also what makes
+//  "carry it home" mean anything — a gun you were given is a BIT THAT WAS
+//  SET, it survives a save, and nothing but a grant can set it.
+export let WS_OWNED      = 16;   // bitmask, bit w set = you own weapon w
+export let WS_FORCE_W    = 17;   // last weapon the AUTHORITY put in the hand
+export let WS_FORCE_N    = 18;   // +1 on every force.  THIS is the edge.
+export let WS_MAG0       = 19;   // .. WS_MAG0 + 7, rounds in each magazine
+export let WS_RES0       = 27;   // .. WS_RES0 + 7, rounds in each reserve
+export let WS_FIELDS     = 35;   // 19 + 8 magazines + 8 reserves
+
+// 1 << w, as a table.  Eight entries because the gun table is eight rows, and
+// a lookup rather than a shift because `wpn_owned` is called on the swap path
+// of every tick of every player.
+let g_wpn_bit = [ 1, 2, 4, 8, 16, 32, 64, 128 ];
 
 // Allocate `p_slots` weapon states, all loaded and idle on WPN_KESTREL — the
 // sidearm you never lose (GDD §2.4). Allocation happens ONCE, at startup.
@@ -866,29 +898,44 @@ export fn wpn_state_new(p_slots: i32): array {
     if (n < 1) { n = 1; }
     let st = [];
     let i = 0;
-    while (i < n * 32) { st.push(0.0); i = i + 1; }
+    while (i < n * 35) { st.push(0.0); i = i + 1; }
     let s = 0;
     while (s < n) {
-        wpn_state_reset(st, s * 32, 4);
+        wpn_state_reset(st, s * 35, 4);
         s = s + 1;
     }
     return st;
 }
 
 // Reset one slot: full magazines, full reserves, no timers, weapon `p_w` in hand.
+//
+// >>> AND YOU OWN EXACTLY ONE GUN. <<<  The magazines and reserves stay full
+// for all eight — that is a table of what a round of each calibre WOULD be,
+// and `probe_village.hml` asserts it — but the OWNED mask is `1 << p_w` and
+// nothing else.  A full magazine you may not draw is not a weapon you have;
+// the bit is.  `server.hml` weighs only the gun in hand for the same reason.
+//
+// The reset also publishes a FORCE EDGE (`WS_FORCE_W` = the starting gun,
+// `WS_FORCE_N` = 1, never 0).  A client that has adopted three grants and
+// then sees a fresh state must be told to go back to the starting gun, and
+// a counter that reset to the same value the client already held would say
+// nothing.  Starting at 1 makes "reset" itself an edge.
 export fn wpn_state_reset(p_st: array, p_o: i32, p_w: i32) {
     let st: array = p_st;
     let o: i32 = p_o;
     let w: i32 = p_w;
     if (wpn_valid(w) == 0) { w = 4; }
     let i = 0;
-    while (i < 32) { st[o + i] = 0.0; i = i + 1; }
+    while (i < 35) { st[o + i] = 0.0; i = i + 1; }
     st[o + 0] = f64(w);          // WS_CUR
     st[o + 1] = -1.0;            // WS_PENDING
+    st[o + 16] = f64(g_wpn_bit[w]);   // WS_OWNED — this gun, and no other
+    st[o + 17] = f64(w);              // WS_FORCE_W
+    st[o + 18] = 1.0;                 // WS_FORCE_N
     let k = 0;
     while (k < 8) {
-        st[o + 16 + k] = f64(g_wpn_mag[k]);
-        st[o + 24 + k] = f64(g_wpn_reserve[k]);
+        st[o + 19 + k] = f64(g_wpn_mag[k]);
+        st[o + 27 + k] = f64(g_wpn_reserve[k]);
         k = k + 1;
     }
     return;
@@ -901,13 +948,160 @@ export fn wpn_cur(p_st: array, p_o: i32): i32 {
 
 export fn wpn_ammo(p_st: array, p_o: i32, p_w: i32): i32 {
     if (wpn_valid(p_w) == 0) { let z: i32 = 0; return z; }
-    let out: i32 = i32(p_st[p_o + 16 + p_w]);
+    let out: i32 = i32(p_st[p_o + 19 + p_w]);
     return out;
 }
 
 export fn wpn_reserve_ammo(p_st: array, p_o: i32, p_w: i32): i32 {
     if (wpn_valid(p_w) == 0) { let z: i32 = 0; return z; }
-    let out: i32 = i32(p_st[p_o + 24 + p_w]);
+    let out: i32 = i32(p_st[p_o + 27 + p_w]);
+    return out;
+}
+
+// ===========================================================================
+//  OWNERSHIP — the authority's answer to "may I hold this?"
+// ===========================================================================
+//  Eight bits in one column.  It is a bitmask and not eight columns because
+//  the whole point of this array is that a 64-player server's weapon state
+//  goes on a wire as a run of doubles: one number per player is one number
+//  per player, and 8 * 64 booleans would not have been.
+//
+//  `wpn_swap_begin` is the ONLY gate that has to consult it, because it is
+//  the only door into `WS_CUR`.  Everything else — fire, reload, ammo — reads
+//  the weapon that is already in the hand, and a weapon that is in the hand
+//  got there through that door.
+
+// 0/1: does this slot own weapon `p_w`?
+export fn wpn_owned(p_st: array, p_o: i32, p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    let m: i32 = i32(p_st[p_o + 16]);
+    let out: i32 = 0;
+    if ((m & g_wpn_bit[w]) != 0) { out = 1; }
+    return out;
+}
+
+// The whole mask, for the HUD and for the snapshot.
+export fn wpn_own_mask(p_st: array, p_o: i32): i32 {
+    let out: i32 = i32(p_st[p_o + 16]);
+    return out;
+}
+
+// How many guns you have. `probe_trade` counts this before and after a trade.
+export fn wpn_own_count(p_st: array, p_o: i32): i32 {
+    let m: i32 = i32(p_st[p_o + 16]);
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < 8) {
+        if ((m & g_wpn_bit[i]) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// Set the bit. Returns 1 the FIRST time only, so a caller can tell a new gun
+// apart from one you already had, without reading the mask itself.
+//
+// (The wording above deliberately keeps the word `from` away from an opening
+// double quote on the same line. `probe_sim_core.hml`'s F3 import wall finds
+// import statements by that pair of tokens, so a PROSE sentence shaped like an
+// import trips it. Two files in `src/sim/` already trip it; do not make it
+// three, and do not "fix" it in a file this task does not own.)
+export fn wpn_own_grant(p_st: array, p_o: i32, p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let m: i32 = i32(st[o + 16]);
+    let b: i32 = g_wpn_bit[w];
+    if ((m & b) != 0) { let had: i32 = 0; return had; }
+    st[o + 16] = f64(m | b);
+    let out: i32 = 1;
+    return out;
+}
+
+// Overwrite the whole mask. For `save.hml`'s loader and for tests; nothing in
+// the tick path calls it.
+export fn wpn_own_set_mask(p_st: array, p_o: i32, p_mask: i32) {
+    p_st[p_o + 16] = f64(p_mask & 255);
+    return;
+}
+
+// The next OWNED weapon after `p_from`, walking `p_dir` (+1 / -1) and
+// wrapping. Returns `p_from` when you own nothing else — a one-gun player
+// pressing "next" must not be handed a gun they do not have.
+export fn wpn_own_next(p_st: array, p_o: i32, p_from: i32, p_dir: i32): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let dir: i32 = 1;
+    if (p_dir < 0) { dir = -1; }
+    let cur: i32 = p_from;
+    if (cur < 0) { cur = 0; }
+    if (cur > 7) { cur = 7; }
+    let i: i32 = 0;
+    while (i < 8) {
+        cur = cur + dir;
+        if (cur > 7) { cur = 0; }
+        if (cur < 0) { cur = 7; }
+        if (wpn_owned(st, o, cur) == 1) {
+            let hit: i32 = cur;
+            return hit;
+        }
+        i = i + 1;
+    }
+    let out: i32 = p_from;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  THE FORCE EDGE — how a grant survives the next tick.
+// ---------------------------------------------------------------------------
+//  `sim.hml` swaps the held gun to `command.weapon_sel` EVERY TICK.  So a
+//  server that puts a rifle in your hands and says nothing gets exactly what
+//  W7 shipped: the swap completes, the client's unchanged `weapon_sel` asks
+//  for the old gun on the very next tick, and 89 ticks after the panel said
+//  TAKEN the rifle is gone.  Every instrument agreed you had been paid.
+//
+//  The fix is an EDGE, not a level.  `WS_FORCE_W` is what the authority put in
+//  your hands and `WS_FORCE_N` counts how many times it has done so; the
+//  client adopts when the COUNTER MOVES and at no other time.  Level-
+//  triggering on "the held weapon differs from what I asked for" fights itself
+//  under latency — every in-flight command disagrees with the snapshot by
+//  construction — and this codebase is built for an authoritative server
+//  (`docs/design/MULTIPLAYER.md`).  A counter is monotone, it survives packet
+//  loss (you adopt late, once, instead of never or forever), and it costs two
+//  doubles.
+export fn wpn_force_w(p_st: array, p_o: i32): i32 {
+    let out: i32 = i32(p_st[p_o + 17]);
+    return out;
+}
+
+export fn wpn_force_n(p_st: array, p_o: i32): i32 {
+    let out: i32 = i32(p_st[p_o + 18]);
+    return out;
+}
+
+// THE AUTHORITY HANDS YOU A GUN.  Grants ownership, starts the swap, and
+// publishes the edge — in that order, because the swap it starts is refused by
+// `wpn_swap_begin` unless the bit is already set. Returns 1 if the weapon is
+// real, 0 if the id is not a gun. It NEVER refuses: `server.hml` has already
+// charged the player by the time it gets here, and a shop that debits a purse
+// and then declines to deliver is the bug this whole file is about.
+export fn wpn_grant(p_st: array, p_o: i32, p_w: i32): i32 {
+    let st: array = p_st;
+    let o: i32 = p_o;
+    let w: i32 = p_w;
+    if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    wpn_own_grant(st, o, w);
+    st[o + 17] = f64(w);
+    st[o + 18] = st[o + 18] + 1.0;
+    // Mid-swap this returns 0 and that is harmless: the client adopts the edge
+    // and asks for `w` on the next tick, and `sim.hml`'s per-tick swap does
+    // the rest. The direct call is what makes the local, zero-latency case
+    // instant rather than one tick late.
+    wpn_swap_begin(st, o, w);
+    let out: i32 = 1;
     return out;
 }
 
@@ -948,7 +1142,7 @@ export fn wpn_can_fire(p_st: array, p_o: i32): i32 {
         // is not. GDD §2.4, "0.55 s/shell (interruptible)".
         if (g_wpn_shell[w] == 0) { let z: i32 = 0; return z; }
     }
-    if (st[o + 16 + w] < 1.0) { let z: i32 = 0; return z; }
+    if (st[o + 19 + w] < 1.0) { let z: i32 = 0; return z; }
     let out: i32 = 1;
     return out;
 }
@@ -979,7 +1173,7 @@ export fn wpn_fire(p_st: array, p_o: i32, p_rng: array, p_out: array): i32 {
     // 5.217 ticks, and a weapon that SET its cooldown would fire every 6th tick
     // and lose 13 % of its rate of fire to the timestep. `wpn_step` bounds the
     // debt at one tick, so the carry can never bank a double shot.
-    st[o + 16 + w] = st[o + 16 + w] - 1.0;
+    st[o + 19 + w] = st[o + 19 + w] - 1.0;
     st[o + 2] = st[o + 2] + 60.0 / g_wpn_rpm[w];
     st[o + 15] = st[o + 15] + 1.0;
     st[o + 12] = 0.0;
@@ -1010,9 +1204,9 @@ export fn wpn_reload_begin(p_st: array, p_o: i32): i32 {
     if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
     if (st[o + 3] > 0.0) { let z: i32 = 0; return z; }     // already reloading
     if (st[o + 5] > 0.0) { let z: i32 = 0; return z; }     // mid-swap
-    let mag: f64 = st[o + 16 + w];
+    let mag: f64 = st[o + 19 + w];
     if (mag >= f64(g_wpn_mag[w])) { let z: i32 = 0; return z; }
-    if (st[o + 24 + w] < 1.0) { let z: i32 = 0; return z; }  // no reserve
+    if (st[o + 27 + w] < 1.0) { let z: i32 = 0; return z; }  // no reserve
     if (g_wpn_shell[w] != 0) {
         st[o + 3] = g_wpn_reload[w];
         st[o + 4] = 3.0;
@@ -1033,11 +1227,25 @@ export fn wpn_reload_begin(p_st: array, p_o: i32): i32 {
 
 // Request a weapon swap. Returns 1 if one started. Stow-then-raise: the swap-out
 // of the old weapon, then the swap-in of the new one.
+//
+// >>> AND IT REFUSES A GUN YOU DO NOT OWN. <<<  This is the authority check.
+// `sim.hml` feeds this function `command.weapon_sel` — a number that came off
+// the wire — on every tick of every player, and before W7-3 it accepted any id
+// `wpn_valid` accepted.  A client that sent `weapon_sel = 5` on its first tick
+// was holding the Emberlance on its second.  That is not a difficulty problem,
+// it is the server believing a client about its own inventory, and
+// `MULTIPLAYER.md` §2 forbids exactly that.
+//
+// The check lives HERE and not at the call site on purpose: this is the only
+// function in the codebase that writes `WS_PENDING`, so it is the only door
+// into `WS_CUR`, so a future third caller inherits the check instead of
+// forgetting it.
 export fn wpn_swap_begin(p_st: array, p_o: i32, p_w: i32): i32 {
     let st: array = p_st;
     let o: i32 = p_o;
     let w: i32 = p_w;
     if (wpn_valid(w) == 0) { let z: i32 = 0; return z; }
+    if (wpn_owned(st, o, w) == 0) { let z: i32 = 0; return z; }
     let cur: i32 = i32(st[o + 0]);
     if (w == cur) { let z: i32 = 0; return z; }
     if (st[o + 5] > 0.0) { let z: i32 = 0; return z; }
@@ -1149,12 +1357,12 @@ export fn wpn_step(p_st: array, p_o: i32, p_ads: i32, p_sprint: i32) {
             let kind: f64 = st[o + 4];
             if (kind == 3.0) {
                 // one shell in, then keep going if there is room and reserve
-                let mag: f64 = st[o + 16 + w];
-                let res: f64 = st[o + 24 + w];
+                let mag: f64 = st[o + 19 + w];
+                let res: f64 = st[o + 27 + w];
                 if (res >= 1.0) {
                     if (mag < f64(g_wpn_mag[w])) {
-                        st[o + 16 + w] = mag + 1.0;
-                        st[o + 24 + w] = res - 1.0;
+                        st[o + 19 + w] = mag + 1.0;
+                        st[o + 27 + w] = res - 1.0;
                         mag = mag + 1.0;
                         res = res - 1.0;
                     }
@@ -1170,12 +1378,12 @@ export fn wpn_step(p_st: array, p_o: i32, p_ads: i32, p_sprint: i32) {
                 st[o + 11] = 0.0;
             } else {
                 let cap: i32 = g_wpn_mag[w];
-                let mag: f64 = st[o + 16 + w];
-                let res: f64 = st[o + 24 + w];
+                let mag: f64 = st[o + 19 + w];
+                let res: f64 = st[o + 27 + w];
                 let want: f64 = f64(cap) - mag;
                 if (want > res) { want = res; }
-                st[o + 16 + w] = mag + want;
-                st[o + 24 + w] = res - want;
+                st[o + 19 + w] = mag + want;
+                st[o + 27 + w] = res - want;
                 st[o + 3] = 0.0;
                 st[o + 4] = 0.0;
                 st[o + 11] = 0.0;         // pattern resets with the magazine
@@ -1246,6 +1454,11 @@ export fn wpn_step(p_st: array, p_o: i32, p_ads: i32, p_sprint: i32) {
 //  magazines and reload timers and recoil patterns, and a second gun table
 //  would have duplicated every one of those columns AND `wpn_step`.  So the
 //  gun table widened from six to eight and the cost was paid in the open:
+//  (W7-3 widened it again, 32 -> 35, for the ownership mask and the force
+//  edge.  Same argument, same cost, paid the same way — see the WS_OWNED
+//  block.  It is the second time, so the property below is worth restating:
+//  the reason two waves could widen this table at all is that nobody outside
+//  this file ever wrote 28, or 32, or 16, as a literal.)
 //  `WS_RES0` 22 -> 24, `WS_FIELDS` 28 -> 32, `g_WPN_COUNT` 6 -> 8.  Every one
 //  of those is an imported constant at its four call sites, so `save.hml` and
 //  `server.hml` and `sim.hml` needed NO edit — which is exactly the property
@@ -1321,6 +1534,12 @@ export let MEL_COUNT = 3;
 // swapped to the Blackthorn on the next tick.  Not a naming clash — a live
 // collision in the tick loop.  `config.hml`'s spell base and
 // `command.hml`'s `CMD_MAX_WEAPON` moved with it; see the task report.
+//
+// W7-3 NARROWED THAT DOOR AGAIN, AND THE ID SPACES STILL HAVE TO BE DISJOINT.
+// `wpn_swap_begin` now demands OWNERSHIP as well as validity, so the failure
+// mode above would today need id 6 to be both a club and a gun you own.  That
+// is a smaller target and it is still a target: keep the spaces disjoint.  The
+// ownership check is defence in depth, not a replacement for the id plan.
 export let MH_MELEE_BASE = 8;
 
 // There is none.  See the header.  Kept as a named zero so that a future
@@ -1539,7 +1758,7 @@ export fn wpn_state_hash(p_st: array, p_o: i32): i32 {
     let o: i32 = p_o;
     let h: u64 = 14695981039346656037;
     let i = 0;
-    while (i < 32) {
+    while (i < 35) {
         h = hash_f(h, st[o + i]);
         i = i + 1;
     }
@@ -1554,7 +1773,7 @@ export fn wpn_hash_all(p_st: array, p_slots: i32): i32 {
     let h: u64 = 14695981039346656037;
     let s = 0;
     while (s < n) {
-        h = (h ^ u64(wpn_state_hash(st, s * 32))) * 1099511628211;
+        h = (h ^ u64(wpn_state_hash(st, s * 35))) * 1099511628211;
         s = s + 1;
     }
     let out: i32 = i32((h >> 33) & 2147483647);

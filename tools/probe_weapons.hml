@@ -27,7 +27,8 @@ import { g_TICK_DT, g_FOG_FAR_CAP, g_RECOIL_SETTLE_S, g_WPN_COUNT,
 import { rng_new, rng_seed, RNG_SPREAD } from "../src/sim/rng.hml";
 
 import { WPN_NONE, WPN_SPARROW, WPN_TINKER, WPN_BELLOWS, WPN_LONGSHADOW,
-         WPN_KESTREL, WPN_EMBERLANCE, WPN_COUNT,
+         WPN_KESTREL, WPN_EMBERLANCE, WPN_BLACKTHORN, WPN_NETTLE, WPN_COUNT,
+         MH_MELEE_BASE,
          wpn_valid, wpn_dmg_at, wpn_dmg_hit, wpn_dmg_shot,
          wpn_rpm, wpn_shot_interval, wpn_mag, wpn_reserve, wpn_pellets,
          wpn_reload_time, wpn_is_shell_reload, wpn_ads_time, wpn_sprint_to_fire,
@@ -41,7 +42,10 @@ import { WPN_NONE, WPN_SPARROW, WPN_TINKER, WPN_BELLOWS, WPN_LONGSHADOW,
          wpn_recoil_aim_pitch, wpn_recoil_aim_yaw, wpn_cur_spread,
          wpn_can_fire, wpn_fire, wpn_reload_begin, wpn_swap_begin, wpn_step,
          wpn_state_hash, wpn_hash_all,
+         wpn_owned, wpn_own_mask, wpn_own_count, wpn_own_grant,
+         wpn_own_set_mask, wpn_own_next, wpn_grant, wpn_force_w, wpn_force_n,
          WS_CUR, WS_FIRE_T, WS_RELOAD_T, WS_ADS, WS_BLOOM, WS_SHOT_IDX, WS_MAG0, WS_RES0,
+         WS_OWNED, WS_FORCE_W, WS_FORCE_N,
          WS_RC_V, WS_RC_H, WS_SHOTS, WS_FIELDS,
          g_BLOOM_RECOVER_S, g_PATTERN_RESET_S
        } from "../src/sim/weapons.hml";
@@ -49,7 +53,7 @@ import { WPN_NONE, WPN_SPARROW, WPN_TINKER, WPN_BELLOWS, WPN_LONGSHADOW,
 // ---------------------------------------------------------------------------
 // EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green.
 // ---------------------------------------------------------------------------
-let g_expect_asserts = 379;   // W6-6: +1, A10b (the two village guns are valid ids)
+let g_expect_asserts = 422;   // W7-3: +43, section K (ownership + the grant edge)
 
 let g_asserts = 0;
 let g_pass = 0;
@@ -662,7 +666,16 @@ fn run_script(p_seed: i32, p_weapon: i32, p_swap: i32): i32 {
         if (tick >= 700) { if (tick < 720) { sprint = 1; } }
 
         if (tick == 300) { wpn_reload_begin(st, 0); }
-        if (tick == 600) { if (p_swap == 1) { wpn_swap_begin(st, 0, WPN_KESTREL); } }
+        // W7-3: the swap at 600 needs OWNERSHIP now — `wpn_state_reset` grants
+        // exactly one gun. `wpn_own_grant` and not `wpn_grant` on purpose: the
+        // determinism fingerprint must not pick up a force-counter increment
+        // that has nothing to do with the trajectory this section measures.
+        if (tick == 600) {
+            if (p_swap == 1) {
+                wpn_own_grant(st, 0, WPN_KESTREL);
+                wpn_swap_begin(st, 0, WPN_KESTREL);
+            }
+        }
 
         if (fire == 1) {
             rng_seed(rng, p_seed, RNG_SPREAD, tick, 1);
@@ -749,7 +762,23 @@ fn section_determinism() {
     //     the ADS column of the golden script differs after every shot it takes.
     // Neither is a drift: both are named changes with a named cause, and the
     // script itself (the command sequence) is byte-for-byte what it was.
-    ck(golden == 1682042934, "F5 golden script hash",
+    //
+    // >>> AND IT MOVED AGAIN IN W7-3, 1682042934 -> 1831627245. <<<  Same two
+    // kinds of reason, both named:
+    // (3) the slot grew 32 -> 35 fields (`WS_OWNED`, `WS_FORCE_W`,
+    //     `WS_FORCE_N`), and `wpn_state_hash` folds EVERY field of the slot,
+    //     so three more numbers enter the fingerprint on every one of the 900
+    //     ticks. `WS_FORCE_W` is 0 here (the script resets onto the Sparrow)
+    //     and `WS_FORCE_N` is 1, so this alone is a constant shift.
+    // (4) `WS_OWNED` genuinely CHANGES mid-script: the swap at tick 600 needs
+    //     the Kestrel bit, so the mask goes 1 -> 17 at that tick and the
+    //     rolling hash diverges from there whether or not (3) existed.
+    // The command sequence is again byte-for-byte what it was, and the
+    // trajectory it produces — ammo, recoil, bloom, ADS, the swap — is
+    // identical. What changed is that the fingerprint now covers ownership,
+    // which is the point: a save that dropped the owned mask would show up
+    // here rather than as a rifle that quietly stopped being yours.
+    ck(golden == 1831627245, "F5 golden script hash",
        `got ${golden}; if this changed on purpose, update the literal AND say why`);
 }
 
@@ -964,6 +993,7 @@ fn section_state() {
     // G14 swap: stow then raise, blocked from firing throughout, and the new
     // weapon is in hand at the end.
     wpn_state_reset(st, 0, WPN_SPARROW);
+    wpn_own_grant(st, 0, WPN_KESTREL);      // W7-3: you have to own it first
     ck(wpn_swap_begin(st, 0, WPN_KESTREL) == 1, "G14 a swap starts", "");
     let swt = 0;
     let blocked: i32 = 1;
@@ -1030,6 +1060,187 @@ fn section_state() {
     ck(i32(st[WS_SHOTS]) == fired, "G17 WS_SHOTS counts exactly the shots fired",
        `${i32(st[WS_SHOTS])} vs ${fired}`);
     ck(fired == 6, "G17 a Kestrel cylinder is six rounds and then it is dry", `${fired}`);
+}
+
+// ===========================================================================
+// K.  OWNERSHIP — W7-3.  THE AUTHORITY CHECK, AND THE GRANT EDGE.
+// ---------------------------------------------------------------------------
+//  The bug this section is the regression test for: `sim.hml` fed
+//  `command.weapon_sel` straight to `wpn_swap_begin` on EVERY TICK, with no
+//  ownership check anywhere, and `server.hml`'s shop started a swap and set no
+//  state. So the panel said TAKEN, the purse was debited, and 89 ticks later
+//  the rifle was gone because the client's unchanged `weapon_sel` asked for
+//  the old gun and got it.
+//
+//  Every assertion below is one clause of the fix, and the LAST one is the one
+//  that would have caught the shipped bug: hold the grant, then run the tick
+//  loop the way `sim.hml` runs it — re-requesting the OLD weapon every tick,
+//  because that is exactly what a client that has not adopted does — and the
+//  rifle must still be there 600 ticks later.
+// ===========================================================================
+fn section_ownership() {
+    print("K. ownership (W7-3)");
+    let st = wpn_state_new(1);
+
+    // ---- K1. A fresh state owns EXACTLY the gun in its hands -------------
+    wpn_state_reset(st, 0, WPN_KESTREL);
+    ck(wpn_owned(st, 0, WPN_KESTREL) == 1, "K1 you own the gun you spawned with", "");
+    ck(wpn_own_count(st, 0) == 1, "K1 and exactly one gun", `${wpn_own_count(st, 0)}`);
+    ck(wpn_own_mask(st, 0) == 16, "K1 the mask is 1 << WPN_KESTREL", `${wpn_own_mask(st, 0)}`);
+    let unowned: i32 = 0;
+    let ki: i32 = 0;
+    while (ki < WPN_COUNT) {
+        if (ki != WPN_KESTREL) { if (wpn_owned(st, 0, ki) == 0) { unowned = unowned + 1; } }
+        ki = ki + 1;
+    }
+    ck(unowned == WPN_COUNT - 1, "K1 and you own none of the other seven", `${unowned}`);
+    // Full magazines are NOT ownership, and this is the distinction the whole
+    // wave turns on. `wpn_state_reset` loads every column in the table because
+    // that is what a round of each calibre would be; the OWNED BIT is what
+    // says you may draw it.
+    ck(wpn_ammo(st, 0, WPN_BLACKTHORN) == wpn_mag(WPN_BLACKTHORN),
+       "K1 an unowned gun still has a full magazine in the table...", "");
+    ck(wpn_owned(st, 0, WPN_BLACKTHORN) == 0,
+       "K1 ...and you still do not own it — a magazine is not a gun", "");
+
+    // ---- K2. AN UNOWNED WEAPON CANNOT BE SELECTED ------------------------
+    // This is the acceptance criterion, stated against the only door there is.
+    ck(wpn_swap_begin(st, 0, WPN_BLACKTHORN) == 0,
+       ">>> K2 ASKING FOR A GUN YOU DO NOT OWN IS REFUSED <<<", "");
+    ck(wpn_cur(st, 0) == WPN_KESTREL, "K2 and the refusal changes nothing", "");
+    let kt: i32 = 0;
+    while (kt < 200) { wpn_swap_begin(st, 0, WPN_BLACKTHORN); wpn_step(st, 0, 0, 0); kt = kt + 1; }
+    ck(wpn_cur(st, 0) == WPN_KESTREL,
+       "K2 and asking 200 ticks running does not wear the check down", `${wpn_cur(st, 0)}`);
+    // Every gun in the table, not just the one the story is about.
+    let refused: i32 = 0;
+    let kj: i32 = 0;
+    while (kj < WPN_COUNT) {
+        if (kj != WPN_KESTREL) { if (wpn_swap_begin(st, 0, kj) == 0) { refused = refused + 1; } }
+        kj = kj + 1;
+    }
+    ck(refused == WPN_COUNT - 1, "K2 all seven unowned guns are refused", `${refused}`);
+
+    // ---- K3. A GRANT SETS THE BIT, AND THE BIT IS WHAT UNLOCKS THE SWAP --
+    ck(wpn_own_grant(st, 0, WPN_BLACKTHORN) == 1, "K3 the first grant returns 1", "");
+    ck(wpn_own_grant(st, 0, WPN_BLACKTHORN) == 0, "K3 the second returns 0 — it is a SET, not a counter", "");
+    ck(wpn_own_count(st, 0) == 2, "K3 and now you own two guns", `${wpn_own_count(st, 0)}`);
+    ck(wpn_swap_begin(st, 0, WPN_BLACKTHORN) == 1, "K3 and NOW the swap is allowed", "");
+
+    // ---- K4. THE FORCE EDGE ----------------------------------------------
+    wpn_state_reset(st, 0, WPN_KESTREL);
+    let n0: i32 = wpn_force_n(st, 0);
+    ck(wpn_force_w(st, 0) == WPN_KESTREL, "K4 a reset publishes the starting gun", `${wpn_force_w(st, 0)}`);
+    ck(n0 == 1, "K4 with a counter of 1, never 0 — a reset must READ as an edge", `${n0}`);
+    ck(wpn_grant(st, 0, WPN_BLACKTHORN) == 1, "K4 a grant of a real gun succeeds", "");
+    ck(wpn_force_w(st, 0) == WPN_BLACKTHORN, "K4 the forced id is the gun granted", "");
+    ck(wpn_force_n(st, 0) == n0 + 1, "K4 and the counter moved by exactly one", `${wpn_force_n(st, 0)}`);
+    ck(wpn_own_grant(st, 0, WPN_NETTLE) == 1, "K4 own_grant alone...", "");
+    ck(wpn_force_n(st, 0) == n0 + 1, "K4 ...does NOT move the counter — a grant is not a force", "");
+    ck(wpn_grant(st, 0, MH_MELEE_BASE) == 0, "K4 granting a club is refused, and moves nothing", "");
+    ck(wpn_force_n(st, 0) == n0 + 1, "K4 the counter is still where it was", `${wpn_force_n(st, 0)}`);
+
+    // ---- K5. CYCLING ONLY EVER LANDS ON SOMETHING YOU OWN -----------------
+    // st now owns { KESTREL, BLACKTHORN, NETTLE }.
+    ck(wpn_own_count(st, 0) == 3, "K5 three guns for the cycle test", `${wpn_own_count(st, 0)}`);
+    let seen_ok: i32 = 1;
+    let cur: i32 = WPN_KESTREL;
+    let steps: i32 = 0;
+    while (steps < 12) {
+        cur = wpn_own_next(st, 0, cur, 1);
+        if (wpn_owned(st, 0, cur) == 0) { seen_ok = 0; }
+        steps = steps + 1;
+    }
+    ck(seen_ok == 1, "K5 twelve steps forward never land on an unowned gun", "");
+    ck(cur == WPN_KESTREL, "K5 and twelve steps over three guns is a whole number of laps", `${cur}`);
+    let back: i32 = wpn_own_next(st, 0, WPN_KESTREL, -1);
+    ck(wpn_own_next(st, 0, back, 1) == WPN_KESTREL, "K5 previous then next is where you started", "");
+    // The one-gun player. "Next" must not hand you something you do not have.
+    let solo = wpn_state_new(1);
+    wpn_state_reset(solo, 0, WPN_KESTREL);
+    ck(wpn_own_next(solo, 0, WPN_KESTREL, 1) == WPN_KESTREL,
+       "K5 with one gun, next is the gun you are holding", "");
+    ck(wpn_own_next(solo, 0, WPN_KESTREL, -1) == WPN_KESTREL, "K5 and so is previous", "");
+
+    // ---- K6. THE MASK SURVIVES A ROUND TRIP -------------------------------
+    // `save.hml` copies WS_FIELDS columns verbatim, so ownership is saved for
+    // free — but only if it is really ONE column of the array and not a side
+    // table. This asserts the column.
+    wpn_own_set_mask(st, 0, 1 + 64);
+    ck(wpn_own_mask(st, 0) == 65, "K6 the mask is one writable column", `${wpn_own_mask(st, 0)}`);
+    ck(wpn_owned(st, 0, WPN_SPARROW) == 1 && wpn_owned(st, 0, WPN_BLACKTHORN) == 1,
+       "K6 and it reads back as the two guns it names", "");
+    ck(wpn_owned(st, 0, WPN_KESTREL) == 0, "K6 ...and only those two", "");
+    let hbefore: i32 = wpn_state_hash(st, 0);
+    wpn_own_set_mask(st, 0, 255);
+    ck(wpn_state_hash(st, 0) != hbefore,
+       "K6 ownership is INSIDE the state fingerprint — a save that dropped it would show", "");
+
+    // ---- K7. THE SHIPPED BUG, AS A TEST ----------------------------------
+    // >>> THIS IS THE ONE. <<<  Reproduce `sim.hml`'s tick loop exactly:
+    // `if (want != wpn_cur) wpn_swap_begin(want)` every single tick, with
+    // `want` STUCK on the old gun — which is precisely what a client that has
+    // not adopted the force edge sends. Before W7-3 the Blackthorn survived 89
+    // ticks of this. It must now survive forever, because the Kestrel is what
+    // you no longer... no: because the KESTREL IS STILL OWNED, so the revert
+    // is legal, and the honest thing this test proves is the OTHER half —
+    // that a client which DID adopt keeps the gun. Both cases, below.
+    let bug = wpn_state_new(1);
+    wpn_state_reset(bug, 0, WPN_KESTREL);
+    wpn_grant(bug, 0, WPN_BLACKTHORN);
+    // (a) the STALE client: never adopts, keeps asking for the Kestrel.
+    let stale_want: i32 = WPN_KESTREL;
+    let bt: i32 = 0;
+    while (bt < 600) {
+        if (stale_want != wpn_cur(bug, 0)) { wpn_swap_begin(bug, 0, stale_want); }
+        wpn_step(bug, 0, 0, 0);
+        bt = bt + 1;
+    }
+    ck(wpn_cur(bug, 0) == WPN_KESTREL,
+       "K7a a client that never adopts DOES revert — the sim is not lying to it", `${wpn_cur(bug, 0)}`);
+    ck(wpn_owned(bug, 0, WPN_BLACKTHORN) == 1,
+       ">>> K7a BUT THE RIFLE IS STILL YOURS — ownership outlives the hand <<<", "");
+    // (b) the ADOPTING client: takes `WS_FORCE_W` as its new request, which is
+    // the three lines `client.hml` gained. The rifle stays.
+    let good = wpn_state_new(1);
+    wpn_state_reset(good, 0, WPN_KESTREL);
+    let want2: i32 = WPN_KESTREL;
+    let seen_n: i32 = -1;
+    wpn_grant(good, 0, WPN_BLACKTHORN);
+    let gt: i32 = 0;
+    let held60: i32 = WPN_NONE;
+    while (gt < 600) {
+        if (wpn_force_n(good, 0) != seen_n) {          // THE EDGE
+            seen_n = wpn_force_n(good, 0);
+            want2 = wpn_force_w(good, 0);
+        }
+        if (want2 != wpn_cur(good, 0)) { wpn_swap_begin(good, 0, want2); }
+        wpn_step(good, 0, 0, 0);
+        gt = gt + 1;
+        if (gt == 60) { held60 = wpn_cur(good, 0); }
+    }
+    ck(held60 == WPN_BLACKTHORN,
+       ">>> K7b 60 TICKS AFTER THE GRANT, THE RIFLE IS IN YOUR HANDS <<<", `${held60}`);
+    ck(wpn_cur(good, 0) == WPN_BLACKTHORN,
+       ">>> K7b AND 600 TICKS AFTER THE GRANT, IT IS STILL THERE <<<", `${wpn_cur(good, 0)}`);
+    ck(wpn_force_n(good, 0) == 2, "K7b on exactly one force — the edge fired once", `${wpn_force_n(good, 0)}`);
+
+    // ---- K8. AND YOU CAN FIRE IT ------------------------------------------
+    // A gun you are holding but cannot shoot is the same failure wearing a
+    // different hat. Damage comes from the table so the number is the
+    // Blackthorn's and not the Kestrel's.
+    let shots_before: i32 = i32(good[WS_SHOTS]);
+    let rngk = rng_new();
+    let outk = [0.0, 0.0];
+    rng_seed(rngk, 4242, RNG_SPREAD, 1, 1);
+    ck(wpn_can_fire(good, 0) == 1, "K8 the granted rifle is ready to fire", "");
+    ck(wpn_fire(good, 0, rngk, outk) == 1, ">>> K8 AND IT FIRES <<<", "");
+    ck(i32(good[WS_SHOTS]) == shots_before + 1, "K8 the shot counter moved", "");
+    let dmg10: f64 = wpn_dmg_at(WPN_BLACKTHORN, 10.0);
+    ck(dmg10 == 95.0, "K8 and it does the BLACKTHORN's 95 damage at 10 m, not the Kestrel's 45",
+       `${dmg10}`);
+    ck(wpn_ammo(good, 0, WPN_BLACKTHORN) == wpn_mag(WPN_BLACKTHORN) - 1,
+       "K8 out of the Blackthorn's own magazine", `${wpn_ammo(good, 0, WPN_BLACKTHORN)}`);
 }
 
 // ===========================================================================
@@ -1210,6 +1421,7 @@ fn main() {
     section_recoil();
     section_determinism();
     section_state();
+    section_ownership();
     section_wall();
     section_perf();
     print_ttk();

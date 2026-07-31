@@ -1,0 +1,1217 @@
+// =============================================================================
+//  probe_firstminute.hml — IS THE FIRST MINUTE UNWINNABLE, OR IS THE BOT BLIND?
+// =============================================================================
+//
+//      hemlockc -O1 tools/probe_firstminute.hml -o /tmp/probe_firstminute
+//      /tmp/probe_firstminute            # compiled — the shipping path
+//      nm /tmp/probe_firstminute | grep -c SDL_    # MUST be 0
+//
+//  Exits 1 on any failed assertion and asserts its own assertion COUNT, so a
+//  section that silently stops running is a failure rather than a green run.
+//
+// -----------------------------------------------------------------------------
+//  WHY THIS FILE EXISTS — AND WHY IT IS NOT ANOTHER COPY OF probe_waveone
+// -----------------------------------------------------------------------------
+//  A gate played the first minute and reported it UNWINNABLE ON 0 OF 8 SEEDS:
+//  "every seed stops at beat WAVE with path 0; the lantern lights on 8/8".
+//  Commit 112b038 had recorded "winnable on 10 of 12 seeds" and that was true
+//  when written.  So something between the two broke it — except that nothing
+//  did, and this probe is the instrument that proves it.
+//
+//  MEASURED, and the whole diagnosis is in these four lines:
+//
+//      tools/probe_waveone.hml   @ 112b038   10 of 12 cleared
+//      tools/probe_waveone.hml   @ f4644f7   12 of 12 cleared
+//      src/game/main.hml --demo  @ 112b038    0 of  8 cleared   (beat WAVE)
+//      src/game/main.hml --demo  @ f4644f7    0 of  8 cleared   (beat WAVE)
+//
+//  `probe_waveone.hml` is BYTE-IDENTICAL between those two commits, and so are
+//  `src/sim/director.hml`, `src/sim/ai.hml`, `src/sim/combat.hml`,
+//  `src/sim/projectiles.hml`, `src/sim/movement.hml` and every `g_DIR_*` /
+//  `g_ENEMY_*` balance constant in `src/core/config.hml`.  The wave did not get
+//  harder.  The player did not get weaker.  The 10-of-12 claim and the 0-of-8
+//  claim were made with TWO DIFFERENT BOTS, and only one of them can shoot.
+//
+//  So this is not a balance probe.  It is an ABLATION OF THE HARNESS, and it
+//  answers the one question that decides whether anything in the game may be
+//  touched at all:  how much of the "unwinnable" first minute is the demo bot?
+//
+// -----------------------------------------------------------------------------
+//  THE FOUR ARMS.  Each adds ONE clause to `main.hml`'s `demo_drive`.
+// -----------------------------------------------------------------------------
+//  ARM 0  SHIPPED      a faithful port of `demo_drive`, clause for clause:
+//                      rate-limited yaw at the NEAREST body, PITCH NAILED TO
+//                      WHATEVER THE VIEW HAPPENS TO HOLD, hipfire inside 26 m,
+//                      backpedal inside 5 m, and `client_press_reload` only
+//                      once the HUD magazine reads zero.
+//  ARM 1  +PITCH       the same bot, given the second axis.  `combat.hml`
+//                      traces a 3-D ray from the eye; a bot that only ever
+//                      steers yaw is firing along a fixed horizontal plane at
+//                      bodies whose centre of mass is 0.45-0.90 m ABOVE THEIR
+//                      FEET on ground that undulates +/-1.5 m over 32 m.
+//  ARM 2  +ADS         ...and holding iron sights.  `weapons.hml` gives the
+//                      Kestrel a 3.6 deg hip cone that BLOOMS to 6.5 and a
+//                      0.20 deg aimed cone.  At 20 m that is a 0.63 m scatter
+//                      radius against a 0.35 m Wisp.
+//  ARM 3  +RELOAD      ...and topping up on the gap with the button HELD,
+//                      instead of pressing `client_press_reload` on an empty
+//                      HUD.  Two separate defects: the empty reload is 2.1 s
+//                      with a Husk on top of you, and `client_ammo` is
+//                      `min(authority, prediction)` and LATCHES LOW (see
+//                      probe_waveone §E.1), so "the HUD says zero" is not the
+//                      same statement as "the gun is empty".
+//
+//  ARM 3 is the fix.  It is three clauses and it lives entirely in the driver.
+//
+// -----------------------------------------------------------------------------
+//  WHAT THIS BOT IS NOT ALLOWED TO DO
+// -----------------------------------------------------------------------------
+//  Every arm reads ONLY what the screen and the HUD show: entity positions from
+//  the render snapshot, its own hp / ammo / reserve, the lantern.  No enemy hit
+//  points, no director state, no world.  ARM 3's reload rule reads `client_ammo`
+//  — the LYING HUD — on purpose: a fix that needs the authority's private shot
+//  counter is not a fix a player could have performed.  The authority refuses a
+//  reload the gun does not need, so believing a HUD that reads LOW costs a
+//  request and nothing else.
+//
+//  It also does not fire the Flare.  `demo_drive` throws one every 2 s once the
+//  lantern grants it; that is IDENTICAL IN ALL FOUR ARMS in the shipping game,
+//  so leaving it out changes no comparison here and keeps the ablation to the
+//  three clauses under test.  REPORTED, not smuggled.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos, atan2, floor } from "@stdlib/math";
+
+import { g_TICK_HZ, g_DIR_ALIVE_CAP, g_ENEMY_KIND_COUNT, g_LANTERN_R_T1
+       } from "../src/core/config.hml";
+import { clampf } from "../src/core/mathx.hml";
+
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha } from "../src/sim/sim.hml";
+import { ai_height_of, ai_speed_of, ai_damage_of } from "../src/sim/ai.hml";
+import { wpn_mag, wpn_max_range, WPN_KESTREL } from "../src/sim/weapons.hml";
+import { BTN_FIRE, BTN_USE, BTN_ADS, BTN_SPRINT, BTN_RELOAD } from "../src/sim/command.hml";
+
+import { transport_loopback } from "../src/net/transport.hml";
+
+// ARM 6 — THE SHIPPING DRIVER, imported rather than re-implemented. This single
+// import is the structural fix for the bug this probe diagnosed: the number
+// below is now a statement about the code `main.hml --demo` runs.
+import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+
+import { server_new, server_tick, server_snapshot, server_local, server_t0,
+         server_spawn_yaw, server_lantern_x, server_lantern_z,
+         server_beat, server_beat_name, server_session, server_path_lit,
+         server_supplied, SV_SUPPLY_S,
+         SV_PSLOT, SV_MODEL_LANTERN, SV_MODEL_PICKUP, SV_START_RESERVE,
+         SV_PATH_N, SV_T_PATH_LAG,
+         SV_BEAT_LIT, SV_BEAT_WAVE, SV_BEAT_CLEAR, SV_BEAT_PATH
+       } from "../src/game/server.hml";
+
+import { client_new, client_set_angles, client_set_move, client_set_button,
+         client_press_fire, client_press_reload, client_send_command,
+         client_apply, client_frame, client_build_render,
+         client_px, client_pz, client_hp, client_ammo, client_reserve,
+         client_dead, client_lantern_lit, client_ent_count, client_ent_id,
+         client_ent_x, client_ent_y, client_ent_z, client_ent_model,
+         client_ads, client_alive, client_cam_y, client_cam_yaw,
+         client_cam_pitch, client_look_axis, client_shots, client_reloading
+       } from "../src/game/client.hml";
+
+// ---------------------------------------------------------------------------
+// CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_PF_SEEDS: i32   = 12;      // the same 12 first minutes probe_waveone runs
+let g_PF_SEED0: i32   = 1337;
+let g_PF_STRIDE: i32  = 7919;
+let g_PF_FRAMES: i32  = 5400;    // 90 s at 60 fps — 34 s of slack past GDD 8's 0:56
+let g_PF_DT_MS: f64   = 16.667;
+let g_PF_EXPECT: i32  = 19;   // counted from the run, then pinned
+
+// *** THE BAR.  112b038's own commit message, and this task's acceptance. ***
+let g_PF_BAR: i32     = 10;      // of g_PF_SEEDS
+
+// The three clauses, as bits. Arm N holds bits 0..N-1.
+let POL_PITCH: i32  = 1;
+let POL_ADS: i32    = 2;
+let POL_RELOAD: i32 = 4;
+let POL_LEASH: i32  = 8;
+// Not a bit: ARM 5 is a DIFFERENT DRIVER, not another clause on this one.
+let POL_REFERENCE: i32 = 1024;
+// Nor is ARM 6: it is `src/game/demobot.hml`, THE SHIPPING MODULE ITSELF,
+// called through its own exported entry point. Not a port of it — the thing.
+// ARM 5 and ARM 6 running the same policy from two different files is the
+// whole point: if they ever disagree, the port has drifted, which is the
+// original bug.
+let POL_SHIPPED: i32 = 2048;
+
+// ARM 3's two numbers, and each is a claim about what a player does.
+let PF_CALM_M: f64  = 12.0;   // "nothing is close" — the free reload window
+let PF_TOPUP: i32   = 3;      // top up at or below this many rounds
+// `demo_drive`'s own constants, unchanged in every arm.
+let PF_FIRE_M: f64  = 26.0;   // it opens fire inside this
+let PF_BACK_M: f64  = 5.0;    // it backpedals inside this
+let PF_ADS_M: f64   = 3.0;    // ARM 2 drops the sights inside this
+// ARM 4's one number. `sv_lantern_supply` pays one round every SV_SUPPLY_S
+// while the player stands inside `g_LANTERN_R_T1`; 16 m is well inside it and
+// leaves the whole backpedal envelope free.
+let PF_LEASH_M: f64 = 16.0;
+
+// ---------------------------------------------------------------------------
+// ASSERTIONS
+// ---------------------------------------------------------------------------
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+// Written by the copied reference player. probe_waveone ASSERTS on these (its
+// §E); this probe only carries them so the copy compiles unchanged, and
+// reports the one that bears on the ammo economy.
+let g_pw_hud: i32   = 0;
+let g_pw_mag: i32   = 0;
+let g_pw_gap: i32   = 0;
+let g_pw_regen: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn f1(p_x: f64): string { let out: string = sv(floor(p_x * 10.0) / 10.0); return out; }
+
+fn mmss(p_ticks: i32): string {
+    if (p_ticks < 0) { let dash: string = " --  "; return dash; }
+    let s: i32 = p_ticks / g_TICK_HZ;
+    let m: i32 = s / 60;
+    let r: i32 = s - m * 60;
+    let pad: string = "";
+    if (r < 10) { pad = "0"; }
+    let out: string = sv(m) + ":" + pad + sv(r);
+    return out;
+}
+
+fn pad3(p_v: i32): string {
+    let s: string = sv(p_v);
+    while (s.length < 3) { s = " " + s; }
+    let out: string = s;
+    return out;
+}
+
+fn wrap_pi(p_a: f64): f64 {
+    let a: f64 = p_a;
+    while (a > 3.141592653589793) { a = a - 6.283185307179586; }
+    while (a < -3.141592653589793) { a = a + 6.283185307179586; }
+    let out: f64 = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE SESSION — `main.hml`'s loop with the window, renderer and clock removed.
+// Identical to probe_game.hml/probe_waveone.hml §HARNESS on purpose: a probe
+// that drives a different loop from the game tests a loop nobody ships.
+// ---------------------------------------------------------------------------
+fn session_new(p_seed: i32): object {
+    let net: object = transport_loopback();
+    let sv2: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    let s: object = {
+        net: net, sv: sv2, cl: cl,
+        acc: sim_accum_new(),
+        tick: server_t0(sv2),
+        // --- the reference player's state (probe_waveone `session_new`) ----
+        target: 0,
+        mag: wpn_mag(WPN_KESTREL),
+        sh_prev: 0,
+        rel_prev: 0.0,
+        mag0: 0,
+        res0: 0,
+        dry_watch: 0,
+        dry_ticks: 0,
+        brk: 0,
+        // ARM 6's state lives inside the shipping module, which owns its own.
+        bot: demobot_new(cl, sv2)
+    };
+    client_set_angles(cl, server_spawn_yaw(sv2), 0.0);
+    server_tick(sv2, s.tick);
+    client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+    s.tick = s.tick + 1;
+    let out: object = s;
+    return out;
+}
+
+fn session_frame(p_s: object, p_frame_ms: f64): i32 {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let n: i32 = sim_accum_advance(s.acc, p_frame_ms);
+    let i: i32 = 0;
+    while (i < n) {
+        client_send_command(cl, s.tick);
+        server_tick(sv2, s.tick);
+        client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+        s.tick = s.tick + 1;
+        i++;
+    }
+    client_frame(cl, p_frame_ms * 0.001, s.tick);
+    client_build_render(cl, sim_accum_alpha(s.acc));
+    let out: i32 = n;
+    return out;
+}
+
+// Move in a WORLD direction. forward = (sin yaw, -cos yaw), right = (cos yaw,
+// sin yaw)  [view.hml], so the two axes are the projections onto that basis.
+fn bot_move_world(p_cl: object, p_yaw: f64, p_wx: f64, p_wz: f64) {
+    let yaw: f64 = p_yaw;
+    let wx: f64 = p_wx;
+    let wz: f64 = p_wz;
+    let m: f64 = sqrt(wx * wx + wz * wz);
+    if (m < 0.0001) { client_set_move(p_cl, 0.0, 0.0); return; }
+    let ux: f64 = wx / m;
+    let uz: f64 = wz / m;
+    let sy: f64 = sin(yaw);
+    let cy: f64 = cos(yaw);
+    let fwd: f64 = ux * sy + uz * (0.0 - cy);
+    let str: f64 = ux * cy + uz * sy;
+    client_set_move(p_cl, fwd, str);
+}
+
+let BOT_KEEP_M: f64    = 9.0;    // back off anything closer than this
+let BOT_LEASH_M: f64   = 16.0;   // ...but never further than this from the post
+let BOT_CALM_M: f64    = 12.0;   // "nothing is close" — the free reload window
+let BOT_TOPUP: i32     = 3;      // reload at or below this many rounds
+let BOT_HIP_M: f64     = 0.0;    // MEASURED: iron sights at every range wins
+let BOT_ENGAGE_M: f64  = 20.0;   // let it walk in; do not chip across the ring
+let BOT_BREAK_M: f64   = 4.5;    // inside this, stop shooting and BREAK CONTACT
+let BOT_CLEAR_M: f64   = 14.0;   // ...and re-engage once the nearest is past this
+
+
+// ===========================================================================
+//  THE REFERENCE PLAYER — ARM 5.
+// ---------------------------------------------------------------------------
+//  Lifted VERBATIM from `tools/probe_waveone.hml` (its `bot_frame` and the
+//  eight constants above it), because that is the instrument 112b038's
+//  "winnable on 10 of 12 seeds" was measured with, and an arm that is a
+//  REWRITE of it would be measuring a third bot rather than closing the loop.
+//  It is byte-identical between 112b038 and f4644f7, and so is every number it
+//  reads.  Its full rationale — targeting by seconds-of-damage-inbound, target
+//  persistence, the leash, iron sights at every range, break-contact on an
+//  empty magazine in swing range, and the reconstructed magazine that routes
+//  around client.hml's latching HUD — is in that file's header and is not
+//  repeated here.
+//
+//  It is here for exactly one purpose: to stand beside ARMS 0-4 on the SAME
+//  twelve seeds in the SAME process, so that "the wave is clearable" and "the
+//  demo driver cannot clear it" are one measurement instead of two reports.
+// ===========================================================================
+fn bot_ammo_sync(p_s: object) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let cap: i32 = wpn_mag(WPN_KESTREL);
+
+    // 1. a reload ENDING first — `sim.hml` stage (c) runs reload before fire
+    //    inside one tick, so a tick that both seats the magazine and fires must
+    //    be applied in that order or the shot is lost and the model runs high.
+    //    A reload STARTING remembers what it will have to work with; the end
+    //    applies `wpn_reload_begin`'s own rule — min(space, reserve).
+    let rt: f64 = client_reloading(cl);
+    if (rt > 0.0 && s.rel_prev <= 0.0) {
+        s.mag0 = s.mag;
+        s.res0 = client_reserve(cl);
+    }
+    if (rt <= 0.0 && s.rel_prev > 0.0) {
+        let need: i32 = cap - s.mag0;
+        let moved: i32 = s.res0;
+        if (moved > need) { moved = need; }
+        if (moved < 0) { moved = 0; }
+        s.mag = s.mag0 + moved;
+    }
+    s.rel_prev = rt;
+
+    // 2. every shot the AUTHORITY counted comes out of the magazine.
+    let sh: i32 = client_shots(cl);
+    let d: i32 = sh - s.sh_prev;
+    if (d > 0) {
+        s.mag = s.mag - d;
+        if (s.mag < 0) { s.mag = 0; }
+        s.dry_watch = 0;
+    }
+    s.sh_prev = sh;
+
+    // 3. the watchdog. `s.dry_watch` counts frames the trigger was held with a
+    //    target in range and nothing came out. `wpn_shot_interval` for the
+    //    Kestrel is 0.30 s; 30 frames is twice that, so a lull, a reload or an
+    //    ADS transition cannot trip it — only an empty chamber can.
+    if (s.dry_watch > 30) {
+        s.mag = 0;
+        s.dry_watch = 0;
+    }
+    if (s.mag > cap) { s.mag = cap; }
+}
+
+fn dl_out(p_px: f64, p_pz: f64, p_lx: f64, p_lz: f64): f64 {
+    let dx: f64 = p_px - p_lx;
+    let dz: f64 = p_pz - p_lz;
+    let out: f64 = sqrt(dx * dx + dz * dz);
+    return out;
+}
+
+fn bot_frame(p_s: object) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+
+    bot_ammo_sync(s);
+    if (s.mag <= 0 && client_reserve(cl) <= 0) { s.dry_ticks = s.dry_ticks + 1; }
+
+    if (client_dead(cl) == 1) {
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_FIRE, 0);
+        client_set_button(cl, BTN_RELOAD, 0);
+        client_set_button(cl, BTN_USE, 0);
+        return;
+    }
+
+    let px: f64 = client_px(cl);
+    let pz: f64 = client_pz(cl);
+    let lx: f64 = server_lantern_x(sv2);
+    let lz: f64 = server_lantern_z(sv2);
+
+    // ---- before the light: walk to the post and hold E --------------------
+    if (client_lantern_lit(cl) == 0) {
+        let bx: f64 = lx - px;
+        let bz: f64 = lz - pz;
+        let d: f64 = sqrt(bx * bx + bz * bz);
+        client_set_angles(cl, atan2(bx, 0.0 - bz), 0.0);
+        client_set_button(cl, BTN_FIRE, 0);
+        client_set_button(cl, BTN_RELOAD, 0);
+        if (d > 1.8) {
+            client_set_move(cl, 1.0, 0.0);
+            client_set_button(cl, BTN_USE, 0);
+        }
+        if (d <= 1.8) {
+            client_set_move(cl, 0.0, 0.0);
+            client_set_button(cl, BTN_USE, 1);
+        }
+        return;
+    }
+    client_set_button(cl, BTN_USE, 0);
+
+    // ---- pick a target: SECONDS OF DAMAGE INBOUND, not distance -----------
+    // Rule 1. Distance alone shoots the slow thing and lets the fast thing land
+    // on your face, but pure time-to-contact is not right either: it sends
+    // rounds at a 6-damage Wisp sprinting in from 25 m while an 18-damage Husk
+    // is four metres away. The score is therefore `(distance / speed) / damage`
+    // — how soon it lands, weighted by how much it costs when it does — and the
+    // tables it reads (`ai_speed_of`, `ai_damage_of`) are the same ones the
+    // enemies themselves run on.
+    //
+    // Bodies OUTSIDE the engagement range are ranked separately and only used
+    // for facing. Letting them win the priority would make the bot hold fire at
+    // a 25 m Wisp while a Husk closed to swipe range, which is what it did.
+    let best_s: f64 = 1.0e30;
+    let tx: f64 = 0.0;
+    let tz: f64 = 0.0;
+    let ty: f64 = 0.0;
+    let tdist: f64 = 0.0;
+    let have: i32 = 0;
+    let best_id: i32 = 0;
+
+    // TARGET PERSISTENCE. Re-scoring every frame makes the bot spray one round
+    // each at six different bodies and finish none of them: a Husk is two
+    // rounds and a Spitter is two, so switching between shots kills nothing.
+    // MEASURED without this line: 45 rounds fired, 8 kills — 5.6 rounds per
+    // kill against a pool whose mean is 1.55. The bot therefore holds its
+    // target until it dies or leaves the engagement range, which is the single
+    // most basic thing a competent player does with a six-round revolver.
+    let held: i32 = s.target;
+    let held_seen: i32 = 0;
+
+    let far_s: f64 = 1.0e30;
+    let fx2: f64 = 0.0;
+    let fz2: f64 = 0.0;
+    let fy2: f64 = 0.0;
+    let fdist: f64 = 0.0;
+    let have_far: i32 = 0;
+
+    let near_d: f64 = 1.0e30;
+    let near_x: f64 = 0.0;
+    let near_z: f64 = 0.0;
+    let repx: f64 = 0.0;
+    let repz: f64 = 0.0;
+    let crowd: i32 = 0;
+
+    let eye: f64 = client_cam_y(cl);
+    let n: i32 = client_ent_count(cl);
+    let i: i32 = 0;
+    while (i < n) {
+        let md: i32 = client_ent_model(cl, i);
+        let id: i32 = client_ent_id(cl, i);
+        if (md != SV_MODEL_LANTERN && md != SV_MODEL_PICKUP && id != SV_PSLOT) {
+            if (md >= 0 && md < g_ENEMY_KIND_COUNT) {
+                let ex: f64 = client_ent_x(cl, i) - px;
+                let ez: f64 = client_ent_z(cl, i) - pz;
+                let dd: f64 = sqrt(ex * ex + ez * ez);
+                let spd: f64 = ai_speed_of(md);
+                if (spd < 0.5) { spd = 0.5; }
+                let dmg: f64 = ai_damage_of(md);
+                if (dmg < 1.0) { dmg = 1.0; }
+                let sc: f64 = dd / (spd * dmg);
+                // Centre mass, not the feet: the snapshot y is the body's base
+                // and `combat.hml` traces a 3-D ray at eye height, so a bot
+                // that aims at y+0 shoots the dirt in front of a 1.8 m Husk.
+                // MEASURED before this line existed: 6 rounds into 3 Wisps and
+                // all 3 still standing.
+                let cy2: f64 = client_ent_y(cl, i) + ai_height_of(md) * 0.5 - eye;
+                if (dd <= BOT_ENGAGE_M) {
+                    if (id == held && held != 0) {
+                        held_seen = 1;
+                        sc = 0.0 - 1.0;          // the held target always wins
+                    }
+                    if (sc < best_s) {
+                        best_s = sc; tx = ex; tz = ez; ty = cy2; tdist = dd;
+                        have = 1; best_id = id;
+                    }
+                }
+                if (dd > BOT_ENGAGE_M) {
+                    if (sc < far_s) {
+                        far_s = sc; fx2 = ex; fz2 = ez; fy2 = cy2; fdist = dd; have_far = 1;
+                    }
+                }
+                if (dd < near_d) { near_d = dd; near_x = ex; near_z = ez; }
+                // Repulsion from EVERY body inside the keep-out radius, not
+                // just the nearest. Backing away from the nearest alone walks
+                // straight into the second one; a Husk pincer is how this bot
+                // died six times a minute. Weight rises as they close and
+                // scales with what the class hits for.
+                if (dd < BOT_KEEP_M && dd > 0.001) {
+                    crowd = crowd + 1;
+                    let wgt: f64 = (BOT_KEEP_M - dd) / BOT_KEEP_M * dmg / 18.0;
+                    repx = repx - ex / dd * wgt;
+                    repz = repz - ez / dd * wgt;
+                }
+            }
+        }
+        i++;
+    }
+    if (have == 0 && have_far == 1) {
+        tx = fx2; tz = fz2; ty = fy2; tdist = fdist;
+    }
+    s.target = best_id;
+    if (held_seen == 0 && held != 0) { s.target = best_id; }
+    let any: i32 = have + have_far;
+    let ammo: i32 = s.mag;
+    let res: i32 = client_reserve(cl);
+
+    // ---- BREAK CONTACT -----------------------------------------------------
+    // A Husk stops at 1.8 m and swings 18 damage every wind-up. Backpedalling
+    // at 4.4 m/s does not escape a 5.2 m/s charge and iron sights make it
+    // 2.9 m/s, so a bot that keeps shooting while something is on its face
+    // simply trades 100 HP for four rounds. SPRINT is 7.0 m/s and it outruns
+    // EVERY tier-1/2 class (Wisp 6.4 is the fastest thing in the pool) — but
+    // only inside a +/-40 deg forward cone, so breaking contact means TURNING
+    // AND RUNNING, which is exactly what it costs a real player.
+    //
+    // WHY THIS IS THE WHOLE SURVIVAL MODEL, AND NOT A PANIC BUTTON.
+    // `g_REGEN_DELAY_S` (4 s) and `g_REGEN_RATE` (25 HP/s) are in
+    // `core/config.hml` and NOTHING IN `src/` READS EITHER — health regen is
+    // designed and unimplemented (reported, not this task's files). So the 100
+    // HP the player wakes up with is the entire health budget of the first
+    // minute, and every point of it must be bought with footwork. Disengaging
+    // is not a fallback here; it is the only defensive mechanic that exists.
+    //
+    // THE TRIGGER IS AN INABILITY, NOT A FEELING. Three wider triggers were
+    // measured over the same 12 first minutes and all three are worse, because
+    // during a wave something is ALWAYS close and a wide trigger latches into a
+    // 90-second retreat:
+    //   "something is inside BOT_BREAK_M"        ->  0 of 12 cleared, 146 shots
+    //   "crowd >= 3 and hp <= 45"                ->  0 of 12 cleared,  15-57 shots
+    //   "empty gun in contact"  (SHIPPED)        ->  6 of 12 cleared, 971 shots
+    // So the mode is entered on exactly one thing the bot cannot answer — an
+    // empty magazine with a body inside swing range, because melee does not
+    // exist and footwork is then the only answer left in the game — and left as
+    // soon as the magazine is back, or the nearest body is past `BOT_CLEAR_M`.
+    // It cannot latch: sprinting away increases `near_d` and the reload that
+    // runs while it sprints ends the trigger on its own.
+    let brk: i32 = s.brk;
+    if (ammo <= 0 && near_d < BOT_BREAK_M) { brk = 1; }
+    if (brk == 1) {
+        if (ammo > 0) { brk = 0; }
+        if (near_d > BOT_CLEAR_M) { brk = 0; }
+    }
+    s.brk = brk;
+    let breaking: i32 = brk;
+    if (breaking == 1) {
+        let ax2: f64 = repx;
+        let az2: f64 = repz;
+        if (ax2 * ax2 + az2 * az2 < 0.000001) { ax2 = 0.0 - near_x; az2 = 0.0 - near_z; }
+        if (dl_out(px, pz, lx, lz) > BOT_LEASH_M) { ax2 = lx - px; az2 = lz - pz; }
+        let byaw: f64 = atan2(ax2, 0.0 - az2);
+        client_set_angles(cl, byaw, 0.0);
+        client_set_move(cl, 1.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 1);
+        client_set_button(cl, BTN_ADS, 0);
+        client_set_button(cl, BTN_FIRE, 0);
+        // Reload WHILE running. `wpn_step` never cancels a reload for sprinting
+        // (weapons.hml has no cancel at all), so the 2.4 s empty reload and the
+        // 2.4 s of footwork are the same 2.4 s. That is the whole trick to
+        // surviving a dry magazine without the melee the design intends.
+        let want_r: i32 = 0;
+        if (ammo < wpn_mag(WPN_KESTREL) && res > 0) { want_r = 1; }
+        client_set_button(cl, BTN_RELOAD, want_r);
+        return;
+    }
+    client_set_button(cl, BTN_SPRINT, 0);
+
+    // ---- aim: yaw AND pitch. `combat.hml` builds the axis from both. -------
+    let yaw: f64 = 0.0;
+    let pitch: f64 = 0.0;
+    if (any > 0) {
+        yaw = atan2(tx, 0.0 - tz);
+        pitch = atan2(ty, tdist);
+    }
+    if (any == 0) { yaw = atan2(lx - px, 0.0 - (lz - pz)); }
+    client_set_angles(cl, yaw, pitch);
+
+    // IRON SIGHTS, ALWAYS.  The Kestrel's cone is 3.6 deg hip (6.5 deg bloomed)
+    // and 0.20 deg aimed (`weapons.hml` g_wpn_spr_*). At 20 m that is a 0.63 m
+    // scatter radius against a 0.35 m Wisp, so hip fire at range is a coin
+    // flip. MEASURED over the same 12 first minutes, rounds per kill:
+    //
+    //      hip only            8.5      (67 rounds, 8 kills, typical seed)
+    //      hip <5 m, ADS out   4.8
+    //      ADS always          3.1      <- shipped
+    //
+    // ADS is by a wide margin the largest lever a competent player has on this
+    // weapon, and it is worth the walk-speed penalty (4.4 -> 2.9 m/s) at every
+    // range. The one place it is not is BREAK CONTACT above, which drops it.
+    let want_ads: i32 = 0;
+    if (any > 0 && tdist > BOT_HIP_M) { want_ads = 1; }
+    client_set_button(cl, BTN_ADS, want_ads);
+
+    // ---- footwork: kite, on a leash to the light ---------------------------
+    // Rule 2 (back off what is on top of you) and rule 3 (never leave the
+    // supply radius). The leash wins when they disagree, because leaving the
+    // light is how the ammo economy of the first minute ends.
+    let dl: f64 = sqrt((px - lx) * (px - lx) + (pz - lz) * (pz - lz));
+    let mvx: f64 = repx;
+    let mvz: f64 = repz;
+    let rm: f64 = sqrt(mvx * mvx + mvz * mvz);
+    if (rm > 0.0001) {
+        // Circle-strafe rather than pure backpedal: a perpendicular component
+        // keeps the post in reach instead of walking a straight line into the
+        // dark, and a body that is orbited has to keep re-steering.
+        let sx: f64 = 0.0 - mvz / rm;
+        let sz: f64 = mvx / rm;
+        mvx = mvx / rm + sx * 0.8;
+        mvz = mvz / rm + sz * 0.8;
+    }
+    if (dl > BOT_LEASH_M) {
+        mvx = mvx + (lx - px) * 2.0 / dl;    // the leash overrides
+        mvz = mvz + (lz - pz) * 2.0 / dl;
+    }
+    bot_move_world(cl, yaw, mvx, mvz);
+
+    // ---- trigger discipline ------------------------------------------------
+    // Rule 4: top up on the gap, not on empty. Rule 5: no rounds past the
+    // weapon's own max range, and none at nothing.
+    let rng: f64 = wpn_max_range(WPN_KESTREL);
+
+    // BTN_RELOAD is HELD, not pressed. `client_press_reload` is a PREDICTION
+    // helper — it sets `pred_reload_t`, which is the second half of the latch
+    // documented on `bot_ammo_sync` and which blocks `client_press_fire` for
+    // 2.4 s even when the server refuses the reload outright. The button bit
+    // itself reaches `sim.hml` stage (c) untouched, where `wpn_reload_begin`
+    // refuses a full magazine and an empty reserve on its own. Holding it is
+    // what a player's finger on R does; nothing here is a shortcut.
+    let want_reload: i32 = 0;
+    if (ammo <= 0 && res > 0) { want_reload = 1; }
+    if (ammo <= BOT_TOPUP && res > 0 && near_d > BOT_CALM_M) { want_reload = 1; }
+    client_set_button(cl, BTN_RELOAD, want_reload);
+
+    // Rule 5, sharpened by the damage curve. `weapons.hml` gives the Kestrel 45
+    // damage inside 14 m and 30 beyond 30 m, so a 90 HP Husk is TWO rounds up
+    // close and THREE at distance. With a 1.25 rounds/s resupply that third
+    // round is the whole margin, so the bot lets a body walk into BOT_ENGAGE_M
+    // instead of chipping at it across the ring. It also waits for the sights
+    // to settle rather than spraying through the ADS transition.
+    // The trigger is HELD, for the same reason the reload button is: BTN_FIRE
+    // is the input, `client_press_fire` is the local prediction of it. The
+    // server fires at `wpn_shot_interval` from the held bit whether or not the
+    // client predicted the shot, which is what a finger on the mouse does.
+    // `client_press_fire` is STILL CALLED, on purpose — it keeps the muzzle
+    // flash, the kick, the shake and the tracer on the same path the game
+    // ships, so this probe exercises the client rather than bypassing it.
+    let fire: i32 = 0;
+    if (have == 1 && ammo > 0 && tdist <= rng && want_reload == 0) {
+        fire = 1;
+        if (want_ads == 1 && client_ads(cl) < 0.9) { fire = 0; }
+    }
+    if (fire == 1) {
+        client_set_button(cl, BTN_FIRE, 1);
+        client_press_fire(cl);
+        s.dry_watch = s.dry_watch + 1;
+    }
+    if (fire == 0) {
+        client_set_button(cl, BTN_FIRE, 0);
+        s.dry_watch = 0;
+    }
+}
+
+
+// ===========================================================================
+//  THE DEMO BOT — `src/game/main.hml` `demo_drive`, ported clause for clause,
+//  with the three ablation bits.  Every line that is NOT guarded by a `pol`
+//  test is what the game ships today.
+// ===========================================================================
+fn demo_frame(p_s: object, p_pol: i32, p_dt: f64) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let pol: i32 = p_pol;
+    let dt: f64 = p_dt;
+
+    let px: f64 = client_px(cl);
+    let pz: f64 = client_pz(cl);
+    let bx: f64 = server_lantern_x(sv2) - px;
+    let bz: f64 = server_lantern_z(sv2) - pz;
+    let d: f64 = sqrt(bx * bx + bz * bz);
+    let want: f64 = atan2(bx, 0.0 - bz);
+    let dy: f64 = wrap_pi(want - client_cam_yaw(cl));
+    client_look_axis(cl, clampf(dy * 4.0, -3.0, 3.0) * dt, 0.0);
+
+    // ---- before the light: walk to the post and hold E --------------------
+    if (d > 2.0 && client_lantern_lit(cl) == 0) {
+        client_set_move(cl, 1.0, 0.0);
+        client_set_button(cl, BTN_USE, 0);
+        return;
+    }
+    if (client_lantern_lit(cl) == 0) {
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_USE, 1);
+        return;
+    }
+    client_set_button(cl, BTN_USE, 0);
+
+    // ---- the NEAREST body. Not the most dangerous one: `demo_drive` sorts on
+    //      distance and this port does not improve that, because "target
+    //      selection" is not one of the three clauses under test.
+    let best: f64 = 1.0e30;
+    let tx: f64 = 0.0;
+    let tz: f64 = 0.0;
+    let ty: f64 = 0.0;
+    let eye: f64 = client_cam_y(cl);
+    let n: i32 = client_ent_count(cl);
+    for (let i = 0; i < n; i++) {
+        let md: i32 = client_ent_model(cl, i);
+        if (md == SV_MODEL_LANTERN || md == SV_MODEL_PICKUP) { continue; }
+        if (client_ent_id(cl, i) == SV_PSLOT) { continue; }
+        let ex: f64 = client_ent_x(cl, i) - px;
+        let ez: f64 = client_ent_z(cl, i) - pz;
+        let dd: f64 = ex * ex + ez * ez;
+        if (dd < best) {
+            best = dd;
+            tx = ex;
+            tz = ez;
+            // >>> CLAUSE 1, AND IT IS THE ONE THAT MATTERS. <<<
+            // The snapshot y is the body's BASE. `combat.hml` traces from the
+            // EYE, so the aim point is base + half the class's height, minus
+            // the eye. `ai_height_of` is the same table the enemies run on.
+            let h: f64 = 0.9;
+            if (md >= 0 && md < g_ENEMY_KIND_COUNT) { h = ai_height_of(md); }
+            ty = client_ent_y(cl, i) + h * 0.5 - eye;
+        }
+    }
+
+    let close: f64 = 1.0e30;
+    let fire: i32 = 0;
+    if (best < 1.0e29) {
+        close = sqrt(best);
+        let wa: f64 = atan2(tx, 0.0 - tz);
+        let dd2: f64 = wrap_pi(wa - client_cam_yaw(cl));
+        // The pitch is driven with the SAME rate limit as the yaw, off the
+        // same render angles the player sees. Nothing here snaps.
+        let dp: f64 = 0.0;
+        if ((pol & POL_PITCH) != 0) {
+            let wp: f64 = atan2(ty, close);
+            dp = clampf(wrap_pi(wp - client_cam_pitch(cl)) * 6.0, -6.0, 6.0) * dt;
+        }
+        client_look_axis(cl, clampf(dd2 * 6.0, -6.0, 6.0) * dt, dp);
+        if (close < PF_BACK_M) { client_set_move(cl, -1.0, 0.4); }
+        else { client_set_move(cl, 0.0, 0.0); }
+        if (close < PF_FIRE_M) { fire = 1; }
+    } else {
+        client_set_move(cl, 0.0, 0.0);
+    }
+
+    // ---- CLAUSE 4: THE LEASH ----------------------------------------------
+    // `demo_drive` backpedals at 4.4 m/s whenever anything is inside 5 m and
+    // NEVER WALKS BACK. With 9-13 bodies alive that condition is almost always
+    // true, so the driver reverses out of the light and stays out — and
+    // `sv_lantern_supply` pays nothing outside `g_LANTERN_R_T1`. 18 carried
+    // rounds is the entire ammunition of a bot that leaves.
+    if ((pol & POL_LEASH) != 0) {
+        let dlx: f64 = server_lantern_x(sv2) - px;
+        let dlz: f64 = server_lantern_z(sv2) - pz;
+        let dl: f64 = sqrt(dlx * dlx + dlz * dlz);
+        if (dl > PF_LEASH_M) {
+            // Walk back to the post, facing whatever it is shooting. The move
+            // axes are in VIEW space, so project the world direction onto the
+            // basis view.hml uses: forward = (sin yaw, -cos yaw).
+            let yw: f64 = client_cam_yaw(cl);
+            let ux: f64 = dlx / dl;
+            let uz: f64 = dlz / dl;
+            let sy: f64 = sin(yw);
+            let cy: f64 = cos(yw);
+            client_set_move(cl, ux * sy + uz * (0.0 - cy), ux * cy + uz * sy);
+        }
+    }
+
+    // ---- CLAUSE 2: iron sights ---------------------------------------------
+    let want_ads: i32 = 0;
+    if ((pol & POL_ADS) != 0) {
+        if (best < 1.0e29 && close > PF_ADS_M) { want_ads = 1; }
+    }
+    client_set_button(cl, BTN_ADS, want_ads);
+    // Do not spray through the ADS transition — a round fired at 0.4 aimed
+    // still carries most of the hip cone.
+    if (want_ads == 1 && client_ads(cl) < 0.9) { fire = 0; }
+
+    // >>> `demo_drive` NEVER CLEARS BTN_FIRE ONCE IT HAS SET IT. <<<  It writes
+    // the bit inside `if (close < 26.0)` and there is no else, so the held
+    // trigger survives every frame in which nothing is in range. That is a
+    // faithful part of ARM 0 and it is corrected in no arm, because the server
+    // refuses a shot at nothing anyway and it changes no measurement here.
+    if (fire == 1) {
+        client_set_button(cl, BTN_FIRE, 1);
+        client_press_fire(cl);
+    }
+    if (fire == 0 && best >= 1.0e29) { client_set_button(cl, BTN_FIRE, 0); }
+
+    // ---- CLAUSE 3: the reload ----------------------------------------------
+    if ((pol & POL_RELOAD) == 0) {
+        // SHIPPED. One press, on an empty HUD, and `client_ammo` is
+        // min(authority, prediction) — it can only ever read LOW.
+        if (client_ammo(cl) <= 0) { client_press_reload(cl); }
+    } else {
+        // HELD, on the gap. `wpn_reload_begin` refuses a full magazine and an
+        // empty reserve on its own, so a HUD that lies LOW costs a refused
+        // request and nothing else — which is exactly why this fix does not
+        // need the authority's private shot counter to work.
+        let am: i32 = client_ammo(cl);
+        let want_r: i32 = 0;
+        if (client_reserve(cl) > 0) {
+            if (am <= 0) { want_r = 1; }
+            if (am <= PF_TOPUP && close > PF_CALM_M) { want_r = 1; }
+        }
+        client_set_button(cl, BTN_RELOAD, want_r);
+    }
+}
+
+// ===========================================================================
+//  ONE FIRST MINUTE
+// ===========================================================================
+let g_R_CLEAR: i32  = 0;
+let g_R_WAVE: i32   = 1;
+let g_R_LIT: i32    = 2;
+let g_R_PATH: i32   = 3;
+let g_R_PATHN: i32  = 4;
+let g_R_HP: i32     = 5;    // hp at the clear, or at the end if it never came
+let g_R_MAG: i32    = 6;    // magazine at that moment
+let g_R_RES: i32    = 7;    // reserve at that moment
+let g_R_ALIVE: i32  = 8;    // director-alive at that moment
+let g_R_PEAK: i32   = 9;
+let g_R_DEATHS: i32 = 10;
+let g_R_SHOTS: i32  = 11;   // the AUTHORITY's lifetime shot counter
+let g_R_BEAT: i32   = 12;   // the beat it ended on
+let g_R_SUP: i32    = 13;   // rounds the LANTERN paid out over the whole run
+let g_R_DLAN: i32   = 14;   // metres from the post at the end
+let g_R_OUT: i32    = 15;   // frames spent OUTSIDE the supply radius
+let g_R_FIELDS: i32 = 16;
+
+fn run_new(): array<i32> {
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < g_R_FIELDS) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+fn run_minute(p_seed: i32, p_pol: i32, p_out: array<i32>): i32 {
+    let out: array<i32> = p_out;
+    let i: i32 = 0;
+    while (i < g_R_FIELDS) { out[i] = 0; i++; }
+    out[g_R_CLEAR] = 0 - 1;
+    out[g_R_WAVE] = 0 - 1;
+    out[g_R_LIT] = 0 - 1;
+    out[g_R_PATH] = 0 - 1;
+
+    let s: object = session_new(p_seed);
+    let sv2: object = s.sv;
+    let cl: object = s.cl;
+    let dt: f64 = g_PF_DT_MS * 0.001;
+
+    let dead_prev: i32 = 0;
+    let f: i32 = 0;
+    while (f < g_PF_FRAMES) {
+        if (p_pol == POL_REFERENCE) { bot_frame(s); }
+        else if (p_pol == POL_SHIPPED) { demobot_frame(s.bot, client_px(cl), client_pz(cl)); }
+        else { demo_frame(s, p_pol, dt); }
+        session_frame(s, g_PF_DT_MS);
+
+        let dn: i32 = client_dead(cl);
+        if (dn == 1 && dead_prev == 0) { out[g_R_DEATHS] = out[g_R_DEATHS] + 1; }
+        dead_prev = dn;
+
+        // PEAK ALIVE DURING WAVE 1 ONLY — probe_waveone's own definition, and
+        // the only one that means anything. Measured over the whole 90 s it
+        // reports wave 2 and wave 3's crowd as if it were the on-ramp's.
+        let al: i32 = client_alive(cl);
+        if (out[g_R_CLEAR] < 0) {
+            if (al > out[g_R_PEAK]) { out[g_R_PEAK] = al; }
+        }
+
+        // THE AMMO ECONOMY, MEASURED. `sv_lantern_supply` is the only resupply
+        // in the game; standing outside its radius is the same as having no
+        // ammunition at all.
+        let qx: f64 = client_px(cl) - server_lantern_x(sv2);
+        let qz: f64 = client_pz(cl) - server_lantern_z(sv2);
+        let qd: f64 = sqrt(qx * qx + qz * qz);
+        if (qd > g_LANTERN_R_T1) { out[g_R_OUT] = out[g_R_OUT] + 1; }
+
+        let sess: i32 = server_session(sv2);
+        let b: i32 = server_beat(sv2);
+        if (b >= SV_BEAT_LIT && out[g_R_LIT] < 0) { out[g_R_LIT] = sess; }
+        if (b >= SV_BEAT_WAVE && out[g_R_WAVE] < 0) { out[g_R_WAVE] = sess; }
+        if (b >= SV_BEAT_CLEAR && out[g_R_CLEAR] < 0) {
+            out[g_R_CLEAR] = sess;
+            // The END STATE, sampled AT THE CLEAR — the number the gate asked
+            // for. Sampling it at frame 5400 instead would report the state
+            // after 34 s of wave 2, which is a different question.
+            out[g_R_HP] = client_hp(cl);
+            out[g_R_MAG] = client_ammo(cl);
+            out[g_R_RES] = client_reserve(cl);
+            out[g_R_ALIVE] = al;
+        }
+        if (b >= SV_BEAT_PATH && out[g_R_PATH] < 0) {
+            out[g_R_PATH] = sess;
+            out[g_R_PATHN] = server_path_lit(sv2);
+        }
+        f++;
+    }
+    out[g_R_SHOTS] = client_shots(cl);
+    out[g_R_BEAT] = server_beat(sv2);
+    out[g_R_SUP] = server_supplied(sv2);
+    let ex2: f64 = client_px(cl) - server_lantern_x(sv2);
+    let ez2: f64 = client_pz(cl) - server_lantern_z(sv2);
+    out[g_R_DLAN] = i32(sqrt(ex2 * ex2 + ez2 * ez2));
+    if (out[g_R_CLEAR] < 0) {
+        // Never cleared: report where it actually stopped.
+        out[g_R_HP] = client_hp(cl);
+        out[g_R_MAG] = client_ammo(cl);
+        out[g_R_RES] = client_reserve(cl);
+        out[g_R_ALIVE] = client_alive(cl);
+    }
+    let ok: i32 = 0;
+    if (out[g_R_CLEAR] >= 0) { ok = 1; }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// ONE ARM — g_PF_SEEDS first minutes, printed as a TABLE, not a summary.
+// ---------------------------------------------------------------------------
+let g_arm_clear: array<i32> = [];
+let g_arm_shots: array<i32> = [];
+let g_arm_hits: array<i32> = [];    // seeds whose clear landed inside 75 s
+let g_arm_worst_clear: array<i32> = [];
+let g_arm_peak: array<i32> = [];
+let g_arm_pathbad: array<i32> = [];
+let g_arm_deaths: array<i32> = [];
+let g_arm_sup: array<i32> = [];
+let g_arm_out: array<i32> = [];
+
+fn run_arm(p_pol: i32, p_name: string): i32 {
+    let o: array<i32> = run_new();
+    let n_clear: i32 = 0;
+    let n_in75: i32 = 0;
+    let worst_clear: i32 = 0;
+    let peak: i32 = 0;
+    let shots: i32 = 0;
+    let pathbad: i32 = 0;
+    let deaths: i32 = 0;
+    let sup: i32 = 0;
+    let outl: i32 = 0;
+    print("  seed     lit   wave   CLEAR  path    hp  mag/res  alive  deaths shots  supplied  d-lantern  out-of-light  ended-on");
+    let q: i32 = 0;
+    while (q < g_PF_SEEDS) {
+        let seed: i32 = g_PF_SEED0 + q * g_PF_STRIDE;
+        let ok: i32 = run_minute(seed, p_pol, o);
+        n_clear = n_clear + ok;
+        deaths = deaths + o[g_R_DEATHS];
+        shots = shots + o[g_R_SHOTS];
+        sup = sup + o[g_R_SUP];
+        outl = outl + o[g_R_OUT];
+        if (o[g_R_PEAK] > peak) { peak = o[g_R_PEAK]; }
+        if (ok == 1) {
+            if (o[g_R_CLEAR] > worst_clear) { worst_clear = o[g_R_CLEAR]; }
+            if (o[g_R_CLEAR] <= 75 * g_TICK_HZ) { n_in75 = n_in75 + 1; }
+            if (o[g_R_PATH] < 0) { pathbad = pathbad + 1; }
+            if (o[g_R_PATH] >= 0) {
+                if (o[g_R_PATH] - o[g_R_CLEAR] != SV_T_PATH_LAG) { pathbad = pathbad + 1; }
+                if (o[g_R_PATHN] != SV_PATH_N) { pathbad = pathbad + 1; }
+            }
+        }
+        print("  " + sv(seed) + "   " + mmss(o[g_R_LIT]) + "  " + mmss(o[g_R_WAVE])
+            + "  " + mmss(o[g_R_CLEAR]) + "  " + mmss(o[g_R_PATH])
+            + "   " + pad3(o[g_R_HP])
+            + "   " + pad3(o[g_R_MAG]) + "/" + pad3(o[g_R_RES])
+            + "    " + pad3(o[g_R_ALIVE])
+            + "     " + sv(o[g_R_DEATHS])
+            + "   " + pad3(o[g_R_SHOTS])
+            + "      " + pad3(o[g_R_SUP])
+            + "      " + pad3(o[g_R_DLAN]) + " m"
+            + "      " + pad3(o[g_R_OUT] / g_TICK_HZ) + " s"
+            + "   " + server_beat_name(o[g_R_BEAT]));
+        q++;
+    }
+    g_arm_clear.push(n_clear);
+    g_arm_shots.push(shots);
+    g_arm_hits.push(n_in75);
+    g_arm_worst_clear.push(worst_clear);
+    g_arm_peak.push(peak);
+    g_arm_pathbad.push(pathbad);
+    g_arm_deaths.push(deaths);
+    g_arm_sup.push(sup);
+    g_arm_out.push(outl);
+    print("  " + p_name + ":  " + sv(n_clear) + " of " + sv(g_PF_SEEDS)
+        + " CLEARED   (" + sv(n_in75) + " inside 75 s, worst " + mmss(worst_clear)
+        + ")   peak alive " + sv(peak) + "/" + sv(g_DIR_ALIVE_CAP)
+        + "   deaths " + sv(deaths) + "   shots " + sv(shots)
+        + "   lantern paid " + sv(sup) + " rounds   "
+        + sv(outl / g_TICK_HZ) + " s spent outside the light");
+    print("");
+    let out: i32 = n_clear;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    print("=========================================================");
+    print(" probe_firstminute — is it the WAVE, or is it the BOT?");
+    print("=========================================================");
+    let bmode: string = "COMPILED";
+    if (compiled() == 0) { bmode = "INTERPRETED"; }
+    print(" build       " + bmode);
+    print(" seeds       " + sv(g_PF_SEEDS) + " x " + sv(g_PF_FRAMES / g_TICK_HZ)
+        + " s, from " + sv(g_PF_SEED0) + " step " + sv(g_PF_STRIDE));
+    print(" loadout     a " + sv(wpn_mag(WPN_KESTREL)) + "-round Kestrel and "
+        + sv(SV_START_RESERVE) + " in reserve (GDD 8's 6 / 12)");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 0: main.hml's demo_drive AS IT WAS (pre-fix) -----");
+    print("    yaw only, hipfire, reload on an empty HUD");
+    // -----------------------------------------------------------------------
+    let a0: i32 = run_arm(0, "ARM 0 WAS-SHIPPED");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 1: + AIM THE SECOND AXIS ------------------------");
+    print("    pitch at centre mass, same rate limit as the yaw");
+    // -----------------------------------------------------------------------
+    let a1: i32 = run_arm(POL_PITCH, "ARM 1 +PITCH");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 2: + IRON SIGHTS --------------------------------");
+    print("    BTN_ADS held beyond " + f1(PF_ADS_M) + " m; 3.6 deg hip cone -> 0.20 deg");
+    // -----------------------------------------------------------------------
+    let a2: i32 = run_arm(POL_PITCH | POL_ADS, "ARM 2 +ADS");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 3: + RELOAD ON THE GAP (THE FIX) ----------------");
+    print("    BTN_RELOAD held at <= " + sv(PF_TOPUP) + " rounds while nothing is inside "
+        + f1(PF_CALM_M) + " m");
+    // -----------------------------------------------------------------------
+    let a3: i32 = run_arm(POL_PITCH | POL_ADS | POL_RELOAD, "ARM 3 +RELOAD");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 4: + THE LEASH TO THE LIGHT (THE FIX) -----------");
+    print("    walk back inside " + f1(PF_LEASH_M) + " m of the post; the light is the ammunition");
+    // -----------------------------------------------------------------------
+    let a4: i32 = run_arm(POL_PITCH | POL_ADS | POL_RELOAD | POL_LEASH,
+                          "ARM 4 +LEASH");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 5: THE REFERENCE PLAYER -------------------------");
+    print("    probe_waveone's bot, verbatim. THIS is the instrument 112b038's");
+    print("    \"winnable on 10 of 12 seeds\" was measured with.");
+    // -----------------------------------------------------------------------
+    let a5: i32 = run_arm(POL_REFERENCE, "ARM 5 REFERENCE  <-- THE BAR");
+
+    // -----------------------------------------------------------------------
+    print("--- ARM 6: THE SHIPPING DRIVER, src/game/demobot.hml ----");
+    print("    NOT a port. This arm IMPORTS the module main.hml --demo runs,");
+    print("    so this number and the game's behaviour cannot drift apart.");
+    // -----------------------------------------------------------------------
+    let a6: i32 = run_arm(POL_SHIPPED, "ARM 6 SHIPPED-NOW  <-- THE FIX");
+
+    // -----------------------------------------------------------------------
+    print("--- THE LADDER ------------------------------------------");
+    // -----------------------------------------------------------------------
+    print("  ARM 0 WAS-SHIPPED" + pad3(a0) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[0]) + " rounds fired   lantern paid " + pad3(g_arm_sup[0]));
+    print("  ARM 1 +PITCH   " + pad3(a1) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[1]) + " rounds fired   lantern paid " + pad3(g_arm_sup[1]));
+    print("  ARM 2 +ADS     " + pad3(a2) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[2]) + " rounds fired   lantern paid " + pad3(g_arm_sup[2]));
+    print("  ARM 3 +RELOAD  " + pad3(a3) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[3]) + " rounds fired   lantern paid " + pad3(g_arm_sup[3]));
+    print("  ARM 4 +LEASH   " + pad3(a4) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[4]) + " rounds fired   lantern paid " + pad3(g_arm_sup[4]));
+    print("  ARM 5 REFERENCE" + pad3(a5) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[5]) + " rounds fired   lantern paid " + pad3(g_arm_sup[5]));
+    print("  ARM 6 SHIPPED-NOW" + pad3(a6) + " / " + sv(g_PF_SEEDS)
+        + "   " + pad3(g_arm_shots[6]) + " rounds fired   lantern paid " + pad3(g_arm_sup[6]));
+    print("");
+
+    // ***********************************************************************
+    //  THE ACCEPTANCE CRITERION — the bar 112b038 set, asserted UNCONDITIONALLY
+    // ***********************************************************************
+    ck(a5 >= g_PF_BAR,
+       "ACCEPTANCE: the first minute is CLEARABLE on at least " + sv(g_PF_BAR) + " of "
+       + sv(g_PF_SEEDS) + " seeds - " + sv(a5) + " cleared. This is 112b038's own bar and"
+       + " its own instrument.");
+    // *** THE ONE THAT WAS MISSING, AND WHOSE ABSENCE IS THE WHOLE STORY. ***
+    // The bar above was always green; the game the gate PLAYED was never
+    // measured against it. This asserts the bar against the driver that
+    // actually ships.
+    ck(a6 >= g_PF_BAR,
+       "ACCEPTANCE: THE SHIPPING DRIVER (src/game/demobot.hml, what main.hml --demo runs)"
+       + " clears at least " + sv(g_PF_BAR) + " of " + sv(g_PF_SEEDS) + " - " + sv(a6)
+       + " cleared.");
+    // PORT-DRIFT GUARD. ARM 5 is probe_waveone's bot; ARM 6 is the shipping
+    // module. Same policy, two files, twelve identical seeds - so the counts
+    // must match EXACTLY. The bug this whole probe diagnosed was two bots
+    // silently diverging; this line is what makes that impossible to repeat
+    // without a red test.
+    ck(a6 == a5,
+       "PORT-DRIFT GUARD: the shipping module and probe_waveone's reference bot clear the"
+       + " SAME seeds - " + sv(a6) + " vs " + sv(a5) + ". If these differ, demobot.hml has"
+       + " drifted from the instrument the bar was set with.");
+    // AND THE SHARP VERSION. Equal clear COUNTS can hide two different bots
+    // that happen to score the same. The authority's lifetime shot counter over
+    // twelve deterministic seeds cannot: one changed comparison in the fire
+    // gate moved it 1028 -> 1090 while the count stayed 12 of 12, which is
+    // exactly the class of drift that started all this.
+    ck(g_arm_shots[6] == g_arm_shots[5],
+       "PORT-DRIFT GUARD, SHARP: identical policy fires an IDENTICAL number of rounds over"
+       + " the same twelve seeds - " + sv(g_arm_shots[6]) + " vs " + sv(g_arm_shots[5]));
+    ck(g_arm_out[6] == 0,
+       "THE SHIPPING DRIVER NEVER LEAVES THE LIGHT: " + sv(g_arm_out[6])
+       + " frames outside the " + f1(g_LANTERN_R_T1) + " m supply radius (the old one spent "
+       + sv(g_arm_out[0] / g_TICK_HZ) + " s out there)");
+    ck(g_arm_sup[6] > g_arm_sup[0] * 4,
+       "...so the lantern now pays it " + sv(g_arm_sup[6])
+       + " rounds against the old driver's " + sv(g_arm_sup[0]));
+    // THE NEGATIVE CONTROL, and it is the diagnosis. If the shipped bot ever
+    // starts clearing on its own, this probe's whole story is wrong and it must
+    // say so LOUDLY rather than quietly pass.
+    ck(a0 < a5,
+       "DIAGNOSIS: the demo driver clears FEWER than the reference player on the SAME"
+       + " twelve seeds - " + sv(a0) + " vs " + sv(a5) + ". If these are equal the cause"
+       + " was never the bot.");
+    ck(a0 == 0,
+       "DIAGNOSIS: main.hml's demo_drive clears NOTHING and never did - "
+       + sv(a0) + " of " + sv(g_PF_SEEDS)
+       + ". It is a screenshot driver, not an acceptance instrument.");
+    ck(g_arm_out[0] > 300 * g_TICK_HZ,
+       "THE DRIVER WALKS OUT OF ITS OWN AMMUNITION: the shipped bot spends "
+       + sv(g_arm_out[0] / g_TICK_HZ) + " s of " + sv(g_PF_SEEDS * g_PF_FRAMES / g_TICK_HZ)
+       + " outside the " + f1(g_LANTERN_R_T1) + " m supply radius");
+    ck(g_arm_out[4] == 0,
+       "...and the leash closes that hole completely (" + sv(g_arm_out[4]) + " frames out)");
+    ck(g_arm_sup[4] > g_arm_sup[0] * 2,
+       "THE AMMO ECONOMY IS THE LIGHT: the lantern pays the leashed driver "
+       + sv(g_arm_sup[4]) + " rounds against the shipped driver's " + sv(g_arm_sup[0]));
+    ck(g_arm_pathbad[5] == 0,
+       "every clear is followed by " + sv(SV_PATH_N) + " lit posts "
+       + sv(SV_T_PATH_LAG) + " ticks later (" + sv(g_arm_pathbad[5]) + " bad)");
+    ck(g_arm_hits[5] >= g_PF_BAR,
+       "at least " + sv(g_PF_BAR) + " of those clears land inside 75 s (GDD 8 puts it at 0:56) - "
+       + sv(g_arm_hits[5]));
+    ck(g_arm_peak[5] < g_DIR_ALIVE_CAP,
+       "THE ON-RAMP: the alive cap " + sv(g_DIR_ALIVE_CAP)
+       + " never saturates for the reference player DURING WAVE 1 (peak "
+       + sv(g_arm_peak[5]) + ")");
+    ck(g_arm_deaths[5] <= g_PF_SEEDS,
+       "the reference player averages at most one death per first minute ("
+       + sv(g_arm_deaths[5]) + " over " + sv(g_PF_SEEDS) + ")");
+
+    // -----------------------------------------------------------------------
+    print("--- determinism -----------------------------------------");
+    // -----------------------------------------------------------------------
+    let oa: array<i32> = run_new();
+    let ob: array<i32> = run_new();
+    let oc: array<i32> = run_new();
+    let pol3: i32 = POL_REFERENCE;
+    run_minute(g_PF_SEED0, pol3, oa);
+    run_minute(g_PF_SEED0, pol3, ob);
+    run_minute(g_PF_SEED0 + 1, pol3, oc);
+    let same: i32 = 1;
+    let diff: i32 = 0;
+    let z: i32 = 0;
+    while (z < g_R_FIELDS) {
+        if (oa[z] != ob[z]) { same = 0; }
+        if (oa[z] != oc[z]) { diff = 1; }
+        z++;
+    }
+    ck(same == 1, "same seed -> bit-identical first minute");
+    ck(diff == 1, "NEGATIVE CONTROL: a different seed differs");
+    print("  seed " + sv(g_PF_SEED0) + " clear " + mmss(oa[g_R_CLEAR]) + " hp " + sv(oa[g_R_HP])
+        + "   seed " + sv(g_PF_SEED0 + 1) + " clear " + mmss(oc[g_R_CLEAR])
+        + " hp " + sv(oc[g_R_HP]));
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- the bot is not a cheat ------------------------------");
+    // -----------------------------------------------------------------------
+    ck(SV_START_RESERVE == 12 && wpn_mag(WPN_KESTREL) == 6,
+       "every arm plays GDD 8's opening loadout, " + sv(wpn_mag(WPN_KESTREL)) + " / "
+       + sv(SV_START_RESERVE));
+    ck(PF_FIRE_M == 26.0 && PF_BACK_M == 5.0,
+       "ARM 0 keeps demo_drive's own 26 m engage and 5 m backpedal, unchanged in every arm");
+    print("  Reads only the render snapshot, its own hp/ammo/reserve and the lantern.");
+    print("  No enemy hp, no director state, no world. ARM 3's reload rule reads the");
+    print("  LYING HUD (client_ammo) on purpose - a fix that needs the authority's");
+    print("  private shot counter is not a fix a player could have performed.");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("=========================================================");
+    print(" assertions  " + sv(g_ok) + " / " + sv(g_n) + " passed");
+    let count_ok: i32 = 0;
+    if (g_n == g_PF_EXPECT) { count_ok = 1; }
+    if (count_ok == 0) {
+        print("  FAIL assertion COUNT: ran " + sv(g_n) + ", expected " + sv(g_PF_EXPECT)
+            + " - a section stopped running");
+    }
+    if (g_ok == g_n) {
+        if (count_ok == 1) {
+            print(" RESULT      PASS");
+            print("=========================================================");
+            return;
+        }
+    }
+    print(" RESULT      FAIL");
+    print("=========================================================");
+    exit(1);
+}
+
+main();

@@ -120,6 +120,7 @@ import { ps_new, move_apply_ex, move_place, move_to_world, move_solids_new,
 import { wpn_state_new, wpn_state_reset, wpn_step, wpn_fire, wpn_can_fire,
          wpn_reload_begin, wpn_swap_begin, wpn_cur, wpn_ammo,
          wpn_reserve_ammo, wpn_cur_spread, wpn_hash_all,
+         wpn_valid, wpn_owned, wpn_own_mask, wpn_force_w, wpn_force_n,
          WPN_NONE, WPN_KESTREL, WPN_EMBERLANCE, WS_FIELDS, WS_ADS
        } from "./weapons.hml";
 
@@ -608,6 +609,9 @@ export fn sim_new_cap(p_cap: i32, p_players: i32, p_seed: i32): object {
         shots: 0,
         reloads: 0,
         swaps_wpn: 0,
+        // W7-3. A client asked to hold a gun it does not own and was refused.
+        // Not saved: it is a counter about the WIRE, not about the world.
+        swaps_denied: 0,
         spawns_req: 0,
         spawns_ok: 0,
         deaths: 0,
@@ -724,6 +728,44 @@ export fn sim_stat_cmds_bad(p_w: object): i32 { let w: object = p_w; let s: obje
 export fn sim_stat_cmds_missing(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.cmds_missing; return o; }
 export fn sim_stat_shots(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.shots; return o; }
 export fn sim_stat_reloads(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.reloads; return o; }
+export fn sim_stat_swaps_wpn(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.swaps_wpn; return o; }
+export fn sim_stat_swaps_denied(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.swaps_denied; return o; }
+
+// ---------------------------------------------------------------------------
+// W7-3. THE OWNED SET, AND THE GRANT EDGE, FOR ONE PLAYER SLOT.
+// ---------------------------------------------------------------------------
+// Thin readers over `weapons.hml`, so that `server.hml` and the probes name a
+// PLAYER SLOT (1..64) rather than computing `(pslot - 1) * WS_FIELDS` at yet
+// another call site. Every one of those multiplications is a place a future
+// widening of `WS_FIELDS` could be missed.
+export fn sim_wpn_owned(p_w: object, p_pslot: i32, p_wid: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let st: array = s.wpn;
+    let out: i32 = wpn_owned(st, (p_pslot - 1) * WS_FIELDS, p_wid);
+    return out;
+}
+export fn sim_wpn_own_mask(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let st: array = s.wpn;
+    let out: i32 = wpn_own_mask(st, (p_pslot - 1) * WS_FIELDS);
+    return out;
+}
+export fn sim_wpn_force_w(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let st: array = s.wpn;
+    let out: i32 = wpn_force_w(st, (p_pslot - 1) * WS_FIELDS);
+    return out;
+}
+export fn sim_wpn_force_n(p_w: object, p_pslot: i32): i32 {
+    let w: object = p_w;
+    let s: object = w.sim;
+    let st: array = s.wpn;
+    let out: i32 = wpn_force_n(st, (p_pslot - 1) * WS_FIELDS);
+    return out;
+}
 export fn sim_stat_deaths(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.deaths; return o; }
 export fn sim_stat_player_deaths(p_w: object): i32 { let w: object = p_w; let s: object = w.sim; let o: i32 = s.player_deaths; return o; }
 export fn sim_player_dead(p_w: object, p_pslot: i32): i32 {
@@ -1055,7 +1097,9 @@ fn stage_movement(p_w: object, p_s: object) {
 
 // ---- (c) weapons: fire, reload, cooldowns, recoil_aim ----------------------
 // Sub-order, and it is API for the same reason the stage order is:
-//     1. swap request   (the command's `weapon_sel` IS the switch)
+//     1. swap request   (the command's `weapon_sel` is the REQUEST; W7-3 —
+//                        it stopped being the switch when `wpn_swap_begin`
+//                        started checking the owned set)
 //     2. reload request
 //     3. wpn_step       (cooldowns, ADS lerp, bloom decay, recoil recovery)
 //     4. fire
@@ -1093,10 +1137,27 @@ fn stage_weapons(p_w: object, p_s: object) {
                 let dead: i32 = 0;
                 if ((flags[slot] & EF_DEAD) != 0) { dead = 1; }
 
+                // >>> THE SWAP REQUEST IS NOW CHECKED, NOT OBEYED. <<<
+                // `wpn_swap_begin` refuses a gun this slot does not own
+                // (`weapons.hml` WS_OWNED), so `weapon_sel` is a REQUEST off
+                // the wire and no longer an instruction. The refusal is
+                // COUNTED and separately from a swap that merely could not
+                // start yet: `swaps_denied` moving is a client asking for
+                // something it was never given, which is the one thing an
+                // authoritative server most wants to see in a counter, and
+                // `swaps_wpn` not moving because a swap is already in flight
+                // is nothing at all. `wpn_valid` gates the count so a
+                // main-hand id that is a club or a spell (8..17) is not
+                // reported as a stolen rifle.
                 let want: i32 = c.weapon_sel;
                 if (dead == 0) {
                     if (want != wpn_cur(st, o)) {
                         if (wpn_swap_begin(st, o, want) == 1) { s.swaps_wpn = s.swaps_wpn + 1; }
+                        else if (wpn_valid(want) == 1) {
+                            if (wpn_owned(st, o, want) == 0) {
+                                s.swaps_denied = s.swaps_denied + 1;
+                            }
+                        }
                     }
                     if (cmd_btn(c, BTN_RELOAD) == 1) {
                         if (wpn_reload_begin(st, o) == 1) { s.reloads = s.reloads + 1; }

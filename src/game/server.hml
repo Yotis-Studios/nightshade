@@ -104,10 +104,12 @@ import { cmd_new, cmd_copy, cmd_wire_ok, cmd_yaw, cmd_pitch, cmd_btn,
 import { move_px, move_py, move_pz, move_eye_y, move_grounded,
          PS_VX, PS_VZ, PS_STEP_DIST, PS_EYE, PS_PY } from "../sim/movement.hml";
 
-import { wpn_cur, wpn_ammo, wpn_reserve_ammo, wpn_valid, wpn_reserve,
-         WPN_KESTREL, WS_FIELDS,
+import { wpn_grant, wpn_own_mask, wpn_own_count, wpn_owned,
+         wpn_force_w, wpn_force_n,
+         wpn_cur, wpn_ammo, wpn_reserve_ammo, wpn_valid, wpn_reserve,
+         WPN_KESTREL, WPN_NONE, WS_FIELDS,
          WS_RELOAD_T, WS_RELOAD_ON, WS_ADS, WS_RC_V, WS_SHOTS,
-         WS_RES0, WS_MAG0, wpn_swap_begin
+         WS_RES0, WS_MAG0
        } from "../sim/weapons.hml";
 
 import { prog_level, prog_xp_total, prog_xp_into, prog_xp_needed,
@@ -508,6 +510,15 @@ fn sv_local_new(): object {
         ads: 0.0,
         rc_v: 0.0,
         shots: 0,
+        // ---- W7-3: what you own, and what was put in your hands ----------
+        // `weapon` above is what you ARE holding. These three are what you
+        // MAY hold, what the authority last handed you, and how many times it
+        // has done so. The client adopts on `weapon_force_n` MOVING; see
+        // `weapons.hml`'s WS_FORCE_N block for why that is a counter and not
+        // a comparison against `weapon`.
+        weapon_owned: 0,
+        weapon_force: WPN_NONE,
+        weapon_force_n: 0,
         // ---- progression --------------------------------------------------
         level: 1,
         xp_total: 0,
@@ -1905,12 +1916,24 @@ fn sv_ui_trade(p_sv: object, p_who: i32, p_row: i32, p_tick: i32) {
         // (DIRECTION §8a).  Both gates are `npc_offer_open`'s and both were
         // already checked inside `npc_trade_take`; what differs is the ARG,
         // and one id space per branch is why nothing here has to guess.
+        //
+        // >>> W7-3: `wpn_grant`, NOT `wpn_swap_begin`. <<<  This one word is
+        // the whole of the bug the gate found.  `wpn_swap_begin` started a
+        // swap and changed nothing else, so 1.48 s later `sim.hml` swapped
+        // straight back to whatever the client's unchanged `weapon_sel` still
+        // said — the panel said TAKEN, the purse was debited, the counter read
+        // `trades 2`, and the rifle was gone.  `wpn_grant` does the three
+        // things a shop actually has to do: SET THE OWNERSHIP BIT (so the swap
+        // is legal at all, now and on every later tick), start the swap, and
+        // PUBLISH THE EDGE that tells the client to stop asking for the old
+        // gun.  Buying a gun is a permanent change to what you own; it was
+        // being implemented as a temporary change to what you hold.
         let wv: i32 = npc_vw_weapon(arg);
         if (wpn_valid(wv) == 1) {
             let wstv: array = sim_weapon_state(w);
             let offv: i32 = (sv.pslot - 1) * WS_FIELDS;
             wstv[offv + WS_RES0 + wv] = f64(wpn_reserve(wv));
-            wpn_swap_begin(wstv, offv, wv);
+            wpn_grant(wstv, offv, wv);
         }
     } else if (kind == NPC_OFF_MFG) {
         // `arg` is a genuine WPN_* id and the Foundry gate is
@@ -1919,7 +1942,7 @@ fn sv_ui_trade(p_sv: object, p_who: i32, p_row: i32, p_tick: i32) {
         let off2: i32 = (sv.pslot - 1) * WS_FIELDS;
         if (wpn_valid(arg) == 1) {
             wst2[off2 + WS_RES0 + arg] = f64(SV_TRADE_MFG_RESERVE);
-            wpn_swap_begin(wst2, off2, arg);
+            wpn_grant(wst2, off2, arg);
         }
     } else if (kind == NPC_OFF_SOUP) {
         // Odo's whole character. GAME_DESIGN §5: "keeps soup warm past
@@ -2029,6 +2052,9 @@ fn sv_publish(p_sv: object) {
     l.ads = wst[off + WS_ADS];
     l.rc_v = wst[off + WS_RC_V];
     l.shots = i32(wst[off + WS_SHOTS]);
+    l.weapon_owned = wpn_own_mask(wst, off);
+    l.weapon_force = wpn_force_w(wst, off);
+    l.weapon_force_n = wpn_force_n(wst, off);
 
     // ---- progression ------------------------------------------------------
     let pr: array = sim_progression(w, sv.pslot);
@@ -2340,6 +2366,48 @@ export fn server_npcs(p_sv: object): object { let sv: object = p_sv; let o: obje
 export fn server_melee(p_sv: object): object { let sv: object = p_sv; let o: object = sv.mel; return o; }
 export fn server_spells(p_sv: object): array { let sv: object = p_sv; let o: array = sv.sp; return o; }
 export fn server_stats(p_sv: object): array { let sv: object = p_sv; let o: array = sv.sk; return o; }
+// ---- W7-3: the arsenal, straight off the authority ------------------------
+// These read the weapon state and not `sv.local`, deliberately: `sv.local` is
+// a snapshot published once a tick and a test that samples it is testing the
+// publish, not the ownership. A probe asking "do I own the Blackthorn" must
+// get the answer from the same array `wpn_swap_begin` consults.
+export fn server_own_mask(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let out: i32 = wpn_own_mask(wst, (sv.pslot - 1) * WS_FIELDS);
+    return out;
+}
+export fn server_owns(p_sv: object, p_w: i32): i32 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let out: i32 = wpn_owned(wst, (sv.pslot - 1) * WS_FIELDS, p_w);
+    return out;
+}
+export fn server_own_count(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let out: i32 = wpn_own_count(wst, (sv.pslot - 1) * WS_FIELDS);
+    return out;
+}
+export fn server_weapon(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let out: i32 = wpn_cur(wst, (sv.pslot - 1) * WS_FIELDS);
+    return out;
+}
+export fn server_force_w(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let out: i32 = wpn_force_w(wst, (sv.pslot - 1) * WS_FIELDS);
+    return out;
+}
+export fn server_force_n(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let out: i32 = wpn_force_n(wst, (sv.pslot - 1) * WS_FIELDS);
+    return out;
+}
+
 export fn server_trades(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.trades; return o; }
 export fn server_trades_refused(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.trades_refused; return o; }
 export fn server_points_spent(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.points_spent; return o; }

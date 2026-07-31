@@ -37,6 +37,9 @@ import { server_new, server_tick, server_local, server_world,
          server_load_kg, server_carry_kg, server_overload, server_move_mult,
          server_fit, server_pack_items, server_kits_placed,
          server_grant_salvage, server_lantern_x, server_lantern_z,
+         // ---- W7-3: the arsenal ----
+         server_owns, server_own_mask, server_own_count, server_weapon,
+         server_force_w, server_force_n,
          SV_PSLOT, SV_XP_PER_SALVAGE, SV_KG_GUN, SV_KG_LANTERN,
          SV_KG_PER_ROUND, SV_TRADE_AMMO, SV_BOOT_SALVAGE,
          UI_PANEL_NONE, UI_PANEL_TRADE,
@@ -44,7 +47,8 @@ import { server_new, server_tick, server_local, server_world,
          UI_MSG_HAVE, UI_MSG_HEAVY }
        from "../src/game/server.hml";
 
-import { cmd_new, cmd_set, BTN_USE, BTN_GRENADE, BTN_SWITCH, BTN_BUILD }
+import { cmd_new, cmd_set, BTN_USE, BTN_GRENADE, BTN_SWITCH, BTN_BUILD,
+         BTN_FIRE }
        from "../src/sim/command.hml";
 
 import { npc_new, npc_named_count, npc_count, npc_x, npc_z, npc_slot_of,
@@ -79,17 +83,19 @@ import { stats_carry_kg_at, stats_move_mult_at, stats_get,
          SK_EQ_NONE, SK_EQ_BANDOLIER, SK_EQ_POUCHES, SK_EQ_PACK, SK_EQ_ALL,
          SK_CAPACITY } from "../src/sim/stats.hml";
 
-import { sim_predicted, sim_progression, sim_weapon_state, sim_player_id }
+import { sim_predicted, sim_progression, sim_weapon_state, sim_player_id,
+         sim_stat_swaps_denied }
        from "../src/sim/sim.hml";
 import { move_px, move_pz } from "../src/sim/movement.hml";
 import { world_slot_of, KIND_LANTERN, EF_DEAD } from "../src/sim/world.hml";
-import { WS_RES0, WS_MAG0, WS_FIELDS, wpn_cur, wpn_is_village } from "../src/sim/weapons.hml";
+import { WS_RES0, WS_MAG0, WS_FIELDS, wpn_cur, wpn_is_village,
+         wpn_dmg_at, wpn_owned, wpn_own_count } from "../src/sim/weapons.hml";
 import { prog_add_xp, prog_xp_total, XPS_KILL } from "../src/sim/progression.hml";
 import { transport_loopback } from "../src/net/transport.hml";
 
 // >>> THE ASSERTION COUNT. <<< Raise it when you add a check; a probe whose
 // count drifts is a probe that stopped running something and told nobody.
-let EXPECTED_ASSERTIONS: i32 = 182;   // W6-6: +17 for the forged village tier
+let EXPECTED_ASSERTIONS: i32 = 197;   // W7-3: +15 — ownership, the grant edge, and KEEPING the gun
 
 let g_n: i32 = 0;
 let g_ok: i32 = 0;
@@ -147,8 +153,51 @@ fn befriend(p_s: object, p_st: object, p_who: i32, p_to: i32) {
 let g_c = cmd_new();
 let g_tick: i32 = 0;
 
+// ---------------------------------------------------------------------------
+// >>> W7-3.  THE HARNESS IS NOW A CLIENT, NOT A STUCK NUMBER. <<<
+// ---------------------------------------------------------------------------
+// `step` used to send a LITERAL 4 as `weapon_sel` on every tick, for every
+// server, forever. That is not "a player holding the Kestrel", it is the exact
+// stale client that made W7 ship a shop which debits your purse and takes the
+// rifle back 1.48 s later — and because the harness itself was that client,
+// the probe could not have caught it: it asserted `trades == 1` and, one line
+// later, the weapon in hand at a single sampled moment.
+//
+// So the harness adopts the way `client.hml` adopts: on the FORCE COUNTER
+// MOVING, and never on comparing what it holds against what it asked for. The
+// two must be the same three lines or this probe stops being a test of the
+// shipping path.
+let g_want: i32 = 4;          // WPN_KESTREL — what this "client" is asking for
+let g_seen_n: i32 = -1;       // the last force counter it has adopted
+
+// Call once per fresh `server_new`: a new session is a new client.
+fn client_reset() {
+    g_want = 4;
+    g_seen_n = -1;
+}
+
+fn client_adopt(p_sv: object) {
+    let n: i32 = server_force_n(p_sv);
+    if (n != g_seen_n) {
+        g_seen_n = n;
+        let fw: i32 = server_force_w(p_sv);
+        if (fw >= 0) { g_want = fw; }
+    }
+}
+
 fn step(p_sv: object, p_btn: i32, p_mx: f64, p_my: f64, p_yaw: f64) {
-    cmd_set(g_c, g_tick, 16, p_mx, p_my, p_yaw, 0.0, p_btn, 4, g_tick);
+    client_adopt(p_sv);
+    cmd_set(g_c, g_tick, 16, p_mx, p_my, p_yaw, 0.0, p_btn, g_want, g_tick);
+    server_apply_command(p_sv, SV_PSLOT, g_c);
+    server_tick(p_sv, g_tick);
+    g_tick = g_tick + 1;
+}
+
+// The STALE client, for the negative case: it never adopts and it never
+// changes its mind. `step` is what a correct client does; this is what the
+// shipped one did.
+fn step_stale(p_sv: object, p_btn: i32, p_wsel: i32) {
+    cmd_set(g_c, g_tick, 16, 0.0, 0.0, 0.0, 0.0, p_btn, p_wsel, g_tick);
     server_apply_command(p_sv, SV_PSLOT, g_c);
     server_tick(p_sv, g_tick);
     g_tick = g_tick + 1;
@@ -576,6 +625,7 @@ fn section_session() {
     print("F  the session: T then C completes a trade");
     let sv = server_new(4242, transport_loopback());
     g_tick = server_t0(sv);
+    client_reset();
     server_settle_boot_tier(sv, SET_TIER_TOWN);
     step(sv, 0, 0.0, 0.0, 0.0);
     for (let q = 0; q < 130; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
@@ -672,6 +722,9 @@ fn section_session() {
     let pm: i32 = server_purse(sv);
     let tm: i32 = server_trades(sv);
     let hand0: i32 = wpn_cur(sim_weapon_state(server_world(sv)), 0);
+    let own0: i32 = server_own_count(sv);
+    let fn0: i32 = server_force_n(sv);
+    ck_i(own0, 1, "before the sale you own exactly one gun — the one you woke with");
     cursor_to(sv, 0);
     step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
     step(sv, 0, 0.0, 0.0, 0.0);
@@ -687,13 +740,74 @@ fn section_session() {
     let wstb: array = sim_weapon_state(server_world(sv));
     let boltw: i32 = npc_vw_weapon(NPC_VW_BOLT);
     ck(wstb[WS_RES0 + boltw] > 0.0, "...and it arrives with brass in the pouch");
-    for (let q9 = 0; q9 < 90; q9++) { step(sv, 0, 0.0, 0.0, 0.0); }
+
+    // >>> W7-3.  THE OWNERSHIP BIT, WHICH IS THE THING THAT WAS MISSING. <<<
+    // Before this wave the trade started a swap and set no state at all, so
+    // "you bought a rifle" was a 1.48 s animation. The bit is what makes it a
+    // purchase. Asserted BEFORE the swap has even finished, because owning it
+    // and holding it are two different facts and only one of them is
+    // permanent.
+    ck_i(server_owns(sv, boltw), 1, ">>> W7-3 THE PURCHASE SET THE OWNERSHIP BIT <<<");
+    ck_i(server_own_count(sv), own0 + 1, "and you own exactly one more gun than you did");
+    ck_i(server_force_n(sv), fn0 + 1, "the authority published ONE force edge for the sale");
+    ck_i(server_force_w(sv), boltw, "...and the gun it names is the one you bought");
+
+    for (let q9 = 0; q9 < 60; q9++) { step(sv, 0, 0.0, 0.0, 0.0); }
     print(`   in hand ${hand0} -> ${wpn_cur(wstb, 0)} (bolt-action is ${boltw})`);
-    ck_i(wpn_cur(wstb, 0), boltw, ">>> AND IT IS IN YOUR HANDS <<<");
+    // >>> THE ASSERTION THAT WOULD HAVE CAUGHT THIS. <<<  The gate measured
+    // `ticks-per-weapon: KESTREL=1711 BLACKTHORN=89` — the rifle was in hand
+    // for 1.48 s and then gone, and this probe missed it because it sampled
+    // once at a moment that happened to be inside those 89 ticks AND because
+    // its own harness was the stale client that caused the revert. Sixty ticks
+    // is one second; six hundred is ten. Both, now, and separately.
+    ck_i(wpn_cur(wstb, 0), boltw, ">>> AND IT IS IN YOUR HANDS 60 TICKS LATER <<<");
+    for (let q10 = 0; q10 < 540; q10++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    ck_i(wpn_cur(wstb, 0), boltw, ">>> AND STILL IN YOUR HANDS 600 TICKS LATER <<<");
+    ck_i(server_owns(sv, boltw), 1, "...and still yours");
+    ck_i(server_weapon(sv), boltw, "the authority's own accessor agrees");
+
+    // >>> AND YOU CAN FIRE IT. <<<  A gun you are holding but cannot shoot is
+    // the same failure wearing a different hat. The shot goes through the real
+    // command path — BTN_FIRE on a wire command, `sim.hml` stage (c) — and the
+    // DAMAGE is read from the table so the number proves it is the Blackthorn
+    // and not the Kestrel that fired.
+    let shots0: i32 = server_local(sv).shots;
+    let fired: i32 = 0;
+    for (let q11 = 0; q11 < 12; q11++) {
+        step(sv, BTN_FIRE, 0.0, 0.0, 0.0);
+        if (server_local(sv).shots > shots0) { fired = 1; }
+    }
+    print(`   fired: shots ${shots0} -> ${server_local(sv).shots}, ` +
+          `Blackthorn damage at 10 m = ${wpn_dmg_at(boltw, 10.0)} ` +
+          `(Kestrel would be ${wpn_dmg_at(4, 10.0)}), mag now ${server_local(sv).ammo}`);
+    ck_i(fired, 1, ">>> AND YOU CAN FIRE THE GUN YOU BOUGHT <<<");
+    ck(server_local(sv).shots > shots0, "the authority counted the shot");
+    ck(near(wpn_dmg_at(boltw, 10.0), 95.0, 0.0),
+       "and it hits for the BLACKTHORN's 95 at 10 m, not the Kestrel's 45");
+    ck_i(wpn_cur(wstb, 0), boltw, "and firing it did not restow it");
+
+    // >>> AN UNOWNED WEAPON CANNOT BE SELECTED, OVER THE COMMAND PATH. <<<
+    // `probe_weapons` K2 asserts this against `wpn_swap_begin` directly; this
+    // asserts it where it actually matters — a command off the wire, applied
+    // by `server_apply_command`, for 300 consecutive ticks. The Emberlance is
+    // the right weapon to try: it is the best gun in the table and before
+    // W7-3 a client could have it by sending the number 5.
+    let held_before: i32 = wpn_cur(wstb, 0);
+    for (let q12 = 0; q12 < 300; q12++) { step_stale(sv, 0, 5); }
+    print(`   300 ticks of asking for the Emberlance (5): still holding ${wpn_cur(wstb, 0)}`);
+    ck_i(server_owns(sv, 5), 0, "you do not own the Emberlance");
+    ck_i(wpn_cur(wstb, 0), held_before,
+         ">>> AND ASKING FOR IT 300 TIMES DOES NOT GET IT <<<");
+    ck(sim_stat_swaps_denied(server_world(sv)) > 0,
+       "...and the authority COUNTED the refusals rather than ignoring them");
+    // Put the harness back where the world is: the stale steps above left our
+    // client asking for a gun it does not own.
+    g_want = boltw;
 
     // ---- being broke says so ----------------------------------------------
     let brk = server_new(4242, transport_loopback());
     g_tick = server_t0(brk);
+    client_reset();
     server_settle_boot_tier(brk, SET_TIER_TOWN);
     for (let q4 = 0; q4 < 131; q4++) { step(brk, 0, 0.0, 0.0, 0.0); }
     let bst = server_settle(brk);
@@ -718,6 +832,7 @@ fn section_carry() {
     print("G  carry capacity (DIRECTION §7)");
     let sv = server_new(777, transport_loopback());
     g_tick = server_t0(sv);
+    client_reset();
     server_settle_boot_tier(sv, SET_TIER_TOWN);
     for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
     let st = server_settle(sv);
@@ -805,6 +920,7 @@ fn section_kit() {
     print("H  a lantern kit goes back into the world");
     let sv = server_new(2024, transport_loopback());
     g_tick = server_t0(sv);
+    client_reset();
     server_settle_boot_tier(sv, SET_TIER_TOWN);
     for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
     let st = server_settle(sv);
@@ -850,6 +966,7 @@ fn section_kit() {
 fn drive_session(p_seed: i32): i32 {
     let sv = server_new(p_seed, transport_loopback());
     g_tick = server_t0(sv);
+    client_reset();
     server_settle_boot_tier(sv, SET_TIER_TOWN);
     for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
     let st = server_settle(sv);
@@ -900,6 +1017,7 @@ fn section_determinism() {
 fn demo_like(p_switches: i32): i32 {
     let sv = server_new(4242, transport_loopback());
     g_tick = server_t0(sv);
+    client_reset();
     server_settle_boot_tier(sv, SET_TIER_TOWN);
     for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
     walk_to_npc(sv, NPC_MABEL, 30000);

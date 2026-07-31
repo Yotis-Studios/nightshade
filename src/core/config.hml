@@ -223,25 +223,65 @@ export let g_BUDGET_RSS_MB: i32 = 96;                // after 10 000 frames
 // a persistent `ThreadPool` created once at boot. This is the ONLY knob the
 // game has on it, and it lives here so a platform port changes one number.
 //
-// THE MEASURED CURVE (docs/design/THREADING_SPIKE.md §4/§5, wall clock, one
-// 3000-triangle dispatch, 24 cores, loadavg 7.2-7.8):
+// >>> 8 -> 4, ON THE GAME'S OWN NUMBERS.  (2026-07-31.)  THE SPIKE'S CURVE IS
+// >>> NOT THIS GAME'S CURVE AND 8 WAS SET FROM THE SPIKE'S.
+//
+// THE SPIKE'S CURVE (docs/design/THREADING_SPIKE.md §4/§5, wall clock, ONE
+// 3000-TRIANGLE DISPATCH, 24 cores, loadavg 7.2-7.8):
 //
 //     workers   1      2      4      6      8     12     16
 //     speedup  0.99   1.90   3.42   4.41   4.66   5.54   ~6.0
 //     CPU cost  --    +?     +11%   +23%   +36%   +49%   +75%
 //
-// 8 is the default because efficiency is >=83 % through 8 and falls off a cliff
-// at 12->16 (58 % -> 51 %). What caps the curve is NOT memory bandwidth: it is
-// `ThreadPool.submit*` costing ~1.2-2.5 us per task SERIALLY on the submitting
-// thread (§6), so past ~12 workers the dispatch loop is the bottleneck.
-// `emit_par_init` clamps to EMIT_PAR_MAX = 12 regardless of what is set here.
+// That curve is real and it is measured; it is also **a workload this game
+// never runs.**  `terrain_render.hml` emits ONE CHUNK PER `emit_mesh_buf` call
+// and a chunk is `g_CHUNK_QUADS`^2 x 2 = 128 triangles, which sits barely above
+// the engine's 96-triangle dispatch floor.  Everything else the frame emits —
+// props, billboards, contact blobs, FX cards, the whole HUD — is BELOW that
+// floor and runs serial no matter what this constant says.  So the frame never
+// hands the pool a 3000-triangle job; it hands it a 128-triangle job, tens of
+// times, and pays the ~28 us fork-join on every one.
+//
+// THE GAME'S CURVE.  Real binary, `--demo 8 --headless --no-audio --seed 1337`,
+// ONE build with `--workers N` (so the only difference is the pool), the game's
+// own per-frame WALL mean over ~477 frames, **min over 7 whole process runs,
+// twice** (min-of-14), 24 cores, loadavg 12.5-16.6 throughout:
+//
+//     workers    0     1     2     3     4     5     6     8    12
+//     render ms 9.0   9.6   8.7   9.0   8.1   8.4   8.4   9.0   8.7
+//                     ^^^ SEE BELOW: 1 IS THE SAME CODE AS 0
+//
+// >>> WALL, NOT `__clock()`.  RULE T's CPU clock SUMS ACROSS THREADS, so it
+// >>> reports the pool getting *worse* while the frame gets faster.  For a
+// >>> parallelism measurement the wall mean is the honest column and the CPU
+// >>> column is the efficiency one.
+//
+// >>> AND HERE IS THE NOISE FLOOR, WHICH IS MOST OF THE EFFECT.  `--workers 1`
+// >>> runs ZERO workers — the engine collapses n < 2 to serial — so columns 0
+// >>> and 1 are THE SAME MACHINE CODE.  They differ by **0.6 ms**.  The whole
+// >>> serial-to-best win is 0.9 ms.  Do not read this table as a smooth curve;
+// >>> read it as one finding that survives three independent sweeps (the wave
+// >>> gate's, and both of these):
+// >>>
+// >>>   * **4 workers is the best value.**  8.1 ms in this sweep and 8.1 ms in
+// >>>     the gate's, agreeing to the printed digit from separate runs.
+// >>>   * **8 is never better than 4** in any of the three (gate 8.5, here
+// >>>     9.4 and 9.0), and it costs twice the threads on a box the player is
+// >>>     sharing with everything else they have open.
+// >>>   * **12 is not worth its threads either** and 1 is the worst column in
+// >>>     the table while being byte-identical to the best-behaved serial one.
+//
+// So: 4.  It is the measured optimum, it is the cheapest way to reach the
+// measured optimum, and `emit_par_init` still clamps to EMIT_PAR_MAX = 12 for
+// anyone who overrides it.  The end-to-end story — 4.6x promised, 1.11-1.16x
+// delivered, and why — is written up in `docs/BUDGET_ACTUAL.md` §P.
 //
 // **A VALUE OF 0 OR 1 IS A SUPPORTED CONFIGURATION, NOT A FAILURE.** It runs
-// the serial path, which `probe_emit` asserts is byte-identical to the parallel
+// the serial path, which `probe_par` asserts is byte-identical to the parallel
 // one. That is the WASM build (docs/design/WASM_SPIKE.md: no threads at all),
 // a single-core target, and any environment where `ThreadPool` throws — the
 // engine falls back to it on its own and never brings the frame down.
-export let g_EMIT_WORKERS: i32 = 8;
+export let g_EMIT_WORKERS: i32 = 4;
 
 // The per-call triangle count below which a dispatch is not worth its ~28 us
 // fork-join. 0 means "keep the engine's own measured default", which is 96 —
@@ -357,7 +397,10 @@ export let g_MIST_HEIGHT: f64 = 1.6;
 //
 // Re-measured on this box (RULE T: __clock CPU time, min of 7 frames, then the
 // MINIMUM over 9 whole process runs), a shot.hml-derived harness, `--scene
-// budget_worst --tod 22.0`, native 320x240, 2536 triangles drawn, 34 prop
+// budget_worst --tod 22.0`, native 320x240 (the 4:3 frame — 76800 px against
+// the shipping 57600, so every absolute millisecond here is ~25 % HIGH; the
+// 2-vs-4 DIFFERENCE, which is what the cap is set on, is per-prop and per-light
+// and does not scale with pixel count), 2536 triangles drawn, 34 prop
 // instances, lantern on, extra contested lights posted through `env_add_light`:
 //
 //     2 lights  12.268 ms      3 lights  12.384 ms      4 lights  12.485 ms
@@ -443,19 +486,73 @@ export let g_ENV_LIGHT_SLOTS: i32 = 4;               // the engine's array size
 // src/art/tod.hml, "WHAT THIS FILE CANNOT DO").
 //
 // DEPTH: 0.12/0.13/0.20 is a 7.7x cut in green, the channel that carries 71 %
-// of luminance.  Measured on the rendered ground band (native rows 150..185,
-// viewmodel window excluded), 22:00, real display, HUD suppressed, additive
-// pool DISABLED, `lantern ON minus OFF` — which read +0.000 with ZERO pixels
-// moved on every one of these scenes before the veil existed:
+// of luminance.
 //
-//     scene @ 22:00      OFF      ON     delta
-//     ridge_golden       8.11   42.66   +34.55
-//     flat_debug         8.25   43.09   +34.84
-//     hub_dawn           8.59   36.24   +27.65
-//     muzzle_fog        13.44   40.28   +26.85
-//     ns_bloom           7.62   28.24   +20.62   <- see below
+// ---------------------------------------------------------------------------
+// >>> THE MEASUREMENT BAND, RE-DERIVED.  "ROWS 150..185" NO LONGER EXISTS. <<<
+// ---------------------------------------------------------------------------
+// (2026-07-31.)  Every "ground band" measurement in this file, in `tod.hml` and
+// in `world_render.hml` names **native rows 150..185**.  The frame has 180 rows.
+// Row 185 is off the bottom of the picture and rows 150..179 are the part of it
+// the VIEWMODEL fills — so the band as written is neither the ground nor even
+// in frame.  It was correct once: it was a window in a 240-row frame at a
+// 70-degree vertical FOV, both of which were retired in the 16:9 conversion.
 //
-// against the +25 the brief asks for.  ns_bloom is the one scene that does not
+// The band is a SCREEN-ANGLE window, so it converts exactly.  A row `r` sits at
+// `tan(theta) = (r - H/2) / (H/2) * tan(fov/2)` below the optical axis:
+//
+//     old   r = 150 of 240 at fov 70  ->  tan = (30/120)  * tan(35) = 0.17505
+//           r = 185 of 240 at fov 70  ->  tan = (65/120)  * tan(35) = 0.37928
+//     new   solve at fov 58, H = 180: r = 90 + tan / tan(29) * 90
+//           0.17505 -> r = 118.4        0.37928 -> r = 151.6
+//
+// >>> SO THE SHIPPING BAND IS **ROWS 118..152 OF 180**, and that is what any
+// >>> re-measurement must use.  It is the same 34-35 rows of sky-angle the old
+// >>> band was; it is NOT rows 113..139 (the naive 180/240 rescale), because
+// >>> the FOV moved too.
+//
+// What ground distance that covers depends on the camera, and the old comment's
+// "about 5 m to about 9 m" assumed an eye height of **2.1 m** that `shot.hml`
+// does not use for four of the five scenes below — it stands at **1.7 m**, and
+// at 2.4 m only for `hub_dawn` (`tools/shot.hml`, `scene_apply`).  Re-derived
+// for the shipping band, `d = eye / tan(theta + |pitch|)`:
+//
+//     scene         eye   pitch   band covers
+//     muzzle_fog    1.7   -3.0    3.9 m .. 7.4 m
+//     ridge_golden  1.7    0.0    4.5 m .. 9.7 m
+//     ns_bloom      1.7   -5.0    3.6 m .. 6.4 m
+//     flat_debug    1.7   -8.0    3.1 m .. 5.0 m
+//     hub_dawn      2.4   -4.0    5.2 m .. 9.7 m
+//
+// ---------------------------------------------------------------------------
+// >>> THE TABLE BELOW IS STALE IN THREE INDEPENDENT WAYS.  DO NOT TRUST IT. <<<
+// ---------------------------------------------------------------------------
+// It was measured at 320x240, at a 70-degree FOV, over rows 150..185, with
+// `g_LANTERN_GAIN` at **24** — and 19.0 ships (see the cut-7 note below).  Not
+// one of its five deltas is reproducible on this tree, and the gap is not
+// cosmetic: re-measured on the shipping build, **`hub_dawn` reads +20.41 where
+// this table says +27.65** (gate measurement, 2026-07-31).
+//
+// It is KEPT, rather than deleted, because it is the only record of the veil's
+// ORDERING across scenes and of why `ns_bloom` is the floor — but every number
+// in it is a historical artefact and is labelled as one:
+//
+//     scene @ 22:00      OFF      ON     delta     <- 320x240, fov 70, GAIN 24
+//     ridge_golden       8.11   42.66   +34.55        STALE, not reproducible
+//     flat_debug         8.25   43.09   +34.84        STALE
+//     hub_dawn           8.59   36.24   +27.65        STALE (ships at +20.41)
+//     muzzle_fog        13.44   40.28   +26.85        STALE
+//     ns_bloom           7.62   28.24   +20.62        STALE, and see below
+//
+// WHAT WAS NOT DONE, PLAINLY: the five rows were not re-measured here.
+// `tools/shot.hml` has no lantern switch — `frame_set_lantern` is exported by
+// `world_render.hml` and no harness calls it — so "lantern ON minus OFF" cannot
+// be produced from any tool in the tree, and `shot.hml` is not this task's file
+// (CLAUDE.md §3).  Whoever owns it should add `--lantern 0|1` and a
+// `--band r0,r1` readout; until then this table stays labelled STALE rather
+// than being quietly re-rounded.
+//
+// The +25 the brief asks for is measured against that band.  ns_bloom does not
 // clear it and the reason is a CEILING, not the veil: WX_BLOOM overrides the
 // ambient almost totally to a violet (src/art/tod.hml), so the night BAKE
 // lands the band at 28.24 and 28.24 is the arithmetic maximum ANY veil could
@@ -488,10 +585,16 @@ export let g_NIGHT_VEIL_B: f64 = 0.20;
 // the lit hours" and the brief's non-regression floor is written against it.
 //
 // 0.470 .. 0.545 puts the veil where the fiction puts it — after the light has
-// actually gone:
+// actually gone.  RE-RUN 2026-07-31 on the shipping build, `tools/probe_night`
+// section [2], which evaluates `gate_darkness` on `tod_eval`'s own fog tint —
+// i.e. these six numbers are printed by a probe, not transcribed:
 //
-//     18:15 golden  0.000      19:30 dusk  0.005      22:00 night  0.945
-//     05:30 dawn    0.000      12:00 noon  0.000      02:00 deep   1.000
+//     18:15 golden  0.0000     19:30 dusk  0.0000     22:00 night  0.9476
+//     05:30 dawn    0.0000     12:00 noon  0.0000     02:00 deep   1.0000
+//
+// (This block used to say dusk 0.005 and night 0.945.  Both were off in the
+// third decimal; the shape of the schedule is unchanged.  The lantern gate on
+// the same run: 18:15 0.0000, 19:30 0.6494, 22:00 1.0000.)
 //
 // and the crossing takes ~80 s of real time (the fog tint lerps between the
 // DUSK and NIGHT keyframes over 0.0835 of a 16-minute day), i.e. 0.02 % of the
@@ -553,18 +656,39 @@ export let g_LANTERN_OFS_DOWN: f64 = 0.58;           // below the eye
 // ground the cosine is grazing past ~4 m and the `max(0.25, ...)` floor takes
 // over, so the term is essentially `colour * 0.25 * (1 - d/r)^2` and the light
 // SATURATES the veil out to `d ~ 0.5 * r` and is gone by `r`.  The measurement
-// band the brief is judged on — native rows 150..185 — is the ground from
-// about 5 m to about 9 m at eye height with pitch -3, because that is where
-// the lower third of a 55-degree vertical FOV lands.  A 7 m radius does not
-// reach the band at all; a 14 m radius saturates to 7 m and left `hub_dawn`
-// at +16.45 against a +25 target; 18 m saturates to 9 m.  Measured, pool
-// disabled, `lantern ON minus OFF` on the ground band at 22:00:
+// band the brief is judged on is **rows 118..152 of 180** (re-derived above;
+// this comment used to say "rows 150..185" and "a 55-degree vertical FOV" —
+// the frame has 180 rows and `g_FOV_HIP` is 58, so both were retired numbers).
+// That band is the ground from about 3.9 m to about 7.4 m on `muzzle_fog`'s
+// camera and 5.2 m to 9.7 m on `hub_dawn`'s; the per-scene table is above.
+// A 7 m radius barely reaches it; a 14 m radius saturates to 7 m and left
+// `hub_dawn` at +16.45 against a +25 target; 18 m saturates to 9 m.
+//
+// >>> THE TWO ROWS BELOW ARE THE SAME STALE MEASUREMENT AS THE VEIL TABLE —
+// >>> 320x240, fov 70, rows 150..185 — and the second one is at GAIN 24, which
+// >>> has not shipped since cut 7.  The COMPARISON they encode (18 m beats 14 m
+// >>> on every scene, decisively on hub_dawn) is what the radius is set on and
+// >>> that comparison is internally consistent; the absolute deltas are not
+// >>> reproducible on this tree.  `hub_dawn` at the shipping radius/gain
+// >>> measures **+20.41**, not the +27.65 the bottom row shows.
 //
 //     radius / gain     muzzle_fog  ns_bloom  ridge_golden  flat_debug  hub_dawn
 //     14 / 18             +25.66     +20.46      +33.93       +29.77     +16.45
 //     18 / 24             +26.85     +20.62      +34.55       +34.84     +27.65
+//                         ^ all STALE: 4:3 frame, fov 70, band 150..185
 //
-// LOOKED AT, both, at 320x240 on a real display.  18 m still reads as a POOL
+// What IS reproducible on the shipping build, and what actually pins the
+// radius, is the falloff itself — `tools/probe_night` [4] runs `shade.hml`'s
+// own `env_light_rgb` and prints the multiplier the ground is lifted to:
+//
+//     0 m 1.0000   5 m 1.0000   11 m 0.6824(g)   20 m 0.1294(g) = the bare veil
+//
+// i.e. saturated to ~9.3 m, edge still clearly inside 18 m.  That is the shape
+// "18 m" was chosen for and it is checked by a probe every run.
+//
+// LOOKED AT, both, at 320x240 — the frame the game no longer has, so the
+// composition judgement below stands but the pixel judgement does not.
+// 18 m still reads as a POOL
 // and not as an ambient lift, because the falloff is squared: the far half of
 // the frame is dark in every night scene in the harness and the pool's edge is
 // visible in all five.  For scale, this is not a large light in this project's
@@ -592,8 +716,10 @@ export let g_LANTERN_LIGHT_B: f64 = 0.52;
 // >>> THE GAIN IS 19 AND IT IS NOT COMPARABLE TO THE OLD 2.4.
 // The old value matched `main.hml`'s settlement-lantern post so a held lantern
 // and a lit lantern post read as the same kind of light.  They read as the
-// same kind of light because NEITHER OF THEM READ AT ALL: measured 2026-07-30,
-// additive pool disabled, ground band rows 150..185, real display, the dynamic
+// same kind of light because NEITHER OF THEM READ AT ALL: measured 2026-07-30
+// on the 4:3 build, additive pool disabled, the then-current band (rows
+// 150..185 of 240; the shipping band is rows 118..152 of 180 — see the veil
+// note above), real display, the dynamic
 // light moved **mean +0.000, max +0.00, ZERO of 8856 pixels** on muzzle_fog,
 // ns_bloom AND ridge_golden at 22:00.  The light was placed, ranked and
 // committed correctly and changed nothing, because the surface was already at
@@ -621,8 +747,17 @@ export let g_LANTERN_LIGHT_B: f64 = 0.52;
 // >>>
 // >>>     gain   green mul @ 0 m   @ 5 m   @ 11 m   @ 20 m   probe [4]
 // >>>     24.0        1.0000      1.0000   0.8275   0.1294   FAIL
-// >>>     19.0        1.0000      1.0000   0.6824   0.1294   pass
+// >>>     19.0        1.0000      1.0000   0.6824   0.1294   pass   <- SHIPS
 // >>>     17.0        1.0000      1.0000   0.6235   0.1294   pass
+// >>>
+// >>> RE-RUN 2026-07-31 ON THE SHIPPING BUILD: `probe_night` [4] prints
+// >>> `lit at 11.0 m = (0.8275, 0.6824, 0.5686)` and
+// >>> `lit at 20.0 m = (0.1216, 0.1294, 0.2000)` — the 19.0 row above,
+// >>> reproduced to four decimals, PASS 32/32.  This table is measured through
+// >>> `shade.hml`'s own `env_light_rgb` and has no resolution or FOV in it, so
+// >>> unlike the pixel tables above it survived the 16:9 conversion intact.
+// >>> (Note the coincidence that makes it easy to misread: red at gain 19 is
+// >>> ALSO 0.8275 at 11 m.  The column is GREEN.)
 // >>>
 // >>> At 24 the lantern SATURATES the veil out to 10.2 m of an 18 m radius and
 // >>> still returns 83 % of the world at 11 m: that is not a pool with an edge,
@@ -635,11 +770,23 @@ export let g_LANTERN_LIGHT_B: f64 = 0.52;
 // >>>   * `g >= 18.2` or `hub_dawn`'s ground band at 22:00 falls under the
 // >>>     brief's `lantern ON minus OFF >= +25` (measured +27.22 at 24,
 // >>>     +25.51 at 19, +24.38 at 17 — about 0.4 luminance per unit of gain).
-// >>> 19.0 sits in that window and saturates the veil out to 9.27 m, which is
-// >>> the 9 m the derivation above was aiming at all along.  LOOKED AT at
-// >>> 320x240 on a real display, gain 24 and gain 19 are indistinguishable in
-// >>> the near field — every pixel that changed was in the falloff, which is
-// >>> the whole point.
+// >>>
+// >>> >>> AND THAT SECOND WALL IS NOT TRUE ON THE SHIPPING FRAME. <<<
+// >>> Those three numbers are 320x240 / fov 70 / rows 150..185.  On 320x180 at
+// >>> fov 58 the gate measured `hub_dawn` at **+20.41** with the gain at 19 —
+// >>> i.e. the brief's +25 floor is MISSED by 4.6, not cleared by 0.5, and no
+// >>> gain inside the window above closes a 4.6 gap at 0.4 per unit.  The wall
+// >>> as written is therefore unsatisfiable and the constant is NOT being moved
+// >>> to chase it: raising the gain to ~30 would clear the band mean and would
+// >>> fail probe_night [4]'s edge assertion, which is the assertion that keeps
+// >>> the lantern a pool instead of a floodlight.  The honest statement is that
+// >>> the +25 acceptance number was written against a frame that no longer
+// >>> exists and needs re-deriving on 320x180 before anything is tuned to it.
+// >>> 19.0 sits in the falloff window and saturates the veil out to 9.27 m,
+// >>> which is the 9 m the derivation above was aiming at all along.  LOOKED AT
+// >>> at 320x240 — again, the retired frame — gain 24 and gain 19 were
+// >>> indistinguishable in the near field; every pixel that changed was in the
+// >>> falloff, which is the whole point.
 //
 // >>> AND THAT MAKES EVERY OTHER LIGHT IN THE PROJECT 10x TOO WEAK.  This is
 // >>> E4 in `src/art/tod.hml` and it is REPORTED, NOT FIXED, because the two
@@ -689,9 +836,13 @@ export let g_LANTERN_GATE_DAY: f64 = 0.72;
 // picture is the card fx.hml intended and never managed to draw.
 //
 // >>> DIV IS THE PRICE OF A SMOOTH POOL, AND HERE IS THE PRICE LIST.
-// Measured `--scene budget_worst --tod 22.0`, native 320x240, min over 7 whole
+// Measured `--scene budget_worst --tod 22.0`, **native 320x240 — the 4:3 frame,
+// which is 33 % more pixels than ships**, min over 7 whole
 // runs of a min-of-7 __clock frame; baseline is the same binary with the
-// lantern forced off (11.391 ms).  Only DIV changed between rows:
+// lantern forced off (11.391 ms).  Only DIV changed between rows.  The absolute
+// column is therefore high and the whole table would need re-running to quote a
+// budget from; the DELTAS are what DIV is chosen on and they are dominated by
+// triangle count and `terrain_h` calls, neither of which is a pixel cost:
 //
 //     DIV=4    11.815 ms   +0.424   10 tris drawn   17 terrain_h calls
 //     DIV=6    11.962 ms   +0.571   21 tris         27 calls
@@ -704,7 +855,12 @@ export let g_LANTERN_GATE_DAY: f64 = 0.72;
 // The terrain_h count does not rise monotonically with DIV because HDIV walks
 // down to the nearest divisor of DIV — DIV 8 and 16 get a 4-cell height grid.)
 //
-// LOOKED at all three of 6, 8 and 12 at 320x240 on a real display.  The cells
+// LOOKED at all three of 6, 8 and 12 at 320x240 on a real display — the 4:3
+// frame, so this is a judgement about a picture the game no longer renders.
+// The cell-banding argument is about CELL COUNT ACROSS THE POOL and does not
+// depend on the frame's shape, so it carries; the "invisible at DIV 12" claim
+// has not been re-checked at 320x180 and should be, since 25 % fewer rows means
+// each cell is bigger on screen, not smaller.  The cells
 // are FLAT-SHADED — `emit_quad_world` takes one rgb for all four vertices — so
 // DIV is literally the number of steps in the falloff ramp, ~4/DIV of peak per
 // step.  DIV 6 and DIV 8 both put a visible rectangular block of brighter
@@ -750,8 +906,17 @@ export let g_LANTERN_POOL_LIFT: f64 = 0.15;
 // exactly as far as the light does, which is what makes the additive card and
 // the per-instance prop lighting agree at the edge.  (fx.hml uses 0.62 for its
 // single card; at 0.62 the pool's visible edge lands at 4.3 m and the nearest
-// ground the camera can see at eye height 2.1 m and pitch -3 is 4.0 m, so
-// almost none of it is on screen.)
+// ground the camera can see is inside that, so almost none of it is on screen.)
+//
+// >>> The old text here said "the nearest ground ... at eye height 2.1 m and
+// >>> pitch -3 is 4.0 m".  Both halves are retired: `shot.hml` stands at 1.7 m
+// >>> (2.4 m only on `hub_dawn`), and the 4.0 m was solved against a 240-row
+// >>> frame at fov 70.  Re-derived for the shipping camera — bottom row 179 of
+// >>> 180 is `atan(tan(29 deg) * 89.5/90) = 28.86 deg` below the axis, plus 3
+// >>> deg of pitch — the nearest visible ground is `eye / tan(31.86 deg)`:
+// >>> **2.74 m at eye 1.7, 3.38 m at eye 2.1, 3.86 m at eye 2.4**.  The
+// >>> CONCLUSION is unchanged and is now stronger, not weaker: a 4.3 m edge is
+// >>> still past the near field, so 0.62 still hides the card.
 export let g_LANTERN_POOL_SPAN: f64 = 0.35;
 
 // >>> ZERO. THE ADDITIVE GROUND POOL IS DELETED, AND THAT IS THE POINT OF THE
@@ -781,7 +946,10 @@ export let g_LANTERN_POOL_SPAN: f64 = 0.35;
 // >>> WHY NOT "A SMALL HOT CORE AT THE FLAME".  Tried, at SPAN 0.35 /
 // >>> SCALE 10, and LOOKED AT next to SCALE 0 on muzzle_fog and ridge_golden:
 // >>> the pool is centred on the EYE, the nearest ground the camera can see at
-// >>> eye height with pitch -3 is ~2.9 m, and a core small enough not to wash
+// >>> eye height with pitch -3 is ~2.9 m (a 4:3-frame figure; the shipping
+// >>> 320x180 frame at fov 58 puts it at 2.74 m from a 1.7 m eye — see the SPAN
+// >>> note above.  The argument does not turn on the third significant figure),
+// >>> and a core small enough not to wash
 // >>> is already at `(1 - 2.9/4.9)^2 = 0.15` of peak there.  It contributed a
 // >>> faint warm haze over the bottom-left grass and took the grass texture
 // >>> with it.  The emitter and its DIV/HDIV/LIFT/SPAN constants are KEPT — a

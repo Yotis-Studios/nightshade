@@ -88,7 +88,7 @@ import { cmd_new, cmd_set, cmd_yaw, cmd_pitch, cmd_btn,
        } from "../sim/command.hml";
 
 import { wpn_shot_interval, wpn_reload_time, wpn_recoil_v, wpn_mag,
-         WPN_KESTREL, WPN_NONE } from "../sim/weapons.hml";
+         WPN_KESTREL, WPN_NONE, WPN_COUNT } from "../sim/weapons.hml";
 
 import { snapshot_new_cap, snapshot_read, snapshot_reset, snapshot_count,
          snapshot_tick, snapshot_size, SNAP_CAP, SNAP_MISS
@@ -275,7 +275,25 @@ export fn client_new(p_transport, p_seed: i32): object {
         in_str: 0.0,
         in_btn: 0,
         in_btn_prev: 0,
+        // >>> THE ONE LINE THIS WAVE EXISTS FOR. <<<  `in_weapon` is what every
+        // command asks the server for, and before W7-3 it was written HERE and
+        // nowhere else in this file: no key, no UI, no trade hook ever moved
+        // it.  So the swap the shop started completed, and the next tick asked
+        // for the Kestrel again.  It is now written by `client_select_weapon`,
+        // `client_cycle_weapon` and — the one that closes the loop — by the
+        // FORCE EDGE in `client_apply`.
         in_weapon: WPN_KESTREL,
+        // The owned set, mirrored off the owner block. The client never
+        // decides this; it is told. `client_select_weapon` consults it only so
+        // that pressing 6 with no rifle is silent instead of sending a request
+        // the server will refuse 60 times a second.
+        own_mask: 0,
+        // The last force counter this client has ADOPTED. -1 rather than 0 so
+        // that the first owner block of a session is always an edge: a client
+        // that joins a game already in progress must adopt the gun the server
+        // says it is holding, not the one this literal happens to name.
+        force_n: -1,
+        forced: 0,             // how many times we have adopted, for the probe
         mouse_dx: 0.0,
         mouse_dy: 0.0,
         sens: 1.0,
@@ -742,6 +760,24 @@ export fn client_apply(p_cl: object, p_packet: object, p_local: object,
     cl.grounded = l.grounded;
     cl.step_dist = l.step_dist;
     cl.weapon = l.weapon;
+    // ---- W7-3. THE GRANT EDGE: ADOPT ONCE, WHEN THE COUNTER MOVES. --------
+    // This is the half of the fix that lives on the client, and it is
+    // deliberately NOT `if (cl.weapon != cl.in_weapon) { cl.in_weapon =
+    // cl.weapon; }`.  That level-triggered form fights itself the moment
+    // there is any latency at all: between sending "I want the rifle" and the
+    // snapshot that shows the rifle, EVERY frame sees a disagreement and
+    // reverts the request, so the player can never change weapons over a real
+    // wire.  The counter is monotone, so a client that misses ten snapshots
+    // adopts LATE and ONCE rather than never or forever, and a client that is
+    // simply predicting ahead is not disturbed at all.
+    cl.own_mask = l.weapon_owned;
+    if (l.weapon_force_n != cl.force_n) {
+        cl.force_n = l.weapon_force_n;
+        if (l.weapon_force >= 0) {
+            cl.in_weapon = l.weapon_force;
+            cl.forced = cl.forced + 1;
+        }
+    }
     cl.ammo = l.ammo;
     cl.reserve = l.reserve;
     cl.reload_t = l.reload_t;
@@ -1460,6 +1496,88 @@ export fn client_ammo(p_cl: object): i32 {
     return out;
 }
 
+// ===========================================================================
+//  W7-3.  THE PLAYER CAN CHOOSE.
+// ---------------------------------------------------------------------------
+//  Everything below writes `cl.in_weapon`, which `client_make_command` puts on
+//  the wire as `weapon_sel`.  Nothing here is authoritative and nothing here
+//  is allowed to be: the owned set is the server's, mirrored in `cl.own_mask`,
+//  and the only thing consulting it locally buys is silence — pressing 6 with
+//  no rifle does nothing at all, rather than sending a request the authority
+//  refuses sixty times a second.  If the mirror is ever wrong, the server
+//  still refuses and the force edge still corrects it.
+// ===========================================================================
+
+// The weapon this client is ASKING for. Different from `client_weapon`, which
+// is what the authority says is in your hands, and the HUD shows both when
+// they disagree because that disagreement IS the swap animation.
+export fn client_in_weapon(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.in_weapon; return o; }
+export fn client_own_mask(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.own_mask; return o; }
+export fn client_forced(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.forced; return o; }
+
+export fn client_owns(p_cl: object, p_w: i32): i32 {
+    let w: i32 = p_w;
+    if (w < 0 || w >= WPN_COUNT) { let z: i32 = 0; return z; }
+    let cl: object = p_cl;
+    let m: i32 = cl.own_mask;
+    let out: i32 = 0;
+    if ((m & g_cl_wpn_bit[w]) != 0) { out = 1; }
+    return out;
+}
+
+export fn client_own_count(p_cl: object): i32 {
+    let cl: object = p_cl;
+    let m: i32 = cl.own_mask;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < WPN_COUNT) {
+        if ((m & g_cl_wpn_bit[i]) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// Ask for weapon `p_w`. Returns 1 if the request changed, 0 if it was refused
+// (not owned, no control, dead) or was already what we were asking for.
+export fn client_select_weapon(p_cl: object, p_w: i32): i32 {
+    let cl: object = p_cl;
+    if (cl.control == 0) { let no: i32 = 0; return no; }
+    if (cl.dead == 1) { let dead: i32 = 0; return dead; }
+    let w: i32 = p_w;
+    if (client_owns(cl, w) == 0) { let unowned: i32 = 0; return unowned; }
+    if (w == cl.in_weapon) { let same: i32 = 0; return same; }
+    cl.in_weapon = w;
+    let out: i32 = 1;
+    return out;
+}
+
+// Next (+1) or previous (-1) OWNED weapon, wrapping. Cycles from what we are
+// ASKING for rather than from what is in our hands: two taps of "next" inside
+// one 0.35 s swap must move two steps, not fight the animation.
+export fn client_cycle_weapon(p_cl: object, p_dir: i32): i32 {
+    let cl: object = p_cl;
+    if (cl.control == 0) { let no: i32 = 0; return no; }
+    if (cl.dead == 1) { let dead: i32 = 0; return dead; }
+    let dir: i32 = 1;
+    if (p_dir < 0) { dir = -1; }
+    let cur: i32 = cl.in_weapon;
+    if (cur < 0 || cur >= WPN_COUNT) { cur = 0; }
+    let i: i32 = 0;
+    while (i < WPN_COUNT) {
+        cur = cur + dir;
+        if (cur >= WPN_COUNT) { cur = 0; }
+        if (cur < 0) { cur = WPN_COUNT - 1; }
+        if (client_owns(cl, cur) == 1) {
+            let hit: i32 = client_select_weapon(cl, cur);
+            return hit;
+        }
+        i = i + 1;
+    }
+    let none: i32 = 0;
+    return none;
+}
+
 export fn client_reserve(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.reserve; return o; }
 export fn client_reloading(p_cl: object): f64 {
     let cl: object = p_cl;
@@ -1720,6 +1838,23 @@ export fn client_spell_name(p_id: i32): string {
     let i: i32 = p_id;
     if (i < 0 || i >= CL_SPELLS) { let none: string = "-"; return none; }
     let out: string = g_cl_spell_name[i];
+    return out;
+}
+
+// The gun names, in `WPN_*` order. Seven glyphs at the longest, because the
+// HUD draws one of them at 4 triangles a glyph beside a 76 px ammo plate and
+// "EMBERLANCE" would be 40 triangles of a 250 cap for a word you already know.
+// These are HUD strings and nothing else reads them; `weapons.hml` owns ids
+// and numbers and deliberately owns no text at all (it is a sim module and a
+// string is not simulation state).
+let g_cl_wpn_name: array = ["SPARROW", "TINKER", "BELLOWS", "LNGSHDW",
+                            "KESTREL", "EMBRLNC", "BLKTHRN", "NETTLE"];
+let g_cl_wpn_bit: array = [1, 2, 4, 8, 16, 32, 64, 128];
+
+export fn client_weapon_name(p_w: i32): string {
+    let i: i32 = p_w;
+    if (i < 0 || i >= WPN_COUNT) { let none: string = "-"; return none; }
+    let out: string = g_cl_wpn_name[i];
     return out;
 }
 

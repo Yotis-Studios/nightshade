@@ -1,8 +1,16 @@
 # MEASURED FRAME BUDGET — after Wave 1
 
 Every number here was measured by the orchestrator on the shipping toolchain
-(**Hemlock v2.9.1**, `hemlockc -O1`, headless, 320×240), not taken from a spec.
+(**Hemlock v2.9.1**, `hemlockc -O1`, headless), not taken from a spec.
 Supersedes the projected figures in `ARCHITECTURE.md` §8 where they disagree.
+
+> **⚠ RESOLUTION.** Everything above §P was measured at **320×240**, the 4:3
+> frame retired on 2026-07-31. The frame is now **320×180** — 57 600 px against
+> 76 800, i.e. **25 % fewer pixels**, so every fill-bound absolute millisecond in
+> §1–§T is *high* and every per-triangle transform cost is unaffected. The
+> triangle budget in §T was re-derived against drawn/source counts rather than
+> pixels and survives; the stage millisecond tables did not get re-run. §P is
+> the only section measured on the shipping frame.
 
 > ## ⬛ 2026-07-29 — THE TRIANGLE CEILING WAS RE-DERIVED FROM SCRATCH.
 > **Read §T below before quoting any triangle number from the rest of this file.**
@@ -691,3 +699,116 @@ The game's end-to-end gain (~0.4 ms) is larger than the isolated call cost
    it is now stale**, including §7b's header (*"read_pixels_rect EXCLUDED"*), the
    gate line *"incl. readback"*, `net_frame()`'s subtraction (now a no-op), and
    the recommendation *"(2) make it opt-in"* — which is done.
+
+---
+
+# §P. PARALLEL EMIT — **4.6× promised, 1.16× delivered.** 2026-07-31
+
+`docs/design/THREADING_SPIKE.md` measured a **4.66× speedup at 8 workers** and the
+project shipped `g_EMIT_WORKERS = 8` on the strength of it. The real game gets
+**1.11–1.16×, and its best worker count is 4, not 8.** This section records the
+gap and its cause, because the gap is the interesting result and it is the kind
+of number that quietly disappears into a changelog.
+
+> **T.9 above recommended exactly this spike and estimated a 2× ceiling gain from
+> it. That estimate is not supported. Read this section before quoting T.9.**
+
+## P.1 The measurement
+
+One `-O3` binary. `--workers N` selects the pool size at runtime (`main.hml`
+calls `frame_par_init` before `frame_init`, which is first-call-wins), so **every
+row below is the same machine code with the same seed on the same demo** — the
+only difference is the pool.
+
+```sh
+hemlockc -O3 src/game/main.hml -o /tmp/ns_w
+SDL_VIDEODRIVER=dummy /tmp/ns_w --demo 8 --headless --no-audio --seed 1337 --workers N
+#   -> "render, wall (STAT_T_FRAME)  mean X ms"   over ~477 frames
+```
+
+**Wall clock, not `__clock()`.** `__clock()` is CPU time and sums across worker
+threads: with the pool on it counts every worker's share and reports the change
+as a *regression* while the frame gets faster. RULE T's min-of-N still applies —
+**min over 7 whole process runs, run twice (min-of-14)** — but the statistic
+being minimised is the game's own per-frame wall mean.
+
+Box: 24 cores, permanently shared (CLAUDE.md §1.2). **loadavg 12.5–16.6 across
+both sweeps**, start and end recorded per pass.
+
+## P.2 The curve
+
+| workers | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 12 |
+|---|---|---|---|---|---|---|---|---|---|
+| render wall, ms | 9.0 | 9.6 | 8.7 | 9.0 | **8.1** | 8.4 | 8.4 | 9.0 | 8.7 |
+
+Wave-gate sweep, same instrument, independent run:
+
+| workers | 0 | 1 | 2 | 4 | 8 | 12 |
+|---|---|---|---|---|---|---|
+| render wall, ms | 9.4 | 9.0 | 8.5 | **8.1** | 8.5 | 8.9 |
+
+## P.3 ⚠ Read the noise floor before you read the curve
+
+**`--workers 1` runs ZERO workers.** The engine collapses `n < 2` to the serial
+path (`probe_par` §1 asserts this; `main.hml --selftest` asserts the same
+clamp). Verified on the binary: `--workers 1` prints `parallel emit: 0 workers`.
+
+**So columns 0 and 1 are the same machine code, and they differ by 0.6 ms.**
+The entire serial-to-best win is 0.9 ms. The measurement barely resolves the
+effect it is measuring, and any reading of this table finer than "4 is good, 8
+is not better" is reading noise.
+
+What *does* survive all three sweeps:
+
+* **4 workers is the best value — 8.1 ms here and 8.1 ms in the gate's sweep**,
+  agreeing to the printed digit from separate runs on separate days.
+* **8 is never better than 4** in any of the three (8.5 / 9.4 / 9.0).
+* **12 is not better than 2.**
+
+`g_EMIT_WORKERS` is therefore **8 → 4**. Same wall time as any larger count,
+half the threads of the shipping value, on a box the player is sharing.
+
+## P.4 Why 4.6× did not transfer — and it is not a bug in the pool
+
+The pool is correct. `probe_par` compares every byte of the vertex arena, all
+six counters and the PNG md5 between serial and parallel, and the wave gate
+verified **45 of 45 renders byte-identical** across nw = 1/2/4/8/12. A perf
+change that moves a pixel is a bug; this one moves none.
+
+The spike and the game do not run the same workload:
+
+| | THREADING_SPIKE §4 | nightshade |
+|---|---|---|
+| triangles per `emit_mesh_buf` call | **3000** | **128** (`g_CHUNK_QUADS`² × 2) |
+| calls per frame | 1 | tens |
+| fork-join paid | once | every call |
+
+`terrain_render.hml` emits **one chunk per call**, and a chunk is 128 triangles —
+barely above the engine's 96-triangle dispatch floor (`emit_par_min`). Everything
+else in the frame is *below* that floor and runs serial regardless of this
+constant: props, billboards, contact blobs, FX cards, the whole HUD.
+
+So the frame never hands the pool a 3000-triangle job. It hands it a
+128-triangle job, tens of times, and pays the ~28 µs fork-join on each one. At
+4 workers that is 32 triangles per range against a fixed per-dispatch cost —
+which is why the curve flattens at 4 and then wanders inside its own noise
+instead of climbing to the spike's 5.5× at 12.
+
+**The lesson, stated so the next spike does not repeat it: a speedup measured on
+one big synthetic dispatch does not predict a speedup on many small real ones,
+and the constant that came out of the synthetic benchmark was 2× the constant
+the game actually wants.** Benchmark the dispatch SIZE the caller uses, not the
+size that shows the kernel at its best.
+
+## P.5 What was not done
+
+* **No attempt was made to batch chunks into one dispatch.** Emitting N chunks
+  through a single `emit_mesh_buf` call would put the game back on the spike's
+  workload and is where the remaining 3× lives — but it is a change to
+  `terrain_render.hml` / `world_render.hml`, which this task does not own
+  (CLAUDE.md §3). **Reported, not fixed.** It is a bigger prize than the worker
+  count: T.9's 2×-ceiling estimate is only reachable through it.
+* `g_EMIT_PAR_MIN_TRIS` was **not** re-derived. It is 0 ("keep the engine's 96"),
+  and 96 vs 128 is a 33 % margin — narrow enough that a re-measured crossover
+  table might move the whole picture. Nobody has measured it against this game's
+  chunk size.

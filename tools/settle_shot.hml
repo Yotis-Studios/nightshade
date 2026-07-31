@@ -3,8 +3,13 @@
 // ===========================================================================
 //
 //   hemlockc -O1 tools/settle_shot.hml -o /tmp/sshot
-//   SDL_VIDEODRIVER=dummy /tmp/sshot --tier 3 --tod 18.4 --out docs/shots/city_dusk.png
 //   SDL_VIDEODRIVER=dummy /tmp/sshot --scene list
+//   SDL_VIDEODRIVER=dummy /tmp/sshot --scene settle_city_dusk \
+//                                    --out docs/shots/settle_city_dusk.png
+//
+// 320x180 at g_FOV_HIP, x3 = 960x540.  Resolution and field of view are
+// IMPORTED from src/core/config.hml; this file may not name either.  Why that
+// sentence is in capitals: see the block above `g_upscale`.
 //
 // The five contracts `tools/shot.hml` holds itself to, held here too:
 //
@@ -148,7 +153,12 @@ import { settle_new, settle_lanterns_set, settle_refresh, settle_step,
        from "../src/sim/settle.hml";
 
 import { clampf, clamp01, clampi, lerpf, floori, rad2deg } from "../src/core/mathx.hml";
-import { g_FOG_FAR_CAP } from "../src/core/config.hml";
+// >>> THE CAMERA IS THE GAME'S CAMERA, AND IT IS IMPORTED, NOT RETYPED. <<<
+// `g_RES_W`, `g_RES_H` and `g_FOV_HIP` come from `src/core/config.hml` — the
+// same three constants `src/game/main.hml` and `src/render/world_render.hml`
+// read.  See the block above `g_upscale` for what happened when they did not.
+import { g_FOG_FAR_CAP, g_RES_W, g_RES_H, g_FOV_HIP, g_UPSCALE_MAX }
+       from "../src/core/config.hml";
 
 // ===========================================================================
 // 0.  compiled-only guard
@@ -161,14 +171,37 @@ fn running_interpreted(): bool {
     return out;
 }
 
-let g_VERSION: string = "settle_shot 1.0 (settlement-render)";
-let g_RES_W: i32 = 320;
-let g_RES_H: i32 = 240;
-let g_upscale: i32 = 3;
+let g_VERSION: string = "settle_shot 2.0 (settlement-render, 16:9)";
+
+// ---------------------------------------------------------------------------
+// >>> 2026-07-31.  THIS TOOL WAS PHOTOGRAPHING A GAME THAT DOES NOT EXIST. <<<
+// ---------------------------------------------------------------------------
+// It carried its OWN `g_RES_W = 320, g_RES_H = 240`, its own
+// `alloc(320 * 240 * 4)` and its own `g_fov = 70.0` — three hand copies of
+// constants that moved to 320x180 / 58 in the 16:9 conversion (config.hml §2).
+// The frame graph never agreed with them for one frame afterwards:
+// `world_render.frame_render` projects at `g_RES_W x g_RES_H` = 320x180 and
+// `frame_present` reads back exactly that rectangle, so
+//
+//     * the render was 320x180 and correct,
+//     * `framebuffer_to_rgb` then read 320x240 out of the buffer, and
+//     * THE BOTTOM 60 NATIVE ROWS — a quarter of every picture — WERE A DEAD
+//       BLACK BAND OF UNWRITTEN MEMORY.  Reproduced on the tree at f4644f7.
+//
+// The seven checked-in goldens do NOT show that band, which proves the second
+// half of the same failure: they are 960x720 and predate the conversion
+// entirely.  Every settlement look-review on record was made against them.
+//
+// This is the SAME bug class as `probe_viewmodel`'s divisor of 2.4 (= 240/100),
+// which turned a viewmodel regression into an apparent improvement.  A stale
+// constant in an INSTRUMENT is worse than one in the code, because the
+// instrument is what you would have caught the code with.  Nothing in this file
+// may name a resolution or a field of view again: both are imported.
+let g_upscale: i32 = 3;              // 320x180 x3 = 960x540, exact
 
 let g_win = null;
 let g_target = null;
-let g_fb: ptr = alloc(320 * 240 * 4);
+let g_fb: ptr = alloc(g_RES_W * g_RES_H * 4);
 let g_atlas_world = null;
 let g_atlas_fx = null;
 let g_atlas_hud = null;
@@ -204,7 +237,12 @@ let g_ladder: i32 = -1;
 let g_ladder_rung: i32 = 0;
 let g_bench: i32 = 0;
 let g_nosettle: i32 = 0;
-let g_fov: f64 = 70.0;
+// The player's hip FOV, VERTICAL degrees (config.hml §12 explains why vertical
+// is not a convention choice).  `--fov` still overrides it; the three geometry
+// instruments below ask for a HORIZONTAL angle instead and derive the vertical
+// one from the shipping aspect, so they cannot go stale the next time the frame
+// changes shape.
+let g_fov: f64 = g_FOV_HIP;
 let g_fog_far: f64 = 56.0;
 let g_fog_near: f64 = 6.0;
 let g_ground_y: f64 = 0.0;
@@ -213,6 +251,7 @@ let g_seed: i32 = 1337;
 let g_tier_want: i32 = 3;
 let g_tod_h: f64 = 18.4;
 let g_relative_mouse_rc: i32 = 0;
+let g_scene: string = "(none — flags only)";
 let g_st = null;
 let g_sim_ticks: i32 = 0;
 let g_dome_on: i32 = 1;
@@ -224,6 +263,25 @@ let g_QUAD_M: f64 = 4.0;
 let g_CHUNK_Q: i32 = 8;
 
 fn eprint(p_s: string) { print(p_s); }
+
+// ---------------------------------------------------------------------------
+// A HORIZONTAL FOV, EXPRESSED AS THE VERTICAL ONE THE PROJECTION WANTS.
+// ---------------------------------------------------------------------------
+// `mat_perspective` takes a VERTICAL fov and divides by aspect for x, so the
+// horizontal angle a frame covers is `2*atan(aspect * tan(vfov/2))`.  A
+// diagnostic scene cares about the HORIZONTAL angle — "does the whole four-rung
+// ladder fit", "is one facade big enough to judge" — and that intent must not
+// be stored as a vertical number, because a vertical number silently changes
+// meaning every time the frame's shape does.  Store the horizontal angle; solve
+// for the vertical one against the SHIPPING aspect, which is g_RES_W/g_RES_H
+// and nothing else.
+fn fov_v_for_h(p_h_deg: f64): f64 {
+    let hr: f64 = p_h_deg * 0.5 * g_D2R;
+    let th: f64 = sin(hr) / cos(hr);
+    let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
+    let out: f64 = 2.0 * rad2deg(atan2(th / aspect, 1.0));
+    return out;
+}
 
 // ===========================================================================
 // 1.  ART
@@ -688,10 +746,15 @@ fn build_report(p_out: string): string {
     s = s + "== NIGHTSHADE SETTLEMENT SHOT ==\n";
     s = s + `tool          ${g_VERSION}\n`;
     s = s + `out           ${p_out}\n`;
-    s = s + `resolution    ${g_RES_W}x${g_RES_H} upscaled x${g_upscale}\n`;
+    s = s + `scene         ${g_scene}\n`;
+    s = s + `resolution    ${g_RES_W}x${g_RES_H} upscaled x${g_upscale} = ${g_RES_W * g_upscale}x${g_RES_H * g_upscale}  (from src/core/config.hml)\n`;
     s = s + `seed          ${g_seed}\n`;
     s = s + `camera        ${g_camx}, ${g_camy}, ${g_camz}\n`;
-    s = s + `look          yaw ${g_yaw} pitch ${g_pitch} fov ${g_fov}\n`;
+    s = s + `look          yaw ${g_yaw} pitch ${g_pitch} fov ${g_fov} vertical  (g_FOV_HIP = ${g_FOV_HIP})\n`;
+    // >>> EVERY FLAG THAT SHAPED THIS PICTURE, PRINTED BACK.  The seven goldens
+    // >>> were unreproducible for exactly the two lines below.
+    s = s + `flags         --tier ${g_tier_want} --tod ${g_tod_h} --back ${g_back} --eye ${g_eye} --pitch ${g_pitch} --dist ${g_dist} --days ${g_days}\n`;
+    s = s + `              --bld ${g_bld} --orbit ${g_orbit} --ladder ${g_ladder} --rung ${g_ladder_rung} dome ${g_dome_on} vm ${g_vm} nosettle ${g_nosettle}\n`;
     s = s + `tod           ${g_tod_h} h  (day_t ${g_day_t})\n`;
     s = s + `fog           near ${g_fog_near} far ${g_fog_far}  (settlement override ${g_SR_FOG_FAR_SETTLEMENT})\n`;
     s = s + `far plane     ${env_far_plane(frame_env())}\n`;
@@ -833,6 +896,106 @@ fn parse_f(p_s: string): f64 {
     return out;
 }
 
+// ===========================================================================
+// 9a.  THE SEVEN GOLDENS — the recipe lives in the tool, not in a shell history
+// ===========================================================================
+// Until 2026-07-31 the seven `docs/shots/settle_*.png` had NO recorded command.
+// Reconstructing them meant solving `camera_place` backwards out of the stats
+// file, and two of the seven could not be reconstructed at all because
+// `--ladder K` and `--rung R` were never printed into the report.  A golden
+// nobody can regenerate is not a golden; it is a rumour with a checksum.
+//
+// So the seven are named here and the report prints every flag back out.
+//
+// >>> THE FOUR LOOK SHOTS TAKE NO `--fov`.  They are the settlement as the
+// >>> PLAYER sees it and the player's lens is `g_FOV_HIP`.  The three geometry
+// >>> instruments ask for a horizontal angle instead (see `fov_v_for_h`), which
+// >>> is the same horizontal framing the 4:3 originals had — the 16:9 frame
+// >>> crops them vertically rather than zooming them out.
+fn scene_apply(p_id: string): i32 {
+    let id: string = p_id;
+    if (id == "settle_city_dusk") {
+        // THE MONEY SHOT.  A finished CITY down the High Road at dusk, from the
+        // green, at the player's own eye height and lens.
+        g_tier_want = 3; g_tod_h = 18.4; g_back = 6.0; g_pitch = -3.0;
+        let a: i32 = 0; return a;
+    }
+    if (id == "settle_village_dawn") {
+        // The same camera at the FIRST tier: what one lantern's worth of town
+        // looks like.  City minus village IS the growth read.
+        g_tier_want = 1; g_tod_h = 6.5; g_back = 6.0; g_pitch = -3.0;
+        let a: i32 = 0; return a;
+    }
+    if (id == "settle_dome_night") {
+        // The warm dome (SETTLEMENT.md 6.4) from 300 m out at 22:00 — the town
+        // seen as a glow on the horizon, which is what "carry it home" means.
+        g_tier_want = 3; g_tod_h = 22.0; g_back = 300.0; g_eye = 12.0;
+        g_pitch = 2.0; g_dome_on = 1;
+        let a: i32 = 0; return a;
+    }
+    if (id == "settle_nodome_night") {
+        // Identical, dome off.  The pair is the evidence; neither half alone is.
+        g_tier_want = 3; g_tod_h = 22.0; g_back = 300.0; g_eye = 12.0;
+        g_pitch = 2.0; g_dome_on = 0;
+        let a: i32 = 0; return a;
+    }
+    if (id == "settle_facade_b1") {
+        // INSTRUMENT: one building at 26 m, the B1 rung, orbited to 45 deg.
+        // 75.2 deg horizontal is what the 4:3 original covered at fov 60.
+        g_tier_want = 3; g_tod_h = 12.0; g_bld = 4; g_orbit = 45.0;
+        g_dist = 26.0; g_pitch = -3.0; g_fov = fov_v_for_h(75.175);
+        let a: i32 = 0; return a;
+    }
+    if (id == "settle_block_b2") {
+        // INSTRUMENT: the same building at 50 m, where the B2 rung takes over.
+        // 44.3 deg horizontal — a long lens, deliberately, so the far rung is
+        // big enough to judge.  DO NOT "fix" this to g_FOV_HIP: the rung is
+        // chosen by DISTANCE, so the distance is what may not move.
+        g_tier_want = 3; g_tod_h = 12.0; g_bld = 4; g_orbit = 90.0;
+        g_dist = 50.0; g_pitch = -1.0; g_fov = fov_v_for_h(44.341);
+        let a: i32 = 0; return a;
+    }
+    if (id == "settle_ladder") {
+        // INSTRUMENT: STAKED -> FRAMED -> CLAD -> DONE of one archetype in a
+        // row.  92.3 deg horizontal, because all four must fit: the row spans
+        // 33 m and the visible half-width at `dist` is `dist * tan(46.17 deg)`.
+        //
+        // >>> `--ladder K`, `--rung R` AND `--dist` WERE NEVER PRINTED INTO THE
+        // >>> STATS REPORT, so the checked-in golden's archetype is NOT
+        // >>> RECOVERABLE.  Its `tris.world = 1248` does not occur at ANY of
+        // >>> K = 0..7 x rung 0..2 x dist 10..20 on this tree (nearest 1229), so
+        // >>> the picture also predates the current `hubgen`.  K = 3 is a fresh
+        // >>> choice, not a reconstruction, and it is stated as one.
+        // dist/eye/pitch are set so all four rungs are actually in frame and
+        // above the grass line; at the golden's old 14 m / eye 7.5 the row does
+        // not fit and the near wall fills the picture.
+        g_tier_want = 3; g_tod_h = 10.0; g_ladder = 3; g_ladder_rung = 0;
+        g_dist = 22.0; g_back = 2.0; g_eye = 4.0;
+        g_yaw = 200.0; g_yaw_ovr = 1; g_pitch = -6.0;
+        g_fov = fov_v_for_h(92.342);
+        let a: i32 = 0; return a;
+    }
+    let bad: i32 = -1;
+    return bad;
+}
+
+let g_SCENES: array = [
+    "settle_city_dusk", "settle_village_dawn", "settle_dome_night",
+    "settle_nodome_night", "settle_facade_b1", "settle_block_b2",
+    "settle_ladder"
+];
+
+fn scene_list() {
+    print("settle_shot scenes (each writes docs/shots/<id>.png at 960x540):");
+    let n: i32 = g_SCENES.length;
+    for (let i = 0; i < n; i++) {
+        print(`  ${g_SCENES[i]}`);
+    }
+    print("");
+    print("  SDL_VIDEODRIVER=dummy /tmp/sshot --scene settle_city_dusk \\");
+    print("                        --out docs/shots/settle_city_dusk.png");
+}
+
 fn main() {
     if (running_interpreted()) {
         eprint("settle_shot: compiled only. hemlockc -O1 tools/settle_shot.hml -o /tmp/sshot");
@@ -842,7 +1005,17 @@ fn main() {
     let n: i32 = args.length;
     for (let i = 1; i < n; i++) {
         let a: string = args[i];
-        if (a == "--out" && i + 1 < n) { out = args[i + 1]; i++; }
+        if (a == "--scene" && i + 1 < n) {
+            i++;
+            if (args[i] == "list") { scene_list(); exit(0); }
+            g_scene = args[i];
+            if (scene_apply(g_scene) != 0) {
+                eprint(`settle_shot: unknown scene '${g_scene}'`);
+                scene_list();
+                exit(2);
+            }
+        }
+        else if (a == "--out" && i + 1 < n) { out = args[i + 1]; i++; }
         else if (a == "--tier" && i + 1 < n) { g_tier_want = i32(parse_f(args[i + 1])); i++; }
         else if (a == "--tod" && i + 1 < n) { g_tod_h = parse_f(args[i + 1]); i++; }
         else if (a == "--seed" && i + 1 < n) { g_seed = i32(parse_f(args[i + 1])); i++; }
@@ -863,7 +1036,7 @@ fn main() {
         else if (a == "--bld" && i + 1 < n) { g_bld = i32(parse_f(args[i + 1])); i++; }
         else if (a == "--orbit" && i + 1 < n) { g_orbit = parse_f(args[i + 1]); i++; }
         else if (a == "--dist" && i + 1 < n) { g_dist = parse_f(args[i + 1]); i++; }
-        else if (a == "--scale" && i + 1 < n) { g_upscale = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--scale" && i + 1 < n) { g_upscale = clampi(i32(parse_f(args[i + 1])), 1, g_UPSCALE_MAX); i++; }
     }
 
     g_win = window_open_ex("nightshade settle_shot", g_RES_W, g_RES_H, 1, 0);
