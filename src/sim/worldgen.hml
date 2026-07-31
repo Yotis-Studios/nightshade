@@ -666,3 +666,158 @@ export fn worldgen_chunk_height_m(p_heights: buffer, p_i: i32, p_j: i32): f64 {
     let out: f64 = f64(lo + hi * 256) * 0.01;
     return out;
 }
+
+// ===========================================================================
+// MULTI-SITE SELECTION — the settlement anchor lattice.   DIRECTION.md §8.
+// ===========================================================================
+// > Owner: "is it possible for settlements to be travelable by foot? ... you
+// > would need to have logic to prevent the seed from putting places too close"
+//
+// This block is the WHERE-CAN-A-TOWN-BE half of that.  It answers, purely from
+// the seed, two questions and no others:
+//
+//     * which 1200 m cells of the world hold a settlement at all
+//     * which 81 world points inside such a cell are the candidate centres
+//
+// It does NOT score them.  Scoring needs `settle_site_score`, which needs the
+// SETTLEMENT.md §1.3 criteria, which live in `src/sim/settle.hml`.  Putting the
+// lattice here and the scorer there is what keeps the dependency acyclic:
+// settle.hml imports worldgen.hml and never the reverse.
+//
+// ---------------------------------------------------------------------------
+// WHY A JITTERED CELL LATTICE AND NOT DART-THROWING
+// ---------------------------------------------------------------------------
+// DIRECTION.md §8 asks for "deterministic blue-noise / Poisson-disc sampling
+// with a minimum radius, seeded".  Classic dart-throwing needs a global
+// accept/reject pass over the whole world and therefore global state; it cannot
+// answer "is there a town near (x, z)?" without generating every town first.
+// That is exactly the property a streaming open world cannot afford, and it is
+// the property `worldgen` has protected everywhere else (lanterns are placed
+// STRUCTURALLY, one per 2x2 block, for the same reason — see the header).
+//
+// So the sampler is a jittered cell lattice with a HARD, PROVABLE separation
+// bound instead of a statistical one:
+//
+//     cell edge                 CELL     = 1200 m     (DIRECTION.md's typical)
+//     anchor jitter, per axis   JITTER   = +/- 52 m
+//     candidate lattice         9 x 9 at 12 m         (SETTLEMENT.md §1.3)
+//     => max deviation of a chosen site from its cell centre, per axis:
+//            DEV = JITTER + (9 - 1)/2 * 12 = 52 + 48 = 100 m
+//     => two sites in ADJACENT cells differ on that axis by at least
+//            CELL - 2*DEV = 1200 - 200 = 1000 m = WG_SITE_MIN_SEP_M
+//
+// which is DIRECTION.md §8's "minimum separation ~1000 m guarantees real wild
+// between two settlements even at full City growth (320 + 320 = 640 m of
+// rings)".  Non-adjacent cells are trivially further.  The bound is ARITHMETIC,
+// not measured — `probe_settle` §S measures it too, over 8 seeds x 441 cells,
+// precisely because an arithmetic bound that nobody re-checks is a comment.
+//
+// Blue-noise irregularity comes from OCCUPANCY, not from the lattice: roughly
+// three cells in five hold a settlement (`worldgen_site_occupied_roll`), so the
+// pattern the player walks through is a sparse irregular scatter at 1000 -
+// 2700 m spacing, not a grid of towns.  A cell that rolls empty is a cell whose
+// wild you cross on the way somewhere.
+//
+// ---------------------------------------------------------------------------
+// CELL (0, 0) IS THE HOME CELL AND IS SPECIAL, DELIBERATELY
+// ---------------------------------------------------------------------------
+// SETTLEMENT.md §1.1 requires the tutorial settlement's centre to lie inside the
+// +/-48 m square around the world origin, because `worldgen_shade_tier` forces
+// tier 0 inside 64 m and `worldgen_biome_tmd` forces Hollowfield inside 96 m and
+// neither takes a settlement position.  So cell (0, 0) has ZERO anchor jitter —
+// its 81 candidates are exactly the +/-48 m lattice that document specifies —
+// and it is ALWAYS occupied.  Every other cell jitters.  The separation proof
+// above is unaffected: zero jitter is inside the +/-52 m bound.
+// ===========================================================================
+
+export let WG_SITE_CELL_M     = 1200.0;   // settlement cell edge, metres
+export let WG_SITE_MIN_SEP_M  = 1000.0;   // proven lower bound on separation
+export let WG_SITE_JITTER_M   = 52.0;     // anchor jitter half-range, per axis
+export let WG_SITE_LAT_N      = 9;        // candidate lattice edge
+export let WG_SITE_LAT_STEP_M = 12.0;     // candidate lattice pitch
+export let WG_SITE_CANDIDATES = 81;       // WG_SITE_LAT_N * WG_SITE_LAT_N
+export let WG_SITE_MAX_DEV_M  = 100.0;    // JITTER + 4 * LAT_STEP; see the proof
+export let WG_SITE_OCCUPANCY  = 0.60;     // target fraction of cells with a town
+
+// World metres -> settlement cell coordinate.  Floor division, correct for
+// negatives: cell 0 spans [-600, +600) so the origin sits at its centre.
+export fn worldgen_site_cell_of(p_w: f64): i32 {
+    let w: f64 = p_w;
+    let out: i32 = floori((w + 600.0) * 0.0008333333333333334);   // /1200
+    return out;
+}
+
+// Centre of cell (gx, gz), in world metres.
+export fn worldgen_site_cell_cx(p_gx: i32): f64 {
+    let out: f64 = f64(p_gx) * 1200.0;
+    return out;
+}
+
+export fn worldgen_site_cell_cz(p_gz: i32): f64 {
+    let out: f64 = f64(p_gz) * 1200.0;
+    return out;
+}
+
+// The jittered anchor of a cell — the centre of its 9x9 candidate lattice.
+// Cell (0, 0) does not jitter (see the header).
+export fn worldgen_site_anchor_x(p_seed: i32, p_gx: i32, p_gz: i32): f64 {
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+    let c: f64 = f64(gx) * 1200.0;
+    if (gx == 0) {
+        if (gz == 0) { let home: f64 = c; return home; }
+    }
+    let h: u64 = xhash2(gx, gz, p_seed ^ 1442695041);
+    let u: f64 = f64(h & 65535) * 0.0000152587890625;    // [0, 1)
+    let out: f64 = c + (u - 0.5) * 104.0;                // +/- 52 m
+    return out;
+}
+
+export fn worldgen_site_anchor_z(p_seed: i32, p_gx: i32, p_gz: i32): f64 {
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+    let c: f64 = f64(gz) * 1200.0;
+    if (gx == 0) {
+        if (gz == 0) { let home: f64 = c; return home; }
+    }
+    let h: u64 = xhash2(gx, gz, p_seed ^ 1103515245);
+    let u: f64 = f64(h & 65535) * 0.0000152587890625;
+    let out: f64 = c + (u - 0.5) * 104.0;
+    return out;
+}
+
+// Candidate k of cell (gx, gz), k in 0..80, on the 9x9 / 12 m lattice.
+// k = j * 9 + i, i along +X and j along +Z — the same row-major order
+// `worldgen_chunk` uses, so nothing downstream has to remember two conventions.
+export fn worldgen_site_cand_x(p_seed: i32, p_gx: i32, p_gz: i32, p_k: i32): f64 {
+    let k: i32 = clampi(p_k, 0, 80);
+    let i: i32 = k % 9;
+    let a: f64 = worldgen_site_anchor_x(p_seed, p_gx, p_gz);
+    let out: f64 = a + f64(i - 4) * 12.0;
+    return out;
+}
+
+export fn worldgen_site_cand_z(p_seed: i32, p_gx: i32, p_gz: i32, p_k: i32): f64 {
+    let k: i32 = clampi(p_k, 0, 80);
+    let j: i32 = (k - (k % 9)) / 9;
+    let a: f64 = worldgen_site_anchor_z(p_seed, p_gx, p_gz);
+    let out: f64 = a + f64(j - 4) * 12.0;
+    return out;
+}
+
+// 1 if this cell holds a settlement at all.  Cell (0, 0) always does — it is
+// the one the player wakes up in.  Everything else is a hash roll at
+// WG_SITE_OCCUPANCY.  This is the blue-noise term: the lattice is regular, the
+// OCCUPANCY is not, and it is occupancy the player experiences as spacing.
+export fn worldgen_site_occupied_roll(p_seed: i32, p_gx: i32, p_gz: i32): i32 {
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+    if (gx == 0) {
+        if (gz == 0) { let home: i32 = 1; return home; }
+    }
+    let h: u64 = xhash2(gx, gz, p_seed ^ 1911520717);
+    let u: f64 = f64(h) * 2.3283064365386963e-10;        // [0, 1)
+    let out: i32 = 0;
+    if (u < 0.60) { out = 1; }
+    return out;
+}

@@ -358,6 +358,119 @@ export let g_MAX_DYNAMIC_LIGHTS: i32 = 4;
 export let g_ENV_LIGHT_SLOTS: i32 = 4;               // the engine's array size
 
 // ---------------------------------------------------------------------------
+// THE NIGHT VEIL — the world is eaten by night, and a light HOLDS THE DARK OFF
+// ---------------------------------------------------------------------------
+// CLAUDE.md §6: vertex colour MULTIPLIES the texture, so a light can only
+// DARKEN.  Every previous attempt to make the lantern visible therefore added
+// an additive sprite, which is the wrong sign: measured, disabling the sprite
+// made the scene DARKER by 10-13 luminance, so "the light" was a decal.
+//
+// The model that fits both the renderer and the fiction is the inverse:
+// **the world is multiplied DOWN at night, and a light multiplies it back UP
+// toward 1.0.**  A lit region is an un-darkened region — the same shape as
+// CIVIC LIGHT in docs/design/MULTIPLAYER.md.
+//
+// These three numbers are the multiplier an UNLIT world surface falls to at
+// full night.  They are applied by `src/render/world_render.hml` at stage 13,
+// as the ambient of a transient env bound for the terrain pass only, with the
+// sun/bounce/rim zeroed — so the per-vertex modelling still comes entirely
+// from the bake (CLAUDE.md §9 rule 4 is not violated: the terrain is NOT
+// flat-lit, it is flat-DARKENED) and the committed dynamic lights add back on
+// top with the engine's own `(1 - d/r)^2 * max(0.25, N.L)` falloff.
+//
+// COLOUR: cool, and slightly blue-biased, because ART_BIBLE §4.2 says night is
+// blue and dark.  The blue channel is held highest so what survives the dark
+// is the cold end — the warm lantern then reads as warm BY CONTRAST, which is
+// free chroma separation the ground albedo itself cannot pay for (see
+// src/art/tod.hml, "WHAT THIS FILE CANNOT DO").
+//
+// DEPTH: 0.12/0.13/0.20 is a 7.7x cut in green, the channel that carries 71 %
+// of luminance.  Measured on the rendered ground band (native rows 150..185,
+// viewmodel window excluded), 22:00, real display, HUD suppressed, additive
+// pool DISABLED, `lantern ON minus OFF` — which read +0.000 with ZERO pixels
+// moved on every one of these scenes before the veil existed:
+//
+//     scene @ 22:00      OFF      ON     delta
+//     ridge_golden       8.11   42.66   +34.55
+//     flat_debug         8.25   43.09   +34.84
+//     hub_dawn           8.59   36.24   +27.65
+//     muzzle_fog        13.44   40.28   +26.85
+//     ns_bloom           7.62   28.24   +20.62   <- see below
+//
+// against the +25 the brief asks for.  ns_bloom is the one scene that does not
+// clear it and the reason is a CEILING, not the veil: WX_BLOOM overrides the
+// ambient almost totally to a violet (src/art/tod.hml), so the night BAKE
+// lands the band at 28.24 and 28.24 is the arithmetic maximum ANY veil could
+// deliver there — a light cannot exceed the albedo (CLAUDE.md §6).  Fixing it
+// means re-authoring ART_BIBLE 12.4's violet exposure, which is a separate art
+// call and was not made here.
+//
+// >>> DEEPER IS NOT BETTER.  `delta = bake * (1 - veil)`, so the delta is
+// >>> bounded above by the night bake and the last few points of it cost a
+// >>> nearly-black unlit ground.  0.12 already puts the unveiled band under 9
+// >>> on four of five scenes; below that the pool stops reading as a pool
+// >>> inside a night and starts reading as a spotlight inside a cave.
+export let g_NIGHT_VEIL_R: f64 = 0.12;
+export let g_NIGHT_VEIL_G: f64 = 0.13;
+export let g_NIGHT_VEIL_B: f64 = 0.20;
+
+// >>> THE VEIL HAS ITS OWN GATE, AND IT IS NARROWER THAN THE LANTERN'S.
+// Both gates read the same number — the env fog tint's luminance, which
+// `g_LANTERN_GATE_*` below explains is the one field that tracks perceived
+// darkness across a day:
+//
+//     clock  11.9  18.25  19.50  22.00  02.00  05.50
+//     foglum 0.855 0.783  0.542  0.480  0.409  0.845
+//
+// The LANTERN gate (0.52 .. 0.72) is deliberately generous: a lantern lit early
+// costs nothing.  THE VEIL IS NOT FREE AND MUST NOT BE GENEROUS.  On the
+// lantern's thresholds, 19:30 scores 0.966 — dusk would be 97 % veiled, and
+// measured on `ridge_golden --tod 19.5` that takes the ground band from 41.95
+// to about 9.  Dusk is a LIT hour: `src/art/tod.hml` calls it "the darkest of
+// the lit hours" and the brief's non-regression floor is written against it.
+//
+// 0.470 .. 0.545 puts the veil where the fiction puts it — after the light has
+// actually gone:
+//
+//     18:15 golden  0.000      19:30 dusk  0.005      22:00 night  0.945
+//     05:30 dawn    0.000      12:00 noon  0.000      02:00 deep   1.000
+//
+// and the crossing takes ~80 s of real time (the fog tint lerps between the
+// DUSK and NIGHT keyframes over 0.0835 of a 16-minute day), i.e. 0.02 % of the
+// veil per frame — three orders under the 4 %/frame discontinuity budget.
+export let g_VEIL_GATE_NIGHT: f64 = 0.470;
+export let g_VEIL_GATE_DAY: f64 = 0.545;
+
+// The curve both gates use, as a FUNCTION rather than as a number copied into
+// two files.  It lives here, in `src/core`, for one reason: `src/render` links
+// SDL through wobbleweed, so a headless probe cannot import `world_render.hml`
+// to check the veil schedule.  With the curve in core, `tools/probe_night.hml`
+// asserts the SAME code the frame runs, and there is no transcription that can
+// drift.  Pure, deterministic, no state: `p_lum` is the env fog tint's
+// luminance, and the answer is 0 in daylight, 1 in full dark.
+export fn gate_darkness(p_lum: f64, p_night: f64, p_day: f64): f64 {
+    let lum: f64 = p_lum;
+    let night: f64 = p_night;
+    let day: f64 = p_day;
+    let span: f64 = day - night;
+    if (span <= 0.0) { let one: f64 = 1.0; return one; }
+    let u: f64 = (day - lum) / span;
+    if (u <= 0.0) { let z: f64 = 0.0; return z; }
+    if (u >= 1.0) { let o: f64 = 1.0; return o; }
+    // Smoothstep, so dusk closes over the world across minutes rather than
+    // popping at one frame boundary.
+    let out: f64 = u * u * (3.0 - 2.0 * u);
+    return out;
+}
+
+// The env fog tint's luminance — "how dark is the world", in ONE place.
+// Rec.601 weights, which is what the light manager has always used here.
+export fn fog_tint_luma(p_r: f64, p_g: f64, p_b: f64): f64 {
+    let out: f64 = 0.299 * p_r + 0.587 * p_g + 0.114 * p_b;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // THE PLAYER'S LANTERN, as a real light.
 // ---------------------------------------------------------------------------
 // The lantern is the viewmodel: it is in the player's hand in every scene that
@@ -372,12 +485,35 @@ export let g_LANTERN_OFS_FWD: f64 = 0.62;            // ahead of the eye
 export let g_LANTERN_OFS_RIGHT: f64 = 0.34;          // toward the held hand
 export let g_LANTERN_OFS_DOWN: f64 = 0.58;           // below the eye
 
-// A believable radius for an oil lantern: it reaches the ground you are
-// standing on and the wall you are next to, and it does not light a field.
-// 7 m puts the pool's visible edge at ~4.3 m (fx.hml draws the ground card at
-// radius * 0.62), which at eye height 1.7 m and pitch 0 lands in the lower
-// third of the frame — where a lantern pool belongs.
-export let g_LANTERN_RADIUS: f64 = 7.0;
+// >>> 18 m, AND IT IS SET BY A MEASUREMENT, NOT BY A GUESS AT AN OIL LAMP.
+// This constant used to be 7.0, justified as "a believable radius for an oil
+// lantern: it reaches the ground you are standing on and the wall you are next
+// to, and it does not light a field."  That reasoning was sound for a light
+// that had no effect; it is wrong for one that does, and here is why.
+//
+// THE ENGINE'S POINT TERM IS `colour * (1 - d/r)^2 * max(0.25, N.L)`.  On flat
+// ground the cosine is grazing past ~4 m and the `max(0.25, ...)` floor takes
+// over, so the term is essentially `colour * 0.25 * (1 - d/r)^2` and the light
+// SATURATES the veil out to `d ~ 0.5 * r` and is gone by `r`.  The measurement
+// band the brief is judged on — native rows 150..185 — is the ground from
+// about 5 m to about 9 m at eye height with pitch -3, because that is where
+// the lower third of a 55-degree vertical FOV lands.  A 7 m radius does not
+// reach the band at all; a 14 m radius saturates to 7 m and left `hub_dawn`
+// at +16.45 against a +25 target; 18 m saturates to 9 m.  Measured, pool
+// disabled, `lantern ON minus OFF` on the ground band at 22:00:
+//
+//     radius / gain     muzzle_fog  ns_bloom  ridge_golden  flat_debug  hub_dawn
+//     14 / 18             +25.66     +20.46      +33.93       +29.77     +16.45
+//     18 / 24             +26.85     +20.62      +34.55       +34.84     +27.65
+//
+// LOOKED AT, both, at 320x240 on a real display.  18 m still reads as a POOL
+// and not as an ambient lift, because the falloff is squared: the far half of
+// the frame is dark in every night scene in the harness and the pool's edge is
+// visible in all five.  For scale, this is not a large light in this project's
+// own terms — `g_LANTERN_R_T1` below, the FIRST settlement lantern tier, is
+// 40 m, and DIRECTION.md §2 makes the held lantern the anchor of the magic
+// side rather than a period oil lamp.
+export let g_LANTERN_RADIUS: f64 = 18.0;
 
 // The lantern's LIGHT colour, linear, as a multiplier — not a surface colour,
 // so palette.hml is not its owner (CLAUDE.md §8 governs albedo; light colour is
@@ -395,31 +531,70 @@ export let g_LANTERN_LIGHT_R: f64 = 1.00;
 export let g_LANTERN_LIGHT_G: f64 = 0.78;
 export let g_LANTERN_LIGHT_B: f64 = 0.52;
 
-// Gain on the colour above.  2.4 matches the multiplier main.hml already uses
-// for the world lantern post, so a held lantern and a lit lantern post read as
-// the same kind of light.
+// >>> THE GAIN IS 19 AND IT IS NOT COMPARABLE TO THE OLD 2.4.
+// The old value matched `main.hml`'s settlement-lantern post so a held lantern
+// and a lit lantern post read as the same kind of light.  They read as the
+// same kind of light because NEITHER OF THEM READ AT ALL: measured 2026-07-30,
+// additive pool disabled, ground band rows 150..185, real display, the dynamic
+// light moved **mean +0.000, max +0.00, ZERO of 8856 pixels** on muzzle_fog,
+// ns_bloom AND ridge_golden at 22:00.  The light was placed, ranked and
+// committed correctly and changed nothing, because the surface was already at
+// its baked ceiling and vertex colour can only darken (CLAUDE.md §6).
 //
-// >>> 2.4 IS A CORRECT NUMBER FOR THE CURRENT LIGHTING MODEL AND THE WRONG
-// >>> NUMBER FOR THE INVERTED ONE.  Do not raise it on its own.
-// Measured 2026-07-30, native 320x240, real display, ground band rows 150..185:
-// with the additive pool disabled, `lantern ON minus OFF` is **mean +0.000,
-// max +0.00, zero pixels moved** on muzzle_fog, ns_bloom AND ridge_golden at
-// 22:00.  The dynamic light is placed, ranked and committed correctly; it
-// changes no ground pixel because the surface it lands on is already at its
-// baked ceiling and vertex colour can only darken (CLAUDE.md §6).  The whole
-// visible lantern is the stage-16b sprite: +12.62 and +14.68 in the same band.
+// With THE NIGHT VEIL above, the light has a floor to lift.  What it has to
+// lift it against is the engine's falloff: at 7 m on flat ground the term is
+// `0.25 * (1 - 7/18)^2 = 0.093` of the colour, and the lantern's green channel
+// is 0.78, so clearing a 0.13 floor to 1.0 there needs a gain of
+// `0.87 / (0.78 * 0.093) = 12`, and clearing it at 9 m needs
+// `0.87 / (0.78 * 0.25 * (1 - 9/18)^2) = 17.9`.
 //
-// The fix is a DARKER default at night that a light multiplies back toward 1.0,
-// and it needs two engine changes plus a project-wide re-authoring of every
-// light gain — the engine's point term is
-// `colour * (1 - d/r)^2 * max(0.25, N.L)`, which on flat ground at 5 m is
-// 0.06 * colour, so lifting a 0.45 night floor there wants colour ~7.5 where
-// this constant and main.hml's lantern post both say 2.4.  The four measured
-// blockers, the swept ceiling (+20.9 against a +25 target) and the exact
-// engine items E1..E4 are written up once, in `src/art/tod.hml` under
-// "THE INVERTED NIGHT MODEL".  Read that before touching this constant,
-// `g_LANTERN_RADIUS`, or the two pool numbers below.
-export let g_LANTERN_GAIN: f64 = 2.4;
+// >>> CUT 7 — THE GAIN WAS 24 AND THAT WAS AN ARITHMETIC SLIP THAT SHIPPED A
+// >>> FLOODLIGHT.  The line above used to end "and clearing it at 9 m needs 24".
+// >>> Evaluate it: `0.25 * (1 - 9/18)^2 = 0.0625`, and `0.87 / (0.78*0.0625)`
+// >>> is **17.9**, not 24.  The derivation this comment gives has always
+// >>> produced ~18; the constant beneath it was a third higher than its own
+// >>> stated reasoning, and nothing measured the difference because the
+// >>> acceptance test (ground band mean) is dominated by the SATURATED near
+// >>> field and cannot see the edge at all.
+// >>>
+// >>> `tools/probe_night.hml` [4] can, and it FAILED on the tree this cut
+// >>> inherited — "the pool has an EDGE: 11 m is well down the falloff",
+// >>> asserting the green multiplier at 11 m is under 0.70:
+// >>>
+// >>>     gain   green mul @ 0 m   @ 5 m   @ 11 m   @ 20 m   probe [4]
+// >>>     24.0        1.0000      1.0000   0.8275   0.1294   FAIL
+// >>>     19.0        1.0000      1.0000   0.6824   0.1294   pass
+// >>>     17.0        1.0000      1.0000   0.6235   0.1294   pass
+// >>>
+// >>> At 24 the lantern SATURATES the veil out to 10.2 m of an 18 m radius and
+// >>> still returns 83 % of the world at 11 m: that is not a pool with an edge,
+// >>> it is a floodlight with a soft rim, and "you push the dark back one
+// >>> lantern at a time" needs the dark to still be there at the rim.
+// >>>
+// >>> THE WINDOW IS NARROW AND BOTH WALLS ARE MEASURED — DO NOT MOVE THIS
+// >>> CONSTANT WITHOUT RE-RUNNING BOTH:
+// >>>   * `g < 19.66` or probe_night [4]'s EDGE assertion fails,
+// >>>   * `g >= 18.2` or `hub_dawn`'s ground band at 22:00 falls under the
+// >>>     brief's `lantern ON minus OFF >= +25` (measured +27.22 at 24,
+// >>>     +25.51 at 19, +24.38 at 17 — about 0.4 luminance per unit of gain).
+// >>> 19.0 sits in that window and saturates the veil out to 9.27 m, which is
+// >>> the 9 m the derivation above was aiming at all along.  LOOKED AT at
+// >>> 320x240 on a real display, gain 24 and gain 19 are indistinguishable in
+// >>> the near field — every pixel that changed was in the falloff, which is
+// >>> the whole point.
+//
+// >>> AND THAT MAKES EVERY OTHER LIGHT IN THE PROJECT 10x TOO WEAK.  This is
+// >>> E4 in `src/art/tod.hml` and it is REPORTED, NOT FIXED, because the two
+// >>> call sites are not this task's files:
+// >>>   * `src/game/main.hml` posts its settlement lantern at
+// >>>     `palette/255 * 2.4`,
+// >>>   * `tools/shot.hml` posts its muzzle flash at 2.6 and its shrine at 2.2.
+// >>> Against a 0.13 veil those are visible only within ~2 m of the source, so
+// >>> a village of lantern posts will not read until they are re-authored to
+// >>> the same order as this constant.  A CIVIC LIGHT design whose civic lights
+// >>> are invisible is broken at the pillar; whoever owns those two files
+// >>> should move them together, in one change, against the table above.
+export let g_LANTERN_GAIN: f64 = 19.0;
 
 // >>> THE DAYLIGHT GATE.  A lantern pool on sunlit grass is a bug.
 // The light manager scales the lantern by how dark the world actually is,
@@ -519,29 +694,43 @@ export let g_LANTERN_POOL_LIFT: f64 = 0.15;
 // single card; at 0.62 the pool's visible edge lands at 4.3 m and the nearest
 // ground the camera can see at eye height 2.1 m and pitch -3 is 4.0 m, so
 // almost none of it is on screen.)
-export let g_LANTERN_POOL_SPAN: f64 = 1.0;
+export let g_LANTERN_POOL_SPAN: f64 = 0.35;
 
-// Additive brightness per unit of light colour, matching fx.hml's own card so
-// the two cannot drift: `rgb = clamp(light_rgb * 96, 0, 255)`.
+// >>> ZERO. THE ADDITIVE GROUND POOL IS DELETED, AND THAT IS THE POINT OF THE
+// >>> WHOLE CHANGE.  `lantern_pool_emit` early-outs on a zero colour before it
+// >>> samples a single terrain height, so stage 16b now costs one compare.
 //
-// >>> THIS SPRITE IS CURRENTLY THE ENTIRE LANTERN, AND THAT IS THE DEFECT.
-// `gain * SCALE` = 2.4 * 42 = 100.8, so the pool's centre adds ~(100,78,52) to
-// whatever ground is under it, flat, over the full `RADIUS * SPAN` disc.
-// Measured contribution to the ground band at 22:00 on a real display: +12.62
-// (muzzle_fog), +14.68 (ns_bloom), against +0.000 from the dynamic light beside
-// it.  Two consequences to keep in view:
-//   * the sprite ADDS, so it cannot respect the texture underneath — it is the
-//     only thing standing between the lantern and "lights nothing", and it pays
-//     for that with the grass detail inside the pool;
-//   * HEADLESS it is not even additive.  SDL's software renderer collapses
-//     BLEND_ADD to BLEND and this card is emitted OPAQUE, so under
-//     `SDL_VIDEODRIVER=dummy` it REPLACES the ground: same frame, ground-band
-//     peak luminance 186 headless against 87 on `DISPLAY=:0`.  Night-scene
-//     glow, peak and texture numbers must be taken on a real display.
-// When E1/E2 in `src/art/tod.hml` land and the light does the work, cut this
-// back to a contact glow (span ~0.3, scale ~4) in the same commit — a real
-// light under an unchanged sprite is measurably worse than either alone.
-export let g_LANTERN_POOL_SCALE: f64 = 42.0;
+// WHAT IT WAS.  `rgb = light_rgb * gain * SCALE`, flat, over the full
+// `RADIUS * SPAN` disc: at the old 2.4 * 42 it added ~(100,78,52) to whatever
+// ground was under it.  Measured contribution to the ground band at 22:00 on a
+// real display: **+12.62 (muzzle_fog), +14.68 (ns_bloom)** — against +0.000
+// from the dynamic light beside it.  The sprite WAS the lantern, and because
+// it ADDS it could not respect the texture underneath: it paid for the illusion
+// with the grass detail inside the pool, and it was worth +12 to the ground
+// band at DUSK as well, which is how this file's day table came to record a
+// dusk 12 luminance brighter than dusk actually was.
+//
+// WHAT REPLACES IT: the veil above and the real point light, which MULTIPLY, so
+// the pool is the ground's own albedo and texture rather than a wash over it.
+//
+// WHAT DELETING IT BOUGHT.  `--scene muzzle_fog --tod 22.0`, min of 7 whole
+// process runs, loadavg 12.2:
+//     emit.fx        0.642 -> 0.123 ms      triangles drawn  1158 -> 1082
+// and the whole frame (`frame ms - sky`) went 7.814 -> 6.866 ms, i.e. the
+// night got 0.948 ms CHEAPER even after paying +0.661 ms for the lit terrain
+// branch the veil runs on.
+//
+// >>> WHY NOT "A SMALL HOT CORE AT THE FLAME".  Tried, at SPAN 0.35 /
+// >>> SCALE 10, and LOOKED AT next to SCALE 0 on muzzle_fog and ridge_golden:
+// >>> the pool is centred on the EYE, the nearest ground the camera can see at
+// >>> eye height with pitch -3 is ~2.9 m, and a core small enough not to wash
+// >>> is already at `(1 - 2.9/4.9)^2 = 0.15` of peak there.  It contributed a
+// >>> faint warm haze over the bottom-left grass and took the grass texture
+// >>> with it.  The emitter and its DIV/HDIV/LIFT/SPAN constants are KEPT — a
+// >>> campfire, a dropped torch or a settlement brazier is a light the camera
+// >>> is OUTSIDE of, which is the case the grid was built for and the case it
+// >>> is good at.  Only the player's own lantern stops drawing one.
+export let g_LANTERN_POOL_SCALE: f64 = 0.0;
 
 // Field of view (GDD §2.3).  Degrees.
 export let g_FOV_HIP: f64 = 70.0;
@@ -743,47 +932,90 @@ export let g_AI_WHISKER_M: f64 = 4.0;
 // ===========================================================================
 // 11. THE WAVE DIRECTOR  (GDD §2.6 + §8)
 // ===========================================================================
-// budget(tier, wave) = 15 + 45*tier + 72*wave, wave in 0..2, tier the 0..5
-// SHADE TIER INDEX.  Read at tier 1, that is 60 + 72*wave.
+// budget(tier, wave) = 0 + 36*tier + 96*wave, wave in 0..2, tier the 0..5
+// SHADE TIER INDEX.  Read at tier 1, that is 36 + 96*wave  ->  36 / 132 / 228.
 //
 // ---------------------------------------------------------------------------
-// WHY THE BASE IS 15 AND NOT THE GDD'S 60 — GAME_DESIGN §2.6 vs §8
+// §8's TWO ANCHORS CONTRADICT EACH OTHER.  THE BODY COUNT WINS.
 // ---------------------------------------------------------------------------
-// GDD §2.6 writes `budget(tier, wave) = 60 + 45*tier + 18*wave`.  GDD §8, the
-// spec for the first sixty seconds, writes "0:36-0:55 | Wave 1, tier 1,
-// budget 60".  Those two statements are not compatible: the §2.6 formula
-// evaluated at tier 1 is 105, not 60.  The two are reconciled by the only
-// reading that satisfies both — §2.6's `tier` is 1-BASED (the first hold you
-// ever play is "tier 1"), while the implementation's `tier` is the 0..5 shade
-// tier INDEX that worldgen and the fog ladder use, where a lit lantern is 0.
-// So the shipped formula is the GDD's own escalation re-indexed:
+// GAME_DESIGN §8, 0:36-0:55, states BOTH of these about the same wave:
 //
-//      60 + 45*(tier - 1)  ==  15 + 45*tier          identical for all tier
+//      "Wave 1, tier 1, budget 60"        <- an accounting number
+//      "~4 Husks and 6 Wisps"             <- what the player actually sees
 //
-// and §8's anchor falls out of it exactly: director_budget(1, 0) == 60.
-// `tools/probe_director.hml` pins that 60 with a LITERAL assertion, not with a
-// re-derivation from these three constants, because a relative assertion is
-// exactly how this drifted in the first place.
+// At GDD §2.2's own spawn-cost column (Wisp 2, Mote 3, Husk 6) those two are
+// not the same wave.  4 Husks + 6 Wisps is 4*6 + 6*2 = 36 POINTS AND 10 BODIES.
+// 60 points against tier 1's mean pool cost of 3.35 is 17.9 BODIES — nearly
+// double, and the difference is not cosmetic:
 //
-// WHAT 105 COST.  105 points against tier 1's mean pool cost of 3.35 is ~31
-// bodies in wave 1 alone, which saturates the 14-body alive cap and holds it
-// saturated; the wave then cannot clear, and every §8 beat downstream of the
-// clear — WAVE 1 CLEARED, the path of lit lanterns, Odo, the village — never
-// arrives.  MEASURED before: wave 1 unclearable.  After: 60 points, ~18 bodies.
+//   MEASURED, `tools/probe_waveone.hml`, a bot that aims in 3-D, kites, uses
+//   iron sights, reloads on the gap and never leaves the lantern's supply
+//   radius:  0 of 12 first minutes cleared wave 1 at 60 points.  The director
+//   pins at alive = 14 of 14 and stays there.  The reason is the ammunition
+//   economy, not the aim: the opening loadout is 6 + 12 rounds and the lit
+//   lantern resupplies 1 round / 0.8 s = 1.25 rounds/s, while 17.9 bodies
+//   arriving at a 1.15 s cadence demand ~1.09 rounds/s sustained at point
+//   blank and MORE past 14 m, where the Kestrel's 45 damage stops being a
+//   two-shot Husk.  The player never gets ahead, so every §8 beat downstream
+//   of the clear — WAVE 1 CLEARED, the path of lit lanterns, Odo, the village —
+//   never arrives.  At 36 points the same bot clears 12 of 12.
 //
-// RESIDUAL DOC GAP, stated rather than papered over: §8 illustrates its 60
-// points as "~4 Husks and 6 Wisps", which is 4*6 + 6*2 = 36 points, not 60, and
-// 10 bodies, not 18.  60 points is the number §8 states outright, so 60 is what
-// is implemented.  Closing the remaining gap would mean raising the per-body
-// spawn COSTS, which live in `sim/director.hml` / `sim/ai.hml` — not this file.
-export let g_DIR_BUDGET_BASE: i32 = 15;
-export let g_DIR_BUDGET_PER_TIER: i32 = 45;
-// 18 -> 72.  See THE NIGHT HOLD, at g_DIR_SPAWN_CADENCE_S below: re-basing the
-// tier-1 wave-1 budget from 105 to 60 removes 45 points from every wave of
-// every hold, and the per-wave escalation is what puts them back where they
-// belong — at the END of the hold, which is where escalation is supposed to
-// live.  Tier 1 now reads 60 / 132 / 204 instead of 105 / 123 / 141.
-export let g_DIR_BUDGET_PER_WAVE: i32 = 72;
+// So the budget follows the body count, and the body count is §8's own
+// illustration read at §2.2's own costs.  `probe_waveone.hml` pins BOTH halves
+// with literals — `director_budget(1,0) == 36` AND
+// `4*director_cost(HUSK) + 6*director_cost(WISP) == 36` — so the pair cannot
+// drift apart again the way "budget 60" did while it sat alone.
+//
+// WHY NOT RAISE THE COSTS INSTEAD.  The other way to make 60 points buy ten
+// bodies is to scale the six per-body costs by 1.79x (Wisp 2->4, Husk 6->9,
+// which lands 4H + 6W on exactly 60).  It was priced and REJECTED:
+//   * §2.2's cost column is the one GDD table with three consistent dependents
+//     — §2.6's cadence, its alive cap and its hold duration all cohere at
+//     ~110 bodies through it.  §8's illustration is the outlier, not the table.
+//   * the costs are duplicated: `g_dir_cost` in `sim/director.hml` and
+//     `g_ai_cost` in `sim/ai.hml`, cross-asserted by `probe_director.hml`.
+//     `ai.hml` is not this task's file, so changing them means shipping a red
+//     probe and a hand-off.  Retuning the budget needs neither.
+// The exact alternative numbers are in the task report so the choice stays
+// available; nothing here forecloses it.
+//
+// WHY THE BASE IS 0.  The GDD writes `60 + 45*tier` with a 1-based tier, i.e.
+// an affine ladder with a floor.  A floor is wrong for THIS tier index: tier 0
+// is a lit lantern's radius, and tier 0 means the dark does not come at all
+// (`director_begin` refuses it outright).  A budget formula whose tier-0 cell
+// is a non-zero number of points is a formula that disagrees with the state
+// machine, and the previous BASE = 15 was exactly that.  0 + 36*tier keeps the
+// ladder strictly increasing, makes the tier-0 cell honestly empty, and reads
+// as "a tier-t hold opens with t tutorial waves' worth".
+export let g_DIR_BUDGET_BASE: i32 = 0;
+export let g_DIR_BUDGET_PER_TIER: i32 = 36;
+// 72 -> 96.  Wave 1 shrank from 60 points to 36 and the hold must not shrink
+// with it — this is the "keep the density" half of the decision below.  The 24
+// points that left wave 1 are put back where escalation belongs, at the END of
+// the hold: tier 1 now reads 36 / 132 / 228 (10.7 / 39.4 / 68.1 bodies) for the
+// same 118-body total the 2:40 target was measured against.  The on-ramp got
+// smaller; the night did not.
+export let g_DIR_BUDGET_PER_WAVE: i32 = 96;
+// THE CROWD BOUND OF THE NIGHT, AND THE ON-RAMP'S RELATION TO IT.
+// 14 is a §2.6 anchor and `probe_director` pins it with a literal. What is NOT
+// in the GDD, and is the thing that broke the first minute, is how wave 1's
+// BODY COUNT sits against it. Measured over 20 000 replays of the director's own
+// spend loop (`director_roll_kind` at the shipped costs and the tier-1 table):
+//
+//      tier 1 wave 1, 36 pts:  mean 11.0 bodies, min 6, max 17, 98.7 % <= 13
+//      tier 2 wave 1, 72 pts:  ~15 bodies  -> MORE THAN THE CAP CAN HOLD
+//
+// So at tier 1 the on-ramp cannot fill the cap in 98.7 % of holds and does not
+// in practice (`probe_waveone`: peak alive 7-11 of 14 across seven tier-1 first
+// minutes). At tier 2 it fills it every time, and GAME_DESIGN §8's scripted
+// first minute is NOT PINNED TO TIER 1 — `worldgen_shade_tier` decides it from
+// the spawn chunk's jitter hash plus the night bonus, and it came up tier 2 on
+// 5 of 12 seeds. Every one of those five failed to clear; six of the seven
+// tier-1 seeds cleared. THE FIX BELONGS IN THE OPENING SCRIPT (force tier 1 for
+// the scripted minute, the way it forces every other §8 beat), not here:
+// flattening the budget ladder's first wave to keep tier 5's wave 1 under the
+// cap would delete the escalation the ladder exists for, and would break
+// `probe_director` §F, which asserts the cap DOES bind at tier 2.
 export let g_DIR_ALIVE_CAP: i32 = 14;
 export let g_DIR_ONSCREEN_CAP: i32 = 8;
 export let g_DIR_SPAWN_MIN_M: f64 = 24.0;
@@ -1007,3 +1239,114 @@ export let g_SPEEDLINE_TRIS: i32 = 8;
 export let g_SPEEDLINE_A: f64 = 0.18;
 export let g_WAVE_CLEAR_SILENCE_S: f64 = 0.4;        // actual silence. Keep it.
 export let g_LANTERN_LIT_S: f64 = 1.2;               // the expanding ring
+
+// ===========================================================================
+// 19. THE SPELL SCHOOL  (DIRECTION.md §2 §9 §10, MAGIC_KINETIC.md §1.5-§1.9)
+// ===========================================================================
+// DIRECTION.md §2 is the directive: "the owner wants the character to LEARN
+// abilities: healing, fire blasts, cloaking".  MAGIC_KINETIC.md §1.9 is the
+// spec: seven spells, three equipped slots, ONE resource (oil), no mana, no
+// new input field, no new dynamic light.
+//
+// What is here: the scalars other modules need — the damage-type axis, the oil
+// economy, the Attunement curve, the phase table, the main-hand id space.
+// What is NOT here: the 7-row spell table itself.  Per this file's own contract
+// ("PER-ROW DATA TABLES ... live in their owning modules") it is parallel
+// arrays in `src/sim/spells.hml`, exactly as the six weapons live in
+// `sim/weapons.hml` and the six enemies in `sim/ai.hml`.
+
+// --- the damage-type axis, orthogonal to the DMG_* delivery kinds ----------
+// MAGIC_KINETIC.md §1.1 names this axis KINETIC / RADIANT; DIRECTION.md and the
+// spell brief name the second value MAGIC.  Same axis, same index, one name
+// here so `combat.hml`'s future affinity table has exactly one thing to index.
+// A spell is a DELIVERY MECHANISM, not a damage type — six of the seven spells
+// are MAGIC and the fire blast is KINETIC (§1.1: fire burns matter).  That is
+// load-bearing: it is why a solo player is never stuck behind a resistance.
+export let g_DTYPE_KINETIC: i32 = 0;
+export let g_DTYPE_MAGIC: i32 = 1;
+export let g_DTYPE_COUNT: i32 = 2;
+
+// --- spell ids.  API: append at the end, never renumber. -------------------
+export let g_SPELL_COUNT: i32 = 7;
+export let g_SPELL_FLARE: i32 = 0;         // 360 degree burst   (MAGIC)
+export let g_SPELL_SHUTTER: i32 = 1;       // sustained cone     (MAGIC)
+export let g_SPELL_EMBERLANCE: i32 = 2;    // THE FIRE BLAST     (KINETIC)
+export let g_SPELL_MEND: i32 = 3;          // THE HEAL           (no damage)
+export let g_SPELL_GUTTERING: i32 = 4;     // THE CLOAK          (no damage)
+export let g_SPELL_LANCE: i32 = 5;         // 5 degree lance     (MAGIC)
+export let g_SPELL_KINDLING: i32 = 6;      // placed light pool  (no damage)
+
+// DIRECTION.md §10 settled the hands question: "the lantern lives permanently
+// in the OFF-HAND.  Everything else — club, spear, sword, rifle, spell — is
+// MAIN-HAND and swaps."  So a spell occupies the SAME `weapon` field on
+// InputCommand that a gun does, and needs zero wire change (MAGIC_KINETIC
+// §1.9.1).
+//
+// THE MAIN-HAND ID SPACE IS NOW FULL, EXACTLY:
+//     0..5   the six guns          (weapons.hml)
+//     6..8   club, spear, sword    (weapons.hml `MH_MELEE_BASE = 6`)
+//     9..15  the seven spells      (here)
+// 9 + 7 - 1 = 15 = CMD_MAX_WEAPON.  There is ZERO headroom left in the field,
+// so the next main-hand item of any kind needs CMD_MAX_WEAPON raised — which is
+// a wire-format decision, not a table edit.  Flagged rather than pre-empted.
+//
+// (This base was 8 for one build, which collided with the sword.  Caught by
+// reading `weapons.hml`'s own id-space comment, not by a compiler.)
+export let g_SPELL_ITEM_BASE: i32 = 9;
+export let g_SPELL_SWAP_IN_S: f64 = 0.30;            // raising a spell
+export let g_SPELL_SWAP_OUT_S: f64 = 0.22;           // lowering it
+
+// --- OIL, the only spell resource (MAGIC_KINETIC §1.6) --------------------
+// Stored in the sim as CENTI-OIL (x100) so the whole state vector is i32 and
+// serialises with no encoder.  Regen is applied through an integer carry, so
+// +0.8/s is exact and identical on both backends.
+export let g_OIL_TANK_T1: f64 = 100.0;
+export let g_OIL_TANK_T2: f64 = 150.0;               // unlock at Lv 10
+export let g_OIL_TANK_T3: f64 = 200.0;               // unlock at Lv 21
+export let g_OIL_TANK_TIERS: i32 = 3;
+export let g_OIL_REGEN_LIT: f64 = 3.0;               // /s inside a lit radius
+export let g_OIL_REGEN_DAY: f64 = 0.8;               // /s outside, PHASE_DAY
+export let g_OIL_REGEN_DARK: f64 = 0.0;              // /s outside, dawn/dusk/night
+export let g_OIL_FLASK: f64 = 35.0;
+export let g_OIL_FLASK_STACK: i32 = 6;
+
+// --- ATTUNEMENT (DIRECTION.md §9: "spell slots, potency, cooldown") -------
+// The stat itself is not built yet; `spells.hml` carries it as one slot of its
+// state so whoever builds the stat trees writes exactly one number.  At the
+// cap: cost x0.60, cooldown x0.70, potency x1.80, 3 equipped slots.
+export let g_ATTUNE_MAX: i32 = 20;
+export let g_ATTUNE_COST_PER: f64 = 0.02;            // -2 % oil per point
+export let g_ATTUNE_COST_FLOOR: f64 = 0.55;
+export let g_ATTUNE_CD_PER: f64 = 0.015;             // -1.5 % cooldown per point
+export let g_ATTUNE_CD_FLOOR: f64 = 0.65;
+export let g_ATTUNE_POT_PER: f64 = 0.04;             // +4 % potency per point
+export let g_ATTUNE_PER_SLOT: i32 = 7;               // 0-6:1  7-13:2  14-20:3
+export let g_SPELL_SLOTS_MIN: i32 = 1;
+export let g_SPELL_SLOTS_MAX: i32 = 3;
+
+// --- the day-phase multiplier on MAGIC damage (MAGIC_KINETIC §1.7) --------
+// Indexed by daycycle's PHASE_DAWN..PHASE_NIGHT.  The lamp is strongest exactly
+// when the game is hardest, and inside a lit radius it is forced to the DAY
+// value because there is no dark there to contrast against.
+export let g_MAGIC_PHASE_DAWN: f64 = 0.85;
+export let g_MAGIC_PHASE_DAY: f64 = 0.70;
+export let g_MAGIC_PHASE_DUSK: f64 = 1.00;
+export let g_MAGIC_PHASE_NIGHT: f64 = 1.30;
+export let g_MAGIC_WINDUP_MULT: f64 = 2.00;          // bodied enemy mid-tell
+export let g_MAGIC_FLOOR_MULT: f64 = 0.15;           // §5.3 THE LAW. Never below.
+export let g_MAGIC_BEAM_HZ: i32 = 10;                // the shutter ticks at 10 Hz
+export let g_MAGIC_REACH_CAP: f64 = 24.0;            // nothing magic reaches past this
+
+// --- the three the owner asked for by name --------------------------------
+export let g_MEND_HP: f64 = 40.0;                    // healing, over the channel
+export let g_MEND_CHANNEL_S: f64 = 1.2;              // cancelled by damage
+export let g_CLOAK_S: f64 = 4.0;                     // cloaking
+export let g_CLOAK_AGGRO_MULT: f64 = 0.15;           // AI aggro radius while hidden
+// THE TELL.  The lantern is always in the off-hand and it never goes out, so a
+// cloaked lamplighter still carries a light.  Inside this radius the glow gives
+// you away completely; the lantern only dims to the floor below.
+export let g_CLOAK_GLOW_M: f64 = 6.0;
+export let g_CLOAK_LIGHT_MULT: f64 = 0.35;           // lantern intensity while cloaked
+export let g_KINDLING_S: f64 = 8.0;                  // placed pool lifetime
+export let g_KINDLING_R: f64 = 3.0;
+export let g_KINDLING_OIL_S: f64 = 1.5;              // /s to anyone standing in it

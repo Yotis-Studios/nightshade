@@ -1,0 +1,991 @@
+// =============================================================================
+//  melee.hml — club, spear, sword.  The weapon that always works.
+// =============================================================================
+//
+//  DIRECTION.md §10.  Table: `src/sim/weapons.hml` (the `mel_*` section).
+//  Hit registration: `src/sim/combat.hml`, unmodified, through its own exports.
+//
+// -----------------------------------------------------------------------------
+//  WHY THIS MODULE EXISTS AT ALL
+// -----------------------------------------------------------------------------
+//  DIRECTION §7 caps what the player can carry, so on the frontier the brass
+//  runs out.  GAME_DESIGN §1's own script for the first minute says it out
+//  loud — *"You have a revolver and 12 rounds.  You will run out.  You will
+//  melee something.  You will win with 30 HP."*  `src/game/server.hml` already
+//  reported that this beat could not close, because `BTN_MELEE` existed in
+//  `command.hml` and `DMG_MELEE` existed in `combat.hml` and NOTHING READ
+//  EITHER.  This file is the thing that reads both.
+//
+//  So melee is not a starter weapon to be discarded.  It is the floor of the
+//  kinetic ladder and the only rung that cannot be taken away:
+//
+//      tier 0  melee          scavenged -> crafted -> forged   (here)
+//      tier 1  primitive      bolt-action, revolver, shotgun, pipe-SMG
+//      tier 2  manufactured   Sparrow, Tinker, LMG — only while the city is lit
+//
+// -----------------------------------------------------------------------------
+//  NO DURABILITY.  NO AMMUNITION.  NO JAM.  NO CONDITION.
+// -----------------------------------------------------------------------------
+//  There is no such field in `MelState` and no such column in the table.
+//  DIRECTION §10: *"reliability is its whole identity; breakage would delete the
+//  reason it exists."*  A durability system added here would be a bug, not a
+//  feature, and `tools/probe_melee.hml` proves the absence behaviourally by
+//  swinging ten thousand times and comparing blow 1 with blow 10 000.
+//
+// -----------------------------------------------------------------------------
+//  THE IMPORT WALL (CLAUDE.md §3)
+// -----------------------------------------------------------------------------
+//  `@stdlib/math`, `src/core/**`, `src/sim/**`.  Nothing else, ever.  No wall
+//  clock (R8) — `g_TICK_DT` is a compile-time constant and this module never
+//  sees a measured delta.
+//
+// -----------------------------------------------------------------------------
+//  MELEE CONSUMES ZERO RANDOMNESS.  THAT IS A DESIGN STATEMENT, NOT A SHORTCUT.
+// -----------------------------------------------------------------------------
+//  A gun draws from RNG_SPREAD every pellet because a cone is the gun's
+//  uncertainty.  A club has no cone: it either reaches the thing or it does
+//  not.  So there is no `rng_*` import in this file and no stream is stepped
+//  by a swing, which means (a) a swing is bit-identical under replay for free,
+//  (b) a melee-only tick advances no RNG lane and therefore cannot desync a
+//  gun fired on the following tick, and (c) "it always works" is true in the
+//  strongest possible sense: the same swing at the same geometry ALWAYS lands.
+//  The probe asserts the RNG state hash is unchanged across a strike.
+//
+// -----------------------------------------------------------------------------
+//  HIT REGISTRATION REUSES combat.hml.  IT DOES NOT REIMPLEMENT IT.
+// -----------------------------------------------------------------------------
+//  A swing is a FAN of `mel_rays` hitscans across the weapon's sweep, each one
+//  `combat_raycast` — the same function `combat_fire` calls, with the same
+//  entity list, the same AABBs, the same head volume, the same terrain DDA and
+//  the same occlusion.  Damage goes through `combat_apply_damage`, which is
+//  documented as THE ONLY PLACE HP CHANGES, so the Warden front plate, the
+//  invulnerability flag, the death flag, EV_HIT / EV_KILL / EV_DAMAGE_TAKEN and
+//  the overkill counter all behave for a sword exactly as they do for a rifle.
+//  There is deliberately NO second hit path in this file to drift from the
+//  first one.
+//
+//  WHY A FAN AND NOT A CONE OR A CAPSULE.  `combat_raycast` already resolves
+//  occlusion and heads correctly and is the authority; a capsule sweep would be
+//  a parallel intersector that could disagree with it about whether a shot is
+//  blocked by a hill.  The fan is chosen so that IT CANNOT MISS THROUGH A GAP:
+//  `mel_ray_gap_m` is the chord between adjacent rays at the weapon's own
+//  reach, and every weapon's chord is under 0.70 m — the width of a Wisp, the
+//  smallest body in the game.  Measured: club 0.605, spear 0.652, sword 0.680.
+//
+// -----------------------------------------------------------------------------
+//  THE §2.5 FEEDBACK CONTRACT IS NOT OPTIONAL FOR MELEE
+// -----------------------------------------------------------------------------
+//  Every blow that connects emits, in the same tick, all five of EV_HITMARKER,
+//  EV_HIT_FLASH, EV_DAMAGE_NUMBER, EV_IMPACT and EV_SOUND, on top of the EV_HIT
+//  `combat_apply_damage` pushes.  `combat_feedback_ok()` is what checks it and
+//  the probe asserts it returns 0 after every swing shape, including a cleave
+//  onto three bodies at once.
+//
+//  The audio id is melee-specific (`SFX_MELEE_CLUB/SPEAR/SWORD`) rather than
+//  the bullet blip, because a club is not a rifle and `SFX_HIT_BLIP`'s pitch
+//  chain is bullet cadence.  See §6 for the one thing that costs us.
+//
+// -----------------------------------------------------------------------------
+//  STAGGER — REPORTED AS A GAP, IMPLEMENTED AS STATE
+// -----------------------------------------------------------------------------
+//  DIRECTION §10 makes stagger the club's identity: it "buys space rather than
+//  kills".  Nothing in `src/sim/` had a stagger concept, and `ai.hml` is not
+//  this task's file.  So the TIMER lives here, in flat serialisable state, with
+//  `melee_staggered()` as the query and `EV_STAGGER` on the bus as the signal.
+//  **`ai.hml` does not consult it yet, so the timer currently changes nothing
+//  about how an enemy moves.**  That is stated plainly in the task report; it
+//  is a two-line read in `ai_step`, and it is deliberately not done here rather
+//  than done quietly in a file this task does not own.
+// =============================================================================
+
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import { g_TICK_DT } from "../core/config.hml";
+
+import { world_id_of, ID_NONE, EF_DEAD } from "./world.hml";
+
+import { cmd_yaw, cmd_pitch, cmd_btn, BTN_MELEE } from "./command.hml";
+
+import { mel_valid, mel_dmg_hit, mel_reach, mel_arc_half_rad, mel_rays,
+         mel_targets, mel_windup, mel_active, mel_recover,
+         mel_stagger_len, mel_to_mainhand,
+         MEL_CLUB, MEL_SPEAR, MEL_SWORD, MEL_COUNT, MH_MELEE_BASE,
+         MEL_HAS_DURABILITY, g_T_EPS
+       } from "./weapons.hml";
+
+import { combat_raycast, combat_apply_damage, combat_ray_scratch,
+         combat_body_h, combat_events,
+         evbus_push, ev_q,
+         EV_IMPACT, EV_SOUND, EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER,
+         HM_HEAD, HM_KILL, HM_ARMOR,
+         SURF_TERRAIN, SURF_FLESH, SURF_ARMOR,
+         SFX_KILL_CHIME, SFX_IMPACT_WORLD, SFX_IMPACT_ARMOR,
+         HIT_FLASH_CS, DMG_MELEE,
+         RAY_T, RAY_X, RAY_Y, RAY_Z, RAY_SLOT, RAY_HEAD,
+         RAY_ENTITY, RAY_TERRAIN
+       } from "./combat.hml";
+
+// ===========================================================================
+// 1.  NEW EVENT AND SFX IDS
+// ===========================================================================
+// `combat.hml` mirrors NETWORKING §11.5's 1..14 and adds the four §2.5
+// derivation events at 20..23.  Melee needs one more fact on the bus and three
+// more sounds, so they are taken from the first free numbers ABOVE that block,
+// with the same reasoning combat.hml gives: a future protocol addition in the
+// reserved range cannot collide silently.
+//
+// EV_STAGGER is a SIM FACT, not a cosmetic: it says an enemy's action was
+// interrupted, which changes what is true.  `sub` carries the tick count.
+// REPORTED — NETWORKING §11.5 does not reserve a number for it, and
+// `src/net/protocol.hml` is across the import wall from here.
+export let EV_STAGGER = 24;
+
+// `combat.hml` uses sfx ids 1..8.  A melee blow gets its own sound per weapon
+// so the player can hear which thing is in their hand — at 320x240 with the
+// lantern filling the off-hand, audio is doing real identification work.
+export let SFX_MELEE_CLUB  = 9;
+export let SFX_MELEE_SPEAR = 10;
+export let SFX_MELEE_SWORD = 11;
+export let SFX_MELEE_WHIFF = 12;    // the swing that touched nothing
+
+// The audio id for a connecting blow with melee weapon `p_m`.
+export fn melee_sfx_for(p_m: i32): i32 {
+    let m: i32 = p_m;
+    let out: i32 = SFX_MELEE_CLUB;
+    if (m == MEL_SPEAR) { out = SFX_MELEE_SPEAR; }
+    if (m == MEL_SWORD) { out = SFX_MELEE_SWORD; }
+    return out;
+}
+
+// ===========================================================================
+// 2.  THE SWING STATE — a FLAT array, one slot per player.
+// ===========================================================================
+// Same discipline as `weapons.hml`'s WS_* block and for the same reasons: it
+// serialises as a run of doubles, it snapshots, it rewinds, and there is no
+// object graph and no closure anywhere near it (CLAUDE.md §7).
+//
+// NOTE WHAT IS ABSENT: no ammo, no reserve, no durability, no condition, no
+// heat.  A melee weapon has exactly one piece of state — where it is in its
+// swing — and one piece of equipment — which of the three it is.
+export let MS_WPN     = 0;    // melee id 0..2, or -1 for none
+export let MS_PHASE   = 1;    // 0 idle, 1 windup, 2 active, 3 recover
+export let MS_T       = 2;    // seconds remaining in the current phase
+export let MS_QUEUED  = 3;    // 1 = a swing was buffered during this one
+export let MS_HELD    = 4;    // BTN_MELEE last tick, for the press edge
+export let MS_SWINGS  = 5;    // lifetime swings started
+export let MS_HITS    = 6;    // lifetime victims struck
+export let MS_FIELDS  = 7;
+
+export let MS_IDLE    = 0;
+export let MS_WINDUP  = 1;
+export let MS_ACTIVE  = 2;
+export let MS_RECOVER = 3;
+
+// Rays are fanned into a fixed scratch; 8 is above the widest weapon's 7.
+export let MEL_MAX_RAYS = 8;
+
+// ===========================================================================
+// 3.  THE CONTEXT — allocated once, at startup.  A swing allocates nothing.
+// ===========================================================================
+fn zeros_f(p_n: i32): array<f64> {
+    let n: i32 = p_n;
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+fn zeros_i(p_n: i32): array<i32> {
+    let n: i32 = p_n;
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { a.push(0); i++; }
+    let out: array<i32> = a;
+    return out;
+}
+
+// `p_slots` player slots, `p_ent_cap` entity slots for the stagger table.
+// `p_ent_cap` must be >= the world's capacity; melee_strike bounds-checks
+// anyway and drops the stagger rather than trapping.
+export fn melee_new_cap(p_slots: i32, p_ent_cap: i32): object {
+    let ns: i32 = p_slots;
+    if (ns < 1) { ns = 1; }
+    let ne: i32 = p_ent_cap;
+    if (ne < 1) { ne = 1; }
+    let st: array<f64> = zeros_f(ns * 7);
+    let s: i32 = 0;
+    while (s < ns) {
+        st[s * 7 + 0] = 0.0 - 1.0;      // MS_WPN = MEL_NONE
+        s++;
+    }
+    let mx: object = {
+        slots: ns,
+        ent_cap: ne,
+        st: st,
+        stag: zeros_i(ne),
+
+        // per-swing scratch, never grown, never reallocated
+        hv_n: 0,
+        hv_slot: zeros_i(MEL_MAX_RAYS),
+        hv_head: zeros_i(MEL_MAX_RAYS),
+        hv_t: zeros_f(MEL_MAX_RAYS),
+        hv_x: zeros_f(MEL_MAX_RAYS),
+        hv_y: zeros_f(MEL_MAX_RAYS),
+        hv_z: zeros_f(MEL_MAX_RAYS),
+        ray: combat_ray_scratch(),
+
+        // counters — every refusal is visible, same rule as combat.hml
+        swings: 0,
+        strikes: 0,
+        hits: 0,
+        whiffs: 0,
+        terrain_hits: 0,
+        staggers: 0,
+        rays_cast: 0,
+        bad_weapon: 0,
+        bad_slot: 0
+    };
+    let out: object = mx;
+    return out;
+}
+
+export fn melee_new(): object {
+    let out: object = melee_new_cap(64, 512);
+    return out;
+}
+
+export let MSTAT_SWINGS       = 0;
+export let MSTAT_STRIKES      = 1;
+export let MSTAT_HITS         = 2;
+export let MSTAT_WHIFFS       = 3;
+export let MSTAT_TERRAIN_HITS = 4;
+export let MSTAT_STAGGERS     = 5;
+export let MSTAT_RAYS_CAST    = 6;
+export let MSTAT_BAD_WEAPON   = 7;
+export let MSTAT_BAD_SLOT     = 8;
+export let MSTAT_COUNT        = 9;
+
+export fn melee_stat(p_mx: object, p_which: i32): i32 {
+    let mx: object = p_mx;
+    let k: i32 = p_which;
+    let out: i32 = 0;
+    if (k == MSTAT_SWINGS)       { out = mx.swings; }
+    if (k == MSTAT_STRIKES)      { out = mx.strikes; }
+    if (k == MSTAT_HITS)         { out = mx.hits; }
+    if (k == MSTAT_WHIFFS)       { out = mx.whiffs; }
+    if (k == MSTAT_TERRAIN_HITS) { out = mx.terrain_hits; }
+    if (k == MSTAT_STAGGERS)     { out = mx.staggers; }
+    if (k == MSTAT_RAYS_CAST)    { out = mx.rays_cast; }
+    if (k == MSTAT_BAD_WEAPON)   { out = mx.bad_weapon; }
+    if (k == MSTAT_BAD_SLOT)     { out = mx.bad_slot; }
+    return out;
+}
+
+// ===========================================================================
+// 4.  EQUIP AND QUERY
+// ===========================================================================
+fn slot_ok(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    let s: i32 = p_s;
+    let out: i32 = 1;
+    if (s < 0) { out = 0; }
+    if (s >= mx.slots) { out = 0; }
+    return out;
+}
+
+// Put melee weapon `p_m` in the main hand of player slot `p_s`.  Cancels any
+// swing in progress — a weapon change is not a place to keep a committed blow.
+export fn melee_equip(p_mx: object, p_s: i32, p_m: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { mx.bad_slot = mx.bad_slot + 1; let z: i32 = 0; return z; }
+    if (mel_valid(p_m) == 0) { mx.bad_weapon = mx.bad_weapon + 1; let z: i32 = 0; return z; }
+    let st = mx.st;
+    let o: i32 = p_s * 7;
+    st[o + 0] = f64(p_m);
+    st[o + 1] = 0.0;
+    st[o + 2] = 0.0;
+    st[o + 3] = 0.0;
+    st[o + 4] = 0.0;
+    let out: i32 = 1;
+    return out;
+}
+
+// Take the melee weapon out of the main hand (a gun goes there instead).
+export fn melee_unequip(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { mx.bad_slot = mx.bad_slot + 1; let z: i32 = 0; return z; }
+    let st = mx.st;
+    let o: i32 = p_s * 7;
+    st[o + 0] = 0.0 - 1.0;
+    st[o + 1] = 0.0;
+    st[o + 2] = 0.0;
+    st[o + 3] = 0.0;
+    st[o + 4] = 0.0;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn melee_equipped(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: i32 = 0 - 1; return z; }
+    let st = mx.st;
+    let out: i32 = i32(st[p_s * 7 + 0]);
+    return out;
+}
+
+// The main-hand id (6..8) of what this slot is holding, or -1.  This is the
+// number `command.hml`'s weapon field carries and the number the viewmodel
+// picks a mesh from.
+export fn melee_mainhand(p_mx: object, p_s: i32): i32 {
+    let m: i32 = melee_equipped(p_mx, p_s);
+    let out: i32 = mel_to_mainhand(m);
+    return out;
+}
+
+export fn melee_phase(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: i32 = 0; return z; }
+    let st = mx.st;
+    let out: i32 = i32(st[p_s * 7 + 1]);
+    return out;
+}
+
+export fn melee_phase_t(p_mx: object, p_s: i32): f64 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: f64 = 0.0; return z; }
+    let st = mx.st;
+    let out: f64 = st[p_s * 7 + 2];
+    return out;
+}
+
+export fn melee_swings(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: i32 = 0; return z; }
+    let st = mx.st;
+    let out: i32 = i32(st[p_s * 7 + 5]);
+    return out;
+}
+
+export fn melee_hits(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: i32 = 0; return z; }
+    let st = mx.st;
+    let out: i32 = i32(st[p_s * 7 + 6]);
+    return out;
+}
+
+// 0/1: can this slot begin a swing THIS tick?  A melee weapon is never out of
+// ammunition, never reloading and never jammed, so the only thing that can say
+// no is a swing already running.
+export fn melee_can_swing(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: i32 = 0; return z; }
+    let st = mx.st;
+    let o: i32 = p_s * 7;
+    if (mel_valid(i32(st[o + 0])) == 0) { let z: i32 = 0; return z; }
+    if (i32(st[o + 1]) != 0) { let z: i32 = 0; return z; }
+    let out: i32 = 1;
+    return out;
+}
+
+// ===========================================================================
+// 5.  STAGGER
+// ===========================================================================
+// Ticks of interruption remaining on entity SLOT `p_slot`.  `ai.hml` should
+// read this and skip its advance/attack while it is above zero; see the header
+// for why that read is not made from this file.
+export fn melee_stagger_of(p_mx: object, p_slot: i32): i32 {
+    let mx: object = p_mx;
+    let s: i32 = p_slot;
+    if (s < 0) { let z: i32 = 0; return z; }
+    if (s >= mx.ent_cap) { let z: i32 = 0; return z; }
+    let g = mx.stag;
+    let out: i32 = g[s];
+    return out;
+}
+
+export fn melee_staggered(p_mx: object, p_slot: i32): i32 {
+    let n: i32 = melee_stagger_of(p_mx, p_slot);
+    let out: i32 = 0;
+    if (n > 0) { out = 1; }
+    return out;
+}
+
+// Entity slots are recycled by `world_despawn`, and this table is indexed by
+// slot, so a slot that dies staggered would hand its remainder to whatever
+// spawns there next.  The staleness is bounded by the longest stagger (27
+// ticks, 0.45 s) because of the decay below, and `world.hml` is not this
+// task's file — so the correct fix is a call to THIS function from the despawn
+// path.  REPORTED.  Until then the bound is the mitigation.
+export fn melee_stagger_clear(p_mx: object, p_slot: i32) {
+    let mx: object = p_mx;
+    let s: i32 = p_slot;
+    if (s < 0) { return; }
+    if (s >= mx.ent_cap) { return; }
+    let g = mx.stag;
+    g[s] = 0;
+    return;
+}
+
+// One fixed tick of decay over the whole table.  Call ONCE per sim tick.  No
+// `dt` parameter, on purpose (CLAUDE.md §7).
+export fn melee_stagger_step(p_mx: object) {
+    let mx: object = p_mx;
+    let g = mx.stag;
+    let n: i32 = mx.ent_cap;
+    let i: i32 = 0;
+    while (i < n) {
+        let v: i32 = g[i];
+        if (v > 0) { g[i] = v - 1; }
+        i++;
+    }
+    return;
+}
+
+// ===========================================================================
+// 6.  THE EVENT HELPER
+// ===========================================================================
+// `combat.hml`'s metre-taking pusher is private, so this is the same two lines
+// it is: quantize at the boundary, so no call site can forget.  `ev_q` and
+// `evbus_push` are both combat.hml's — there is no second bus.
+fn mel_push_m(p_b: object, p_tick: i32, p_type: i32, p_sub: i32,
+              p_actor: i32, p_target: i32,
+              p_x: f64, p_y: f64, p_z: f64): i32 {
+    let out: i32 = evbus_push(p_b, p_tick, p_type, p_sub, p_actor, p_target,
+                              ev_q(p_x), ev_q(p_y), ev_q(p_z));
+    return out;
+}
+
+// ===========================================================================
+// 7.  THE STRIKE — one blow, resolved once, on the windup->active edge.
+// ===========================================================================
+// Returns the number of distinct victims damaged.
+//
+//   p_ent_slot   the swinging entity's world slot
+//   p_eye_y      ABSOLUTE world Y of the eye.  Passed in for exactly the reason
+//                `combat_fire` takes it: eye height is `movement.hml`'s
+//                PredictedState and melee must not keep a second copy of it.
+//   p_cmd        the InputCommand.  The swing axis comes from its QUANTIZED
+//                yaw and pitch and from nowhere else, so a predicting client
+//                sweeps the identical arc the authority does.
+fn melee_strike(p_mx: object, p_cx: object, p_w: object, p_cs,
+                p_ent_slot: i32, p_eye_y: f64, p_cmd: object,
+                p_m: i32): i32 {
+    let mx: object = p_mx;
+    let cx: object = p_cx;
+    let wr: object = p_w;
+    let es: i32 = p_ent_slot;
+    let m: i32 = p_m;
+
+    if (es < 0) { let z: i32 = 0; return z; }
+    if (es >= wr.count) { let z: i32 = 0; return z; }
+
+    mx.strikes = mx.strikes + 1;
+
+    let tick: i32 = wr.tick;
+    let aid: i32 = world_id_of(wr, es);
+    let mh: i32 = mel_to_mainhand(m);
+
+    // Same `+ 0.0` launder as the trig block below and for the same measured
+    // reason: an f64 local initialised DIRECTLY from a call stays BOXED on
+    // v2.9.1, and both of these are read once per ray.
+    let t_reach: f64 = mel_reach(m);
+    let t_arc: f64 = mel_arc_half_rad(m);
+    let reach: f64 = t_reach + 0.0;
+    let arc: f64 = t_arc + 0.0;
+    let nray: i32 = mel_rays(m);
+    if (nray < 1) { nray = 1; }
+    if (nray > MEL_MAX_RAYS) { nray = MEL_MAX_RAYS; }
+    let maxv: i32 = mel_targets(m);
+    if (maxv < 1) { maxv = 1; }
+
+    // ---- the swing axis, from the command --------------------------------
+    // Byte-for-byte the basis `combat_fire` builds, including the `+ 0.0`
+    // launder: a typed f64 local initialised DIRECTLY from an @stdlib/math
+    // extern stays BOXED on v2.9.1, and routing it through one arithmetic
+    // expression unboxes it.  Each of these is read four times below.
+    let yaw: f64 = cmd_yaw(p_cmd);
+    let pit: f64 = cmd_pitch(p_cmd);
+    let t_cp: f64 = cos(pit);
+    let t_sp: f64 = sin(pit);
+    let t_cy: f64 = cos(yaw);
+    let t_sy: f64 = sin(yaw);
+    let cp: f64 = t_cp + 0.0;
+    let sp: f64 = t_sp + 0.0;
+    let cy: f64 = t_cy + 0.0;
+    let sy: f64 = t_sy + 0.0;
+    let fwx: f64 = sy * cp;
+    let fwy: f64 = sp;
+    let fwz: f64 = 0.0 - cy * cp;
+    // right = (cos yaw, 0, sin yaw).  It is unit and exactly perpendicular to
+    // forward, so `fwd*cos(a) + right*sin(a)` is a true rotation of the aim
+    // axis through `a` and needs no renormalisation.  The sweep is HORIZONTAL
+    // about the player's own up: a club is swung across, not rolled.
+    let rgx: f64 = cy;
+    let rgz: f64 = sy;
+
+    let pxs = wr.px;
+    let pzs = wr.pz;
+    let t_ox: f64 = pxs[es];
+    let t_oz: f64 = pzs[es];
+    let ox: f64 = t_ox + 0.0;
+    let oy: f64 = p_eye_y + 0.0;
+    let oz: f64 = t_oz + 0.0;
+
+    let ray = mx.ray;
+    let bus: object = combat_events(cx);
+
+    let hv_slot = mx.hv_slot;
+    let hv_head = mx.hv_head;
+    let hv_t = mx.hv_t;
+    let hv_x = mx.hv_x;
+    let hv_y = mx.hv_y;
+    let hv_z = mx.hv_z;
+    mx.hv_n = 0;
+
+    let centre: i32 = nray / 2;
+    let terrain_seen: i32 = 0;
+    let ter_x: f64 = 0.0;
+    let ter_y: f64 = 0.0;
+    let ter_z: f64 = 0.0;
+
+    // ---- pass 1: fan the rays, aggregate distinct victims ----------------
+    let denom: f64 = 1.0;
+    if (nray > 1) { denom = f64(nray - 1); }
+    let i: i32 = 0;
+    while (i < nray) {
+        let a: f64 = 0.0;
+        if (nray > 1) { a = arc * (2.0 * f64(i) / denom - 1.0); }
+        let t_ca: f64 = cos(a);
+        let t_sa: f64 = sin(a);
+        let ca: f64 = t_ca + 0.0;
+        let sa: f64 = t_sa + 0.0;
+        let ddx: f64 = fwx * ca + rgx * sa;
+        let ddy: f64 = fwy * ca;
+        let ddz: f64 = fwz * ca + rgz * sa;
+        let t_dl: f64 = sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+        let dl: f64 = t_dl + 0.0;
+        if (dl <= 0.0) { dl = 1.0; }
+        ddx = ddx / dl;
+        ddy = ddy / dl;
+        ddz = ddz / dl;
+
+        mx.rays_cast = mx.rays_cast + 1;
+        let kind: i32 = combat_raycast(cx, wr, p_cs, ox, oy, oz,
+                                       ddx, ddy, ddz, reach, aid, ray);
+
+        if (kind == RAY_ENTITY) {
+            let vslot: i32 = i32(ray[RAY_SLOT]);
+            let head: i32 = i32(ray[RAY_HEAD]);
+            let t_rt: f64 = ray[RAY_T];
+            let t: f64 = t_rt + 0.0;
+            let row: i32 = 0 - 1;
+            let q: i32 = 0;
+            let hn: i32 = mx.hv_n;
+            while (q < hn) {
+                if (hv_slot[q] == vslot) { row = q; q = hn; } else { q++; }
+            }
+            if (row < 0) {
+                if (hn < MEL_MAX_RAYS) {
+                    row = hn;
+                    hv_slot[row] = vslot;
+                    hv_head[row] = head;
+                    hv_t[row] = t;
+                    hv_x[row] = ray[RAY_X];
+                    hv_y[row] = ray[RAY_Y];
+                    hv_z[row] = ray[RAY_Z];
+                    mx.hv_n = hn + 1;
+                }
+            } else {
+                // The same body caught by two rays is ONE blow, not two.  Keep
+                // the nearest contact point and let a head touch win, so a
+                // sweep that clips a shoulder and a skull scores the skull.
+                if (t < hv_t[row]) {
+                    hv_t[row] = t;
+                    hv_x[row] = ray[RAY_X];
+                    hv_y[row] = ray[RAY_Y];
+                    hv_z[row] = ray[RAY_Z];
+                }
+                if (head == 1) { hv_head[row] = 1; }
+            }
+        }
+
+        // One terrain impact per SWING, from the centre ray, not one per ray:
+        // seven sparks off a hillside is what a shotgun looks like, and a club
+        // is not a shotgun.
+        if (kind == RAY_TERRAIN) {
+            if (i == centre) {
+                terrain_seen = 1;
+                ter_x = ray[RAY_X];
+                ter_y = ray[RAY_Y];
+                ter_z = ray[RAY_Z];
+            }
+        }
+
+        i++;
+    }
+
+    // ---- order by contact distance, nearest first ------------------------
+    // Insertion sort over at most 8 rows, ties broken by slot index so the
+    // order is a pure function of the state and never of iteration luck.  The
+    // cleave cap then takes the NEAREST `maxv` bodies, which is the only
+    // ordering a player can predict from what is on screen.
+    let n: i32 = mx.hv_n;
+    let s: i32 = 1;
+    while (s < n) {
+        let kt: f64 = hv_t[s];
+        let ks: i32 = hv_slot[s];
+        let kh: i32 = hv_head[s];
+        let kx: f64 = hv_x[s];
+        let ky: f64 = hv_y[s];
+        let kz: f64 = hv_z[s];
+        let j: i32 = s - 1;
+        let done: i32 = 0;
+        while (done == 0) {
+            if (j < 0) { done = 1; } else {
+                let sw: i32 = 0;
+                if (hv_t[j] > kt) { sw = 1; }
+                if (hv_t[j] == kt) { if (hv_slot[j] > ks) { sw = 1; } }
+                if (sw == 1) {
+                    hv_t[j + 1] = hv_t[j];
+                    hv_slot[j + 1] = hv_slot[j];
+                    hv_head[j + 1] = hv_head[j];
+                    hv_x[j + 1] = hv_x[j];
+                    hv_y[j + 1] = hv_y[j];
+                    hv_z[j + 1] = hv_z[j];
+                    j = j - 1;
+                } else {
+                    done = 1;
+                }
+            }
+        }
+        hv_t[j + 1] = kt;
+        hv_slot[j + 1] = ks;
+        hv_head[j + 1] = kh;
+        hv_x[j + 1] = kx;
+        hv_y[j + 1] = ky;
+        hv_z[j + 1] = kz;
+        s++;
+    }
+    if (n > maxv) { n = maxv; }
+
+    // ---- pass 2: one damage application + one full feedback set per victim
+    let stag = mx.stag;
+    let stick: i32 = mel_stagger_len(m);
+    let sfx_hit: i32 = melee_sfx_for(m);
+
+    let v: i32 = 0;
+    while (v < n) {
+        let vslot: i32 = hv_slot[v];
+        let head: i32 = hv_head[v];
+        let t_hx: f64 = hv_x[v];
+        let t_hy: f64 = hv_y[v];
+        let t_hz: f64 = hv_z[v];
+        let hx: f64 = t_hx + 0.0;
+        let hy: f64 = t_hy + 0.0;
+        let hz: f64 = t_hz + 0.0;
+
+        let hm: i32 = 0;
+        if (head == 1) { hm = hm | HM_HEAD; }
+        // There is no HM_FALLOFF on a melee blow, ever: melee has no range
+        // falloff, so a grey damage number would be a lie about the weapon.
+
+        let t_raw: f64 = mel_dmg_hit(m, head);
+        let raw: f64 = t_raw + 0.0;
+
+        // XZ direction of the blow, for the Warden plate arc.  Same derivation
+        // combat_fire uses, so a sword into a front plate is reduced exactly as
+        // a bullet is and a flank still works.
+        let sdx: f64 = hx - ox;
+        let sdz: f64 = hz - oz;
+        let t_sl: f64 = sqrt(sdx * sdx + sdz * sdz);
+        let sl: f64 = t_sl + 0.0;
+        if (sl <= 0.0) { sl = 1.0; }
+        sdx = sdx / sl;
+        sdz = sdz / sl;
+
+        let vid: i32 = world_id_of(wr, vslot);
+
+        // THE authority.  Not a copy of it.
+        let dealt: i32 = combat_apply_damage(cx, wr, aid, vslot, raw,
+                                             mh, DMG_MELEE, hm,
+                                             sdx, sdz, hx, hy, hz);
+        if (cx.last_plated == 1) { hm = hm | HM_ARMOR; }
+
+        let flags2 = wr.flags;
+        let killed: i32 = 0;
+        if ((flags2[vslot] & EF_DEAD) != 0) { killed = 1; }
+        if (killed == 1) { hm = hm | HM_KILL; }
+
+        // ============================================================
+        // THE FIVE SIGNALS OF GAME_DESIGN §2.5.  ALL FIVE, THIS TICK.
+        // ============================================================
+        // 1. hitmarker
+        mel_push_m(bus, tick, EV_HITMARKER, hm, aid, vid, hx, hy, hz);
+
+        // 2. enemy flash, at the body centre — the whole body flashes
+        let pys2 = wr.py;
+        let bh: f64 = combat_body_h(wr, vslot);
+        mel_push_m(bus, tick, EV_HIT_FLASH, HIT_FLASH_CS, aid, vid,
+                   pxs[vslot], pys2[vslot] + bh * 0.5, pzs[vslot]);
+
+        // 3. damage number
+        let shown: i32 = dealt;
+        if (shown > 255) { shown = 255; }
+        mel_push_m(bus, tick, EV_DAMAGE_NUMBER, shown, aid, vid, hx, hy, hz);
+
+        // 4. impact billboard.  ONE per victim, not one per ray: a club that
+        //    caught a body with four of its seven rays hit it once.
+        let surf: i32 = SURF_FLESH;
+        if ((hm & HM_ARMOR) != 0) { surf = SURF_ARMOR; }
+        mel_push_m(bus, tick, EV_IMPACT, surf, aid, vid, hx, hy, hz);
+
+        // 5. audio.  Melee has its own voice; see §1.
+        let sfx: i32 = sfx_hit;
+        if ((hm & HM_ARMOR) != 0) { sfx = SFX_IMPACT_ARMOR; }
+        if (killed == 1) { sfx = SFX_KILL_CHIME; }
+        mel_push_m(bus, tick, EV_SOUND, sfx, aid, vid, hx, hy, hz);
+
+        // ---- stagger.  The club's whole reason to exist. ----------------
+        // MAX, not sum: two clubs on one Husk hold it, they do not freeze it
+        // for 0.9 s.  A dead thing is not staggered.
+        if (killed == 0) {
+            if (vslot >= 0) {
+                if (vslot < mx.ent_cap) {
+                    if (stick > stag[vslot]) { stag[vslot] = stick; }
+                    mx.staggers = mx.staggers + 1;
+                    let pys3 = wr.py;
+                    mel_push_m(bus, tick, EV_STAGGER, stick, aid, vid,
+                               pxs[vslot], pys3[vslot], pzs[vslot]);
+                }
+            }
+        }
+
+        mx.hits = mx.hits + 1;
+        v++;
+    }
+
+    // ---- what a swing that touched nothing sounds like -------------------
+    if (n == 0) {
+        if (terrain_seen == 1) {
+            mx.terrain_hits = mx.terrain_hits + 1;
+            mel_push_m(bus, tick, EV_IMPACT, SURF_TERRAIN, aid, ID_NONE,
+                       ter_x, ter_y, ter_z);
+            mel_push_m(bus, tick, EV_SOUND, SFX_IMPACT_WORLD, aid, ID_NONE,
+                       ter_x, ter_y, ter_z);
+        } else {
+            mx.whiffs = mx.whiffs + 1;
+            mel_push_m(bus, tick, EV_SOUND, SFX_MELEE_WHIFF, aid, ID_NONE,
+                       ox + fwx * reach, oy + fwy * reach, oz + fwz * reach);
+        }
+    }
+
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 8.  THE TICK
+// ===========================================================================
+// Advance one player's melee by exactly ONE FIXED TICK, resolving a strike if
+// this is the tick the windup ends on.  Returns the victims struck this tick.
+//
+// The press EDGE is detected here, from `p_cmd`'s BTN_MELEE bit, and the "held"
+// bit lives in MS_HELD — i.e. in the state array, not in a caller's local.
+// CLAUDE.md §7: every movement variable lives in PredictedState, and the same
+// argument applies verbatim to a swing.  A caller-side edge detector would
+// replay differently and the divergence would show up as an occasional extra
+// swing, which is the worst kind of bug to find.
+//
+// A swing requested mid-swing is BUFFERED (one deep) and fires the instant the
+// recovery ends.  That buffer is one integer in the state array, so it rewinds
+// with everything else.
+export fn melee_tick(p_mx: object, p_cx: object, p_w: object, p_cs,
+                     p_pslot: i32, p_ent_slot: i32, p_eye_y: f64,
+                     p_cmd: object): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_pslot) == 0) {
+        mx.bad_slot = mx.bad_slot + 1;
+        let z: i32 = 0;
+        return z;
+    }
+    let st = mx.st;
+    let o: i32 = p_pslot * 7;
+    let m: i32 = i32(st[o + 0]);
+    if (mel_valid(m) == 0) {
+        st[o + 4] = 0.0;
+        let z: i32 = 0;
+        return z;
+    }
+
+    let dt: f64 = g_TICK_DT;
+
+    // ---- the press edge --------------------------------------------------
+    let down: i32 = 0;
+    if (cmd_btn(p_cmd, BTN_MELEE) != 0) { down = 1; }
+    let was: i32 = i32(st[o + 4]);
+    st[o + 4] = f64(down);
+    let edge: i32 = 0;
+    if (down == 1) { if (was == 0) { edge = 1; } }
+
+    let phase: i32 = i32(st[o + 1]);
+
+    if (edge == 1) {
+        if (phase == 0) {
+            st[o + 1] = 1.0;
+            st[o + 2] = mel_windup(m);
+            st[o + 5] = st[o + 5] + 1.0;
+            mx.swings = mx.swings + 1;
+            phase = 1;
+        } else {
+            st[o + 3] = 1.0;
+        }
+    }
+
+    if (phase == 0) { let z: i32 = 0; return z; }
+
+    // ---- advance the phase clock ----------------------------------------
+    let t: f64 = st[o + 2] - dt;
+    if (t > g_T_EPS) {
+        st[o + 2] = t;
+        let z: i32 = 0;
+        return z;
+    }
+
+    let struck: i32 = 0;
+    if (phase == 1) {
+        struck = melee_strike(mx, p_cx, p_w, p_cs, p_ent_slot, p_eye_y,
+                              p_cmd, m);
+        st[o + 6] = st[o + 6] + f64(struck);
+        st[o + 1] = 2.0;
+        st[o + 2] = mel_active(m);
+    } else {
+        if (phase == 2) {
+            st[o + 1] = 3.0;
+            st[o + 2] = mel_recover(m);
+        } else {
+            st[o + 1] = 0.0;
+            st[o + 2] = 0.0;
+            if (st[o + 3] != 0.0) {
+                st[o + 3] = 0.0;
+                st[o + 1] = 1.0;
+                st[o + 2] = mel_windup(m);
+                st[o + 5] = st[o + 5] + 1.0;
+                mx.swings = mx.swings + 1;
+            }
+        }
+    }
+    let out: i32 = struck;
+    return out;
+}
+
+// The number of TICKS each phase of a swing occupies at the fixed 60 Hz step,
+// which is what the state machine above actually produces — `ceil(seconds/dt)`,
+// because a phase ends on the tick its remainder runs out.  Exported so the
+// viewmodel animator and the probe read the same number the sim uses instead of
+// each rounding the seconds themselves.
+export fn melee_phase_len(p_m: i32, p_phase: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0; return z; }
+    let sec: f64 = 0.0;
+    if (p_phase == 1) { sec = mel_windup(p_m); }
+    if (p_phase == 2) { sec = mel_active(p_m); }
+    if (p_phase == 3) { sec = mel_recover(p_m); }
+    if (sec <= 0.0) { let z: i32 = 0; return z; }
+    let n: i32 = i32(sec * 60.0);
+    while (f64(n) * g_TICK_DT < sec - g_T_EPS) { n = n + 1; }
+    while (n > 1) {
+        if (f64(n - 1) * g_TICK_DT >= sec - g_T_EPS) { n = n - 1; } else { break; }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// Ticks from the press to the next press being accepted.
+export fn melee_cycle_len(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0; return z; }
+    let out: i32 = melee_phase_len(p_m, 1) + melee_phase_len(p_m, 2)
+                 + melee_phase_len(p_m, 3);
+    return out;
+}
+
+// ===========================================================================
+// 9.  FINGERPRINTS — the determinism gate
+// ===========================================================================
+// Same construction as `wpn_state_hash`: floats folded through a 2^20
+// fixed-point grid so the hash is a function of the simulated value and not of
+// a last-bit rounding difference between the two backends.  All mixing in u64
+// (A13 — i32/i64 `*` TRAPS on overflow).
+fn hash_f(p_h: u64, p_v: f64): u64 {
+    let v: f64 = p_v * 1048576.0 + 4503599627370496.0;
+    if (v < 0.0) { v = 0.0; }
+    if (v > 9007199254740992.0) { v = 9007199254740992.0; }
+    let u: u64 = u64(v);
+    let out: u64 = (p_h ^ u) * 1099511628211;
+    return out;
+}
+
+fn hash_i(p_h: u64, p_v: i32): u64 {
+    let k: i32 = p_v;
+    let u: u64 = u64(k & 2147483647);
+    if (k < 0) { u = u + 2147483648; }
+    let h: u64 = (p_h ^ u) * 1099511628211;
+    let out: u64 = h ^ (h >> 29);
+    return out;
+}
+
+export fn melee_state_hash(p_mx: object, p_s: i32): i32 {
+    let mx: object = p_mx;
+    if (slot_ok(mx, p_s) == 0) { let z: i32 = 0; return z; }
+    let st = mx.st;
+    let o: i32 = p_s * 7;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < 7) {
+        h = hash_f(h, st[o + i]);
+        i++;
+    }
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// Every swing state plus the whole stagger table.  This is the number a replay
+// compares; a stagger that decayed differently is a desync even when no HP
+// moved, because it decides whether an enemy swings back.
+export fn melee_hash(p_mx: object): i32 {
+    let mx: object = p_mx;
+    let h: u64 = 14695981039346656037;
+    let ns: i32 = mx.slots;
+    let s: i32 = 0;
+    while (s < ns) {
+        h = (h ^ u64(melee_state_hash(mx, s))) * 1099511628211;
+        s++;
+    }
+    let g = mx.stag;
+    let ne: i32 = mx.ent_cap;
+    let i: i32 = 0;
+    while (i < ne) {
+        h = hash_i(h, g[i]);
+        i++;
+    }
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// 10.  SELF-DESCRIPTION — what a melee weapon structurally is NOT
+// ===========================================================================
+// A blunt, cheap, callable statement of the three design invariants that a
+// later edit is most likely to break quietly.  The probe asserts all three.
+export fn melee_invariants_ok(): i32 {
+    let out: i32 = 1;
+    // 1. no durability, anywhere
+    if (MEL_HAS_DURABILITY != 0) { out = 0; }
+    // 2. the state record has exactly seven fields and none of them is ammo
+    if (MS_FIELDS != 7) { out = 0; }
+    // 3. the three melee ids fit the wire's main-hand field alongside the guns
+    if (mel_to_mainhand(MEL_SWORD) > 15) { out = 0; }
+    if (mel_to_mainhand(MEL_CLUB) != MH_MELEE_BASE) { out = 0; }
+    if (MEL_COUNT != 3) { out = 0; }
+    return out;
+}

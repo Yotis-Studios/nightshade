@@ -1,0 +1,765 @@
+// ===========================================================================
+// nightshade/src/render/settle_render.hml — THE SETTLEMENT EMIT WALK   (NEW)
+// ===========================================================================
+//
+// SETTLEMENT.md §7 and §8.3, built.  This file turns the settlement store that
+// `src/sim/settle.hml` owns into:
+//
+//   * ground geometry  — the green's terraced deck, its kerb, and the roads,
+//     pushed as ordinary CHUNK meshes (one per road plus one for the green, so
+//     the frustum can throw away the roads behind you);
+//   * prop instances   — every building, with its three LOD rungs, its B1
+//     sector, the §7.6 caps and the demote-never-drop rule;
+//   * FX cards         — the lit windows, which cannot be world geometry
+//     because vertex colour can only DARKEN (CLAUDE.md §6);
+//   * the numbers      — a full per-frame accounting, because a settlement that
+//     cannot be measured cannot be budgeted.
+//
+// ---------------------------------------------------------------------------
+// THE IMPORT WALL PUT THE ART ON THE OTHER SIDE OF A HANDOFF
+// ---------------------------------------------------------------------------
+// `ci_imports.sh` R1: `src/render/**` may import wobbleweed, `src/render/**`,
+// `src/core/**` and `src/sim/**` — but NOT `src/art/**`.  So this file never
+// names `hubgen.hml`.  The mesh library arrives as four flat tables through
+// `settle_render_bind`, exactly the way `world_render.hml` already receives its
+// blob, viewmodel and glow cell through `frame_bind_assets`.  That is not a
+// workaround; it is the wall doing its job — the renderer reads and never
+// writes, and nothing in `src/render/` learns what a building is made of.
+//
+//     hubgen_build_all();
+//     settle_render_bind(hubgen_mesh_table(), hubgen_tris_table(),
+//                        hubgen_radius_table(), hubgen_aabb_table());
+//
+// ---------------------------------------------------------------------------
+// THE GROUND YOU SEE IS THE GROUND THE SIM STANDS ON
+// ---------------------------------------------------------------------------
+// `terrain_render.hml` exports a `terrain_h` of its own and it is NOT the
+// heightfield the simulation uses — `main.hml` §"THE GROUND YOU SEE" is the
+// scar tissue from that one.  `settle.hml` places its green, its roads and all
+// 72 plots on `worldgen_height`, so this file samples `worldgen_height` and
+// nothing else.  Building the green off `terrain_h` would put the deck at one
+// height and the buildings standing on it at another.
+//
+// ---------------------------------------------------------------------------
+// WHY THE GROUND MESH IS CACHED AND WHAT INVALIDATES IT
+// ---------------------------------------------------------------------------
+// `worldgen_height` is the expensive call in this project (SETTLEMENT.md §1.3
+// measures 8.1-9.2 us).  The green + roads mesh takes ~500 of them, so it is
+// built ONCE and rebuilt only when (seed, tier) changes — i.e. on world load
+// and on a promotion, which is when the Back Lane is supposed to appear.  It is
+// never on the frame path.  `settle_render_ground_dirty()` forces a rebuild.
+// ===========================================================================
+
+import { sqrt, floor, atan2, cos, sin, divi } from "@stdlib/math";
+
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_vert_ao, mesh_quad, mesh_end,
+         mesh_tri_count, mesh_bake_light, mesh_radius }
+       from "../../../wobbleweed/src/mesh.hml";
+import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
+
+import { clampi, clampf, clamp01, lerpf, floori, minf, maxf, absf }
+       from "../core/mathx.hml";
+
+import { terrain_chunk_add } from "./terrain_render.hml";
+import { entity_prop_add, entity_prop_key, g_LOD_FOG_CARD } from "./entity_render.hml";
+import { fx_add, g_FXK_SPRITE } from "./fx.hml";
+
+import { worldgen_height } from "../sim/worldgen.hml";
+import { settle_tier, settle_brownout, settle_cx, settle_cz, settle_deck_y,
+         settle_bearing, settle_grid_lux, settle_road_count,
+         settle_road_pt_x, settle_road_pt_z,
+         settle_building_count, settle_building_pid, settle_building_kind,
+         settle_building_state, settle_plot_x, settle_plot_z, settle_plot_y,
+         settle_plot_yaw, settle_hash,
+         SET_CON_STAKED, SET_CON_DONE, SET_B_COUNT, SET_B_STACK, SET_B_WELL,
+         SET_GREEN_R_M, SET_ROAD_MESH_STEPS, SET_ROAD_STEP_M }
+       from "../sim/settle.hml";
+
+// ===========================================================================
+// 1.  THE CONSTANTS THIS FILE OWNS
+// ===========================================================================
+
+// SETTLEMENT.md §7.6.  ENFORCED IN THE EMIT WALK, NOT HOPED FOR.
+export let SR_MAX_BLD_FULL: i32  = 8;    // B0 + B1 combined, the nearest
+export let SR_MAX_BLD_BLOCK: i32 = 16;   // B2
+export let SR_MAX_GLOW: i32      = 24;   // lit windows, FX layer
+export let SR_PLAYER_BUILD_TRIS: i32 = 120;   // drawn, the green's 1 m grid
+
+// The LOD rungs (§7.2).  B0 exists ONLY for the downhill camera that can see a
+// roof deck; 18 m is where that stops mattering.
+export let SR_LOD_B1_M: f64 = 18.0;
+export let SR_LOD_B2_M: f64 = 40.0;
+
+// §7.3 / §11.6.  A PLACE override, not a tier override: a lit lantern's tier-0
+// disc out in the wild keeps its 72 m.  `hub_dawn` already ships at 52 m, so
+// the shipping money shot is already on the other side of this line.
+//
+// ⚠ THIS CONSTANT WANTS TO LIVE IN `src/core/config.hml` next to
+// g_FOG_FAR_TIER0.  This task does not own config.hml, so it is declared here
+// and the move is REPORTED rather than done silently (CLAUDE.md §3).
+export let g_SR_FOG_FAR_SETTLEMENT: f64 = 56.0;
+// The ramp: linear from the settlement value at the ring to the biome's value
+// over the following 32 m.  At 5 m/s that is 6.4 s, against ART_BIBLE's >= 3 s.
+export let g_SR_FOG_RAMP_M: f64 = 32.0;
+
+// The green deck: 20 x 20 m on the 4 m grid, 5 x 5 = 25 quads (§5.2).
+let g_SR_GREEN_HALF_M: f64 = 10.0;
+let g_SR_GREEN_Q: i32 = 5;
+let g_SR_DAIS_R_M: f64 = 4.5;      // cobble inside this radius, path outside
+let g_SR_ROAD_HALF_M: f64 = 2.0;   // 4 m carriageway
+let g_SR_DECK_LIFT_M: f64 = 0.06;
+
+// ===========================================================================
+// 2.  BINDINGS — everything this file may not import
+// ===========================================================================
+
+let g_sr_mesh: array = [];
+let g_sr_tris: array<i32> = [];
+let g_sr_rad: array<f64> = [];
+let g_sr_aabb: array<f64> = [];
+let g_sr_bound: i32 = 0;
+
+let g_sr_atlas = null;
+let g_sr_glow_cell: i32 = 0;
+
+// The atlas cell ids the ground mesh uses.  BOUND, NEVER NAMED: `texgen.hml`
+// is an art module, CELL_* is its vocabulary, and the wall says this file may
+// not import it.  Cell 0 is the default only because there has to be one; a
+// caller that forgets `settle_render_bind_cells` gets grass, which is a visible
+// bug rather than a silent one.
+let g_sr_cell_cobble: i32 = 0;
+let g_sr_cell_path: i32 = 0;
+let g_sr_cell_dirt: i32 = 0;
+let g_sr_cell_rubble: i32 = 0;
+
+// The four ground colours, likewise BOUND rather than named — CLAUDE.md §8:
+// no colour is authored outside palette.hml, and palette.hml is in src/art.
+//
+// The default is 16777215, which is not a colour: it is (255,255,255), the
+// IDENTITY of the vertex-colour multiply.  An unbound ground therefore renders
+// its texture unmodified rather than rendering a colour this file invented.
+let g_sr_col_cobble: i32 = 16777215;
+let g_sr_col_path: i32 = 16777215;
+let g_sr_col_kerb: i32 = 16777215;
+let g_sr_col_glow: i32 = 16777215;
+
+export let SR_VARIANTS: i32 = 9;
+export let SR_CONS: i32 = 4;
+
+export fn settle_render_bind(p_mesh: array, p_tris: array<i32>,
+                             p_rad: array<f64>, p_aabb: array<f64>) {
+    g_sr_mesh = p_mesh;
+    g_sr_tris = p_tris;
+    g_sr_rad = p_rad;
+    g_sr_aabb = p_aabb;
+    g_sr_bound = 1;
+}
+
+export fn settle_render_is_bound(): i32 { let out: i32 = g_sr_bound; return out; }
+
+export fn settle_render_bind_atlas(p_atlas) { g_sr_atlas = p_atlas; }
+
+// The FX cell a lit window uses.  MUST be the neutral glow card, never the one
+// that carries its own violet: the first build of the shot harness used the
+// violet card and every window in the hub came back MAGENTA, which is CLAUDE.md
+// §8's one unforgivable art bug (violet decorating a friendly building).
+export fn settle_render_bind_glow(p_cell: i32, p_rgb: i32) {
+    g_sr_glow_cell = p_cell;
+    g_sr_col_glow = p_rgb;
+}
+
+export fn settle_render_bind_cells(p_cobble: i32, p_path: i32,
+                                   p_dirt: i32, p_rubble: i32) {
+    g_sr_cell_cobble = p_cobble;
+    g_sr_cell_path = p_path;
+    g_sr_cell_dirt = p_dirt;
+    g_sr_cell_rubble = p_rubble;
+}
+
+export fn settle_render_bind_ground_rgb(p_cobble: i32, p_path: i32, p_kerb: i32) {
+    g_sr_col_cobble = p_cobble;
+    g_sr_col_path = p_path;
+    g_sr_col_kerb = p_kerb;
+}
+
+fn sr_slot(p_kind: i32, p_con: i32, p_variant: i32): i32 {
+    let out: i32 = (p_kind * SR_CONS + p_con) * SR_VARIANTS + p_variant;
+    return out;
+}
+
+fn sr_variant(p_rung: i32, p_sector: i32): i32 {
+    let r: i32 = p_rung;
+    if (r <= 0) { let a: i32 = 0; return a; }
+    let s: i32 = p_sector & 3;
+    if (r == 1) { let b: i32 = 1 + s; return b; }
+    let c: i32 = 5 + s;
+    return c;
+}
+
+// ===========================================================================
+// 3.  THE SECTOR PICK
+// ---------------------------------------------------------------------------
+// The ONE per-frame decision, and the reason the boundaries are where they are
+// is in hubgen.hml's header: they sit on the FACE NORMALS, so the two faces
+// that swap at a boundary are both exactly edge-on at zero screen area.
+//
+//     phi = atan2(camz - bz, camx - bx) - plot_yaw        [SETTLEMENT.md §7.2]
+//
+// `plot_yaw` is the SIM's compass yaw.  The renderer must hand
+// `-plot_yaw` to `entity_prop_add` — see `settle_render_yaw` and the derivation
+// in hubgen.hml.
+// ===========================================================================
+
+export fn settle_render_sector(p_camx: f64, p_camz: f64,
+                               p_bx: f64, p_bz: f64, p_yaw: f64): i32 {
+    let dx: f64 = p_camx - p_bx;
+    let dz: f64 = p_camz - p_bz;
+    let phi: f64 = atan2(dz, dx) - p_yaw;
+    let t: f64 = phi / 6.283185307179586;
+    t = t - floor(t);
+    let s: i32 = floori(t * 4.0);
+    if (s < 0) { s = 0; }
+    if (s > 3) { s = 3; }
+    let out: i32 = s;
+    return out;
+}
+
+export fn settle_render_yaw(p_sim_yaw: f64): f64 {
+    let out: f64 = 0.0 - p_sim_yaw;
+    return out;
+}
+
+// ===========================================================================
+// 4.  THE GROUND: the green, its kerb, and the roads
+// ===========================================================================
+
+let g_sr_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_sr_gmesh: array = [];
+let g_sr_gtris: i32 = 0;
+let g_sr_gstamp: i32 = 0;          // (hash of seed, tier) the cache was built at
+let g_sr_gready: i32 = 0;
+let g_sr_gcx: f64 = 0.0;
+let g_sr_gcz: f64 = 0.0;
+let g_sr_grad: array<f64> = [];
+
+fn sr_uv(p_cell: i32) {
+    if (g_sr_atlas == null) {
+        let c: i32 = p_cell;
+        let cx: f64 = f64(c % 8);
+        let cy: f64 = f64(divi(c, 8));
+        let ins: f64 = 0.001953125;
+        g_sr_uvq[0] = cx * 0.125 + ins;
+        g_sr_uvq[1] = cy * 0.125 + ins;
+        g_sr_uvq[2] = (cx + 1.0) * 0.125 - ins;
+        g_sr_uvq[3] = (cy + 1.0) * 0.125 - ins;
+        return;
+    }
+    atlas_cell_uv(g_sr_atlas, p_cell, g_sr_uvq, 0);
+}
+
+fn sr_rgb_r(p_c: i32): i32 { let out: i32 = (p_c >> 16) & 255; return out; }
+fn sr_rgb_g(p_c: i32): i32 { let out: i32 = (p_c >> 8) & 255; return out; }
+fn sr_rgb_b(p_c: i32): i32 { let out: i32 = p_c & 255; return out; }
+
+// One up-facing quad in world space.  Vertex normals lean with the height
+// field so a deck on a slope is not flat-lit (CLAUDE.md §9 rule 4).
+fn sr_ground_quad(p_m, p_cell: i32, p_col: i32, p_ao: f64,
+                  p_ax: f64, p_ay: f64, p_az: f64,
+                  p_bx: f64, p_by: f64, p_bz: f64,
+                  p_cx: f64, p_cy: f64, p_cz: f64,
+                  p_dx: f64, p_dy: f64, p_dz: f64) {
+    sr_uv(p_cell);
+    let u0: f64 = g_sr_uvq[0]; let v0: f64 = g_sr_uvq[1];
+    let u1: f64 = g_sr_uvq[2]; let v1: f64 = g_sr_uvq[3];
+    let r: i32 = sr_rgb_r(p_col); let g: i32 = sr_rgb_g(p_col);
+    let b: i32 = sr_rgb_b(p_col);
+    // va/vb/vc/vd, not a/b/c/d: `d` is one of the twelve hot-local names and
+    // ci_unbox.sh fails an untyped one.  See the same note in hubgen.hml.
+    let va: i32 = mesh_vert_n(p_m, p_ax, p_ay, p_az, u0, v0, r, g, b, 0.0, 1.0, 0.0);
+    let vb: i32 = mesh_vert_n(p_m, p_bx, p_by, p_bz, u1, v0, r, g, b, 0.0, 1.0, 0.0);
+    let vc: i32 = mesh_vert_n(p_m, p_cx, p_cy, p_cz, u1, v1, r, g, b, 0.0, 1.0, 0.0);
+    let vd: i32 = mesh_vert_n(p_m, p_dx, p_dy, p_dz, u0, v1, r, g, b, 0.0, 1.0, 0.0);
+    mesh_vert_ao(p_m, va, p_ao);
+    mesh_vert_ao(p_m, vb, p_ao);
+    mesh_vert_ao(p_m, vc, p_ao);
+    mesh_vert_ao(p_m, vd, p_ao);
+    mesh_quad(p_m, va, vb, vc, vd);
+}
+
+// A vertical kerb panel from a LEVEL top edge down to the height field.  This
+// is what makes a terrace legal on a 10 m / 32 m slope (§5.2): the deck is
+// level, the kerb absorbs the difference, and nothing floats.
+fn sr_kerb_panel(p_m, p_seed: i32, p_cell: i32, p_col: i32,
+                 p_px: f64, p_pz: f64, p_qx: f64, p_qz: f64, p_top: f64) {
+    let nx: f64 = 0.0 - (p_qz - p_pz);
+    let nz: f64 = p_qx - p_px;
+    let ny: f64 = sqrt(nx * nx + nz * nz) * 0.95;
+    let by0: f64 = worldgen_height(p_seed, p_px, p_pz) - 0.55;
+    let by1: f64 = worldgen_height(p_seed, p_qx, p_qz) - 0.55;
+    if (by0 > p_top - 0.05) { by0 = p_top - 0.05; }
+    if (by1 > p_top - 0.05) { by1 = p_top - 0.05; }
+    sr_uv(p_cell);
+    let u0: f64 = g_sr_uvq[0]; let v0: f64 = g_sr_uvq[1];
+    let u1: f64 = g_sr_uvq[2]; let v1: f64 = g_sr_uvq[3];
+    let r: i32 = sr_rgb_r(p_col); let g: i32 = sr_rgb_g(p_col);
+    let b: i32 = sr_rgb_b(p_col);
+    let va: i32 = mesh_vert_n(p_m, p_px, p_top, p_pz, u0, v0, r, g, b, nx, ny, nz);
+    let vb: i32 = mesh_vert_n(p_m, p_qx, p_top, p_qz, u1, v0, r, g, b, nx, ny, nz);
+    let vc: i32 = mesh_vert_n(p_m, p_qx, by1, p_qz, u1, v1, r, g, b, nx, ny, nz);
+    let vd: i32 = mesh_vert_n(p_m, p_px, by0, p_pz, u0, v1, r, g, b, nx, ny, nz);
+    mesh_vert_ao(p_m, va, 1.0);
+    mesh_vert_ao(p_m, vb, 1.0);
+    mesh_vert_ao(p_m, vc, 0.66);
+    mesh_vert_ao(p_m, vd, 0.66);
+    mesh_quad(p_m, va, vb, vc, vd);
+}
+
+fn sr_build_green(p_st: object): i32 {
+    let st: object = p_st;
+    let seed: i32 = st.seed;
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    let dy: f64 = settle_deck_y(st) + g_SR_DECK_LIFT_M;
+    let q: i32 = g_SR_GREEN_Q;
+    let half: f64 = g_SR_GREEN_HALF_M;
+    let step: f64 = half * 2.0 / f64(q);
+    // 25 deck quads + 4 x 5 kerb panels = 45 quads = 90 triangles
+    let m = mesh_new(q * q * 2 + q * 8 + 16);
+    mesh_begin(m);
+    for (let j = 0; j < q; j++) {
+        for (let i = 0; i < q; i++) {
+            let x0: f64 = cx - half + step * f64(i);
+            let x1: f64 = x0 + step;
+            let z0: f64 = cz - half + step * f64(j);
+            let z1: f64 = z0 + step;
+            let mx: f64 = (x0 + x1) * 0.5 - cx;
+            let mz: f64 = (z0 + z1) * 0.5 - cz;
+            let d: f64 = sqrt(mx * mx + mz * mz);
+            let cell: i32 = g_sr_cell_path;
+            let col: i32 = g_sr_col_path;
+            let ao: f64 = 0.94;
+            if (d <= g_SR_DAIS_R_M) {
+                cell = g_sr_cell_cobble; col = g_sr_col_cobble; ao = 1.0;
+            }
+            sr_ground_quad(m, cell, col, ao,
+                           x0, dy, z0, x1, dy, z0, x1, dy, z1, x0, dy, z1);
+        }
+    }
+    // the kerb, all four sides, wound so every outward normal points away
+    for (let k = 0; k < q; k++) {
+        let t0: f64 = 0.0 - half + step * f64(k);
+        let t1: f64 = t0 + step;
+        // -Z side: P=(cx+t1, cz-half) -> Q=(cx+t0, cz-half)
+        sr_kerb_panel(m, seed, g_sr_cell_rubble, g_sr_col_kerb,
+                      cx + t1, cz - half, cx + t0, cz - half, dy);
+        // +Z side
+        sr_kerb_panel(m, seed, g_sr_cell_rubble, g_sr_col_kerb,
+                      cx + t0, cz + half, cx + t1, cz + half, dy);
+        // -X side
+        sr_kerb_panel(m, seed, g_sr_cell_rubble, g_sr_col_kerb,
+                      cx - half, cz + t0, cx - half, cz + t1, dy);
+        // +X side
+        sr_kerb_panel(m, seed, g_sr_cell_rubble, g_sr_col_kerb,
+                      cx + half, cz + t1, cx + half, cz + t0, dy);
+    }
+    mesh_end(m);
+    g_sr_gmesh.push(m);
+    g_sr_grad.push(half * 1.45 + 3.0);
+    let out: i32 = mesh_tri_count(m);
+    return out;
+}
+
+fn sr_build_road(p_st: object, p_road: i32): i32 {
+    let st: object = p_st;
+    let seed: i32 = st.seed;
+    let nsteps: i32 = SET_ROAD_MESH_STEPS;
+    let m = mesh_new(nsteps * 4 + 16);
+    mesh_begin(m);
+    let hw: f64 = g_SR_ROAD_HALF_M;
+    let cr: i32 = g_sr_col_path;
+    for (let s = 0; s < nsteps; s++) {
+        let ax: f64 = settle_road_pt_x(st, p_road, s);
+        let az: f64 = settle_road_pt_z(st, p_road, s);
+        let bx: f64 = settle_road_pt_x(st, p_road, s + 1);
+        let bz: f64 = settle_road_pt_z(st, p_road, s + 1);
+        let ex: f64 = bx - ax;
+        let ez: f64 = bz - az;
+        let el: f64 = sqrt(ex * ex + ez * ez);
+        if (el < 0.001) { continue; }
+        let px2: f64 = 0.0 - ez / el * hw;
+        let pz2: f64 = ex / el * hw;
+        // TWO quads per 8 m segment, so no ground quad is over 4 m and the
+        // affine-UV warp stays charming rather than obvious (CLAUDE.md §6).
+        for (let h = 0; h < 2; h++) {
+            let t0: f64 = f64(h) * 0.5;
+            let t1: f64 = t0 + 0.5;
+            let x0: f64 = ax + ex * t0; let z0: f64 = az + ez * t0;
+            let x1: f64 = ax + ex * t1; let z1: f64 = az + ez * t1;
+            let ka: f64 = worldgen_height(seed, x0 - px2, z0 - pz2) + 0.05;
+            let kb: f64 = worldgen_height(seed, x0 + px2, z0 + pz2) + 0.05;
+            let kc: f64 = worldgen_height(seed, x1 + px2, z1 + pz2) + 0.05;
+            let kd: f64 = worldgen_height(seed, x1 - px2, z1 - pz2) + 0.05;
+            sr_ground_quad(m, g_sr_cell_path, cr, 0.90,
+                           x0 - px2, ka, z0 - pz2,
+                           x0 + px2, kb, z0 + pz2,
+                           x1 + px2, kc, z1 + pz2,
+                           x1 - px2, kd, z1 - pz2);
+        }
+    }
+    mesh_end(m);
+    g_sr_gmesh.push(m);
+    g_sr_grad.push(f64(nsteps) * SET_ROAD_STEP_M * 0.62 + 6.0);
+    let out: i32 = mesh_tri_count(m);
+    return out;
+}
+
+fn sr_stamp(p_st: object): i32 {
+    let st: object = p_st;
+    let s: i32 = st.seed;
+    let out: i32 = (s * 16 + settle_tier(st)) & 1073741823;
+    return out;
+}
+
+// Force the next `settle_render_ground` call to rebuild.
+export fn settle_render_ground_dirty() { g_sr_gready = 0; }
+
+// Build (or reuse) the green + road meshes.  Returns total authored triangles.
+// NEVER call this from the frame path without checking the stamp — it is ~500
+// `worldgen_height` calls.
+export fn settle_render_ground_build(p_st: object): i32 {
+    let st: object = p_st;
+    let stamp: i32 = sr_stamp(st);
+    if (g_sr_gready == 1) {
+        if (g_sr_gstamp == stamp) { let cached: i32 = g_sr_gtris; return cached; }
+    }
+    g_sr_gmesh = [];
+    g_sr_grad = [];
+    let n: i32 = 0;
+    n = n + sr_build_green(st);
+    let roads: i32 = settle_road_count(settle_tier(st));
+    for (let r = 0; r < roads; r++) { n = n + sr_build_road(st, r); }
+    g_sr_gtris = n;
+    g_sr_gstamp = stamp;
+    g_sr_gready = 1;
+    g_sr_gcx = settle_cx(st);
+    g_sr_gcz = settle_cz(st);
+    let out: i32 = n;
+    return out;
+}
+
+export fn settle_render_ground_count(): i32 {
+    let out: i32 = g_sr_gmesh.length;
+    return out;
+}
+export fn settle_render_ground_mesh(p_i: i32) { return g_sr_gmesh[p_i]; }
+export fn settle_render_ground_tris(): i32 { let out: i32 = g_sr_gtris; return out; }
+
+// Bake the ground meshes for this frame's sun.  Cheap: 4 meshes, ~500 verts.
+export fn settle_render_ground_bake(p_lx: f64, p_ly: f64, p_lz: f64,
+                                    p_sr: f64, p_sg: f64, p_sb: f64,
+                                    p_ar: f64, p_ag: f64, p_ab: f64,
+                                    p_br: f64, p_bg: f64, p_bb: f64): i32 {
+    let n: i32 = g_sr_gmesh.length;
+    for (let i = 0; i < n; i++) {
+        mesh_bake_light(g_sr_gmesh[i], p_lx, p_ly, p_lz,
+                        p_sr, p_sg, p_sb, p_ar, p_ag, p_ab, p_br, p_bg, p_bb);
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// Push the ground meshes into the chunk registry.  One entry per mesh, so the
+// frustum can throw away the two roads behind the camera.
+export fn settle_render_ground_push(p_st: object): i32 {
+    let st: object = p_st;
+    settle_render_ground_build(st);
+    let seed: i32 = st.seed;
+    let n: i32 = g_sr_gmesh.length;
+    let pushed: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let m = g_sr_gmesh[i];
+        let cx: f64 = g_sr_gcx;
+        let cz: f64 = g_sr_gcz;
+        if (i > 0) {
+            // a road's bound sphere is centred half way along it
+            let mid: i32 = divi(SET_ROAD_MESH_STEPS, 2);
+            cx = settle_road_pt_x(st, i - 1, mid);
+            cz = settle_road_pt_z(st, i - 1, mid);
+        }
+        terrain_chunk_add(m, 0.0, 0.0, cx, worldgen_height(seed, cx, cz), cz,
+                          g_sr_grad[i]);
+        pushed++;
+    }
+    let out: i32 = pushed;
+    return out;
+}
+
+// ===========================================================================
+// 5.  THE EMIT WALK
+// ===========================================================================
+
+export let SR_STAT_TESTED: i32    = 0;
+export let SR_STAT_B0: i32        = 1;
+export let SR_STAT_B1: i32        = 2;
+export let SR_STAT_B2: i32        = 3;
+export let SR_STAT_DEMOTED: i32   = 4;
+export let SR_STAT_DROPPED: i32   = 5;
+export let SR_STAT_SUBMITTED: i32 = 6;
+export let SR_STAT_GLOWS: i32     = 7;
+export let SR_STAT_GROUND: i32    = 8;
+export let SR_STAT_COUNT: i32     = 9;
+
+let g_sr_stat: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+export fn settle_render_stats(p_f: i32): i32 {
+    let f: i32 = clampi(p_f, 0, SR_STAT_COUNT - 1);
+    let out: i32 = g_sr_stat[f];
+    return out;
+}
+
+// scratch, allocated once (A8 / N6)
+let g_sr_idx: array<i32> = [];
+let g_sr_d: array<f64> = [];
+let g_sr_rung: array<i32> = [];
+let g_sr_win: array<f64> = [0.0, 0.0, 0.0];
+
+// The natural rung for a distance, before the caps bite.
+fn sr_rung_of(p_d: f64): i32 {
+    if (p_d < SR_LOD_B1_M) { let a: i32 = 0; return a; }
+    if (p_d < SR_LOD_B2_M) { let b: i32 = 1; return b; }
+    let c: i32 = 2;
+    return c;
+}
+
+// Emit every building into the prop registry.  The caller has already cleared
+// it.  Returns the number of props added.
+//
+// ⚠ A BUILDING PAST THE CAP IS DEMOTED ONE RUNG, NEVER DROPPED — until there is
+// no rung left to demote to, which is the ONLY case that drops, and it is
+// COUNTED (`SR_STAT_DROPPED`).  Dropping a building punches a hole in a street
+// and reads as a bug; demoting one is invisible.  `shot.hml`'s own note on
+// `structure_mesh_new` records what a SILENT cap costs: "the frame simply comes
+// back missing a thing nobody mentioned".
+export fn settle_render_emit(p_st: object, p_camx: f64, p_camz: f64,
+                             p_fog_far: f64, p_night: f64): i32 {
+    for (let z = 0; z < SR_STAT_COUNT; z++) { g_sr_stat[z] = 0; }
+    if (g_sr_bound == 0) { let bad: i32 = 0; return bad; }
+    let st: object = p_st;
+    let camx: f64 = p_camx;
+    let camz: f64 = p_camz;
+    let nb: i32 = settle_building_count(st);
+    let far: f64 = p_fog_far;
+
+    // ---- 1. gather the in-range buildings, nearest first -------------------
+    g_sr_idx = [];
+    g_sr_d = [];
+    g_sr_rung = [];
+    for (let i = 0; i < nb; i++) {
+        let pid: i32 = settle_building_pid(st, i);
+        if (pid < 0) { continue; }
+        g_sr_stat[SR_STAT_TESTED] = g_sr_stat[SR_STAT_TESTED] + 1;
+        let bx: f64 = settle_plot_x(st, pid);
+        let bz: f64 = settle_plot_z(st, pid);
+        let dx: f64 = bx - camx;
+        let dz: f64 = bz - camz;
+        let d: f64 = sqrt(dx * dx + dz * dz);
+        // the fog wall plus the largest half-diagonal in the library
+        if (d - 12.0 > far) { continue; }
+        // insertion sort on distance.  n <= 28 and this runs ONCE per frame,
+        // not per triangle — it is nowhere near the hot path.
+        let k: i32 = g_sr_idx.length;
+        g_sr_idx.push(i);
+        g_sr_d.push(d);
+        g_sr_rung.push(0);
+        while (k > 0) {
+            if (g_sr_d[k - 1] <= g_sr_d[k]) { k = 0; }
+            else {
+                let td: f64 = g_sr_d[k - 1];
+                g_sr_d[k - 1] = g_sr_d[k];
+                g_sr_d[k] = td;
+                let ti: i32 = g_sr_idx[k - 1];
+                g_sr_idx[k - 1] = g_sr_idx[k];
+                g_sr_idx[k] = ti;
+                k = k - 1;
+            }
+        }
+    }
+
+    // ---- 2. rungs and the §7.6 caps ---------------------------------------
+    let n: i32 = g_sr_idx.length;
+    let nfull: i32 = 0;
+    let nblock: i32 = 0;
+    for (let a = 0; a < n; a++) {
+        let r: i32 = sr_rung_of(g_sr_d[a]);
+        if (r < 2) {
+            if (nfull >= SR_MAX_BLD_FULL) {
+                r = 2;
+                g_sr_stat[SR_STAT_DEMOTED] = g_sr_stat[SR_STAT_DEMOTED] + 1;
+            } else { nfull++; }
+        }
+        if (r == 2) {
+            if (nblock >= SR_MAX_BLD_BLOCK) { r = 3; }     // 3 == dropped
+            else { nblock++; }
+        }
+        g_sr_rung[a] = r;
+    }
+
+    // ---- 3. emit ----------------------------------------------------------
+    let added: i32 = 0;
+    let glows: i32 = 0;
+    let brown: i32 = settle_brownout(st);
+    let lit: f64 = clamp01(p_night);
+    if (brown != 0) { lit = lit * 0.28; }
+    for (let b = 0; b < n; b++) {
+        let r2: i32 = g_sr_rung[b];
+        if (r2 > 2) {
+            g_sr_stat[SR_STAT_DROPPED] = g_sr_stat[SR_STAT_DROPPED] + 1;
+            continue;
+        }
+        let i2: i32 = g_sr_idx[b];
+        let pid2: i32 = settle_building_pid(st, i2);
+        let kind: i32 = settle_building_kind(st, i2);
+        let con: i32 = settle_building_state(st, i2);
+        let bx2: f64 = settle_plot_x(st, pid2);
+        let bz2: f64 = settle_plot_z(st, pid2);
+        let by2: f64 = settle_plot_y(st, pid2);
+        let yaw: f64 = settle_plot_yaw(st, pid2);
+        let sect: i32 = settle_render_sector(camx, camz, bx2, bz2, yaw);
+
+        let s0: i32 = sr_slot(kind, con, 0);
+        let s1: i32 = sr_slot(kind, con, sr_variant(1, sect));
+        let s2: i32 = sr_slot(kind, con, sr_variant(2, sect));
+        let m0 = g_sr_mesh[s0];
+        let m1 = g_sr_mesh[s1];
+        let m2 = g_sr_mesh[s2];
+        let d1: f64 = SR_LOD_B1_M;
+        let d2: f64 = SR_LOD_B2_M;
+        let sub: i32 = 0;
+        if (r2 == 2) {
+            // DEMOTED (or naturally far): every slot is the block, so whichever
+            // tier the hysteresis picks, the block is what gets emitted.
+            m0 = m2; m1 = m2;
+            sub = g_sr_tris[s2];
+            g_sr_stat[SR_STAT_B2] = g_sr_stat[SR_STAT_B2] + 1;
+        } else if (g_sr_d[b] < SR_LOD_B1_M) {
+            sub = g_sr_tris[s0];
+            g_sr_stat[SR_STAT_B0] = g_sr_stat[SR_STAT_B0] + 1;
+        } else {
+            sub = g_sr_tris[s1];
+            g_sr_stat[SR_STAT_B1] = g_sr_stat[SR_STAT_B1] + 1;
+        }
+        g_sr_stat[SR_STAT_SUBMITTED] = g_sr_stat[SR_STAT_SUBMITTED] + sub;
+
+        // The contact shadow.  MANDATORY (CLAUDE.md §9 rule 6): a building that
+        // does not touch the ground is a sticker pasted on a hill.  The blob is
+        // scaled to the footprint, not to a prop default.
+        let ax0: f64 = g_sr_aabb[kind * 6];
+        let ax1: f64 = g_sr_aabb[kind * 6 + 3];
+        let az0: f64 = g_sr_aabb[kind * 6 + 2];
+        let az1: f64 = g_sr_aabb[kind * 6 + 5];
+        let fx: f64 = ax1 - ax0;
+        let fz: f64 = az1 - az0;
+        // MESH_BLOB is a kite of unit half-width, and `entity_emit` emits it at
+        // `shadow * scale * 0.5`.  So `shadow = the footprint` puts the kite's
+        // half-width at the building's half-width — the projected footprint
+        // SETTLEMENT.md §7.1 budgets, not a halo around it.  The first build
+        // passed `footprint + 1.2` and the shadow was a slab visibly larger and
+        // longer than the house it belonged to; caught by LOOKING at it.
+        let shadow: f64 = maxf(fx, fz);
+        if (con == SET_CON_STAKED) { shadow = 0.0; }
+
+        let idx: i32 = entity_prop_add(m0, m1, m2, d1, d2, g_sr_rad[s0],
+                                       bx2, by2, bz2,
+                                       settle_render_yaw(yaw), 1.0,
+                                       255, 255, 255, shadow, 4096 + kind);
+        // A STABLE identity for the LOD hysteresis.  Buildings never move, so
+        // the plot id is a perfect key and it survives the registry being
+        // cleared and rebuilt every frame.
+        entity_prop_key(idx, 70001 + pid2);
+        added++;
+
+        // ---- the lit windows ----------------------------------------------
+        // The WINDOW cell can only ever be as bright as its own albedo, because
+        // vertex colour cannot brighten.  An actually-glowing window is the
+        // dark glass cell PLUS an additive card in front of it: the ART_BIBLE
+        // §3.4 albedo/emission split applied to architecture.
+        if (con == SET_CON_DONE && lit > 0.02 && r2 < 2) {
+            if (kind != SET_B_STACK && kind != SET_B_WELL) {
+                if (glows < SR_MAX_GLOW) {
+                    let cy: f64 = 0.0; let cxl: f64 = 0.0; let czl: f64 = 0.0;
+                    // two windows on the road-facing wall, in local -Z
+                    let nwin: i32 = 2;
+                    if (fx <= 4.5) { nwin = 1; }
+                    for (let w = 0; w < nwin; w++) {
+                        if (glows >= SR_MAX_GLOW) { continue; }
+                        let off: f64 = 0.0;
+                        if (nwin > 1) { off = 0.0 - fx * 0.26 + fx * 0.52 * f64(w); }
+                        let lz: f64 = 0.0 - fz * 0.5 - 0.22;
+                        // rotate the local offset by the RENDER yaw
+                        let ry: f64 = settle_render_yaw(yaw);
+                        let cc: f64 = cos(ry); let ss: f64 = sin(ry);
+                        cxl = bx2 + off * cc + lz * ss;
+                        czl = bz2 - off * ss + lz * cc;
+                        cy = by2 + (g_sr_aabb[kind * 6 + 4] - 0.62) * 0.58;
+                        fx_add(cxl, cy, czl, 0.85, g_sr_glow_cell, g_FXK_SPRITE,
+                               sr_rgb_r(g_sr_col_glow), sr_rgb_g(g_sr_col_glow),
+                               sr_rgb_b(g_sr_col_glow),
+                               clampi(i32(215.0 * lit), 0, 255));
+                        glows++;
+                    }
+                }
+            }
+        }
+    }
+    g_sr_stat[SR_STAT_GLOWS] = glows;
+    g_sr_stat[SR_STAT_GROUND] = g_sr_gtris;
+    let out: i32 = added;
+    return out;
+}
+
+// ===========================================================================
+// 6.  THE FOG OVERRIDE  (§7.3)
+// ---------------------------------------------------------------------------
+// The settlement runs at 56 m and it is not a budget cheat.  The fog COLOUR
+// carries the tier, not the distance: warm ochre reads as safe at any distance,
+// cold slate reads as hostile at any distance, and warm DENSE air is the
+// opposite read from cold thin air — the difference between "I can't see" and
+// "I'm inside something".  Ground cost falls 509 -> 308 triangles with it.
+//
+// Ramped, never stepped: linear from the settlement value at the tier ring to
+// the biome's value over the following 32 m.
+// ===========================================================================
+
+export fn settle_render_fog_far(p_st: object, p_camx: f64, p_camz: f64,
+                                p_ring_m: f64, p_biome_far: f64): f64 {
+    let st: object = p_st;
+    let dx: f64 = p_camx - settle_cx(st);
+    let dz: f64 = p_camz - settle_cz(st);
+    let d: f64 = sqrt(dx * dx + dz * dz);
+    let ring: f64 = p_ring_m;
+    if (d <= ring) { let inside: f64 = g_SR_FOG_FAR_SETTLEMENT; return inside; }
+    let t: f64 = clamp01((d - ring) / g_SR_FOG_RAMP_M);
+    let out: f64 = lerpf(g_SR_FOG_FAR_SETTLEMENT, p_biome_far, t);
+    return out;
+}
+
+// ===========================================================================
+// 7.  THE DOME BEARING
+// ---------------------------------------------------------------------------
+// The dome itself is painted by `hubgen.hml` (an art module owns the sky).
+// This is the one number the renderer contributes: where the settlement is,
+// relative to the camera, in the panorama's own azimuth.
+// ===========================================================================
+
+export fn settle_render_dome_dx(p_st: object, p_camx: f64): f64 {
+    let out: f64 = settle_cx(p_st) - p_camx;
+    return out;
+}
+export fn settle_render_dome_dz(p_st: object, p_camz: f64): f64 {
+    let out: f64 = settle_cz(p_st) - p_camz;
+    return out;
+}
+export fn settle_render_dome_lux(p_st: object): i32 {
+    let out: i32 = settle_grid_lux(p_st);
+    return out;
+}

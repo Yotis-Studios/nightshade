@@ -1,0 +1,1340 @@
+// ===========================================================================
+// nightshade/src/art/hubgen.hml — THE SETTLEMENT MESH LIBRARY   (settlement-render)
+// ===========================================================================
+//
+// SETTLEMENT.md §8.2, re-scoped: this file builds the ARCHETYPE MESH LIBRARY
+// and nothing else.  Layout, growth, LUX and the accretion order live in
+// `src/sim/settle.hml` (§11.2) because they are world state and must run on a
+// headless server; this file may not be imported from `src/sim/**` and never
+// learns where a building goes.
+//
+// It also owns THE WARM DOME (§6.4) — the settlement's glow written into
+// skygen's horizon band.  That is here, not in the renderer, because
+// `src/render/**` may not import `src/art/**` and skygen is an art module.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS IN THE LIBRARY
+// ---------------------------------------------------------------------------
+//   8 archetypes  x  4 construction states  x  9 variants
+//
+//   variant 0        B0   the full archetype, under 18 m
+//   variant 1..4     B1   the FACADE: only the two walls the camera can see in
+//                         that quadrant, their footing and their fascia.
+//                         18..40 m.
+//   variant 5..8     B2   the BLOCK: two wall quads + two fascia quads, 8 tris.
+//                         beyond 40 m.
+//
+// B1 IS FREE TRIANGLES AND REAL MILLISECONDS.  From outside a closed box the
+// backface cull already threw away two walls, two footings, two fascias and the
+// whole roof deck.  B1 authors exactly what survived, so DRAWN is identical and
+// SUBMITTED halves — and submitted is what costs time (BUDGET_ACTUAL: emit+pack
+// is 3.57 ms at 2500 submitted).
+//
+// ---------------------------------------------------------------------------
+// 🛑 THE SECTOR BOUNDARIES SIT ON THE FACE NORMALS.  THIS IS LOAD-BEARING.
+// ---------------------------------------------------------------------------
+// A box has four faces with outward normals +X, +Z, -X, -Z.  Face +X is visible
+// exactly while the camera's LOCAL bearing phi is in (-90, +90); face +Z exactly
+// while phi is in (0, 180).  So on each QUADRANT [0,90), [90,180), [180,270),
+// [270,360) exactly two faces are visible, and the quadrant boundaries are the
+// face normals themselves.
+//
+// At a boundary the camera is square-on to the face the two neighbouring
+// variants SHARE, and the two faces that swap are both exactly edge-on, at zero
+// screen area.  The pop is provably invisible.  Put the boundaries on the
+// CORNERS instead and a fully-visible wall vanishes — that is the bug this
+// paragraph exists to prevent.
+//
+//   sector 0  phi in [0,90)     faces {+X, +Z}
+//   sector 1  phi in [90,180)   faces {-X, +Z}
+//   sector 2  phi in [180,270)  faces {-X, -Z}
+//   sector 3  phi in [270,360)  faces {+X, -Z}
+//
+// ---------------------------------------------------------------------------
+// ⚠ THE YAW CONVENTION.  DERIVED FROM THE ENGINE, NOT ASSUMED.
+// ---------------------------------------------------------------------------
+// `mesh_emit_yaw` builds M = T . Ry(yaw) . S, whose rotation maps a local
+// direction at local angle phi to WORLD angle (phi - yaw)   [atan2(z, x) both
+// sides].  `settle.hml` works in compass bearings: dir(b) = (sin b, -cos b), so
+// a plot's front direction dir(plot_yaw) has world angle plot_yaw - 90 deg.
+//
+// Solving  phi_front - render_yaw = plot_yaw - 90 deg  for a FIXED local front
+// face gives  render_yaw = -plot_yaw  and  phi_front = -90 deg, i.e. LOCAL -Z.
+//
+// So: THE FRONT OF EVERY ARCHETYPE FACES LOCAL -Z, AND THE RENDERER MUST PASS
+// `-settle_plot_yaw` TO `entity_prop_add`.  `hubgen_render_yaw()` is that
+// negation, exported so exactly one file owns it.  The camera's local bearing
+// is then phi = atan2(camz-bz, camx-bx) - plot_yaw, which is what SETTLEMENT.md
+// §7.2 writes.
+//
+// ---------------------------------------------------------------------------
+// R1 — THIS FILE NAMES NO COLOUR AND NO ATLAS CELL BY NUMBER
+// ---------------------------------------------------------------------------
+// Every colour is a `g_` constant from palette.hml; every tile is a `CELL_`
+// constant from texgen.hml.  There is not one hex literal here.
+//
+// ---------------------------------------------------------------------------
+// KNOWN APPROXIMATION, STATED RATHER THAN HIDDEN
+// ---------------------------------------------------------------------------
+// `mesh_bake_light` takes the light in MODEL space, and one mesh is shared by
+// every instance of its archetype regardless of yaw.  So the sun's lit side is
+// baked in LOCAL space and therefore rotates with the building, exactly as it
+// already does for every enemy, NPC and tree in the project (meshgen has the
+// same property).  Mitigations actually applied here:
+//   * the wall normal is tilted 44 deg into the sky (the sm_wall trick), so the
+//     horizontal term is a minority of N.L and the value structure is carried
+//     by the AO gradient and the fascia band, both of which ARE yaw-invariant;
+//   * the roof deck, the fascia top and the pad face +Y, so they are exactly
+//     yaw-invariant.
+// The honest fix, if a critic ever books it, is a yaw-bucketed library (x4
+// memory).  It is NOT built here and this comment is the report.
+// ===========================================================================
+
+import { sqrt, floor, divi, atan2, cos, sin } from "@stdlib/math";
+
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_vert_ao, mesh_quad, mesh_tri,
+         mesh_end, mesh_bake_light, mesh_tri_count, mesh_vert_count,
+         mesh_radius }
+       from "../../../wobbleweed/src/mesh.hml";
+import { atlas_cell_uv, atlas_update_rows, atlas_mark_rows, atlas_tex }
+       from "../../../wobbleweed/src/atlas.hml";
+
+import { pal_r, pal_g, pal_b, pal_lerp, pal_lum,
+         g_CONCRETE_HI, g_CONCRETE_MID, g_CONCRETE_LO,
+         g_STONE_HI, g_STONE_MID, g_STONE_LO,
+         g_GRANITE_LO, g_WOOD_HI, g_WOOD_MID, g_WOOD_LO,
+         g_ROOF_TILE, g_PAINT_TEAL, g_PAINT_OCHRE,
+         g_DIRT_MID, g_DIRT_LO, g_SAND_LO,
+         g_SUN_HALO, g_EMBER, g_BRASS }
+       from "./palette.hml";
+
+import { CELL_PLASTER, CELL_BRICK, CELL_WOOD_PLANK, CELL_ROOF_TILE,
+         CELL_STONE_A, CELL_STONE_B, CELL_COBBLE, CELL_RUBBLE, CELL_GRAVEL,
+         CELL_WOOD_LOG,
+         CELL_CONCRETE, CELL_METAL_PANEL, CELL_WINDOW, CELL_DOOR,
+         CELL_DIRT, CELL_PATH, CELL_PAINT_TEAL, CELL_PAINT_OCHRE }
+       from "./texgen.hml";
+
+import { skygen_atlas, skygen_w, skygen_h, skygen_dirty_rows,
+         skygen_rebake_slice }
+       from "./skygen.hml";
+
+import { clampi, clampf, clamp01, lerpf, floori, bayer4i }
+       from "../core/mathx.hml";
+
+// ===========================================================================
+// 1.  THE ENUMS.  Kind ids MIRROR `settle.hml`'s SET_B_* exactly, and the
+//     probe asserts that with a literal (CLAUDE.md rule 5: pin the anchors).
+// ===========================================================================
+
+export let HG_B_SHACK: i32   = 0;
+export let HG_B_COTTAGE: i32 = 1;
+export let HG_B_HOUSE: i32   = 2;
+export let HG_B_HALL: i32    = 3;
+export let HG_B_TOWER: i32   = 4;
+export let HG_B_STACK: i32   = 5;
+export let HG_B_WELL: i32    = 6;
+export let HG_B_WORKS: i32   = 7;
+export let HG_B_COUNT: i32   = 8;
+
+export let HG_CON_STAKED: i32 = 0;
+export let HG_CON_FRAMED: i32 = 1;
+export let HG_CON_CLAD: i32   = 2;
+export let HG_CON_DONE: i32   = 3;
+export let HG_CON_COUNT: i32  = 4;
+
+export let HG_RUNG_B0: i32 = 0;
+export let HG_RUNG_B1: i32 = 1;
+export let HG_RUNG_B2: i32 = 2;
+
+export let HG_SECTORS: i32  = 4;
+export let HG_VARIANTS: i32 = 9;          // 1 B0 + 4 B1 + 4 B2
+export let HG_SLOTS: i32    = 288;        // 8 * 4 * 9
+
+// The two LOD switch distances, SETTLEMENT.md §7.2.
+export let HG_LOD_B1_M: f64 = 18.0;
+export let HG_LOD_B2_M: f64 = 40.0;
+
+// The fascia band depth.  MEASURED in shot.hml: 0.62 m is four native pixels
+// of hard dark value at 34 m, which is what makes CLAD (no fascia) and DONE
+// (fascia) different SILHOUETTES at real distance rather than different
+// textures.  Do not shrink it.
+export let HG_EAVE_M: f64 = 0.62;
+
+// How far the walls run BELOW the sill so undulating ground never shows a gap.
+export let HG_FOOT_M: f64 = 1.4;
+
+// AO down a wall: 1.0 at the eaves, 0.74 into the dirt.  A 2-triangle contact
+// blob under a 12 m hall would be absurd; this gradient IS the building's
+// contact shadow (CLAUDE.md §9 rule 6).
+let g_HG_AO_TOP: f64  = 1.0;
+let g_HG_AO_FOOT: f64 = 0.74;
+
+// face ids / bit positions
+let g_HG_FX_POS: i32 = 0;      // +X
+let g_HG_FZ_POS: i32 = 1;      // +Z
+let g_HG_FX_NEG: i32 = 2;      // -X
+let g_HG_FZ_NEG: i32 = 3;      // -Z
+let g_HG_FACES_ALL: i32 = 15;
+
+// ===========================================================================
+// 2.  THE ARCHETYPE TABLE — SETTLEMENT.md §7.1, counted from the code
+// ---------------------------------------------------------------------------
+//   quads = 2*px*rows + 2*pz*rows   main walls, 4 faces
+//         + 2*px + 2*pz             footing course, 4 faces, 1 row
+//         + px*pz                   roof deck
+//         + 2*px + 2*pz             fascia band, 4 faces, 1 row
+//   tris  = 2 * quads
+//
+// which reproduces every authored figure in the doc's table EXACTLY:
+//   Shack 34 / Cottage 52 / House 88 / Hall 112 / Works 164 / Tower 50 /
+//   Stack 58.   And the drawn column is the same sum over TWO faces instead of
+//   four with the roof deck dropped: 16 / 24 / 40 / 50 / 70 / 24 / 28.
+//
+// A "panel" is 4 m, which is one atlas cell at the ground's 12 cm/texel — so
+// a 12 m facade is three cells, never one cell stretched over the whole wall
+// (CLAUDE.md §9 rule 13).
+// ===========================================================================
+
+let g_HG_PANEL_M: f64 = 4.0;
+
+fn hg_px(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_COTTAGE) { let a: i32 = 2; return a; }
+    if (k == HG_B_HOUSE)   { let b: i32 = 2; return b; }
+    if (k == HG_B_HALL)    { let c: i32 = 3; return c; }
+    if (k == HG_B_WORKS)   { let d: i32 = 4; return d; }
+    let out: i32 = 1;                        // shack, tower, stack, well
+    return out;
+}
+
+fn hg_pz(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_HOUSE) { let a: i32 = 2; return a; }
+    if (k == HG_B_HALL)  { let b: i32 = 2; return b; }
+    if (k == HG_B_WORKS) { let c: i32 = 3; return c; }
+    let out: i32 = 1;
+    return out;
+}
+
+fn hg_rows(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_HOUSE) { let a: i32 = 3; return a; }
+    if (k == HG_B_HALL)  { let b: i32 = 3; return b; }
+    if (k == HG_B_WORKS) { let c: i32 = 3; return c; }
+    if (k == HG_B_TOWER) { let d: i32 = 4; return d; }
+    if (k == HG_B_STACK) { let e: i32 = 5; return e; }
+    if (k == HG_B_WELL)  { let f: i32 = 1; return f; }
+    let out: i32 = 2;                        // shack, cottage
+    return out;
+}
+
+// Eaves height.  IDENTICAL to `settle_arch_eaves` — the sim uses it for the
+// collider top and this file uses it for the geometry, and if they ever
+// disagree the building's AABB stops matching the building.  probe_hubgen
+// asserts the two agree for all 8 kinds.
+export fn hubgen_eaves(p_kind: i32): f64 {
+    let k: i32 = p_kind;
+    if (k == HG_B_COTTAGE) { let a: f64 = 2.8; return a; }
+    if (k == HG_B_HOUSE)   { let b: f64 = 3.4; return b; }
+    if (k == HG_B_HALL)    { let c: f64 = 4.2; return c; }
+    if (k == HG_B_TOWER)   { let d: f64 = 9.0; return d; }
+    if (k == HG_B_STACK)   { let e: f64 = 12.0; return e; }
+    if (k == HG_B_WORKS)   { let f: f64 = 5.4; return f; }
+    if (k == HG_B_WELL)    { let g: f64 = 1.2; return g; }
+    let out: f64 = 2.6;                      // shack
+    return out;
+}
+
+export fn hubgen_footprint_x(p_kind: i32): f64 {
+    let out: f64 = f64(hg_px(p_kind)) * g_HG_PANEL_M;
+    return out;
+}
+
+export fn hubgen_footprint_z(p_kind: i32): f64 {
+    let out: f64 = f64(hg_pz(p_kind)) * g_HG_PANEL_M;
+    return out;
+}
+
+// The authored count of the FULL archetype, from the formula above.  This is
+// the number the probe pins against SETTLEMENT.md §7.1 with a literal.
+export fn hubgen_arch_authored(p_kind: i32): i32 {
+    let px: i32 = hg_px(p_kind);
+    let pz: i32 = hg_pz(p_kind);
+    let rw: i32 = hg_rows(p_kind);
+    if (p_kind == HG_B_WELL) { let w: i32 = 30; return w; }
+    let quads: i32 = 2 * px * rw + 2 * pz * rw     // walls, 4 faces
+                   + 2 * px + 2 * pz               // footing, 4 faces
+                   + px * pz                       // roof deck
+                   + 2 * px + 2 * pz;              // fascia, 4 faces
+    let out: i32 = 2 * quads;
+    return out;
+}
+
+// The DRAWN count: two walls, two footings, two fascias, no roof deck.
+export fn hubgen_arch_drawn(p_kind: i32): i32 {
+    let px: i32 = hg_px(p_kind);
+    let pz: i32 = hg_pz(p_kind);
+    let rw: i32 = hg_rows(p_kind);
+    if (p_kind == HG_B_WELL) { let w: i32 = 18; return w; }
+    let quads: i32 = px * rw + pz * rw + px + pz + px + pz;
+    let out: i32 = 2 * quads;
+    return out;
+}
+
+// ---- materials, per archetype ---------------------------------------------
+
+fn hg_wall_cell(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_SHACK) { let a: i32 = CELL_WOOD_PLANK; return a; }
+    if (k == HG_B_TOWER) { let b: i32 = CELL_STONE_A;    return b; }
+    if (k == HG_B_STACK) { let c: i32 = CELL_BRICK;      return c; }
+    if (k == HG_B_WORKS) { let d: i32 = CELL_CONCRETE;   return d; }
+    if (k == HG_B_WELL)  { let e: i32 = CELL_STONE_B;    return e; }
+    let out: i32 = CELL_PLASTER;             // cottage, house, hall
+    return out;
+}
+
+fn hg_roof_cell(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_WORKS) { let a: i32 = CELL_METAL_PANEL; return a; }
+    if (k == HG_B_STACK) { let b: i32 = CELL_CONCRETE;    return b; }
+    let out: i32 = CELL_ROOF_TILE;
+    return out;
+}
+
+// The trim cell.  Ember Hollow's two saturated accents (ART_BIBLE): teal and
+// ochre, alternating by kind so a street is not one colour.
+fn hg_trim_cell(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_COTTAGE) { let a: i32 = CELL_PAINT_TEAL;  return a; }
+    if (k == HG_B_HALL)    { let b: i32 = CELL_PAINT_OCHRE; return b; }
+    if (k == HG_B_HOUSE)   { let c: i32 = CELL_PAINT_TEAL;  return c; }
+    let out: i32 = CELL_PAINT_OCHRE;
+    return out;
+}
+
+fn hg_wall_col(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_SHACK) { let a: i32 = g_WOOD_MID;     return a; }
+    if (k == HG_B_TOWER) { let b: i32 = g_STONE_MID;    return b; }
+    if (k == HG_B_STACK) { let c: i32 = g_STONE_MID;    return c; }
+    if (k == HG_B_WORKS) { let d: i32 = g_CONCRETE_MID; return d; }
+    if (k == HG_B_WELL)  { let e: i32 = g_STONE_MID;    return e; }
+    let out: i32 = g_CONCRETE_HI;            // plastered cottage/house/hall
+    return out;
+}
+
+// ===========================================================================
+// 3.  THE PRIMITIVES.  Local space: the footprint is centred on the origin,
+//     the sill is y = 0, the front face is -Z (see the yaw note in the header).
+// ===========================================================================
+
+let g_hg_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_hg_atlas = null;
+
+// Bind the WORLD atlas before `hubgen_build_all`.  UVs are baked into the
+// vertex arena and are not patchable afterwards — the same contract meshgen
+// publishes for `meshgen_set_material_uv`.
+export fn hubgen_bind_atlas(p_atlas) {
+    g_hg_atlas = p_atlas;
+}
+
+fn hg_uv(p_cell: i32) {
+    if (g_hg_atlas == null) {
+        // A sane default so the library is still BUILDABLE (and countable) with
+        // no atlas: an 8x8 grid on a 256 px sheet with a half-texel inset.
+        let c: i32 = p_cell;
+        let cx: f64 = f64(c % 8);
+        let cy: f64 = f64(divi(c, 8));
+        let ins: f64 = 0.001953125;
+        g_hg_uvq[0] = cx * 0.125 + ins;
+        g_hg_uvq[1] = cy * 0.125 + ins;
+        g_hg_uvq[2] = (cx + 1.0) * 0.125 - ins;
+        g_hg_uvq[3] = (cy + 1.0) * 0.125 - ins;
+        return;
+    }
+    atlas_cell_uv(g_hg_atlas, p_cell, g_hg_uvq, 0);
+}
+
+// One textured panel.  Corners CLOCKWISE AS SEEN FROM OUTSIDE, starting at the
+// texture's top-left.  emit.hml's EMIT_BF_CCW culls screen-space cross <= 0 and
+// screen y points DOWN, so a face survives iff it winds CLOCKWISE ON SCREEN.
+fn hg_quad(p_m, p_cell: i32,
+           p_ax: f64, p_ay: f64, p_az: f64,
+           p_bx: f64, p_by: f64, p_bz: f64,
+           p_cx: f64, p_cy: f64, p_cz: f64,
+           p_dx: f64, p_dy: f64, p_dz: f64,
+           p_nx: f64, p_ny: f64, p_nz: f64,
+           p_r: i32, p_g: i32, p_b: i32,
+           p_aot: f64, p_aob: f64) {
+    hg_uv(p_cell);
+    let u0: f64 = g_hg_uvq[0]; let v0: f64 = g_hg_uvq[1];
+    let u1: f64 = g_hg_uvq[2]; let v1: f64 = g_hg_uvq[3];
+    // ⚠ THE CORNERS ARE va/vb/vc/vd, NOT a/b/c/d.  `d` is one of CLAUDE.md §2's
+    // twelve hot-local names and `tools/ci_unbox.sh` fails an UNTYPED one — the
+    // vertex index it holds is a handle, not a scalar, so the honest fix is a
+    // name outside the reserved twelve rather than a lie about its type.
+    let va: i32 = mesh_vert_n(p_m, p_ax, p_ay, p_az, u0, v0,
+                              p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    let vb: i32 = mesh_vert_n(p_m, p_bx, p_by, p_bz, u1, v0,
+                              p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    let vc: i32 = mesh_vert_n(p_m, p_cx, p_cy, p_cz, u1, v1,
+                              p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    let vd: i32 = mesh_vert_n(p_m, p_dx, p_dy, p_dz, u0, v1,
+                              p_r, p_g, p_b, p_nx, p_ny, p_nz);
+    // AO must be set BEFORE the triangle that copies the vertex into the arena
+    // (mesh.hml's own note on mesh_vert_ao).
+    mesh_vert_ao(p_m, va, p_aot);
+    mesh_vert_ao(p_m, vb, p_aot);
+    mesh_vert_ao(p_m, vc, p_aob);
+    mesh_vert_ao(p_m, vd, p_aob);
+    mesh_quad(p_m, va, vb, vc, vd);
+}
+
+// A wall from (px,pz) to (qx,qz), split into cols x rows panels.
+//
+// p_mask is a bitfield, bit (row * 4 + col), row 0 at the EAVES.  Set bits take
+// the alternate cell and the alternate tint: an opening is a different tile at
+// a different tint and it costs exactly the triangles the blank wall would have
+// cost anyway.
+//
+// ⚠ THE WALL NORMAL IS TILTED 44 DEG INTO THE SKY, ON PURPOSE — the same fix
+// shot.hml carries.  `mesh_bake_light` is a pure lambert with no wrap, so a
+// truly vertical face has N.L = 0 at noon and renders on ambient alone, which
+// measured out as brick, panel and tile all reading as the same dark blue.
+fn hg_wall(p_m, p_pxx: f64, p_pzz: f64, p_qx: f64, p_qz: f64,
+           p_y0: f64, p_y1: f64,
+           p_cell: i32, p_alt: i32, p_mask: i32,
+           p_cols: i32, p_rows: i32,
+           p_r: i32, p_g: i32, p_b: i32,
+           p_ar: i32, p_ag: i32, p_ab: i32) {
+    let nc: i32 = p_cols; if (nc < 1) { nc = 1; } if (nc > 4) { nc = 4; }
+    let nr: i32 = p_rows; if (nr < 1) { nr = 1; } if (nr > 5) { nr = 5; }
+    let ex: f64 = p_qx - p_pxx;
+    let ez: f64 = p_qz - p_pzz;
+    let nx: f64 = 0.0 - ez;
+    let nz: f64 = ex;
+    let ny: f64 = sqrt(nx * nx + nz * nz) * 0.95;
+    for (let i = 0; i < nc; i++) {
+        let t0: f64 = f64(i) / f64(nc);
+        let t1: f64 = f64(i + 1) / f64(nc);
+        let x0: f64 = p_pxx + ex * t0; let z0: f64 = p_pzz + ez * t0;
+        let x1: f64 = p_pxx + ex * t1; let z1: f64 = p_pzz + ez * t1;
+        for (let j = 0; j < nr; j++) {
+            let s0: f64 = f64(j) / f64(nr);
+            let s1: f64 = f64(j + 1) / f64(nr);
+            // row 0 is the top course, so s runs DOWN from the eaves
+            let ya0: f64 = p_y1 + (p_y0 - p_y1) * s0;
+            let ya1: f64 = p_y1 + (p_y0 - p_y1) * s1;
+            let cell: i32 = p_cell;
+            let rr: i32 = p_r; let gg: i32 = p_g; let bb: i32 = p_b;
+            // AO ramps down the WHOLE wall, not down each course
+            let aot: f64 = lerpf(g_HG_AO_TOP, g_HG_AO_FOOT, s0);
+            let aob: f64 = lerpf(g_HG_AO_TOP, g_HG_AO_FOOT, s1);
+            if ((p_mask & (1 << (j * 4 + i))) != 0) {
+                cell = p_alt; rr = p_ar; gg = p_ag; bb = p_ab;
+                aot = 1.0; aob = 0.96;       // glass is not masonry
+            }
+            hg_quad(p_m, cell,
+                    x0, ya0, z0, x1, ya0, z1, x1, ya1, z1, x0, ya1, z0,
+                    nx, ny, nz, rr, gg, bb, aot, aob);
+        }
+    }
+}
+
+// A horizontal face at height y, facing UP, tiled nu x nv.
+fn hg_deck(p_m, p_x0: f64, p_z0: f64, p_x1: f64, p_z1: f64, p_y: f64,
+           p_cell: i32, p_nu: i32, p_nv: i32,
+           p_r: i32, p_g: i32, p_b: i32, p_ao: f64) {
+    let nu: i32 = p_nu; if (nu < 1) { nu = 1; }
+    let nv: i32 = p_nv; if (nv < 1) { nv = 1; }
+    for (let j = 0; j < nv; j++) {
+        for (let i = 0; i < nu; i++) {
+            let x0: f64 = p_x0 + (p_x1 - p_x0) * f64(i) / f64(nu);
+            let x1: f64 = p_x0 + (p_x1 - p_x0) * f64(i + 1) / f64(nu);
+            let z0: f64 = p_z0 + (p_z1 - p_z0) * f64(j) / f64(nv);
+            let z1: f64 = p_z0 + (p_z1 - p_z0) * f64(j + 1) / f64(nv);
+            hg_quad(p_m, p_cell,
+                    x0, p_y, z0, x1, p_y, z0, x1, p_y, z1, x0, p_y, z1,
+                    0.0, 1.0, 0.0, p_r, p_g, p_b, p_ao, p_ao);
+        }
+    }
+}
+
+// ---- the four faces, in the ONE winding that points every normal outward ---
+// A wall from P to Q has outward normal (-dz, 0, dx): seen from outside, P is
+// on the LEFT.  Checked against the terrain quad, which does draw.
+//
+// Fills g_hg_fp[0..3] with px,pz,qx,qz and returns the column count.
+let g_hg_fp: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+fn hg_face(p_kind: i32, p_face: i32, p_grow: f64): i32 {
+    let hx: f64 = hubgen_footprint_x(p_kind) * 0.5 + p_grow;
+    let hz: f64 = hubgen_footprint_z(p_kind) * 0.5 + p_grow;
+    let f: i32 = p_face;
+    if (f == g_HG_FX_POS) {
+        g_hg_fp[0] = hx;  g_hg_fp[1] = hz;  g_hg_fp[2] = hx;  g_hg_fp[3] = 0.0 - hz;
+        let a: i32 = hg_pz(p_kind); return a;
+    }
+    if (f == g_HG_FZ_POS) {
+        g_hg_fp[0] = 0.0 - hx; g_hg_fp[1] = hz; g_hg_fp[2] = hx; g_hg_fp[3] = hz;
+        let b: i32 = hg_px(p_kind); return b;
+    }
+    if (f == g_HG_FX_NEG) {
+        g_hg_fp[0] = 0.0 - hx; g_hg_fp[1] = 0.0 - hz;
+        g_hg_fp[2] = 0.0 - hx; g_hg_fp[3] = hz;
+        let c: i32 = hg_pz(p_kind); return c;
+    }
+    g_hg_fp[0] = hx; g_hg_fp[1] = 0.0 - hz;
+    g_hg_fp[2] = 0.0 - hx; g_hg_fp[3] = 0.0 - hz;
+    let d: i32 = hg_px(p_kind); return d;
+}
+
+// sector -> the two faces it can see, as a 4-bit mask
+export fn hubgen_sector_faces(p_sector: i32): i32 {
+    let s: i32 = p_sector & 3;
+    if (s == 0) { let a: i32 = 3;  return a; }   // +X | +Z
+    if (s == 1) { let b: i32 = 6;  return b; }   // -X | +Z
+    if (s == 2) { let c: i32 = 12; return c; }   // -X | -Z
+    let d: i32 = 9; return d;                    // +X | -Z
+}
+
+// The camera's sector for a building at (bx,bz) with SIM yaw `p_yaw`.
+// phi = atan2(camz-bz, camx-bx) - yaw, wrapped, quantized to quadrants.
+export fn hubgen_sector_of(p_camx: f64, p_camz: f64,
+                           p_bx: f64, p_bz: f64, p_yaw: f64): i32 {
+    let dx: f64 = p_camx - p_bx;
+    let dz: f64 = p_camz - p_bz;
+    let phi: f64 = atan2(dz, dx) - p_yaw;
+    let tau: f64 = 6.283185307179586;
+    let t: f64 = phi / tau;
+    t = t - floor(t);                    // wrap into [0,1)
+    let s: i32 = floori(t * 4.0);
+    if (s < 0) { s = 0; }
+    if (s > 3) { s = 3; }
+    let out: i32 = s;
+    return out;
+}
+
+// The negation the header derives.  Exactly one file owns it.
+export fn hubgen_render_yaw(p_sim_yaw: f64): f64 {
+    let out: f64 = 0.0 - p_sim_yaw;
+    return out;
+}
+
+// ===========================================================================
+// 4.  WINDOW MASKS
+// ---------------------------------------------------------------------------
+// Openings sit in the middle course where there is one, so a lintel band sits
+// above and a plinth band below.  With the opening in the bottom course it runs
+// to the ground and reads as a shopfront shutter, not a window.
+// ===========================================================================
+
+fn hg_win_mask(p_kind: i32, p_cols: i32, p_front: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_STACK) { let z: i32 = 0; return z; }
+    if (k == HG_B_WELL)  { let z2: i32 = 0; return z2; }
+    let rw: i32 = hg_rows(k);
+    let row: i32 = 1;
+    if (rw < 3) { row = 0; }
+    if (k == HG_B_TOWER) { row = 1; }
+    let cols: i32 = p_cols;
+    let m: i32 = 0;
+    if (cols <= 1) {
+        m = 1 << (row * 4);
+    } else if (cols == 2) {
+        // ONE opening per face, never two of two.  Two of two is a CURTAIN
+        // WALL, and a hub hut does not have one — caught by looking at the
+        // 26 m orbit, where the front read as a shopfront rather than a house.
+        if (p_front != 0) { m = 1 << (row * 4 + 1); }
+        else { m = 1 << (row * 4); }
+    } else {
+        // three or four columns: leave the outer piers blank
+        m = (1 << (row * 4 + 1));
+        if (p_front != 0) { m = m | (1 << (row * 4 + 2)); }
+    }
+    let out: i32 = m;
+    return out;
+}
+
+// ===========================================================================
+// 5.  THE STATE BUILDERS
+// ===========================================================================
+
+// ---- STAKED: a levelled pad, four corner stakes and a rope line.  20 tris. --
+// Reads at 320x240 as a pale rectangle on the ground with four ticks:
+// "something is going here".  Silhouette height 0.3 m.
+fn hg_build_staked(p_m, p_kind: i32, p_full: i32) {
+    let hx: f64 = hubgen_footprint_x(p_kind) * 0.5 + 0.6;
+    let hz: f64 = hubgen_footprint_z(p_kind) * 0.5 + 0.6;
+    let dr: i32 = pal_r(g_DIRT_MID); let dg: i32 = pal_g(g_DIRT_MID);
+    let db: i32 = pal_b(g_DIRT_MID);
+    // the pad — one quad, 2 tris
+    hg_deck(p_m, 0.0 - hx, 0.0 - hz, hx, hz, 0.03, CELL_DIRT, 1, 1,
+            dr, dg, db, 0.86);
+    if (p_full == 0) { return; }
+    // four corner stakes.  Each is an L of two quads showing the two faces you
+    // can actually see of a post — 4 tris, exactly what §6.1 budgets.
+    let sr: i32 = pal_r(g_WOOD_LO); let sg: i32 = pal_g(g_WOOD_LO);
+    let sb: i32 = pal_b(g_WOOD_LO);
+    let w: f64 = 0.09;
+    let h: f64 = 0.34;
+    for (let c = 0; c < 4; c++) {
+        let sx: f64 = hx - 0.25;  if (c == 1 || c == 2) { sx = 0.25 - hx; }
+        let sz: f64 = hz - 0.25;  if (c >= 2) { sz = 0.25 - hz; }
+        let ox: f64 = 1.0;        if (c == 1 || c == 2) { ox = -1.0; }
+        let oz: f64 = 1.0;        if (c >= 2) { oz = -1.0; }
+        // the +X-ish face
+        hg_wall(p_m, sx + w * ox, sz + w * oz, sx + w * ox, sz - w * oz,
+                0.0, h, CELL_WOOD_PLANK, CELL_WOOD_PLANK, 0, 1, 1,
+                sr, sg, sb, sr, sg, sb);
+        // the +Z-ish face
+        hg_wall(p_m, sx - w * ox, sz + w * oz, sx + w * ox, sz + w * oz,
+                0.0, h, CELL_WOOD_PLANK, CELL_WOOD_PLANK, 0, 1, 1,
+                sr, sg, sb, sr, sg, sb);
+    }
+    // the rope line along the road-facing edge — one quad, 2 tris
+    hg_wall(p_m, hx - 0.25, 0.16 - hz, 0.25 - hx, 0.16 - hz, 0.24, 0.30,
+            CELL_WOOD_PLANK, CELL_WOOD_PLANK, 0, 1, 1,
+            sr, sg, sb, sr, sg, sb);
+}
+
+// ---- the footing course: one dark conforming course from the sill down into
+// the dirt, so undulating ground can never show daylight under a wall and the
+// building is visibly PLANTED rather than parked.
+fn hg_build_footing(p_m, p_kind: i32, p_faces: i32, p_top: f64) {
+    let fr: i32 = pal_r(g_STONE_HI); let fg: i32 = pal_g(g_STONE_HI);
+    let fb: i32 = pal_b(g_STONE_HI);
+    for (let f = 0; f < 4; f++) {
+        if ((p_faces & (1 << f)) == 0) { continue; }
+        let cols: i32 = hg_face(p_kind, f, 0.0);
+        hg_wall(p_m, g_hg_fp[0], g_hg_fp[1], g_hg_fp[2], g_hg_fp[3],
+                0.0 - HG_FOOT_M, p_top,
+                CELL_RUBBLE, CELL_RUBBLE, 0, cols, 1,
+                fr, fg, fb, fr, fg, fb);
+    }
+}
+
+// ---- the lean-to scaffold: four triangles that say "work in progress" from
+// 40 m.  On the road-facing side (-Z) so it is the first thing seen.
+fn hg_build_scaffold(p_m, p_kind: i32) {
+    let hz: f64 = hubgen_footprint_z(p_kind) * 0.5;
+    let hx: f64 = hubgen_footprint_x(p_kind) * 0.5;
+    let wr: i32 = pal_r(g_WOOD_HI); let wg: i32 = pal_g(g_WOOD_HI);
+    let wb: i32 = pal_b(g_WOOD_HI);
+    let ax: f64 = hx * 0.62;
+    // the sloped plank deck (up-facing) and the leg (out-facing)
+    hg_quad(p_m, CELL_WOOD_PLANK,
+            0.0 - ax, 1.55, 0.0 - hz - 0.12,
+            ax,       1.55, 0.0 - hz - 0.12,
+            ax,       0.40, 0.0 - hz - 1.30,
+            0.0 - ax, 0.40, 0.0 - hz - 1.30,
+            0.0, 1.7, -1.0, wr, wg, wb, 1.0, 0.88);
+    hg_wall(p_m, ax, 0.0 - hz - 1.30, 0.0 - ax, 0.0 - hz - 1.30,
+            0.0, 0.42, CELL_WOOD_PLANK, CELL_WOOD_PLANK, 0, 1, 1,
+            wr, wg, wb, wr, wg, wb);
+}
+
+// ---- FRAMED: the footing course plus four corner posts.  A dark ring at
+// ground level with posts — LOW AND OPEN, unmistakably not a house.
+fn hg_build_framed(p_m, p_kind: i32, p_faces: i32) {
+    hg_build_footing(p_m, p_kind, p_faces, 0.35);
+    let hx: f64 = hubgen_footprint_x(p_kind) * 0.5;
+    let hz: f64 = hubgen_footprint_z(p_kind) * 0.5;
+    let pr: i32 = pal_r(g_WOOD_MID); let pg: i32 = pal_g(g_WOOD_MID);
+    let pb: i32 = pal_b(g_WOOD_MID);
+    let w: f64 = 0.14;
+    let h: f64 = 1.25;
+    for (let c = 0; c < 4; c++) {
+        let sx: f64 = hx - w;  if (c == 1 || c == 2) { sx = w - hx; }
+        let sz: f64 = hz - w;  if (c >= 2) { sz = w - hz; }
+        let ox: f64 = 1.0;     if (c == 1 || c == 2) { ox = -1.0; }
+        let oz: f64 = 1.0;     if (c >= 2) { oz = -1.0; }
+        hg_wall(p_m, sx + w * ox, sz + w * oz, sx + w * ox, sz - w * oz,
+                0.0, h, CELL_WOOD_LOG, CELL_WOOD_LOG, 0, 1, 1,
+                pr, pg, pb, pr, pg, pb);
+        hg_wall(p_m, sx - w * ox, sz + w * oz, sx + w * ox, sz + w * oz,
+                0.0, h, CELL_WOOD_LOG, CELL_WOOD_LOG, 0, 1, 1,
+                pr, pg, pb, pr, pg, pb);
+    }
+    hg_build_scaffold(p_m, p_kind);
+}
+
+// ---- CLAD: full walls, NO roof deck, NO fascia.  Walls with sky above them;
+// the roofline is missing and that is the read.
+fn hg_build_clad(p_m, p_kind: i32, p_faces: i32) {
+    let eav: f64 = hubgen_eaves(p_kind);
+    let cell: i32 = hg_wall_cell(p_kind);
+    let col: i32 = hg_wall_col(p_kind);
+    let rw: i32 = hg_rows(p_kind);
+    let cr: i32 = pal_r(col); let cg: i32 = pal_g(col); let cb: i32 = pal_b(col);
+    for (let f = 0; f < 4; f++) {
+        if ((p_faces & (1 << f)) == 0) { continue; }
+        let cols: i32 = hg_face(p_kind, f, 0.0);
+        // an unclad course reads as bare frame: darker, no openings yet
+        hg_wall(p_m, g_hg_fp[0], g_hg_fp[1], g_hg_fp[2], g_hg_fp[3],
+                0.0, eav, cell, cell, 0, cols, rw,
+                i32(f64(cr) * 0.86), i32(f64(cg) * 0.86), i32(f64(cb) * 0.86),
+                cr, cg, cb);
+    }
+    hg_build_footing(p_m, p_kind, p_faces, 0.0);
+    hg_build_scaffold(p_m, p_kind);
+}
+
+// ---- the chimney: four brick faces and a stone cap.  Ten triangles to put a
+// notch in a silhouette that is otherwise a rectangle with a dark stripe on it.
+fn hg_build_chimney(p_m, p_kind: i32) {
+    let hx: f64 = hubgen_footprint_x(p_kind) * 0.5;
+    let hz: f64 = hubgen_footprint_z(p_kind) * 0.5;
+    let cx: f64 = hx * 0.55;
+    let cz: f64 = hz * 0.35;
+    let hw: f64 = 0.34;
+    let y0: f64 = hubgen_eaves(p_kind) + HG_EAVE_M - 0.4;
+    let y1: f64 = hubgen_eaves(p_kind) + HG_EAVE_M + 0.95;
+    let cols4: array<i32> = [g_STONE_HI, g_STONE_LO, g_STONE_MID, g_CONCRETE_HI];
+    for (let f = 0; f < 4; f++) {
+        let px0: f64 = cx + hw; let pz0: f64 = cz + hw;
+        let qx0: f64 = cx + hw; let qz0: f64 = cz - hw;
+        if (f == 1) { px0 = cx - hw; pz0 = cz + hw; qx0 = cx + hw; qz0 = cz + hw; }
+        if (f == 2) { px0 = cx - hw; pz0 = cz - hw; qx0 = cx - hw; qz0 = cz + hw; }
+        if (f == 3) { px0 = cx + hw; pz0 = cz - hw; qx0 = cx - hw; qz0 = cz - hw; }
+        let c: i32 = cols4[f];
+        hg_wall(p_m, px0, pz0, qx0, qz0, y0, y1,
+                CELL_BRICK, CELL_BRICK, 0, 1, 1,
+                pal_r(c), pal_g(c), pal_b(c), pal_r(c), pal_g(c), pal_b(c));
+    }
+    // the cap, proud on every side, so the top of the stack is a hard line
+    hg_deck(p_m, cx - hw - 0.1, cz - hw - 0.1, cx + hw + 0.1, cz + hw + 0.1, y1,
+            CELL_STONE_A, 1, 1,
+            pal_r(g_STONE_HI), pal_g(g_STONE_HI), pal_b(g_STONE_HI), 1.0);
+}
+
+// ---- DONE: the full archetype.  Walls, footing, roof deck, fascia — plus the
+// chimney and the door, which SETTLEMENT.md §7.5 puts on the B0 rung only.
+fn hg_build_done(p_m, p_kind: i32, p_faces: i32, p_extras: i32) {
+    let eav: f64 = hubgen_eaves(p_kind);
+    let cell: i32 = hg_wall_cell(p_kind);
+    let trim: i32 = hg_trim_cell(p_kind);
+    let col: i32 = hg_wall_col(p_kind);
+    let rw: i32 = hg_rows(p_kind);
+    let cr: i32 = pal_r(col); let cg: i32 = pal_g(col); let cb: i32 = pal_b(col);
+    // the opening tint: dark, cool, and NOT violet.  Violet is reserved for
+    // hostile / collectable / progression (CLAUDE.md §8) and the fastest way to
+    // kill long-range enemy readability is to let it decorate a friendly house.
+    let gr: i32 = pal_r(g_GRANITE_LO); let gg: i32 = pal_g(g_GRANITE_LO);
+    let gb: i32 = pal_b(g_GRANITE_LO);
+
+    // --- the four walls ----------------------------------------------------
+    for (let f = 0; f < 4; f++) {
+        if ((p_faces & (1 << f)) == 0) { continue; }
+        let cols: i32 = hg_face(p_kind, f, 0.0);
+        let front: i32 = 0;
+        if (f == g_HG_FZ_NEG) { front = 1; }
+        let mask: i32 = hg_win_mask(p_kind, cols, front);
+        // a mild value block per face so the box has a corner even before the
+        // sun gets to it (ART_BIBLE 8.2.5)
+        let k: f64 = 1.0;
+        if (f == g_HG_FX_NEG) { k = 0.90; }
+        if (f == g_HG_FZ_POS) { k = 0.94; }
+        hg_wall(p_m, g_hg_fp[0], g_hg_fp[1], g_hg_fp[2], g_hg_fp[3],
+                0.0, eav, cell, CELL_WINDOW, mask, cols, rw,
+                i32(f64(cr) * k), i32(f64(cg) * k), i32(f64(cb) * k),
+                gr, gg, gb);
+    }
+
+    // --- the footing course ------------------------------------------------
+    hg_build_footing(p_m, p_kind, p_faces, 0.0);
+
+    // --- the roof deck, overhanging 0.4 m so the eave shadows the facade ----
+    // Its normal is +Y and every eye in this project is at 2.4 m, below every
+    // eaves line — so this is ZERO drawn triangles from any legal camera and it
+    // exists only for the downhill shot B0 was kept for.
+    if ((p_extras & 4) != 0) {
+        let hx: f64 = hubgen_footprint_x(p_kind) * 0.5 + 0.4;
+        let hz: f64 = hubgen_footprint_z(p_kind) * 0.5 + 0.4;
+        hg_deck(p_m, 0.0 - hx, 0.0 - hz, hx, hz, eav + HG_EAVE_M,
+                hg_roof_cell(p_kind), hg_px(p_kind), hg_pz(p_kind),
+                232, 226, 216, 1.0);
+    }
+
+    // --- ⚠ THE FASCIA *IS* THE ROOF.  The deck above is decoration. --------
+    // Measured in shot.hml: at 0.26 m the band subtended 1.7 px at 34 m and
+    // read as luminance 180.1 against a 180.3 sky — a 1-pixel line drawn over
+    // the sky.  At 0.62 m it is four native pixels of hard dark value, and the
+    // tint drops to STONE_LO so the band is a silhouette EDGE and not a lighter
+    // shade of masonry.  This is the cheapest legible roof there is.
+    let fasr: i32 = pal_r(g_STONE_LO); let fasg: i32 = pal_g(g_STONE_LO);
+    let fasb: i32 = pal_b(g_STONE_LO);
+    for (let f2 = 0; f2 < 4; f2++) {
+        if ((p_faces & (1 << f2)) == 0) { continue; }
+        let cols2: i32 = hg_face(p_kind, f2, 0.4);
+        hg_wall(p_m, g_hg_fp[0], g_hg_fp[1], g_hg_fp[2], g_hg_fp[3],
+                eav, eav + HG_EAVE_M,
+                hg_roof_cell(p_kind), hg_roof_cell(p_kind), 0, cols2, 1,
+                fasr, fasg, fasb, fasr, fasg, fasb);
+    }
+
+    // --- the door: one quad, proud of the front wall by 2 cm ---------------
+    if ((p_extras & 1) != 0) {
+        let dhx: f64 = hubgen_footprint_x(p_kind) * 0.5;
+        let dz: f64 = 0.0 - hubgen_footprint_z(p_kind) * 0.5 - 0.02;
+        let dw: f64 = 0.52;
+        let dh: f64 = 2.05;
+        let dox: f64 = 0.0;
+        if (hg_px(p_kind) > 1) { dox = 0.0 - hubgen_footprint_x(p_kind) * 0.22; }
+        let tr: i32 = pal_r(g_WOOD_LO); let tg: i32 = pal_g(g_WOOD_LO);
+        let tb: i32 = pal_b(g_WOOD_LO);
+        hg_wall(p_m, dox + dw, dz, dox - dw, dz, 0.0, dh,
+                CELL_DOOR, CELL_DOOR, 0, 1, 1, tr, tg, tb, tr, tg, tb);
+    }
+
+    // --- the chimney -------------------------------------------------------
+    if ((p_extras & 2) != 0) { hg_build_chimney(p_m, p_kind); }
+
+    // --- the trim band on the front, ONE quad, the town's warmth ----------
+    if ((p_extras & 8) != 0) {
+        let thx: f64 = hubgen_footprint_x(p_kind) * 0.5;
+        let tz: f64 = 0.0 - hubgen_footprint_z(p_kind) * 0.5 - 0.03;
+        let tc: i32 = g_PAINT_OCHRE;
+        if (hg_trim_cell(p_kind) == CELL_PAINT_TEAL) { tc = g_PAINT_TEAL; }
+        hg_wall(p_m, thx, tz, 0.0 - thx, tz, eav - 0.34, eav - 0.06,
+                trim, trim, 0, hg_px(p_kind), 1,
+                pal_r(tc), pal_g(tc), pal_b(tc),
+                pal_r(tc), pal_g(tc), pal_b(tc));
+    }
+}
+
+// ---- the WELL: a 6-sided lathe.  Six shaft quads, a six-triangle cap and six
+// plinth quads.  30 authored / 18 drawn.
+fn hg_build_well(p_m, p_full: i32) {
+    let r: f64 = 1.25;
+    let y1: f64 = hubgen_eaves(HG_B_WELL);
+    let sr: i32 = pal_r(g_STONE_MID); let sg: i32 = pal_g(g_STONE_MID);
+    let sb: i32 = pal_b(g_STONE_MID);
+    let n: i32 = 6;
+    let tau: f64 = 6.283185307179586;
+    for (let i = 0; i < n; i++) {
+        let a0: f64 = f64(i) * tau / f64(n);
+        let a1: f64 = f64(i + 1) * tau / f64(n);
+        let x0: f64 = cos(a0) * r; let z0: f64 = sin(a0) * r;
+        let x1: f64 = cos(a1) * r; let z1: f64 = sin(a1) * r;
+        // outward normal for P->Q is (-dz, dx); the ring is traversed CCW in
+        // XZ, so P=(x1,z1) Q=(x0,z0) puts the normal outward.
+        hg_wall(p_m, x1, z1, x0, z0, 0.0, y1,
+                CELL_STONE_B, CELL_STONE_B, 0, 1, 1, sr, sg, sb, sr, sg, sb);
+        if (p_full != 0) {
+            hg_wall(p_m, x1, z1, x0, z0, 0.0 - HG_FOOT_M, 0.0,
+                    CELL_RUBBLE, CELL_RUBBLE, 0, 1, 1,
+                    pal_r(g_STONE_HI), pal_g(g_STONE_HI), pal_b(g_STONE_HI),
+                    pal_r(g_STONE_HI), pal_g(g_STONE_HI), pal_b(g_STONE_HI));
+        }
+    }
+    if (p_full == 0) { return; }
+    // the cap: a six-triangle fan, dark — you are looking down a well
+    hg_uv(CELL_STONE_A);
+    let u0: f64 = g_hg_uvq[0]; let v0: f64 = g_hg_uvq[1];
+    let u1: f64 = g_hg_uvq[2]; let v1: f64 = g_hg_uvq[3];
+    let cr: i32 = pal_r(g_STONE_LO); let cg: i32 = pal_g(g_STONE_LO);
+    let cb: i32 = pal_b(g_STONE_LO);
+    let ctr = mesh_vert_n(p_m, 0.0, y1, 0.0, (u0 + u1) * 0.5, (v0 + v1) * 0.5,
+                          cr, cg, cb, 0.0, 1.0, 0.0);
+    mesh_vert_ao(p_m, ctr, 0.42);
+    for (let j = 0; j < n; j++) {
+        let b0: f64 = f64(j) * tau / f64(n);
+        let b1: f64 = f64(j + 1) * tau / f64(n);
+        let ax: f64 = cos(b0) * r; let az: f64 = sin(b0) * r;
+        let bx: f64 = cos(b1) * r; let bz: f64 = sin(b1) * r;
+        let va = mesh_vert_n(p_m, ax, y1, az, u0, v0, cr, cg, cb, 0.0, 1.0, 0.0);
+        let vb = mesh_vert_n(p_m, bx, y1, bz, u1, v1, cr, cg, cb, 0.0, 1.0, 0.0);
+        mesh_vert_ao(p_m, va, 0.70);
+        mesh_vert_ao(p_m, vb, 0.70);
+        mesh_tri(p_m, ctr, va, vb);
+    }
+}
+
+// ---- B2, the BLOCK.  Two wall quads and two fascia quads: 8 triangles, and
+// every one of them survives the backface cull.
+//
+// WHY A BOX AND NOT A BILLBOARD.  A billboard must rotate to face the camera,
+// which at 320x240 with pixel-snapped vertices reads as SWIMMING, and it cannot
+// carry a CORNER — and a corner is the one thing that makes a building read as
+// solid.  Two adjacent faces share a vertical edge; that edge is the corner.
+fn hg_build_block(p_m, p_kind: i32, p_con: i32, p_sector: i32) {
+    if (p_con == HG_CON_STAKED) {
+        hg_build_staked(p_m, p_kind, 0);
+        return;
+    }
+    let faces: i32 = hubgen_sector_faces(p_sector);
+    let eav: f64 = hubgen_eaves(p_kind);
+    let top: f64 = eav;
+    if (p_con == HG_CON_FRAMED) { top = 1.25; }
+    let col: i32 = hg_wall_col(p_kind);
+    // the mean albedo of the archetype, darkened a step: at 40 m the block is
+    // two flat panels and a flat panel at full albedo reads as a sticker.
+    let mr: i32 = i32(f64(pal_r(col)) * 0.90);
+    let mg: i32 = i32(f64(pal_g(col)) * 0.90);
+    let mb: i32 = i32(f64(pal_b(col)) * 0.90);
+    for (let f = 0; f < 4; f++) {
+        if ((faces & (1 << f)) == 0) { continue; }
+        hg_face(p_kind, f, 0.0);
+        hg_wall(p_m, g_hg_fp[0], g_hg_fp[1], g_hg_fp[2], g_hg_fp[3],
+                0.0 - HG_FOOT_M, top,
+                hg_wall_cell(p_kind), hg_wall_cell(p_kind), 0, 1, 1,
+                mr, mg, mb, mr, mg, mb);
+    }
+    if (p_con != HG_CON_DONE) { return; }
+    // the fascia band survives to B2: it is what keeps the roofline dark
+    // against the sky at 40 m, and it is two triangles.
+    let fr: i32 = pal_r(g_STONE_LO); let fg: i32 = pal_g(g_STONE_LO);
+    let fb: i32 = pal_b(g_STONE_LO);
+    for (let f2 = 0; f2 < 4; f2++) {
+        if ((faces & (1 << f2)) == 0) { continue; }
+        hg_face(p_kind, f2, 0.4);
+        hg_wall(p_m, g_hg_fp[0], g_hg_fp[1], g_hg_fp[2], g_hg_fp[3],
+                eav, eav + HG_EAVE_M,
+                hg_roof_cell(p_kind), hg_roof_cell(p_kind), 0, 1, 1,
+                fr, fg, fb, fr, fg, fb);
+    }
+}
+
+// ===========================================================================
+// 6.  THE LIBRARY
+// ===========================================================================
+
+let g_hg_mesh: array = [];
+let g_hg_tris: array<i32> = [];
+let g_hg_rad: array<f64> = [];
+let g_hg_built: i32 = 0;
+let g_hg_total: i32 = 0;
+let g_hg_distinct: i32 = 0;
+let g_hg_aabb: array<f64> = [];
+
+fn hg_slot(p_kind: i32, p_con: i32, p_variant: i32): i32 {
+    let out: i32 = (p_kind * HG_CON_COUNT + p_con) * HG_VARIANTS + p_variant;
+    return out;
+}
+
+// rung + sector -> variant index
+export fn hubgen_variant(p_rung: i32, p_sector: i32): i32 {
+    let r: i32 = p_rung;
+    if (r <= HG_RUNG_B0) { let a: i32 = 0; return a; }
+    let s: i32 = p_sector & 3;
+    if (r == HG_RUNG_B1) { let b: i32 = 1 + s; return b; }
+    let c: i32 = 5 + s;
+    return c;
+}
+
+// The extras mask for a DONE archetype: 1 door, 2 chimney, 4 roof deck, 8 trim.
+fn hg_extras(p_kind: i32, p_rung: i32): i32 {
+    if (p_rung != HG_RUNG_B0) { let z: i32 = 0; return z; }
+    let k: i32 = p_kind;
+    let e: i32 = 4;                                  // roof deck on B0 only
+    if (k != HG_B_STACK && k != HG_B_WELL) { e = e | 1; }        // door
+    if (k == HG_B_SHACK || k == HG_B_COTTAGE ||
+        k == HG_B_HOUSE || k == HG_B_HALL) { e = e | 2; }        // chimney
+    if (k == HG_B_COTTAGE || k == HG_B_HOUSE ||
+        k == HG_B_HALL || k == HG_B_WORKS) { e = e | 8; }        // trim band
+    let out: i32 = e;
+    return out;
+}
+
+fn hg_make(p_kind: i32, p_con: i32, p_rung: i32, p_sector: i32, p_cap: i32) {
+    let cap: i32 = p_cap * 2;
+    if (cap < 64) { cap = 64; }
+    let m = mesh_new(cap);
+    mesh_begin(m);
+    let faces: i32 = g_HG_FACES_ALL;
+    if (p_rung == HG_RUNG_B1) { faces = hubgen_sector_faces(p_sector); }
+    if (p_kind == HG_B_WELL) {
+        // A WELL IS DUG, NOT BUILT IN COURSES.  It has two visible states —
+        // STAKED (the generic pad) and finished — because a 30-triangle object
+        // cannot carry a four-rung ladder whose first rung is a 20-triangle
+        // pad without the ladder running BACKWARDS.  Reported, not hidden.
+        let wcon: i32 = HG_CON_DONE;
+        if (p_con == HG_CON_STAKED) { wcon = HG_CON_STAKED; }
+        if (p_rung == HG_RUNG_B2) { hg_build_block(m, p_kind, wcon, p_sector); }
+        else if (wcon == HG_CON_STAKED) { hg_build_staked(m, p_kind, 1); }
+        else { hg_build_well(m, 1); }
+    } else if (p_rung == HG_RUNG_B2) {
+        hg_build_block(m, p_kind, p_con, p_sector);
+    } else if (p_con == HG_CON_STAKED) {
+        hg_build_staked(m, p_kind, 1);
+    } else if (p_con == HG_CON_FRAMED) {
+        hg_build_framed(m, p_kind, faces);
+    } else if (p_con == HG_CON_CLAD) {
+        hg_build_clad(m, p_kind, faces);
+    } else {
+        hg_build_done(m, p_kind, faces, hg_extras(p_kind, p_rung));
+    }
+    mesh_end(m);
+    let slot: i32 = hg_slot(p_kind, p_con, hubgen_variant(p_rung, p_sector));
+    g_hg_mesh[slot] = m;
+    g_hg_tris[slot] = mesh_tri_count(m);
+    g_hg_rad[slot] = mesh_radius(m);
+    g_hg_total = g_hg_total + mesh_tri_count(m);
+    g_hg_distinct++;
+}
+
+fn hg_alias(p_kind: i32, p_con: i32, p_from: i32, p_to: i32) {
+    let s0: i32 = hg_slot(p_kind, p_con, p_from);
+    let s1: i32 = hg_slot(p_kind, p_con, p_to);
+    g_hg_mesh[s1] = g_hg_mesh[s0];
+    g_hg_tris[s1] = g_hg_tris[s0];
+    g_hg_rad[s1] = g_hg_rad[s0];
+}
+
+// Build the whole library.  Boot only.  Returns total triangles.
+export fn hubgen_build_all(): i32 {
+    if (g_hg_built == 1) { let done: i32 = g_hg_total; return done; }
+    g_hg_mesh = [];
+    g_hg_tris = [];
+    g_hg_rad = [];
+    g_hg_aabb = [];
+    for (let i = 0; i < HG_SLOTS; i++) {
+        g_hg_mesh.push(null); g_hg_tris.push(0); g_hg_rad.push(0.0);
+    }
+    g_hg_total = 0;
+    g_hg_distinct = 0;
+
+    for (let k = 0; k < HG_B_COUNT; k++) {
+        let full: i32 = hubgen_arch_authored(k);
+        for (let c = 0; c < HG_CON_COUNT; c++) {
+            if (c == HG_CON_STAKED) {
+                // a staked pad is flat and 20 triangles: one mesh serves B0 and
+                // all four B1 sectors, and B2 is the bare pad.
+                hg_make(k, c, HG_RUNG_B0, 0, 24);
+                for (let s = 0; s < HG_SECTORS; s++) { hg_alias(k, c, 0, 1 + s); }
+                hg_make(k, c, HG_RUNG_B2, 0, 4);
+                for (let s2 = 1; s2 < HG_SECTORS; s2++) { hg_alias(k, c, 5, 5 + s2); }
+            } else {
+                hg_make(k, c, HG_RUNG_B0, 0, full + 40);
+                for (let s3 = 0; s3 < HG_SECTORS; s3++) {
+                    hg_make(k, c, HG_RUNG_B1, s3, full);
+                    hg_make(k, c, HG_RUNG_B2, s3, 24);
+                }
+            }
+        }
+        // the local-space AABB: 6 f64 per kind
+        let hx: f64 = hubgen_footprint_x(k) * 0.5;
+        let hz: f64 = hubgen_footprint_z(k) * 0.5;
+        g_hg_aabb.push(0.0 - hx);
+        g_hg_aabb.push(0.0 - HG_FOOT_M);
+        g_hg_aabb.push(0.0 - hz);
+        g_hg_aabb.push(hx);
+        g_hg_aabb.push(hubgen_eaves(k) + HG_EAVE_M);
+        g_hg_aabb.push(hz);
+    }
+    g_hg_built = 1;
+    let out: i32 = g_hg_total;
+    return out;
+}
+
+export fn hubgen_is_built(): i32 { let out: i32 = g_hg_built; return out; }
+export fn hubgen_total_tris(): i32 { let out: i32 = g_hg_total; return out; }
+export fn hubgen_mesh_count(): i32 { let out: i32 = g_hg_distinct; return out; }
+
+export fn hubgen_mesh(p_kind: i32, p_con: i32, p_rung: i32, p_sector: i32) {
+    let k: i32 = clampi(p_kind, 0, HG_B_COUNT - 1);
+    let c: i32 = clampi(p_con, 0, HG_CON_COUNT - 1);
+    let v: i32 = hubgen_variant(p_rung, p_sector);
+    return g_hg_mesh[hg_slot(k, c, v)];
+}
+
+export fn hubgen_tris(p_kind: i32, p_con: i32, p_rung: i32, p_sector: i32): i32 {
+    let k: i32 = clampi(p_kind, 0, HG_B_COUNT - 1);
+    let c: i32 = clampi(p_con, 0, HG_CON_COUNT - 1);
+    let v: i32 = hubgen_variant(p_rung, p_sector);
+    let out: i32 = g_hg_tris[hg_slot(k, c, v)];
+    return out;
+}
+
+export fn hubgen_radius(p_kind: i32, p_con: i32, p_rung: i32, p_sector: i32): f64 {
+    let k: i32 = clampi(p_kind, 0, HG_B_COUNT - 1);
+    let c: i32 = clampi(p_con, 0, HG_CON_COUNT - 1);
+    let v: i32 = hubgen_variant(p_rung, p_sector);
+    let out: f64 = g_hg_rad[hg_slot(k, c, v)];
+    return out;
+}
+
+// The whole table, so a consumer in another zone can bind it with ONE call.
+// `src/render/**` may not import `src/art/**`, so the glue hands these over.
+export fn hubgen_mesh_table(): array { let out: array = g_hg_mesh; return out; }
+export fn hubgen_tris_table(): array<i32> { let out: array<i32> = g_hg_tris; return out; }
+export fn hubgen_radius_table(): array<f64> { let out: array<f64> = g_hg_rad; return out; }
+export fn hubgen_aabb_table(): array<f64> { let out: array<f64> = g_hg_aabb; return out; }
+
+// 6 f64: minx, miny, minz, maxx, maxy, maxz, in LOCAL space.
+export fn hubgen_aabb(p_kind: i32, p_out: array<f64>): i32 {
+    let k: i32 = clampi(p_kind, 0, HG_B_COUNT - 1);
+    let o: i32 = k * 6;
+    for (let i = 0; i < 6; i++) { p_out[i] = g_hg_aabb[o + i]; }
+    let out: i32 = 6;
+    return out;
+}
+
+// ---- the light bake, once per ToD step ------------------------------------
+export fn hubgen_bake_all(p_lx: f64, p_ly: f64, p_lz: f64,
+                          p_sr: f64, p_sg: f64, p_sb: f64,
+                          p_ar: f64, p_ag: f64, p_ab: f64,
+                          p_br: f64, p_bg: f64, p_bb: f64): i32 {
+    if (g_hg_built == 0) { let bad: i32 = -1; return bad; }
+    let n: i32 = 0;
+    let seen: i32 = 0;
+    for (let i = 0; i < HG_SLOTS; i++) {
+        let m = g_hg_mesh[i];
+        if (m == null) { continue; }
+        // aliased slots share a handle; baking one twice is harmless (the bake
+        // reads the albedo side table, never the current vertex colour) but it
+        // is wasted work, so skip a slot whose handle equals the previous one.
+        if (i > 0) { if (g_hg_mesh[i - 1] == m) { continue; } }
+        mesh_bake_light(m, p_lx, p_ly, p_lz, p_sr, p_sg, p_sb,
+                        p_ar, p_ag, p_ab, p_br, p_bg, p_bb);
+        n = n + mesh_vert_count(m);
+        seen++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 7.  WINDOW ANCHORS — where the FX layer puts a lit window
+// ---------------------------------------------------------------------------
+// The WINDOW cell can only ever be as bright as its own albedo, because vertex
+// colour cannot brighten.  So an actually-glowing window is the dark glass cell
+// PLUS an additive glow card in front of it — the ART_BIBLE §3.4 split (albedo
+// in ATLAS_WORLD, emission in ATLAS_FX) applied to architecture.
+//
+// These are LOCAL offsets.  The caller rotates them by the plot yaw.
+// ===========================================================================
+
+export fn hubgen_window_count(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k == HG_B_STACK) { let a: i32 = 0; return a; }
+    if (k == HG_B_WELL)  { let b: i32 = 0; return b; }
+    if (k == HG_B_TOWER) { let c: i32 = 1; return c; }
+    if (k == HG_B_SHACK) { let d: i32 = 1; return d; }
+    if (k == HG_B_WORKS) { let e: i32 = 3; return e; }
+    let out: i32 = 2;
+    return out;
+}
+
+// out[0]=x, out[1]=y, out[2]=z in local space; the card sits 0.18 m proud of
+// the front wall so it is never coplanar with it.
+export fn hubgen_window_local(p_kind: i32, p_i: i32, p_out: array<f64>): i32 {
+    let k: i32 = p_kind;
+    let n: i32 = hubgen_window_count(k);
+    if (n <= 0) { let z: i32 = 0; return z; }
+    let i: i32 = clampi(p_i, 0, n - 1);
+    let w: f64 = hubgen_footprint_x(k);
+    let d: f64 = hubgen_footprint_z(k);
+    let rw: i32 = hg_rows(k);
+    let eav: f64 = hubgen_eaves(k);
+    // the middle course, or the top one on a two-course wall
+    let row: f64 = 1.0;
+    if (rw < 3) { row = 0.0; }
+    let cy: f64 = eav * (1.0 - (row + 0.5) / f64(rw));
+    let span: f64 = w * 0.5;
+    let cx: f64 = 0.0;
+    if (n > 1) { cx = 0.0 - span * 0.55 + (span * 1.10) * f64(i) / f64(n - 1); }
+    p_out[0] = cx;
+    p_out[1] = cy;
+    p_out[2] = 0.0 - d * 0.5 - 0.18;
+    let out: i32 = 3;
+    return out;
+}
+
+// ===========================================================================
+// 8.  THE WARM DOME  (SETTLEMENT.md §6.4)
+// ---------------------------------------------------------------------------
+// "Find home from the frontier" cannot be geometry: FOG_FAR never exceeds 72 m,
+// so at 300 m there is nothing drawn.  It is the SKY.
+//
+//   dome_half_angle = 6 deg + 14 deg * min(1, GRID_LUX / 18432)
+//   dome_lift       = 0.10  + 0.22    * min(1, GRID_LUX / 18432)
+//
+// ZERO TRIANGLES, ZERO DRAW CALLS.  It rides the re-bake skygen already does:
+// `hubgen_sky_slice()` calls `skygen_rebake_slice()` and then paints the dome
+// into EXACTLY the rows that slice just baked, intersected with the horizon
+// band and with the dome's own angular span.  At the shipping 4 rows/frame that
+// is at most 4 rows x ~60 columns = 240 texels of read-modify-write per frame.
+//
+// The panorama's u is `atan2(-wx, wz) / 2pi + 0.5` (world_render.hml
+// `sky_uv_at`, and the azimuth negation there is load-bearing) and v runs
+// zenith -> horizon, so the band is the bottom rows.
+// ===========================================================================
+
+export let HG_DOME_LUX_FULL: i32 = 18432;     // GRID_LUX at CITY
+let g_HG_DOME_A0: f64 = 0.10471975511965977;  //  6 deg
+let g_HG_DOME_A1: f64 = 0.24434609527920614;  // 14 deg
+let g_HG_DOME_L0: f64 = 0.10;
+let g_HG_DOME_L1: f64 = 0.22;
+// The band: the bottom 18 % of the panorama, which is exactly the span skygen
+// transitions to its fog-derived seam over.
+let g_HG_DOME_BAND: f64 = 0.82;
+
+let g_hg_dome_on: i32 = 0;
+let g_hg_dome_u: f64 = 0.5;          // panorama u of the settlement bearing
+let g_hg_dome_half: f64 = 0.0;       // radians
+let g_hg_dome_lift: f64 = 0.0;
+let g_hg_dome_r: i32 = 255;
+let g_hg_dome_g: i32 = 217;
+let g_hg_dome_b: i32 = 138;
+let g_hg_dome_texels: i32 = 0;
+
+fn hg_dome_t(p_lux: i32): f64 {
+    let t: f64 = f64(p_lux) / f64(HG_DOME_LUX_FULL);
+    let out: f64 = clamp01(t);
+    return out;
+}
+
+export fn hubgen_dome_half_angle(p_lux: i32): f64 {
+    let out: f64 = g_HG_DOME_A0 + g_HG_DOME_A1 * hg_dome_t(p_lux);
+    return out;
+}
+
+export fn hubgen_dome_lift(p_lux: i32): f64 {
+    let out: f64 = g_HG_DOME_L0 + g_HG_DOME_L1 * hg_dome_t(p_lux);
+    return out;
+}
+
+// (dx, dz) is settlement MINUS camera, in world metres.  A GRID_LUX of 0 turns
+// the dome off entirely: a camp has no glow because a camp has no lamps lit.
+export fn hubgen_dome_set(p_dx: f64, p_dz: f64, p_lux: i32) {
+    if (p_lux <= 0) { g_hg_dome_on = 0; return; }
+    let az: f64 = atan2(0.0 - p_dx, p_dz);
+    g_hg_dome_u = az / 6.283185307179586 + 0.5;
+    g_hg_dome_half = hubgen_dome_half_angle(p_lux);
+    g_hg_dome_lift = hubgen_dome_lift(p_lux);
+    // The colour walks from the sun's own halo toward ember as the grid grows:
+    // a village is a faint warm smudge, a city is a forge on the horizon.
+    let c: i32 = pal_lerp(g_SUN_HALO, g_EMBER, hg_dome_t(p_lux) * 0.55);
+    g_hg_dome_r = pal_r(c);
+    g_hg_dome_g = pal_g(c);
+    g_hg_dome_b = pal_b(c);
+    g_hg_dome_on = 1;
+}
+
+export fn hubgen_dome_clear() { g_hg_dome_on = 0; }
+export fn hubgen_dome_active(): i32 { let out: i32 = g_hg_dome_on; return out; }
+export fn hubgen_dome_u(): f64 { let out: f64 = g_hg_dome_u; return out; }
+export fn hubgen_dome_texels(): i32 { let out: i32 = g_hg_dome_texels; return out; }
+
+// Paint the dome into rows [y0, y0+rows) of the sky panorama.  Returns the
+// number of texels touched.  Does NOT upload — `hubgen_sky_slice` does that.
+export fn hubgen_dome_paint(p_y0: i32, p_rows: i32): i32 {
+    g_hg_dome_texels = 0;
+    if (g_hg_dome_on == 0) { let z: i32 = 0; return z; }
+    let a = skygen_atlas();
+    if (a == null) { let z2: i32 = 0; return z2; }
+    let w: i32 = skygen_w();
+    let h: i32 = skygen_h();
+    let band0: i32 = floori(f64(h) * g_HG_DOME_BAND);
+    let y0: i32 = p_y0;   if (y0 < band0) { y0 = band0; }
+    let y1: i32 = p_y0 + p_rows;  if (y1 > h) { y1 = h; }
+    if (y0 >= y1) { let z3: i32 = 0; return z3; }
+
+    // the column span: half the dome's angular width, in texels
+    let halfu: f64 = g_hg_dome_half / 6.283185307179586;
+    let cu: f64 = g_hg_dome_u;
+    let cx: f64 = cu * f64(w);
+    let hw: f64 = halfu * f64(w);
+    let x0: i32 = floori(cx - hw) - 1;
+    let x1: i32 = floori(cx + hw) + 2;
+    let span: f64 = hw;
+    if (span < 0.5) { span = 0.5; }
+
+    let dat = a.data;
+    let lift: f64 = g_hg_dome_lift;
+    let dr: f64 = f64(g_hg_dome_r);
+    let dg: f64 = f64(g_hg_dome_g);
+    let db: f64 = f64(g_hg_dome_b);
+    let denom: f64 = f64(h - 1) - f64(band0);
+    if (denom < 1.0) { denom = 1.0; }
+    let touched: i32 = 0;
+
+    for (let y = y0; y < y1; y++) {
+        // vertical profile: 0 at the top of the band, 1 at the horizon row,
+        // raised to 1.7 so the glow HUGS the skyline instead of washing the sky
+        let vt: f64 = (f64(y) - f64(band0)) / denom;
+        if (vt < 0.0) { vt = 0.0; }
+        let vf: f64 = vt * vt * (0.30 + 0.70 * vt);
+        for (let xx = x0; xx < x1; xx++) {
+            // angular falloff, smooth: (1 - t^2)^2 has zero slope at the edge,
+            // which is what keeps the dome from showing a hard rim.
+            let du: f64 = (f64(xx) + 0.5) - cx;
+            // wrap the column distance across the seam
+            let fw: f64 = f64(w);
+            if (du > fw * 0.5) { du = du - fw; }
+            if (du < 0.0 - fw * 0.5) { du = du + fw; }
+            let t: f64 = du / span;
+            if (t < 0.0) { t = 0.0 - t; }
+            if (t >= 1.0) { continue; }
+            let q: f64 = 1.0 - t * t;
+            let fall: f64 = q * q;
+            let amt: f64 = lift * fall * vf;
+            if (amt <= 0.0) { continue; }
+            let xi: i32 = xx % w;
+            if (xi < 0) { xi = xi + w; }
+            let o: i32 = (y * w + xi) * 4;
+            // Bayer-dither the added value.  CLAUDE.md §9 rule 12: the sky is
+            // 40 % of every outdoor frame and an undithered gradient BANDS.
+            let bay: f64 = (f64(bayer4i(xi, y)) + 0.5) / 16.0;
+            let ar: f64 = f64(dat[o])     + dr * amt + bay - 0.5;
+            let ag: f64 = f64(dat[o + 1]) + dg * amt + bay - 0.5;
+            let ab: f64 = f64(dat[o + 2]) + db * amt + bay - 0.5;
+            let ir: i32 = i32(ar); if (ir > 255) { ir = 255; } if (ir < 0) { ir = 0; }
+            let ig: i32 = i32(ag); if (ig > 255) { ig = 255; } if (ig < 0) { ig = 0; }
+            let ib: i32 = i32(ab); if (ib > 255) { ib = 255; } if (ib < 0) { ib = 0; }
+            dat[o] = ir;
+            dat[o + 1] = ig;
+            dat[o + 2] = ib;
+            touched++;
+        }
+    }
+    g_hg_dome_texels = touched;
+    let out: i32 = touched;
+    return out;
+}
+
+// THE ONE CALL THE FRAME MAKES.  Drop-in replacement for `skygen_rebake_slice`:
+// bake the slice, paint the dome into it, push the rows once more so the paint
+// reaches the texture.  Returns the rows baked, exactly as skygen does.
+//
+// The second `atlas_update_rows` is 4 rows x 512 px = 8 kB — the same dirty
+// rect skygen just pushed.  It is the price of not editing skygen.hml, which
+// this task does not own, and it is measured in the report.
+export fn hubgen_sky_slice(): i32 {
+    let rem: i32 = skygen_dirty_rows();
+    let h: i32 = skygen_h();
+    let y0: i32 = h - rem;                 // skygen's cursor, by its invariant
+    let n: i32 = skygen_rebake_slice();
+    if (n <= 0) { let z: i32 = 0; return z; }
+    if (g_hg_dome_on == 0) { let out0: i32 = n; return out0; }
+    let painted: i32 = hubgen_dome_paint(y0, n);
+    if (painted > 0) {
+        let a = skygen_atlas();
+        if (a != null) {
+            if (atlas_tex(a) != null) { atlas_update_rows(a, y0, n); }
+            else { atlas_mark_rows(a, y0, y0 + n); }
+        }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// Paint the dome across the WHOLE horizon band and mark it.  For the one-shot
+// full bake at boot and for `tools/settle_shot.hml`, which renders one frame
+// and therefore never gets a rolling slice.
+export fn hubgen_dome_paint_all(): i32 {
+    let h: i32 = skygen_h();
+    let band0: i32 = floori(f64(h) * g_HG_DOME_BAND);
+    let n: i32 = hubgen_dome_paint(band0, h - band0);
+    let a = skygen_atlas();
+    if (a != null) {
+        if (atlas_tex(a) != null) { atlas_update_rows(a, band0, h - band0); }
+        else { atlas_mark_rows(a, band0, h); }
+    }
+    let out: i32 = n;
+    return out;
+}

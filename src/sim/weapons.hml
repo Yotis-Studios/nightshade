@@ -61,7 +61,7 @@
 //   g_SWAP_READY_FRAC   1.0     a swap is not fireable until fully "in"
 // Reported to the orchestrator. If design disagrees, they are one line each.
 
-import { sqrt } from "@stdlib/math";
+import { sqrt, sin } from "@stdlib/math";
 
 import { g_TICK_DT, g_RECOIL_SETTLE_S, g_WPN_COUNT,
          g_WPN_SPARROW, g_WPN_TINKER, g_WPN_BELLOWS,
@@ -1025,6 +1025,280 @@ export fn wpn_step(p_st: array, p_o: i32, p_ads: i32, p_sprint: i32) {
         st[o + 11] = 0.0;
     }
     return;
+}
+
+// ===========================================================================
+//  MELEE — DIRECTION.md §10.  THE TIER-0 RUNG OF THE KINETIC LADDER.
+// ===========================================================================
+//
+//  This is a SECOND, INDEPENDENT table.  It deliberately does NOT widen the six
+//  gun arrays above and it does NOT move `WPN_COUNT`.
+//
+//  WHY NOT.  `g_WPN_COUNT` is load-bearing in four other modules that this task
+//  does not own: `loot.hml` ties exactly one Relic to each weapon FAMILY and
+//  `probe_loot.hml` asserts `RELIC_COUNT == g_WPN_COUNT`; `projectiles.hml`
+//  sizes its per-weapon shot counter from it; `save.hml` writes a
+//  `g_WPN_COUNT`-wide table AND a `WS_FIELDS`-wide one, and `WS_FIELDS` (28) is
+//  `16 + 6 magazines + 6 reserves`.  Widening the gun table to nine would move
+//  `WS_RES0`, move `WS_FIELDS`, change the save-file record width and hand the
+//  club three Relics' worth of loot table.  A melee weapon has no magazine, no
+//  reserve, no reload, no bloom, no recoil pattern and no ADS, so eighteen of
+//  the twenty-four gun columns would be zeroes carried through four files.
+//
+//  THE ID SPACES ARE THEREFORE DISJOINT AND BOTH FIT THE WIRE.  `command.hml`
+//  gives the main-hand field a 0..15 range (`CMD_MAX_WEAPON = 15`).  Guns keep
+//  0..5.  Melee takes 6..8 via `MH_MELEE_BASE`, which is what
+//  `mel_to_mainhand` / `mel_from_mainhand` convert.  `wpn_valid` already
+//  answers 0 for 6..8, so no gun query can ever be handed a club by accident.
+//
+//  NO DURABILITY.  There is no durability column here and there is no place to
+//  add one.  DIRECTION §10: "reliability is its whole identity; breakage would
+//  delete the reason it exists."  `MEL_HAS_DURABILITY` is 0 and
+//  `tools/probe_melee.hml` proves it behaviourally — swing 1 and swing 10 000
+//  deal the same damage.
+//
+//  ALL THREE ARE KINETIC (`MAGIC_KINETIC.md` §1.2, `DTYPE_KINETIC = 0`), which
+//  is the point: when a light-affinity enemy shrugs the club off, the answer is
+//  the lantern hand, not a bigger stick.
+//
+// ---------------------------------------------------------------------------
+//  ROLES, NOT DAMAGE NUMBERS
+// ---------------------------------------------------------------------------
+//                          CLUB          SPEAR          SWORD
+//    identity          buys SPACE       buys REACH     buys DAMAGE
+//    source            scavenged        crafted        forged (worked metal)
+//    damage                34             46             62
+//    reach  (m)           1.90           3.40           2.30
+//    sweep  (+-deg)       55             11             34
+//    cycle  (s)           0.36           0.62           0.52
+//    dps                  94.4           74.2          119.2
+//    targets/swing         3              2              2
+//    stagger (ticks)      27              9             16
+//
+//  The orderings ARE the design and `probe_melee.hml` asserts every one of them
+//  against a literal, not against the table it is reading:
+//    * club has the SHORTEST cycle and the MOST stagger  -> it buys space
+//    * spear has the LONGEST reach, by 1.10 m            -> it buys distance
+//    * sword has the HIGHEST damage and the HIGHEST dps  -> it buys kills
+//    * and dps is NOT ordered the same way as damage: the club out-damages the
+//      spear per second while doing least per swing, so "fast and weak" is a
+//      real position rather than a strictly-worse one.
+//
+//  Read against `ai.hml`'s HP column [15, 30, 90, 70, 220, 900] and its attack
+//  RANGE column [1.0, 1.0, 1.8, 30.0, 2.2, 5.0]:
+//    * the club ONE-SHOTS a Wisp (15) and a Mote (30) and NEVER a Husk (90) —
+//      the opening minute with nothing but a stick clears the swarm tier and
+//      has to retreat from the first real body.  That is the intended image.
+//    * the sword one-shots a Husk ON THE HEAD (62 x 1.50 = 93 >= 90) and takes
+//      two body blows.  It is the first weapon that answers a Husk alone.
+//    * the spear (3.40 m) out-reaches every contact class in the game —
+//      Wisp 1.0, Mote 1.0, Husk 1.8, Warden 2.2 — and does NOT out-reach the
+//      Bulwark (5.0).  You can poke the horde; you cannot poke the wall.
+// ---------------------------------------------------------------------------
+
+export let MEL_NONE  = -1;
+export let MEL_CLUB  = 0;
+export let MEL_SPEAR = 1;
+export let MEL_SWORD = 2;
+export let MEL_COUNT = 3;
+
+// Main-hand id space.  Guns 0..5, melee 6..8, ceiling 15 (CMD_MAX_WEAPON).
+export let MH_MELEE_BASE = 6;
+
+// There is none.  See the header.  Kept as a named zero so that a future
+// "just a little durability" edit has to delete a documented constant.
+export let MEL_HAS_DURABILITY = 0;
+
+// MAGIC_KINETIC §1.2 DTYPE_KINETIC.  Melee is lead, never light.
+export let MEL_DTYPE_KINETIC = 0;
+
+//                             CLUB   SPEAR   SWORD
+export let g_mel_dmg      = [  34.0,   46.0,   62.0 ];
+export let g_mel_hs_mult  = [   1.15,   1.60,   1.50 ];
+export let g_mel_reach    = [   1.90,   3.40,   2.30 ];   // metres from the eye
+export let g_mel_arc_deg  = [  55.0,   11.0,   34.0  ];   // HALF-angle of sweep
+export let g_mel_rays     = [   7,      3,      5     ];  // rays across the arc
+export let g_mel_targets  = [   3,      2,      2     ];  // victims per swing
+
+// The three phases of one swing, in seconds.  The strike resolves ONCE, on the
+// windup -> active transition, so a swing can never land twice however the tick
+// count falls.  `active` is the window the animation shows the blow inside.
+export let g_mel_windup   = [   0.10,   0.20,   0.16 ];
+export let g_mel_active   = [   0.06,   0.08,   0.08 ];
+export let g_mel_recover  = [   0.20,   0.34,   0.28 ];
+
+// Ticks of stagger applied to a struck enemy.  60 Hz, so 27 ticks = 0.45 s.
+export let g_mel_stagger  = [  27,      9,     16     ];
+
+// 0 scavenged, 1 crafted (wood + a point), 2 forged (worked metal).
+export let g_mel_tier     = [   0,      1,      2     ];
+
+export fn mel_valid(p_m: i32): i32 {
+    let m: i32 = p_m;
+    let out: i32 = 0;
+    if (m >= 0) { if (m < 3) { out = 1; } }
+    return out;
+}
+
+// main-hand id (0..15) -> melee id, or MEL_NONE for a gun / a bad id.
+export fn mel_from_mainhand(p_id: i32): i32 {
+    let id: i32 = p_id - 6;
+    if (id < 0) { let z: i32 = 0 - 1; return z; }
+    if (id > 2) { let z: i32 = 0 - 1; return z; }
+    let out: i32 = id;
+    return out;
+}
+
+export fn mel_to_mainhand(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0 - 1; return z; }
+    let out: i32 = p_m + 6;
+    return out;
+}
+
+export fn mel_dmg(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_dmg[p_m];
+    return out;
+}
+
+// Damage of one connecting blow.  `p_head` is 0/1.  NOTE: no range argument.
+// Melee has no falloff by construction — at 1.9 m there is nothing to model,
+// and a weapon whose whole identity is "it always works" must not have a soft
+// edge where it quietly does less.
+export fn mel_dmg_hit(p_m: i32, p_head: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let d: f64 = g_mel_dmg[p_m];
+    if (p_head != 0) { d = d * g_mel_hs_mult[p_m]; }
+    let out: f64 = d;
+    return out;
+}
+
+export fn mel_hs_mult(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 1.0; return z; }
+    let out: f64 = g_mel_hs_mult[p_m];
+    return out;
+}
+
+export fn mel_reach(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_reach[p_m];
+    return out;
+}
+
+// The sweep HALF-angle in RADIANS — the same reading `wpn_spread_half_rad`
+// settled for the guns, converted once, here, so no consumer halves it twice.
+export fn mel_arc_half_rad(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_arc_deg[p_m] * 0.017453292519943295;
+    return out;
+}
+
+export fn mel_arc_deg(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_arc_deg[p_m];
+    return out;
+}
+
+export fn mel_rays(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0; return z; }
+    let out: i32 = g_mel_rays[p_m];
+    return out;
+}
+
+export fn mel_targets(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0; return z; }
+    let out: i32 = g_mel_targets[p_m];
+    return out;
+}
+
+export fn mel_windup(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_windup[p_m];
+    return out;
+}
+
+export fn mel_active(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_active[p_m];
+    return out;
+}
+
+export fn mel_recover(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_recover[p_m];
+    return out;
+}
+
+// Seconds from pressing swing to being able to press it again.
+export fn mel_cycle(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_windup[p_m] + g_mel_active[p_m] + g_mel_recover[p_m];
+    return out;
+}
+
+export fn mel_stagger_len(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0; return z; }
+    let out: i32 = g_mel_stagger[p_m];
+    return out;
+}
+
+export fn mel_tier(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0 - 1; return z; }
+    let out: i32 = g_mel_tier[p_m];
+    return out;
+}
+
+// Single-target damage per second, every blow connecting on the body.  The
+// number the "roles, not damage numbers" table is argued from.
+export fn mel_dps(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let c: f64 = mel_cycle(p_m);
+    if (c <= 0.0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_mel_dmg[p_m] / c;
+    return out;
+}
+
+// Blows to kill `p_hp`.  Same minimal-n discipline as `ceil_div_f` above.
+export fn mel_ttk_hits(p_m: i32, p_hp: f64, p_head: i32): i32 {
+    let d: f64 = mel_dmg_hit(p_m, p_head);
+    let out: i32 = ceil_div_f(p_hp, d);
+    return out;
+}
+
+// Time to kill in MILLISECONDS: (hits - 1) full cycles, the first blow at t=0.
+export fn mel_ttk_ms(p_m: i32, p_hp: f64, p_head: i32): f64 {
+    let n: i32 = mel_ttk_hits(p_m, p_hp, p_head);
+    if (n <= 1) { let z: f64 = 0.0; return z; }
+    let out: f64 = f64(n - 1) * mel_cycle(p_m) * 1000.0;
+    return out;
+}
+
+// The widest angular gap between two adjacent rays, measured as a CHORD at the
+// weapon's own reach, in metres.  This is the number that decides whether a
+// sweep can pass THROUGH the smallest enemy in the game without touching it: a
+// Wisp is 0.70 m across, so every weapon's chord must be under 0.70 or the
+// club has holes in it.  Asserted with the 0.70 literal in the probe.
+export fn mel_ray_gap_m(p_m: i32): f64 {
+    if (mel_valid(p_m) == 0) { let z: f64 = 0.0; return z; }
+    let n: i32 = g_mel_rays[p_m];
+    if (n < 2) { let z: f64 = 0.0; return z; }
+    let step: f64 = 2.0 * mel_arc_half_rad(p_m) / f64(n - 1);
+    let out: f64 = 2.0 * g_mel_reach[p_m] * sin(step * 0.5);
+    return out;
+}
+
+// Every melee weapon is KINETIC.  A function rather than a constant so that a
+// future radiant melee weapon has one place to disagree.
+export fn mel_dtype(p_m: i32): i32 {
+    if (mel_valid(p_m) == 0) { let z: i32 = 0 - 1; return z; }
+    let out: i32 = MEL_DTYPE_KINETIC;
+    return out;
+}
+
+// Melee never consumes ammunition.  This is the whole reason it is in the game.
+export fn mel_uses_ammo(p_m: i32): i32 {
+    let z: i32 = 0;
+    return z;
 }
 
 // ---------------------------------------------------------------------------

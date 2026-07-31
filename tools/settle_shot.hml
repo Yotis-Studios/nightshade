@@ -1,0 +1,936 @@
+// ===========================================================================
+// nightshade/tools/settle_shot.hml — LOOK AT THE TOWN            (settlement-render)
+// ===========================================================================
+//
+//   hemlockc -O1 tools/settle_shot.hml -o /tmp/sshot
+//   SDL_VIDEODRIVER=dummy /tmp/sshot --tier 3 --tod 18.4 --out docs/shots/city_dusk.png
+//   SDL_VIDEODRIVER=dummy /tmp/sshot --scene list
+//
+// The five contracts `tools/shot.hml` holds itself to, held here too:
+//
+//  1. It renders through the REAL frame path — `src/render/world_render.hml`,
+//     imported, never reimplemented.  `ci_imports.sh` R7 fails the build if any
+//     tool defines its own `frame_render`, and this file does not.
+//  2. It renders the REAL ART: palette, tod, texgen, skygen, fxgen, meshgen and
+//     hubgen.  There is no second art pipeline here.
+//  3. Deterministic: no wall clock and no `@stdlib/random` reaches any geometry
+//     decision.  Same arguments, same PNG bytes.
+//  4. Compiled only.
+//  5. A screenshot without its stats report is impossible: the PNG and the
+//     `.stats.txt` are written as a pair or neither survives.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS EXISTS RATHER THAN A NEW `--scene` IN shot.hml
+// ---------------------------------------------------------------------------
+// `tools/shot.hml` is not this task's file (CLAUDE.md §3, and other agents are
+// in this tree right now).  Its scenes also build their terrain from
+// `world_render.hml`'s `terrain_h`, which is NOT the heightfield the settlement
+// stands on — `settle.hml` places everything on `worldgen_height`.  A
+// settlement scene in shot.hml would therefore float.  This harness builds its
+// ground from `worldgen_height`, exactly as `src/game/main.hml` does.
+//
+// ---------------------------------------------------------------------------
+// HOW THE SETTLEMENT IS DRIVEN TO A TIER
+// ---------------------------------------------------------------------------
+// Not by poking `st.tier`.  A synthetic LANTERN GRID is handed to
+// `settle_lanterns_set` and then `settle_step` is run over real in-game days
+// until the ladder promotes and the work sites finish — i.e. the picture is of
+// a settlement that EARNED its tier through the same code path the game uses.
+// If the ladder ever stops working, this tool stops producing a city.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+import { write_file, exists, remove_file, make_dirs } from "@stdlib/fs";
+import { getenv } from "@stdlib/env";
+import { sin, cos, sqrt, floor, divi, atan2 } from "@stdlib/math";
+
+import { window_open_ex, window_close, set_relative_mouse, sdl_error,
+         BLEND_BLEND, BLEND_ADD }
+       from "../../wobbleweed/src/sdl.hml";
+import { target_new, target_free, target_set_shake, target_set_border }
+       from "../../wobbleweed/src/target.hml";
+import { write_png } from "../../wobbleweed/src/png.hml";
+import { emit_set_env } from "../../wobbleweed/src/emit.hml";
+import { env_set_camera, env_set_fog, env_set_mist, env_field, env_light_count,
+         env_far_plane,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_FOG_ALPHA_MAX }
+       from "../../wobbleweed/src/shade.hml";
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_vert_ao, mesh_quad, mesh_end,
+         mesh_bake_light, mesh_tri_count, mesh_tris_emitted, mesh_rej_backface }
+       from "../../wobbleweed/src/mesh.hml";
+import { atlas_new, atlas_cell_uv, atlas_upload }
+       from "../../wobbleweed/src/atlas.hml";
+import { stat_set, stat_begin, stat_end, stat_get, stat_ms,
+         stat_report_string_now,
+         STAT_SKY_ROWS, STAT_T_SKYBAKE, STAT_LIGHTS,
+         STAT_TRIS_WORLD, STAT_TRIS_SKY, STAT_TRIS_FX, STAT_TRIS_HUD,
+         STAT_DRAW_CALLS, STAT_BATCH_OVERFLOW, STAT_T_TOD, STAT_T_FRAME }
+       from "../../wobbleweed/src/stats.hml";
+
+// ---- THE FRAME GRAPH.  ci_imports.sh R7 checks for this import by name. ----
+import { frame_init, frame_render, frame_present, frame_begin,
+         frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
+         frame_set_camera, frame_set_clear, frame_set_sheet_clear,
+         frame_set_options, frame_set_capture, frame_set_hud_solid_uv,
+         frame_set_vignette_colour, frame_set_flash_colour,
+         frame_env, world_clear, world_chunk_add, world_prop_add }
+       from "../src/render/world_render.hml";
+
+import { settle_render_bind, settle_render_bind_atlas, settle_render_bind_glow,
+         settle_render_bind_cells, settle_render_bind_ground_rgb,
+         settle_render_ground_build, settle_render_ground_push,
+         settle_render_ground_bake, settle_render_ground_tris,
+         settle_render_ground_count, settle_render_emit,
+         settle_render_fog_far, settle_render_stats,
+         settle_render_dome_dx, settle_render_dome_dz, settle_render_dome_lux,
+         SR_STAT_TESTED, SR_STAT_B0, SR_STAT_B1, SR_STAT_B2,
+         SR_STAT_DEMOTED, SR_STAT_DROPPED, SR_STAT_SUBMITTED,
+         SR_STAT_GLOWS, SR_STAT_GROUND, g_SR_FOG_FAR_SETTLEMENT }
+       from "../src/render/settle_render.hml";
+
+// ---- the art -------------------------------------------------------------
+import { pal_r, pal_g, pal_b, pal_pack, pal_lerp,
+         g_GRASS_MID, g_GRASS_LO, g_GRASS_DRY, g_DIRT_MID, g_SAND_LO,
+         g_STONE_MID, g_STONE_HI, g_UI_BLACK, g_LIGHTNING, g_SUN_HALO,
+         g_UI_AMBER, g_EMBER }
+       from "../src/art/palette.hml";
+import { texgen_build_world_atlas, texgen_cell_name,
+         CELL_GRASS_A, CELL_GRASS_B, CELL_GRASS_DRY, CELL_DIRT, CELL_PATH,
+         CELL_COBBLE, CELL_RUBBLE }
+       from "../src/art/texgen.hml";
+import { fxgen_build_atlas, FX_GLOW_L, FX_CELL_COUNT }
+       from "../src/art/fxgen.hml";
+import { hudgen_build_atlas, hudgen_uv, HUD_SOLID }
+       from "../src/art/hudgen.hml";
+import { skygen_init, skygen_set_clock, skygen_keys_new, skygen_set_keys,
+         skygen_mark_dirty, skygen_dirty_rows, skygen_rebake_slice,
+         skygen_build, skygen_w, skygen_h, skygen_star_count,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER, SKYK_COUNT }
+       from "../src/art/skygen.hml";
+import { meshgen_build_all, meshgen_set_material_uv, meshgen_mesh,
+         meshgen_bake_all, meshgen_set_sun_azimuth, meshgen_count,
+         meshgen_radius, MESH_BLOB, MESH_LANTERN, MESH_LANTERN_VM,
+         MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT, MG_MAT_GLASS }
+       from "../src/art/meshgen.hml";
+import { hubgen_mesh, hubgen_tris, hubgen_radius,
+         hubgen_bind_atlas, hubgen_build_all, hubgen_bake_all,
+         hubgen_mesh_table, hubgen_tris_table, hubgen_radius_table,
+         hubgen_aabb_table, hubgen_total_tris, hubgen_mesh_count,
+         hubgen_dome_set, hubgen_dome_clear, hubgen_dome_paint_all,
+         hubgen_dome_half_angle, hubgen_dome_lift, hubgen_dome_texels,
+         hubgen_sky_slice }
+       from "../src/art/hubgen.hml";
+import { tod_eval, tod_reset, tod_sky_keys, tod_set_weather, tod_set_mist_band,
+         tod_clock_hours, tod_mist_density, tod_is_night,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R, TODSKY_STAR_ALPHA,
+         TODSKY_HALO, TODSKY_BODY_X, TODSKY_CLOUD_COVER, TODSKY_COUNT }
+       from "../src/art/tod.hml";
+
+// ---- the sim -------------------------------------------------------------
+import { worldgen_height } from "../src/sim/worldgen.hml";
+import { settle_new, settle_lanterns_set, settle_refresh, settle_step,
+         settle_tier, settle_tier_ever, settle_grid_lux, settle_grid_points,
+         settle_core_lux, settle_building_count, settle_building_state,
+         settle_building_kind, settle_building_pid,
+         settle_plot_x, settle_plot_z, settle_plot_y, settle_plot_yaw,
+         settle_cx, settle_cz, settle_deck_y, settle_bearing, settle_name,
+         settle_brownout, settle_industry, settle_hash,
+         SET_CON_STAKED, SET_CON_FRAMED, SET_CON_CLAD, SET_CON_DONE,
+         SET_TIER_CITY }
+       from "../src/sim/settle.hml";
+
+import { clampf, clamp01, clampi, lerpf, floori, rad2deg } from "../src/core/mathx.hml";
+import { g_FOG_FAR_CAP } from "../src/core/config.hml";
+
+// ===========================================================================
+// 0.  compiled-only guard
+// ===========================================================================
+fn running_interpreted(): bool {
+    let a: i32 = 1;
+    let b: bool = false;
+    try { let c: i32 = a / 0; b = false; } catch (e) { b = false; }
+    let out: bool = b;
+    return out;
+}
+
+let g_VERSION: string = "settle_shot 1.0 (settlement-render)";
+let g_RES_W: i32 = 320;
+let g_RES_H: i32 = 240;
+let g_upscale: i32 = 3;
+
+let g_win = null;
+let g_target = null;
+let g_fb: ptr = alloc(320 * 240 * 4);
+let g_atlas_world = null;
+let g_atlas_fx = null;
+let g_atlas_hud = null;
+let g_tex_world: ptr = ptr_null();
+let g_tex_fx: ptr = ptr_null();
+let g_tex_hud: ptr = ptr_null();
+let g_tex_sky: ptr = ptr_null();
+let g_skyk: array<f64> = [];
+let g_todsky: array<f64> = [];
+let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_world_cells: i32 = 0;
+let g_mesh_tris: i32 = 0;
+let g_hub_tris: i32 = 0;
+let g_mat_cells: array<i32> = [];
+
+let g_camx: f64 = 0.0;
+let g_camy: f64 = 0.0;
+let g_camz: f64 = 0.0;
+let g_yaw: f64 = 0.0;
+let g_pitch: f64 = -2.0;
+let g_eye: f64 = 2.4;
+let g_back: f64 = 9.0;
+let g_yaw_ovr: i32 = 0;
+let g_fog_ovr: f64 = 0.0;
+let g_vm: i32 = 1;
+let g_bld: i32 = -1;
+let g_orbit: f64 = 0.0;
+let g_dist: f64 = 14.0;
+let g_days: i32 = 40;
+let g_dump: i32 = 0;
+let g_ladder: i32 = -1;
+let g_ladder_rung: i32 = 0;
+let g_bench: i32 = 0;
+let g_nosettle: i32 = 0;
+let g_fov: f64 = 70.0;
+let g_fog_far: f64 = 56.0;
+let g_fog_near: f64 = 6.0;
+let g_ground_y: f64 = 0.0;
+let g_day_t: f64 = 0.0;
+let g_seed: i32 = 1337;
+let g_tier_want: i32 = 3;
+let g_tod_h: f64 = 18.4;
+let g_relative_mouse_rc: i32 = 0;
+let g_st = null;
+let g_sim_ticks: i32 = 0;
+let g_dome_on: i32 = 1;
+let g_D2R: f64 = 0.017453292519943295;
+let g_MIST_HEIGHT: f64 = 3.5;
+
+let g_CHUNK_M: f64 = 32.0;
+let g_QUAD_M: f64 = 4.0;
+let g_CHUNK_Q: i32 = 8;
+
+fn eprint(p_s: string) { print(p_s); }
+
+// ===========================================================================
+// 1.  ART
+// ===========================================================================
+
+fn art_bind_materials() {
+    let pairs: array<i32> = [
+        MG_MAT_BARK, 18, MG_MAT_LEAF, 20, MG_MAT_STONE, 8, MG_MAT_WOOD, 16,
+        MG_MAT_METAL, 27, MG_MAT_CONCRETE, 24, MG_MAT_CLOTH, 35,
+        MG_MAT_HIDE, 17, MG_MAT_DIRT, 3, MG_MAT_GLASS, 38
+    ];
+    let n: i32 = pairs.length;
+    for (let i = 0; i < n; i = i + 2) {
+        atlas_cell_uv(g_atlas_world, pairs[i + 1], g_uvq, 0);
+        meshgen_set_material_uv(pairs[i], g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3]);
+        g_mat_cells.push(pairs[i + 1]);
+    }
+}
+
+fn art_build(p_win) {
+    g_atlas_world = atlas_new(256, 256, 8, 8);
+    g_world_cells = texgen_build_world_atlas(g_atlas_world, 1337);
+    g_atlas_fx = fxgen_build_atlas();
+    g_atlas_hud = hudgen_build_atlas();
+    hudgen_uv(HUD_SOLID, g_uvw, 0);
+    art_bind_materials();
+    g_mesh_tris = meshgen_build_all();
+
+    // --- the settlement mesh library ---------------------------------------
+    hubgen_bind_atlas(g_atlas_world);
+    g_hub_tris = hubgen_build_all();
+
+    skygen_init();
+    skygen_set_clock(0.0);
+    g_skyk = skygen_keys_new();
+    g_todsky = [];
+    for (let i = 0; i < TODSKY_COUNT; i++) { g_todsky.push(0.0); }
+
+    g_tex_world = atlas_upload(p_win, g_atlas_world, BLEND_BLEND);
+    g_tex_fx = atlas_upload(p_win, g_atlas_fx, BLEND_ADD);
+    g_tex_hud = atlas_upload(p_win, g_atlas_hud, BLEND_BLEND);
+    g_tex_sky = skygen_build(p_win);
+
+    // --- hand the renderer everything it may not import --------------------
+    settle_render_bind(hubgen_mesh_table(), hubgen_tris_table(),
+                       hubgen_radius_table(), hubgen_aabb_table());
+    settle_render_bind_atlas(g_atlas_world);
+    settle_render_bind_glow(FX_GLOW_L, g_UI_AMBER);
+    settle_render_bind_cells(CELL_COBBLE, CELL_PATH, CELL_DIRT, CELL_RUBBLE);
+    settle_render_bind_ground_rgb(g_STONE_MID, g_SAND_LO, g_STONE_HI);
+}
+
+// ===========================================================================
+// 2.  TIME OF DAY — driven, never reimplemented
+// ===========================================================================
+
+fn hours_unwrapped(p_t: f64): f64 {
+    let h: f64 = tod_clock_hours(p_t);
+    if (h < 5.5) { h = h + 24.0; }
+    let out: f64 = h;
+    return out;
+}
+
+fn tod_t_from_hours(p_hours: f64): f64 {
+    let want: f64 = p_hours;
+    while (want < 0.0) { want = want + 24.0; }
+    while (want >= 24.0) { want = want - 24.0; }
+    if (want < 5.5) { want = want + 24.0; }
+    let lo: f64 = 0.0;
+    let hi: f64 = 1.0;
+    for (let i = 0; i < 44; i++) {
+        let mid: f64 = (lo + hi) * 0.5;
+        if (hours_unwrapped(mid) < want) { lo = mid; } else { hi = mid; }
+    }
+    let out: f64 = (lo + hi) * 0.5;
+    return out;
+}
+
+fn tod_apply() {
+    let env: array<f64> = frame_env();
+    tod_reset();
+    tod_set_weather(0);
+    tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
+    g_day_t = tod_t_from_hours(g_tod_h);
+    tod_eval(env, g_day_t, 0);
+    env_set_camera(env, g_camx, g_camy, g_camz);
+
+    let fnear: f64 = env_field(env, ENV_FOG_NEAR);
+    let ffar: f64 = g_fog_far;
+    if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
+    env_set_fog(env, fnear, ffar,
+                env_field(env, ENV_FOG_R), env_field(env, ENV_FOG_G),
+                env_field(env, ENV_FOG_B), env_field(env, ENV_FOG_ALPHA_MAX));
+    g_fog_far = ffar;
+    g_fog_near = fnear;
+
+    // The tod <-> skygen unit bridge.  tod hands out 0..1, skygen's key block is
+    // documented in 0..255.  shot.hml carries the identical eight lines and the
+    // identical comment: neither module is owned by a harness, so both harnesses
+    // scale here and say so.
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+}
+
+// ===========================================================================
+// 3.  THE GROUND — from `worldgen_height`, the heightfield the SIM uses
+// ===========================================================================
+
+let g_hgrid: array<f64> = [];
+
+fn ground_cell(p_slope: f64): i32 {
+    if (p_slope > 0.62) { let a: i32 = CELL_DIRT; return a; }
+    let out: i32 = CELL_GRASS_A;
+    return out;
+}
+
+fn ground_vcol(p_h: f64, p_slope: f64): i32 {
+    let t: f64 = clamp01((p_h - 26.0) / 12.0);
+    let c: i32 = pal_lerp(g_GRASS_LO, g_GRASS_MID, t);
+    if (p_slope > 0.62) { c = pal_lerp(g_DIRT_MID, g_GRASS_DRY, t * 0.4); }
+    let out: i32 = c;
+    return out;
+}
+
+fn chunk_build(p_cx: i32, p_cz: i32) {
+    let q: i32 = g_CHUNK_Q;
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    // (q+1)^2 shared corner samples: 81 worldgen_height calls per chunk, not
+    // 256.  worldgen_height is the expensive call in this project.
+    g_hgrid = [];
+    for (let j = 0; j <= q; j++) {
+        for (let i = 0; i <= q; i++) {
+            g_hgrid.push(worldgen_height(g_seed, ox + f64(i) * g_QUAD_M,
+                                                 oz + f64(j) * g_QUAD_M));
+        }
+    }
+    let m = mesh_new(q * q * 2 + 4);
+    mesh_begin(m);
+    for (let j2 = 0; j2 < q; j2++) {
+        for (let i2 = 0; i2 < q; i2++) {
+            let x0: f64 = f64(i2) * g_QUAD_M;
+            let z0: f64 = f64(j2) * g_QUAD_M;
+            let x1: f64 = x0 + g_QUAD_M;
+            let z1: f64 = z0 + g_QUAD_M;
+            let y00: f64 = g_hgrid[j2 * (q + 1) + i2];
+            let y10: f64 = g_hgrid[j2 * (q + 1) + i2 + 1];
+            let y11: f64 = g_hgrid[(j2 + 1) * (q + 1) + i2 + 1];
+            let y01: f64 = g_hgrid[(j2 + 1) * (q + 1) + i2];
+            let dy: f64 = y10 - y00; if (dy < 0.0) { dy = 0.0 - dy; }
+            let dz: f64 = y01 - y00; if (dz < 0.0) { dz = 0.0 - dz; }
+            let slope: f64 = (dy + dz) / g_QUAD_M;
+            let cell: i32 = ground_cell(slope);
+            atlas_cell_uv(g_atlas_world, cell, g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            let k00: i32 = ground_vcol(y00, slope);
+            let k10: i32 = ground_vcol(y10, slope);
+            let k11: i32 = ground_vcol(y11, slope);
+            let k01: i32 = ground_vcol(y01, slope);
+            let nx: f64 = y00 - y10;
+            let nz: f64 = y00 - y01;
+            let a = mesh_vert_n(m, x0, y00, z0, u0, v0,
+                                pal_r(k00), pal_g(k00), pal_b(k00), nx, 2.0, nz);
+            let b = mesh_vert_n(m, x1, y10, z0, u1, v0,
+                                pal_r(k10), pal_g(k10), pal_b(k10), nx, 2.0, nz);
+            let c = mesh_vert_n(m, x1, y11, z1, u1, v1,
+                                pal_r(k11), pal_g(k11), pal_b(k11), nx, 2.0, nz);
+            let d = mesh_vert_n(m, x0, y01, z1, u0, v1,
+                                pal_r(k01), pal_g(k01), pal_b(k01), nx, 2.0, nz);
+            mesh_quad(m, a, b, c, d);
+        }
+    }
+    mesh_end(m);
+    world_chunk_add(m, ox, oz,
+                    ox + g_CHUNK_M * 0.5,
+                    worldgen_height(g_seed, ox + g_CHUNK_M * 0.5,
+                                            oz + g_CHUNK_M * 0.5),
+                    oz + g_CHUNK_M * 0.5,
+                    g_CHUNK_M * 0.78 + 12.0);
+}
+
+// ===========================================================================
+// 4.  THE SETTLEMENT — earned, not poked
+// ===========================================================================
+
+let g_DAY_TICKS: i32 = 57600;
+
+// A synthetic lantern grid: the Great Lantern on the green plus four rings out
+// to the CITY radius, every post T4 at full wick and every post inside 90 m of
+// another so the whole grid is one Wick Line (contrib x2, MAGIC_KINETIC §6.1a).
+fn lanterns_for(p_tier: i32): array<f64> {
+    let st = g_st;
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    let a: array<f64> = [];
+    a.push(cx); a.push(cz); a.push(4.0); a.push(256.0);      // the Great Lantern
+    if (p_tier <= 0) {
+        // a CAMP's lamps went out because nobody tended them (LORE §2)
+        a[3] = 0.0;
+        let out0: array<f64> = a;
+        return out0;
+    }
+    // Ring radii and post counts chosen so that (a) every chord is under the
+    // 90 m Wick Line range so the whole grid links, and (b) the count INSIDE
+    // each tier's own ring clears the next tier's threshold — the ring grows
+    // with the tier, so a grid that would be a City at 320 m is only a Village
+    // at 120 m.  That is the ladder working, not a bug.
+    let rings: array<f64> = [45.0, 95.0, 150.0, 195.0, 260.0];
+    let counts: array<i32> = [8, 12, 16, 20, 22];
+    let want: i32 = 12;
+    if (p_tier == 2) { want = 24; }
+    if (p_tier >= 3) { want = 78; }
+    let n: i32 = 0;
+    for (let r = 0; r < 5; r++) {
+        let cnt: i32 = counts[r];
+        for (let k = 0; k < cnt; k++) {
+            if (n >= want) { continue; }
+            let th: f64 = 6.283185307179586 * f64(k) / f64(cnt)
+                        + 0.37 * f64(r);
+            a.push(cx + cos(th) * rings[r]);
+            a.push(cz + sin(th) * rings[r]);
+            a.push(4.0);
+            a.push(256.0);
+            n++;
+        }
+    }
+    let out: array<f64> = a;
+    return out;
+}
+
+// Run the ladder for real.  Returns the number of sim ticks spent.
+fn settle_drive(p_tier: i32): i32 {
+    let st = g_st;
+    let lan: array<f64> = lanterns_for(p_tier);
+    settle_lanterns_set(st, lan, divi(lan.length, 4));
+    settle_refresh(st);
+    if (p_tier <= 0) { let none: i32 = 0; return none; }
+    // 40 in-game days is comfortably past SETTLEMENT.md §6.2's 23.25 for a
+    // full City build-out, and the loop stops early once the town is finished.
+    let maxd: i32 = g_days;
+    let tick: i32 = 0;
+    let spent: i32 = 0;
+    for (let d = 0; d < maxd; d++) {
+        for (let s = 0; s < 960; s++) {          // 960 settle ticks = 1 day
+            tick = tick + 60;
+            settle_step(st, tick);
+        }
+        spent = tick;
+        if (settle_tier_ever(st) >= p_tier) {
+            // finished when every building of the tier is DONE
+            let nb: i32 = settle_building_count(st);
+            let all: i32 = 1;
+            for (let b = 0; b < nb; b++) {
+                if (settle_building_state(st, b) != SET_CON_DONE) { all = 0; }
+            }
+            if (all == 1) { d = maxd; }
+        }
+    }
+    let out: i32 = spent;
+    return out;
+}
+
+// ===========================================================================
+// 5.  BAKE + BUILD
+// ===========================================================================
+
+fn bake_all(p_lx: f64, p_ly: f64, p_lz: f64) {
+    let env: array<f64> = frame_env();
+    let sr: f64 = env_field(env, ENV_SUN_R); let sg: f64 = env_field(env, ENV_SUN_G);
+    let sb: f64 = env_field(env, ENV_SUN_B);
+    let ar: f64 = env_field(env, ENV_AMB_R); let ag: f64 = env_field(env, ENV_AMB_G);
+    let ab: f64 = env_field(env, ENV_AMB_B);
+    let br: f64 = env_field(env, ENV_BOUNCE_R); let bg: f64 = env_field(env, ENV_BOUNCE_G);
+    let bb: f64 = env_field(env, ENV_BOUNCE_B);
+    let nc: i32 = 0;
+    // the terrain chunks live in the registry; bake through the same handles
+    // world_chunk_add returned by walking the registry the frame graph exposes
+    settle_render_ground_bake(p_lx, p_ly, p_lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
+    meshgen_set_sun_azimuth(p_lx, p_lz);
+    meshgen_bake_all(p_lx, p_ly, p_lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
+    hubgen_bake_all(p_lx, p_ly, p_lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
+}
+
+let g_terrain_meshes: array = [];
+
+fn world_build() {
+    world_clear();
+    g_terrain_meshes = [];
+    settle_render_ground_build(g_st);
+    let rad: i32 = i32(g_fog_far / g_CHUNK_M) + 1;
+    let ccx: i32 = i32(floor(g_camx / g_CHUNK_M));
+    let ccz: i32 = i32(floor(g_camz / g_CHUNK_M));
+    for (let j = 0 - rad; j <= rad; j++) {
+        for (let i = 0 - rad; i <= rad; i++) { chunk_build(ccx + i, ccz + j); }
+    }
+    if (g_nosettle == 0) { settle_render_ground_push(g_st); }
+    // --ladder K: the FOUR CONSTRUCTION STATES of archetype K in a row, on the
+    // real terrain, through the real prop path.  This photographs the mesh
+    // library rather than the town, which is the only way to show STAKED ->
+    // FRAMED -> CLAD -> DONE in one frame: in the town they are 14 m apart on
+    // three different roads and the growth read has to be judged over a session.
+    if (g_ladder >= 0) {
+        let k: i32 = g_ladder;
+        for (let c = 0; c < 4; c++) {
+            let lx: f64 = g_camx + sin(g_yaw * g_D2R) * g_dist
+                        + cos(g_yaw * g_D2R) * (f64(c) * 11.0 - 16.5);
+            let lz: f64 = g_camz - cos(g_yaw * g_D2R) * g_dist
+                        + sin(g_yaw * g_D2R) * (f64(c) * 11.0 - 16.5);
+            let ly: f64 = worldgen_height(g_seed, lx, lz);
+            let m0 = hubgen_mesh(k, c, g_ladder_rung, 2);
+            world_prop_add(m0, m0, m0, 999.0, 999.0, hubgen_radius(k, c, 0, 0),
+                           lx, ly, lz, 0.0, 1.0, 255, 255, 255, 4.0, 900 + c);
+        }
+        let none: f64 = 0.0;
+        return;
+    }
+    let night: f64 = 0.0;
+    if (tod_is_night(g_day_t) != 0) { night = 1.0; }
+    else if (g_tod_h > 17.0 || g_tod_h < 7.0) { night = 0.6; }
+    if (g_nosettle == 0) { settle_render_emit(g_st, g_camx, g_camz, g_fog_far, night); }
+}
+
+// ===========================================================================
+// 6.  CAMERA
+// ===========================================================================
+
+fn camera_place() {
+    let st = g_st;
+    // --bld: park the camera on a circle around ONE building.  This is the
+    // instrument that verifies the B1 sector pick: orbit a building through 360
+    // deg and no wall may ever go missing.
+    if (g_bld >= 0) {
+        let pid: i32 = settle_building_pid(st, g_bld);
+        let bx: f64 = settle_plot_x(st, pid);
+        let bz: f64 = settle_plot_z(st, pid);
+        let by: f64 = settle_plot_y(st, pid);
+        let a: f64 = g_orbit * g_D2R;
+        g_camx = bx + sin(a) * g_dist;
+        g_camz = bz - cos(a) * g_dist;
+        g_yaw = g_orbit + 180.0;
+        g_ground_y = by;
+        g_camy = by + g_eye;
+        return;
+    }
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    let th: f64 = settle_bearing(st);
+    // The renderer's yaw and settle's compass bearing are the SAME convention:
+    // `sky_basis` builds forward = (sin yaw, .., -cos yaw) and settle's dir(b)
+    // is (sin b, -cos b).  So looking down the High Road is yaw = degrees(th).
+    let fx: f64 = sin(th);
+    let fz: f64 = 0.0 - cos(th);
+    g_camx = cx - fx * g_back;
+    g_camz = cz - fz * g_back;
+    if (g_yaw_ovr == 0) { g_yaw = rad2deg(th); }
+    g_ground_y = settle_deck_y(st);
+    g_camy = g_ground_y + g_eye;    // the hub's raised-path eye height
+}
+
+// ===========================================================================
+// 7.  RENDER
+// ===========================================================================
+
+fn framebuffer_to_rgb(p_scale: i32): buffer {
+    let sc: i32 = p_scale;
+    let w: i32 = g_RES_W * sc;
+    let h: i32 = g_RES_H * sc;
+    let out: buffer = buffer(w * h * 3);
+    let op: ptr = buffer_ptr(out);
+    for (let y = 0; y < h; y++) {
+        let sy: i32 = divi(y, sc);
+        for (let x = 0; x < w; x++) {
+            let sx: i32 = divi(x, sc);
+            let si: i32 = (sy * g_RES_W + sx) * 4;
+            let di: i32 = (y * w + x) * 3;
+            ptr_write_u8(ptr_offset(op, di, 1), ptr_deref_u8(ptr_offset(g_fb, si + 2, 1)));
+            ptr_write_u8(ptr_offset(op, di + 1, 1), ptr_deref_u8(ptr_offset(g_fb, si + 1, 1)));
+            ptr_write_u8(ptr_offset(op, di + 2, 1), ptr_deref_u8(ptr_offset(g_fb, si, 1)));
+        }
+    }
+    let r: buffer = out;
+    return r;
+}
+
+fn shot_render(): i32 {
+    let env: array<f64> = frame_env();
+
+    // the settlement's fog override, ramped (§7.3)
+    g_fog_far = settle_render_fog_far(g_st, g_camx, g_camz, 80.0, 72.0);
+    if (g_fog_ovr > 0.0) { g_fog_far = g_fog_ovr; }
+
+    frame_begin();
+    stat_begin(STAT_T_TOD);
+    tod_apply();
+    emit_set_env(env);
+    stat_set(STAT_LIGHTS, env_light_count(env));
+    stat_end(STAT_T_TOD);
+
+    world_build();
+    bake_all(env_field(env, ENV_SUN_X), env_field(env, ENV_SUN_Y),
+             env_field(env, ENV_SUN_Z));
+
+    // --- the warm dome (SETTLEMENT.md §6.4), zero triangles -----------------
+    if (g_dome_on == 1) {
+        hubgen_dome_set(settle_render_dome_dx(g_st, g_camx),
+                        settle_render_dome_dz(g_st, g_camz),
+                        settle_render_dome_lux(g_st));
+    } else { hubgen_dome_clear(); }
+
+    stat_begin(STAT_T_SKYBAKE);
+    let rows: i32 = 0;
+    skygen_mark_dirty();
+    while (skygen_dirty_rows() > 0) { rows = rows + hubgen_sky_slice(); }
+    stat_end(STAT_T_SKYBAKE);
+    stat_set(STAT_SKY_ROWS, rows);
+
+    frame_set_camera(g_camx, g_camy, g_camz, g_yaw, g_pitch, g_fov);
+    frame_set_clear(g_skyk[SKYK_ZEN], g_skyk[SKYK_ZEN + 1], g_skyk[SKYK_ZEN + 2]);
+    frame_set_options(0, g_vm, 0);
+    frame_render();
+    frame_present();
+    let ok: i32 = 0;
+    return ok;
+}
+
+// ===========================================================================
+// 8.  THE REPORT
+// ===========================================================================
+
+fn con_name(p_c: i32): string {
+    if (p_c == SET_CON_STAKED) { let a: string = "STAKED"; return a; }
+    if (p_c == SET_CON_FRAMED) { let b: string = "FRAMED"; return b; }
+    if (p_c == SET_CON_CLAD) { let c: string = "CLAD"; return c; }
+    let d: string = "DONE";
+    return d;
+}
+
+fn build_report(p_out: string): string {
+    let st = g_st;
+    let s: string = "";
+    s = s + "== NIGHTSHADE SETTLEMENT SHOT ==\n";
+    s = s + `tool          ${g_VERSION}\n`;
+    s = s + `out           ${p_out}\n`;
+    s = s + `resolution    ${g_RES_W}x${g_RES_H} upscaled x${g_upscale}\n`;
+    s = s + `seed          ${g_seed}\n`;
+    s = s + `camera        ${g_camx}, ${g_camy}, ${g_camz}\n`;
+    s = s + `look          yaw ${g_yaw} pitch ${g_pitch} fov ${g_fov}\n`;
+    s = s + `tod           ${g_tod_h} h  (day_t ${g_day_t})\n`;
+    s = s + `fog           near ${g_fog_near} far ${g_fog_far}  (settlement override ${g_SR_FOG_FAR_SETTLEMENT})\n`;
+    s = s + `far plane     ${env_far_plane(frame_env())}\n`;
+    s = s + "\n-- the settlement (src/sim/settle.hml, driven through settle_step) --\n";
+    s = s + `  name index    ${settle_name(st)}\n`;
+    s = s + `  centre        ${settle_cx(st)}, ${settle_cz(st)}   deck_y ${settle_deck_y(st)}\n`;
+    s = s + `  bearing       ${settle_bearing(st)} rad (the High Road)\n`;
+    s = s + `  tier          ${settle_tier(st)}  (ever ${settle_tier_ever(st)})  brownout ${settle_brownout(st)}\n`;
+    s = s + `  GRID_LUX      ${settle_grid_lux(st)}  = ${settle_grid_points(st)} grid points\n`;
+    s = s + `  CORE_LUX      ${settle_core_lux(st)}\n`;
+    s = s + `  industry      ${settle_industry(st)}\n`;
+    s = s + `  sim ticks run ${g_sim_ticks}  (${g_sim_ticks / g_DAY_TICKS} in-game days)\n`;
+    s = s + `  settle_hash   ${settle_hash(st)}\n`;
+    let nb: i32 = settle_building_count(st);
+    let cs: array<i32> = [0, 0, 0, 0];
+    for (let b = 0; b < nb; b++) { cs[settle_building_state(st, b)]++; }
+    s = s + `  buildings     ${nb}: ${cs[0]} STAKED, ${cs[1]} FRAMED, ${cs[2]} CLAD, ${cs[3]} DONE\n`;
+
+    s = s + "\n-- the mesh library (src/art/hubgen.hml) --\n";
+    s = s + `  ${hubgen_mesh_count()} meshes, ${hubgen_total_tris()} triangles\n`;
+    s = s + `  meshgen.hml   ${meshgen_count()} meshes, ${g_mesh_tris} triangles\n`;
+    s = s + `  texgen.hml    ${g_world_cells} world cells\n`;
+
+    s = s + "\n-- the emit walk (src/render/settle_render.hml) --\n";
+    s = s + `  buildings tested ${settle_render_stats(SR_STAT_TESTED)}\n`;
+    s = s + `  rung B0 ${settle_render_stats(SR_STAT_B0)}  B1 ${settle_render_stats(SR_STAT_B1)}  B2 ${settle_render_stats(SR_STAT_B2)}\n`;
+    s = s + `  demoted by cap   ${settle_render_stats(SR_STAT_DEMOTED)}   dropped ${settle_render_stats(SR_STAT_DROPPED)}\n`;
+    s = s + `  building tris SUBMITTED ${settle_render_stats(SR_STAT_SUBMITTED)}\n`;
+    s = s + `  ground tris (green + roads, authored) ${settle_render_stats(SR_STAT_GROUND)} over ${settle_render_ground_count()} meshes\n`;
+    s = s + `  lit window glow cards ${settle_render_stats(SR_STAT_GLOWS)}\n`;
+
+    s = s + "\n-- the warm dome (SETTLEMENT.md §6.4) --\n";
+    s = s + `  active ${g_dome_on}  GRID_LUX ${settle_grid_lux(st)}\n`;
+    s = s + `  half angle ${rad2deg(hubgen_dome_half_angle(settle_grid_lux(st)))} deg   lift ${hubgen_dome_lift(settle_grid_lux(st))}\n`;
+    s = s + `  texels painted in the last slice ${hubgen_dome_texels()}   TRIANGLES 0\n`;
+
+    s = s + "\n";
+    s = s + stat_report_string_now();
+    let tris: i32 = stat_get(STAT_TRIS_SKY) + stat_get(STAT_TRIS_WORLD)
+                  + stat_get(STAT_TRIS_FX) + stat_get(STAT_TRIS_HUD);
+    s = s + "\n-- budget (ARCHITECTURE.md §8) --\n";
+    s = s + `  triangles drawn = ${tris}  (3000 steady / 3500 hard clamp)\n`;
+    s = s + `  world  = ${stat_get(STAT_TRIS_WORLD)}  sky = ${stat_get(STAT_TRIS_SKY)}  fx = ${stat_get(STAT_TRIS_FX)}  hud = ${stat_get(STAT_TRIS_HUD)}\n`;
+    s = s + `  draw calls      = ${stat_get(STAT_DRAW_CALLS)}\n`;
+    s = s + `  batch overflow  = ${stat_get(STAT_BATCH_OVERFLOW)}  (must be 0)\n`;
+    let fr: f64 = stat_ms(STAT_T_FRAME);
+    let sk: f64 = stat_ms(STAT_T_SKYBAKE);
+    s = s + `  frame ms        = ${fr}\n`;
+    s = s + `  frame ms - sky  = ${fr - sk}   <- the comparable number\n`;
+    s = s + "  NOTE: sky.bake re-bakes the WHOLE panorama because this is a single\n";
+    s = s + "        frame. The game bakes 4 rows/frame and never pays this.\n";
+    s = s + "  NOTE: this box permanently shares ~17 of 24 cores with a llama-server\n";
+    s = s + "        (CLAUDE.md §1.2); stage times inflate 60-100 % under that load.\n";
+    let out: string = s;
+    return out;
+}
+
+fn dirname_of(p_path: string): string {
+    let s: string = p_path;
+    let cut: i32 = -1;
+    for (let i = 0; i < s.length; i++) {
+        if (s.slice(i, i + 1) == "/") { cut = i; }
+    }
+    if (cut <= 0) { let empty: string = ""; return empty; }
+    let out: string = s.slice(0, cut);
+    return out;
+}
+
+fn stats_path_for(p_out: string): string {
+    let s: string = p_out;
+    if (s.length > 4 && s.ends_with(".png")) {
+        let base: string = s.slice(0, s.length - 4);
+        let out: string = base + ".stats.txt";
+        return out;
+    }
+    let out2: string = s + ".stats.txt";
+    return out2;
+}
+
+fn write_pair(p_png: string, p_report: string): i32 {
+    let dir: string = dirname_of(p_png);
+    if (dir.length > 0 && exists(dir) == false) {
+        try { make_dirs(dir); }
+        catch (e) {
+            eprint(`settle_shot: cannot create ${dir}`);
+            let bad0: i32 = -1;
+            return bad0;
+        }
+    }
+    let img: buffer = framebuffer_to_rgb(g_upscale);
+    write_png(p_png, img, g_RES_W * g_upscale, g_RES_H * g_upscale);
+    if (exists(p_png) == false) {
+        eprint(`settle_shot: FAILED to write ${p_png}`);
+        let bad: i32 = -1;
+        return bad;
+    }
+    let sp: string = stats_path_for(p_png);
+    write_file(sp, p_report);
+    if (exists(sp) == false) {
+        remove_file(p_png);
+        eprint("settle_shot: stats write failed; the PNG was removed (they are a pair)");
+        let bad2: i32 = -1;
+        return bad2;
+    }
+    let ok: i32 = 0;
+    return ok;
+}
+
+// ===========================================================================
+// 9.  CLI
+// ===========================================================================
+
+fn parse_f(p_s: string): f64 {
+    let s: string = p_s;
+    let neg: f64 = 1.0;
+    let i: i32 = 0;
+    if (s.length > 0 && s.slice(0, 1) == "-") { neg = -1.0; i = 1; }
+    let v: f64 = 0.0;
+    let frac: f64 = 0.0;
+    let scale: f64 = 0.1;
+    let dot: i32 = 0;
+    while (i < s.length) {
+        let ch: string = s.slice(i, i + 1);
+        if (ch == ".") { dot = 1; }
+        else {
+            let d: i32 = -1;
+            let digits: string = "0123456789";
+            for (let k = 0; k < 10; k++) {
+                if (digits.slice(k, k + 1) == ch) { d = k; }
+            }
+            if (d >= 0) {
+                if (dot == 0) { v = v * 10.0 + f64(d); }
+                else { frac = frac + f64(d) * scale; scale = scale * 0.1; }
+            }
+        }
+        i++;
+    }
+    let out: f64 = neg * (v + frac);
+    return out;
+}
+
+fn main() {
+    if (running_interpreted()) {
+        eprint("settle_shot: compiled only. hemlockc -O1 tools/settle_shot.hml -o /tmp/sshot");
+        exit(2);
+    }
+    let out: string = "/tmp/settle_shot.png";
+    let n: i32 = args.length;
+    for (let i = 1; i < n; i++) {
+        let a: string = args[i];
+        if (a == "--out" && i + 1 < n) { out = args[i + 1]; i++; }
+        else if (a == "--tier" && i + 1 < n) { g_tier_want = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--tod" && i + 1 < n) { g_tod_h = parse_f(args[i + 1]); i++; }
+        else if (a == "--seed" && i + 1 < n) { g_seed = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--yaw" && i + 1 < n) { g_yaw = parse_f(args[i + 1]); g_yaw_ovr = 1; i++; }
+        else if (a == "--eye" && i + 1 < n) { g_eye = parse_f(args[i + 1]); i++; }
+        else if (a == "--fov" && i + 1 < n) { g_fov = parse_f(args[i + 1]); i++; }
+        else if (a == "--fog" && i + 1 < n) { g_fog_ovr = parse_f(args[i + 1]); i++; }
+        else if (a == "--pitch" && i + 1 < n) { g_pitch = parse_f(args[i + 1]); i++; }
+        else if (a == "--back" && i + 1 < n) { g_back = parse_f(args[i + 1]); i++; }
+        else if (a == "--nodome") { g_dome_on = 0; }
+        else if (a == "--dump") { g_dump = 1; }
+        else if (a == "--bench") { g_bench = 1; }
+        else if (a == "--nosettle") { g_nosettle = 1; }
+        else if (a == "--ladder" && i + 1 < n) { g_ladder = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--rung" && i + 1 < n) { g_ladder_rung = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--novm") { g_vm = 0; }
+        else if (a == "--days" && i + 1 < n) { g_days = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--bld" && i + 1 < n) { g_bld = i32(parse_f(args[i + 1])); i++; }
+        else if (a == "--orbit" && i + 1 < n) { g_orbit = parse_f(args[i + 1]); i++; }
+        else if (a == "--dist" && i + 1 < n) { g_dist = parse_f(args[i + 1]); i++; }
+        else if (a == "--scale" && i + 1 < n) { g_upscale = i32(parse_f(args[i + 1])); i++; }
+    }
+
+    g_win = window_open_ex("nightshade settle_shot", g_RES_W, g_RES_H, 1, 0);
+    if (g_win == null) {
+        eprint(`settle_shot: window_open failed: ${sdl_error()}`);
+        exit(1);
+    }
+    g_relative_mouse_rc = set_relative_mouse(1);
+    set_relative_mouse(0);
+    g_target = target_new(g_win, g_RES_W, g_RES_H, 1);
+    if (g_target == null) { eprint("settle_shot: target_new failed"); exit(1); }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+    if (frame_init(g_win, g_target, g_fb) != 0) {
+        eprint("settle_shot: frame_init failed");
+        exit(1);
+    }
+    frame_set_capture(1);
+    art_build(g_win);
+    frame_bind_textures(g_tex_world, g_tex_fx, g_tex_hud, g_tex_sky);
+    frame_bind_fx_atlas(g_atlas_fx);
+    frame_bind_assets(meshgen_mesh(MESH_BLOB), meshgen_mesh(MESH_LANTERN_VM),
+                      FX_GLOW_L);
+    frame_set_hud_solid_uv(g_uvw[0], g_uvw[1], g_uvw[2], g_uvw[3]);
+    frame_set_vignette_colour(pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+    frame_set_flash_colour(pal_r(g_LIGHTNING), pal_g(g_LIGHTNING), pal_b(g_LIGHTNING));
+    frame_set_sheet_clear(pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+
+    g_st = settle_new(g_seed);
+    g_sim_ticks = settle_drive(g_tier_want);
+    camera_place();
+
+    shot_render();
+    if (g_bench == 1) {
+        // RULE T: __clock() (CPU time) + min-of-7.  Mean-of-wall drifts 62 %
+        // under this box's permanent load; min-of-7 cuts it to ~29 %.
+        let best: f64 = 0.0;
+        for (let t = 0; t < 7; t++) {
+            let c0: f64 = __clock();
+            frame_begin();
+            frame_render();
+            frame_present();
+            let c1: f64 = __clock();
+            let ms: f64 = (c1 - c0) * 1000.0;
+            if (t == 0) { best = ms; }
+            if (ms < best) { best = ms; }
+        }
+        print(`BENCH frame min-of-7 = ${best} ms   (world tris ${stat_get(STAT_TRIS_WORLD)}, submitted ${settle_render_stats(SR_STAT_SUBMITTED)})`);
+    }
+    if (g_dump == 1) {
+        let nb2: i32 = settle_building_count(g_st);
+        print("idx kind con  pid      x        z      dist  yawdeg");
+        for (let b = 0; b < nb2; b++) {
+            let pd: i32 = settle_building_pid(g_st, b);
+            let bx3: f64 = settle_plot_x(g_st, pd);
+            let bz3: f64 = settle_plot_z(g_st, pd);
+            let dd3: f64 = sqrt((bx3 - g_camx) * (bx3 - g_camx)
+                              + (bz3 - g_camz) * (bz3 - g_camz));
+            print(`${b} ${settle_building_kind(g_st, b)} ${settle_building_state(g_st, b)} ${pd} ${bx3} ${bz3} ${dd3} ${rad2deg(settle_plot_yaw(g_st, pd))}`);
+        }
+    }
+    let rep: string = build_report(out);
+    if (write_pair(out, rep) != 0) { exit(1); }
+    print(rep);
+    print(`settle_shot: wrote ${out} and ${stats_path_for(out)}`);
+    target_free(g_target);
+    window_close(g_win);
+}
+
+main();

@@ -1,0 +1,1547 @@
+// probe_spells.hml — acceptance probe for src/sim/spells.hml (the spell school).
+//
+// Run it FROM THE NIGHTSHADE REPO ROOT, both ways:
+//     hemlockc -O1 tools/probe_spells.hml -o /tmp/pspell && /tmp/pspell
+//     hemlock  tools/probe_spells.hml
+//
+// It exits 1 on any failure AND on an assertion-count mismatch.  It links no
+// SDL: `nm /tmp/pspell | grep -c SDL_` must print 0.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS PROBE ASSERTS, AND WHAT IT REFUSES TO
+// ---------------------------------------------------------------------------
+// CLAUDE.md rule 5: "assert the design, not the digits — but pin design ANCHORS
+// with a literal."  So the literals below are exactly the ones that ARE the
+// design, written in DIRECTION.md and MAGIC_KINETIC.md in a programmer's own
+// numbers, and nothing else:
+//
+//     the owner's three verbs exist        healing, fire blasts, cloaking
+//     the fire blast is the Emberlance     60 impact + 12/s burn, 3.5 m AoE
+//     the fire blast is KINETIC            §1.1 — a spell is a DELIVERY kind
+//     the cloak has a TELL                 6 m, and the lantern never goes out
+//     Attunement moves three numbers       slots, potency, cooldown  (§9)
+//     nothing magic reaches past 24 m      §1.3
+//     no multiplier is ever below 0.15     §5.3 THE LAW
+//
+// Everything else is asserted as a RELATIONSHIP: cost falls monotonically with
+// Attunement, damage falls monotonically with distance, the beam bills at 10 Hz
+// no matter how fast the caller casts, oil regen is exact over a whole minute,
+// the state round-trips, the hash separates.  Those survive a retune; a table
+// of frozen digits does not, and this project has already been burned twice by
+// probes that encoded consequences as constants.
+//
+// ---------------------------------------------------------------------------
+// THE ONE THING IT CANNOT TEST
+// ---------------------------------------------------------------------------
+// `spells.hml` is NOT WIRED INTO `sim.hml`'s tick order — that file is not
+// owned by this task and the tick order is API (CLAUDE.md §7).  So this probe
+// drives `spell_step` and `spell_cast` directly.  Every number below is real
+// and measured; none of it is reachable from a keypress yet.  Said plainly in
+// the task report rather than buried here.
+
+import { exit } from "@stdlib/process";
+import { read_file, is_dir } from "@stdlib/fs";
+import { sqrt } from "@stdlib/math";
+
+import {
+    g_TICK_HZ, g_EYE_STAND,
+    g_DTYPE_KINETIC, g_DTYPE_MAGIC, g_DTYPE_COUNT,
+    g_SPELL_COUNT, g_SPELL_FLARE, g_SPELL_SHUTTER, g_SPELL_EMBERLANCE,
+    g_SPELL_MEND, g_SPELL_GUTTERING, g_SPELL_LANCE, g_SPELL_KINDLING,
+    g_SPELL_ITEM_BASE, g_SPELL_SWAP_IN_S, g_SPELL_SWAP_OUT_S,
+    g_OIL_TANK_T1, g_OIL_TANK_T2, g_OIL_TANK_T3,
+    g_OIL_REGEN_LIT, g_OIL_REGEN_DAY,
+    g_ATTUNE_MAX, g_ATTUNE_POT_PER, g_ATTUNE_PER_SLOT,
+    g_SPELL_SLOTS_MAX,
+    g_MAGIC_PHASE_DAY, g_MAGIC_PHASE_NIGHT, g_MAGIC_WINDUP_MULT,
+    g_MAGIC_FLOOR_MULT, g_MAGIC_BEAM_HZ, g_MAGIC_REACH_CAP,
+    g_MEND_HP, g_MEND_CHANNEL_S, g_CLOAK_S, g_CLOAK_AGGRO_MULT,
+    g_CLOAK_GLOW_M, g_CLOAK_LIGHT_MULT, g_KINDLING_R,
+    g_BUDGET_SIM_MS
+} from "../src/core/config.hml";
+
+import {
+    SPELL_VERSION, SP_FIELDS,
+    SP_OIL_X100, SP_TANK_TIER, SP_ATTUNE, SP_EQUIP_0, SP_ACTIVE, SP_SWAP_T,
+    SP_CD_0, SP_CH_SPELL, SP_CH_T, SP_CLOAK_T, SP_BEAM_T, SP_POOL_T,
+    SP_LIT, SP_PHASE, SP_LAST_RESULT, SP_LAST_TARGETS, SP_LAST_DAMAGE,
+    SP_CASTS, SP_REFUSALS, SP_BREAKS,
+    SPELL_OK, SPELL_ERR_UNKNOWN, SPELL_ERR_NOT_EQUIPPED, SPELL_ERR_LOCKED,
+    SPELL_ERR_COOLDOWN, SPELL_ERR_OIL, SPELL_ERR_BUSY, SPELL_ERR_NO_CASTER,
+    SPELL_ERR_NO_DELIVERY, SPELL_ERR_UNBOUND,
+    SPELL_DMG_BURST, SPELL_DMG_BEAM, SPELL_DMG_LANCE,
+    HM_MAGIC, HM_RESISTED,
+    EV_SPELL_CAST, EV_SPELL_CHANNEL, EV_SPELL_CLOAK, EV_SPELL_HEAL,
+    EV_SPELL_POOL, CHAN_START, CHAN_DONE,
+    SHAPE_SPHERE, SHAPE_CONE, SHAPE_BOLT, SHAPE_SELF, SHAPE_PLACE,
+    CHMODE_NONE, CHMODE_TICK, CHMODE_FINISH,
+    spell_new, spell_reset, spell_copy, spell_name, spell_dtype, spell_shape,
+    spell_base_oil_x100, spell_base_cd_ticks, spell_unlock_level,
+    spell_reach_m, spell_half_angle_deg, spell_channel_ticks,
+    spell_channel_mode, spell_item_id, spell_of_item,
+    spell_attune_of, spell_set_attunement, spell_cost_mult, spell_cd_mult,
+    spell_potency, spell_slots, spell_oil_cost_x100, spell_cooldown_ticks,
+    spell_tank_x100, spell_set_tank_tier, spell_oil, spell_oil_x100,
+    spell_add_oil_x100, spell_fill, spell_set_lit, spell_set_phase,
+    spell_equipped, spell_equip, spell_select, spell_active, spell_cd_left,
+    spell_ctx_new, spell_bind, spell_bind_projectiles, spell_has_world,
+    spell_has_projectiles,
+    spell_phase_mult, spell_falloff, spell_damage_at,
+    spell_cast, spell_step, spell_cancel_channel, spell_break_cloak,
+    spell_notify_fired, spell_notify_damaged,
+    spell_aggro_mult, spell_light_mult, spell_cloaked, spell_channelling,
+    spell_channel_frac, spell_pool_active, spell_pool_x, spell_pool_z,
+    spell_pool_radius, spell_casts, spell_refusals, spell_breaks,
+    spell_last_result, spell_last_targets, spell_last_damage, spell_last_heal,
+    spell_serialize, spell_deserialize, spell_hash, spell_selfcheck
+} from "../src/sim/spells.hml";
+
+import {
+    world_new_cap, world_spawn, world_spawn_player, world_slot_of,
+    world_id_of, world_count, world_set_tick, world_set_seed,
+    KIND_AI, EF_DEAD, ID_NONE, SLOT_NONE
+} from "../src/sim/world.hml";
+
+import {
+    combat_new, combat_events, combat_begin_tick, combat_feedback_ok,
+    evbus_count, evbus_type, evbus_sub, evbus_target, evbus_dropped,
+    EV_HIT, EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER, EV_IMPACT, EV_SOUND,
+    DMG_SUB_BASE, HM_KILL
+} from "../src/sim/combat.hml";
+
+import { AI_ST_IDLE, AI_ST_WINDUP } from "../src/sim/ai.hml";
+import { PHASE_DAY, PHASE_DUSK, PHASE_NIGHT, PHASE_COUNT } from "../src/sim/daycycle.hml";
+import {
+    proj_new, proj_set_combat, proj_step, proj_count, proj_impact_damage,
+    proj_aoe_radius, proj_burn_dps_x100, proj_burn_duration_ticks,
+    proj_burning, PROJ_EMBERLANCE
+} from "../src/sim/projectiles.hml";
+import { rng_new, rng_seed, rng_f01, rng_range, RNG_AI } from "../src/sim/rng.hml";
+
+// ---------------------------------------------------------------------------
+// EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 214;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+fn eqi(p_name: string, p_got: i32, p_want: i32) {
+    ck(p_got == p_want, p_name, `got ${p_got} want ${p_want}`);
+}
+
+fn near(p_name: string, p_got: f64, p_want: f64, p_tol: f64) {
+    let dv: f64 = p_got - p_want;
+    if (dv < 0.0) { dv = 0.0 - dv; }
+    ck(dv <= p_tol, p_name, `got ${p_got} want ${p_want} tol ${p_tol}`);
+}
+
+// A running fingerprint of everything the probe observes.  Compiled and
+// interpreted runs must print the SAME line — one string diff, not 130.
+let g_parity: i32 = 0;
+fn par(p_v: i32) {
+    let a: u64 = 0;
+    let v: i32 = p_v;
+    if (v >= 0) { a = u64(v); } else { a = u64(f64(v) + 4294967296.0); }
+    let h: u64 = u64(g_parity);
+    h = (h ^ a) * 1099511628211;
+    h = h ^ (h >> 29);
+    h = h * 13787848793156543929;
+    g_parity = i32((h >> 33) & 2147483647);
+}
+
+// ---------------------------------------------------------------------------
+// SCENE HELPERS
+// ---------------------------------------------------------------------------
+fn put_target(p_w: object, p_x: f64, p_y: f64, p_z: f64, p_hp: i32): i32 {
+    let wr: object = p_w;
+    let s: i32 = world_spawn(wr, KIND_AI, 0);
+    if (s == SLOT_NONE) { let bad: i32 = ID_NONE; return bad; }
+    let pxs: array<f64> = wr.px;
+    let pys: array<f64> = wr.py;
+    let pzs: array<f64> = wr.pz;
+    let hp: array<i32> = wr.hp;
+    let hm: array<i32> = wr.hp_max;
+    let tm: array<i32> = wr.team;
+    let ais: array<i32> = wr.ai_state;
+    pxs[s] = p_x; pys[s] = p_y; pzs[s] = p_z;
+    hp[s] = p_hp; hm[s] = p_hp; tm[s] = 2; ais[s] = AI_ST_IDLE;
+    let ids: array<i32> = wr.id;
+    let out: i32 = ids[s];
+    return out;
+}
+
+fn hp_of(p_w: object, p_id: i32): i32 {
+    let s: i32 = world_slot_of(p_w, p_id);
+    if (s == SLOT_NONE) { let z: i32 = -1; return z; }
+    let wr: object = p_w;
+    let hp: array<i32> = wr.hp;
+    let out: i32 = hp[s];
+    return out;
+}
+
+fn set_aim(p_w: object, p_id: i32, p_yaw: f64, p_pitch: f64) {
+    let s: i32 = world_slot_of(p_w, p_id);
+    if (s == SLOT_NONE) { return; }
+    let wr: object = p_w;
+    let ya: array<f64> = wr.yaw;
+    let pa: array<f64> = wr.pitch;
+    ya[s] = p_yaw; pa[s] = p_pitch;
+}
+
+fn set_windup(p_w: object, p_id: i32, p_on: i32) {
+    let s: i32 = world_slot_of(p_w, p_id);
+    if (s == SLOT_NONE) { return; }
+    let wr: object = p_w;
+    let ais: array<i32> = wr.ai_state;
+    if (p_on == 1) { ais[s] = AI_ST_WINDUP; } else { ais[s] = AI_ST_IDLE; }
+}
+
+// A bound world with one player at the origin looking down -Z (yaw 0).
+fn make_scene(p_cap: i32): object {
+    let wr: object = world_new_cap(p_cap);
+    let cxs: object = combat_new();
+    let ps: object = proj_new();
+    proj_set_combat(ps, cxs);
+    let ctx: object = spell_ctx_new();
+    spell_bind(ctx, wr, cxs);
+    let pslot: i32 = world_spawn_player(wr, 1);
+    let pxs: array<f64> = wr.px;
+    let pys: array<f64> = wr.py;
+    let pzs: array<f64> = wr.pz;
+    let hp: array<i32> = wr.hp;
+    let hm: array<i32> = wr.hp_max;
+    let tm: array<i32> = wr.team;
+    pxs[pslot] = 0.0; pys[pslot] = 0.0; pzs[pslot] = 0.0;
+    hp[pslot] = 100; hm[pslot] = 100; tm[pslot] = 1;
+    let sc: object = {
+        wr: wr, cx: cxs, ps: ps, ctx: ctx,
+        pid: world_id_of(wr, pslot)
+    };
+    let out: object = sc;
+    return out;
+}
+
+// Equip one spell into slot 0 and raise it, skipping the swap.
+fn arm(p_st: array, p_spell: i32) {
+    let st: array = p_st;
+    spell_set_attunement(st, g_ATTUNE_MAX);
+    spell_equip(st, 0, p_spell, 30);
+    spell_select(st, 0);
+    st[SP_SWAP_T] = 0;
+}
+
+// ===========================================================================
+// A.  THE SEVEN SPELLS, AND THE OWNER'S THREE VERBS
+// ===========================================================================
+fn section_tables() {
+    print("A. The school  (DIRECTION.md §2, MAGIC_KINETIC.md §1.9.2)");
+
+    eqi("A1 spell_selfcheck is clean", spell_selfcheck(), 0);
+    eqi("A2 seven spells", g_SPELL_COUNT, 7);
+    eqi("A3 SP_FIELDS", SP_FIELDS, 39);
+    eqi("A4 SPELL_VERSION", SPELL_VERSION, 1);
+
+    // A5-A7 — THE OWNER ASKED FOR THESE THREE BY NAME.  DIRECTION.md §2:
+    // "healing, fire blasts, cloaking".  If any of these three ever stops
+    // existing, this task did not do what it was asked.
+    ck(spell_name(g_SPELL_MEND) == "Mend", "A5 HEALING exists (Mend)", spell_name(g_SPELL_MEND));
+    ck(spell_name(g_SPELL_EMBERLANCE) == "Emberlance", "A6 FIRE BLAST exists (Emberlance)", spell_name(g_SPELL_EMBERLANCE));
+    ck(spell_name(g_SPELL_GUTTERING) == "Guttering", "A7 CLOAKING exists (Guttering)", spell_name(g_SPELL_GUTTERING));
+
+    // A8 — the consolidation.  MAGIC_KINETIC §1.1: the Emberlance moves to the
+    // spell side and its DAMAGE TYPE DOES NOT MOVE WITH IT.  Fire burns matter.
+    // This is the single row that makes the merge nearly free, and it is also
+    // why a solo player is never stuck: the fire blast is a KINETIC answer in
+    // the lamp hand (§5.3 / DIRECTION.md §4 "never solo-hostile").
+    eqi("A8 the fire blast is KINETIC (§1.1)", spell_dtype(g_SPELL_EMBERLANCE), g_DTYPE_KINETIC);
+
+    // A9 — and it is the ONLY kinetic one.  Six MAGIC, one KINETIC.
+    let nmagic: i32 = 0;
+    let nkin: i32 = 0;
+    let i: i32 = 0;
+    while (i < g_SPELL_COUNT) {
+        if (spell_dtype(i) == g_DTYPE_MAGIC) { nmagic = nmagic + 1; }
+        if (spell_dtype(i) == g_DTYPE_KINETIC) { nkin = nkin + 1; }
+        par(spell_dtype(i));
+        par(spell_shape(i));
+        par(spell_base_oil_x100(i));
+        par(spell_base_cd_ticks(i));
+        par(spell_unlock_level(i));
+        i = i + 1;
+    }
+    eqi("A9 six spells are MAGIC", nmagic, 6);
+    eqi("A10 exactly one is KINETIC", nkin, 1);
+    eqi("A11 the axis has two values", g_DTYPE_COUNT, 2);
+
+    // A12-A14 — three of the seven do NO DAMAGE AT ALL.  MAGIC_KINETIC §1.9.2
+    // calls this "the real answer to why would a player ever choose the weaker
+    // hand — better than any resistance number".
+    // The BOLT is excluded on purpose: the fire blast's 60 impact and 12/s burn
+    // live in `projectiles.hml`'s measured tables, not in this school's rows.
+    // Section F asserts them there, where they actually are.
+    let nodmg: i32 = 0;
+    let k: i32 = 0;
+    while (k < g_SPELL_COUNT) {
+        if (spell_shape(k) != SHAPE_BOLT) {
+            if (spell_damage_at(spell_new(), k, 0.0, 0) <= 0.0) { nodmg = nodmg + 1; }
+        }
+        k = k + 1;
+    }
+    eqi("A12 three spells do no damage at all (Mend, Guttering, Kindling)", nodmg, 3);
+    near("A13 Mend does no damage", spell_damage_at(spell_new(), g_SPELL_MEND, 0.0, 0), 0.0, 0.0);
+    near("A14 Guttering does no damage", spell_damage_at(spell_new(), g_SPELL_GUTTERING, 0.0, 0), 0.0, 0.0);
+
+    // A15-A18 — the shapes.  Every spell is a volume test or a stat change with
+    // a timer (§11 out-of-scope 8b: no summon, no shield, no status stack).
+    eqi("A15 Flare is a sphere", spell_shape(g_SPELL_FLARE), SHAPE_SPHERE);
+    eqi("A16 Shutter is a cone", spell_shape(g_SPELL_SHUTTER), SHAPE_CONE);
+    eqi("A17 the fire blast is the game's one bolt", spell_shape(g_SPELL_EMBERLANCE), SHAPE_BOLT);
+    eqi("A18 Guttering is a stat change", spell_shape(g_SPELL_GUTTERING), SHAPE_SELF);
+    eqi("A19 Kindling places a volume", spell_shape(g_SPELL_KINDLING), SHAPE_PLACE);
+
+    // A20 — NOTHING MAGIC REACHES PAST 24 m, EVER (§1.3).  A design anchor.
+    let far: f64 = 0.0;
+    let r: i32 = 0;
+    while (r < g_SPELL_COUNT) {
+        if (spell_reach_m(r) > far) { far = spell_reach_m(r); }
+        r = r + 1;
+    }
+    near("A20 the longest magic reach is the 24 m lance", far, g_MAGIC_REACH_CAP, 0.0);
+    near("A21 the reach cap is 24 m", g_MAGIC_REACH_CAP, 24.0, 0.0);
+
+    // A22-A23 — the design's own cone angles.
+    near("A22 the shutter is a 22 degree cone", spell_half_angle_deg(g_SPELL_SHUTTER), 22.0, 0.0);
+    near("A23 the lance is a 5 degree cone", spell_half_angle_deg(g_SPELL_LANCE), 5.0, 0.0);
+
+    // A24-A26 — the two channels: Mend heals over 1.2 s, the lance's 1.2 s
+    // wind-up lands at the end.  Same machinery, two resolution modes.
+    eqi("A24 Mend channels for 1.2 s", spell_channel_ticks(g_SPELL_MEND),
+        i32(g_MEND_CHANNEL_S * f64(g_TICK_HZ) + 0.5));
+    eqi("A25 Mend resolves every tick", spell_channel_mode(g_SPELL_MEND), CHMODE_TICK);
+    eqi("A26 the lance resolves on completion", spell_channel_mode(g_SPELL_LANCE), CHMODE_FINISH);
+    eqi("A27 the flare never channels — it is the panic button",
+        spell_channel_mode(g_SPELL_FLARE), CHMODE_NONE);
+
+    // A28 — the Emberlance's cooldown is DERIVED from the weapon it used to be
+    // (g_wpn_rpm[EMBERLANCE] = 40 -> 60/40 s), not invented.  Moving the fire
+    // blast out of the gun slots must not change how fast it can be thrown.
+    eqi("A28 the fire blast's cooldown is the old weapon's 40 RPM",
+        spell_base_cd_ticks(g_SPELL_EMBERLANCE), i32(60.0 / 40.0 * f64(g_TICK_HZ) + 0.5));
+
+    // A29-A31 — the main-hand id space.  DIRECTION.md §10: everything but the
+    // lantern is main-hand and swaps, so a spell rides in the SAME `weapon`
+    // field a gun does.  Zero wire change (MAGIC_KINETIC §1.9.1).
+    // A29-A30 — the main-hand id space is guns 0..5, melee 6..8 (weapons.hml's
+    // own MH_MELEE_BASE), spells 9..15.  The field is now EXACTLY full.
+    eqi("A29 spell ids start above the guns AND the three melee weapons",
+        g_SPELL_ITEM_BASE, 9);
+    eqi("A30 the last spell lands exactly on CMD_MAX_WEAPON",
+        g_SPELL_ITEM_BASE + g_SPELL_COUNT - 1, 15);
+    eqi("A30b no spell id collides with a melee id (sword is 8)",
+        spell_of_item(8), -1);
+    eqi("A31 item id round-trips", spell_of_item(spell_item_id(g_SPELL_LANCE)), g_SPELL_LANCE);
+    eqi("A32 a gun id is not a spell", spell_of_item(0), -1);
+
+    // A33 — the three new damage kinds ride at 70/71/72 on the wire, exactly as
+    // MAGIC_KINETIC §1.1 specifies, with NO edit to combat.hml.
+    eqi("A33 the burst rides at sub 70", DMG_SUB_BASE + SPELL_DMG_BURST, 70);
+    eqi("A34 the beam rides at sub 71", DMG_SUB_BASE + SPELL_DMG_BEAM, 71);
+    eqi("A35 the lance rides at sub 72", DMG_SUB_BASE + SPELL_DMG_LANCE, 72);
+
+    // A36 — the hitmarker bits are clear of the four that exist.
+    eqi("A36 HM_MAGIC is bit 16", HM_MAGIC, 16);
+    eqi("A37 HM_RESISTED is bit 32", HM_RESISTED, 32);
+    par(spell_selfcheck());
+}
+
+// ===========================================================================
+// B.  ATTUNEMENT  (DIRECTION.md §9: "spell slots, potency, cooldown")
+// ===========================================================================
+fn section_attune() {
+    print("B. Attunement  (DIRECTION.md §9)");
+
+    let st: array = spell_new();
+
+    // B1 — the trap DIRECTION.md §9 names explicitly: "unlocks decide WHAT YOU
+    // HAVE, stats decide HOW WELL YOU USE IT."  Attunement must never unlock a
+    // spell.  Max Attunement, level 1: everything above level 1 stays locked.
+    spell_set_attunement(st, g_ATTUNE_MAX);
+    let locked: i32 = 0;
+    let i: i32 = 0;
+    while (i < g_SPELL_COUNT) {
+        if (spell_unlock_level(i) > 1) {
+            if (spell_equip(st, 0, i, 1) == SPELL_ERR_LOCKED) { locked = locked + 1; }
+        }
+        i = i + 1;
+    }
+    eqi("B1 max Attunement unlocks NOTHING (§9's trap)", locked, 6);
+
+    // B2-B4 — the three numbers it does move, at both ends.
+    spell_set_attunement(st, 0);
+    near("B2 A=0 costs full price", spell_cost_mult(st), 1.0, 0.0);
+    near("B3 A=0 full cooldown", spell_cd_mult(st), 1.0, 0.0);
+    near("B4 A=0 potency 1.0", spell_potency(st), 1.0, 0.0);
+
+    spell_set_attunement(st, g_ATTUNE_MAX);
+    near("B5 A=20 potency is 1.80", spell_potency(st), 1.0 + g_ATTUNE_POT_PER * 20.0, 0.000001);
+    ck(spell_cost_mult(st) < 1.0, "B6 A=20 costs less", `${spell_cost_mult(st)}`);
+    ck(spell_cd_mult(st) < 1.0, "B7 A=20 cools faster", `${spell_cd_mult(st)}`);
+
+    // B8-B9 — a floor, so a high-Attunement caster can never reach a FREE or an
+    // INSTANT spell.  An unbounded stat is a stat that eventually deletes the
+    // resource it is scaling.
+    ck(spell_cost_mult(st) >= 0.55, "B8 the cost multiplier has a floor", `${spell_cost_mult(st)}`);
+    ck(spell_cd_mult(st) >= 0.65, "B9 the cooldown multiplier has a floor", `${spell_cd_mult(st)}`);
+    ck(spell_oil_cost_x100(st, g_SPELL_FLARE) > 0, "B10 no spell is ever free",
+       `${spell_oil_cost_x100(st, g_SPELL_FLARE)}`);
+    ck(spell_cooldown_ticks(st, g_SPELL_FLARE) > 0, "B11 no cooldown ever reaches 0 from a stat",
+       `${spell_cooldown_ticks(st, g_SPELL_FLARE)}`);
+
+    // B12-B13 — MONOTONIC, over the whole stat range.  This is the assertion
+    // that survives a retune; the two endpoints above are the anchors.
+    let mono_cost: i32 = 1;
+    let mono_cd: i32 = 1;
+    let mono_pot: i32 = 1;
+    let a: i32 = 1;
+    while (a <= g_ATTUNE_MAX) {
+        spell_set_attunement(st, a - 1);
+        let c0: i32 = spell_oil_cost_x100(st, g_SPELL_LANCE);
+        let d0: i32 = spell_cooldown_ticks(st, g_SPELL_LANCE);
+        let p0: f64 = spell_potency(st);
+        spell_set_attunement(st, a);
+        let c1: i32 = spell_oil_cost_x100(st, g_SPELL_LANCE);
+        let d1: i32 = spell_cooldown_ticks(st, g_SPELL_LANCE);
+        let p1: f64 = spell_potency(st);
+        if (c1 > c0) { mono_cost = 0; }
+        if (d1 > d0) { mono_cd = 0; }
+        if (p1 <= p0) { mono_pot = 0; }
+        par(c1); par(d1);
+        a = a + 1;
+    }
+    eqi("B12 oil cost never rises with Attunement", mono_cost, 1);
+    eqi("B13 cooldown never rises with Attunement", mono_cd, 1);
+    eqi("B14 potency strictly rises with Attunement", mono_pot, 1);
+
+    // B15-B18 — spell SLOTS, the third thing §9 names.
+    spell_set_attunement(st, 0);
+    eqi("B15 A=0 gives one slot", spell_slots(st), 1);
+    spell_set_attunement(st, g_ATTUNE_PER_SLOT);
+    eqi("B16 A=7 gives two slots", spell_slots(st), 2);
+    spell_set_attunement(st, g_ATTUNE_PER_SLOT * 2);
+    eqi("B17 A=14 gives three slots", spell_slots(st), 3);
+    spell_set_attunement(st, g_ATTUNE_MAX);
+    eqi("B18 the third slot is the last (§11 out-of-scope 8a)", spell_slots(st), g_SPELL_SLOTS_MAX);
+
+    // B19 — out-of-range Attunement clamps, never traps.
+    spell_set_attunement(st, 9999);
+    eqi("B19 Attunement clamps at the cap", spell_attune_of(st), g_ATTUNE_MAX);
+    spell_set_attunement(st, -50);
+    eqi("B20 Attunement clamps at zero", spell_attune_of(st), 0);
+
+    // B21 — potency reaches the NON-DAMAGE spells too, which is what makes a
+    // support caster worth building.  Cloak duration at A=20 must exceed A=0.
+    let sc: object = make_scene(16);
+    let s0: array = spell_new();
+    spell_set_attunement(s0, 0);
+    spell_equip(s0, 0, g_SPELL_GUTTERING, 30); spell_select(s0, 0); s0[SP_SWAP_T] = 0;
+    spell_cast(s0, sc.ctx, sc.pid);
+    let d_low: i32 = s0[SP_CLOAK_T];
+    let s1: array = spell_new();
+    arm(s1, g_SPELL_GUTTERING);
+    spell_cast(s1, sc.ctx, sc.pid);
+    let d_high: i32 = s1[SP_CLOAK_T];
+    ck(d_high > d_low, "B21 Attunement lengthens the CLOAK (potency, not damage)",
+       `A0 ${d_low} ticks vs A20 ${d_high} ticks`);
+    eqi("B22 A=0 cloak is the design's 4.0 s", d_low, i32(g_CLOAK_S * f64(g_TICK_HZ) + 0.5));
+    par(d_low); par(d_high);
+}
+
+// ===========================================================================
+// C.  OIL — the only resource (MAGIC_KINETIC §1.6).  No mana, ever.
+// ===========================================================================
+fn section_oil() {
+    print("C. Oil  (MAGIC_KINETIC §1.6)");
+
+    let st: array = spell_new();
+    eqi("C1 a new caster starts with a full tier-1 tank",
+        spell_oil_x100(st), i32(g_OIL_TANK_T1 * 100.0 + 0.5));
+    near("C2 that is 100 oil", spell_oil(st), g_OIL_TANK_T1, 0.0);
+
+    spell_set_tank_tier(st, 1);
+    eqi("C3 tier 2 is 150", spell_tank_x100(st), i32(g_OIL_TANK_T2 * 100.0 + 0.5));
+    spell_set_tank_tier(st, 2);
+    eqi("C4 tier 3 is 200", spell_tank_x100(st), i32(g_OIL_TANK_T3 * 100.0 + 0.5));
+    spell_fill(st);
+    eqi("C5 a fill reaches the tier cap", spell_oil_x100(st), spell_tank_x100(st));
+
+    // C6-C7 — shrinking the tank must clamp, not leave a caster over cap.
+    spell_set_tank_tier(st, 0);
+    ck(spell_oil_x100(st) <= spell_tank_x100(st), "C6 oil never exceeds the tank",
+       `${spell_oil_x100(st)} of ${spell_tank_x100(st)}`);
+    spell_add_oil_x100(st, -999999);
+    eqi("C7 oil floors at zero, never negative", spell_oil_x100(st), 0);
+    spell_add_oil_x100(st, 999999);
+    eqi("C8 oil ceilings at the tank", spell_oil_x100(st), spell_tank_x100(st));
+
+    // C9-C11 — THE REGEN IS EXACT.  The design's +0.8/s is 48 oil a minute, and
+    // it must be 48 exactly, on both backends, forever — that is what the
+    // integer carry is for.  A float accumulator would drift and the drift
+    // would land in the save.
+    let sc: object = make_scene(8);
+    let s2: array = spell_new();
+    spell_set_tank_tier(s2, 2);
+    s2[SP_OIL_X100] = 0;
+    spell_set_phase(s2, PHASE_DAY);
+    spell_set_lit(s2, 0);
+    let t: i32 = 0;
+    while (t < g_TICK_HZ * 60) { spell_step(s2, sc.ctx, sc.pid); t = t + 1; }
+    eqi("C9 +0.8/s is exactly 48 oil a minute (integer carry, no drift)",
+        spell_oil_x100(s2), i32(g_OIL_REGEN_DAY * 60.0 * 100.0 + 0.5));
+
+    let s3: array = spell_new();
+    spell_set_tank_tier(s3, 2);
+    s3[SP_OIL_X100] = 0;
+    spell_set_lit(s3, 1);
+    spell_set_phase(s3, PHASE_NIGHT);
+    let t3: i32 = 0;
+    while (t3 < g_TICK_HZ * 60) { spell_step(s3, sc.ctx, sc.pid); t3 = t3 + 1; }
+    eqi("C10 +3.0/s inside a lit radius is exactly 180 a minute",
+        spell_oil_x100(s3), i32(g_OIL_REGEN_LIT * 60.0 * 100.0 + 0.5));
+
+    // C11 — dark and outside a radius: NOTHING regenerates.  That is the whole
+    // pressure of the night, and it is why the lit hold matters.
+    let s4: array = spell_new();
+    s4[SP_OIL_X100] = 0;
+    spell_set_lit(s4, 0);
+    spell_set_phase(s4, PHASE_NIGHT);
+    let t4: i32 = 0;
+    while (t4 < g_TICK_HZ * 60) { spell_step(s4, sc.ctx, sc.pid); t4 = t4 + 1; }
+    eqi("C11 outside a radius at night, oil does not come back", spell_oil_x100(s4), 0);
+
+    // C12 — the rates do NOT stack.  Lit + a Kindling pool is 3.0/s, not 4.5.
+    let s5: array = spell_new();
+    spell_set_tank_tier(s5, 2);
+    arm(s5, g_SPELL_KINDLING);
+    spell_cast(s5, sc.ctx, sc.pid);
+    s5[SP_OIL_X100] = 0;
+    spell_set_lit(s5, 1);
+    spell_set_phase(s5, PHASE_DAY);
+    let t5: i32 = 0;
+    while (t5 < g_TICK_HZ) { spell_step(s5, sc.ctx, sc.pid); t5 = t5 + 1; }
+    eqi("C12 regen rates take the best, never the sum",
+        spell_oil_x100(s5), i32(g_OIL_REGEN_LIT * 100.0 + 0.5));
+    par(spell_oil_x100(s2)); par(spell_oil_x100(s3)); par(spell_oil_x100(s5));
+
+    // C13 — running dry REFUSES the cast; it never goes negative and never
+    // half-casts.  A refusal is counted, so it can never be silent.
+    let s6: array = spell_new();
+    arm(s6, g_SPELL_LANCE);
+    s6[SP_OIL_X100] = 0;
+    eqi("C13 an empty tank refuses the cast", spell_cast(s6, sc.ctx, sc.pid), SPELL_ERR_OIL);
+    eqi("C14 a refused cast spends nothing", spell_oil_x100(s6), 0);
+    eqi("C15 a refusal is counted, never silent", spell_refusals(s6), 1);
+    eqi("C16 a refused cast is not a cast", spell_casts(s6), 0);
+}
+
+// ===========================================================================
+// D.  THE MAIN HAND  (DIRECTION.md §10 — this is the party-composition answer)
+// ===========================================================================
+fn section_hands() {
+    print("D. The main hand  (DIRECTION.md §10)");
+
+    let sc: object = make_scene(16);
+    let st: array = spell_new();
+    spell_set_attunement(st, g_ATTUNE_MAX);
+
+    eqi("D1 nothing is equipped on a new caster", spell_equipped(st, 0), -1);
+    eqi("D2 no spell is in the main hand", spell_active(st), -1);
+    eqi("D3 casting an empty hand is refused", spell_cast(st, sc.ctx, sc.pid), SPELL_ERR_NOT_EQUIPPED);
+
+    eqi("D4 equipping a known spell at the right level", spell_equip(st, 0, g_SPELL_MEND, 30), SPELL_OK);
+    eqi("D5 equipping it below its level is refused", spell_equip(st, 1, g_SPELL_LANCE, 5), SPELL_ERR_LOCKED);
+    eqi("D6 the same spell twice is refused", spell_equip(st, 1, g_SPELL_MEND, 30), SPELL_ERR_UNKNOWN);
+    eqi("D7 a nonexistent spell is refused", spell_equip(st, 1, 99, 30), SPELL_ERR_UNKNOWN);
+
+    // D8 — a slot Attunement has not opened is refused.
+    spell_set_attunement(st, 0);
+    eqi("D8 slot 2 needs the Attunement for it", spell_equip(st, 2, g_SPELL_FLARE, 30), SPELL_ERR_LOCKED);
+    spell_set_attunement(st, g_ATTUNE_MAX);
+    eqi("D9 with the Attunement, slot 2 opens", spell_equip(st, 2, g_SPELL_FLARE, 30), SPELL_OK);
+
+    // D10-D13 — THE SWAP.  This one timer is the entire party-composition
+    // answer (MAGIC_KINETIC §5.2): solo is sequential, a party is parallel.
+    // Nothing else in the design has to exist for co-op to feel different.
+    eqi("D10 raising a spell starts a swap", spell_select(st, 0), SPELL_OK);
+    eqi("D11 the swap is the design's 0.30 s", st[SP_SWAP_T],
+        i32(g_SPELL_SWAP_IN_S * f64(g_TICK_HZ) + 0.5));
+    eqi("D12 you cannot cast mid-swap", spell_cast(st, sc.ctx, sc.pid), SPELL_ERR_BUSY);
+    let t: i32 = 0;
+    while (t < 20) { spell_step(st, sc.ctx, sc.pid); t = t + 1; }
+    eqi("D13 the swap finishes", st[SP_SWAP_T], 0);
+    eqi("D14 and then it casts", spell_cast(st, sc.ctx, sc.pid), SPELL_OK);
+
+    // D15 — lowering the hand is faster than raising it, and it cancels the
+    // channel: you cannot bank a half-finished Mend behind your gun.
+    eqi("D15 lowering the hand", spell_select(st, -1), SPELL_OK);
+    eqi("D16 lowering is the design's 0.22 s", st[SP_SWAP_T],
+        i32(g_SPELL_SWAP_OUT_S * f64(g_TICK_HZ) + 0.5));
+    eqi("D17 lowering the hand cancels the channel", spell_channelling(st), -1);
+    ck(g_SPELL_SWAP_OUT_S < g_SPELL_SWAP_IN_S, "D18 lowering is faster than raising",
+       `${g_SPELL_SWAP_OUT_S} vs ${g_SPELL_SWAP_IN_S}`);
+
+    // D19 — an unbound context refuses rather than crashing.
+    let st2: array = spell_new();
+    arm(st2, g_SPELL_FLARE);
+    let bare: object = spell_ctx_new();
+    eqi("D19 an unbound cast is refused, not a crash", spell_cast(st2, bare, 1), SPELL_ERR_UNBOUND);
+    eqi("D20 a caster who is not in the world is refused",
+        spell_cast(st2, sc.ctx, 987654), SPELL_ERR_NO_CASTER);
+    par(st[SP_SWAP_T]);
+}
+
+// ===========================================================================
+// E.  THE HEAL  (DIRECTION.md §2 "healing")
+// ===========================================================================
+fn section_heal() {
+    print("E. HEALING — Mend  (DIRECTION.md §2)");
+
+    let sc: object = make_scene(16);
+    let wr: object = sc.wr;
+    let hp: array<i32> = wr.hp;
+    let pslot: i32 = world_slot_of(wr, sc.pid);
+
+    let st: array = spell_new();
+    spell_set_attunement(st, 0);          // A=0 so the design's 40 HP is exact
+    spell_equip(st, 0, g_SPELL_MEND, 30);
+    spell_select(st, 0); st[SP_SWAP_T] = 0;
+    spell_fill(st);
+
+    hp[pslot] = 20;
+    eqi("E1 Mend casts", spell_cast(st, sc.ctx, sc.pid), SPELL_OK);
+    eqi("E2 it is a CHANNEL, not an instant", spell_channelling(st), g_SPELL_MEND);
+    eqi("E3 nothing has healed yet", hp[pslot], 20);
+    ck(spell_channel_frac(st) == 0.0, "E4 the channel starts at 0 %", `${spell_channel_frac(st)}`);
+
+    let chan: i32 = spell_channel_ticks(g_SPELL_MEND);
+    let t: i32 = 0;
+    while (t < chan) { spell_step(st, sc.ctx, sc.pid); t = t + 1; }
+    eqi("E5 the channel finishes", spell_channelling(st), -1);
+
+    // E6 — THE ANCHOR.  +40 HP over 1.2 s, and it must be EXACTLY 40, because
+    // the integer carry exists to make it so.  20 -> 60.
+    eqi("E6 healing restores exactly 40 HP (§1.9.2)", hp[pslot], 20 + i32(g_MEND_HP));
+
+    // E7 — it never overheals.  A cap is not optional when the number is
+    // written into the world's hp array.
+    let st2: array = spell_new();
+    spell_set_attunement(st2, 0);
+    spell_equip(st2, 0, g_SPELL_MEND, 30); spell_select(st2, 0); st2[SP_SWAP_T] = 0;
+    hp[pslot] = 95;
+    spell_cast(st2, sc.ctx, sc.pid);
+    let t2: i32 = 0;
+    while (t2 < chan) { spell_step(st2, sc.ctx, sc.pid); t2 = t2 + 1; }
+    eqi("E7 healing never overheals", hp[pslot], 100);
+
+    // E8-E10 — CANCELLED BY DAMAGE (§1.9.2).  This is what stops Mend being a
+    // free reset button in the middle of a fight, and it is the reason a party
+    // is better: someone else can cover you while you channel.
+    let st3: array = spell_new();
+    spell_set_attunement(st3, 0);
+    spell_equip(st3, 0, g_SPELL_MEND, 30); spell_select(st3, 0); st3[SP_SWAP_T] = 0;
+    hp[pslot] = 30;
+    spell_cast(st3, sc.ctx, sc.pid);
+    let t3: i32 = 0;
+    while (t3 < 20) { spell_step(st3, sc.ctx, sc.pid); t3 = t3 + 1; }
+    let partial: i32 = hp[pslot];
+    ck(partial > 30, "E8 a channel heals as it runs", `${partial}`);
+    spell_notify_damaged(st3);
+    eqi("E9 taking damage CANCELS the channel", spell_channelling(st3), -1);
+    let t4: i32 = 0;
+    while (t4 < chan) { spell_step(st3, sc.ctx, sc.pid); t4 = t4 + 1; }
+    eqi("E10 and no more healing arrives", hp[pslot], partial);
+    ck(partial < 30 + i32(g_MEND_HP), "E11 an interrupted Mend is worse than a finished one",
+       `${partial} < ${30 + i32(g_MEND_HP)}`);
+
+    // E12 — the oil was still spent.  An interrupted cast that refunds is a
+    // cast with no risk, and a spell with no risk is not a decision.
+    ck(spell_oil_x100(st3) < spell_tank_x100(st3), "E12 an interrupted Mend still cost oil",
+       `${spell_oil_x100(st3)} of ${spell_tank_x100(st3)}`);
+
+    // E13 — potency heals more.  Attunement is worth taking for a healer.
+    let st4: array = spell_new();
+    arm(st4, g_SPELL_MEND);
+    hp[pslot] = 1;
+    spell_cast(st4, sc.ctx, sc.pid);
+    let t5: i32 = 0;
+    while (t5 < chan) { spell_step(st4, sc.ctx, sc.pid); t5 = t5 + 1; }
+    ck(hp[pslot] - 1 > i32(g_MEND_HP), "E13 potency heals MORE than the base 40",
+       `${hp[pslot] - 1} HP`);
+    par(hp[pslot]); par(partial);
+}
+
+// ===========================================================================
+// F.  THE FIRE BLAST  (DIRECTION.md §2 "fire blasts")
+// ===========================================================================
+// DIRECTION.md §2: "the Emberlance is currently a GUN that does 60 impact +
+// 12/s burn over 5 s with a 3.5 m AoE.  That is a fire blast.  It should
+// probably move to the spell side."  It has moved.  The BOLT is untouched —
+// MAGIC_KINETIC §12's trap is explicit: "the projectile itself does not change.
+// Only its CALLER changes.  Do not take the opportunity to improve it."
+fn section_fire() {
+    print("F. FIRE BLASTS — the Emberlance, moved to the spell side  (DIRECTION.md §2)");
+
+    // F1-F4 — the four numbers the owner quoted, straight out of the shipped,
+    // measured projectile table.  If any of these moved, the consolidation
+    // rebalanced a playtested weapon and that is not what was asked for.
+    eqi("F1 60 impact damage", proj_impact_damage(PROJ_EMBERLANCE), 60);
+    near("F2 a 3.5 m AoE", proj_aoe_radius(PROJ_EMBERLANCE), 3.5, 0.0);
+    eqi("F3 12/s burn", proj_burn_dps_x100(PROJ_EMBERLANCE), 1200);
+    eqi("F4 for 5 s", proj_burn_duration_ticks(PROJ_EMBERLANCE), 5 * g_TICK_HZ);
+
+    // F5 — with no projectile system bound the cast is REFUSED, loudly.  A
+    // fire blast that silently does nothing is the worst possible failure.
+    let sc: object = make_scene(32);
+    let st: array = spell_new();
+    arm(st, g_SPELL_EMBERLANCE);
+    eqi("F5 no delivery bound -> a loud refusal", spell_cast(st, sc.ctx, sc.pid),
+        SPELL_ERR_NO_DELIVERY);
+    eqi("F6 a refused fire blast spends no oil", spell_oil_x100(st), spell_tank_x100(st));
+
+    // F7 onward — bind the real projectile system and throw one.
+    spell_bind_projectiles(sc.ctx, sc.ps);
+    eqi("F7 the projectile system binds", spell_has_projectiles(sc.ctx), 1);
+
+    let wr: object = sc.wr;
+    let tid: i32 = put_target(wr, 0.0, 0.0, -6.0, 200);
+    set_aim(wr, sc.pid, 0.0, -0.06);          // level-ish, into the target
+    world_set_tick(wr, 0);
+    combat_begin_tick(sc.cx);
+
+    let before: i32 = hp_of(wr, tid);
+    eqi("F8 the fire blast casts", spell_cast(st, sc.ctx, sc.pid), SPELL_OK);
+    eqi("F9 a bolt is in the air", proj_count(sc.ps), 1);
+    ck(spell_oil_x100(st) < spell_tank_x100(st), "F10 and it cost oil",
+       `${spell_oil_x100(st)}`);
+
+    // F11 — fly it.  This is the real projectile stepping through the real
+    // detonation into the real combat path.
+    let t: i32 = 1;
+    while (t < 120) {
+        world_set_tick(wr, t);
+        proj_step(sc.ps, wr);
+        t = t + 1;
+    }
+    let after: i32 = hp_of(wr, tid);
+    ck(after < before, "F11 THE FIRE BLAST DOES DAMAGE", `${before} -> ${after}`);
+    ck(before - after >= 60, "F12 at least the 60-point impact landed",
+       `${before - after} HP`);
+
+    // F13 — and it BURNS.  12/s for 5 s is what makes it a fire blast rather
+    // than a grenade.
+    ck(proj_burning(sc.ps, tid) == 1, "F13 the target is burning", `${proj_burning(sc.ps, tid)}`);
+    let t2: i32 = 120;
+    while (t2 < 480) {
+        world_set_tick(wr, t2);
+        proj_step(sc.ps, wr);
+        t2 = t2 + 1;
+    }
+    let burned: i32 = hp_of(wr, tid);
+    ck(burned < after, "F14 the burn keeps ticking after the impact",
+       `${after} -> ${burned}`);
+
+    // F15 — the cooldown is real and it is the old weapon's rate of fire.
+    eqi("F15 the fire blast goes on cooldown", spell_cast(st, sc.ctx, sc.pid),
+        SPELL_ERR_COOLDOWN);
+    let t3: i32 = 0;
+    while (t3 < spell_cooldown_ticks(st, g_SPELL_EMBERLANCE)) {
+        spell_step(st, sc.ctx, sc.pid); t3 = t3 + 1;
+    }
+    eqi("F16 and comes back off it", spell_cd_left(st, g_SPELL_EMBERLANCE), 0);
+
+    par(before); par(after); par(burned);
+}
+
+// ===========================================================================
+// G.  THE CLOAK, AND ITS TELL  (DIRECTION.md §2 "cloaking" + §10)
+// ===========================================================================
+fn section_cloak() {
+    print("G. CLOAKING — Guttering, and the lantern that gives you away");
+
+    let sc: object = make_scene(16);
+    let st: array = spell_new();
+    spell_set_attunement(st, 0);
+    spell_equip(st, 0, g_SPELL_GUTTERING, 30);
+    spell_select(st, 0); st[SP_SWAP_T] = 0;
+
+    eqi("G1 not cloaked to begin with", spell_cloaked(st), 0);
+    near("G2 uncloaked, AI sees you normally at 30 m", spell_aggro_mult(st, 30.0), 1.0, 0.0);
+    near("G3 uncloaked, the lantern is at full brightness", spell_light_mult(st), 1.0, 0.0);
+
+    eqi("G4 the cloak casts", spell_cast(st, sc.ctx, sc.pid), SPELL_OK);
+    eqi("G5 you are cloaked", spell_cloaked(st), 1);
+    eqi("G6 for the design's 4.0 s", st[SP_CLOAK_T], i32(g_CLOAK_S * f64(g_TICK_HZ) + 0.5));
+
+    // G7-G8 — THE MECHANIC.  AI aggro range x0.15 (§1.9.2).
+    near("G7 cloaked at range, aggro is x0.15", spell_aggro_mult(st, 30.0),
+         g_CLOAK_AGGRO_MULT, 0.0);
+    ck(spell_aggro_mult(st, 30.0) < 1.0, "G8 the cloak actually hides you",
+       `${spell_aggro_mult(st, 30.0)}`);
+
+    // G9-G12 — **THE TELL.**  DIRECTION.md §10 put the lantern permanently in
+    // the off-hand and said "the light never leaves the player".  So a cloaked
+    // lamplighter is still carrying a lit lamp: inside the glow radius the
+    // cloak does NOTHING, and the lantern only dims — it never goes out.
+    // Two numbers, no UI, and the counterplay is legible: *get close.*
+    near("G9 THE TELL: inside 6 m the glow gives you away completely",
+         spell_aggro_mult(st, g_CLOAK_GLOW_M - 0.5), 1.0, 0.0);
+    near("G10 exactly at the glow radius you are still seen",
+         spell_aggro_mult(st, g_CLOAK_GLOW_M), 1.0, 0.0);
+    near("G11 one step further out the cloak holds",
+         spell_aggro_mult(st, g_CLOAK_GLOW_M + 0.01), g_CLOAK_AGGRO_MULT, 0.0);
+    near("G12 the lantern DIMS while cloaked", spell_light_mult(st), g_CLOAK_LIGHT_MULT, 0.0);
+    ck(spell_light_mult(st) > 0.0, "G13 but it NEVER goes out — that is the tell",
+       `${spell_light_mult(st)}`);
+
+    // G14-G16 — it breaks on firing, on any spell, and on taking damage
+    // (§1.9.2).  All three, each an explicit call so it is never an accident.
+    eqi("G14 firing the gun breaks the cloak", spell_notify_fired(st), 1);
+    eqi("G15 and you are visible again", spell_cloaked(st), 0);
+
+    let st2: array = spell_new();
+    arm(st2, g_SPELL_GUTTERING);
+    spell_cast(st2, sc.ctx, sc.pid);
+    eqi("G16 taking damage breaks the cloak", spell_notify_damaged(st2), 1);
+    eqi("G17 breaks are counted", spell_breaks(st2), 1);
+
+    // G18 — casting ANY other spell breaks it, and re-cloaking does not count
+    // as a break.
+    let st3: array = spell_new();
+    spell_set_attunement(st3, g_ATTUNE_MAX);
+    spell_equip(st3, 0, g_SPELL_GUTTERING, 30);
+    spell_equip(st3, 1, g_SPELL_FLARE, 30);
+    spell_select(st3, 0); st3[SP_SWAP_T] = 0;
+    spell_cast(st3, sc.ctx, sc.pid);
+    eqi("G18 recloaking is not a break", spell_breaks(st3), 0);
+    spell_select(st3, 1); st3[SP_SWAP_T] = 0;
+    spell_cast(st3, sc.ctx, sc.pid);
+    eqi("G19 casting another spell breaks the cloak", spell_cloaked(st3), 0);
+    eqi("G20 and that break is counted", spell_breaks(st3), 1);
+
+    // G21 — it expires on its own, and the renderer is told.
+    let st4: array = spell_new();
+    spell_set_attunement(st4, 0);
+    spell_equip(st4, 0, g_SPELL_GUTTERING, 30); spell_select(st4, 0); st4[SP_SWAP_T] = 0;
+    world_set_tick(sc.wr, 7);
+    combat_begin_tick(sc.cx);
+    spell_cast(st4, sc.ctx, sc.pid);
+    let t: i32 = 0;
+    while (t < i32(g_CLOAK_S * f64(g_TICK_HZ) + 0.5)) {
+        spell_step(st4, sc.ctx, sc.pid); t = t + 1;
+    }
+    eqi("G21 the cloak expires on its own", spell_cloaked(st4), 0);
+    let bus: object = combat_events(sc.cx);
+    let ndown: i32 = 0;
+    let nup: i32 = 0;
+    let i: i32 = 0;
+    while (i < evbus_count(bus)) {
+        if (evbus_type(bus, i) == EV_SPELL_CLOAK) {
+            if (evbus_sub(bus, i) == 1) { nup = nup + 1; }
+            if (evbus_sub(bus, i) == 0) { ndown = ndown + 1; }
+        }
+        i = i + 1;
+    }
+    eqi("G22 the renderer is told the cloak went up", nup, 1);
+    eqi("G23 and that it came down", ndown, 1);
+    par(st[SP_CLOAK_T]); par(nup); par(ndown);
+}
+
+// ===========================================================================
+// H.  THE THREE LIGHT VERBS  (MAGIC_KINETIC §1.5)
+// ===========================================================================
+fn section_verbs() {
+    print("H. The light verbs  (MAGIC_KINETIC §1.5)");
+
+    let st: array = spell_new();
+    spell_set_attunement(st, 0);
+    spell_set_lit(st, 0);
+    spell_set_phase(st, PHASE_DUSK);
+
+    // H1-H4 — LINEAR falloff, not smoothstepped.  §1.5 is explicit about why:
+    // the player must be able to FEEL the edge of the cone, and a smoothstep
+    // makes the boundary mushy and unlearnable.
+    near("H1 inside r0 the flare does full damage",
+         spell_damage_at(st, g_SPELL_FLARE, 0.0, 0), 28.0, 0.0001);
+    near("H2 at r0 exactly, still full", spell_damage_at(st, g_SPELL_FLARE, 2.0, 0), 28.0, 0.0001);
+    near("H3 at r1 it is halved", spell_damage_at(st, g_SPELL_FLARE, 6.0, 0), 14.0, 0.0001);
+    near("H4 the midpoint is the LINEAR midpoint",
+         spell_damage_at(st, g_SPELL_FLARE, 4.0, 0), 21.0, 0.0001);
+    near("H5 past r1 there is nothing", spell_damage_at(st, g_SPELL_FLARE, 6.01, 0), 0.0, 0.0);
+
+    // H6 — the lance's 55 -> 27 over 18..24 m.
+    near("H6 the lance does 55 at 18 m", spell_damage_at(st, g_SPELL_LANCE, 18.0, 0), 55.0, 0.0001);
+    near("H7 and 27 at 24 m", spell_damage_at(st, g_SPELL_LANCE, 24.0, 0), 27.0, 0.0001);
+
+    // H8-H10 — the day-phase multiplier (§1.7).  The lamp is strongest exactly
+    // when the game is hardest, and inside a lit radius it is forced to the DAY
+    // value because there is no dark there to contrast against.
+    spell_set_phase(st, PHASE_NIGHT);
+    near("H8 at night magic is x1.30", spell_phase_mult(st), g_MAGIC_PHASE_NIGHT, 0.0);
+    spell_set_phase(st, PHASE_DAY);
+    near("H9 by day it is x0.70", spell_phase_mult(st), g_MAGIC_PHASE_DAY, 0.0);
+    spell_set_phase(st, PHASE_NIGHT);
+    spell_set_lit(st, 1);
+    near("H10 inside a lit radius, night is forced to the day value",
+         spell_phase_mult(st), g_MAGIC_PHASE_DAY, 0.0);
+    spell_set_lit(st, 0);
+
+    // H11 — the phase multiplier does NOT touch the KINETIC fire blast.  A
+    // separate axis is only worth having if it actually separates.
+    let d_day: f64 = 0.0;
+    let d_night: f64 = 0.0;
+    spell_set_phase(st, PHASE_DAY);
+    d_day = spell_damage_at(st, g_SPELL_FLARE, 0.0, 0);
+    spell_set_phase(st, PHASE_NIGHT);
+    d_night = spell_damage_at(st, g_SPELL_FLARE, 0.0, 0);
+    ck(d_night > d_day, "H11 MAGIC damage rises at night", `${d_day} -> ${d_night}`);
+
+    // H12 — the wind-up window (§1.3 point 4): light punishes a committed tell.
+    spell_set_phase(st, PHASE_DUSK);
+    let plain: f64 = spell_damage_at(st, g_SPELL_FLARE, 0.0, 0);
+    let tell: f64 = spell_damage_at(st, g_SPELL_FLARE, 0.0, 1);
+    near("H12 magic does x2.0 into a committed tell", tell / plain, g_MAGIC_WINDUP_MULT, 0.0001);
+
+    // ---- the volume tests, resolved against a real world -------------------
+    let sc: object = make_scene(64);
+    let wr: object = sc.wr;
+    let st2: array = spell_new();
+    spell_set_attunement(st2, 0);
+    spell_set_phase(st2, PHASE_DUSK);
+    arm2(st2, g_SPELL_FLARE);
+
+    // Four targets: two inside the 6 m sphere, one outside, one behind.
+    let a1: i32 = put_target(wr, 0.0, 0.0, -3.0, 400);
+    let a2: i32 = put_target(wr, 5.0, 0.0, 0.0, 400);
+    let a3: i32 = put_target(wr, 0.0, 0.0, -20.0, 400);
+    let a4: i32 = put_target(wr, 0.0, 0.0, 4.0, 400);
+    set_aim(wr, sc.pid, 0.0, 0.0);
+    world_set_tick(wr, 3);
+    combat_begin_tick(sc.cx);
+
+    eqi("H13 the flare casts", spell_cast(st2, sc.ctx, sc.pid), SPELL_OK);
+    eqi("H14 THE FLARE IS 360 DEGREES — it hits the one behind you too",
+        spell_last_targets(st2), 3);
+    ck(hp_of(wr, a4) < 400, "H15 the target behind you took damage", `${hp_of(wr, a4)}`);
+    eqi("H16 the one at 20 m is untouched", hp_of(wr, a3), 400);
+    ck(hp_of(wr, a1) < hp_of(wr, a2), "H17 the nearer target took MORE",
+       `${hp_of(wr, a1)} vs ${hp_of(wr, a2)}`);
+
+    // H18-H20 — the cone actually cones.  Same four targets, the shutter.
+    let sc2: object = make_scene(64);
+    let wr2: object = sc2.wr;
+    let b1: i32 = put_target(wr2, 0.0, 0.0, -10.0, 400);   // dead ahead
+    let b2: i32 = put_target(wr2, 10.0, 0.0, 0.0, 400);    // 90 degrees off
+    let b3: i32 = put_target(wr2, 0.0, 0.0, 10.0, 400);    // behind
+    let st3: array = spell_new();
+    spell_set_attunement(st3, 0);
+    spell_set_phase(st3, PHASE_DUSK);
+    arm2(st3, g_SPELL_SHUTTER);
+    set_aim(wr2, sc2.pid, 0.0, 0.0);
+    world_set_tick(wr2, 1);
+    combat_begin_tick(sc2.cx);
+    spell_cast(st3, sc2.ctx, sc2.pid);
+    eqi("H18 the shutter hits only what is in front of it", spell_last_targets(st3), 1);
+    ck(hp_of(wr2, b1) < 400, "H19 the one ahead is hit", `${hp_of(wr2, b1)}`);
+    eqi("H20 the one 90 degrees off is not", hp_of(wr2, b2), 400);
+    eqi("H21 and neither is the one behind", hp_of(wr2, b3), 400);
+
+    // H22-H24 — THE BEAM BILLS AT 10 Hz, NOT 60.  A caller holding BTN_FIRE
+    // casts every tick; if each of those charged, the design's 22 oil/s would
+    // be 132 oil/s and the shutter would empty a full tank in 0.75 s.
+    let oil0: i32 = spell_oil_x100(st3);
+    let ticks: i32 = 60;
+    let t: i32 = 0;
+    while (t < ticks) {
+        world_set_tick(wr2, 10 + t);
+        combat_begin_tick(sc2.cx);
+        spell_cast(st3, sc2.ctx, sc2.pid);      // holding the button
+        spell_step(st3, sc2.ctx, sc2.pid);
+        t = t + 1;
+    }
+    let spent: i32 = oil0 - spell_oil_x100(st3);
+    let want: i32 = spell_base_oil_x100(g_SPELL_SHUTTER) * g_MAGIC_BEAM_HZ;
+    eqi("H22 one second of held beam costs the design's 22 oil", spent, want);
+    near("H23 which is 22.0 oil/s", f64(spent) / 100.0, 22.0, 0.0001);
+
+    // H24 — and it stops when the tank runs dry, rather than going negative.
+    st3[SP_OIL_X100] = 100;
+    let t2: i32 = 0;
+    while (t2 < 30) {
+        world_set_tick(wr2, 200 + t2);
+        combat_begin_tick(sc2.cx);
+        spell_step(st3, sc2.ctx, sc2.pid);
+        t2 = t2 + 1;
+    }
+    ck(spell_oil_x100(st3) >= 0, "H24 a dry tank shutters the beam, never overdraws",
+       `${spell_oil_x100(st3)}`);
+    eqi("H25 and the beam goes out", st3[SP_BEAM_T], 0);
+
+    // H26-H28 — the lance's 1.2 s locked wind-up, priced exactly so it never
+    // becomes a sniper rifle (§1.5).
+    let sc3: object = make_scene(32);
+    let wr3: object = sc3.wr;
+    let c1: i32 = put_target(wr3, 0.0, 0.0, -20.0, 400);
+    let st4: array = spell_new();
+    spell_set_attunement(st4, 0);
+    spell_set_phase(st4, PHASE_DUSK);
+    arm2(st4, g_SPELL_LANCE);
+    set_aim(wr3, sc3.pid, 0.0, 0.0);
+    world_set_tick(wr3, 1);
+    combat_begin_tick(sc3.cx);
+    spell_cast(st4, sc3.ctx, sc3.pid);
+    eqi("H26 the lance has a wind-up, it does not land instantly", hp_of(wr3, c1), 400);
+    let t3: i32 = 0;
+    while (t3 < spell_channel_ticks(g_SPELL_LANCE)) {
+        spell_step(st4, sc3.ctx, sc3.pid); t3 = t3 + 1;
+    }
+    ck(hp_of(wr3, c1) < 400, "H27 and then it lands at 20 m", `${hp_of(wr3, c1)}`);
+
+    // H28 — cancelled by damage, exactly like Mend's channel.
+    let st5: array = spell_new();
+    spell_set_attunement(st5, 0);
+    arm2(st5, g_SPELL_LANCE);
+    let c2: i32 = put_target(wr3, 2.0, 0.0, -20.0, 400);
+    spell_cast(st5, sc3.ctx, sc3.pid);
+    spell_notify_damaged(st5);
+    let t4: i32 = 0;
+    while (t4 < 200) { spell_step(st5, sc3.ctx, sc3.pid); t4 = t4 + 1; }
+    eqi("H28 a cancelled lance never fires", hp_of(wr3, c2), 400);
+
+    par(hp_of(wr, a1)); par(hp_of(wr2, b1)); par(spent); par(hp_of(wr3, c1));
+}
+
+// PHASE_DUSK is the neutral 1.00 row (§1.7), so the damage assertions above
+// are about the damage table and not about a phase multiplier.
+// arm() with the world already built, at A=0 so the design's own numbers show.
+fn arm2(p_st: array, p_spell: i32) {
+    let st: array = p_st;
+    spell_equip(st, 0, p_spell, 30);
+    spell_select(st, 0);
+    st[SP_SWAP_T] = 0;
+    spell_fill(st);
+}
+
+// ===========================================================================
+// I.  THE FIVE SIGNALS  (CLAUDE.md §9 — non-negotiable, spells included)
+// ===========================================================================
+fn section_feedback() {
+    print("I. The hit-feedback contract  (CLAUDE.md §9)");
+
+    let sc: object = make_scene(64);
+    let wr: object = sc.wr;
+    put_target(wr, 0.0, 0.0, -3.0, 400);
+    put_target(wr, 2.0, 0.0, -1.0, 400);
+    let st: array = spell_new();
+    spell_set_attunement(st, 0);
+    arm2(st, g_SPELL_FLARE);
+    set_aim(wr, sc.pid, 0.0, 0.0);
+    world_set_tick(wr, 11);
+    combat_begin_tick(sc.cx);
+    spell_cast(st, sc.ctx, sc.pid);
+
+    // I1 — THE CONTRACT.  combat.hml's own checker, unmodified, run against a
+    // frame in which the only damage came from a spell.  "If any one is
+    // missing, the gun is broken regardless of how correct the math is" — and a
+    // spell is not exempt from that sentence.
+    eqi("I1 every spell hit fires all five signals in the same frame",
+        combat_feedback_ok(sc.cx), 0);
+
+    let bus: object = combat_events(sc.cx);
+    let n: i32 = evbus_count(bus);
+    let nhit: i32 = 0;
+    let nmark: i32 = 0;
+    let nflash: i32 = 0;
+    let nnum: i32 = 0;
+    let nimp: i32 = 0;
+    let nsnd: i32 = 0;
+    let ncast: i32 = 0;
+    let nmagic: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let ty: i32 = evbus_type(bus, i);
+        if (ty == EV_HIT) { nhit = nhit + 1; }
+        if (ty == EV_HITMARKER) {
+            nmark = nmark + 1;
+            if ((evbus_sub(bus, i) & HM_MAGIC) != 0) { nmagic = nmagic + 1; }
+        }
+        if (ty == EV_HIT_FLASH) { nflash = nflash + 1; }
+        if (ty == EV_DAMAGE_NUMBER) { nnum = nnum + 1; }
+        if (ty == EV_IMPACT) { nimp = nimp + 1; }
+        if (ty == EV_SOUND) { nsnd = nsnd + 1; }
+        if (ty == EV_SPELL_CAST) { ncast = ncast + 1; }
+        i = i + 1;
+    }
+    eqi("I2 two enemies hit", nhit, 2);
+    eqi("I3 two hitmarkers", nmark, 2);
+    eqi("I4 two enemy flashes", nflash, 2);
+    eqi("I5 two damage numbers", nnum, 2);
+    eqi("I6 two impact billboards", nimp, 2);
+    eqi("I7 two audio blips", nsnd, 2);
+
+    // I8 — RULE C (§2.1): a magic hit must LOOK magic in the same frame.  The
+    // 4-petal bloom rides in the existing hitmarker sub field: zero new events,
+    // zero new packet fields.
+    eqi("I8 every magic hitmarker carries HM_MAGIC", nmagic, 2);
+
+    // I9 — the renderer is told a spell was cast, once.
+    eqi("I9 one cast event for the renderer", ncast, 1);
+    eqi("I10 nothing was dropped off the bus", evbus_dropped(bus), 0);
+
+    // I11 — the EV_HIT sub rides at 70 for a burst, so a packet dump can tell a
+    // flare from a Sparrow round.
+    let sub70: i32 = 0;
+    let k: i32 = 0;
+    while (k < n) {
+        if (evbus_type(bus, k) == EV_HIT) {
+            if (evbus_sub(bus, k) == DMG_SUB_BASE + SPELL_DMG_BURST) { sub70 = sub70 + 1; }
+        }
+        k = k + 1;
+    }
+    eqi("I11 a flare hit is legible on the wire as sub 70", sub70, 2);
+
+    // I12 — a KILL still says kill.  A flare that deletes a Wisp swarm must
+    // advance the streak like any other kill (§7.6: "do not special-case it").
+    let sc2: object = make_scene(32);
+    let wr2: object = sc2.wr;
+    let w1: i32 = put_target(wr2, 0.0, 0.0, -2.0, 5);
+    let st2: array = spell_new();
+    spell_set_attunement(st2, 0);
+    arm2(st2, g_SPELL_FLARE);
+    set_aim(wr2, sc2.pid, 0.0, 0.0);
+    world_set_tick(wr2, 2);
+    combat_begin_tick(sc2.cx);
+    spell_cast(st2, sc2.ctx, sc2.pid);
+    eqi("I12 a flare kills a 5 HP shade", hp_of(wr2, w1), 0);
+    let bus2: object = combat_events(sc2.cx);
+    let nkill: i32 = 0;
+    let j: i32 = 0;
+    while (j < evbus_count(bus2)) {
+        if (evbus_type(bus2, j) == EV_HITMARKER) {
+            if ((evbus_sub(bus2, j) & HM_KILL) != 0) { nkill = nkill + 1; }
+        }
+        j = j + 1;
+    }
+    eqi("I13 and the hitmarker says so", nkill, 1);
+    eqi("I14 the contract still holds on a kill", combat_feedback_ok(sc2.cx), 0);
+    par(nhit); par(nmark); par(nmagic); par(nkill);
+}
+
+// ===========================================================================
+// J.  DETERMINISM
+// ===========================================================================
+// `spells.hml` draws NO random numbers, so the seed below drives the SCRIPT of
+// casts, not the spell system: same seed -> same script -> bit-identical state;
+// different seed -> different script -> different state.  That is the honest
+// form of the criterion for a module with no generator in it, and it is a
+// stronger claim than "same seed, same result" — there is no stream to desync.
+fn scenario(p_seed: i32, p_ticks: i32): i32 {
+    let sc: object = make_scene(64);
+    let wr: object = sc.wr;
+    world_set_seed(wr, p_seed);
+    spell_bind_projectiles(sc.ctx, sc.ps);
+
+    let rs: array = rng_new();
+    rng_seed(rs, p_seed, RNG_AI, 0, 0);
+
+    // a seeded ring of targets
+    let k: i32 = 0;
+    while (k < 8) {
+        let ang: f64 = rng_f01(rs) * 6.283185307179586;
+        let rad: f64 = 2.0 + rng_f01(rs) * 16.0;
+        put_target(wr, cos_of(ang) * rad, 0.0, sin_of(ang) * rad, 300);
+        k = k + 1;
+    }
+
+    let st: array = spell_new();
+    spell_set_attunement(st, rng_range(rs, 0, g_ATTUNE_MAX));
+    spell_set_tank_tier(st, rng_range(rs, 0, 2));
+    spell_fill(st);
+    spell_equip(st, 0, g_SPELL_FLARE, 30);
+    spell_equip(st, 1, g_SPELL_MEND, 30);
+    spell_equip(st, 2, g_SPELL_GUTTERING, 30);
+    spell_select(st, 0);
+
+    let hp: array<i32> = wr.hp;
+    let pslot: i32 = world_slot_of(wr, sc.pid);
+
+    let t: i32 = 0;
+    while (t < p_ticks) {
+        world_set_tick(wr, t);
+        combat_begin_tick(sc.cx);
+        spell_set_phase(st, rng_range(rs, 0, PHASE_COUNT - 1));
+        spell_set_lit(st, rng_range(rs, 0, 1));
+        if (t % 23 == 0) {
+            spell_select(st, rng_range(rs, 0, 2));
+            set_aim(wr, sc.pid, rng_f01(rs) * 6.283185307179586, 0.0);
+        }
+        if (t % 11 == 0) { spell_cast(st, sc.ctx, sc.pid); }
+        if (t % 97 == 0) { hp[pslot] = 40; spell_notify_damaged(st); }
+        spell_step(st, sc.ctx, sc.pid);
+        proj_step(sc.ps, wr);
+        t = t + 1;
+    }
+
+    // fold the spell state together with what it actually did to the world
+    let h: i32 = spell_hash(st);
+    let n: i32 = world_count(wr);
+    let hpa: array<i32> = wr.hp;
+    let acc: u64 = u64(h);
+    let i: i32 = 0;
+    while (i < n) {
+        let v: i32 = hpa[i];
+        let u: u64 = 0;
+        if (v >= 0) { u = u64(v); } else { u = u64(f64(v) + 4294967296.0); }
+        acc = (acc ^ u) * 1099511628211;
+        acc = acc ^ (acc >> 29);
+        i = i + 1;
+    }
+    let out: i32 = i32((acc >> 33) & 2147483647);
+    return out;
+}
+
+fn cos_of(p_a: f64): f64 { let o: f64 = __cos(p_a); return o; }
+fn sin_of(p_a: f64): f64 { let o: f64 = __sin(p_a); return o; }
+
+fn section_determinism() {
+    print("J. Determinism");
+
+    let a1: i32 = scenario(1234, 600);
+    let a2: i32 = scenario(1234, 600);
+    let b1: i32 = scenario(9876, 600);
+    eqi("J1 the same seed is BIT-IDENTICAL over 600 ticks", a1, a2);
+    ck(a1 != b1, "J2 a different seed differs", `${a1} vs ${b1}`);
+    print(`   J   seed 1234 -> ${a1}   seed 9876 -> ${b1}`);
+    par(a1); par(b1);
+
+    // J3 — no RNG at all in the spell system itself: a state advanced with no
+    // casts is a pure function of its inputs, so two casters fed the identical
+    // inputs agree without exchanging any generator state.
+    let sc: object = make_scene(8);
+    let s1: array = spell_new();
+    let s2: array = spell_new();
+    let t: i32 = 0;
+    while (t < 400) {
+        spell_set_lit(s1, t % 3); spell_set_lit(s2, t % 3);
+        spell_step(s1, sc.ctx, sc.pid);
+        spell_step(s2, sc.ctx, sc.pid);
+        t = t + 1;
+    }
+    eqi("J3 two casters given identical inputs are identical", spell_hash(s1), spell_hash(s2));
+
+    // J4-J7 — the save round-trip.  MAGIC_KINETIC §12's trap: "Mend and
+    // Guttering are sim state with timers — they must be in the hash and in the
+    // save, or a replay diverges."
+    let s3: array = spell_new();
+    arm(s3, g_SPELL_GUTTERING);
+    spell_cast(s3, sc.ctx, sc.pid);
+    spell_step(s3, sc.ctx, sc.pid);
+    let before: i32 = spell_hash(s3);
+    let buf: array = [];
+    let z: i32 = 0;
+    while (z < SP_FIELDS + 4) { buf.push(0); z = z + 1; }
+    eqi("J4 serialize writes the whole vector", spell_serialize(s3, buf, 2), SP_FIELDS);
+    let s4: array = spell_new();
+    eqi("J5 deserialize consumes the whole vector", spell_deserialize(s4, buf, 2), SP_FIELDS);
+    eqi("J6 the round trip is bit-identical", spell_hash(s4), before);
+    eqi("J7 the cloak timer survived the save", s4[SP_CLOAK_T], s3[SP_CLOAK_T]);
+
+    // J8 — a stale save is REJECTED, never reinterpreted.
+    buf[2] = 999;
+    eqi("J8 a bad version word is rejected", spell_deserialize(s4, buf, 2), -1);
+
+    // J9-J10 — the hash separates on every slot.  A hash that misses a field is
+    // a replay that diverges silently in that field.
+    let missed: i32 = 0;
+    let f: i32 = 1;
+    while (f < SP_FIELDS) {
+        let sa: array = spell_new();
+        let sb: array = spell_new();
+        sb[f] = sb[f] + 1;
+        if (spell_hash(sa) == spell_hash(sb)) { missed = missed + 1; }
+        f = f + 1;
+    }
+    eqi("J9 every one of the 38 mutable slots changes the hash", missed, 0);
+    let sc2: array = spell_new();
+    let sd: array = spell_new();
+    spell_copy(sd, sc2);
+    eqi("J10 a copy hashes the same", spell_hash(sd), spell_hash(sc2));
+    par(before);
+}
+
+// ===========================================================================
+// K.  NEVER SOLO-HOSTILE, AND THE LAW  (DIRECTION.md §4, MAGIC_KINETIC §5.3)
+// ===========================================================================
+fn section_solo() {
+    print("K. Solo  (DIRECTION.md §4: satisfying solo, better in a party, never solo-hostile)");
+
+    // K1 — every spell is castable by one player alone.  No spell targets an
+    // ally, no spell needs a second caster, and nothing here has a party gate.
+    let sc: object = make_scene(32);
+    spell_bind_projectiles(sc.ctx, sc.ps);
+    let castable: i32 = 0;
+    let i: i32 = 0;
+    while (i < g_SPELL_COUNT) {
+        let st: array = spell_new();
+        spell_set_attunement(st, g_ATTUNE_MAX);
+        spell_set_tank_tier(st, 2);
+        spell_equip(st, 0, i, 30);
+        spell_select(st, 0);
+        st[SP_SWAP_T] = 0;
+        spell_fill(st);
+        if (spell_cast(st, sc.ctx, sc.pid) == SPELL_OK) { castable = castable + 1; }
+        i = i + 1;
+    }
+    eqi("K1 all seven spells are castable by one player alone", castable, g_SPELL_COUNT);
+
+    // K2 — every spell is reachable on the level ladder before the soft cap.
+    let reachable: i32 = 0;
+    let k: i32 = 0;
+    while (k < g_SPELL_COUNT) {
+        if (spell_unlock_level(k) <= 30) { reachable = reachable + 1; }
+        k = k + 1;
+    }
+    eqi("K2 every spell is reachable before the level 30 soft cap", reachable, g_SPELL_COUNT);
+
+    // K3 — the first verb costs no unlock at all.  MAGIC_KINETIC §7.1: the
+    // flare is granted by LIGHTING THE FIRST LANTERN, ~30 seconds in.  The
+    // player has the school from the first lantern, forever.
+    eqi("K3 the flare is available from level 1", spell_unlock_level(g_SPELL_FLARE), 1);
+
+    // K4 — a full tank at tier 1 buys five flares.  §1.6's own arithmetic: the
+    // lamp can carry the unbodied half of a tier-1 hold and nothing else.
+    let st2: array = spell_new();
+    spell_set_attunement(st2, 0);
+    eqi("K4 a starting tank is five flares",
+        i32(f64(spell_tank_x100(st2)) / f64(spell_oil_cost_x100(st2, g_SPELL_FLARE))), 5);
+
+    // K5 — THE LAW (§5.3): no multiplier in this file is ever below 0.15.  The
+    // worst case in the game is a longer fight, never an impossible one.
+    let worst: f64 = 9.0;
+    let p: i32 = 0;
+    while (p < PHASE_COUNT) {
+        let stp: array = spell_new();
+        spell_set_phase(stp, p);
+        spell_set_lit(stp, 0);
+        if (spell_phase_mult(stp) < worst) { worst = spell_phase_mult(stp); }
+        p = p + 1;
+    }
+    ck(worst >= g_MAGIC_FLOOR_MULT, "K5 no phase multiplier is below THE LAW's 0.15",
+       `${worst} >= ${g_MAGIC_FLOOR_MULT}`);
+    near("K6 THE LAW is 0.15", g_MAGIC_FLOOR_MULT, 0.15, 0.0);
+
+    // K7 — the cloak's aggro multiplier obeys THE LAW too.
+    ck(g_CLOAK_AGGRO_MULT >= g_MAGIC_FLOOR_MULT, "K7 the cloak never makes you invisible",
+       `${g_CLOAK_AGGRO_MULT}`);
+    par(i32(worst * 1000.0));
+}
+
+// ===========================================================================
+// L.  SOURCE PURITY  (the import wall, by reading the file)
+// ===========================================================================
+fn section_purity() {
+    print("L. Source purity  (CLAUDE.md §3, ci_imports R1/R5/R8)");
+
+    let src: string = read_file("src/sim/spells.hml");
+    ck(src.length > 1000, "L1 the module source was read", `${src.length} bytes`);
+
+    let banned: array = ["@stdlib/random", "wobbleweed", "SDL_", "gn.hml",
+                         "__clock", "ticks()", "print("];
+    let hits: string = "";
+    let lines: array = src.split("\n");
+    let l: i32 = 0;
+    while (l < lines.length) {
+        let code: string = lines[l].split("//")[0];
+        let b: i32 = 0;
+        while (b < banned.length) {
+            if (code.contains(banned[b])) { hits = `${hits} ${l}:${banned[b]}`; }
+            b = b + 1;
+        }
+        l = l + 1;
+    }
+    ck(hits == "", "L2 no banned import, SDL symbol, wall clock or print in spells CODE", `${hits}`);
+
+    // L3 — a ban list that cannot fire is not a ban list.
+    let caught: i32 = 0;
+    let probe: string = "let x = __clock();";
+    let bb: i32 = 0;
+    while (bb < banned.length) {
+        if (probe.contains(banned[bb])) { caught = caught + 1; }
+        bb = bb + 1;
+    }
+    eqi("L3 the ban list actually fires on a violation", caught, 1);
+
+    // L4 — src/sim may import only @stdlib/math, src/sim/** and src/core/**.
+    let bad_imports: string = "";
+    let m: i32 = 0;
+    while (m < lines.length) {
+        let ln: string = lines[m];
+        if (ln.contains("from \"")) {
+            let okimp: i32 = 0;
+            if (ln.contains("@stdlib/math")) { okimp = 1; }
+            if (ln.contains("../core/")) { okimp = 1; }
+            if (ln.contains("\"./")) { okimp = 1; }
+            if (okimp == 0) { bad_imports = `${bad_imports} ${m}`; }
+        }
+        m = m + 1;
+    }
+    ck(bad_imports == "", "L4 every import is inside the wall", `${bad_imports}`);
+}
+
+// ===========================================================================
+// M.  PERFORMANCE  (RULE T: __clock CPU time, min of 7, ratio bounds)
+// ===========================================================================
+fn section_perf() {
+    print("M. Performance (RULE T: __clock CPU time, min of 7 trials)");
+
+    let TRIALS: i32 = 7;
+    let NC: i32 = 400000;
+    let bestc: f64 = 1000000.0;
+    let calsink: i32 = 0;
+    let tc: i32 = 0;
+    while (tc < TRIALS) {
+        let t0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < NC) { calsink = calsink ^ i; i = i + 1; }
+        let dt: f64 = __clock() - t0;
+        if (dt < bestc) { bestc = dt; }
+        tc = tc + 1;
+    }
+    let cal: f64 = bestc * 1000000000.0 / f64(NC);
+    let scale: f64 = cal / 12.5;
+    if (scale < 1.0) { scale = 1.0; }
+    print(`   M0  empty-loop calibration ${cal} ns/iter -> bound scale x${scale}   sink=${calsink}`);
+
+    // M1 — spell_step.  THE per-tick cost: once per player, every tick, forever,
+    // whether or not anything is cast.  MAGIC_KINETIC §8.3 PREDICTED "~20 f64
+    // ops per player per tick" and said so was a prediction; this measures it.
+    let sc: object = make_scene(32);
+    let st: array = spell_new();
+    arm(st, g_SPELL_GUTTERING);
+    spell_set_lit(st, 1);
+    let N1: i32 = 100000;
+    let best1: f64 = 1000000.0;
+    let t1: i32 = 0;
+    while (t1 < TRIALS) {
+        st[SP_CLOAK_T] = N1 + 10;
+        st[SP_POOL_T] = N1 + 10;
+        let a0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < N1) { spell_step(st, sc.ctx, sc.pid); i = i + 1; }
+        let dt: f64 = __clock() - a0;
+        if (dt < best1) { best1 = dt; }
+        t1 = t1 + 1;
+    }
+    let ns1: f64 = best1 * 1000000000.0 / f64(N1);
+    print(`   M1  spell_step (cloak + pool live) ${ns1} ns/call`);
+
+    // M2 — the volume test with the director's own alive cap of 14 shades in
+    // range.  §8.3 predicted this too.  It runs at 10 Hz for the beam and at
+    // well under 2 Hz for the flare, never at 60.
+    let sc2: object = make_scene(64);
+    let wr2: object = sc2.wr;
+    let k: i32 = 0;
+    while (k < 14) {
+        put_target(wr2, f64(k) * 0.3 - 2.0, 0.0, 0.0 - 2.0 - f64(k) * 0.2, 100000);
+        k = k + 1;
+    }
+    let st2: array = spell_new();
+    spell_set_attunement(st2, 0);
+    arm2(st2, g_SPELL_FLARE);
+    set_aim(wr2, sc2.pid, 0.0, 0.0);
+    let N2: i32 = 4000;
+    let best2: f64 = 1000000.0;
+    let t2: i32 = 0;
+    while (t2 < TRIALS) {
+        let b0: f64 = __clock();
+        let i: i32 = 0;
+        while (i < N2) {
+            combat_begin_tick(sc2.cx);
+            st2[SP_CD_0 + g_SPELL_FLARE] = 0;
+            st2[SP_OIL_X100] = 100000;
+            spell_cast(st2, sc2.ctx, sc2.pid);
+            i = i + 1;
+        }
+        let dt: f64 = __clock() - b0;
+        if (dt < best2) { best2 = dt; }
+        t2 = t2 + 1;
+    }
+    let ns2: f64 = best2 * 1000000000.0 / f64(N2);
+    print(`   M2  a flare against 14 shades (damage + 5 events each) ${ns2} ns/cast`);
+
+    // M3 — the honest per-frame share.  One spell_step per tick plus a beam
+    // application 10 times a second, against the 2.0 ms sim budget.
+    let per_tick_ns: f64 = ns1 + ns2 / 6.0;
+    let per_tick_ms: f64 = per_tick_ns / (scale * 1000000.0);
+    let pct: f64 = per_tick_ms * 100.0 / g_BUDGET_SIM_MS;
+    print(`   M3  worst realistic tick = ${per_tick_ms} ms = ${pct} % of the ${g_BUDGET_SIM_MS} ms sim budget`);
+    ck(pct < 5.0, "M3 the school costs < 5 % of the sim budget on its worst tick",
+       `${pct} %`);
+
+    // M4-M5 — ratio bounds, which survive contention because both terms inflate
+    // together (CLAUDE.md §1.2).
+    let r1: f64 = ns1 / cal;
+    let r2: f64 = ns2 / cal;
+    print(`   M4  spell_step = ${r1} empty-loop iterations · flare-vs-14 = ${r2}`);
+    ck(r1 < 200.0, "M4 spell_step costs < 200 empty-loop iterations", `${r1}`);
+    ck(r2 < 40000.0, "M5 a 14-target flare costs < 40000 empty-loop iterations", `${r2}`);
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_spells  —  src/sim/spells.hml  (the spell school)");
+    print("");
+
+    if (is_dir("src/sim") != true) {
+        print("FAIL  run this from the nightshade repo root: src/sim/ not found from here");
+        exit(1);
+    }
+
+    section_tables();      print("");
+    section_attune();      print("");
+    section_oil();         print("");
+    section_hands();       print("");
+    section_heal();        print("");
+    section_fire();        print("");
+    section_cloak();       print("");
+    section_verbs();       print("");
+    section_feedback();    print("");
+    section_determinism(); print("");
+    section_solo();        print("");
+    section_purity();      print("");
+    section_perf();        print("");
+
+    print(`PARITY  ${g_parity}`);
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

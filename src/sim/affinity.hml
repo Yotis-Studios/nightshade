@@ -1,0 +1,974 @@
+// =============================================================================
+//  affinity.hml — the KINETIC / MAGIC axis, and the law that keeps it fun.
+// =============================================================================
+//
+//  MAGIC_KINETIC.md §1.1 (the axis), §2 (what the player sees), §3 (the table),
+//  §5.3 (the solo law).  GAME_DESIGN §2.2 is EXTENDED here, never replaced:
+//  every HP, tri, speed, attack, damage, range, tell, ember, XP and cost value
+//  in that section is untouched.  ONE COLUMN IS ADDED.
+//
+//  VOCABULARY.  The design document says RADIANT.  The shipped code said MAGIC
+//  first (`config.hml` §19 `g_DTYPE_MAGIC`, `spells.hml` `HM_MAGIC`), so this
+//  file says MAGIC too.  One word for one thing.  RADIANT == MAGIC == dtype 1.
+//
+// -----------------------------------------------------------------------------
+//  WHAT THIS MODULE IS
+// -----------------------------------------------------------------------------
+//  A TABLE AND ITS LAWS.  No state, no allocation on any query path, no world,
+//  no context, no RNG, no clock.  Every function here is a pure function of its
+//  arguments, which is what lets `combat.hml` call it from inside the authority
+//  and lets a probe assert the design without building a world.
+//
+//  It deliberately holds NO copy of anything `spells.hml` already owns — the
+//  phase multiplier, the falloff, the potency curve and the per-verb damage
+//  table all live there.  A resistance table in two files is a resistance table
+//  that will disagree.  `spells.hml` §7 says the same sentence from its side.
+//
+// -----------------------------------------------------------------------------
+//  THE IMPORT WALL (CLAUDE.md §3)
+// -----------------------------------------------------------------------------
+//  `src/core/config.hml` only.  Not even `@stdlib/math` — there is no
+//  transcendental in a lookup table.  This module is a LEAF of the sim: nothing
+//  under `src/sim/` may be imported from here, because `combat.hml` imports
+//  THIS, and `spells.hml` imports `combat.hml`.  Importing upward would close a
+//  cycle.
+//
+// -----------------------------------------------------------------------------
+//  THE THREE LAWS.  Each is checkable, each has a checker, and the checkers are
+//  wired into `aff_selfcheck()` so a table edit that breaks one FAILS A BUILD
+//  rather than shipping as a feeling.
+// -----------------------------------------------------------------------------
+//
+//  LAW 1 — THE KINETIC COLUMN IS 1.00 ON EVERY CLASS GAME_DESIGN §2.2 SHIPS.
+//      Classes 0..5 take exactly ×1.00 from lead, always.  This is not
+//      conservatism, it is the load-bearing decision of the whole design: the
+//      GDD §2.4 TTK table has been measured, implemented and playtested, and
+//      `x * 1.0` is EXACT in IEEE-754, so applying this column cannot move a
+//      single measured number by a single ULP.  The entire affinity system
+//      lives in the MAGIC column for the six shipped classes.  Pinned with a
+//      literal in `aff_kinetic_anchor_ok()` — CLAUDE.md rule 5: assert the
+//      design, but pin the ANCHORS with a literal, because "kinetic equals the
+//      config value" is a test that passes while the design rots.
+//
+//  LAW 2 — NO WALL.  `AFF_FLOOR_MULT = 0.15`.  No entry is ever below it and no
+//      entry is ever 0.  The worst hand in the entire game is 6.67× slower,
+//      never impossible.  A solo player who meets a mob resistant to the only
+//      damage type they feel like using has a path through, and the price of
+//      that path is a stated number (§5.3's ladder), not a locked door.
+//      `aff_solo_ok()`.
+//
+//  LAW 3 — NO UNPERCEIVABLE RESISTANCE.  This is the one that decides whether
+//      the system is fun or annoying, so it is the one with the most machinery.
+//
+//      > A resistance the player cannot PERCEIVE is just an unexplained damage
+//      > drop.
+//
+//      So: every class whose multiplier leaves the FELT BAND [0.80, 1.25] must
+//      carry a cue, the cue must ride on a channel that survives at 6 px
+//      (ART_BIBLE §8.1: value contrast, motion, or an emissive marker), and
+//      **the damage number is not a legal primary cue.**  `AFF_CH_NUMBER` is
+//      declared precisely so that using it is a build failure and not an
+//      oversight.  `aff_cue_ok()`.
+//
+//      The payoff of stating it this way is §7's table: for six of the eight
+//      classes the whole system reduces to ONE BIT AT 6 PX — is the ground
+//      under that thing darker than the ground, or brighter?  Dark means it has
+//      a body; shoot it.  Bright means it is made of the light the dark stole;
+//      burn it.  The two exceptions are the two classes that earn a stronger
+//      cue than a bit.
+//
+// -----------------------------------------------------------------------------
+//  THE FORWARD ROWS — Gloam (6) and Snuffer (7)
+// -----------------------------------------------------------------------------
+//  `config.hml` today says `g_ENEMY_KIND_COUNT = 6`.  Widening it is not this
+//  task's file to own (CLAUDE.md §3), so this table is EIGHT rows wide and the
+//  two new class ids are declared here as `AFF_CLS_GLOAM` / `AFF_CLS_SNUFFER`.
+//  `aff_config_agrees()` asserts the six shipped rows line up with config's own
+//  enum and that the table is never NARROWER than config — so the day
+//  `g_ENEMY_KIND_COUNT` goes to 8, this file needs no edit, and the day it goes
+//  to 9 without a row here, the probe goes red.  Reported in the task report as
+//  an `ARCHITECTURE.md` §5 addition.
+//
+//  THE TRAP, named in MAGIC_KINETIC §12: `combat.hml`'s `class_of()` clamps an
+//  unknown class to Husk so a missing hitbox cannot crash a raycast.  Affinity
+//  MUST NOT reuse that clamp — a Gloam that fell through to Husk affinity would
+//  silently become bullet-vulnerable, which is the exact opposite of the class.
+//  `aff_class_of_model()` therefore clamps against `AFF_CLASS_COUNT`, not
+//  against `g_ENEMY_KIND_COUNT`, and returns `AFF_CLS_NONE` for a non-enemy.
+//
+// -----------------------------------------------------------------------------
+//  PERFORMANCE
+// -----------------------------------------------------------------------------
+//  Two array reads and a multiply, once per `combat_apply_damage`.  The worst
+//  case in the game is 9 Bellows pellets aggregated to ONE victim record plus
+//  at most 14 AI contact events per tick — this is not a hot path and it is not
+//  written as one.  No `defer`, no `throw`, no closure, no allocation, no
+//  template string on any query path (CLAUDE.md §1, §4).
+// =============================================================================
+
+import { g_ENEMY_KIND_COUNT,
+         g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK,
+         g_ENEMY_SPITTER, g_ENEMY_WARDEN, g_ENEMY_BULWARK,
+         g_DTYPE_KINETIC, g_DTYPE_MAGIC, g_DTYPE_COUNT
+       } from "../core/config.hml";
+
+// ===========================================================================
+// 1.  THE DELIVERY-KIND -> DAMAGE-TYPE MAP
+// ===========================================================================
+// `combat.hml` already has six DELIVERY KINDS — what shape did the damage
+// arrive in.  Damage TYPE is a second, orthogonal axis — what is it made of.
+// The two are NOT merged, and that orthogonality is what made moving the
+// Emberlance into the spell school nearly free (MAGIC_KINETIC §1.1): it is a
+// fire blast cast from the lamp hand, and it is still KINETIC, because fire
+// burns matter, it does not call light back.
+//
+// These ids MIRROR `combat.hml`'s `DMG_*` and `spells.hml`'s `SPELL_DMG_*`
+// exactly.  They are re-declared rather than imported because `combat.hml`
+// imports this file and a cycle is not allowed; `aff_kind_ids_ok()` is called
+// from `combat.hml`'s own selfcheck with combat's literals, so the two copies
+// cannot drift silently.
+export let AFF_DMG_BULLET: i32    = 0;
+export let AFF_DMG_MELEE: i32     = 1;
+export let AFF_DMG_BURN: i32      = 2;   // fire burns MATTER.  Kinetic.
+export let AFF_DMG_EXPLOSION: i32 = 3;
+export let AFF_DMG_FALL: i32      = 4;
+export let AFF_DMG_CONTACT: i32   = 5;
+export let AFF_DMG_BURST: i32     = 6;   // the flare
+export let AFF_DMG_BEAM: i32      = 7;   // the shutter
+export let AFF_DMG_LANCE: i32     = 8;   // the lance
+export let AFF_DMG_KIND_COUNT: i32 = 9;
+
+// Indexed by AFF_DMG_*, yields g_DTYPE_*.  Everything that existed before the
+// spell school is KINETIC, including DMG_BURN and including the Emberlance.
+let g_aff_dtype: array<i32> = [0, 0, 0, 0, 0, 0, 1, 1, 1];
+
+// An unknown delivery kind resolves to KINETIC, never to MAGIC.  Getting this
+// backwards would hand a future damage source the whole magic affinity column
+// by accident; KINETIC is ×1.00 on every shipped class, so the failure mode of
+// the wrong answer here is "no change", which is the correct failure mode.
+export fn aff_dtype_of_kind(p_kind: i32): i32 {
+    let k: i32 = p_kind;
+    if (k < 0 || k >= AFF_DMG_KIND_COUNT) { let kin: i32 = g_DTYPE_KINETIC; return kin; }
+    let out: i32 = g_aff_dtype[k];
+    return out;
+}
+
+// ===========================================================================
+// 2.  THE CLASS AXIS
+// ===========================================================================
+export let AFF_CLS_NONE: i32    = -1;   // a player, an NPC, a prop: no affinity
+export let AFF_CLS_WISP: i32    = 0;
+export let AFF_CLS_MOTE: i32    = 1;
+export let AFF_CLS_HUSK: i32    = 2;
+export let AFF_CLS_SPITTER: i32 = 3;
+export let AFF_CLS_WARDEN: i32  = 4;
+export let AFF_CLS_BULWARK: i32 = 5;
+export let AFF_CLS_GLOAM: i32   = 6;    // FORWARD — config.hml must adopt as g_ENEMY_GLOAM
+export let AFF_CLS_SNUFFER: i32 = 7;    // FORWARD — config.hml must adopt as g_ENEMY_SNUFFER
+export let AFF_CLASS_COUNT: i32 = 8;
+
+// Bodied / unbodied.  THIS IS THE WHOLE PLAYER-FACING SYSTEM (§7, RULE A).
+// Matter has a shadow and a footfall; stolen light has neither.
+export let AFF_UNBODIED: i32 = 0;
+export let AFF_BODIED: i32   = 1;
+//                                W  M  H  S  Wa Bu Gl Sn
+let g_aff_bodied: array<i32> = [  0, 0, 1, 1, 1, 1, 0, 1];
+
+// ===========================================================================
+// 3.  THE AFFINITY TABLE  (MAGIC_KINETIC §3.3, verbatim)
+// ===========================================================================
+// Flat, row-major, indexed [cls * g_DTYPE_COUNT + dtype].
+//
+// Read the KINETIC column first and notice that it is 1.00 six times.  That is
+// LAW 1 and it is the reason this whole change cannot move the shipped TTK
+// tables: the six classes the game ships take exactly what they always took
+// from every gun, every melee weapon, every burn tick, every explosion, every
+// fall and every contact hit.
+//
+// Then read the MAGIC column and notice the spread is 0.25 -> 2.50.  A factor
+// of 10 across the roster, never more than 4.5x from the mean for one class.
+// Deliberate (§3.5): a ×0.05 resistance is indistinguishable from immunity and
+// reads as a broken gun; a ×6.0 vulnerability makes the other hand pointless.
+let g_aff: array<f64> = [
+//  KIN   MAGIC
+    1.00, 2.50,      // 0 Wisp     pure stolen light in a shape.  One flare deletes a swarm.
+    1.00, 2.00,      // 1 Mote     the AoE target the game is teaching you to notice behind you.
+    1.00, 0.35,      // 2 Husk     matter with a tenant.  Bread and butter stays a GUN fight.
+    1.00, 0.60,      // 3 Spitter  its existing tell IS a light-filled sac.  See AFF_SPITTER_SAC.
+    1.00, 0.25,      // 4 Warden   light goes ROUND a shield.  See AFF_WARDEN_PLATE_MAGIC.
+    1.00, 0.30,      // 5 Bulwark  900 HP at 11.7 magic DPS is 77 s.  The lamp is irrelevant here.
+    0.15, 2.00,      // 6 Gloam    the light-eater.  Teaches "lead is not always the answer."
+    0.20, 2.20       // 7 Snuffer  SHELLED.  See §4 — the shell is a second layer, not a wall.
+];
+
+// ---- the two state-dependent rows -----------------------------------------
+// The Snuffer is the one designed instance of an enemy that changes affinity
+// mid-fight (MAGIC_KINETIC §11 #11), and it does it with machinery that already
+// exists: `world.armor`, the same column the Warden plate uses.
+export let AFF_SNUFFER_SHELL_HP: i32       = 60;
+export let AFF_SNUFFER_SHELL_MAGIC: f64    = 2.20;   // into the SHELL POOL, never into HP
+export let AFF_SNUFFER_SHELLED_KINETIC: f64 = 0.20;  // into HP, does not touch the shell
+export let AFF_SNUFFER_OPEN_KINETIC: f64   = 1.00;   // an ordinary humanoid once it is open
+export let AFF_SNUFFER_OPEN_MAGIC: f64     = 0.30;
+
+// Light goes round a shield, so it does not care which way the shield faces.
+// Facing-independent, into the same 80-point pool `combat.hml` already spends.
+export let AFF_WARDEN_PLATE_MAGIC: f64 = 2.50;
+
+// ---- the vulnerability windows --------------------------------------------
+// Lead is the PROACTIVE hand: you aim it where a thing will be.  Light is the
+// REACTIVE hand: you spend it the instant a thing commits.  That asymmetry is
+// why an expert uses both in one fight instead of picking a favourite.
+//
+// The window is BODIED-ONLY.  An unbodied class is already ×2.00 or better and
+// stacking a tell bonus on top would make the flare a strictly-correct button.
+// Indexed by class; 1.00 means "this class has no window".
+export let AFF_WINDUP_MAGIC: f64 = 2.00;   // the 0.45 s Husk arm-raise, the 1.1 s Bulwark crouch
+export let AFF_SPITTER_SAC: f64  = 5.00;   // the 1.4 s glow charge.  Hit it and it pops.
+//                                  W     M     H     S     Wa    Bu    Gl    Sn
+let g_aff_windup: array<f64> = [ 1.00, 1.00, 2.00, 5.00, 2.00, 2.00, 1.00, 2.00];
+
+// ---- the law ---------------------------------------------------------------
+// LAW 2.  Nothing in the game is ever below this, and nothing is ever zero.
+export let AFF_FLOOR_MULT: f64 = 0.15;
+// 1 / 0.15.  THE PENALTY, and read the next paragraph before using it.
+export let AFF_MAX_TTK_RATIO: f64 = 6.6666666666666670;
+// Every class must have at least one hand that is not penalised at all.
+export let AFF_GOOD_HAND_MULT: f64 = 1.00;
+
+// A CONTRADICTION IN MAGIC_KINETIC.md, RESOLVED HERE AND REPORTED.
+// -----------------------------------------------------------------
+// §5.3 states the law as *"No multiplier is ever below FLOOR_MULT = 0.15.  The
+// worst case in the entire game is a 6.7x longer TTK."*  §3.2 states, of the
+// Gloam, *"13:1 in favour of the right hand"*.  BOTH ARE IN THE SAME DOCUMENT
+// AND THEY ARE NOT THE SAME NUMBER, because they measure different things:
+//
+//   PENALTY     1 / mult          — this hand vs an UNRESISTED hit of the same
+//                                   base damage.  Gloam kinetic: 1/0.15 = 6.67.
+//                                   This is the quantity §5.3 bounds, and the
+//                                   floor bounds it by construction.
+//   HAND SPREAD best / worst      — the better hand vs the worse one on the
+//                                   same target.  Gloam: 2.00/0.15 = 13.33.
+//                                   This is §3.2's 13:1.
+//
+// THE LAW IS THE PENALTY.  The hand spread is a consequence of a vulnerability
+// on one side and a resistance on the other, and bounding it would forbid
+// exactly the classes the design was written to add — the first draft of this
+// file gated LAW 2 on the spread and it failed on the Gloam, which is how the
+// ambiguity was found.  The spread is still computed and still asserted per
+// class with literals, because it is the number a player feels; it just is not
+// the law.  Reported so somebody can put one sentence in §5.3.
+export fn aff_penalty(p_cls: i32, p_dtype: i32): f64 {
+    let m: f64 = aff_base_mult(p_cls, p_dtype);
+    if (m <= 0.0) { let wall: f64 = 0.0 - 1.0; return wall; }   // -1 => a WALL.  Illegal.
+    let out: f64 = 1.0 / m;
+    return out;
+}
+
+// ===========================================================================
+// 4.  POOL ROUTING — the Warden plate and the Snuffer shell
+// ===========================================================================
+// `combat.hml` already spends `world.armor` for the Warden.  Magic adds a
+// second door into the same column, and the Snuffer adds a second tenant.  Four
+// modes, and `combat.hml` does nothing except obey the one it is handed.
+//
+//   AFF_POOL_NONE   the pool is not engaged.  Body takes raw * body_mult.
+//   AFF_POOL_PLATE  the SHIPPED Warden kinetic branch, byte for byte: the pool
+//                   eats the full incoming damage while 25 % passes through, so
+//                   the plate breaks in the same number of shots whether or not
+//                   it is reducing anything.  UNCHANGED.  It is what makes
+//                   "keep shooting the plate" a slow but real option and "go
+//                   around" the fast one.
+//   AFF_POOL_SCOUR  magic into an intact pool at `aff_pool_mult`, AND the body
+//                   still takes its ordinary body multiplier.  This is the
+//                   Warden: scour the plate off in 0.82 s with the lamp, then
+//                   kill with lead.  A fast option, never the only one.
+//   AFF_POOL_STRIP  magic into an intact pool at `aff_pool_mult` and NOTHING
+//                   into HP.  This is the Snuffer shell: "light opens, lead
+//                   kills."  MAGIC_KINETIC §3.2 is explicit that magic against
+//                   a shelled Snuffer never touches HP.
+//
+// WHY THE WARDEN SCOURS AND THE SNUFFER STRIPS, stated because the difference
+// looks arbitrary and is not.  The shipped Warden plate ALREADY passes 25 %
+// through to the body while eating full damage from the pool; making magic
+// behave the same way keeps one rule for one object.  It also keeps the damage
+// number non-zero, which matters more than it sounds: at 320x240 a damage
+// number of 0 reads as "my gun is broken", and CLAUDE.md §9's hit-feedback
+// contract is non-negotiable.  The Snuffer STRIPS because its design *is* two
+// beats, and because it does not exist yet — so the caller change its zero body
+// damage requires (`combat_last_pool_dmg`) can land with the class instead of
+// regressing a shipped enemy today.  Both facts are in the task report.
+export let AFF_POOL_NONE: i32  = 0;
+export let AFF_POOL_PLATE: i32 = 1;
+export let AFF_POOL_SCOUR: i32 = 2;
+export let AFF_POOL_STRIP: i32 = 3;
+
+// ===========================================================================
+// 5.  THE CUE TABLE — LAW 3, as data
+// ===========================================================================
+// ART_BIBLE §8.1: at 6 px an enemy is a smudge and exactly three things
+// survive — value contrast against the background, motion, and an emissive
+// marker.  Every cue below rides on one of those three, or on the world itself.
+//
+// The channels.  AFF_CH_NUMBER exists ONLY so that using it fails a build.
+export let AFF_CH_NONE: i32       = 0;
+export let AFF_CH_GROUND: i32     = 1;  // value contrast in the contact card under the thing
+export let AFF_CH_SILHOUETTE: i32 = 2;  // shape and negative space
+export let AFF_CH_MOTION: i32     = 3;  // footfall cadence vs drift
+export let AFF_CH_EMISSIVE: i32   = 4;  // an additive marker that changes brightness or hue
+export let AFF_CH_WORLD: i32      = 5;  // the fog and the lantern radius themselves
+export let AFF_CH_NUMBER: i32     = 6;  // ILLEGAL AS A PRIMARY CUE.  See aff_cue_ok().
+export let AFF_CH_COUNT: i32      = 7;
+
+// The cues.
+export let AFF_CUE_NONE: i32     = 0;
+export let AFF_CUE_UNBODIED: i32 = 1;   // the contact card is a POOL OF LIGHT, not a shadow
+export let AFF_CUE_BODIED: i32   = 2;   // a dark contact blob, footfalls, earth palette
+export let AFF_CUE_SAC: i32      = 3;   // the sac goes NS_CORE -> EXPLO_HOT and grows 2.2x
+export let AFF_CUE_PLATE: i32    = 4;   // the widest silhouette in the game; it glows before the ram
+export let AFF_CUE_SHELL: i32    = 5;   // NO class silhouette at all, and a TOTAL change on break
+export let AFF_CUE_FOGPULL: i32  = 6;   // the world closes in.  FOG_FAR x0.35, lantern radius x0.50
+export let AFF_CUE_COUNT: i32    = 7;
+
+// Cues come in TWO RANGES, because ART_BIBLE §8.1 asks two different questions
+// at two different distances and they are carried by different channels:
+//
+//   RULE S1a, 12 px / 30 m — "identifiable by CLASS".  Carried by SILHOUETTE.
+//       This is the shipped readability system doing a second job for free: the
+//       bodied/unbodied split maps exactly onto humanoid/not-humanoid, which the
+//       six shipped meshes already are.  Humanoid means it has a body; shoot it.
+//       An orb or a lozenge means it is made of the light the dark stole; burn it.
+//
+//   RULE S1b, 6 px / 60 m — "detectable as a THREAT".  Carried by GROUND value
+//       contrast, because at 6 px nothing about the geometry survives.  This is
+//       MAGIC_KINETIC RULE A: the bodied keep the dark contact blob; the unbodied
+//       get the same 2 triangles laid in ATLAS_FX, additive, NS_HALO — a POOL OF
+//       LIGHT instead of a shadow.  Same triangle count, opposite meaning.
+//
+// BUILT vs SPECIFIED.  A cue that is designed and not rendered is exactly the
+// unexplained damage drop this law exists to prevent, so the table carries the
+// build status as data and `aff_cue_built_ok()` reports it separately from
+// `aff_cue_ok()`.  One says "the design is complete"; the other says "the game
+// actually shows it".  They are different questions and conflating them is how a
+// resistance ships invisible.  The BUILT column below is a MEASUREMENT, taken by
+// rendering `tools/shot.hml` and reading `src/render/entity_render.hml` — see
+// the task report.  Whoever builds the missing art flips a 0 to a 1 here and the
+// probe goes green; until then it is red on purpose.
+export let AFF_BUILT_NO: i32  = 0;
+export let AFF_BUILT_YES: i32 = 1;
+
+// --- the 12 px / 30 m CLASS read -------------------------------------------
+//                                W      M      H      S      Wa     Bu     Gl     Sn
+let g_aff_cue: array<i32> =    [  1,     1,     2,     2,     2,     2,     6,     5];
+let g_aff_cue_ch: array<i32> = [  2,     2,     2,     2,     2,     2,     5,     2];
+let g_aff_cue_m: array<f64> =  [ 30.0,  30.0,  30.0,  30.0,  30.0,  30.0,  72.0,  30.0];
+// Wisp/Mote/Husk/Warden/Bulwark: the shipped mesh IS the cue, and it renders.
+// Spitter: the humanoid renders, but the x5.00 SAC WINDOW has no visual — the
+//   NS_CORE -> EXPLO_HOT swap and the 2.2x swell are not built.  0.
+// Gloam / Snuffer: the classes do not exist in config.hml yet.  0.
+let g_aff_cue_built: array<i32> = [ 1,   1,     1,     0,     1,     1,     0,     0];
+
+// --- the 6 px / 60 m THREAT read -------------------------------------------
+//                                    W      M      H      S      Wa     Bu     Gl     Sn
+let g_aff_ext: array<i32> =        [  1,     1,     2,     2,     2,     2,     6,     2];
+let g_aff_ext_ch: array<i32> =     [  1,     1,     1,     1,     1,     1,     5,     1];
+let g_aff_ext_m: array<f64> =      [ 60.0,  60.0,  60.0,  60.0,  60.0,  60.0,  72.0,  60.0];
+// The four BODIED shipped classes already get the dark contact blob every prop
+// gets (CLAUDE.md §9 rule 6, `entity_render.hml` stage 14).  The two UNBODIED
+// shipped classes get that SAME DARK BLOB, which is the wrong sign — they need
+// the inverted additive card and it does not exist.  0.
+let g_aff_ext_built: array<i32> =  [  0,     0,     1,     1,     1,     1,     0,     0];
+
+// The FELT BAND.  A multiplier inside it is not a resistance the player will
+// notice on the first try, so it needs no cue.  Outside it, LAW 3 applies.
+// 0.80 and 1.25 are reciprocal, so the band is symmetric in TTK: a 25 % longer
+// or 20 % shorter kill.  These are pinned literals, not derived, because the
+// whole point of the band is that moving it is a design decision somebody has
+// to make on purpose.
+export let AFF_TELL_LO: f64 = 0.80;
+export let AFF_TELL_HI: f64 = 1.25;
+
+// ===========================================================================
+// 6.  QUERIES
+// ===========================================================================
+
+export fn aff_class_ok(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    let out: i32 = 0;
+    if (c >= 0 && c < AFF_CLASS_COUNT) { out = 1; }
+    return out;
+}
+
+export fn aff_dtype_ok(p_dtype: i32): i32 {
+    let d: i32 = p_dtype;
+    let out: i32 = 0;
+    if (d >= 0 && d < g_DTYPE_COUNT) { out = 1; }
+    return out;
+}
+
+// The affinity class of a `world.model` value.  DOES NOT reuse `combat.hml`'s
+// clamp-to-Husk (see the header): an out-of-range model is AFF_CLS_NONE, which
+// multiplies by 1.00, so an unknown thing takes ordinary damage rather than
+// silently inheriting the bread-and-butter enemy's resistances.
+export fn aff_class_of_model(p_model: i32): i32 {
+    let m: i32 = p_model;
+    if (m < 0 || m >= AFF_CLASS_COUNT) { let none: i32 = AFF_CLS_NONE; return none; }
+    let out: i32 = m;
+    return out;
+}
+
+export fn aff_is_bodied(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let no: i32 = 0; return no; }
+    let out: i32 = g_aff_bodied[c];
+    return out;
+}
+
+// The raw table entry.  AFF_CLS_NONE and any bad index yield 1.00 — a
+// multiplier of 1.00 is the identity and `x * 1.0` is exact in IEEE-754, so the
+// "I do not know what this is" path cannot perturb a measured number.
+export fn aff_base_mult(p_cls: i32, p_dtype: i32): f64 {
+    let c: i32 = p_cls;
+    let d: i32 = p_dtype;
+    if (c < 0 || c >= AFF_CLASS_COUNT) { let one: f64 = 1.0; return one; }
+    if (d < 0 || d >= g_DTYPE_COUNT)   { let one2: f64 = 1.0; return one2; }
+    let out: f64 = g_aff[c * g_DTYPE_COUNT + d];
+    return out;
+}
+
+// The multiplier that reaches HP, given how much pool the target has left.
+// This is the only query `combat.hml` needs for the ordinary case.
+//
+//   p_pool   `world.armor[slot]` — the Warden plate or the Snuffer shell.
+//
+// Only the Snuffer's row is state-dependent.  The Warden's body row is 0.25
+// whether or not its plate is up, because the plate is a POOL, not a modifier.
+export fn aff_body_mult(p_cls: i32, p_dtype: i32, p_pool: i32): f64 {
+    let c: i32 = p_cls;
+    let d: i32 = p_dtype;
+    let pool: i32 = p_pool;
+    if (c == AFF_CLS_SNUFFER) {
+        if (pool > 0) {
+            if (d == g_DTYPE_MAGIC) { let z: f64 = 0.0; return z; }   // STRIP: nothing reaches HP
+            let k: f64 = AFF_SNUFFER_SHELLED_KINETIC;
+            return k;
+        }
+        if (d == g_DTYPE_MAGIC) { let om: f64 = AFF_SNUFFER_OPEN_MAGIC; return om; }
+        let ok2: f64 = AFF_SNUFFER_OPEN_KINETIC;
+        return ok2;
+    }
+    let out: f64 = aff_base_mult(c, d);
+    return out;
+}
+
+// Which pool branch applies.
+//
+//   p_pool         `world.armor[slot]`
+//   p_plate_faces  1 if `combat.hml`'s shipped facing test says this kinetic hit
+//                  is striking the front plate arc and is not a headshot.  Only
+//                  consulted on the kinetic path — light has no arc.
+export fn aff_pool_mode(p_cls: i32, p_dtype: i32, p_pool: i32,
+                        p_plate_faces: i32): i32 {
+    let c: i32 = p_cls;
+    let d: i32 = p_dtype;
+    if (p_pool <= 0) { let none: i32 = AFF_POOL_NONE; return none; }
+    if (c == AFF_CLS_WARDEN) {
+        if (d == g_DTYPE_MAGIC) { let sc: i32 = AFF_POOL_SCOUR; return sc; }
+        if (p_plate_faces == 1) { let pl: i32 = AFF_POOL_PLATE; return pl; }
+        let n2: i32 = AFF_POOL_NONE;
+        return n2;
+    }
+    if (c == AFF_CLS_SNUFFER) {
+        if (d == g_DTYPE_MAGIC) { let st: i32 = AFF_POOL_STRIP; return st; }
+        let n3: i32 = AFF_POOL_NONE;   // lead does not touch the shell; it goes through it at 0.20
+        return n3;
+    }
+    let n4: i32 = AFF_POOL_NONE;
+    return n4;
+}
+
+// What the pool itself takes, per point of incoming damage.
+export fn aff_pool_mult(p_cls: i32, p_dtype: i32): f64 {
+    let c: i32 = p_cls;
+    let d: i32 = p_dtype;
+    if (d != g_DTYPE_MAGIC) { let one: f64 = 1.0; return one; }   // the shipped plate eats full
+    if (c == AFF_CLS_WARDEN)  { let w: f64 = AFF_WARDEN_PLATE_MAGIC; return w; }
+    if (c == AFF_CLS_SNUFFER) { let s: f64 = AFF_SNUFFER_SHELL_MAGIC; return s; }
+    let one2: f64 = 1.0;
+    return one2;
+}
+
+// The pool an enemy class spawns with.  `combat_plate_hp` forwards to this so
+// the two numbers cannot drift.  0 for a class with no pool.
+export fn aff_pool_hp(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (c == AFF_CLS_SNUFFER) { let s: i32 = AFF_SNUFFER_SHELL_HP; return s; }
+    let z: i32 = 0;
+    return z;
+}
+
+// The vulnerability window.  1.00 unless this is MAGIC damage landing on a
+// bodied class that is mid-tell.  Exposed so `spells.hml` can replace its flat
+// class-blind `g_MAGIC_WINDUP_MULT` with the per-class value the design
+// specifies — see the task report; today spells.hml applies 2.00 to everything,
+// which over-rewards a Wisp mid-tell and under-rewards the Spitter sac by 2.5x.
+export fn aff_windup_mult(p_cls: i32, p_dtype: i32, p_in_windup: i32): f64 {
+    let c: i32 = p_cls;
+    if (p_in_windup != 1)          { let one: f64 = 1.0; return one; }
+    if (p_dtype != g_DTYPE_MAGIC)  { let one2: f64 = 1.0; return one2; }
+    if (aff_class_ok(c) == 0)      { let one3: f64 = 1.0; return one3; }
+    let out: f64 = g_aff_windup[c];
+    return out;
+}
+
+// Does this hit need to LOOK resisted?  RULE C (§2.1): the resisted hit looks
+// resisted in the same frame — a half-size UI_DIM number with a small marker, a
+// dim amber flash instead of white, a dull thock instead of the pitched blip.
+// A resisted hit is still a hit; it is a hit that says "wrong hand".
+export fn aff_resisted(p_mult: f64): i32 {
+    let m: f64 = p_mult;
+    let out: i32 = 0;
+    if (m < AFF_TELL_LO) { out = 1; }
+    return out;
+}
+
+// Does this hit need to LOOK vulnerable?
+export fn aff_vulnerable(p_mult: f64): i32 {
+    let m: f64 = p_mult;
+    let out: i32 = 0;
+    if (m > AFF_TELL_HI) { out = 1; }
+    return out;
+}
+
+export fn aff_cue_of(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_CUE_NONE; return z; }
+    let out: i32 = g_aff_cue[c];
+    return out;
+}
+
+export fn aff_cue_channel_of(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_CH_NONE; return z; }
+    let out: i32 = g_aff_cue_ch[c];
+    return out;
+}
+
+export fn aff_cue_range_m(p_cls: i32): f64 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_aff_cue_m[c];
+    return out;
+}
+
+export fn aff_cue_built(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_BUILT_NO; return z; }
+    let out: i32 = g_aff_cue_built[c];
+    return out;
+}
+
+// The 6 px / 60 m extension: the same question, answered by the ground.
+export fn aff_ext_of(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_CUE_NONE; return z; }
+    let out: i32 = g_aff_ext[c];
+    return out;
+}
+
+export fn aff_ext_channel_of(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_CH_NONE; return z; }
+    let out: i32 = g_aff_ext_ch[c];
+    return out;
+}
+
+export fn aff_ext_range_m(p_cls: i32): f64 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: f64 = 0.0; return z; }
+    let out: f64 = g_aff_ext_m[c];
+    return out;
+}
+
+export fn aff_ext_built(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_BUILT_NO; return z; }
+    let out: i32 = g_aff_ext_built[c];
+    return out;
+}
+
+// Does this class's affinity read at 320x240 TODAY, in the shipping build, at
+// both ranges?  This is the question the brief actually asks, and the answer is
+// currently NO for four of eight classes.  Kept separate from the design check
+// on purpose: see the AFF_BUILT_* comment.
+export fn aff_cue_is_built(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let z: i32 = AFF_BUILT_NO; return z; }
+    let out: i32 = 0;
+    if (g_aff_cue_built[c] == AFF_BUILT_YES && g_aff_ext_built[c] == AFF_BUILT_YES) { out = 1; }
+    return out;
+}
+
+// The TTK penalty a solo player pays for using the WORSE hand on this class:
+// best multiplier divided by worst.  LAW 2 caps it at AFF_MAX_TTK_RATIO.
+export fn aff_ttk_ratio(p_cls: i32): f64 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let one: f64 = 1.0; return one; }
+    let a: f64 = g_aff[c * g_DTYPE_COUNT + 0];
+    let b: f64 = g_aff[c * g_DTYPE_COUNT + 1];
+    let hi: f64 = a;
+    let lo: f64 = b;
+    if (b > a) { hi = b; lo = a; }
+    if (lo <= 0.0) { let inf: f64 = 0.0 - 1.0; return inf; }   // -1 => a WALL.  Illegal.
+    let out: f64 = hi / lo;
+    return out;
+}
+
+// The hand a solo player should reach for.  Returns g_DTYPE_KINETIC or
+// g_DTYPE_MAGIC.  This is the answer §2.5's playtest asks a human for, so it is
+// worth having the sim's own opinion on record next to the art's.
+export fn aff_best_hand(p_cls: i32): i32 {
+    let c: i32 = p_cls;
+    if (aff_class_ok(c) == 0) { let k: i32 = g_DTYPE_KINETIC; return k; }
+    let a: f64 = g_aff[c * g_DTYPE_COUNT + 0];
+    let b: f64 = g_aff[c * g_DTYPE_COUNT + 1];
+    let out: i32 = g_DTYPE_KINETIC;
+    if (b > a) { out = g_DTYPE_MAGIC; }
+    return out;
+}
+
+// ===========================================================================
+// 7.  THE CUES, IN WORDS.  Cold path — strings, never called per frame (N3).
+// ===========================================================================
+// This is the paragraph the art task and the render task are held to, and the
+// reason it is in the sim rather than in a document is that a document does not
+// fail a build.  §2.2's cue table, one row per class:
+//
+//  Wisp / Mote  (light-weak, x2.50 / x2.00)
+//      60 px: bright pool under it, NO FEET, sine-bob, violet halo card whose
+//             alpha is its health.
+//      12 px: a pool of light instead of a shadow; drift with no footfall
+//             cadence.
+//       6 px: a violet dot over a BRIGHT smudge on the ground.
+//
+//  Husk / Bulwark  (light-resistant, x0.35 / x0.30)
+//      60 px: dark contact blob, footfalls, earth palette (MUD, GRANITE_LO,
+//             STONE_MID).
+//      12 px: dark blob, walk cycle, wide head:shoulder.
+//       6 px: a violet dot over a DARK smudge.
+//
+//  Spitter  (x0.60 body, x5.00 into the sac)
+//      60 px: the sac emissive switches NS_CORE -> EXPLO_HOT and grows 2.2x for
+//             the 1.4 s charge.
+//      12 px: the warm dot appears and swells — visible because it is a
+//             BRIGHTNESS change, not a shape change.
+//       6 px: the violet dot briefly turns amber.
+//
+//  Warden  (x0.25 body, x2.50 into the plate)
+//      Primary is the bodied ground blob, same as the Husk.  The plate is the
+//      widest silhouette in the game and it glows before the ram, which is a
+//      shipped tell (GAME_DESIGN §2.2) doing a second job.
+//
+//  Gloam  (kinetic x0.15 — the only class in the game that resists LEAD)
+//      THE WORLD CLOSES IN.  Fog draws to 35 % of its distance; your lantern
+//      radius halves.  Screen-wide, so distance does not degrade it.  This is
+//      the only cue in Nightshade that is MORE visible the further away it is,
+//      and it arrives BEFORE the creature does.
+//
+//  Snuffer  (kinetic x0.20 while shelled)
+//      Shelled it has NO CLASS SILHOUETTE AT ALL — a featureless NS_DEEP
+//      lozenge with one violet seam among readable enemies.  "I can't tell what
+//      that is" MEANS "strip it".  Open it is an ordinary humanoid.  The
+//      silhouette change on break is the strongest 320x240 signal available.
+export fn aff_cue_name(p_cue: i32): string {
+    let c: i32 = p_cue;
+    if (c == AFF_CUE_UNBODIED) { return "UNBODIED: the contact card is a pool of LIGHT, no footfall, sine-bob"; }
+    if (c == AFF_CUE_BODIED)   { return "BODIED: a dark contact blob, footfalls, earth palette"; }
+    if (c == AFF_CUE_SAC)      { return "SAC: NS_CORE -> EXPLO_HOT, grows 2.2x for the 1.4 s charge"; }
+    if (c == AFF_CUE_PLATE)    { return "PLATE: the widest silhouette in the game; it glows before the ram"; }
+    if (c == AFF_CUE_SHELL)    { return "SHELL: no class silhouette at all, and a total change on break"; }
+    if (c == AFF_CUE_FOGPULL)  { return "FOGPULL: the world closes in - FOG_FAR x0.35, lantern radius x0.50"; }
+    return "NONE";
+}
+
+export fn aff_channel_name(p_ch: i32): string {
+    let c: i32 = p_ch;
+    if (c == AFF_CH_GROUND)     { return "GROUND (value contrast)"; }
+    if (c == AFF_CH_SILHOUETTE) { return "SILHOUETTE"; }
+    if (c == AFF_CH_MOTION)     { return "MOTION"; }
+    if (c == AFF_CH_EMISSIVE)   { return "EMISSIVE"; }
+    if (c == AFF_CH_WORLD)      { return "WORLD (fog + lantern radius)"; }
+    if (c == AFF_CH_NUMBER)     { return "DAMAGE NUMBER - ILLEGAL AS A PRIMARY CUE"; }
+    return "NONE";
+}
+
+export fn aff_class_name(p_cls: i32): string {
+    let c: i32 = p_cls;
+    if (c == AFF_CLS_WISP)    { return "Wisp"; }
+    if (c == AFF_CLS_MOTE)    { return "Mote"; }
+    if (c == AFF_CLS_HUSK)    { return "Husk"; }
+    if (c == AFF_CLS_SPITTER) { return "Spitter"; }
+    if (c == AFF_CLS_WARDEN)  { return "Warden"; }
+    if (c == AFF_CLS_BULWARK) { return "Bulwark"; }
+    if (c == AFF_CLS_GLOAM)   { return "Gloam"; }
+    if (c == AFF_CLS_SNUFFER) { return "Snuffer"; }
+    return "none";
+}
+
+// ===========================================================================
+// 8.  THE CHECKERS.  Every law above, as a function that returns 0.
+// ===========================================================================
+// Each returns a BITMASK of what failed, so a probe reports which law broke and
+// not merely that one did.  `aff_selfcheck()` ORs them together.
+
+export let AFFCHK_WIDTH: i32   = 1;    // a table is not AFF_CLASS_COUNT wide
+export let AFFCHK_KINETIC: i32 = 2;    // LAW 1: the shipped kinetic column moved
+export let AFFCHK_FLOOR: i32   = 4;    // LAW 2: an entry below AFF_FLOOR_MULT, or zero
+export let AFFCHK_TTK: i32     = 8;    // LAW 2: a TTK ratio above AFF_MAX_TTK_RATIO
+export let AFFCHK_HAND: i32    = 16;   // LAW 2: a class with no un-penalised hand
+export let AFFCHK_CUE: i32     = 32;   // LAW 3: a felt multiplier with no cue
+export let AFFCHK_CHANNEL: i32 = 64;   // LAW 3: a cue on an illegal or unreadable channel
+export let AFFCHK_DTYPE: i32   = 128;  // the delivery-kind map is wrong
+export let AFFCHK_CONFIG: i32  = 256;  // config.hml and this file disagree
+
+// Table widths.
+export fn aff_width_ok(): i32 {
+    let out: i32 = 0;
+    if (g_aff.length != AFF_CLASS_COUNT * g_DTYPE_COUNT) { out = AFFCHK_WIDTH; }
+    if (g_aff_bodied.length != AFF_CLASS_COUNT)   { out = AFFCHK_WIDTH; }
+    if (g_aff_windup.length != AFF_CLASS_COUNT)   { out = AFFCHK_WIDTH; }
+    if (g_aff_cue.length != AFF_CLASS_COUNT)       { out = AFFCHK_WIDTH; }
+    if (g_aff_cue_ch.length != AFF_CLASS_COUNT)    { out = AFFCHK_WIDTH; }
+    if (g_aff_cue_m.length != AFF_CLASS_COUNT)     { out = AFFCHK_WIDTH; }
+    if (g_aff_cue_built.length != AFF_CLASS_COUNT) { out = AFFCHK_WIDTH; }
+    if (g_aff_ext.length != AFF_CLASS_COUNT)       { out = AFFCHK_WIDTH; }
+    if (g_aff_ext_ch.length != AFF_CLASS_COUNT)    { out = AFFCHK_WIDTH; }
+    if (g_aff_ext_m.length != AFF_CLASS_COUNT)     { out = AFFCHK_WIDTH; }
+    if (g_aff_ext_built.length != AFF_CLASS_COUNT) { out = AFFCHK_WIDTH; }
+    if (g_aff_dtype.length != AFF_DMG_KIND_COUNT) { out = AFFCHK_WIDTH; }
+    return out;
+}
+
+// LAW 1, PINNED WITH A LITERAL.  Not `== g_aff[i]`, not `== some_constant` — the
+// literal 1.0, six times, because CLAUDE.md rule 5 was written after enemy caps
+// went mutable with every probe green.  If somebody decides a Husk should
+// resist bullets, they have to come here and delete this, and then explain in a
+// task report why GAME_DESIGN §2.4's measured TTK table is being reopened.
+export fn aff_kinetic_anchor_ok(): i32 {
+    let out: i32 = 0;
+    if (g_aff[0 * 2 + 0] != 1.0) { out = AFFCHK_KINETIC; }   // Wisp
+    if (g_aff[1 * 2 + 0] != 1.0) { out = AFFCHK_KINETIC; }   // Mote
+    if (g_aff[2 * 2 + 0] != 1.0) { out = AFFCHK_KINETIC; }   // Husk
+    if (g_aff[3 * 2 + 0] != 1.0) { out = AFFCHK_KINETIC; }   // Spitter
+    if (g_aff[4 * 2 + 0] != 1.0) { out = AFFCHK_KINETIC; }   // Warden
+    if (g_aff[5 * 2 + 0] != 1.0) { out = AFFCHK_KINETIC; }   // Bulwark
+    return out;
+}
+
+// LAW 2 — the solo law.  Three separate failures, three separate bits.
+export fn aff_solo_ok(): i32 {
+    let out: i32 = 0;
+    let c: i32 = 0;
+    while (c < AFF_CLASS_COUNT) {
+        let k: f64 = g_aff[c * g_DTYPE_COUNT + 0];
+        let m: f64 = g_aff[c * g_DTYPE_COUNT + 1];
+
+        // No immunity.  No wall.  Ever.
+        if (k < AFF_FLOOR_MULT) { out = out | AFFCHK_FLOOR; }
+        if (m < AFF_FLOOR_MULT) { out = out | AFFCHK_FLOOR; }
+
+        // The worst hand is slower, never impossible.  THE PENALTY, not the
+        // hand spread — see the AFF_MAX_TTK_RATIO comment for why the
+        // distinction is load-bearing and where the design conflates them.
+        let d2: i32 = 0;
+        while (d2 < g_DTYPE_COUNT) {
+            let pen: f64 = aff_penalty(c, d2);
+            if (pen < 0.0) { out = out | AFFCHK_TTK; }
+            if (pen > AFF_MAX_TTK_RATIO + 0.000001) { out = out | AFFCHK_TTK; }
+            d2++;
+        }
+
+        // And there is always a hand that is not penalised at all, so "switch
+        // hands" (§5.3 step 1, available from minute one with no unlock) is
+        // ALWAYS a complete answer and never merely a partial one.
+        let best: f64 = k;
+        if (m > best) { best = m; }
+        if (best < AFF_GOOD_HAND_MULT) { out = out | AFFCHK_HAND; }
+
+        c++;
+    }
+    // The state-dependent rows obey the law too.  A shelled Snuffer takes 0.20
+    // from lead — above the floor — and an open one takes 1.00, so "lead only"
+    // is 22 Sparrow rounds and 1.83 s, never a locked door.
+    if (AFF_SNUFFER_SHELLED_KINETIC < AFF_FLOOR_MULT) { out = out | AFFCHK_FLOOR; }
+    if (AFF_SNUFFER_OPEN_MAGIC < AFF_FLOOR_MULT)      { out = out | AFFCHK_FLOOR; }
+    if (AFF_SNUFFER_OPEN_KINETIC < AFF_GOOD_HAND_MULT) { out = out | AFFCHK_HAND; }
+    return out;
+}
+
+// LAW 3 — the perception law.  THE ONE THAT DECIDES WHETHER THIS IS FUN.
+//
+// For every class and every damage type: if the multiplier is outside the felt
+// band, the class must carry a primary cue, and that cue must ride on a channel
+// that survives at 6 px.  A cue on AFF_CH_NUMBER is rejected explicitly — that
+// is the "unexplained damage drop" failure mode, and this is where it becomes a
+// build failure instead of a playtest note.
+export fn aff_cue_ok(): i32 {
+    let out: i32 = 0;
+    let c: i32 = 0;
+    while (c < AFF_CLASS_COUNT) {
+        let felt: i32 = 0;
+        let d: i32 = 0;
+        while (d < g_DTYPE_COUNT) {
+            let m: f64 = g_aff[c * g_DTYPE_COUNT + d];
+            if (m < AFF_TELL_LO || m > AFF_TELL_HI) { felt = 1; }
+            d++;
+        }
+        if (felt == 1) {
+            // The 12 px CLASS read.
+            let cue: i32 = g_aff_cue[c];
+            let ch: i32 = g_aff_cue_ch[c];
+            if (cue == AFF_CUE_NONE) { out = out | AFFCHK_CUE; }
+            if (cue < 0 || cue >= AFF_CUE_COUNT) { out = out | AFFCHK_CUE; }
+            if (ch == AFF_CH_NONE)   { out = out | AFFCHK_CUE; }
+            // THE ILLEGAL CHANNEL.  A damage number is feedback ABOUT the
+            // mistake; it is not information that prevents it.
+            if (ch == AFF_CH_NUMBER) { out = out | AFFCHK_CHANNEL; }
+            if (ch < 0 || ch >= AFF_CH_COUNT) { out = out | AFFCHK_CHANNEL; }
+            if (g_aff_cue_m[c] < 30.0) { out = out | AFFCHK_CHANNEL; }
+
+            // The 6 px THREAT read.  RULE S1: detectable at 60 m.  A cue that
+            // only reads closer than that is a cue you meet after the ambush.
+            let ex: i32 = g_aff_ext[c];
+            let ech: i32 = g_aff_ext_ch[c];
+            if (ex == AFF_CUE_NONE) { out = out | AFFCHK_CUE; }
+            if (ex < 0 || ex >= AFF_CUE_COUNT) { out = out | AFFCHK_CUE; }
+            if (ech == AFF_CH_NUMBER) { out = out | AFFCHK_CHANNEL; }
+            if (ech < 0 || ech >= AFF_CH_COUNT) { out = out | AFFCHK_CHANNEL; }
+            if (ech == AFF_CH_NONE) { out = out | AFFCHK_CHANNEL; }
+            if (g_aff_ext_m[c] < 60.0) { out = out | AFFCHK_CHANNEL; }
+        }
+        c++;
+    }
+    // The Snuffer's SHELLED kinetic row is state-dependent and therefore does
+    // not appear in `g_aff`'s scan above, but it is 0.20 — a felt resistance —
+    // and it is exactly the case the design leans on hardest ("I can't tell
+    // what that is" MEANS "strip it").  Check it by hand.
+    if (AFF_SNUFFER_SHELLED_KINETIC < AFF_TELL_LO) {
+        if (g_aff_cue[AFF_CLS_SNUFFER] == AFF_CUE_NONE) { out = out | AFFCHK_CUE; }
+        if (g_aff_cue_ch[AFF_CLS_SNUFFER] == AFF_CH_NUMBER) { out = out | AFFCHK_CHANNEL; }
+    }
+    return out;
+}
+
+// LAW 3, SECOND HALF: is the specification REALISED?  Returns a bitmask of the
+// CLASS IDS whose cue is designed but not rendering — bit (1 << cls).  This is
+// deliberately NOT folded into `aff_selfcheck()`, because it is not a defect in
+// this module and it must not be silenced by being made to pass: it is a
+// standing, machine-readable statement of exactly which art work is outstanding,
+// and the number it returns today is in the task report.
+//
+// The distinction that matters: `aff_cue_ok()` asks "did somebody think about
+// how the player perceives this?"; `aff_cue_built_ok()` asks "can the player
+// perceive it?".  Shipping with the first green and the second red is a choice
+// somebody has to make out loud.
+export fn aff_cue_built_ok(): i32 {
+    let out: i32 = 0;
+    let c: i32 = 0;
+    while (c < AFF_CLASS_COUNT) {
+        let felt: i32 = 0;
+        let d: i32 = 0;
+        while (d < g_DTYPE_COUNT) {
+            let m: f64 = g_aff[c * g_DTYPE_COUNT + d];
+            if (m < AFF_TELL_LO || m > AFF_TELL_HI) { felt = 1; }
+            d++;
+        }
+        if (c == AFF_CLS_SNUFFER) { felt = 1; }
+        if (felt == 1) {
+            if (aff_cue_is_built(c) == 0) { out = out | (1 << c); }
+        }
+        c++;
+    }
+    return out;
+}
+
+// How many of the eight classes carry an affinity the player can actually see
+// right now.  A single number for a report to quote and for a later wave to
+// watch climb to 8.
+export fn aff_cue_built_count(): i32 {
+    let n: i32 = 0;
+    let c: i32 = 0;
+    while (c < AFF_CLASS_COUNT) {
+        if (aff_cue_is_built(c) == 1) { n++; }
+        c++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// The delivery-kind map.  Everything that existed before the spell school is
+// KINETIC — including DMG_BURN, including the Emberlance — and the three spell
+// kinds are MAGIC.
+export fn aff_dtype_map_ok(): i32 {
+    let out: i32 = 0;
+    if (aff_dtype_of_kind(AFF_DMG_BULLET)    != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_MELEE)     != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_BURN)      != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_EXPLOSION) != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_FALL)      != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_CONTACT)   != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_BURST)     != g_DTYPE_MAGIC)   { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_BEAM)      != g_DTYPE_MAGIC)   { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_LANCE)     != g_DTYPE_MAGIC)   { out = AFFCHK_DTYPE; }
+    // Out of range is KINETIC, never MAGIC.  The failure mode of the wrong
+    // answer must be "no change".
+    if (aff_dtype_of_kind(0 - 1) != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    if (aff_dtype_of_kind(AFF_DMG_KIND_COUNT) != g_DTYPE_KINETIC) { out = AFFCHK_DTYPE; }
+    return out;
+}
+
+// This file's class ids must be config's, and this table must never be
+// NARROWER than config's enum.  Wider is fine and expected — that is the whole
+// forward-compatibility story for the Gloam and the Snuffer.
+export fn aff_config_agrees(): i32 {
+    let out: i32 = 0;
+    if (AFF_CLS_WISP    != g_ENEMY_WISP)    { out = AFFCHK_CONFIG; }
+    if (AFF_CLS_MOTE    != g_ENEMY_MOTE)    { out = AFFCHK_CONFIG; }
+    if (AFF_CLS_HUSK    != g_ENEMY_HUSK)    { out = AFFCHK_CONFIG; }
+    if (AFF_CLS_SPITTER != g_ENEMY_SPITTER) { out = AFFCHK_CONFIG; }
+    if (AFF_CLS_WARDEN  != g_ENEMY_WARDEN)  { out = AFFCHK_CONFIG; }
+    if (AFF_CLS_BULWARK != g_ENEMY_BULWARK) { out = AFFCHK_CONFIG; }
+    if (AFF_CLASS_COUNT < g_ENEMY_KIND_COUNT) { out = AFFCHK_CONFIG; }
+    if (g_DTYPE_KINETIC != 0) { out = AFFCHK_CONFIG; }
+    if (g_DTYPE_MAGIC != 1)   { out = AFFCHK_CONFIG; }
+    if (g_DTYPE_COUNT != 2)   { out = AFFCHK_CONFIG; }
+    return out;
+}
+
+// `combat.hml` calls this with ITS OWN literals, so the two copies of the
+// delivery-kind ids cannot drift apart without a probe going red.
+export fn aff_kind_ids_ok(p_bullet: i32, p_melee: i32, p_burn: i32,
+                          p_explosion: i32, p_fall: i32, p_contact: i32,
+                          p_count: i32): i32 {
+    let out: i32 = 0;
+    if (p_bullet != AFF_DMG_BULLET)       { out = AFFCHK_DTYPE; }
+    if (p_melee != AFF_DMG_MELEE)         { out = AFFCHK_DTYPE; }
+    if (p_burn != AFF_DMG_BURN)           { out = AFFCHK_DTYPE; }
+    if (p_explosion != AFF_DMG_EXPLOSION) { out = AFFCHK_DTYPE; }
+    if (p_fall != AFF_DMG_FALL)           { out = AFFCHK_DTYPE; }
+    if (p_contact != AFF_DMG_CONTACT)     { out = AFFCHK_DTYPE; }
+    if (p_count > AFF_DMG_KIND_COUNT)     { out = AFFCHK_DTYPE; }
+    return out;
+}
+
+// Everything, ORed.  0 is the only acceptable answer.
+export fn aff_selfcheck(): i32 {
+    let out: i32 = 0;
+    out = out | aff_width_ok();
+    out = out | aff_kinetic_anchor_ok();
+    out = out | aff_solo_ok();
+    out = out | aff_cue_ok();
+    out = out | aff_dtype_map_ok();
+    out = out | aff_config_agrees();
+    return out;
+}

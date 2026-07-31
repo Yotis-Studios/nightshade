@@ -1,0 +1,816 @@
+// ===========================================================================
+// nightshade/tools/spellfx_shot.hml — LOOK AT THE SPELLS          (spell-fx)
+// ===========================================================================
+//
+//   hemlockc -O1 tools/spellfx_shot.hml -o /tmp/spellfx
+//   DISPLAY=:0 /tmp/spellfx --sheet /tmp/spells.png
+//   DISPLAY=:0 /tmp/spellfx --scene heal --tod 22 --out /tmp/heal_night.png
+//   DISPLAY=:0 /tmp/spellfx --list
+//
+// WHY THIS FILE EXISTS.  CLAUDE.md rule 8: "LOOK at every frame you change — a
+// number saying 'fixed' while the picture is wrong is not fixed."  The spell FX
+// have no call site in the shipping game yet (`main.hml` is not this task's file
+// and does not know the school exists), so without this harness the only thing
+// anybody could look at is the 16x16 atlas cells — and the whole brief is about
+// what they look like AT 320x240 IN A SCENE, at night and in daylight.
+//
+// ⚠ RENDER WITH DISPLAY=:0.  Under `SDL_VIDEODRIVER=dummy` SDL picks the
+// SOFTWARE renderer, which collapses BLEND_ADD to BLEND inside
+// SDL_RenderGeometry — every additive FX pixel in this project is meaningless
+// under it.  `fxgen.hml` says the same thing about its own measurements.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS HARNESS IS AND IS NOT
+// ---------------------------------------------------------------------------
+// IS: the real frame graph (`src/render/world_render.hml`), the real art
+// (palette, tod, texgen, skygen, fxgen, meshgen), the real additive atlas
+// through the real `fx_emit`, the real ToD at a real hour, and the real spell
+// FX layer driven at a real 1/60 s timestep.  Every pixel of the effects comes
+// from `src/art/fxgen.hml` and `src/render/fx.hml` and nothing here fakes any
+// of it.
+//
+// IS NOT: `tools/shot.hml`.  That file is the project's primary visual
+// instrument and owns the scene registry, the eight critic scenes, the props,
+// the structures, the HUD and the stats contract.  This is a much smaller
+// thing — grass, a hill, a lantern-lit night, and one spell going off — and it
+// exists because this task may not edit `shot.hml`.  When the spell FX get a
+// call site in `main.hml`, the right home for these scenes is `shot.hml`'s
+// registry and this file should be deleted.
+//
+// DETERMINISTIC: no wall clock reaches any decision.  The camera, the terrain
+// seed and the spell timeline are all fixed, `tod_reset()` runs before every
+// evaluation, and `fx_spell_update` is stepped with a literal dt.  The same
+// command produces byte-identical PNG bytes; `--selftest` proves it.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+import { make_dirs } from "@stdlib/fs";
+import { sin, cos, sqrt, divi } from "@stdlib/math";
+
+import { window_open_ex, window_close, sdl_error, BLEND_BLEND, BLEND_ADD }
+       from "../../wobbleweed/src/sdl.hml";
+import { target_new, target_free, target_set_shake, target_set_border }
+       from "../../wobbleweed/src/target.hml";
+import { write_png } from "../../wobbleweed/src/png.hml";
+import { emit_set_env } from "../../wobbleweed/src/emit.hml";
+import { env_set_camera, env_set_fog, env_set_mist, env_field,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z, ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_FOG_NEAR, ENV_FOG_FAR, ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_FOG_ALPHA_MAX }
+       from "../../wobbleweed/src/shade.hml";
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_quad, mesh_end, mesh_bake_light }
+       from "../../wobbleweed/src/mesh.hml";
+import { atlas_new, atlas_cell_uv, atlas_upload }
+       from "../../wobbleweed/src/atlas.hml";
+import { stat_get, STAT_TRIS_FX, STAT_TRIS_WORLD, STAT_DRAW_CALLS }
+       from "../../wobbleweed/src/stats.hml";
+
+import { g_RES_W, g_RES_H, g_FOG_FAR_CAP, g_MIST_HEIGHT,
+         g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS }
+       from "../src/core/config.hml";
+
+import { pal_r, pal_g, pal_b,
+         g_NS_CORE, g_NS_MID, g_NS_HALO, g_VENOM, g_VENOM_HALO,
+         g_MUZZLE_CORE, g_EMBER, g_UI_BLACK, g_LIGHTNING, g_WINDOW_LIGHT,
+         g_GRASS_MID, g_GRASS_LO }
+       from "../src/art/palette.hml";
+
+import { tod_eval, tod_reset, tod_set_weather, tod_set_mist_band,
+         tod_sky_keys, WX_CLEAR,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R,
+         TODSKY_STAR_ALPHA, TODSKY_HALO, TODSKY_BODY_X, TODSKY_CLOUD_COVER,
+         TODSKY_COUNT }
+       from "../src/art/tod.hml";
+
+import { texgen_build_world_atlas, CELL_GRASS_A, CELL_GRASS_B }
+       from "../src/art/texgen.hml";
+
+import { fxgen_build_atlas,
+         FX_GLOW_L, FX_EMBER, FX_EXPLO_0,
+         FX_MEND_RING, FX_MEND_MOTE, FX_CLOAK_0, FX_CLOAK_1,
+         FX_FLARE_0, FX_BOLT_HEAD, FX_BEAM_SEG, FX_LANCE_CORE,
+         FX_KINDLE_POOL, FX_SIGIL }
+       from "../src/art/fxgen.hml";
+
+import { hudgen_build_atlas, hudgen_uv, HUD_SOLID }
+       from "../src/art/hudgen.hml";
+
+import { skygen_init, skygen_keys_new, skygen_keys_default, skygen_set_keys,
+         skygen_set_clock, skygen_mark_dirty, skygen_dirty_rows,
+         skygen_rebake_slice, skygen_atlas, skygen_build,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER }
+       from "../src/art/skygen.hml";
+
+import { meshgen_build_all, meshgen_mesh, meshgen_set_material_uv,
+         meshgen_bake_all, meshgen_set_sun_azimuth,
+         MESH_BLOB, MESH_LANTERN_VM,
+         MG_MAT_BARK, MG_MAT_LEAF, MG_MAT_STONE, MG_MAT_WOOD, MG_MAT_METAL,
+         MG_MAT_CONCRETE, MG_MAT_CLOTH, MG_MAT_HIDE, MG_MAT_DIRT, MG_MAT_GLASS }
+       from "../src/art/meshgen.hml";
+
+// --- the frame graph -------------------------------------------------------
+import { frame_init, frame_render, frame_present, frame_begin,
+         frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
+         frame_set_camera, frame_set_clear, frame_set_options,
+         frame_set_capture, frame_set_hud_solid_uv,
+         frame_set_vignette_colour, frame_set_flash_colour,
+         frame_set_sheet_clear, frame_env,
+         frame_lights_reset, frame_light_add,
+         world_clear, world_chunk_add, world_chunk_count, world_chunk_mesh }
+       from "../src/render/world_render.hml";
+import { terrain_set, terrain_h } from "../src/render/terrain_render.hml";
+
+// --- the thing under test --------------------------------------------------
+import { fx_spell_bind_cells, fx_spell_bind_tints, fx_spell_reset,
+         fx_spell_update, fx_spell_emit, fx_spell_live, fx_spell_sprites,
+         fx_spell_dropped, fx_spell_unbound,
+         fx_spell_heal, fx_spell_flare, fx_spell_blast, fx_spell_lance,
+         fx_spell_sigil, fx_spell_trail,
+         fx_spell_cloak_now, fx_spell_beam_now, fx_spell_pool_now,
+         fx_spell_bolt_now, fx_spell_windup_now,
+         g_FXSC_COUNT, g_FXST_COUNT,
+         g_FXSC_MEND_RING, g_FXSC_MEND_MOTE, g_FXSC_CLOAK_0, g_FXSC_CLOAK_1,
+         g_FXSC_FLARE_0, g_FXSC_BOLT_HEAD, g_FXSC_BEAM_SEG, g_FXSC_LANCE,
+         g_FXSC_KINDLE_POOL, g_FXSC_SIGIL, g_FXSC_EXPLO_0, g_FXSC_EMBER,
+         g_FXST_MEND, g_FXST_MEND_DEEP, g_FXST_MAGIC, g_FXST_MAGIC_DEEP,
+         g_FXST_CLOAK, g_FXST_FIRE, g_FXST_FIRE_DEEP }
+       from "../src/render/fx.hml";
+
+// ===========================================================================
+// 0. COMPILED ONLY
+// ===========================================================================
+// Same test shot.hml uses: interpreted, argv[0] is the .hml source path.
+fn running_interpreted(): i32 {
+    if (args.length < 1) { let no: i32 = 0; return no; }
+    let a0: string = args[0];
+    let n: i32 = 0;
+    if (a0.ends_with(".hml")) { n = 1; }
+    let out: i32 = n;
+    return out;
+}
+
+fn num_or(p_s: string, p_d: f64): f64 {
+    let s: string = p_s;
+    if (s.length == 0) { let d: f64 = p_d; return d; }
+    let neg: f64 = 1.0;
+    let i: i32 = 0;
+    if (s.slice(0, 1) == "-") { neg = 0.0 - 1.0; i = 1; }
+    let whole: f64 = 0.0;
+    let frac: f64 = 0.0;
+    let scale: f64 = 1.0;
+    let dot: i32 = 0;
+    let any: i32 = 0;
+    while (i < s.length) {
+        let c: string = s.slice(i, i + 1);
+        if (c == ".") { dot = 1; i++; continue; }
+        let d: i32 = 0 - 1;
+        if (c == "0") { d = 0; } if (c == "1") { d = 1; } if (c == "2") { d = 2; }
+        if (c == "3") { d = 3; } if (c == "4") { d = 4; } if (c == "5") { d = 5; }
+        if (c == "6") { d = 6; } if (c == "7") { d = 7; } if (c == "8") { d = 8; }
+        if (c == "9") { d = 9; }
+        if (d < 0) { let bad: f64 = p_d; return bad; }
+        any = 1;
+        if (dot == 0) { whole = whole * 10.0 + f64(d); }
+        else { scale = scale * 0.1; frac = frac + f64(d) * scale; }
+        i++;
+    }
+    if (any == 0) { let d2: f64 = p_d; return d2; }
+    let out: f64 = neg * (whole + frac);
+    return out;
+}
+
+// ===========================================================================
+// 1. state
+// ===========================================================================
+
+let g_SEED: i32 = 20260730;
+let g_RIDGE: f64 = 0.35;
+let g_CHUNK_Q: i32 = 8;
+let g_QUAD_M: f64 = 4.0;
+let g_CHUNK_M: f64 = 32.0;
+let g_DT: f64 = 0.016666666666666666;      // one 60 Hz tick, a literal
+
+let g_win = null;
+let g_target = null;
+let g_fb: ptr = alloc(320 * 240 * 4);
+
+let g_atlas_world = null;
+let g_atlas_fx = null;
+let g_atlas_hud = null;
+let g_tex_world = null;
+let g_tex_fx = null;
+let g_tex_hud = null;
+let g_tex_sky = null;
+
+let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];
+let g_todsky: array<f64> = [];
+let g_skyk: array<f64> = [];
+
+// the camera looks at the effect from 5.2 m away, eye height 1.7 m
+let g_camx: f64 = 0.0;
+let g_camy: f64 = 0.0;
+let g_camz: f64 = 5.2;   // yaw 0 looks down -Z (view.hml), so stand +Z of it
+let g_yaw: f64 = 0.0;
+let g_pitch: f64 = 0.0 - 4.0;
+let g_fov: f64 = 70.0;
+let g_ground_y: f64 = 0.0;
+
+// the effect happens here
+let g_fxx: f64 = 0.0;
+let g_fxz: f64 = 0.0;
+let g_fxy: f64 = 0.0;
+
+// ===========================================================================
+// 2. the scene table
+// ===========================================================================
+// name, what it drives, the FRAME of the effect's life the shot is taken at.
+// The frame numbers are chosen per effect so the picture is the moment the
+// player would actually be looking at, not an arbitrary t=0.
+
+let g_sc_name: array<string> = [
+    "heal", "flare", "blast", "cloak", "beam", "lance", "pool", "bolt", "windup"
+];
+let g_sc_frame: array<i32> = [22, 8, 10, 30, 30, 4, 40, 22, 40];
+let g_sc_desc: array<string> = [
+    "MEND — the closing green ring and its rising motes",
+    "FLARE — the 360 degree violet burst, mid-expansion",
+    "EMBERLANCE — the fire blast detonation (ORANGE, not violet)",
+    "GUTTERING — the cloak shimmer.  It is SUPPOSED to be dim.",
+    "SHUTTER — the sustained violet beam",
+    "LANCE — the instant blade plus its muzzle sigil",
+    "KINDLING — the placed pool.  A BOUNDARY, not a light source.",
+    "EMBERLANCE — the bolt in flight with its comet trail",
+    "the channel wind-up: a sigil that grows, motes coming in"
+];
+
+fn scene_count(): i32 { let out: i32 = g_sc_name.length; return out; }
+
+fn scene_index(p_n: string): i32 {
+    for (let i = 0; i < scene_count(); i++) {
+        if (g_sc_name[i] == p_n) { let out: i32 = i; return out; }
+    }
+    let bad: i32 = 0 - 1;
+    return bad;
+}
+
+// ===========================================================================
+// 3. art
+// ===========================================================================
+
+fn art_bind_materials() {
+    let pairs: array<i32> = [
+        MG_MAT_BARK, 18, MG_MAT_LEAF, 20, MG_MAT_STONE, 8,
+        MG_MAT_WOOD, 16, MG_MAT_METAL, 27, MG_MAT_CONCRETE, 24,
+        MG_MAT_CLOTH, 35, MG_MAT_HIDE, 17, MG_MAT_DIRT, 3,
+        MG_MAT_GLASS, 38
+    ];
+    for (let i = 0; i < pairs.length; i = i + 2) {
+        atlas_cell_uv(g_atlas_world, pairs[i + 1], g_uvq, 0);
+        meshgen_set_material_uv(pairs[i], g_uvq[0], g_uvq[1], g_uvq[2], g_uvq[3]);
+    }
+}
+
+fn art_build(p_win) {
+    g_atlas_world = atlas_new(g_ATLAS_WORLD_PX, g_ATLAS_WORLD_PX,
+                              g_ATLAS_WORLD_CELLS, g_ATLAS_WORLD_CELLS);
+    texgen_build_world_atlas(g_atlas_world, 1337);
+    g_atlas_fx = fxgen_build_atlas();
+    g_atlas_hud = hudgen_build_atlas();
+    hudgen_uv(HUD_SOLID, g_uvw, 0);
+    art_bind_materials();
+    meshgen_build_all();
+    skygen_init();
+    skygen_set_clock(0.0);
+    g_skyk = skygen_keys_new();
+    skygen_keys_default(g_skyk);
+    while (g_todsky.length < TODSKY_COUNT) { g_todsky.push(0.0); }
+    g_tex_world = atlas_upload(p_win, g_atlas_world, BLEND_BLEND);
+    g_tex_fx = atlas_upload(p_win, g_atlas_fx, BLEND_ADD);
+    g_tex_hud = atlas_upload(p_win, g_atlas_hud, BLEND_BLEND);
+    g_tex_sky = skygen_build(p_win);
+}
+
+// The whole binding the game layer will one day do in `main.hml`, done here so
+// that binding is exercised rather than assumed.  This is the ONLY place in
+// this file that knows an fxgen cell number, which is the point of the
+// indirection (see fx.hml §4).
+fn spell_bind() {
+    let cells: array<i32> = [];
+    while (cells.length < g_FXSC_COUNT) { cells.push(0 - 1); }
+    cells[g_FXSC_MEND_RING] = FX_MEND_RING;
+    cells[g_FXSC_MEND_MOTE] = FX_MEND_MOTE;
+    cells[g_FXSC_CLOAK_0] = FX_CLOAK_0;
+    cells[g_FXSC_CLOAK_1] = FX_CLOAK_1;
+    cells[g_FXSC_FLARE_0] = FX_FLARE_0;
+    cells[g_FXSC_BOLT_HEAD] = FX_BOLT_HEAD;
+    cells[g_FXSC_BEAM_SEG] = FX_BEAM_SEG;
+    cells[g_FXSC_LANCE] = FX_LANCE_CORE;
+    cells[g_FXSC_KINDLE_POOL] = FX_KINDLE_POOL;
+    cells[g_FXSC_SIGIL] = FX_SIGIL;
+    cells[g_FXSC_EXPLO_0] = FX_EXPLO_0;
+    cells[g_FXSC_EMBER] = FX_EMBER;
+    fx_spell_bind_cells(cells);
+
+    let tints: array<i32> = [];
+    while (tints.length < g_FXST_COUNT) { tints.push(16777215); }
+    tints[g_FXST_MEND] = g_VENOM_HALO;
+    tints[g_FXST_MEND_DEEP] = g_VENOM;
+    tints[g_FXST_MAGIC] = g_NS_HALO;
+    tints[g_FXST_MAGIC_DEEP] = g_NS_CORE;
+    tints[g_FXST_CLOAK] = g_NS_CORE;
+    tints[g_FXST_FIRE] = g_MUZZLE_CORE;
+    tints[g_FXST_FIRE_DEEP] = g_EMBER;
+    fx_spell_bind_tints(tints);
+}
+
+// ===========================================================================
+// 4. the world — grass, a hill, nothing else
+// ===========================================================================
+
+fn ground_cell(p_x: f64, p_z: f64): i32 {
+    let s: i32 = 0;
+    if (p_x + p_z > 0.0) { s = 1; }
+    let hx: i32 = i32(p_x * 0.25) + i32(p_z * 0.37) + s;
+    if ((hx & 1) == 0) { let a: i32 = CELL_GRASS_A; return a; }
+    let b: i32 = CELL_GRASS_B;
+    return b;
+}
+
+fn chunk_build(p_cx: i32, p_cz: i32) {
+    let q: i32 = g_CHUNK_Q;
+    let m = mesh_new(q * q * 2 + 4);
+    mesh_begin(m);
+    let ox: f64 = f64(p_cx) * g_CHUNK_M;
+    let oz: f64 = f64(p_cz) * g_CHUNK_M;
+    let gr: i32 = pal_r(g_GRASS_MID); let gg: i32 = pal_g(g_GRASS_MID);
+    let gb: i32 = pal_b(g_GRASS_MID);
+    let lr: i32 = pal_r(g_GRASS_LO); let lg: i32 = pal_g(g_GRASS_LO);
+    let lb: i32 = pal_b(g_GRASS_LO);
+    for (let j = 0; j < q; j++) {
+        for (let i = 0; i < q; i++) {
+            let x0: f64 = ox + f64(i) * g_QUAD_M;
+            let z0: f64 = oz + f64(j) * g_QUAD_M;
+            let x1: f64 = x0 + g_QUAD_M;
+            let z1: f64 = z0 + g_QUAD_M;
+            atlas_cell_uv(g_atlas_world, ground_cell(x0, z0), g_uvq, 0);
+            let u0: f64 = g_uvq[0]; let v0: f64 = g_uvq[1];
+            let u1: f64 = g_uvq[2]; let v1: f64 = g_uvq[3];
+            let nx0: f64 = terrain_h(x0 - 1.0, z0) - terrain_h(x0 + 1.0, z0);
+            let nz0: f64 = terrain_h(x0, z0 - 1.0) - terrain_h(x0, z0 + 1.0);
+            let nx1: f64 = terrain_h(x1 - 1.0, z1) - terrain_h(x1 + 1.0, z1);
+            let nz1: f64 = terrain_h(x1, z1 - 1.0) - terrain_h(x1, z1 + 1.0);
+            let dk: i32 = (i + j) & 1;
+            let cr: i32 = gr; let cg: i32 = gg; let cb: i32 = gb;
+            if (dk == 1) { cr = lr; cg = lg; cb = lb; }
+            let a = mesh_vert_n(m, x0 - ox, terrain_h(x0, z0), z0 - oz, u0, v0,
+                                cr, cg, cb, nx0, 2.0, nz0);
+            let b = mesh_vert_n(m, x1 - ox, terrain_h(x1, z0), z0 - oz, u1, v0,
+                                cr, cg, cb, nx1, 2.0, nz0);
+            let c = mesh_vert_n(m, x1 - ox, terrain_h(x1, z1), z1 - oz, u1, v1,
+                                cr, cg, cb, nx1, 2.0, nz1);
+            let d = mesh_vert_n(m, x0 - ox, terrain_h(x0, z1), z1 - oz, u0, v1,
+                                cr, cg, cb, nx0, 2.0, nz1);
+            mesh_quad(m, a, b, c, d);
+        }
+    }
+    mesh_end(m);
+    world_chunk_add(m, ox, oz,
+                    ox + g_CHUNK_M * 0.5,
+                    terrain_h(ox + g_CHUNK_M * 0.5, oz + g_CHUNK_M * 0.5),
+                    oz + g_CHUNK_M * 0.5,
+                    g_CHUNK_M * 0.78 + 9.0);
+}
+
+fn world_build() {
+    world_clear();
+    for (let cz = 0 - 2; cz <= 1; cz++) {
+        for (let cx = 0 - 2; cx <= 1; cx++) { chunk_build(cx, cz); }
+    }
+}
+
+fn bake_all() {
+    let env: array<f64> = frame_env();
+    let lx: f64 = env_field(env, ENV_SUN_X);
+    let ly: f64 = env_field(env, ENV_SUN_Y);
+    let lz: f64 = env_field(env, ENV_SUN_Z);
+    let sr: f64 = env_field(env, ENV_SUN_R); let sg: f64 = env_field(env, ENV_SUN_G);
+    let sb: f64 = env_field(env, ENV_SUN_B);
+    let ar: f64 = env_field(env, ENV_AMB_R); let ag: f64 = env_field(env, ENV_AMB_G);
+    let ab: f64 = env_field(env, ENV_AMB_B);
+    let br: f64 = env_field(env, ENV_BOUNCE_R); let bg: f64 = env_field(env, ENV_BOUNCE_G);
+    let bb: f64 = env_field(env, ENV_BOUNCE_B);
+    let n: i32 = world_chunk_count();
+    for (let i = 0; i < n; i++) {
+        mesh_bake_light(world_chunk_mesh(i), lx, ly, lz,
+                        sr, sg, sb, ar, ag, ab, br, bg, bb);
+    }
+    meshgen_set_sun_azimuth(lx, lz);
+    meshgen_bake_all(lx, ly, lz, sr, sg, sb, ar, ag, ab, br, bg, bb);
+}
+
+// ===========================================================================
+// 5. time of day — the same stage-6/7 the harness owns in shot.hml
+// ===========================================================================
+
+fn clamp01(p_v: f64): f64 {
+    let v: f64 = p_v;
+    if (v < 0.0) { let a: f64 = 0.0; return a; }
+    if (v > 1.0) { let b: f64 = 1.0; return b; }
+    let out: f64 = v;
+    return out;
+}
+
+// The day fraction whose clock reads `p_h` hours. tod.hml's mapping starts the
+// cycle at 05:30, exactly as shot.hml's `tod_t_from_hours` does; this is the
+// same bisection, kept short.
+fn hours_of(p_t: f64): f64 {
+    let h: f64 = 5.5 + p_t * 24.0;
+    let out: f64 = h;
+    return out;
+}
+fn t_from_hours(p_h: f64): f64 {
+    let want: f64 = p_h;
+    while (want >= 24.0) { want = want - 24.0; }
+    if (want < 5.5) { want = want + 24.0; }
+    let out: f64 = (want - 5.5) / 24.0;
+    return out;
+}
+
+fn tod_apply(p_hours: f64) {
+    let env: array<f64> = frame_env();
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
+    let t: f64 = t_from_hours(p_hours);
+    tod_eval(env, t, WX_CLEAR);
+    env_set_camera(env, g_camx, g_camy, g_camz);
+    let fnear: f64 = env_field(env, ENV_FOG_NEAR);
+    let ffar: f64 = env_field(env, ENV_FOG_FAR);
+    if (ffar > g_FOG_FAR_CAP) { ffar = g_FOG_FAR_CAP; }
+    if (fnear > ffar - 4.0) { fnear = ffar - 4.0; }
+    env_set_fog(env, fnear, ffar,
+                env_field(env, ENV_FOG_R), env_field(env, ENV_FOG_G),
+                env_field(env, ENV_FOG_B), env_field(env, ENV_FOG_ALPHA_MAX));
+
+    // the tod <-> skygen unit bridge shot.hml documents: tod hands out 0..1,
+    // skygen wants 0..255.  Not this task's modules; scaled here and flagged.
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+    skygen_set_clock(t);
+}
+
+// ===========================================================================
+// 6. the spell timeline
+// ---------------------------------------------------------------------------
+// One scene = one effect run from t=0 for `frames` sixtieths of a second.  The
+// RETAINED effects are spawned once at frame 0; the IMMEDIATE ones are called
+// every frame, exactly as the game layer will.
+// ===========================================================================
+
+fn spell_spawn(p_si: i32) {
+    let x: f64 = g_fxx;
+    let z: f64 = g_fxz;
+    let y: f64 = g_fxy;
+    let n: string = g_sc_name[p_si];
+    if (n == "heal") { fx_spell_heal(x, y + 0.10, z); }
+    if (n == "flare") { fx_spell_flare(x, y + 1.10, z, 6.0); }
+    if (n == "blast") { fx_spell_blast(x, y + 1.00, z, 3.5); }
+    if (n == "lance") {
+        // eye -> 24 m downrange, which is the Lance's own reach
+        fx_spell_lance(g_camx + 0.35, g_camy - 0.18, g_camz - 0.6,
+                       x, y + 1.30, z - 18.0);
+    }
+}
+
+fn spell_frame(p_si: i32, p_f: i32) {
+    let x: f64 = g_fxx;
+    let z: f64 = g_fxz;
+    let y: f64 = g_fxy;
+    let n: string = g_sc_name[p_si];
+    let ff: f64 = f64(p_f) * g_DT;
+    if (n == "cloak") { fx_spell_cloak_now(x, y, z, 0.8); }
+    if (n == "beam") {
+        fx_spell_beam_now(g_camx + 0.35, g_camy - 0.18, g_camz - 0.6,
+                          x, y + 1.35, z - 8.0, 0.85);
+    }
+    if (n == "pool") { fx_spell_pool_now(x, y, z, 3.0, 0.9); }
+    if (n == "bolt") {
+        // the bolt travels away from the camera at 22 m/s, laying trail nodes
+        // The bolt flies ACROSS the view, not straight down the barrel.  A
+        // projectile receding along the camera axis hides its own trail behind
+        // its own head, which is a composition problem, not an FX one — the
+        // player who fires one is normally strafing or leading a target.
+        let d: f64 = 1.2 + 12.0 * ff;
+        let bz: f64 = g_camz - d;
+        let bx: f64 = g_camx + 0.20 - 0.34 * d;
+        let by: f64 = g_camy - 0.10 + 0.02 * d;
+        fx_spell_bolt_now(bx, by, bz);
+        fx_spell_trail(bx, by, bz);
+    }
+    if (n == "windup") {
+        let fr: f64 = clamp01(ff / 1.2);
+        fx_spell_windup_now(g_camx + 0.55, g_camy - 0.30, g_camz - 1.05, fr, 0);
+    }
+}
+
+// ===========================================================================
+// 7. render one scene
+// ===========================================================================
+
+fn framebuffer_to_rgb(): buffer {
+    let w: i32 = g_RES_W;
+    let h: i32 = g_RES_H;
+    let out: buffer = buffer(w * h * 3);
+    let op: ptr = buffer_ptr(out);
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            let si: i32 = (y * w + x) * 4;
+            let di: i32 = (y * w + x) * 3;
+            ptr_write_u8(ptr_offset(op, di, 1), ptr_deref_u8(ptr_offset(g_fb, si + 2, 1)));
+            ptr_write_u8(ptr_offset(op, di + 1, 1), ptr_deref_u8(ptr_offset(g_fb, si + 1, 1)));
+            ptr_write_u8(ptr_offset(op, di + 2, 1), ptr_deref_u8(ptr_offset(g_fb, si, 1)));
+        }
+    }
+    let r: buffer = out;
+    return r;
+}
+
+let g_last_fx_tris: i32 = 0;
+let g_last_sprites: i32 = 0;
+
+// Runs the whole timeline and leaves the final frame in g_fb.
+fn render_scene(p_si: i32, p_hours: f64) {
+    terrain_set(g_SEED, g_RIDGE);
+    g_ground_y = terrain_h(g_camx, g_camz);
+    g_camy = g_ground_y + 1.70;
+    g_fxy = terrain_h(g_fxx, g_fxz);
+
+    tod_apply(p_hours);
+    emit_set_env(frame_env());
+    world_build();
+    bake_all();
+
+    // At night the lamplighter is carrying a lit lantern, and the night model
+    // wants that light to exist: an FX card is not a light source (fx.hml §4)
+    // and a night frame with no dynamic light at all is not the frame the
+    // player will see.
+    frame_lights_reset();
+    if (p_hours >= 19.0 || p_hours < 6.0) {
+        frame_light_add(g_camx + 0.35, g_camy - 0.25, g_camz - 0.55,
+                        f64(pal_r(g_WINDOW_LIGHT)) / 255.0,
+                        f64(pal_g(g_WINDOW_LIGHT)) / 255.0,
+                        f64(pal_b(g_WINDOW_LIGHT)) / 255.0,
+                        8.5);
+    }
+
+    fx_spell_reset();
+    let frames: i32 = g_sc_frame[p_si];
+    spell_spawn(p_si);
+
+    // Step the timeline. Only the LAST iteration renders — the earlier ones
+    // exist so the effect is photographed at the age the table asks for, and
+    // so `fx_spell_update`'s retirement path is actually exercised.
+    for (let f = 0; f <= frames; f++) {
+        if (f > 0) { fx_spell_update(g_DT); }
+        // The IMMEDIATE emitters must run on every step, not only on the frame
+        // that renders: `fx_spell_trail` lays one retained node per call and a
+        // comet with one node is a dot.  Their sprite pushes on non-rendering
+        // steps are thrown away by the `world_clear` below, so this is free.
+        if (f < frames) { spell_frame(p_si, f); continue; }
+
+        frame_begin();
+        tod_apply(p_hours);
+        emit_set_env(frame_env());
+        skygen_mark_dirty();
+        while (skygen_dirty_rows() > 0) { skygen_rebake_slice(); }
+
+        world_clear();
+        world_build();
+        bake_all();
+        spell_frame(p_si, f);
+        fx_spell_emit();
+
+        frame_set_camera(g_camx, g_camy, g_camz, g_yaw, g_pitch, g_fov);
+        frame_set_clear(g_skyk[SKYK_ZEN], g_skyk[SKYK_ZEN + 1], g_skyk[SKYK_ZEN + 2]);
+        frame_set_options(0, 1, 0);
+        frame_render();
+        frame_present();
+        g_last_fx_tris = stat_get(STAT_TRIS_FX);
+        g_last_sprites = fx_spell_sprites();
+    }
+}
+
+// ===========================================================================
+// 8. output
+// ===========================================================================
+
+fn shot_one(p_si: i32, p_hours: f64, p_path: string) {
+    render_scene(p_si, p_hours);
+    let img: buffer = framebuffer_to_rgb();
+    write_png(p_path, img, g_RES_W, g_RES_H);
+    print(`${g_sc_name[p_si]} @ ${p_hours}h -> ${p_path}  fx_tris=${g_last_fx_tris} spell_sprites=${g_last_sprites} dropped=${fx_spell_dropped()} unbound=${fx_spell_unbound()}`);
+}
+
+// The contact sheet: every scene at night and in daylight, tiled at NATIVE
+// 320x240 so the thing being judged is exactly the thing the player sees.
+// Columns are scenes, rows are (night, day).
+fn sheet(p_path: string) {
+    let n: i32 = scene_count();
+    let cols: i32 = 3;
+    let rows: i32 = 0;
+    let per: i32 = n;
+    rows = divi(per + cols - 1, cols) * 2;
+    let W: i32 = cols * g_RES_W;
+    let H: i32 = rows * g_RES_H;
+    let out: buffer = buffer(W * H * 3);
+    let op: ptr = buffer_ptr(out);
+    for (let i = 0; i < W * H * 3; i++) { ptr_write_u8(ptr_offset(op, i, 1), 0); }
+    for (let s = 0; s < n; s++) {
+        for (let d = 0; d < 2; d++) {
+            let hours: f64 = 22.0;
+            if (d == 1) { hours = 12.0; }
+            render_scene(s, hours);
+            let bandrow: i32 = divi(s, cols) * 2 + d;
+            let col: i32 = s % cols;
+            let x0: i32 = col * g_RES_W;
+            let y0: i32 = bandrow * g_RES_H;
+            for (let y = 0; y < g_RES_H; y++) {
+                for (let x = 0; x < g_RES_W; x++) {
+                    let si: i32 = (y * g_RES_W + x) * 4;
+                    let di: i32 = ((y0 + y) * W + (x0 + x)) * 3;
+                    ptr_write_u8(ptr_offset(op, di, 1), ptr_deref_u8(ptr_offset(g_fb, si + 2, 1)));
+                    ptr_write_u8(ptr_offset(op, di + 1, 1), ptr_deref_u8(ptr_offset(g_fb, si + 1, 1)));
+                    ptr_write_u8(ptr_offset(op, di + 2, 1), ptr_deref_u8(ptr_offset(g_fb, si, 1)));
+                }
+            }
+            let lbl: string = "NIGHT 22h";
+            if (d == 1) { lbl = "DAY 12h"; }
+            print(`  tile [${col},${bandrow}] ${g_sc_name[s]} ${lbl}  fx_tris=${g_last_fx_tris} sprites=${g_last_sprites}`);
+        }
+    }
+    write_png(p_path, out, W, H);
+    print(`sheet -> ${p_path}  (${W}x${H}, tiles are native 320x240)`);
+}
+
+fn fnv1a(p_buf: buffer, p_n: i32): u64 {
+    let h: u64 = 14695981039346656037;
+    let p: ptr = buffer_ptr(p_buf);
+    for (let i = 0; i < p_n; i++) {
+        h = h ^ u64(ptr_deref_u8(ptr_offset(p, i, 1)));
+        h = h * 1099511628211;
+    }
+    let out: u64 = h;
+    return out;
+}
+
+// ===========================================================================
+// 9. boot
+// ===========================================================================
+
+fn boot(): i32 {
+    g_win = window_open_ex("nightshade spellfx", g_RES_W, g_RES_H, 1, 0);
+    if (g_win == null) {
+        eprint(`spellfx: window_open failed: ${sdl_error()}`);
+        let bad: i32 = 0 - 1;
+        return bad;
+    }
+    g_target = target_new(g_win, g_RES_W, g_RES_H, 1);
+    if (g_target == null) {
+        eprint("spellfx: target_new failed");
+        let bad2: i32 = 0 - 1;
+        return bad2;
+    }
+    target_set_border(g_target, 0, 0, 0);
+    target_set_shake(g_target, 0.0, 0.0);
+    if (frame_init(g_win, g_target, g_fb) != 0) {
+        eprint("spellfx: frame_init failed");
+        let bad3: i32 = 0 - 1;
+        return bad3;
+    }
+    frame_set_capture(1);
+    art_build(g_win);
+    spell_bind();
+    frame_bind_textures(g_tex_world, g_tex_fx, g_tex_hud, g_tex_sky);
+    frame_bind_fx_atlas(g_atlas_fx);
+    frame_bind_assets(meshgen_mesh(MESH_BLOB), meshgen_mesh(MESH_LANTERN_VM),
+                      FX_GLOW_L);
+    frame_set_hud_solid_uv(g_uvw[0], g_uvw[1], g_uvw[2], g_uvw[3]);
+    frame_set_vignette_colour(pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+    frame_set_flash_colour(pal_r(g_LIGHTNING), pal_g(g_LIGHTNING), pal_b(g_LIGHTNING));
+    frame_set_sheet_clear(pal_r(g_UI_BLACK), pal_g(g_UI_BLACK), pal_b(g_UI_BLACK));
+    let ok: i32 = 0;
+    return ok;
+}
+
+fn selftest(): i32 {
+    let fails: i32 = 0;
+    // determinism: the same scene rendered twice must be byte-identical
+    render_scene(0, 22.0);
+    let a: buffer = framebuffer_to_rgb();
+    let ha: u64 = fnv1a(a, g_RES_W * g_RES_H * 3);
+    render_scene(0, 22.0);
+    let b: buffer = framebuffer_to_rgb();
+    let hb: u64 = fnv1a(b, g_RES_W * g_RES_H * 3);
+    if (ha != hb) { fails++; eprint(`spellfx: NOT deterministic ${ha} != ${hb}`); }
+    else { print(`spellfx: deterministic, heal@22h = ${ha}`); }
+    // a different hour must differ
+    render_scene(0, 12.0);
+    let c: buffer = framebuffer_to_rgb();
+    let hc: u64 = fnv1a(c, g_RES_W * g_RES_H * 3);
+    if (hc == ha) { fails++; eprint("spellfx: day and night render identically"); }
+    else { print(`spellfx: heal@12h = ${hc} (differs, as it must)`); }
+    // nothing may be dropped or unbound in any scene
+    for (let s = 0; s < scene_count(); s++) {
+        render_scene(s, 22.0);
+        if (fx_spell_dropped() != 0) {
+            fails++;
+            eprint(`spellfx: ${g_sc_name[s]} dropped ${fx_spell_dropped()} sprites`);
+        }
+        if (fx_spell_unbound() != 0) {
+            fails++;
+            eprint(`spellfx: ${g_sc_name[s]} wanted ${fx_spell_unbound()} unbound cells`);
+        }
+        print(`  ${g_sc_name[s]}: sprites=${g_last_sprites} fx_tris=${g_last_fx_tris}`);
+    }
+    let out: i32 = fails;
+    return out;
+}
+
+fn usage() {
+    print("spellfx_shot — LOOK at the spell FX.  Render with DISPLAY=:0.");
+    print("  --sheet <png>          every scene, night and day, tiled at 320x240");
+    print("  --scene <name> --tod <h> --out <png>");
+    print("  --list                 the scene table");
+    print("  --selftest             determinism + budget");
+}
+
+fn main() {
+    if (running_interpreted() == 1) {
+        eprint("spellfx_shot must be COMPILED (hemlockc -O1). Refusing.");
+        exit(2);
+    }
+    let mode: string = "";
+    let scene: string = "heal";
+    let outp: string = "/tmp/spellfx.png";
+    let hours: f64 = 22.0;
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--list") { mode = "list"; }
+        else if (a == "--selftest") { mode = "selftest"; }
+        else if (a == "--sheet") { mode = "sheet"; i++; outp = args[i]; }
+        else if (a == "--scene") { mode = "one"; i++; scene = args[i]; }
+        else if (a == "--out") { i++; outp = args[i]; }
+        else if (a == "--tod") { i++; hours = num_or(args[i], 22.0); }
+        else { usage(); exit(2); }
+        i++;
+    }
+    if (mode == "") { usage(); exit(2); }
+    if (mode == "list") {
+        for (let s = 0; s < scene_count(); s++) {
+            print(`  ${g_sc_name[s]}  (frame ${g_sc_frame[s]})  ${g_sc_desc[s]}`);
+        }
+        return;
+    }
+    if (boot() != 0) { exit(3); }
+    if (mode == "selftest") {
+        let f: i32 = selftest();
+        if (f != 0) { eprint(`spellfx selftest: ${f} FAILURES`); exit(1); }
+        print("spellfx selftest: PASS");
+    } else if (mode == "sheet") {
+        sheet(outp);
+    } else {
+        let si: i32 = scene_index(scene);
+        if (si < 0) { eprint(`no such scene: ${scene}`); exit(2); }
+        shot_one(si, hours, outp);
+    }
+    if (g_target != null) { target_free(g_target); }
+    if (g_win != null) { window_close(g_win); }
+}
+
+main();

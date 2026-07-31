@@ -119,6 +119,18 @@ import { rng_new, rng_seed, rng_f01, RNG_SPREAD } from "./rng.hml";
 
 import { cmd_yaw, cmd_pitch } from "./command.hml";
 
+// The KINETIC / MAGIC axis.  `affinity.hml` is a LEAF — it imports nothing from
+// `src/sim/` — so this direction can never close a cycle.  Everything about
+// which class resists which hand lives there; this file owns only the
+// APPLICATION of it inside the existing authority.  MAGIC_KINETIC §1.8's "one
+// insertion point, one multiply" is `combat_apply_damage` below.
+import { aff_dtype_of_kind, aff_class_of_model, aff_body_mult,
+         aff_pool_mode, aff_pool_mult, aff_pool_hp,
+         aff_resisted, aff_vulnerable,
+         aff_selfcheck, aff_kind_ids_ok,
+         AFF_CLS_NONE, AFF_POOL_PLATE, AFF_POOL_SCOUR, AFF_POOL_STRIP
+       } from "./affinity.hml";
+
 // ===========================================================================
 // 0.  SMALL ALLOCATORS  (startup only — never on a firing path)
 // ===========================================================================
@@ -201,6 +213,26 @@ export let HM_KILL    = 2;    // red-tinted, 1.6x
 export let HM_FALLOFF = 4;    // grey damage number: range reduced the damage
 export let HM_ARMOR   = 8;    // the Warden plate ate 75 % of it
 
+// ---- the affinity channel (MAGIC_KINETIC §2.1 RULE C) ---------------------
+// "The resisted hit looks resisted, IN THE SAME FRAME."  Both bits ride in the
+// `sub` field of the EV_HITMARKER the caller already emits: ZERO new events,
+// ZERO new packet fields.  The five-signal contract still fires all five — they
+// just fire DIFFERENTLY, which is the whole point.  A resisted hit is still a
+// hit; it is a hit that says "wrong hand".
+//
+//   HM_MAGIC     the hitmarker is a 4-petal bloom, not a cross; number UI_AMBER
+//   HM_RESISTED  the number renders UI_DIM at HALF SIZE with a small down
+//                glyph, the flash goes dim amber instead of white and lasts
+//                HIT_FLASH_RESISTED_CS, and the impact is a scald puff.
+//
+// DUPLICATED IN `spells.hml` AT THE SAME VALUES (16 / 32).  It declared them
+// first and it cannot import them from here without help, because THIS file
+// gained them after that one shipped.  `combat_hm_bits_ok()` exists so a probe
+// that can see both zones asserts the copies still agree; the dedup is in the
+// task report as a one-line change for that file's owner.
+export let HM_MAGIC    = 16;
+export let HM_RESISTED = 32;
+
 // EV_IMPACT `sub`: which material the pellet landed on.  Drives the particle
 // tint of GDD §7.7.
 export let SURF_TERRAIN = 0;
@@ -216,9 +248,18 @@ export let SFX_PITCH_STEPS  = 5;    // 0, +2, +4, +6, +8 semitones
 export let SFX_KILL_CHIME   = 6;
 export let SFX_IMPACT_WORLD = 7;
 export let SFX_IMPACT_ARMOR = 8;
+// MAGIC_KINETIC §2.4: a resisted hit gets a dull THOCK instead of the pitched
+// blip, and the +2-semitone chain DOES NOT ADVANCE — the rising pitch is a
+// reward for using the right hand, so the wrong hand must not be able to climb
+// it.  One sample.
+export let SFX_HIT_THOCK    = 9;
 
 export let HIT_CHAIN_TICKS = 36;    // GDD §7.2: 0.6 s * 60 Hz
 export let HIT_FLASH_CS    = 6;     // GDD §7.3: 0.06 s, in centiseconds
+// RULE C: the resisted flash halves and goes dim amber instead of white.  The
+// duration is the sim's to decide because it rides in the event; the colour is
+// the renderer's, keyed off HM_RESISTED on the same tick and target.
+export let HIT_FLASH_RESISTED_CS = 3;
 
 // ===========================================================================
 // 2.  DAMAGE KINDS
@@ -444,6 +485,36 @@ export let PLATE_ARC_COS   = 0.0;    // front hemisphere: shots into the facing
 // sentence: go around it, or shoot over it.
 export let PLATE_COVERS_HEAD = 0;
 
+// ---------------------------------------------------------------------------
+// The affinity axis agrees with this file.  Returns 0, or `affinity.hml`'s own
+// AFFCHK_* bitmask.  Called by the probe, never per frame.
+// ---------------------------------------------------------------------------
+// Three separate agreements, because they fail for three different reasons:
+//   1. `affinity.hml`'s internal laws (LAW 1/2/3) — `aff_selfcheck`.
+//   2. Its copy of the delivery-kind ids vs THIS file's literals.  It cannot
+//      import them (that would close a cycle), so they are checked instead.
+//   3. `DMG_KIND_COUNT` here is still 6 while the spell school's kinds are 6..8.
+//      Raising it belongs to whoever renumbers the wire, so this asserts only
+//      that this file's count never EXCEEDS the affinity map's width — which is
+//      the direction that would silently drop a damage type off the axis.
+export fn combat_affinity_ok(): i32 {
+    let out: i32 = 0;
+    out = out | aff_selfcheck();
+    out = out | aff_kind_ids_ok(DMG_BULLET, DMG_MELEE, DMG_BURN,
+                                DMG_EXPLOSION, DMG_FALL, DMG_CONTACT,
+                                DMG_KIND_COUNT);
+    return out;
+}
+
+// `spells.hml` declares HM_MAGIC / HM_RESISTED itself.  A probe that can see
+// both zones calls this with that file's values so the two copies cannot drift.
+export fn combat_hm_bits_ok(p_magic: i32, p_resisted: i32): i32 {
+    let out: i32 = 1;
+    if (p_magic != HM_MAGIC) { out = 0; }
+    if (p_resisted != HM_RESISTED) { out = 0; }
+    return out;
+}
+
 // The hitbox table is exactly as wide as config's enemy-class enum.
 export fn combat_hb_ok(): i32 {
     let out: i32 = 1;
@@ -486,10 +557,17 @@ export fn combat_body_h(p_w: object, p_slot: i32): f64 {
 
 // The plate pool an enemy class spawns with.  `ai.hml` writes this into
 // `world.armor` at spawn; combat is the only thing that spends it.
+// The Snuffer shell is the SAME COLUMN and the SAME FUNCTION as the Warden
+// plate (MAGIC_KINETIC §3.2: "using machinery that already exists").  The
+// Warden's 80 stays a literal here because it is shipped, measured content; the
+// Snuffer's 60 is forwarded from `affinity.hml` so the shell HP and the shell
+// multiplier cannot drift into different files.
 export fn combat_plate_hp(p_cls: i32): i32 {
     let cls: i32 = p_cls;
     let out: i32 = 0;
     if (cls == g_ENEMY_WARDEN) { out = WARDEN_PLATE_HP; }
+    let fwd: i32 = aff_pool_hp(cls);
+    if (fwd > 0) { out = fwd; }
     return out;
 }
 
@@ -616,6 +694,15 @@ export fn combat_new_cap(p_ev_cap: i32): object {
 
         // set by combat_apply_damage, read by combat_fire for the marker bits
         last_plated: 0,
+        // ...and the affinity outcome of that same call, for RULE C.  These are
+        // SCRATCH, not state: rewritten on every call including the ones that
+        // refuse, never captured, never hashed, never on the wire.  A caller
+        // that is not `combat_fire` (a spell, a projectile) reads them through
+        // the four accessors below to decide its own marker bits.
+        last_resisted: 0,
+        last_vulnerable: 0,
+        last_pool_dmg: 0,
+        last_dtype: 0,
 
         // counters — every refusal is visible
         shots: 0,
@@ -629,7 +716,9 @@ export fn combat_new_cap(p_ev_cap: i32): object {
         damage_dealt: 0,
         no_weapon_source: 0,
         start_solid: 0,
-        overkill: 0
+        overkill: 0,
+        resisted_hits: 0,
+        pool_damage: 0
     };
     let out: object = cx;
     return out;
@@ -678,7 +767,9 @@ export let STAT_DAMAGE_DEALT     = 8;
 export let STAT_NO_WEAPON_SOURCE = 9;
 export let STAT_START_SOLID      = 10;
 export let STAT_OVERKILL         = 11;
-export let STAT_COUNT            = 12;
+export let STAT_RESISTED_HITS    = 12;   // hits that landed on the wrong hand
+export let STAT_POOL_DAMAGE      = 13;   // plate + shell absorbed, all sources
+export let STAT_COUNT            = 14;
 
 export fn combat_stat(p_cx: object, p_which: i32): i32 {
     let cx: object = p_cx;
@@ -696,6 +787,44 @@ export fn combat_stat(p_cx: object, p_which: i32): i32 {
     if (k == STAT_NO_WEAPON_SOURCE) { out = cx.no_weapon_source; }
     if (k == STAT_START_SOLID)      { out = cx.start_solid; }
     if (k == STAT_OVERKILL)         { out = cx.overkill; }
+    if (k == STAT_RESISTED_HITS)    { out = cx.resisted_hits; }
+    if (k == STAT_POOL_DAMAGE)      { out = cx.pool_damage; }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The affinity outcome of the LAST `combat_apply_damage` call.
+// ---------------------------------------------------------------------------
+// `combat_fire` reads these inline.  Every other caller — `spells.hml`,
+// `projectiles.hml`, `melee.hml`, `ai.hml` — must read them through here to set
+// its own HM_* bits and to show a damage number that is not zero when the
+// damage all went into a pool.  Reported as an ARCHITECTURE §5.4 addition.
+export fn combat_last_resisted(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let out: i32 = cx.last_resisted;
+    return out;
+}
+
+export fn combat_last_vulnerable(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let out: i32 = cx.last_vulnerable;
+    return out;
+}
+
+// Damage that went into the Warden plate or the Snuffer shell instead of HP.
+// THIS IS WHY IT EXISTS: magic against a shelled Snuffer removes ZERO HP by
+// design, so `combat_apply_damage`'s return is 0, and a damage number of 0
+// reads as "my gun is broken" at 320x240.  The caller must show
+// `dealt + combat_last_pool_dmg(cx)`.
+export fn combat_last_pool_dmg(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let out: i32 = cx.last_pool_dmg;
+    return out;
+}
+
+export fn combat_last_dtype(p_cx: object): i32 {
+    let cx: object = p_cx;
+    let out: i32 = cx.last_dtype;
     return out;
 }
 
@@ -1123,6 +1252,10 @@ export fn combat_apply_damage(p_cx: object, p_w: object, p_attacker_id: i32,
     let wr: object = p_w;
     let vs: i32 = p_victim_slot;
     cx.last_plated = 0;
+    cx.last_resisted = 0;
+    cx.last_vulnerable = 0;
+    cx.last_pool_dmg = 0;
+    cx.last_dtype = aff_dtype_of_kind(p_dmg_kind);
     if (vs < 0 || vs >= wr.count) { let bad: i32 = 0; return bad; }
 
     let flags = wr.flags;
@@ -1142,24 +1275,94 @@ export fn combat_apply_damage(p_cx: object, p_w: object, p_attacker_id: i32,
     let head: i32 = 0;
     if ((hmbits & HM_HEAD) != 0) { head = 1; }
 
-    // ---- the Warden front plate (GDD §2.2) ------------------------------
-    // 75 % DR while intact.  The plate absorbs the FULL incoming damage out of
-    // its own 80-point pool while passing 25 % through to the body, so the
-    // plate breaks in the same number of shots whether or not it is reducing
-    // anything.  That is what makes "keep shooting the plate" a slow but real
-    // option and "go around" the fast one — which is the whole design intent
-    // of the Warden (GDD §2.2: "stop shooting the wall, go around").
-    let plated: i32 = plate_applies(wr, vs, head, p_dirx, p_dirz);
-    let applied: f64 = raw;
-    if (plated == 1) {
+    // ---- THE AFFINITY AXIS (MAGIC_KINETIC §1.8; affinity.hml) ------------
+    // One insertion point, one multiply.  Two array reads on a function whose
+    // worst case is 9 Bellows pellets ALREADY AGGREGATED to one victim record
+    // plus at most 14 AI contact events per tick.
+    //
+    // WHY THIS CANNOT MOVE A MEASURED NUMBER.  For every class GAME_DESIGN §2.2
+    // ships and every delivery kind that existed before the spell school,
+    // `amul` is exactly 1.0 — `affinity.hml` LAW 1, pinned there with six
+    // literals.  `x * 1.0` is exact in IEEE-754 for every finite x, so the GDD
+    // §2.4 TTK table reproduces BIT FOR BIT, not approximately.  That is the
+    // whole reason the axis was allowed to land inside the authority.
+    //
+    // THE TRAP (MAGIC_KINETIC §12): this must NOT go through `class_of`, which
+    // clamps an unknown class to Husk so a missing hitbox cannot crash a
+    // raycast.  A Gloam that fell through to Husk affinity would silently
+    // become bullet-vulnerable — the exact opposite of what the class is for.
+    // `aff_class_of_model` clamps against the affinity table's own width and
+    // answers AFF_CLS_NONE (a flat 1.00) for anything that is not an enemy,
+    // which is also the answer for a PLAYER victim: MAGIC_KINETIC §11 #2 puts
+    // player resistances explicitly out of scope.
+    let models = wr.model;
+    let dtype: i32 = cx.last_dtype;
+    let acls: i32 = AFF_CLS_NONE;
+    if (kinds[vs] == KIND_AI) { acls = aff_class_of_model(models[vs]); }
+    let pool0: i32 = armor[vs];
+    let amul: f64 = aff_body_mult(acls, dtype, pool0);
+
+    // ---- the pools: the Warden front plate, and the Snuffer shell --------
+    // GDD §2.2's Warden is "220 (+80 front plate, 75 % DR while intact)".  That
+    // sentence remains literally true for KINETIC damage: the arc, the DR and
+    // the pool are untouched below.  MAGIC adds a SECOND DOOR into the same
+    // pool — facing-independent, because light has no arc — which is the design
+    // intent "light goes round a shield".  See `affinity.hml` §4 for why the
+    // Warden SCOURS (pool and body both) and the Snuffer STRIPS (pool only).
+    let faces: i32 = plate_applies(wr, vs, head, p_dirx, p_dirz);
+    let pmode: i32 = aff_pool_mode(acls, dtype, pool0, faces);
+    let applied: f64 = raw * amul;
+    let pool_dmg: i32 = 0;
+    let plated: i32 = 0;
+
+    if (pmode == AFF_POOL_PLATE) {
+        // THE SHIPPED KINETIC BRANCH, UNCHANGED.  The plate absorbs the FULL
+        // incoming damage out of its own 80-point pool while passing 25 %
+        // through, so it breaks in the same number of shots whether or not it
+        // is reducing anything.  That is what makes "keep shooting the plate" a
+        // slow but real option and "go around" the fast one.
         applied = raw * (1.0 - PLATE_DR);
-        let pool: i32 = armor[vs];
         let eat: i32 = i32(raw + 0.5);
-        if (eat > pool) { eat = pool; }
-        armor[vs] = pool - eat;
+        if (eat > pool0) { eat = pool0; }
+        armor[vs] = pool0 - eat;
+        pool_dmg = eat;
+        plated = 1;
+    } else if (pmode == AFF_POOL_SCOUR || pmode == AFF_POOL_STRIP) {
+        let pm: f64 = aff_pool_mult(acls, dtype);
+        let eat2: i32 = i32(raw * pm + 0.5);
+        // Same anti-"my gun is broken" floor the HP write gets, for the same
+        // reason: a hit that connects and moves nothing is indistinguishable
+        // from a bug.
+        if (eat2 < 1 && raw > 0.0) { eat2 = 1; }
+        if (eat2 > pool0) { eat2 = pool0; }
+        armor[vs] = pool0 - eat2;
+        pool_dmg = eat2;
+        plated = 1;
+        // STRIP: the shell takes it ALL and HP takes none (§3.2).  `aff_body_mult`
+        // already returned 0.0 for this case; this is the belt to that braces.
+        if (pmode == AFF_POOL_STRIP) { applied = 0.0; }
+    }
+
+    if (plated == 1) {
         hmbits = hmbits | HM_ARMOR;
         cx.plate_blocks = cx.plate_blocks + 1;
         cx.last_plated = 1;
+        cx.last_pool_dmg = pool_dmg;
+        cx.pool_damage = cx.pool_damage + pool_dmg;
+    }
+
+    // ---- RULE C: the resisted hit must LOOK resisted, in the same frame ---
+    // Scouring or stripping a pool is the RIGHT hand whatever the body
+    // multiplier underneath says, so it never reads as resisted — the number
+    // the player sees is the pool coming off, not the 0.25 body row.
+    if (plated == 1) {
+        if (pmode != AFF_POOL_PLATE) { cx.last_vulnerable = 1; }
+    } else {
+        if (aff_resisted(amul) == 1) {
+            cx.last_resisted = 1;
+            cx.resisted_hits = cx.resisted_hits + 1;
+        }
+        if (aff_vulnerable(amul) == 1) { cx.last_vulnerable = 1; }
     }
 
     // Round to the nearest HP.  A hit that lands must never do zero: at 320x240
@@ -1533,6 +1736,12 @@ export fn combat_fire(p_cx: object, p_w: object, p_cs,
                                              wpn, DMG_BULLET, hm,
                                              sdx, sdz, hx, hy, hz);
         if (cx.last_plated == 1) { hm = hm | HM_ARMOR; }
+        // RULE C.  This is the Gloam's whole lesson arriving through a channel
+        // that already exists: you shoot the thing that ate the light, and you
+        // get grey half-size numbers and a dull thock instead of the rising
+        // pitch.  Nobody tells you.  Then you raise the lamp.
+        let resisted: i32 = cx.last_resisted;
+        if (resisted == 1) { hm = hm | HM_RESISTED; }
 
         let flags2 = wr.flags;
         let killed: i32 = 0;
@@ -1551,7 +1760,11 @@ export fn combat_fire(p_cx: object, p_w: object, p_cs,
         let pys2 = wr.py;
         let pzs2 = wr.pz;
         let bh: f64 = combat_body_h(wr, vslot);
-        evbus_push_m(bus, tick, EV_HIT_FLASH, HIT_FLASH_CS, shooter_id, vid,
+        // RULE C: the resisted flash halves, 6 -> 3 cs, and the renderer takes
+        // it to dim amber instead of white off HM_RESISTED on the same tick.
+        let flash_cs: i32 = HIT_FLASH_CS;
+        if (resisted == 1) { flash_cs = HIT_FLASH_RESISTED_CS; }
+        evbus_push_m(bus, tick, EV_HIT_FLASH, flash_cs, shooter_id, vid,
                      pxs2[vslot], pys2[vslot] + bh * 0.5, pzs2[vslot]);
 
         // 3. damage number
@@ -1568,9 +1781,18 @@ export fn combat_fire(p_cx: object, p_w: object, p_cs,
                          hx, hy, hz);
         }
 
-        // 5. audio blip, pitch-chained per §7.2
-        let step: i32 = chain_step(cx, shooter_id, tick);
-        let sfx: i32 = SFX_HIT_BLIP + step;
+        // 5. audio blip, pitch-chained per §7.2.  MAGIC_KINETIC §2.4: THE CHAIN
+        //    DOES NOT ADVANCE ON A RESISTED HIT.  The rising pitch is a reward
+        //    for using the right hand, so the wrong hand must not be able to
+        //    climb it — and a resisted hit gets a dull thock, not a blip.
+        //    `chain_step` MUTATES sim state (it is in the snapshot and the
+        //    rollback path), so not calling it is a deliberate divergence of
+        //    the state evolution and not merely a different sound.
+        let sfx: i32 = SFX_HIT_THOCK;
+        if (resisted == 0) {
+            let step: i32 = chain_step(cx, shooter_id, tick);
+            sfx = SFX_HIT_BLIP + step;
+        }
         if ((hm & HM_ARMOR) != 0) { sfx = SFX_IMPACT_ARMOR; }
         if (killed == 1) { sfx = SFX_KILL_CHIME; }
         evbus_push_m(bus, tick, EV_SOUND, sfx, shooter_id, vid, hx, hy, hz);

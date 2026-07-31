@@ -1,0 +1,369 @@
+// probe_night.hml — verification program for THE NIGHT VEIL.
+//
+// Run COMPILED. Headless, no SDL, no window.
+//     hemlockc -O1 tools/probe_night.hml -o /tmp/probe_night && /tmp/probe_night
+//
+// Prints one line per measurement, then `PASS n/n`, and exits 0 only if every
+// assertion held AND the assertion count is the expected one — so a skipped
+// branch cannot shrink numerator and denominator together and still read green.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS PROBE IS FOR
+// ---------------------------------------------------------------------------
+// The night model is: the world is multiplied DOWN at night and a light
+// multiplies it back UP toward 1.0.  `src/render/world_render.hml` §2c builds
+// it; `src/core/config.hml` holds its three numbers and its schedule; this file
+// proves the ARITHMETIC without a window.
+//
+// Two design decisions make that possible and both are load-bearing:
+//
+//   * the gate curve and the "how dark is it" luminance live in
+//     `src/core/config.hml` as FUNCTIONS (`gate_darkness`, `fog_tint_luma`),
+//     not as numbers copied into the renderer.  `src/render/**` links SDL
+//     through wobbleweed, so a headless probe cannot import the renderer; with
+//     the curve in core, this probe runs THE SAME CODE the frame runs.
+//   * the light term is not re-typed here either.  `shade.hml`'s own
+//     `env_light_rgb` is called with a veil env and a lantern, which is
+//     literally the function `emit_mesh_buf`'s lit branch calls per vertex.
+//     If the engine's falloff changes, this probe changes with it.
+//
+// ---------------------------------------------------------------------------
+// WHAT IT CANNOT DO, STATED PLAINLY
+// ---------------------------------------------------------------------------
+// It cannot measure a PIXEL.  "The 22:00 ground band is >= 25 luminance
+// brighter with the lantern on" is a rendered-frame measurement and it is made
+// with `tools/shot.hml` on a real display, not here.  What this probe pins is
+// everything that must be true for that measurement to be reproducible: the
+// veil's depth, its schedule across the day, the ordering of the hours, and
+// that the engine's own light term actually clears the veil at the distances
+// the lantern is authored for.
+//
+// >>> ASSERT THE DESIGN, PIN THE ANCHORS WITH A LITERAL (CLAUDE.md rule 5).
+// Every threshold below is a literal.  None of them is derived from the config
+// value it is checking, because a probe whose bound moves with the thing it
+// guards is a probe that passes for ever.
+
+import { exit } from "@stdlib/process";
+import {
+    env_new, env_bind, env_field, env_light_rgb,
+    env_clear_lights, env_add_light,
+    env_set_sun, env_set_ambient, env_set_bounce, env_set_rim,
+    ENV_FOG_R, ENV_FOG_G, ENV_FOG_B
+} from "../../wobbleweed/src/shade.hml";
+import {
+    tod_eval, tod_reset, tod_set_weather, tod_key_anchor,
+    TOD_DAWN, TOD_NOON, TOD_GOLDEN, TOD_DUSK, TOD_NIGHT, TOD_DEEP,
+    WX_CLEAR
+} from "../src/art/tod.hml";
+import {
+    gate_darkness, fog_tint_luma,
+    g_NIGHT_VEIL_R, g_NIGHT_VEIL_G, g_NIGHT_VEIL_B,
+    g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY,
+    g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY,
+    g_LANTERN_RADIUS, g_LANTERN_GAIN,
+    g_LANTERN_LIGHT_R, g_LANTERN_LIGHT_G, g_LANTERN_LIGHT_B,
+    g_LANTERN_OFS_DOWN, g_LANTERN_POOL_SCALE
+} from "../src/core/config.hml";
+
+let EXPECTED_ASSERTIONS = 32;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(label: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${label}`); }
+}
+fn note(s: string) { g_notes.push(s); }
+
+fn f4(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 10000.0 + 0.5);
+    let whole: i64 = scaled / 10000;
+    let frac: i64 = scaled - whole * 10000;
+    let fs: string = `${frac}`;
+    while (fs.length < 4) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+// Rec.709, the weights src/art/tod.hml quotes for every ground measurement.
+fn luma709(p_r: f64, p_g: f64, p_b: f64): f64 {
+    let out: f64 = 0.2126 * p_r + 0.7152 * p_g + 0.0722 * p_b;
+    return out;
+}
+
+// The terrain albedo, BACK-MEASURED off the rendered noon frame and written
+// down in src/art/tod.hml ("WHAT THIS FILE CANNOT DO"): at noon `ambient + sun`
+// is exactly (1,1,1) and the mist is zero, so the screen pixel IS the albedo.
+let ALB_R: f64 = 79.0;
+let ALB_G: f64 = 91.0;
+let ALB_B: f64 = 32.0;
+
+// The veil amount at a given hour, through the SAME two functions the frame
+// uses. `tod_eval` fills the env; the fog tint is what "how dark is it" reads.
+// The six hours the day is judged on ARE the six keyframe anchors, so the
+// probe asks tod.hml where they are rather than inverting its clock.
+fn veil_at_hour(p_env: array<f64>, p_key: i32): f64 {
+    let env: array<f64> = p_env;
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    tod_eval(env, tod_key_anchor(p_key), WX_CLEAR);
+    let lum: f64 = fog_tint_luma(env_field(env, ENV_FOG_R),
+                                 env_field(env, ENV_FOG_G),
+                                 env_field(env, ENV_FOG_B));
+    let out: f64 = gate_darkness(lum, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY);
+    return out;
+}
+
+fn lantern_at_hour(p_env: array<f64>, p_key: i32): f64 {
+    let env: array<f64> = p_env;
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    tod_eval(env, tod_key_anchor(p_key), WX_CLEAR);
+    let lum: f64 = fog_tint_luma(env_field(env, ENV_FOG_R),
+                                 env_field(env, ENV_FOG_G),
+                                 env_field(env, ENV_FOG_B));
+    let out: f64 = gate_darkness(lum, g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY);
+    return out;
+}
+
+// Bind an env that is EXACTLY what `world_render.hml`'s `veil_push` binds:
+// ambient = the veil, sun/bounce/rim zero, one lantern at the eye offset.
+// Then ask shade.hml itself what a patch of flat ground gets.
+//   p_lant  0 = no light, 1 = the lantern
+//   returns the LIT MULTIPLIER's green channel and, through p_out, all three
+fn ground_mul(p_env: array<f64>, p_veil: f64, p_lant: i32, p_dist: f64,
+              p_out: array<f64>) {
+    let env: array<f64> = p_env;
+    let a: f64 = p_veil;
+    env_set_sun(env, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    env_set_ambient(env, 1.0 + (g_NIGHT_VEIL_R - 1.0) * a,
+                         1.0 + (g_NIGHT_VEIL_G - 1.0) * a,
+                         1.0 + (g_NIGHT_VEIL_B - 1.0) * a);
+    env_set_bounce(env, 0.0, 0.0, 0.0);
+    env_set_rim(env, 0.0, 0.0, 0.0);
+    env_clear_lights(env);
+    // The lantern sits g_LANTERN_OFS_DOWN below a 1.7 m eye, i.e. 1.12 m over
+    // the ground, exactly as `lights_commit` places it.
+    let ly: f64 = 1.7 - g_LANTERN_OFS_DOWN;
+    if (p_lant != 0) {
+        let amp: f64 = g_LANTERN_GAIN * a;
+        env_add_light(env, 0.0, ly, 0.0,
+                      g_LANTERN_LIGHT_R * amp,
+                      g_LANTERN_LIGHT_G * amp,
+                      g_LANTERN_LIGHT_B * amp, g_LANTERN_RADIUS);
+    }
+    env_bind(env);
+    // Flat ground: normal +Y, which is the normal terrain_render hands the
+    // kernel for every chunk.
+    let c: u32 = env_light_rgb(0.0, 1.0, 0.0, p_dist, 0.0, 0.0);
+    p_out[0] = f64(i32(c & 255)) / 255.0;
+    p_out[1] = f64(i32((c >> 8) & 255)) / 255.0;
+    p_out[2] = f64(i32((c >> 16) & 255)) / 255.0;
+}
+
+fn main() {
+    print("probe_night — THE NIGHT VEIL (src/render/world_render.hml §2c)");
+    print("");
+
+    let env: array<f64> = env_new();
+    let m: array<f64> = [0.0, 0.0, 0.0];
+    let m2: array<f64> = [0.0, 0.0, 0.0];
+
+    // -----------------------------------------------------------------------
+    print("[1] the veil constants are a DARKENING, and a cool one");
+    // -----------------------------------------------------------------------
+    print(`  veil = (${f4(g_NIGHT_VEIL_R)}, ${f4(g_NIGHT_VEIL_G)}, ${f4(g_NIGHT_VEIL_B)})`);
+    // CLAUDE.md §6: vertex colour can only darken. A veil at or above 1.0 is
+    // not a veil, and a NEGATIVE one is a black frame.
+    ok("the veil darkens every channel (0 < v < 1)",
+       g_NIGHT_VEIL_R > 0.0 && g_NIGHT_VEIL_R < 1.0 &&
+       g_NIGHT_VEIL_G > 0.0 && g_NIGHT_VEIL_G < 1.0 &&
+       g_NIGHT_VEIL_B > 0.0 && g_NIGHT_VEIL_B < 1.0);
+    // ART_BIBLE §4.2: night is BLUE and dark. What survives the dark is the
+    // cold end, which is what makes a warm lantern read warm by contrast.
+    ok("the veil is cool: blue survives most, red least",
+       g_NIGHT_VEIL_B > g_NIGHT_VEIL_G && g_NIGHT_VEIL_G > g_NIGHT_VEIL_R);
+    // The design anchor, pinned with a literal (rule 5). A veil shallower than
+    // this cannot deliver the +25 luminance the brief asks for on a night bake
+    // that lands the ground band near 42.
+    ok("the veil is at least a 4x cut in green", g_NIGHT_VEIL_G <= 0.25);
+    ok("the veil is not a black frame", g_NIGHT_VEIL_G >= 0.05);
+
+    // -----------------------------------------------------------------------
+    print("[2] the schedule — the veil is a NIGHT effect, not a dusk one");
+    // -----------------------------------------------------------------------
+    let v_dawn: f64 = veil_at_hour(env, TOD_DAWN);
+    let v_noon: f64 = veil_at_hour(env, TOD_NOON);
+    let v_gold: f64 = veil_at_hour(env, TOD_GOLDEN);
+    let v_dusk: f64 = veil_at_hour(env, TOD_DUSK);
+    let v_nite: f64 = veil_at_hour(env, TOD_NIGHT);
+    let v_deep: f64 = veil_at_hour(env, TOD_DEEP);
+    print(`  veil  05:30 ${f4(v_dawn)}  12:00 ${f4(v_noon)}  18:15 ${f4(v_gold)}`);
+    print(`        19:30 ${f4(v_dusk)}  22:00 ${f4(v_nite)}  02:00 ${f4(v_deep)}`);
+    ok("no veil at dawn", v_dawn == 0.0);
+    ok("no veil at noon", v_noon == 0.0);
+    ok("no veil at golden hour", v_gold == 0.0);
+    // DUSK IS A LIT HOUR. On the lantern's own thresholds 19:30 scores 0.966
+    // and dusk would lose 78 % of its ground. This bound is the whole reason
+    // the veil has a second pair of thresholds.
+    ok("dusk is essentially unveiled (< 0.05)", v_dusk < 0.05);
+    ok("22:00 is nearly fully veiled (> 0.85)", v_nite > 0.85);
+    ok("02:00 is fully veiled", v_deep == 1.0);
+    ok("the veil never decreases into the night", v_deep >= v_nite && v_nite > v_dusk);
+    note(`veil schedule 05:30/12:00/18:15/19:30/22:00/02:00 = ${f4(v_dawn)}/${f4(v_noon)}/${f4(v_gold)}/${f4(v_dusk)}/${f4(v_nite)}/${f4(v_deep)}`);
+
+    // The lantern's gate is deliberately the GENEROUS one: a lantern lit early
+    // costs nothing, a veil dropped early costs dusk.
+    let l_dusk: f64 = lantern_at_hour(env, TOD_DUSK);
+    let l_nite: f64 = lantern_at_hour(env, TOD_NIGHT);
+    let l_gold: f64 = lantern_at_hour(env, TOD_GOLDEN);
+    print(`  lantern 18:15 ${f4(l_gold)}  19:30 ${f4(l_dusk)}  22:00 ${f4(l_nite)}`);
+    ok("the lantern is out at golden hour", l_gold == 0.0);
+    ok("the lantern is up before the veil closes", l_dusk > v_dusk);
+    ok("the lantern is full at 22:00", l_nite > 0.85);
+
+    // -----------------------------------------------------------------------
+    print("[3] no gate is a step: the smoothstep is continuous and monotone");
+    // -----------------------------------------------------------------------
+    let bad_mono: i32 = 0;
+    let max_step: f64 = 0.0;
+    let prev: f64 = gate_darkness(0.70, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY);
+    let k: i32 = 1;
+    while (k <= 400) {
+        let lum: f64 = 0.70 - 0.0010 * f64(k);
+        let g: f64 = gate_darkness(lum, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY);
+        if (g < prev - 0.000000001) { bad_mono = bad_mono + 1; }
+        let d: f64 = g - prev;
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > max_step) { max_step = d; }
+        prev = g;
+        k = k + 1;
+    }
+    print(`  worst step over a 0.001 luminance move: ${f4(max_step)}`);
+    ok("the veil gate is monotone as the world darkens", bad_mono == 0);
+    // The fog tint crosses the whole gate over ~80 s of a 16-minute day, so the
+    // per-frame move is three orders under CLAUDE.md's 4 %/frame budget. This
+    // bound checks the CURVE cannot produce a step even if the tint jumped
+    // 0.001 in one frame, which is 30x faster than it ever moves.
+    ok("the veil gate has no discontinuity", max_step < 0.04);
+    ok("the gate saturates at both ends",
+       gate_darkness(0.90, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY) == 0.0 &&
+       gate_darkness(0.10, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY) == 1.0);
+
+    // -----------------------------------------------------------------------
+    print("[4] THE MODEL — the engine's own light term clears the veil");
+    // -----------------------------------------------------------------------
+    // Everything here goes through shade.hml's `env_light_rgb`, which is the
+    // function `emit_mesh_buf`'s lit branch calls once per terrain vertex.
+    ground_mul(env, 1.0, 0, 3.0, m);
+    print(`  unlit ground multiplier  = (${f4(m[0])}, ${f4(m[1])}, ${f4(m[2])})`);
+    ok("unlit night multiplies the world DOWN, hard",
+       m[1] < 0.20 && m[1] > 0.0);
+    ok("unlit night is never black in any channel", m[0] > 0.0 && m[2] > 0.0);
+
+    // The lantern is 1.12 m over the ground, so the ground DIRECTLY under it is
+    // the brightest thing the light can produce.
+    ground_mul(env, 1.0, 1, 0.0, m);
+    print(`  lit at 0.0 m             = (${f4(m[0])}, ${f4(m[1])}, ${f4(m[2])})`);
+    ok("under the lantern the world is given back whole", m[1] >= 0.99);
+
+    ground_mul(env, 1.0, 1, 5.0, m);
+    print(`  lit at 5.0 m             = (${f4(m[0])}, ${f4(m[1])}, ${f4(m[2])})`);
+    ok("at 5 m the pool still reads as lit ground", m[1] >= 0.80);
+
+    ground_mul(env, 1.0, 1, 11.0, m);
+    print(`  lit at 11.0 m            = (${f4(m[0])}, ${f4(m[1])}, ${f4(m[2])})`);
+    ok("the pool has an EDGE: 11 m is well down the falloff", m[1] < 0.70);
+
+    ground_mul(env, 1.0, 1, 20.0, m);
+    ground_mul(env, 1.0, 0, 20.0, m2);
+    print(`  lit at 20.0 m            = (${f4(m[0])}, ${f4(m[1])}, ${f4(m[2])})`);
+    ok("past the radius the dark is untouched",
+       m[0] == m2[0] && m[1] == m2[1] && m[2] == m2[2]);
+
+    // THE HEADLINE. On the measured terrain albedo, the lantern's contribution
+    // to a patch of ground at 3 m must clear the +25 the brief asks for BEFORE
+    // fog, which is the only part of it this file can see.
+    ground_mul(env, 1.0, 1, 3.0, m);
+    ground_mul(env, 1.0, 0, 3.0, m2);
+    let lit: f64 = luma709(ALB_R * m[0], ALB_G * m[1], ALB_B * m[2]);
+    let unl: f64 = luma709(ALB_R * m2[0], ALB_G * m2[1], ALB_B * m2[2]);
+    print(`  albedo luminance at 3 m: unlit ${f4(unl)}  lit ${f4(lit)}  delta ${f4(lit - unl)}`);
+    note(`lantern ON minus OFF on the bare albedo at 3 m = ${f4(lit - unl)} luminance`);
+    ok("the lantern is worth at least +25 luminance on the albedo", lit - unl >= 25.0);
+    ok("the lit ground never exceeds the albedo (only darkening, CLAUDE.md §6)",
+       m[0] <= 1.0 && m[1] <= 1.0 && m[2] <= 1.0);
+
+    // A WARM light on a cool veil: the pool must read warmer than the dark.
+    // r/g rises inside the pool. This is the chroma the ground albedo itself
+    // cannot pay for (src/art/tod.hml, "WHAT THIS FILE CANNOT DO").
+    // Measured at 11 m, INSIDE the falloff: at 3 m every channel has already
+    // saturated at 1.0 and a ratio of saturated channels proves nothing.
+    ground_mul(env, 1.0, 1, 11.0, m);
+    ground_mul(env, 1.0, 0, 11.0, m2);
+    let warm_lit: f64 = m[0] / m[1];
+    let warm_unl: f64 = m2[0] / m2[1];
+    print(`  red/green: dark ${f4(warm_unl)}  pool ${f4(warm_lit)}`);
+    ok("the pool is warmer than the dark it holds off", warm_lit > warm_unl);
+
+    // -----------------------------------------------------------------------
+    print("[5] the additive ground pool is no longer the lantern");
+    // -----------------------------------------------------------------------
+    // The defect this whole task exists to remove: with the sprite at
+    // gain*scale = 2.4*42 = 100.8, disabling it made the frame DARKER by 10-13
+    // luminance while the dynamic light moved ZERO pixels. A light that is a
+    // decal is not a light.
+    print(`  g_LANTERN_POOL_SCALE = ${f4(g_LANTERN_POOL_SCALE)}`);
+    ok("the additive ground pool no longer lights the world",
+       g_LANTERN_POOL_SCALE * g_LANTERN_GAIN < 32.0);
+
+    // -----------------------------------------------------------------------
+    print("[6] determinism — the whole model is a pure function of the hour");
+    // -----------------------------------------------------------------------
+    let a1: f64 = veil_at_hour(env, TOD_NIGHT);
+    let a2: f64 = veil_at_hour(env, TOD_NIGHT);
+    let a3: f64 = veil_at_hour(env, TOD_DAWN);
+    let a4: f64 = veil_at_hour(env, TOD_NIGHT);
+    ok("the same hour gives a bit-identical veil", a1 == a2 && a1 == a4);
+    ok("a different hour gives a different veil", a1 != a3);
+    ground_mul(env, 1.0, 1, 11.0, m);
+    ground_mul(env, 1.0, 1, 11.0, m2);
+    ok("the light term is bit-identical for identical inputs",
+       m[0] == m2[0] && m[1] == m2[1] && m[2] == m2[2]);
+    // 12 m, not 11.5: inside the pool's saturated core every distance gives
+    // (1,1,1) and "a different position gives a different answer" would be a
+    // lie dressed as a test. Both of these sit on the falloff.
+    ground_mul(env, 1.0, 1, 12.0, m2);
+    ok("the light term differs for a different position",
+       m[0] != m2[0] || m[1] != m2[1] || m[2] != m2[2]);
+    // The veil at gate 0 must be the IDENTITY, or a day frame is not the day
+    // frame it always was. world_render skips the branch entirely at 0, and
+    // this is the arithmetic proof that skipping it is free of change.
+    ground_mul(env, 0.0, 0, 6.0, m);
+    ok("a zero veil is exactly the identity multiplier",
+       m[0] == 1.0 && m[1] == 1.0 && m[2] == 1.0);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    if (g_n != EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+main();

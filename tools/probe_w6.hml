@@ -1,0 +1,299 @@
+// =============================================================================
+//  probe_w6.hml — THE TEN SYSTEMS, END TO END, THROUGH THE AUTHORITY
+// -----------------------------------------------------------------------------
+//  Ten tasks built the night, wave 1, melee, spells, stats, the settlement, its
+//  rendering, its people, spell FX and affinities. This probe asserts that a
+//  PLAYER can reach them: it drives `src/game/server.hml` with real
+//  `InputCommand`s and nothing else -- no client, no renderer, no SDL
+//  (`nm` reports 0 SDL_ symbols) -- and walks one session from waking up on the
+//  ridge to taking a trade off Mabel's bench.
+//
+//  It is deliberately a SESSION, not a unit test. Every module already has a
+//  probe that proves it correct in isolation; the thing that was missing, and
+//  the thing this file exists to stop regressing, is that the modules are
+//  CONNECTED. Each of the 31 assertions is one sentence of the task:
+//
+//      swing a melee weapon . cast a spell . spend a stat point .
+//      walk into a settlement . talk to a villager . trade for a weapon .
+//      light a lantern . watch the town grow
+//
+//  Run:  hemlockc -O1 tools/probe_w6.hml -o /tmp/pw6 && /tmp/pw6
+//  Exits 1 on any failure.
+// =============================================================================
+
+// W6 end-to-end verification. Drives server.hml headlessly, no client, no SDL.
+import { exit } from "@stdlib/process";
+import { sqrt, floor, sin, cos, atan2 } from "@stdlib/math";
+import { server_new, server_boot, server_tick, server_local, server_world,
+         server_apply_command, server_settle, server_npcs, server_settle_boot_tier,
+         server_settle_tier, server_trades, server_trades_refused,
+         server_points_spent, server_talks, server_ui_panel, server_lan_count,
+         server_w6_hash, server_melee, server_spells, server_stats, server_spawn_x, server_spawn_z, server_spawn_yaw,
+         server_lantern_x, server_lantern_z, server_lantern_lit,
+         server_enemies_alive, server_beat, server_beat_name, server_t0,
+         SV_PSLOT, UI_PANEL_NONE, UI_PANEL_CHAR, UI_PANEL_TRADE,
+         UI_MSG_POINT, UI_MSG_TRADED, UI_MSG_UNBUILT }
+       from "../src/game/server.hml";
+import { cmd_new, cmd_set, BTN_FIRE, BTN_USE, BTN_MELEE, BTN_GRENADE,
+         BTN_SWITCH, BTN_BUILD, BTN_INV }
+       from "../src/sim/command.hml";
+import { settle_cx, settle_cz, settle_tier, settle_tier_ever, settle_core_lux,
+         settle_grid_points, settle_building_count, settle_great_tier }
+       from "../src/sim/settle.hml";
+import { npc_named_count, npc_count, npc_talk_target, npc_x, npc_z, npc_slot_of,
+         npc_offers_open, npc_offer_first, npc_offer_count, npc_offer_kind,
+         NPC_NONE, NPC_MABEL, NPC_ODO, NPC_WICK }
+       from "../src/sim/npc.hml";
+import { melee_swings, melee_hits, melee_equipped }
+       from "../src/sim/melee.hml";
+import { sim_predicted, sim_progression, sim_weapon_state, sim_player_id }
+       from "../src/sim/sim.hml";
+import { world_slot_of } from "../src/sim/world.hml";
+import { move_px, move_pz } from "../src/sim/movement.hml";
+import { WS_RES0, WS_FIELDS } from "../src/sim/weapons.hml";
+import { prog_add_xp, prog_level } from "../src/sim/progression.hml";
+import { stats_get, stats_unspent, SK_VITALITY, SK_HANDLING } from "../src/sim/stats.hml";
+import { spell_active, spell_oil, SP_CASTS } from "../src/sim/spells.hml";
+import { transport_loopback } from "../src/net/transport.hml";
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+fn ck(p_c: bool, p_m: string) {
+    g_n = g_n + 1;
+    if (p_c) { g_ok = g_ok + 1; }
+    else { print(`  FAIL ${p_m}`); }
+}
+
+let g_c = cmd_new();
+let g_tick: i32 = 0;
+
+let g_immortal: i32 = 0;
+fn heal(p_sv: object) {
+    let w = server_world(p_sv);
+    let id: i32 = sim_player_id(w, SV_PSLOT);
+    if (id < 0) { return; }
+    let slot: i32 = world_slot_of(w, id);
+    if (slot < 0) { return; }
+    let hp = w.hp; let hpm = w.hp_max;
+    hp[slot] = hpm[slot];
+}
+fn step(p_sv: object, p_btn: i32, p_mx: f64, p_my: f64, p_yaw: f64) {
+    if (g_immortal == 1) { heal(p_sv); }
+    cmd_set(g_c, g_tick, 16, p_mx, p_my, p_yaw, 0.0, p_btn, 4, g_tick);
+    server_apply_command(p_sv, SV_PSLOT, g_c);
+    server_tick(p_sv, g_tick);
+    g_tick = g_tick + 1;
+}
+
+fn walk_to(p_sv: object, p_x: f64, p_z: f64, p_max: i32): f64 {
+    let w = server_world(p_sv);
+    let i: i32 = 0;
+    let d: f64 = 1e18;
+    while (i < p_max) {
+        let ps = sim_predicted(w, SV_PSLOT);
+        let px: f64 = move_px(ps); let pz: f64 = move_pz(ps);
+        let dx: f64 = p_x - px; let dz: f64 = p_z - pz;
+        d = sqrt(dx*dx + dz*dz);
+        if (d < 2.0) { i = p_max; }
+        else {
+            let yaw: f64 = atan2(dx, 0.0 - dz);
+            step(p_sv, 0, 0.0, 1.0, yaw);
+            i++;
+        }
+    }
+    return d;
+}
+
+fn main() {
+  print("W6 END-TO-END");
+  let net = transport_loopback();
+  let sv = server_new(1337, net);
+  g_tick = server_t0(sv);
+
+  // ---- A. everything is constructed -------------------------------------
+  ck(server_settle(sv) != null, "settlement exists");
+  ck(server_npcs(sv) != null, "npc store exists");
+  ck(melee_equipped(server_melee(sv), SV_PSLOT) == 0, "club equipped at spawn");
+  let st = server_settle(sv);
+  let sx: f64 = settle_cx(st); let sz: f64 = settle_cz(st);
+  let spx: f64 = server_spawn_x(sv); let spz: f64 = server_spawn_z(sv);
+  let d0: f64 = sqrt((sx-spx)*(sx-spx)+(sz-spz)*(sz-spz));
+  print(`  settlement at (${sx}, ${sz}), ${d0} m from spawn, tier ${settle_tier(st)}, ${settle_building_count(st)} buildings`);
+  ck(d0 < 600.0, "settlement is walkable from spawn");
+  ck(settle_building_count(st) >= 2, "camp has buildings");
+
+  // ---- B. melee ----------------------------------------------------------
+  let mx = server_melee(sv);
+  let sw0: i32 = melee_swings(mx, SV_PSLOT);
+  for (let i = 0; i < 4; i++) {
+      step(sv, BTN_MELEE, 0.0, 0.0, 0.0);
+      for (let j = 0; j < 40; j++) { step(sv, 0, 0.0, 0.0, 0.0); }
+  }
+  let sw1: i32 = melee_swings(mx, SV_PSLOT);
+  print(`  melee swings ${sw0} -> ${sw1}`);
+  ck(sw1 >= sw0 + 4, "BTN_MELEE swings the club");
+
+  // ---- C. the lantern, and the Flare ------------------------------------
+  let lx: f64 = server_lantern_x(sv); let lz: f64 = server_lantern_z(sv);
+  let dl: f64 = walk_to(sv, lx, lz, 4000);
+  print(`  walked to the lantern, ${dl} m away after the walk`);
+  ck(dl < 3.0, "reached the lantern");
+  let sp = server_spells(sv);
+  ck(spell_active(sp) < 0, "no spell before the lantern");
+  for (let k = 0; k < 260; k++) { step(sv, BTN_USE, 0.0, 0.0, 0.0); }
+  print(`  lantern lit = ${server_lantern_lit(sv)}, spell in hand = ${spell_active(sp)}`);
+  ck(server_lantern_lit(sv) == 1, "lantern lit by holding USE");
+  ck(spell_active(sp) == 0, "lighting the lantern grants the Flare");
+
+  g_immortal = 1;   // the rest of this probe tests MENUS, not survival
+  // ---- D. cast -----------------------------------------------------------
+  let c0: i32 = sp[SP_CASTS];
+  let oil0: f64 = spell_oil(sp);
+  for (let k2 = 0; k2 < 6; k2++) {
+      step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+      for (let j2 = 0; j2 < 45; j2++) { step(sv, 0, 0.0, 0.0, 0.0); }
+  }
+  let c1: i32 = sp[SP_CASTS];
+  print(`  casts ${c0} -> ${c1}, oil ${oil0} -> ${spell_oil(sp)}`);
+  ck(c1 > c0, "C casts the spell in hand");
+  ck(spell_oil(sp) < oil0, "casting spends oil");
+
+  // ---- E. a stat point ----------------------------------------------------
+  let w = server_world(sv);
+  let pr = sim_progression(w, SV_PSLOT);
+  prog_add_xp(pr, 6000);
+  let sk = server_stats(sv);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  let un0: i32 = stats_unspent(sk, pr);
+  print(`  level ${prog_level(pr)}, unspent points ${un0}`);
+  ck(un0 > 0, "levelling grants stat points");
+  step(sv, BTN_INV, 0.0, 0.0, 0.0);
+  ck(server_ui_panel(sv) == UI_PANEL_CHAR, "TAB opens the character sheet");
+  step(sv, 0, 0.0, 0.0, 0.0);
+  let v0: i32 = stats_get(sk, SK_HANDLING);
+  step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  let v1: i32 = stats_get(sk, SK_HANDLING);
+  print(`  HANDLING ${v0} -> ${v1}, points spent ${server_points_spent(sv)}`);
+  ck(v1 == v0 + 1, "C spends a point on the highlighted stat");
+  step(sv, BTN_SWITCH, 0.0, 0.0, 0.0);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  ck(stats_get(sk, 1) == 1, "X moves the cursor to the next stat");
+  step(sv, BTN_INV, 0.0, 0.0, 0.0);
+  ck(server_ui_panel(sv) == UI_PANEL_NONE, "TAB closes the sheet");
+
+  // ---- F. the settlement, and the people ---------------------------------
+  print(`  BEFORE --town: tier ${settle_tier(st)} named ${npc_named_count(server_npcs(sv))}`);
+  ck(npc_named_count(server_npcs(sv)) == 0, "a camp has no named villagers");
+  server_settle_boot_tier(sv, 2);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  for (let q = 0; q < 130; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
+  print(`  AFTER --town 2: tier ${settle_tier(st)} ever ${settle_tier_ever(st)} bld ${settle_building_count(st)} named ${npc_named_count(server_npcs(sv))} total ${npc_count(server_npcs(sv))}`);
+  ck(settle_tier(st) == 2, "the dev flag boots the settlement to TOWN");
+  ck(npc_named_count(server_npcs(sv)) >= 3, "villagers arrived with the tier");
+
+  let dd: f64 = walk_to(sv, sx, sz, 40000);
+  print(`  walked into the settlement, ${dd} m from the green`);
+  ck(dd < 4.0, "walked into the settlement on foot");
+
+  let l = server_local(sv);
+  print(`  in town: set_inside=${l.set_inside} lux=${l.set_lux} talk_who=${l.talk_who}`);
+
+  // walk to MABEL: DIRECTION.md §6.1's thesis is that the arsenal is a
+  // PERSON, so the trade test has to reach the gunsmith and not just anybody.
+  let sto = server_npcs(sv);
+  let bi: i32 = npc_slot_of(sto, NPC_MABEL);
+  let tx: f64 = npc_x(sto, st, bi, g_tick);
+  let tz: f64 = npc_z(sto, st, bi, g_tick);
+  let dv2: f64 = walk_to(sv, tx, tz, 20000);
+  print(`  nearest villager slot ${bi} at ${dv2} m; talk target = ${server_local(sv).talk_who}`);
+  ck(server_local(sv).talk_who == NPC_MABEL, "Mabel is in talk range");
+
+  // ---- G. talk ------------------------------------------------------------
+  let t0: i32 = server_talks(sv);
+  step(sv, BTN_USE, 0.0, 0.0, 0.0);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  let ll = server_local(sv);
+  print(`  talks ${t0} -> ${server_talks(sv)}, topic ${ll.talk_topic} arg ${ll.talk_arg} regard ${ll.talk_regard}`);
+  ck(server_talks(sv) > t0, "E talks to the villager");
+  ck(ll.talk_topic >= 0, "the villager said something");
+  ck(ll.talk_regard > 0, "talking raises regard");
+
+  // ---- H. trade -----------------------------------------------------------
+  step(sv, BTN_BUILD, 0.0, 0.0, 0.0);
+  step(sv, 0, 0.0, 0.0, 0.0);
+  let who: i32 = server_local(sv).talk_who;
+  print(`  trade panel = ${server_ui_panel(sv)} for ${who}, rows ${server_local(sv).ui_rows}, open mask ${server_local(sv).talk_offers}`);
+  ck(server_ui_panel(sv) == UI_PANEL_TRADE, "T opens the trade panel");
+  ck(server_local(sv).ui_rows > 0, "the villager has rows");
+
+  // find an AMMO row and take it
+  let wst = sim_weapon_state(w);
+  let first: i32 = npc_offer_first(who);
+  let cnt: i32 = npc_offer_count(who);
+  let want: i32 = -1;
+  for (let r = 0; r < cnt; r++) {
+      if (npc_offer_kind(first + r) == 2) { want = r; }   // NPC_OFF_AMMO
+  }
+  print(`  ${who}: ${cnt} rows, ammo row local index ${want}`);
+  if (want >= 0) {
+      let tr0: i32 = server_trades(sv);
+      // move the cursor to `want`
+      let guard: i32 = 0;
+      while (server_local(sv).ui_row != want && guard < 32) {
+          step(sv, BTN_SWITCH, 0.0, 0.0, 0.0);
+          step(sv, 0, 0.0, 0.0, 0.0);
+          guard++;
+      }
+      let a0: f64 = ammo_reserve(w);
+      step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+      step(sv, 0, 0.0, 0.0, 0.0);
+      let a1: f64 = ammo_reserve(w);
+      print(`  reserve ${a0} -> ${a1}, trades ${tr0} -> ${server_trades(sv)}, msg ${server_local(sv).ui_msg}`);
+      ck(a1 > a0, "taking the AMMUNITION row adds reserve");
+      ck(server_trades(sv) > tr0, "the trade counted");
+  } else { ck(false, "an ammo row exists"); }
+
+  // the UNBUILT branch — take a village-gun row and check it says so
+  let gw: i32 = -1;
+  let omask: i32 = server_local(sv).talk_offers;
+  for (let r2 = cnt - 1; r2 >= 0; r2--) {
+      // the FIRST OPEN weapon row: a closed one refuses for the ordinary
+      // reason and would not exercise the UNBUILT branch at all
+      if (npc_offer_kind(first + r2) == 0) {
+          if ((omask & (1 << r2)) != 0) { gw = r2; }
+      }
+  }
+  if (gw >= 0) {
+      let guard2: i32 = 0;
+      while (server_local(sv).ui_row != gw && guard2 < 32) {
+          step(sv, BTN_SWITCH, 0.0, 0.0, 0.0);
+          step(sv, 0, 0.0, 0.0, 0.0);
+          guard2++;
+      }
+      step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+      step(sv, 0, 0.0, 0.0, 0.0);
+      print(`  village-gun row -> ui_msg ${server_local(sv).ui_msg} (UI_MSG_UNBUILT=${UI_MSG_UNBUILT})`);
+      ck(server_local(sv).ui_msg == UI_MSG_UNBUILT, "a gun with no row in weapons.hml says NOT FORGED");
+  }
+
+  // ---- I. determinism of the W6 hash --------------------------------------
+  let h1: i32 = server_w6_hash(sv);
+  let sv2 = server_new(1337, transport_loopback());
+  let h2: i32 = server_w6_hash(sv2);
+  print(`  w6 hash live ${h1}, fresh ${h2}`);
+  ck(h1 != h2, "the hash covers what the player did");
+
+  print(`W6 ${g_ok} / ${g_n}`);
+  if (g_ok != g_n) { exit(1); }
+}
+
+fn ammo_reserve(p_w: object): f64 {
+    let wst = sim_weapon_state(p_w);
+    let tot: f64 = 0.0;
+    for (let i = 0; i < 6; i++) { tot = tot + wst[WS_RES0 + i]; }
+    return tot;
+}
+main();

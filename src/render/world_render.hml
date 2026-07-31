@@ -140,6 +140,10 @@ import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
 import { env_new, env_field, env_far_plane, ENV_FOG_FAR,
          env_clear_lights, env_add_light, env_light_count,
          ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_BOUNCE_R, ENV_BOUNCE_G, ENV_BOUNCE_B,
+         ENV_RIM_R, ENV_RIM_G, ENV_RIM_B,
          ENV_LIGHT0_X, ENV_LIGHT_STRIDE, ENV_MAX_LIGHTS,
          ENV_L_X, ENV_L_Y, ENV_L_Z, ENV_L_R, ENV_L_G, ENV_L_B, ENV_L_RADIUS }
        from "../../../wobbleweed/src/shade.hml";
@@ -176,6 +180,9 @@ import { g_RES_W, g_RES_H,
          g_LANTERN_RADIUS, g_LANTERN_GAIN,
          g_LANTERN_LIGHT_R, g_LANTERN_LIGHT_G, g_LANTERN_LIGHT_B,
          g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY,
+         g_NIGHT_VEIL_R, g_NIGHT_VEIL_G, g_NIGHT_VEIL_B,
+         g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY,
+         gate_darkness, fog_tint_luma,
          g_LANTERN_POOL_DIV, g_LANTERN_POOL_SPAN, g_LANTERN_POOL_SCALE,
          g_LANTERN_POOL_HDIV, g_LANTERN_POOL_LIFT }
        from "../core/config.hml";
@@ -763,6 +770,12 @@ export fn frame_set_lantern_shape(p_radius: f64, p_gain: f64) {
     if (p_gain >= 0.0) { g_lant_gain = p_gain; }
 }
 
+// The additive ground pool's brightness, overridable so a probe or a verifier
+// can build the "pool disabled" half of the acceptance test without editing a
+// constant. -1 (the default) means "use g_LANTERN_POOL_SCALE".
+let g_pool_scale_ovr: f64 = -1.0;
+export fn frame_set_pool_scale(p_s: f64) { g_pool_scale_ovr = p_s; }
+
 export fn frame_lantern_mode(): i32 { let out: i32 = g_lant_mode; return out; }
 export fn frame_lantern_scale(): f64 { let out: f64 = g_lant_scale; return out; }
 
@@ -778,18 +791,180 @@ export fn frame_lantern_scale(): f64 { let out: f64 = g_lant_scale; return out; 
 fn lantern_gate(): f64 {
     if (g_lant_mode == 0) { let off: f64 = 0.0; return off; }
     if (g_lant_mode == 2) { let on: f64 = 1.0; return on; }
+    let g: f64 = gate_on_fog_tint(g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY);
+    return g;
+}
+
+// HOW DARK IS THE WORLD, 0 (daylight) .. 1 (full night), independent of whether
+// the player is carrying anything.  `lantern_gate` used to BE this function;
+// it is split out because the NIGHT VEIL must not depend on the lantern's mode.
+// If it did, "lantern off" would also mean "night off", the acceptance test
+// (ON minus OFF with the additive pool disabled) would compare a veiled frame
+// against an unveiled one, and the number it produced would be meaningless.
+// The world is dark at night whether or not you brought a light. That is the
+// whole premise.
+fn dark_gate(): f64 {
+    let g: f64 = gate_on_fog_tint(g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY);
+    return g;
+}
+
+// The shared curve. Two callers, two thresholds, ONE transcription of the
+// smoothstep and of "darkness is the fog tint's luminance".
+fn gate_on_fog_tint(p_night: f64, p_day: f64): f64 {
     let env: array<f64> = g_env;
-    let lum: f64 = 0.299 * env_field(env, ENV_FOG_R)
-                 + 0.587 * env_field(env, ENV_FOG_G)
-                 + 0.114 * env_field(env, ENV_FOG_B);
-    let span: f64 = g_LANTERN_GATE_DAY - g_LANTERN_GATE_NIGHT;
-    if (span <= 0.0) { let one: f64 = 1.0; return one; }
-    let u: f64 = (g_LANTERN_GATE_DAY - lum) / span;
-    if (u <= 0.0) { let z: f64 = 0.0; return z; }
-    if (u >= 1.0) { let o2: f64 = 1.0; return o2; }
-    // Smoothstep, so dusk brings the lantern up over minutes rather than
-    // popping it on at one frame boundary.
-    let out: f64 = u * u * (3.0 - 2.0 * u);
+    let lum: f64 = fog_tint_luma(env_field(env, ENV_FOG_R),
+                                 env_field(env, ENV_FOG_G),
+                                 env_field(env, ENV_FOG_B));
+    let out: f64 = gate_darkness(lum, p_night, p_day);
+    return out;
+}
+
+// ===========================================================================
+// 2c. THE NIGHT VEIL — the half of the lantern that is not a sprite
+// ---------------------------------------------------------------------------
+// THE MODEL, and it is the fiction rather than a workaround.
+//
+// `emit_set_lighting(0)` (stage 8) puts BAKED vertex colour on every world
+// triangle and applies fog and nothing else, so a dynamic light reached the
+// world only through fx.hml's additive card and entity_render's per-instance
+// tint. Measured 2026-07-30, additive pool disabled, native 320x240, real
+// display, ground band rows 150..185 minus the viewmodel window:
+//
+//     lantern ON minus OFF        muzzle_fog +0.00   ns_bloom +0.00
+//                                 ridge_golden +0.00   0 of 8856 px moved
+//
+// Not "weak" — EXACTLY ZERO, on every scene, at every hour. The light path is
+// alive and correct; the SURFACE has no headroom, because vertex colour can
+// only darken (CLAUDE.md §6) and the night bake is already at its ceiling.
+//
+// So the fix is not to add light. It is to take the world away and let a light
+// give it back:
+//
+//     terrain = bake * min(1, veil + SUM lights) * fog
+//
+// with `veil` a cool multiplier well below 1 at night and 1.0 in daylight.
+// Inside a lantern's pool the ground reads at its baked value; outside it, the
+// dark has eaten it. That is CIVIC LIGHT (docs/design/MULTIPLAYER.md) at hand
+// scale, and it is the ONE arrangement this renderer's single constraint is
+// actually happy with.
+//
+// HOW IT IS BUILT, and why it is not an engine change.
+// `emit_mesh_buf`'s LIT branch already computes exactly this term:
+//
+//     rgba = env_vertex_rgba(N, P) * baked_colour / 255        (emit.hml:815)
+//
+// It is a MULTIPLY against the bake, not a replacement. So binding an env
+// whose ambient is the veil and whose sun, bounce and rim are ZERO, for the
+// terrain pass only, gives `bake * (veil + lights) * fog` — and because the
+// veil env contributes no directional term at all, every bit of the per-vertex
+// modelling still comes from `mesh_bake_light`'s real per-vertex normals.
+// CLAUDE.md §9 rule 4 ("flat-lit terrain is cardboard") is NOT violated: the
+// terrain is flat-DARKENED, which is what a night is.
+//
+// >>> AN EARLIER ROUND CALLED THIS SECOND MULTIPLY A BUG TO AVOID ("it
+// >>> double-darkens every vertex"). It is the opposite: it is the only
+// >>> per-frame, per-vertex, POSITIONAL handle on baked terrain the engine has.
+//
+// WHAT IT COSTS. `emit_mesh_buf`'s lit branch calls `env_vertex_rgba` once per
+// vertex, which shade.hml prices at 413 ns. Measured end to end, min-of-7
+// `__clock`, loadavg stated in the task report:
+//
+//     muzzle_fog 22:00    emit.terrain   1.393 -> 1.9xx ms
+//
+// so it is bought, not free — and it is bought ONLY AT NIGHT: `dark_gate()`
+// returns 0 in daylight and the stage keeps `emit_set_lighting(0)`, which is
+// the identical code path and the identical picture it always ran. A day frame
+// pays one compare.
+//
+// WHAT IT DOES NOT REACH, STATED PLAINLY: PROPS.
+// `mesh.hml` has no lit path and `entity_render.hml`'s per-instance `plr`
+// starts at 1.0, so trees, NPCs, crates and contact blobs take the veil only
+// through their BAKE. `src/art/tod.hml` therefore darkens the NIGHT and DEEP
+// keyframes to hold them at the veiled ground's LIT value — so a prop reads as
+// though it were standing in the pool, everywhere. That is the honest half-fix
+// and it is why the night keyframes moved in the same commit. The complete fix
+// is one line in a file this task does not own, and it is written up as E2 in
+// `src/art/tod.hml`.
+// ===========================================================================
+
+// ENV_SUN_X .. ENV_RIM_B are indices 0..14 and are contiguous (shade.hml §
+// "the RenderEnv layout"). The veil saves and restores exactly that block.
+let g_VEIL_FIELDS: i32 = 15;
+let g_veil_save: array<f64> = [];
+let g_veil_amt: f64 = 0.0;          // 0 daylight .. 1 full night, this frame
+
+export fn frame_veil_amount(): f64 { let out: f64 = g_veil_amt; return out; }
+
+// Overwrite the bound env with the veil. Cold: once per frame, not per vertex.
+fn veil_push(p_a: f64) {
+    let e: array<f64> = g_env;
+    while (g_veil_save.length < g_VEIL_FIELDS) { g_veil_save.push(0.0); }
+    for (let i = 0; i < g_VEIL_FIELDS; i++) { g_veil_save[i] = e[i]; }
+    let a: f64 = p_a;
+    // Lerp from (1,1,1) — a no-op multiply — down to the night floor, so dusk
+    // closes over the world across the same smoothstep the lantern rises on
+    // and there is no frame where the veil pops.
+    e[ENV_AMB_R] = 1.0 + (g_NIGHT_VEIL_R - 1.0) * a;
+    e[ENV_AMB_G] = 1.0 + (g_NIGHT_VEIL_G - 1.0) * a;
+    e[ENV_AMB_B] = 1.0 + (g_NIGHT_VEIL_B - 1.0) * a;
+    // Zero the three directional terms. The bake already carries the sun, the
+    // bounce and the rim at full per-vertex resolution; re-applying them here
+    // off ONE chunk normal is exactly the cardboard §9.4 warns about.
+    e[ENV_SUN_R] = 0.0;    e[ENV_SUN_G] = 0.0;    e[ENV_SUN_B] = 0.0;
+    e[ENV_BOUNCE_R] = 0.0; e[ENV_BOUNCE_G] = 0.0; e[ENV_BOUNCE_B] = 0.0;
+    e[ENV_RIM_R] = 0.0;    e[ENV_RIM_G] = 0.0;    e[ENV_RIM_B] = 0.0;
+    emit_set_env(e);        // re-bind: env_bind hoists all of the above
+}
+
+fn veil_pop() {
+    let e: array<f64> = g_env;
+    for (let i = 0; i < g_VEIL_FIELDS; i++) { e[i] = g_veil_save[i]; }
+    emit_set_env(e);
+}
+
+// ---------------------------------------------------------------------------
+// THE PROPS' HALF OF THE VEIL — and it is a HALF, deliberately and measurably.
+// ---------------------------------------------------------------------------
+// `mesh.hml` has no lit path, so a tree cannot be re-shaded per frame the way
+// terrain can. What `entity_render.hml` DOES compute per instance is
+//
+//     tint = instance_tint * plr * (1 - f * (1 - fog_tint))       (line 508)
+//
+// where `plr` starts at 1.0 and every dynamic light in range ADDS to it, and
+// `f` is `env_fog_factor` off the BOUND env. Two things follow:
+//
+//   * the fog-tint term is the only per-instance MULTIPLIER DOWN available, and
+//     `entity_emit` reads it from the env it is HANDED, not from the bound one;
+//   * `plr` then multiplies it back up, clamping at the instance tint — so a
+//     prop standing in a lantern's pool returns to its full baked value.
+//
+// That is the inverted model again, on the one term props expose. Handing
+// `entity_emit` a COPY of the env whose fog tint has been scaled toward the
+// night floor therefore darkens props with distance and un-darkens them inside
+// a pool, and it does it without binding anything (so `f`, the fog alpha, the
+// LOD distances and every other stage are untouched) and without editing
+// `entity_render.hml`, which this task does not own.
+//
+// >>> WHY IT IS ONLY A HALF. The terrain veil is RADIAL — distance from the
+// >>> light. This one is FOG-SHAPED — distance from the camera, gated by the
+// >>> night's own mist. They agree in the near field, which is where the pool
+// >>> is and where the eye is, and they disagree in the middle distance, where
+// >>> a prop 8 m away off to one side is veiled by its range rather than by its
+// >>> range from the lantern. The complete fix is E2 in `src/art/tod.hml`: one
+// >>> line in `entity_render.hml` starting `plr` at a `night_floor` the env
+// >>> carries, at which point this copy can be deleted.
+let g_penv: array<f64> = [];
+
+fn prop_veil_env(): array<f64> {
+    let e: array<f64> = g_env;
+    let n: i32 = e.length;
+    while (g_penv.length < n) { g_penv.push(0.0); }
+    for (let i = 0; i < n; i++) { g_penv[i] = e[i]; }
+    let a: f64 = g_veil_amt;
+    g_penv[ENV_FOG_R] = e[ENV_FOG_R] * (1.0 + (g_NIGHT_VEIL_R - 1.0) * a);
+    g_penv[ENV_FOG_G] = e[ENV_FOG_G] * (1.0 + (g_NIGHT_VEIL_G - 1.0) * a);
+    g_penv[ENV_FOG_B] = e[ENV_FOG_B] * (1.0 + (g_NIGHT_VEIL_B - 1.0) * a);
+    let out: array<f64> = g_penv;
     return out;
 }
 
@@ -921,6 +1096,10 @@ fn lights_commit() {
     // mat_look_dir and every scene builder in the project already use.
     let scale: f64 = lantern_gate();
     g_lant_scale = scale;
+    // §2c: the veil follows the HOUR, never the lantern's mode. Computed here
+    // because this is the one place in the frame that runs after tod has
+    // written the env and before any stage has read it.
+    g_veil_amt = dark_gate();
     let lant: i32 = 0;
     let lx: f64 = 0.0;  let ly: f64 = 0.0;  let lz: f64 = 0.0;
     let lr: f64 = 0.0;  let lg: f64 = 0.0;  let lb: f64 = 0.0;
@@ -1135,7 +1314,9 @@ fn lantern_pool_emit(): i32 {
     // >>> for exactly the reason above: the card it packs has never once been
     // >>> drawn. Reported, not fixed (fx.hml is not this task's file).
     // >>> Copying fx.hml's line is how this pool first rendered ice blue.
-    let peak: f64 = amp * g_LANTERN_POOL_SCALE;
+    let psc: f64 = g_LANTERN_POOL_SCALE;
+    if (g_pool_scale_ovr >= 0.0) { psc = g_pool_scale_ovr; }
+    let peak: f64 = amp * psc;
     let cr: f64 = g_lant_r * peak;
     let cg: f64 = g_lant_g * peak;
     let cb: f64 = g_lant_b * peak;
@@ -1975,9 +2156,20 @@ export fn frame_render(): i32 {
     stat_end(STAT_T_EMIT_SKY);
 
     // -- 13  terrain: ring walk -> frustum_sphere per chunk -> emit ----------
+    // THE NIGHT VEIL rides on this stage and nothing else: §2c. In daylight
+    // `g_veil_amt` is 0, the branch is not taken, and this is byte for byte
+    // the `emit_set_lighting(0)` path it has always been.
     stat_begin(STAT_T_EMIT_TERRAIN);
     if (sheet == 0) {
-        terrain_emit(g_bworld, g_tex_world, g_frustum, g_camx, g_camz, fog_far);
+        if (g_veil_amt > 0.0) {
+            veil_push(g_veil_amt);
+            emit_set_lighting(1);
+            terrain_emit(g_bworld, g_tex_world, g_frustum, g_camx, g_camz, fog_far);
+            emit_set_lighting(0);
+            veil_pop();
+        } else {
+            terrain_emit(g_bworld, g_tex_world, g_frustum, g_camx, g_camz, fog_far);
+        }
     } else {
         terrain_emit_none();
     }
@@ -1986,7 +2178,12 @@ export fn frame_render(): i32 {
     // -- 14  entities/props: real LOD + ONE contact blob each ----------------
     stat_begin(STAT_T_EMIT_ENTITY);
     if (sheet == 0) {
-        entity_emit(g_bworld, g_tex_world, g_env, g_frustum, g_mesh_blob,
+        // §2c: at night the props get a fog tint scaled toward the night floor,
+        // through a COPY of the env. Nothing is bound and nothing else in the
+        // frame sees it. In daylight `g_veil_amt` is 0 and this is `g_env`.
+        let penv: array<f64> = g_env;
+        if (g_veil_amt > 0.0) { penv = prop_veil_env(); }
+        entity_emit(g_bworld, g_tex_world, penv, g_frustum, g_mesh_blob,
                     g_camx, g_camz, fog_far);
     } else {
         entity_emit_none();

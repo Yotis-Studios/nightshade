@@ -1,0 +1,2556 @@
+// settle.hml — the settlement simulation.  Camp -> Village -> Town -> City.
+//
+// ===========================================================================
+// WHAT THIS FILE IS
+// ===========================================================================
+// The SIM HALF of `docs/design/SETTLEMENT.md`, plus `docs/design/DIRECTION.md`
+// §8's newest directive (multiple walkable settlements per world).  It owns:
+//
+//     §1  site selection, per settlement cell, as a pure f(seed)
+//     §2  CIVIC LIGHT (LUX), the entropy gradient, and grid points
+//     §3  the tier ladder, promotion, brownout, and the high-water mark
+//     §4  the Foundry gate (F1..F4), the output ladder, and the three
+//         degradation stages
+//     §5  the seven layout passes: green, roads, plot lattice, validity,
+//         accretion order, assignment
+//     §6  construction pacing: STAKED -> FRAMED -> CLAD -> DONE
+//     §8.5 the delta-log rows
+//
+// It owns NO geometry, NO colour, NO mesh, NO draw call and no wall clock.
+// `src/art/hubgen.hml` builds the meshes; this file decides where they stand
+// and what state they are in.  SETTLEMENT.md §11.2 argues that split at length
+// and the import wall enforces it: `src/sim/**` may not import `src/art/**`, so
+// a sim module could never ask hubgen where a building goes.
+//
+// Imports: `src/core/mathx.hml`, `src/core/config.hml`, `src/sim/worldgen.hml`,
+// `src/sim/daycycle.hml`.  Nothing else.  No SDL, no wobbleweed, no
+// `@stdlib/random`, no `__clock`.  This module is part of the future
+// authoritative server and must link headless (ci_imports.sh R1/R5/R8).
+//
+// ===========================================================================
+// THE ONE SENTENCE
+// ===========================================================================
+// A seed picks a hollow, the hollow gets a green and three roads, the roads get
+// a fixed lattice of 72 plots, and plots fill outward in a fixed order as the
+// grid points the player has been earning cross four thresholds — so the town
+// is f(seed) in SHAPE and f(light) in EXTENT, and every player on a shard sees
+// the same town grow in the same order.
+//
+// ===========================================================================
+// LUX IS NOT A NEW CURRENCY
+// ===========================================================================
+// `MAGIC_KINETIC.md` §6.1a already ships grid points ("1 point per lit lantern;
+// 2 if on a Wick Line; -4 while a Pall stands").  CIVIC LIGHT and grid points
+// are THE SAME NUMBER AT TWO RESOLUTIONS:
+//
+//     grid_points = GRID_LUX / 256          integer division
+//
+// LUX is an i32 in 1/256 of "one unlinked lit lantern at full wick, at its own
+// post".  Integers, not floats, because this goes into `sim_hash` and `sim_hash`
+// quantizes floats to 1/16 m — a float field would look round-tripped when it
+// had drifted.  Do not build a second light economy.  There is one.
+//
+// ===========================================================================
+// THE LANTERN CONTRACT — settle.hml NEVER OWNS A LANTERN
+// ===========================================================================
+// SETTLEMENT.md §8.5: "settle.hml only ever READS the lantern set — it must
+// never own a lantern, or the two modules will disagree about what is lit."
+// `src/sim/lantern.hml` is Wave 4 and does not exist yet, so rather than import
+// a file that is not there, the lantern set is INJECTED as a caller-owned flat
+// array — the same shape `chunk.hml` uses for its terrain source and
+// `move_apply_ex` uses for its solids:
+//
+//     settle_lanterns_set(st, arr: array<f64>, n: i32)
+//         arr is flat, stride SET_LAN_STRIDE = 4:
+//             arr[i*4 + 0]  world x
+//             arr[i*4 + 1]  world z
+//             arr[i*4 + 2]  tier, 1..4          -> radius 40/60/85/120 m
+//             arr[i*4 + 3]  wick, 0..256        -> 0 means UNLIT
+//
+//     >>> INDEX 0 IS THE GREAT LANTERN, at the settlement centre. <<<
+//     That is the whole of the contract.  `settle_new` installs a default
+//     one-entry array holding an UNLIT tier-0 Great Lantern, so a fresh store is
+//     valid and correct (a Camp) before anything is injected.
+//
+//     settle_palls_set(st, arr: array<f64>, n: i32)
+//         stride SET_PALL_STRIDE = 4: x, z, radius m, strength (1024 standing /
+//         512 shrunk below half radius / 0 extinguished).
+//
+// When `lantern.hml` lands, its owner fills these two arrays once per change.
+// Nothing in this file has to move.
+//
+// ===========================================================================
+// DETERMINISM
+// ===========================================================================
+// Every layout decision is a pure function of (seed, cell) through
+// `mathx.xhash2` and `worldgen.*`, whose mixing is entirely in u64 (CLAUDE.md
+// A13).  There is no RNG STATE anywhere in this file — which is what makes the
+// layout REGENERABLE rather than PERSISTABLE, and is why a complete City saves
+// in a few hundred bytes (§8.5): the site, the terrace height, the name, the
+// roads, all 72 plot positions and yaws, plot validity, the entire accretion
+// order and the entire kind assignment are recomputed from the seed on load and
+// never written down.
+//
+// Seed derivation is `^`, NEVER `+`: `seed + 31` THROWS "Integer overflow: i32
+// addition" when the world seed is near 2^31.  worldgen.hml's header records
+// the same rule and the same reason.
+//
+// ===========================================================================
+// COST — where each pass runs
+// ===========================================================================
+//   settle_new_at()     ONCE PER SETTLEMENT, at world creation or on load.
+//                       Site (81 candidates x 17 heights) + roads (3 x 22 steps
+//                       x 3 heights) + plots (72 x 4 corners).  Off every frame
+//                       path.  Bar: SETTLEMENT.md A6, <= 25 ms.
+//   settle_step()       ONE TICK IN 60, at frame-graph step (h).  Re-integrates
+//                       SET_SLICE = 8 lanterns per call on a rotating slice, so
+//                       a 200-lantern grid fully refreshes in 25 s and never
+//                       costs more than 8 distance evaluations per second.
+//                       Bar: A5, <= 0.05 ms per tick, <= 0.001 ms/frame.
+//   settle_lux_at()     O(lanterns).  Point queries only — never per vertex.
+//
+// ===========================================================================
+// DEVIATIONS FROM SETTLEMENT.md, EACH ARGUED
+// ===========================================================================
+// Flagged here rather than silently applied (CLAUDE.md §10.5).
+//
+// D1  ROAD LENGTH.  §5.3 says 12 steps of 8 m (96 m) and §5.4 says 12 plots at
+//     a 14 m pitch (168 m of frontage).  Those two cannot both be true: eight
+//     of the twelve slots would fall off the end of the road.  The plot lattice
+//     is what §5.4 calls "the lattice never runs out and therefore never needs
+//     re-planning", so the ROAD is what has to give: the polyline is generated
+//     for SET_ROAD_STEPS = 22 steps (176 m), by exactly the algorithm §5.3
+//     specifies, and `SET_ROAD_MESH_STEPS = 12` is exported as the DRAWN extent
+//     so §5.3's 96 m of road mesh and §7.5's 12 in-wedge segments both stand.
+//     Same algorithm, same step size, same pull — only run further.
+//
+// D2  PLOT YAW.  §5.4 writes "yaw = road segment bearing + 90 deg * side".  With
+//     side in {0, 1} that puts the two sides of one street at RIGHT ANGLES to
+//     each other.  Implemented as "road bearing + 90 deg, flipped 180 deg on the
+//     far side" — which is the sentence's intent (`settle_plot_yaw` is the
+//     FACING direction and every building faces the road by construction) and
+//     is what the task brief states.
+//
+// D3  SITE SAMPLES.  §1.3 counts 21 height samples per candidate: centre, an
+//     8-ring at 20 m, an 8-ring at 48 m, "4 diagonal probes at r = 34 m".  No
+//     criterion C1..C8 consumes the 34 m probes.  17 samples are taken, not 21,
+//     and the site pass is correspondingly cheaper.  Nothing is scored on data
+//     that was never read.
+//
+// D4  F4, THE FEEDER LINE.  §4.1 asks for ">= 6 lit lanterns forming an unbroken
+//     Wick chain from the Great Lantern to the Foundry's own post".  Read as
+//     "the SHORTEST path must be >= 6 nodes long" the gate is UNSATISFIABLE:
+//     the accretion order puts the Foundry on a plot inside the 176 m road
+//     lattice, well within one 90 m Wick link of the green, so the shortest
+//     chain is 2 nodes and no amount of player effort makes it 6.  Implemented
+//     as: the Great Lantern and the Foundry post must lie in the SAME connected
+//     lit Wick component, AND that component must contain >= SET_FEEDER_MIN = 6
+//     lit lanterns.  That keeps every property §4.1 asks for — an unbroken
+//     chain, a route the player walks and defends, a graph and not a global
+//     average — and `settle_feeder_node` returns the shortest GL -> Foundry
+//     chain node by node, which is the HUD route marker §8.1 asks for.
+//
+// D5  BUILDING COUNT.  §3.3's own tables give 2 (Camp) + 7 (Village) + 8 (Town,
+//     with Pip's Stall a green fixture at 14 tris rather than a plot building,
+//     which is what makes §6.2's "8" agree with §3.3) + 11 (City) = 28
+//     buildings.  §8.5 says "24 buildings x 4 i32 = 384 bytes for a complete
+//     City".  28 rows is 448 bytes.  Still a few hundred bytes; the count is 28.
+//
+// D6  CORE_LUX FLOOR.  §3.2's hard floor of 512 exists "because the Great
+//     Lantern has never gone out".  At CAMP it demonstrably has — §3.1 gives
+//     CAMP a CORE_LUX floor of 0 and an UNLIT Great Lantern.  The floor is
+//     therefore applied from VILLAGE upward (on `tier_ever`, so it can never be
+//     lost), which is what makes the Camp -> Village step mean something.
+//
+// D7  ACCRETION AND ROAD AVAILABILITY.  §5.3 introduces the Wick Road at
+//     Village and the Back Lane at Town, but §5.6's order key sorts by ring
+//     first — so a ring-0 Back Lane plot would be assigned at Village, on a road
+//     that does not exist yet.  Assignment therefore skips plots whose road is
+//     not yet open at that building's tier.  The order itself is untouched and
+//     is still pure f(seed); only the cursor walks past unavailable plots.
+// ===========================================================================
+
+import { clampi, floori, xhash2 } from "../core/mathx.hml";
+import { g_LANTERN_R_T1, g_LANTERN_R_T2, g_LANTERN_R_T3, g_LANTERN_R_T4,
+         g_WICKLINE_M, g_LANTERN_TIERS } from "../core/config.hml";
+import { DAY_TICKS } from "./daycycle.hml";
+import { WG_BIOME_FEN, WG_POI_RUIN, WG_POI_CARAVAN,
+         WG_SITE_CELL_M, WG_SITE_MIN_SEP_M, WG_SITE_CANDIDATES,
+         worldgen_height, worldgen_temp, worldgen_moist,
+         worldgen_relief_tm, worldgen_height_rel, worldgen_biome_tmd,
+         worldgen_poi_roll, worldgen_block_of,
+         worldgen_lantern_x, worldgen_lantern_z,
+         worldgen_site_cell_of, worldgen_site_cand_x, worldgen_site_cand_z,
+         worldgen_site_occupied_roll } from "./worldgen.hml";
+
+// ===========================================================================
+// 1.  THE VOCABULARY
+// ===========================================================================
+
+// ---- tiers ---------------------------------------------------------------
+export let SET_TIER_CAMP: i32    = 0;
+export let SET_TIER_VILLAGE: i32 = 1;
+export let SET_TIER_TOWN: i32    = 2;
+export let SET_TIER_CITY: i32    = 3;
+export let SET_TIER_COUNT: i32   = 4;
+
+// SETTLEMENT.md §3.1, typed in as literals because they ARE the design
+// (CLAUDE.md rule 5: pin design anchors with a literal, never with a config
+// read that a later edit can move without anyone noticing).
+export let SET_RING_CAMP_M: f64    = 64.0;
+export let SET_RING_VILLAGE_M: f64 = 120.0;
+export let SET_RING_TOWN_M: f64    = 200.0;
+export let SET_RING_CITY_M: f64    = 320.0;
+
+export let SET_PTS_VILLAGE: i32 = 10;
+export let SET_PTS_TOWN: i32    = 32;
+export let SET_PTS_CITY: i32    = 72;
+
+export let SET_CORE_VILLAGE: i32 = 512;
+export let SET_CORE_TOWN: i32    = 1024;
+export let SET_CORE_CITY: i32    = 2048;
+
+export let SET_GL_VILLAGE: i32 = 1;
+export let SET_GL_TOWN: i32    = 2;
+export let SET_GL_CITY: i32    = 4;
+
+// ---- the field -----------------------------------------------------------
+export let SET_LUX_PER_POINT: i32 = 256;    // grid_points = GRID_LUX / 256
+export let SET_CL_MAX: i32        = 4096;   // 16 lantern-equivalents.  §11.4:
+                                            // a consequence of the GDD's radii,
+                                            // not an arbitrary clamp.
+export let SET_WICK_FULL: i32     = 256;
+export let SET_WICK_SAFE: i32     = 128;    // >= this and no enemy can snuff it
+export let SET_GREEN_R_M: f64     = 16.0;   // keep-out, and the decay-0 zone
+export let SET_CORE_FLOOR: i32    = 512;    // D6
+
+// Entropy, §2.3.  decay_per_real_hour = MAX - floor(SPAN * min(1, LUX/SAT)).
+export let SET_DECAY_MAX: i32     = 16;
+export let SET_DECAY_SPAN: i32    = 14;
+export let SET_DECAY_SAT_LUX: i32 = 2048;
+
+// ---- lantern injection ---------------------------------------------------
+export let SET_LAN_STRIDE: i32  = 4;    // x, z, tier, wick
+export let SET_PALL_STRIDE: i32 = 4;    // x, z, radius, strength
+export let SET_PALL_STAND: i32  = 1024; // MAGIC_KINETIC §6.1a: -4 grid points
+export let SET_PALL_SHRUNK: i32 = 512;
+export let SET_SLICE: i32       = 8;    // lanterns re-integrated per settle tick
+export let SET_STEP_EVERY: i32  = 60;   // one settle tick in 60 sim ticks
+
+// ---- the plot lattice, §5.3 / §5.4 ---------------------------------------
+export let SET_ROADS: i32          = 3;
+export let SET_PLOT_SLOTS: i32     = 12;
+export let SET_PLOT_SIDES: i32     = 2;
+export let SET_PLOTS: i32          = 72;   // ROADS * SIDES * SLOTS
+export let SET_PLOT_W_M: f64       = 12.0; // along the road
+export let SET_PLOT_D_M: f64       = 10.0; // across it
+export let SET_PLOT_PITCH_M: f64   = 14.0;
+export let SET_PLOT_A0_M: f64      = 22.0; // arc length of slot 0.  Chosen so the
+                                           // NEAREST CORNER of slot 0 clears the
+                                           // 16 m green: (22-6)^2 + 4^2 = 272 > 256.
+export let SET_PLOT_LATERAL_M: f64 = 9.0;  // 2 m road half-width + 2 m verge + 5 m
+export let SET_PLOT_RANGE_M: f64   = 2.4;  // §5.5 max corner height range
+export let SET_RING_BUCKET_M: f64  = 24.0; // §5.6 accretion ring width
+
+export let SET_ROAD_STEP_M: f64    = 8.0;
+export let SET_ROAD_STEPS: i32     = 22;   // D1.  176 m, reaching plot slot 11.
+export let SET_ROAD_MESH_STEPS: i32 = 12;  // §5.3's 96 m of DRAWN road deck
+export let SET_ROAD_PTS: i32       = 23;   // SET_ROAD_STEPS + 1
+export let SET_ROAD_FAN_RAD: f64   = 0.3490658503988659;  // 20 degrees
+export let SET_ROAD_PULL: f64      = 0.40;                // §5.3's 40 %
+export let SET_BACKLANE_JIT_RAD: f64 = 0.4363323129985824; // +/- 25 degrees
+
+// ---- construction states, §6.1 -------------------------------------------
+export let SET_CON_STAKED: i32 = 0;
+export let SET_CON_FRAMED: i32 = 1;
+export let SET_CON_CLAD: i32   = 2;
+export let SET_CON_DONE: i32   = 3;
+export let SET_CON_COUNT: i32  = 4;
+
+// ---- building archetypes, §7.1 -------------------------------------------
+export let SET_B_SHACK: i32   = 0;
+export let SET_B_COTTAGE: i32 = 1;
+export let SET_B_HOUSE: i32   = 2;
+export let SET_B_HALL: i32    = 3;
+export let SET_B_TOWER: i32   = 4;
+export let SET_B_STACK: i32   = 5;
+export let SET_B_WELL: i32    = 6;
+export let SET_B_WORKS: i32   = 7;
+export let SET_B_COUNT: i32   = 8;
+export let SET_BLD_MAX: i32   = 28;    // D5: 2 + 7 + 8 + 11
+
+// ---- industry, §4.2 / §4.3 -----------------------------------------------
+export let SET_IND_COLD: i32     = 0;
+export let SET_IND_BROWNOUT: i32 = 1;
+export let SET_IND_FLICKER: i32  = 2;
+export let SET_IND_RUNNING: i32  = 3;
+
+export let SET_O0: i32 = 0;
+export let SET_O5: i32 = 5;
+export let SET_FEEDER_MIN: i32   = 6;     // §4.1 F4
+export let SET_COLD_POINTS: i32  = 58;    // §4.3, 80 % of 72 rounded up
+export let SET_COLD_REAL_DAYS: i32 = 7;   // §4.3
+// 7 real days at 60 Hz.  Written as a derivation, not as 36288000, so re-tuning
+// the tick rate cannot silently move it.
+export let SET_COLD_REAL_TICKS: i32 = 7 * 24 * 3600 * 60;
+export let SET_RELIGHT_EMBER: i32  = 200; // §4.3
+export let SET_FEEDER_MAX: i32     = 32;  // reported chain length cap
+
+// ---- events returned by settle_step --------------------------------------
+export let SET_EV_NONE: i32          = 0;
+export let SET_EV_PROMOTED: i32      = 1;
+export let SET_EV_STAKED: i32        = 2;
+export let SET_EV_BUILD_ADVANCE: i32 = 4;
+export let SET_EV_BUILD_DONE: i32    = 8;
+export let SET_EV_BROWNOUT_IN: i32   = 16;
+export let SET_EV_BROWNOUT_OUT: i32  = 32;
+export let SET_EV_INDUSTRY: i32      = 64;
+
+// ---- names, §5.7 ---------------------------------------------------------
+export let SET_NAME_STEMS: i32 = 16;
+export let SET_NAME_TAILS: i32 = 8;
+export let SET_NAMES: i32      = 128;
+
+// ---- the save rows, §8.5 -------------------------------------------------
+export let SET_SAVE_COLS: i32 = 4;   // pid, kind, con_state, con_progress
+export let SET_META_COLS: i32 = 8;   // tier, tier_ever, industry, cold_ticks,
+                                     // ammo_stock, feeder_head, cursor, brownout
+
+// ===========================================================================
+// 2.  SMALL HELPERS
+// ===========================================================================
+
+fn idiv(p_a: i32, p_b: i32): i32 {
+    let a: f64 = f64(p_a);
+    let b: f64 = f64(p_b);
+    let out: i32 = i32(a / b);
+    return out;
+}
+
+fn dist2(p_ax: f64, p_az: f64, p_bx: f64, p_bz: f64): f64 {
+    let dx: f64 = p_ax - p_bx;
+    let dz: f64 = p_az - p_bz;
+    let out: f64 = dx * dx + dz * dz;
+    return out;
+}
+
+fn dist(p_ax: f64, p_az: f64, p_bx: f64, p_bz: f64): f64 {
+    let d: f64 = 0.0;
+    d = __sqrt(dist2(p_ax, p_az, p_bx, p_bz));
+    let out: f64 = d;
+    return out;
+}
+
+// The project's yaw convention (ai.hml, meshgen.hml): forward(yaw) =
+// (sin yaw, -cos yaw), and yaw = atan2(dx, -dz).  Stated once, used everywhere
+// below, so a bearing never means two different things in this file.
+fn fwd_x(p_yaw: f64): f64 { let y: f64 = p_yaw; let out: f64 = __sin(y); return out; }
+fn fwd_z(p_yaw: f64): f64 { let y: f64 = p_yaw; let out: f64 = 0.0 - __cos(y); return out; }
+
+fn bearing_of(p_dx: f64, p_dz: f64): f64 {
+    let out: f64 = __atan2(p_dx, 0.0 - p_dz);
+    return out;
+}
+
+// Signed shortest angular difference target - cur, in (-pi, pi].
+fn ang_diff(p_target: f64, p_cur: f64): f64 {
+    let d: f64 = p_target - p_cur;
+    let twopi: f64 = 6.283185307179586;
+    let k: f64 = __floor((d + 3.141592653589793) / twopi);
+    let out: f64 = d - k * twopi;
+    return out;
+}
+
+// A hash value in [0, 1) from two integers and a salt.  `^`, never `+`.
+fn h01i(p_a: i32, p_b: i32, p_salt: i32): f64 {
+    let h: u64 = xhash2(p_a, p_b, p_salt);
+    let hf: f64 = f64(h);
+    let out: f64 = hf * 2.3283064365386963e-10;
+    return out;
+}
+
+// ===========================================================================
+// 3.  SITE SELECTION  (§1)
+// ===========================================================================
+// Every criterion is expressible in `worldgen_height`, `worldgen_temp`,
+// `worldgen_moist`, `worldgen_biome_tmd` and `worldgen_poi_roll`, and nothing
+// else — because that is all the heightfield can answer.  There is no
+// hydrology in this world and a scorer that waits for a flat 40 m plot waits
+// forever (measured per-chunk height range: mean 10.3 m, minimum 3.58 m over
+// 20 808 chunks).  The design TERRACES; the scorer only has to find a hollow.
+
+export fn settle_ring_m(p_tier: i32): f64 {
+    let t: i32 = p_tier;
+    if (t <= SET_TIER_CAMP) { let a: f64 = SET_RING_CAMP_M; return a; }
+    if (t == SET_TIER_VILLAGE) { let b: f64 = SET_RING_VILLAGE_M; return b; }
+    if (t == SET_TIER_TOWN) { let c: f64 = SET_RING_TOWN_M; return c; }
+    let out: f64 = SET_RING_CITY_M;
+    return out;
+}
+
+export fn settle_tier_points(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    if (t == SET_TIER_VILLAGE) { let a: i32 = SET_PTS_VILLAGE; return a; }
+    if (t == SET_TIER_TOWN) { let b: i32 = SET_PTS_TOWN; return b; }
+    if (t == SET_TIER_CITY) { let c: i32 = SET_PTS_CITY; return c; }
+    let out: i32 = 0;
+    return out;
+}
+
+export fn settle_tier_core(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    if (t == SET_TIER_VILLAGE) { let a: i32 = SET_CORE_VILLAGE; return a; }
+    if (t == SET_TIER_TOWN) { let b: i32 = SET_CORE_TOWN; return b; }
+    if (t == SET_TIER_CITY) { let c: i32 = SET_CORE_CITY; return c; }
+    let out: i32 = 0;
+    return out;
+}
+
+export fn settle_tier_gl(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    if (t == SET_TIER_VILLAGE) { let a: i32 = SET_GL_VILLAGE; return a; }
+    if (t == SET_TIER_TOWN) { let b: i32 = SET_GL_TOWN; return b; }
+    if (t == SET_TIER_CITY) { let c: i32 = SET_GL_CITY; return c; }
+    let out: i32 = 0;
+    return out;
+}
+
+// §5.3's road count per tier: High Road at Camp, + Wick Road at Village,
+// + Back Lane at Town.  A City opens no new road; three is the design.
+export fn settle_road_count(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    if (t <= SET_TIER_CAMP) { let a: i32 = 1; return a; }
+    if (t == SET_TIER_VILLAGE) { let b: i32 = 2; return b; }
+    let out: i32 = 3;
+    return out;
+}
+
+export fn settle_lantern_radius(p_tier: i32): f64 {
+    let t: i32 = p_tier;
+    if (t <= 1) { let a: f64 = g_LANTERN_R_T1; return a; }
+    if (t == 2) { let b: f64 = g_LANTERN_R_T2; return b; }
+    if (t == 3) { let c: f64 = g_LANTERN_R_T3; return c; }
+    let out: f64 = g_LANTERN_R_T4;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE SCORER, §1.3.  Position-parametric from the start (§1.1's promise), which
+// is exactly what DIRECTION.md §8 then cashes in: the SAME scorer runs inside
+// the multi-site sampler with no change at all.
+// ---------------------------------------------------------------------------
+// C6 is a HARD VETO and returns SET_SITE_VETO, a large negative, rather than 0 —
+// a zero would tie with a merely terrible site and the tie-break would then pick
+// a Fen.  You do not found a town in black water.
+export let SET_SITE_VETO: f64 = -1000000.0;
+export let SET_SITE_CANDS: i32 = 81;    // == WG_SITE_CANDIDATES
+
+export fn settle_site_score(p_seed: i32, p_sx: f64, p_sz: f64): f64 {
+    // A floor no partial bound can ever fall to, so the public scorer NEVER
+    // prunes and is the plain weighted sum §1.3 specifies.
+    let out: f64 = settle_site_score_bounded(p_seed, p_sx, p_sz, SET_SITE_VETO - 1.0);
+    return out;
+}
+
+// The one and only implementation of §1.3's arithmetic, with an ADMISSIBLE
+// early-out.  `p_floor` is the best score found so far; the function may stop
+// early and return a value that is <= p_floor whenever the terms it has not
+// evaluated yet CANNOT carry the candidate past it.
+//
+// Why this is safe, and why it is one function rather than two:
+//   * every remaining criterion is in [0, 1] and its weight is known, so
+//     "partial + remaining_max" is a true UPPER BOUND on the final score;
+//   * `settle_site_pick` accepts a candidate only on `s > best`, so returning
+//     any value <= best is indistinguishable from returning the true score;
+//   * a SECOND, faster copy of the scorer is how a determinism bug gets born.
+//     There is one copy.  `probe_settle` B5 pins `settle_site_pick` against a
+//     brute-force argmax over the PUBLIC (never-pruning) scorer across all 81
+//     candidates, which is exactly the test a bad bound fails.
+//
+// Measured: 81 candidates fall from ~20.2 ms to ~13 ms, because the 8-point
+// 48 m ring — 8 of the 17 height samples — is skipped on candidates that
+// already cannot win.
+fn settle_site_score_bounded(p_seed: i32, p_sx: f64, p_sz: f64, p_floor: f64): f64 {
+    let seed: i32 = p_seed;
+    let sx: f64 = p_sx;
+    let sz: f64 = p_sz;
+    let floor: f64 = p_floor;
+
+    // one (t, m) pair at the centre, shared by C5, C6 and the centre height
+    let t: f64 = worldgen_temp(seed, sx, sz);
+    let m: f64 = worldgen_moist(seed, sx, sz);
+    let d0: f64 = 0.0;
+    d0 = __sqrt(sx * sx + sz * sz);
+
+    // C6 — hard veto.  Cheapest test, so it runs first and costs nothing.
+    let b: i32 = worldgen_biome_tmd(t, m, d0);
+    if (b == WG_BIOME_FEN) { let veto: f64 = SET_SITE_VETO; return veto; }
+
+    let rel: f64 = worldgen_relief_tm(t, m);
+    let hc: f64 = worldgen_height_rel(seed, sx, sz, rel);
+
+    // ---- the 8-point ring at r = 20 m: C1, C2 -----------------------------
+    let lo20: f64 = hc;
+    let hi20: f64 = hc;
+    let k: i32 = 0;
+    while (k < 8) {
+        let ang: f64 = f64(k) * 0.7853981633974483;    // 45 degrees
+        let h20: f64 = worldgen_height(seed, sx + __sin(ang) * 20.0,
+                                             sz - __cos(ang) * 20.0);
+        if (h20 < lo20) { lo20 = h20; }
+        if (h20 > hi20) { hi20 = h20; }
+        k++;
+    }
+    let range20: f64 = hi20 - lo20;
+
+    // C1 buildable, x3.0 — 2 m is perfect, 8 m is zero
+    let c1: f64 = __clamp(1.0 - (range20 - 2.0) / 6.0, 0.0, 1.0);
+    // C2 not dead flat, x1.0 — a flat horizon is CLAUDE.md §9.5's anti-goal
+    let c2: f64 = 0.0;
+    if (range20 >= 1.2) { c2 = 1.0; }
+    // C5 water, x1.5 — 0.545 is just under the Fen threshold: a damp valley
+    //    bottom with a spring, not a bog.  Free: (t, m) is already in hand.
+    let c5: f64 = __clamp(1.0 - __abs(m - 0.545) / 0.10, 0.0, 1.0);
+
+    // ADMISSIBLE BOUND 1.  C3 (x2.5), C4 (x2.0), C7 (x1.0) and C8 (x1.5) are
+    // each in [0, 1], so 7.0 is the most this candidate can still gain.  If
+    // that cannot beat the incumbent, the 8-point 48 m ring is 8 height
+    // evaluations nobody will ever read.
+    let part1: f64 = 3.0 * c1 + 1.0 * c2 + 1.5 * c5;
+    if (part1 + 7.0 <= floor) { let cut1: f64 = part1 + 7.0; return cut1; }
+
+    // ---- the 8-point ring at r = 48 m: C3, C4 -----------------------------
+    let shoulders: i32 = 0;
+    let lo48: f64 = 0.0;
+    let j48: i32 = 0;
+    while (j48 < 8) {
+        let ang: f64 = f64(j48) * 0.7853981633974483;
+        let h48: f64 = worldgen_height(seed, sx + __sin(ang) * 48.0,
+                                             sz - __cos(ang) * 48.0);
+        if (h48 >= hc + 2.5) { shoulders++; }
+        if (j48 == 0) { lo48 = h48; }
+        if (h48 < lo48) { lo48 = h48; }
+        j48++;
+    }
+    // C3 the hollow, x2.5 — the defensibility term, and why it is called a Hollow
+    let sh: i32 = shoulders;
+    if (sh > 5) { sh = 5; }
+    let c3: f64 = f64(sh) * 0.2;
+    // C4 the view corridor, x2.0 — a full bowl kills the money shot
+    let c4: f64 = __clamp((hc - lo48) / 3.0, 0.0, 1.0);
+
+    // ADMISSIBLE BOUND 2.  C7 (x1.0) and C8 (x1.5) are all that is left.
+    let part2: f64 = part1 + 2.5 * c3 + 2.0 * c4;
+    if (part2 + 2.5 <= floor) { let cut2: f64 = part2 + 2.5; return cut2; }
+
+    // C7 resources, x1.0 — ruins are dressed stone, caravans are brass.
+    //    worldgen_poi_roll over the 5x5 chunk block centred on the candidate.
+    let ccx: i32 = floori(sx * 0.03125);
+    let ccz: i32 = floori(sz * 0.03125);
+    let res: i32 = 0;
+    let j: i32 = -2;
+    while (j <= 2) {
+        let i: i32 = -2;
+        while (i <= 2) {
+            let poi: i32 = worldgen_poi_roll(seed, ccx + i, ccz + j);
+            if (poi == WG_POI_RUIN) { res++; }
+            if (poi == WG_POI_CARAVAN) { res++; }
+            i++;
+        }
+        j++;
+    }
+    if (res > 4) { res = 4; }
+    let c7: f64 = f64(res) * 0.25;
+
+    // C8 grid reach, x1.5 — distance to the nearest lantern anchor OUTSIDE 64 m.
+    //    Nearly always 1 by construction (the anchor lattice guarantees one
+    //    within 67.9 m); it exists to break ties toward a site that HAS a first
+    //    road to somewhere.
+    let dl: f64 = settle_nearest_anchor_d(seed, sx, sz);
+    let c8: f64 = __clamp(1.0 - (dl - 64.0) / 56.0, 0.0, 1.0);
+
+    let acc: f64 = part2 + 1.0 * c7 + 1.5 * c8;
+    let out: f64 = acc;
+    return out;
+}
+
+// Distance to the nearest structural lantern anchor strictly outside 64 m.
+// Scans the 5x5 block neighbourhood (a 320 m square) — the anchor lattice is
+// one per 64 m block, so 25 blocks always contain one.
+export fn settle_nearest_anchor_d(p_seed: i32, p_sx: f64, p_sz: f64): f64 {
+    let seed: i32 = p_seed;
+    let sx: f64 = p_sx;
+    let sz: f64 = p_sz;
+    let bx0: i32 = worldgen_block_of(floori(sx * 0.03125));
+    let bz0: i32 = worldgen_block_of(floori(sz * 0.03125));
+    let best: f64 = 1000000.0;
+    let j: i32 = -2;
+    while (j <= 2) {
+        let i: i32 = -2;
+        while (i <= 2) {
+            let lx: f64 = worldgen_lantern_x(seed, bx0 + i, bz0 + j);
+            let lz: f64 = worldgen_lantern_z(seed, bx0 + i, bz0 + j);
+            let d: f64 = 0.0;
+            d = dist(sx, sz, lx, lz);
+            if (d > 64.0) {
+                if (d < best) { best = d; }
+            }
+            i++;
+        }
+        j++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+// Bearing from (sx, sz) to the nearest anchor outside 64 m — the Wick Road's
+// target (§5.3).  "The road network and the lantern network are the same
+// network", which is not a mechanic dressed as fiction: it is what LORE.md §7
+// says the paving under a Wick Line literally is.
+export fn settle_anchor_bearing(p_seed: i32, p_sx: f64, p_sz: f64): f64 {
+    let seed: i32 = p_seed;
+    let sx: f64 = p_sx;
+    let sz: f64 = p_sz;
+    let bx0: i32 = worldgen_block_of(floori(sx * 0.03125));
+    let bz0: i32 = worldgen_block_of(floori(sz * 0.03125));
+    let best: f64 = 1000000.0;
+    let bx: f64 = sx;
+    let bz: f64 = sz + 1.0;
+    let j: i32 = -2;
+    while (j <= 2) {
+        let i: i32 = -2;
+        while (i <= 2) {
+            let lx: f64 = worldgen_lantern_x(seed, bx0 + i, bz0 + j);
+            let lz: f64 = worldgen_lantern_z(seed, bx0 + i, bz0 + j);
+            let d: f64 = 0.0;
+            d = dist(sx, sz, lx, lz);
+            if (d > 64.0) {
+                if (d < best) { best = d; bx = lx; bz = lz; }
+            }
+            i++;
+        }
+        j++;
+    }
+    let out: f64 = bearing_of(bx - sx, bz - sz);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// The winning candidate of a cell.  Ties break on the lattice index (lowest k
+// wins), so the result is TOTAL and deterministic — §1.3's requirement.
+// ---------------------------------------------------------------------------
+export fn settle_site_pick(p_seed: i32, p_gx: i32, p_gz: i32): i32 {
+    let seed: i32 = p_seed;
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+    let best: f64 = SET_SITE_VETO - 1.0;
+    let bestk: i32 = 0;
+    let k: i32 = 0;
+    while (k < SET_SITE_CANDS) {
+        let cx: f64 = worldgen_site_cand_x(seed, gx, gz, k);
+        let cz: f64 = worldgen_site_cand_z(seed, gx, gz, k);
+        // `best` is the incumbent; a candidate that cannot strictly exceed it
+        // may stop early.  `> best`, never `>=`, is what makes ties break on
+        // the lattice index and what makes the bound admissible.
+        let s: f64 = settle_site_score_bounded(seed, cx, cz, best);
+        if (s > best) { best = s; bestk = k; }
+        k++;
+    }
+    let out: i32 = bestk;
+    return out;
+}
+
+// ---- the four things a site produces, §1.4 -------------------------------
+export fn settle_site_x_at(p_seed: i32, p_gx: i32, p_gz: i32): f64 {
+    let k: i32 = settle_site_pick(p_seed, p_gx, p_gz);
+    let out: f64 = worldgen_site_cand_x(p_seed, p_gx, p_gz, k);
+    return out;
+}
+
+export fn settle_site_z_at(p_seed: i32, p_gx: i32, p_gz: i32): f64 {
+    let k: i32 = settle_site_pick(p_seed, p_gx, p_gz);
+    let out: f64 = worldgen_site_cand_z(p_seed, p_gx, p_gz, k);
+    return out;
+}
+
+// The documented single-settlement entry points (§8.1) — the home cell.
+export fn settle_site_x(p_seed: i32): f64 {
+    let out: f64 = settle_site_x_at(p_seed, 0, 0);
+    return out;
+}
+
+export fn settle_site_z(p_seed: i32): f64 {
+    let out: f64 = settle_site_z_at(p_seed, 0, 0);
+    return out;
+}
+
+// theta0 — the bearing of C4's view corridor: the LOWEST of the eight r = 48 m
+// bearings.  This is the High Road axis, the direction the player arrives from,
+// and the money-shot axis.
+export fn settle_bearing_at(p_seed: i32, p_sx: f64, p_sz: f64): f64 {
+    let seed: i32 = p_seed;
+    let sx: f64 = p_sx;
+    let sz: f64 = p_sz;
+    let lo: f64 = 0.0;
+    let best: f64 = 0.0;
+    let k: i32 = 0;
+    while (k < 8) {
+        let ang: f64 = f64(k) * 0.7853981633974483;
+        let h: f64 = worldgen_height(seed, sx + __sin(ang) * 48.0,
+                                           sz - __cos(ang) * 48.0);
+        if (k == 0) { lo = h; best = ang; }
+        if (h < lo) { lo = h; best = ang; }
+        k++;
+    }
+    let out: f64 = best;
+    return out;
+}
+
+export fn settle_site_bearing(p_seed: i32): f64 {
+    let sx: f64 = settle_site_x(p_seed);
+    let sz: f64 = settle_site_z(p_seed);
+    let out: f64 = settle_bearing_at(p_seed, sx, sz);
+    return out;
+}
+
+// The green's terrace height: the MEDIAN of the 9 samples inside r = 10 m,
+// never a mean.  A mean is dragged by one boulder and puts the green half a
+// metre into the hill (§1.4).
+export fn settle_deck_y_at(p_seed: i32, p_sx: f64, p_sz: f64): f64 {
+    let seed: i32 = p_seed;
+    let sx: f64 = p_sx;
+    let sz: f64 = p_sz;
+    let s: array<f64> = [];
+    s.push(worldgen_height(seed, sx, sz));
+    let k: i32 = 0;
+    while (k < 8) {
+        let ang: f64 = f64(k) * 0.7853981633974483;
+        s.push(worldgen_height(seed, sx + __sin(ang) * 8.0, sz - __cos(ang) * 8.0));
+        k++;
+    }
+    // insertion sort of nine doubles; the median is index 4.
+    // `placed` is a separate flag and not `j = -1`: collapsing the two exits
+    // into one loses the insertion index, which is the classic way to write an
+    // insertion sort that silently produces garbage.
+    let i: i32 = 1;
+    while (i < 9) {
+        let v: f64 = s[i];
+        let j: i32 = i - 1;
+        let placed: i32 = 0;
+        while (j >= 0 && placed == 0) {
+            if (s[j] <= v) { placed = 1; }
+            else { s[j + 1] = s[j]; j--; }
+        }
+        s[j + 1] = v;
+        i++;
+    }
+    let out: f64 = s[4];
+    return out;
+}
+
+export fn settle_site_deck_y(p_seed: i32): f64 {
+    let sx: f64 = settle_site_x(p_seed);
+    let sz: f64 = settle_site_z(p_seed);
+    let out: f64 = settle_deck_y_at(p_seed, sx, sz);
+    return out;
+}
+
+// §5.7's 16 x 8 = 128-name table.  INDEX 0 IS EMBER HOLLOW and is the home
+// cell's name on every seed — LORE.md §11.2.2 already leaves the room for the
+// rest: "Some of them founded towns you have not found."
+export fn settle_site_name_at(p_seed: i32, p_gx: i32, p_gz: i32): i32 {
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+    if (gx == 0) {
+        if (gz == 0) { let home: i32 = 0; return home; }
+    }
+    let h: u64 = xhash2(gx, gz, p_seed ^ 2027808477);
+    let n: i32 = i32(h % 127) + 1;      // 1..127; 0 is reserved for home
+    let out: i32 = n;
+    return out;
+}
+
+export fn settle_site_name(p_seed: i32): i32 {
+    let out: i32 = settle_site_name_at(p_seed, 0, 0);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// MULTI-SITE, DIRECTION.md §8.  A world is a REGION, not a town.
+// ---------------------------------------------------------------------------
+// A cell holds a settlement iff worldgen's occupancy roll says so AND the best
+// candidate in it is not vetoed — SETTLEMENT.md §1's per-candidate scoring
+// applied WITHIN the sampling, which is exactly what DIRECTION.md §8 asks for.
+// The minimum separation is guaranteed by the lattice geometry, not by this
+// test (see worldgen.hml's proof), so a rejected cell can never pull a
+// neighbour closer than WG_SITE_MIN_SEP_M.
+export fn settle_cell_occupied(p_seed: i32, p_gx: i32, p_gz: i32): i32 {
+    let seed: i32 = p_seed;
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+    if (worldgen_site_occupied_roll(seed, gx, gz) == 0) { let z: i32 = 0; return z; }
+    let k: i32 = settle_site_pick(seed, gx, gz);
+    let cx: f64 = worldgen_site_cand_x(seed, gx, gz, k);
+    let cz: f64 = worldgen_site_cand_z(seed, gx, gz, k);
+    let s: f64 = settle_site_score(seed, cx, cz);
+    let out: i32 = 0;
+    if (s > SET_SITE_VETO) { out = 1; }
+    return out;
+}
+
+// The settlement cell a world point belongs to.
+export fn settle_cell_x_of(p_wx: f64): i32 {
+    let out: i32 = worldgen_site_cell_of(p_wx);
+    return out;
+}
+
+export fn settle_cell_z_of(p_wz: f64): i32 {
+    let out: i32 = worldgen_site_cell_of(p_wz);
+    return out;
+}
+
+export fn settle_min_separation_m(): f64 {
+    let out: f64 = WG_SITE_MIN_SEP_M;
+    return out;
+}
+
+export fn settle_cell_m(): f64 {
+    let out: f64 = WG_SITE_CELL_M;
+    return out;
+}
+
+// ===========================================================================
+// 4.  THE STORE
+// ===========================================================================
+// Flat scalars and flat arrays only (CLAUDE.md §7 / NETWORKING §3): every field
+// is an i32, an f64 or an array of those.  No object graph, no closure, no
+// reference to an entity.  What lives here is exactly what a shard's delta log
+// needs plus the f(seed) layout cache, and the cache is marked as such.
+
+export fn settle_new_at(p_seed: i32, p_gx: i32, p_gz: i32): object {
+    let seed: i32 = p_seed;
+    let gx: i32 = p_gx;
+    let gz: i32 = p_gz;
+
+    // ---- pass 0: the frame (§5.1) ----------------------------------------
+    let kbest: i32 = settle_site_pick(seed, gx, gz);
+    let cx: f64 = worldgen_site_cand_x(seed, gx, gz, kbest);
+    let cz: f64 = worldgen_site_cand_z(seed, gx, gz, kbest);
+    let th0: f64 = settle_bearing_at(seed, cx, cz);
+    let deck: f64 = settle_deck_y_at(seed, cx, cz);
+
+    // ---- pass 2: three roads (§5.3) --------------------------------------
+    let rx: array<f64> = [];
+    let rz: array<f64> = [];
+    let rb: array<f64> = [];          // per-point outgoing bearing
+    let targets: array<f64> = [];
+    targets.push(th0);
+    targets.push(settle_anchor_bearing(seed, cx, cz));
+    let jit: f64 = (h01i(gx, gz, seed ^ 1013904223) - 0.5) * 2.0 * SET_BACKLANE_JIT_RAD;
+    targets.push(th0 + 3.141592653589793 + jit);
+
+    let r: i32 = 0;
+    while (r < SET_ROADS) {
+        settle_road_walk(seed, cx, cz, targets[r], rx, rz, rb);
+        r++;
+    }
+
+    // ---- pass 3/4: the 72 plots (§5.4, §5.5) ------------------------------
+    let px: array<f64> = [];
+    let pz: array<f64> = [];
+    let py: array<f64> = [];
+    let pyaw: array<f64> = [];
+    let pval: array<i32> = [];
+    let pid: i32 = 0;
+    while (pid < SET_PLOTS) {
+        settle_plot_build(seed, cx, cz, rx, rz, rb, pid, px, pz, py, pyaw, pval);
+        pid++;
+    }
+
+    // ---- pass 5: the accretion order (§5.6) ------------------------------
+    let order: array<i32> = settle_order_build(cx, cz, px, pz, pval);
+
+    // ---- pass 6: assignment (§5.7).  Pure f(seed) over the FULL 28-entry
+    //      manifest, tier-independent, which is what makes a plot's building
+    //      permanent by construction rather than by discipline.
+    let apid: array<i32> = [];
+    let akind: array<i32> = [];
+    settle_assign_build(order, px, pz, apid, akind);
+
+    // ---- default lantern set: the unlit Great Lantern on its cracked dais --
+    let lan: array<f64> = [];
+    lan.push(cx); lan.push(cz); lan.push(0.0); lan.push(0.0);
+    let link: array<i32> = [];
+    link.push(0);
+
+    let bcon: array<i32> = [];
+    let bprog: array<i32> = [];
+    let feeder: array<i32> = [];
+    let i: i32 = 0;
+    while (i < SET_BLD_MAX) { bcon.push(0); bprog.push(0); i++; }
+    let f: i32 = 0;
+    while (f < SET_FEEDER_MAX) { feeder.push(-1); f++; }
+
+    let st = {
+        // --- identity, and the f(seed) layout cache -----------------------
+        seed: seed,
+        gx: gx,
+        gz: gz,
+        site_k: kbest,
+        cx: cx,
+        cz: cz,
+        bearing: th0,
+        deck_y: deck,
+        name: settle_site_name_at(seed, gx, gz),
+        road_x: rx,             // SET_ROADS * SET_ROAD_PTS
+        road_z: rz,
+        road_b: rb,
+        plot_x: px,             // SET_PLOTS
+        plot_z: pz,
+        plot_y: py,
+        plot_yaw: pyaw,
+        plot_valid: pval,
+        order: order,           // SET_PLOTS, -1 padded
+        a_pid: apid,            // SET_BLD_MAX
+        a_kind: akind,
+
+        // --- the delta log: everything below is world state ----------------
+        tier: SET_TIER_CAMP,
+        tier_ever: SET_TIER_CAMP,
+        brownout: 0,
+        n_bld: 0,
+        b_con: bcon,
+        b_prog: bprog,
+        hold_ticks: 0,
+        work_ticks: 0,
+        worksite_cursor: 0,
+        industry: SET_IND_COLD,
+        ind_cold_latch: 0,
+        ind_fail_ticks: 0,
+        ind_cold_ticks: 0,
+        ind_warm_ticks: 0,
+        ammo_stock: 0,
+
+        // --- the injected lantern / pall sets (never owned, only read) -----
+        lan: lan,
+        lan_n: 1,
+        lan_link: link,
+        pall: lan,
+        pall_n: 0,
+
+        // --- the field, refreshed on the rotating slice --------------------
+        core_lux: 0,
+        grid_lux: 0,
+        acc_core: 0.0,
+        acc_grid: 0.0,
+        acc_valid: 0,
+        slice: 0,
+        tick: 0,
+
+        // --- the feeder line ------------------------------------------------
+        feeder: feeder,
+        feeder_n: 0,
+        feeder_lit: 0,
+        foundry_post: -1
+    };
+
+    // Camp exists from tick zero: two roofless shells with footings (§3.3).
+    settle_grow_to(st, SET_TIER_CAMP);
+    settle_refresh(st);
+    return st;
+}
+
+// The documented single-settlement constructor (§8.1) — the home cell.
+export fn settle_new(p_seed: i32): object {
+    let out: object = settle_new_at(p_seed, 0, 0);
+    return out;
+}
+
+// ===========================================================================
+// 5.  PASS 2 — THE ROADS  (§5.3)
+// ===========================================================================
+// Greedy least-grade stepping.  From C, SET_ROAD_STEPS steps of 8 m.  At each
+// step, evaluate 3 candidate headings (psi - 20, psi, psi + 20) and take the one
+// with the smallest |dh| over the 8 m step; then pull psi back toward the target
+// bearing by 40 %.  It always remembers where it is going.
+//
+// This produces a road that BENDS AROUND A HILL INSTEAD OF CLIMBING IT while
+// never losing its destination — which is exactly the "connect rather than
+// wander" read.  A wandering road has no argument; this one has two.
+fn settle_road_walk(p_seed: i32, p_cx: f64, p_cz: f64, p_target: f64,
+                    p_rx: array<f64>, p_rz: array<f64>, p_rb: array<f64>) {
+    let seed: i32 = p_seed;
+    let target: f64 = p_target;
+    let x: f64 = p_cx;
+    let z: f64 = p_cz;
+    let psi: f64 = target;
+    let h: f64 = 0.0;
+    h = worldgen_height(seed, x, z);
+
+    let s: i32 = 0;
+    while (s < SET_ROAD_STEPS) {
+        let bestd: f64 = 0.0;
+        let besth: f64 = 0.0;
+        let bestg: f64 = 1000000.0;
+        let c: i32 = -1;
+        while (c <= 1) {
+            let dd: f64 = f64(c) * SET_ROAD_FAN_RAD;
+            let a: f64 = psi + dd;
+            let nx: f64 = x + __sin(a) * SET_ROAD_STEP_M;
+            let nz: f64 = z - __cos(a) * SET_ROAD_STEP_M;
+            let nh: f64 = worldgen_height(seed, nx, nz);
+            let g: f64 = __abs(nh - h);
+            if (g < bestg) { bestg = g; bestd = dd; besth = nh; }
+            c++;
+        }
+        p_rx.push(x);
+        p_rz.push(z);
+        p_rb.push(psi + bestd);
+        x = x + __sin(psi + bestd) * SET_ROAD_STEP_M;
+        z = z - __cos(psi + bestd) * SET_ROAD_STEP_M;
+        h = besth;
+        psi = psi + bestd;
+        psi = psi + SET_ROAD_PULL * ang_diff(target, psi);
+        s++;
+    }
+    // the terminal point, carrying the final heading forward
+    p_rx.push(x);
+    p_rz.push(z);
+    p_rb.push(psi);
+}
+
+// Public, pure form for tools and for the determinism probe.  Recomputes the
+// whole walk; `settle_road_pt_*` on a store reads the cache instead.
+// out[0] = x, out[1] = z, out[2] = outgoing bearing.  Returns 1, or 0 on a bad
+// argument.
+export fn settle_road_point(p_seed: i32, p_gx: i32, p_gz: i32,
+                            p_road: i32, p_step: i32, p_out: array<f64>): i32 {
+    let road: i32 = p_road;
+    let step: i32 = p_step;
+    if (road < 0) { let bad: i32 = 0; return bad; }
+    if (road >= SET_ROADS) { let bad2: i32 = 0; return bad2; }
+    if (step < 0) { let bad3: i32 = 0; return bad3; }
+    if (step >= SET_ROAD_PTS) { let bad4: i32 = 0; return bad4; }
+    if (p_out.length < 3) { let bad5: i32 = 0; return bad5; }
+
+    let seed: i32 = p_seed;
+    let k: i32 = settle_site_pick(seed, p_gx, p_gz);
+    let cx: f64 = worldgen_site_cand_x(seed, p_gx, p_gz, k);
+    let cz: f64 = worldgen_site_cand_z(seed, p_gx, p_gz, k);
+    let th0: f64 = settle_bearing_at(seed, cx, cz);
+    let target: f64 = th0;
+    if (road == 1) { target = settle_anchor_bearing(seed, cx, cz); }
+    if (road == 2) {
+        let jit: f64 = (h01i(p_gx, p_gz, seed ^ 1013904223) - 0.5) * 2.0 * SET_BACKLANE_JIT_RAD;
+        target = th0 + 3.141592653589793 + jit;
+    }
+    let rx: array<f64> = [];
+    let rz: array<f64> = [];
+    let rb: array<f64> = [];
+    settle_road_walk(seed, cx, cz, target, rx, rz, rb);
+    p_out[0] = rx[step];
+    p_out[1] = rz[step];
+    p_out[2] = rb[step];
+    let out: i32 = 1;
+    return out;
+}
+
+export fn settle_road_pt_x(p_st: object, p_road: i32, p_step: i32): f64 {
+    let st: object = p_st;
+    let i: i32 = clampi(p_road, 0, SET_ROADS - 1) * SET_ROAD_PTS
+               + clampi(p_step, 0, SET_ROAD_PTS - 1);
+    let a: array<f64> = st.road_x;
+    let out: f64 = a[i];
+    return out;
+}
+
+export fn settle_road_pt_z(p_st: object, p_road: i32, p_step: i32): f64 {
+    let st: object = p_st;
+    let i: i32 = clampi(p_road, 0, SET_ROADS - 1) * SET_ROAD_PTS
+               + clampi(p_step, 0, SET_ROAD_PTS - 1);
+    let a: array<f64> = st.road_z;
+    let out: f64 = a[i];
+    return out;
+}
+
+// ===========================================================================
+// 6.  PASS 3 / 4 — THE PLOT LATTICE AND VALIDITY  (§5.4, §5.5)
+// ===========================================================================
+// PLOT_ID = road*24 + side*12 + slot.  72 plots.  A City uses 28 (D5).  The
+// lattice never runs out and therefore never needs re-planning, which is what
+// lets the accretion order be permanent.
+
+export fn settle_plot_count(): i32 { let out: i32 = SET_PLOTS; return out; }
+export fn settle_pid_road(p_pid: i32): i32 { let out: i32 = idiv(p_pid, 24); return out; }
+export fn settle_pid_side(p_pid: i32): i32 { let out: i32 = idiv(p_pid % 24, 12); return out; }
+export fn settle_pid_slot(p_pid: i32): i32 { let out: i32 = p_pid % 12; return out; }
+
+fn settle_plot_build(p_seed: i32, p_cx: f64, p_cz: f64,
+                     p_rx: array<f64>, p_rz: array<f64>, p_rb: array<f64>,
+                     p_pid: i32,
+                     p_px: array<f64>, p_pz: array<f64>, p_py: array<f64>,
+                     p_pyaw: array<f64>, p_pval: array<i32>) {
+    let seed: i32 = p_seed;
+    let pid: i32 = p_pid;
+    let road: i32 = idiv(pid, 24);
+    let side: i32 = idiv(pid % 24, 12);
+    let slot: i32 = pid % 12;
+
+    // arc length along the road centreline, then the segment it falls in.
+    // Every step is exactly SET_ROAD_STEP_M long, so the mapping is exact —
+    // no polyline arc-length integration, no accumulated float drift.
+    let arc: f64 = SET_PLOT_A0_M + SET_PLOT_PITCH_M * f64(slot);
+    let sf: f64 = arc / SET_ROAD_STEP_M;
+    let seg: i32 = floori(sf);
+    if (seg > SET_ROAD_STEPS - 1) { seg = SET_ROAD_STEPS - 1; }
+    let tt: f64 = sf - f64(seg);
+    let base: i32 = road * SET_ROAD_PTS;
+    let ax: f64 = p_rx[base + seg];
+    let az: f64 = p_rz[base + seg];
+    let bx: f64 = p_rx[base + seg + 1];
+    let bz: f64 = p_rz[base + seg + 1];
+    let ox: f64 = ax + (bx - ax) * tt;
+    let oz: f64 = az + (bz - az) * tt;
+    let psi: f64 = p_rb[base + seg];
+
+    // D2: lateral direction is psi + 90 deg on side 0 and psi - 90 deg on
+    // side 1, so the two rows of the same street sit either side of it.  The
+    // building FACES back at the road: yaw = lateral + 180 deg.  Every building
+    // fronts the road by construction — the one line that is the difference
+    // between a village and a scatter plot.
+    let lat: f64 = psi + 1.5707963267948966 - 3.141592653589793 * f64(side);
+    let lx: f64 = __sin(lat);
+    let lz: f64 = 0.0 - __cos(lat);
+    let ux: f64 = __sin(psi);
+    let uz: f64 = 0.0 - __cos(psi);
+    let mx: f64 = ox + lx * SET_PLOT_LATERAL_M;
+    let mz: f64 = oz + lz * SET_PLOT_LATERAL_M;
+    let yaw: f64 = lat + 3.141592653589793;
+
+    // four corners: +/- half the 12 m frontage along psi, +/- half the 10 m
+    // depth along the lateral
+    let hw: f64 = SET_PLOT_W_M * 0.5;
+    let hd: f64 = SET_PLOT_D_M * 0.5;
+    let lo: f64 = 0.0;
+    let hi: f64 = 0.0;
+    let sum: f64 = 0.0;
+    let mind: f64 = 1000000.0;
+    let c: i32 = 0;
+    while (c < 4) {
+        let su: f64 = 1.0;
+        if (c >= 2) { su = -1.0; }
+        let sv: f64 = 1.0;
+        if (c % 2 == 1) { sv = -1.0; }
+        let qx: f64 = mx + ux * hw * su + lx * hd * sv;
+        let qz: f64 = mz + uz * hw * su + lz * hd * sv;
+        let h: f64 = worldgen_height(seed, qx, qz);
+        if (c == 0) { lo = h; hi = h; }
+        if (h < lo) { lo = h; }
+        if (h > hi) { hi = h; }
+        sum = sum + h;
+        let d: f64 = 0.0;
+        d = dist(qx, qz, p_cx, p_cz);
+        if (d < mind) { mind = d; }
+        c++;
+    }
+
+    // §5.5 — invalid plots are SKIPPED, NEVER MOVED.  A gap in a row of houses
+    // where the ground is bad reads as MORE intentional than a shuffled
+    // building: the town visibly declined to build on the boggy bit.  A nudged
+    // building reads as a bug.
+    let ok: i32 = 1;
+    if (hi - lo > SET_PLOT_RANGE_M) { ok = 0; }
+    if (mind < SET_GREEN_R_M) { ok = 0; }
+    let t: f64 = worldgen_temp(seed, mx, mz);
+    let m: f64 = worldgen_moist(seed, mx, mz);
+    let dd: f64 = 0.0;
+    dd = __sqrt(mx * mx + mz * mz);
+    if (worldgen_biome_tmd(t, m, dd) == WG_BIOME_FEN) { ok = 0; }
+
+    p_px.push(mx);
+    p_pz.push(mz);
+    p_py.push(sum * 0.25);
+    p_pyaw.push(yaw);
+    p_pval.push(ok);
+}
+
+export fn settle_plot_x(p_st: object, p_pid: i32): f64 {
+    let st: object = p_st;
+    let a: array<f64> = st.plot_x;
+    let out: f64 = a[clampi(p_pid, 0, SET_PLOTS - 1)];
+    return out;
+}
+
+export fn settle_plot_z(p_st: object, p_pid: i32): f64 {
+    let st: object = p_st;
+    let a: array<f64> = st.plot_z;
+    let out: f64 = a[clampi(p_pid, 0, SET_PLOTS - 1)];
+    return out;
+}
+
+export fn settle_plot_y(p_st: object, p_pid: i32): f64 {
+    let st: object = p_st;
+    let a: array<f64> = st.plot_y;
+    let out: f64 = a[clampi(p_pid, 0, SET_PLOTS - 1)];
+    return out;
+}
+
+export fn settle_plot_yaw(p_st: object, p_pid: i32): f64 {
+    let st: object = p_st;
+    let a: array<f64> = st.plot_yaw;
+    let out: f64 = a[clampi(p_pid, 0, SET_PLOTS - 1)];
+    return out;
+}
+
+export fn settle_plot_valid(p_st: object, p_pid: i32): i32 {
+    let st: object = p_st;
+    let a: array<i32> = st.plot_valid;
+    let out: i32 = a[clampi(p_pid, 0, SET_PLOTS - 1)];
+    return out;
+}
+
+// ===========================================================================
+// 7.  PASS 5 — THE ACCRETION ORDER  (§5.6)
+// ===========================================================================
+// > A plot, once assigned a building, keeps that building forever.
+// > Growth only ever appends.
+//
+//   key = ( floor(dist(plot, C) / 24), road, side, |slot - 5.5|, sign(slot-5.5) )
+//
+// Ring by ring outward from the green; within a ring, road by road; within a
+// road, alternating sides outward from the centre.  Packed into one i32 so the
+// sort is a comparison of integers and cannot disagree between backends:
+//
+//   bits 17..20  ring   0..15      bits  9      sign      0 = far half first
+//   bits 15..16  road   0..2       bits  0..6   pid       total order tiebreak
+//   bit  14      side   0..1
+//   bits 10..13  q = |2*slot - 11| 1..11
+//
+// This is what makes growth legible: the town grows outward in RINGS, so the
+// centre is the oldest and the edge is the newest, and the frontier of
+// construction is a visible ring you can read the town's age off with no UI.
+fn settle_order_key(p_cx: f64, p_cz: f64, p_px: f64, p_pz: f64, p_pid: i32): i32 {
+    let pid: i32 = p_pid;
+    let road: i32 = idiv(pid, 24);
+    let side: i32 = idiv(pid % 24, 12);
+    let slot: i32 = pid % 12;
+    let d: f64 = 0.0;
+    d = dist(p_px, p_pz, p_cx, p_cz);
+    let ring: i32 = clampi(floori(d / SET_RING_BUCKET_M), 0, 15);
+    let q: i32 = slot * 2 - 11;
+    let sgn: i32 = 0;
+    if (q < 0) { q = 0 - q; sgn = 1; }
+    let out: i32 = (ring << 17) | (road << 15) | (side << 14) | (q << 10)
+                 | (sgn << 9) | pid;
+    return out;
+}
+
+fn settle_order_build(p_cx: f64, p_cz: f64,
+                      p_px: array<f64>, p_pz: array<f64>,
+                      p_pval: array<i32>): array<i32> {
+    let keys: array<i32> = [];
+    let pids: array<i32> = [];
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < SET_PLOTS) {
+        if (p_pval[i] == 1) {
+            keys.push(settle_order_key(p_cx, p_cz, p_px[i], p_pz[i], i));
+            pids.push(i);
+            n++;
+        }
+        i++;
+    }
+    // insertion sort, 72 entries max.  No closure (CLAUDE.md rule 8), no
+    // `array.sort` — this is a cold, once-per-world path and an explicit sort
+    // is one fewer thing that can differ between backends.
+    let j: i32 = 1;
+    while (j < n) {
+        let kv: i32 = keys[j];
+        let pv: i32 = pids[j];
+        let k: i32 = j - 1;
+        let placed: i32 = 0;
+        while (k >= 0 && placed == 0) {
+            if (keys[k] <= kv) { placed = 1; }
+            else { keys[k + 1] = keys[k]; pids[k + 1] = pids[k]; k--; }
+        }
+        keys[k + 1] = kv;
+        pids[k + 1] = pv;
+        j++;
+    }
+    while (n < SET_PLOTS) { pids.push(-1); n++; }
+    let out: array<i32> = pids;
+    return out;
+}
+
+// Accretion order n -> plot id, or -1 past the last valid plot.
+export fn settle_plot_order(p_st: object, p_n: i32): i32 {
+    let st: object = p_st;
+    let n: i32 = p_n;
+    if (n < 0) { let bad: i32 = -1; return bad; }
+    if (n >= SET_PLOTS) { let bad2: i32 = -1; return bad2; }
+    let a: array<i32> = st.order;
+    let out: i32 = a[n];
+    return out;
+}
+
+export fn settle_valid_count(p_st: object): i32 {
+    let st: object = p_st;
+    let a: array<i32> = st.plot_valid;
+    let c: i32 = 0;
+    let i: i32 = 0;
+    while (i < SET_PLOTS) { c = c + a[i]; i++; }
+    let out: i32 = c;
+    return out;
+}
+
+// ===========================================================================
+// 8.  PASS 6 — THE MANIFEST AND ASSIGNMENT  (§3.3, §5.7)
+// ===========================================================================
+// Each tier's manifest is an ordered list of kinds; kind i goes to order[i], so
+// SERVICES LAND NEAREST THE GREEN and houses fill outward.  One refinement,
+// worth the complication: THE FIRST PLOT ON EACH ROAD MUST BE A SERVICE, or the
+// Wick Road and Back Lane are streets of nothing and nobody walks down them.
+//
+// The whole 28-entry manifest is assigned in ONE pass at construction, before
+// any tier exists, and the tier only decides HOW MANY of them are real.  That
+// makes "a plot once assigned keeps its building forever" true by construction
+// rather than by discipline — there is no code path that could reassign one.
+
+fn settle_man_kind(p_i: i32): i32 {
+    let i: i32 = p_i;
+    if (i < 2) { let a: i32 = SET_B_SHACK; return a; }        // camp ruins x2
+    if (i == 2) { let b: i32 = SET_B_HALL; return b; }        // Mabel's Bench
+    if (i == 3) { let c: i32 = SET_B_HOUSE; return c; }       // Odo's Inn
+    if (i == 4) { let d: i32 = SET_B_WELL; return d; }        // The Well
+    if (i < 9) { let e: i32 = SET_B_COTTAGE; return e; }      // 4 cottages
+    if (i == 9) { let f: i32 = SET_B_COTTAGE; return f; }     // Connie's Board
+    if (i == 10) { let g: i32 = SET_B_HALL; return g; }       // The Almanac
+    if (i == 11) { let h: i32 = SET_B_TOWER; return h; }      // The Watch Tower
+    if (i < 17) { let j: i32 = SET_B_HOUSE; return j; }       // 5 houses
+    if (i == 17) { let k: i32 = SET_B_WORKS; return k; }      // THE FOUNDRY
+    if (i == 18) { let l: i32 = SET_B_STACK; return l; }      // the Foundry stack
+    if (i == 19) { let m: i32 = SET_B_HALL; return m; }       // The Arsenal
+    let out: i32 = SET_B_HOUSE;                               // 8 houses
+    return out;
+}
+
+// 1 if manifest entry i unlocks a service (§3.3's "Service unlocked" column).
+fn settle_man_svc(p_i: i32): i32 {
+    let i: i32 = p_i;
+    if (i == 2) { let a: i32 = 1; return a; }    // bench
+    if (i == 3) { let b: i32 = 1; return b; }    // inn
+    if (i == 4) { let c: i32 = 1; return c; }    // well
+    if (i == 9) { let d: i32 = 1; return d; }    // board
+    if (i == 10) { let e: i32 = 1; return e; }   // almanac
+    if (i == 11) { let f: i32 = 1; return f; }   // watch tower
+    if (i == 17) { let g: i32 = 1; return g; }   // foundry
+    if (i == 19) { let h: i32 = 1; return h; }   // arsenal
+    let out: i32 = 0;
+    return out;
+}
+
+// The tier that introduces manifest entry i.  §3.3 / §6.2: 2 / 7 / 8 / 11.
+export fn settle_man_tier(p_i: i32): i32 {
+    let i: i32 = p_i;
+    if (i < 2) { let a: i32 = SET_TIER_CAMP; return a; }
+    if (i < 9) { let b: i32 = SET_TIER_VILLAGE; return b; }
+    if (i < 17) { let c: i32 = SET_TIER_TOWN; return c; }
+    let out: i32 = SET_TIER_CITY;
+    return out;
+}
+
+// Cumulative building count at a tier.  2 / 9 / 17 / 28.
+export fn settle_tier_buildings(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    if (t <= SET_TIER_CAMP) { let a: i32 = 2; return a; }
+    if (t == SET_TIER_VILLAGE) { let b: i32 = 9; return b; }
+    if (t == SET_TIER_TOWN) { let c: i32 = 17; return c; }
+    let out: i32 = SET_BLD_MAX;
+    return out;
+}
+
+// The construction state a building is BORN in.  §6.2: the Camp's ruins and the
+// Village's seven start FRAMED ("a camp's ruins have footings", and the Village
+// transition is 7 buildings over 14 steps = 2 each); Town and City stake first.
+export fn settle_born_state(p_tier: i32): i32 {
+    let t: i32 = p_tier;
+    if (t <= SET_TIER_VILLAGE) { let a: i32 = SET_CON_FRAMED; return a; }
+    let out: i32 = SET_CON_STAKED;
+    return out;
+}
+
+fn settle_assign_build(p_order: array<i32>, p_px: array<f64>, p_pz: array<f64>,
+                       p_apid: array<i32>, p_akind: array<i32>) {
+    // a local, mutable copy of the manifest so the service-first refinement can
+    // swap two entries without touching the manifest functions
+    let kind: array<i32> = [];
+    let svc: array<i32> = [];
+    let tr: array<i32> = [];
+    let i: i32 = 0;
+    while (i < SET_BLD_MAX) {
+        kind.push(settle_man_kind(i));
+        svc.push(settle_man_svc(i));
+        tr.push(settle_man_tier(i));
+        i++;
+    }
+    let served: array<i32> = [0, 0, 0];
+    let taken: array<i32> = [];
+    let q: i32 = 0;
+    while (q < SET_PLOTS) { taken.push(0); q++; }
+
+    let n: i32 = 0;
+    while (n < SET_BLD_MAX) {
+        // D7: the cursor PREFERS plots on roads that are open at this
+        // building's tier, and falls back to any free plot when there is none.
+        // The fallback matters: without it, a seed whose High Road carries one
+        // valid plot loses Mabel's Bench — the weapon crafting service — for
+        // ever, while the Town's bounty board lands two tiers later on the same
+        // road.  A building standing on a lane whose DECK arrives one tier later
+        // is invisible (§5.3: "its appearance IS the promotion" is about the
+        // road mesh, not the plots); a missing service is not.  The ORDER is
+        // untouched either way; only the pick skips.
+        let nroads: i32 = settle_road_count(tr[n]);
+        let pick: i32 = -1;
+        let any: i32 = -1;
+        let p: i32 = 0;
+        while (p < SET_PLOTS) {
+            let pid: i32 = p_order[p];
+            if (pid >= 0) {
+                if (taken[pid] == 0) {
+                    if (any < 0) { any = pid; }
+                    if (idiv(pid, 24) < nroads) { pick = pid; p = SET_PLOTS; }
+                }
+            }
+            p++;
+        }
+        if (pick < 0) { pick = any; }
+        if (pick < 0) {
+            // The lattice ran out — 72 plots against 28 buildings makes this
+            // unreachable for any terrain this generator can produce, but a
+            // silent -1 downstream would be a floating building.  Report it.
+            p_apid.push(-1);
+            p_akind.push(kind[n]);
+            n++;
+        } else {
+            // §5.7's refinement: if this is slot 0 of a road with no service
+            // yet and the manifest offers a house, pull the next service of the
+            // SAME TIER forward.  Same tier, because pulling a City service into
+            // a Village would change what a Village contains.
+            if (pick % 12 == 0) {
+                let rd: i32 = idiv(pick, 24);
+                if (served[rd] == 0) {
+                    if (svc[n] == 0) {
+                        let j: i32 = n + 1;
+                        let found: i32 = -1;
+                        while (j < SET_BLD_MAX) {
+                            if (tr[j] == tr[n]) {
+                                if (svc[j] == 1) { found = j; j = SET_BLD_MAX; }
+                            }
+                            j++;
+                        }
+                        if (found >= 0) {
+                            let tk: i32 = kind[n]; kind[n] = kind[found]; kind[found] = tk;
+                            let ts: i32 = svc[n]; svc[n] = svc[found]; svc[found] = ts;
+                        }
+                    }
+                    if (svc[n] == 1) { served[rd] = 1; }
+                }
+            }
+            taken[pick] = 1;
+            p_apid.push(pick);
+            p_akind.push(kind[n]);
+            n++;
+        }
+    }
+}
+
+export fn settle_assign_pid(p_st: object, p_n: i32): i32 {
+    let st: object = p_st;
+    let n: i32 = clampi(p_n, 0, SET_BLD_MAX - 1);
+    let a: array<i32> = st.a_pid;
+    let out: i32 = a[n];
+    return out;
+}
+
+export fn settle_assign_kind(p_st: object, p_n: i32): i32 {
+    let st: object = p_st;
+    let n: i32 = clampi(p_n, 0, SET_BLD_MAX - 1);
+    let a: array<i32> = st.a_kind;
+    let out: i32 = a[n];
+    return out;
+}
+
+// ===========================================================================
+// 9.  THE FIELD — LUX, GRID_LUX, CORE_LUX, ENTROPY  (§2)
+// ===========================================================================
+//   LUX(p) = min(CL_MAX, SUM over lit lanterns of contrib(L)*max(0,1-d/R(L)))
+//          - SUM over standing Palls of pall(P)*max(0, 1 - d/R(P))
+//
+//   contrib(L) = wick        if L is not on a Wick Line     [wick in 0..256]
+//              = wick * 2    if it is (a lit lantern within 90 m)
+//
+// The cap is LOAD-BEARING (§11.4): a T4 lantern covers 45 239 m2 against one
+// anchor per 4 096 m2, so a fully-upgraded grid overlaps ~11-deep and the field
+// saturates without a ceiling — at which point the ladder stops meaning
+// anything and expansion stops costing anything.
+
+export fn settle_lanterns_set(p_st: object, p_arr: array<f64>, p_n: i32) {
+    let st: object = p_st;
+    let n: i32 = p_n;
+    if (n < 0) { n = 0; }
+    st.lan = p_arr;
+    st.lan_n = n;
+    let link: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { link.push(0); i++; }
+    st.lan_link = link;
+    st.acc_valid = 0;
+    settle_links_rebuild(st);
+}
+
+export fn settle_palls_set(p_st: object, p_arr: array<f64>, p_n: i32) {
+    let st: object = p_st;
+    let n: i32 = p_n;
+    if (n < 0) { n = 0; }
+    st.pall = p_arr;
+    st.pall_n = n;
+    st.acc_valid = 0;
+}
+
+// A lantern is ON A WICK LINE iff another LIT lantern stands within 90 m.
+// O(n^2), run when the lantern set changes and re-checked 8 at a time on the
+// rotating slice — never per frame and never per query.
+fn settle_link_of(p_st: object, p_i: i32): i32 {
+    let st: object = p_st;
+    let a: array<f64> = st.lan;
+    let n: i32 = st.lan_n;
+    let i: i32 = p_i;
+    if (a[i * 4 + 3] <= 0.0) { let unlit: i32 = 0; return unlit; }
+    let x: f64 = a[i * 4];
+    let z: f64 = a[i * 4 + 1];
+    let lim: f64 = g_WICKLINE_M * g_WICKLINE_M;
+    let j: i32 = 0;
+    while (j < n) {
+        if (j != i) {
+            if (a[j * 4 + 3] > 0.0) {
+                if (dist2(x, z, a[j * 4], a[j * 4 + 1]) <= lim) {
+                    let yes: i32 = 1;
+                    return yes;
+                }
+            }
+        }
+        j++;
+    }
+    let out: i32 = 0;
+    return out;
+}
+
+export fn settle_links_rebuild(p_st: object) {
+    let st: object = p_st;
+    let n: i32 = st.lan_n;
+    let link: array<i32> = st.lan_link;
+    let i: i32 = 0;
+    while (i < n) { link[i] = settle_link_of(st, i); i++; }
+}
+
+// LUX at an arbitrary world point.  O(lanterns).  Point queries only.
+export fn settle_lux_at(p_st: object, p_wx: f64, p_wz: f64): i32 {
+    let st: object = p_st;
+    let a: array<f64> = st.lan;
+    let link: array<i32> = st.lan_link;
+    let n: i32 = st.lan_n;
+    let x: f64 = p_wx;
+    let z: f64 = p_wz;
+    let acc: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < n) {
+        let wick: f64 = a[i * 4 + 3];
+        if (wick > 0.0) {
+            let r: f64 = settle_lantern_radius(i32(a[i * 4 + 2]));
+            let d: f64 = 0.0;
+            d = dist(x, z, a[i * 4], a[i * 4 + 1]);
+            if (d < r) {
+                let c: f64 = wick;
+                if (link[i] == 1) { c = wick * 2.0; }
+                acc = acc + c * (1.0 - d / r);
+            }
+        }
+        i++;
+    }
+    if (acc > f64(SET_CL_MAX)) { acc = f64(SET_CL_MAX); }
+
+    let pa: array<f64> = st.pall;
+    let pn: i32 = st.pall_n;
+    let k: i32 = 0;
+    while (k < pn) {
+        let s: f64 = pa[k * 4 + 3];
+        if (s > 0.0) {
+            let pr: f64 = pa[k * 4 + 2];
+            if (pr > 0.0) {
+                let d: f64 = 0.0;
+                d = dist(x, z, pa[k * 4], pa[k * 4 + 1]);
+                if (d < pr) { acc = acc - s * (1.0 - d / pr); }
+            }
+        }
+        k++;
+    }
+    let out: i32 = clampi(floori(acc), 0 - SET_CL_MAX, SET_CL_MAX);
+    return out;
+}
+
+// ENTROPY, §2.3, with the owner's gradient and nothing else in it:
+// decay is INVERSELY proportional to civic light, so maintenance is cheap near
+// the core and expensive at the frontier.
+//
+//   the green (r <= 16 m)   0/hr    never goes out
+//   core, saturated >=2048  2/hr    5.3 real days full -> dark
+//   maintained ring ~1024   9/hr    28 real hours
+//   frontier, alone  ~256  15/hr    17 real hours
+//
+// Durability: a lantern at wick >= 128 cannot be snuffed by an enemy.  So
+// NEGLECT is what makes a post vulnerable; the dark finishes what you started.
+export fn settle_decay_of_lux(p_lux: i32): i32 {
+    let lux: i32 = p_lux;
+    if (lux < 0) { lux = 0; }
+    let f: f64 = f64(lux) / f64(SET_DECAY_SAT_LUX);
+    if (f > 1.0) { f = 1.0; }
+    let out: i32 = SET_DECAY_MAX - floori(f64(SET_DECAY_SPAN) * f);
+    return out;
+}
+
+export fn settle_wick_decay(p_st: object, p_wx: f64, p_wz: f64): i32 {
+    let st: object = p_st;
+    let d: f64 = 0.0;
+    d = dist(p_wx, p_wz, st.cx, st.cz);
+    if (d <= SET_GREEN_R_M) { let zero: i32 = 0; return zero; }
+    let lux: i32 = settle_lux_at(st, p_wx, p_wz);
+    let out: i32 = settle_decay_of_lux(lux);
+    return out;
+}
+
+// A lantern at wick >= SET_WICK_SAFE cannot be snuffed (§2.3).
+export fn settle_wick_safe(p_wick: i32): i32 {
+    let out: i32 = 0;
+    if (p_wick >= SET_WICK_SAFE) { out = 1; }
+    return out;
+}
+
+// ---- CORE_LUX and GRID_LUX ------------------------------------------------
+// CORE_LUX is the QUALITY of home: LUX at the settlement centre.
+// GRID_LUX is the EXTENT of the grid: a PLAIN SUM of contrib(L) over every lit
+// lantern whose POST is inside the tier's ring — deliberately not
+// distance-weighted, because extent should not care where in the ring a post is.
+
+fn settle_grid_sum(p_st: object): f64 {
+    let st: object = p_st;
+    let a: array<f64> = st.lan;
+    let link: array<i32> = st.lan_link;
+    let n: i32 = st.lan_n;
+    let ring: f64 = settle_ring_m(st.tier_ever);
+    let r2: f64 = ring * ring;
+    let acc: f64 = 0.0;
+    let i: i32 = 0;
+    while (i < n) {
+        let wick: f64 = a[i * 4 + 3];
+        if (wick > 0.0) {
+            if (dist2(a[i * 4], a[i * 4 + 1], st.cx, st.cz) <= r2) {
+                let c: f64 = wick;
+                if (link[i] == 1) { c = wick * 2.0; }
+                acc = acc + c;
+            }
+        }
+        i++;
+    }
+    // MAGIC_KINETIC §6.1a: a standing Pall costs 4 grid points.
+    let pa: array<f64> = st.pall;
+    let pn: i32 = st.pall_n;
+    let k: i32 = 0;
+    while (k < pn) {
+        if (dist2(pa[k * 4], pa[k * 4 + 1], st.cx, st.cz) <= r2) {
+            acc = acc - pa[k * 4 + 3];
+        }
+        k++;
+    }
+    if (acc < 0.0) { acc = 0.0; }
+    let out: f64 = acc;
+    return out;
+}
+
+// Full, immediate re-integration.  Used at construction, on load, after a
+// lantern set injection, and by the probe.  `settle_step` does the same work
+// SET_SLICE lanterns at a time.
+export fn settle_refresh(p_st: object) {
+    let st: object = p_st;
+    settle_links_rebuild(st);
+    st.core_lux = settle_lux_at(st, st.cx, st.cz);
+    st.grid_lux = floori(settle_grid_sum(st));
+    st.acc_core = 0.0;
+    st.acc_grid = 0.0;
+    // A sweep in flight is now stale: its accumulator was built against the
+    // PREVIOUS lantern set.  Invalidate it, or the next slice-(n-1) tick will
+    // commit a partial sum over a set that no longer exists and the settlement
+    // will brown out for one sweep every time a lantern is lit.  Found by
+    // probe_settle H17.
+    st.acc_valid = 0;
+    settle_feeder_eval(st);
+    settle_industry_eval(st);
+}
+
+// D6: the floor exists because the Great Lantern has never gone out — which at
+// CAMP it demonstrably has.
+export fn settle_core_lux(p_st: object): i32 {
+    let st: object = p_st;
+    let v: i32 = st.core_lux;
+    if (st.tier_ever >= SET_TIER_VILLAGE) {
+        if (v < SET_CORE_FLOOR) { v = SET_CORE_FLOOR; }
+    }
+    let out: i32 = clampi(v, 0 - SET_CL_MAX, SET_CL_MAX);
+    return out;
+}
+
+export fn settle_grid_lux(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.grid_lux;
+    return out;
+}
+
+// THE number MAGIC_KINETIC.md §6.1a already defines.  Not a new currency.
+export fn settle_grid_points(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = idiv(st.grid_lux, SET_LUX_PER_POINT);
+    return out;
+}
+
+export fn settle_great_tier(p_st: object): i32 {
+    let st: object = p_st;
+    let a: array<f64> = st.lan;
+    if (st.lan_n < 1) { let z: i32 = 0; return z; }
+    if (a[3] <= 0.0) { let unlit: i32 = 0; return unlit; }   // wick 0 = unlit
+    let out: i32 = clampi(i32(a[2]), 0, g_LANTERN_TIERS);
+    return out;
+}
+
+// ===========================================================================
+// 10.  THE TIER LADDER  (§3)
+// ===========================================================================
+
+export fn settle_tier(p_st: object): i32 { let st: object = p_st; let out: i32 = st.tier; return out; }
+export fn settle_tier_ever(p_st: object): i32 { let st: object = p_st; let out: i32 = st.tier_ever; return out; }
+export fn settle_brownout(p_st: object): i32 { let st: object = p_st; let out: i32 = st.brownout; return out; }
+export fn settle_name(p_st: object): i32 { let st: object = p_st; let out: i32 = st.name; return out; }
+export fn settle_cx(p_st: object): f64 { let st: object = p_st; let out: f64 = st.cx; return out; }
+export fn settle_cz(p_st: object): f64 { let st: object = p_st; let out: f64 = st.cz; return out; }
+export fn settle_deck_y(p_st: object): f64 { let st: object = p_st; let out: f64 = st.deck_y; return out; }
+export fn settle_bearing(p_st: object): f64 { let st: object = p_st; let out: f64 = st.bearing; return out; }
+
+// The tier the field currently justifies: all three of grid points, CORE_LUX
+// and Great Lantern tier, at once.  Never more than one step above the current
+// tier — a settlement walks the ladder, it does not teleport up it.
+export fn settle_promote_check(p_st: object): i32 {
+    let st: object = p_st;
+    let pts: i32 = settle_grid_points(st);
+    let core: i32 = settle_core_lux(st);
+    let gl: i32 = settle_great_tier(st);
+    let best: i32 = SET_TIER_CAMP;
+    let t: i32 = SET_TIER_VILLAGE;
+    while (t <= SET_TIER_CITY) {
+        let ok: i32 = 1;
+        if (pts < settle_tier_points(t)) { ok = 0; }
+        if (core < settle_tier_core(t)) { ok = 0; }
+        if (gl < settle_tier_gl(t)) { ok = 0; }
+        if (ok == 1) { best = t; }
+        t++;
+    }
+    let out: i32 = best;
+    return out;
+}
+
+// BROWNOUT: below 80 % of the CURRENT tier's threshold.  Geometry unchanged,
+// window glow cards off, shops lose restock, the Foundry stops.  No triangle
+// spike, no pop, no "my town was deleted".  Recovering is instant.
+export fn settle_brownout_check(p_st: object): i32 {
+    let st: object = p_st;
+    let t: i32 = st.tier_ever;
+    if (t <= SET_TIER_CAMP) { let z: i32 = 0; return z; }
+    let need: i32 = settle_tier_points(t) * 8;
+    let have: i32 = settle_grid_points(st) * 10;
+    let out: i32 = 0;
+    if (have < need) { out = 1; }
+    return out;
+}
+
+// Bring the settlement up to `p_tier`, appending every building the tiers up to
+// and including it introduce.  Never removes.  Never reassigns.  On promotion
+// EVERY NEW PLOT STAKES INSTANTLY — the player immediately sees the shape of the
+// future town, which is a strong Animal Crossing beat at 20 triangles per plot.
+fn settle_grow_to(p_st: object, p_tier: i32): i32 {
+    let st: object = p_st;
+    let want: i32 = settle_tier_buildings(p_tier);
+    let have: i32 = st.n_bld;
+    let con: array<i32> = st.b_con;
+    let prog: array<i32> = st.b_prog;
+    let added: i32 = 0;
+    let i: i32 = have;
+    while (i < want) {
+        con[i] = settle_born_state(settle_man_tier(i));
+        prog[i] = 0;
+        added++;
+        i++;
+    }
+    st.n_bld = want;
+    if (p_tier > st.tier_ever) { st.tier_ever = p_tier; }
+    if (p_tier > st.tier) { st.tier = p_tier; }
+    let out: i32 = added;
+    return out;
+}
+
+// ===========================================================================
+// 11.  BUILDINGS AND CONSTRUCTION  (§6)
+// ===========================================================================
+
+export fn settle_building_count(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.n_bld;
+    return out;
+}
+
+export fn settle_building_pid(p_st: object, p_i: i32): i32 {
+    let st: object = p_st;
+    let i: i32 = p_i;
+    if (i < 0) { let bad: i32 = -1; return bad; }
+    if (i >= st.n_bld) { let bad2: i32 = -1; return bad2; }
+    let a: array<i32> = st.a_pid;
+    let out: i32 = a[i];
+    return out;
+}
+
+export fn settle_building_kind(p_st: object, p_i: i32): i32 {
+    let st: object = p_st;
+    let i: i32 = p_i;
+    if (i < 0) { let bad: i32 = -1; return bad; }
+    if (i >= st.n_bld) { let bad2: i32 = -1; return bad2; }
+    let a: array<i32> = st.a_kind;
+    let out: i32 = a[i];
+    return out;
+}
+
+export fn settle_building_state(p_st: object, p_i: i32): i32 {
+    let st: object = p_st;
+    let i: i32 = p_i;
+    if (i < 0) { let bad: i32 = -1; return bad; }
+    if (i >= st.n_bld) { let bad2: i32 = -1; return bad2; }
+    let a: array<i32> = st.b_con;
+    let out: i32 = a[i];
+    return out;
+}
+
+// One construction step.  Returns the new state, or -1 if there was nothing to
+// do.  A DONE building is DONE FOREVER: this is the only writer of b_con and it
+// only ever increments.
+export fn settle_building_advance(p_st: object, p_i: i32): i32 {
+    let st: object = p_st;
+    let i: i32 = p_i;
+    if (i < 0) { let bad: i32 = -1; return bad; }
+    if (i >= st.n_bld) { let bad2: i32 = -1; return bad2; }
+    let a: array<i32> = st.b_con;
+    if (a[i] >= SET_CON_DONE) { let done: i32 = -1; return done; }
+    a[i] = a[i] + 1;
+    let out: i32 = a[i];
+    return out;
+}
+
+// §6.2: work sites = tier + 1.  Village 2, Town 3, City 4.  Growth accelerates
+// as the town grows, which is the correct feel.
+export fn settle_worksite_count(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.tier_ever + 1;
+    return out;
+}
+
+// The camp's two roofless shells are RUINS, not work sites.  They are the
+// "before" the whole game is measured against and they never advance — which is
+// also what makes §6.2's Camp -> Village count of 7 agree with §3.3's table.
+fn settle_is_ruin(p_i: i32): i32 {
+    let out: i32 = 0;
+    if (p_i < 2) { out = 1; }
+    return out;
+}
+
+// ===========================================================================
+// 12.  THE FOUNDRY  (§4)
+// ===========================================================================
+// F1 tier CITY.  F2 CORE_LUX >= 2048.  F3 Great Lantern >= T4.
+// F4 THE FEEDER LINE — and F4 is the one that makes this a game rather than a
+// number.  A global average is not a place; a specific chain of posts you have
+// to walk is.  See D4 for exactly how it is evaluated and why.
+
+// The Foundry's own post: the lit-or-unlit lantern nearest the Foundry
+// building's plot, excluding the Great Lantern itself.
+export fn settle_foundry_post(p_st: object): i32 {
+    let st: object = p_st;
+    if (st.n_bld <= 17) { let none: i32 = -1; return none; }
+    let apid: array<i32> = st.a_pid;
+    let pid: i32 = apid[17];
+    if (pid < 0) { let none2: i32 = -1; return none2; }
+    let pxa: array<f64> = st.plot_x;
+    let pza: array<f64> = st.plot_z;
+    let fx: f64 = pxa[pid];
+    let fz: f64 = pza[pid];
+    let a: array<f64> = st.lan;
+    let n: i32 = st.lan_n;
+    let best: i32 = -1;
+    let bd: f64 = 1000000.0;
+    let i: i32 = 1;
+    while (i < n) {
+        let d: f64 = dist2(fx, fz, a[i * 4], a[i * 4 + 1]);
+        if (d < bd) { bd = d; best = i; }
+        i++;
+    }
+    let out: i32 = best;
+    return out;
+}
+
+// Breadth-first search over the LIT lantern graph, edges at 90 m.  Fills
+// st.feeder with the shortest chain from the Great Lantern (node 0) to the
+// Foundry post, and sets st.feeder_lit to the number of lit lanterns in the
+// connected component that contains both.  0 if either endpoint is unlit or the
+// chain is broken.  Runs once per in-game day, never per frame.
+export fn settle_feeder_eval(p_st: object): i32 {
+    let st: object = p_st;
+    let a: array<f64> = st.lan;
+    let n: i32 = st.lan_n;
+    let feeder: array<i32> = st.feeder;
+    let i: i32 = 0;
+    while (i < SET_FEEDER_MAX) { feeder[i] = -1; i++; }
+    st.feeder_n = 0;
+    st.feeder_lit = 0;
+
+    let dst: i32 = settle_foundry_post(st);
+    st.foundry_post = dst;
+    if (dst < 0) { let none: i32 = 0; return none; }
+    if (n < 1) { let none2: i32 = 0; return none2; }
+    if (a[3] <= 0.0) { let unlit: i32 = 0; return unlit; }        // GL is out
+    if (a[dst * 4 + 3] <= 0.0) { let unlit2: i32 = 0; return unlit2; }
+
+    let prev: array<i32> = [];
+    let seen: array<i32> = [];
+    let queue: array<i32> = [];
+    let k: i32 = 0;
+    while (k < n) { prev.push(-1); seen.push(0); k++; }
+    seen[0] = 1;
+    queue.push(0);
+    let lim: f64 = g_WICKLINE_M * g_WICKLINE_M;
+    let head: i32 = 0;
+    let comp: i32 = 0;
+    while (head < queue.length) {
+        let u: i32 = queue[head];
+        head++;
+        comp++;
+        let ux: f64 = a[u * 4];
+        let uz: f64 = a[u * 4 + 1];
+        let v: i32 = 0;
+        while (v < n) {
+            if (seen[v] == 0) {
+                if (a[v * 4 + 3] > 0.0) {
+                    if (dist2(ux, uz, a[v * 4], a[v * 4 + 1]) <= lim) {
+                        seen[v] = 1;
+                        prev[v] = u;
+                        queue.push(v);
+                    }
+                }
+            }
+            v++;
+        }
+    }
+    if (seen[dst] == 0) { let broken: i32 = 0; return broken; }
+
+    // walk the chain back, then reverse it into feeder[]
+    let chain: array<i32> = [];
+    let c: i32 = dst;
+    while (c >= 0) {
+        chain.push(c);
+        if (c == 0) { c = -1; } else { c = prev[c]; }
+    }
+    let m: i32 = chain.length;
+    let w: i32 = 0;
+    while (w < m) {
+        if (w < SET_FEEDER_MAX) { feeder[w] = chain[m - 1 - w]; }
+        w++;
+    }
+    st.feeder_n = m;
+    st.feeder_lit = comp;
+    let out: i32 = comp;
+    return out;
+}
+
+export fn settle_feeder_lit(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.feeder_lit;
+    return out;
+}
+
+// The i-th lantern along the walkable chain, for the HUD route marker.
+export fn settle_feeder_node(p_st: object, p_i: i32): i32 {
+    let st: object = p_st;
+    let i: i32 = p_i;
+    if (i < 0) { let bad: i32 = -1; return bad; }
+    if (i >= st.feeder_n) { let bad2: i32 = -1; return bad2; }
+    if (i >= SET_FEEDER_MAX) { let bad3: i32 = -1; return bad3; }
+    let a: array<i32> = st.feeder;
+    let out: i32 = a[i];
+    return out;
+}
+
+export fn settle_feeder_len(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.feeder_n;
+    return out;
+}
+
+// All four conditions, as a bitmask: 1 F1, 2 F2, 4 F3, 8 F4.  15 means the
+// Foundry runs.
+export fn settle_foundry_gate(p_st: object): i32 {
+    let st: object = p_st;
+    let m: i32 = 0;
+    if (st.tier_ever >= SET_TIER_CITY) {
+        if (settle_grid_points(st) >= SET_PTS_CITY) { m = m | 1; }
+    }
+    if (settle_core_lux(st) >= SET_CORE_CITY) { m = m | 2; }
+    if (settle_great_tier(st) >= SET_GL_CITY) { m = m | 4; }
+    // F4 reads the CACHED feeder result.  The BFS is O(n^2) — 40 000 distance
+    // evaluations on a 200-lantern grid — and the settle tick's whole budget is
+    // 0.05 ms, so it runs once per in-game day (and on every refresh), not at
+    // 1 Hz.  §4.1 checks the four conditions "once per in-game day" anyway.
+    if (st.feeder_lit >= SET_FEEDER_MIN) { m = m | 8; }
+    let out: i32 = m;
+    return out;
+}
+
+// §4.2's five output tiers, thresholded on grid points.
+export fn settle_output_tier(p_st: object): i32 {
+    let st: object = p_st;
+    if (st.industry == SET_IND_COLD) { let z: i32 = SET_O0; return z; }
+    if (st.industry == SET_IND_BROWNOUT) { let z2: i32 = SET_O0; return z2; }
+    let p: i32 = settle_grid_points(st);
+    if (p < 72) { let a: i32 = 0; return a; }
+    if (p < 90) { let b: i32 = 1; return b; }
+    if (p < 110) { let c: i32 = 2; return c; }
+    if (p < 134) { let d: i32 = 3; return d; }
+    if (p < 162) { let e: i32 = 4; return e; }
+    let out: i32 = 5;
+    return out;
+}
+
+// Manufactured rounds per in-game day.  FLICKER halves production; BROWNOUT and
+// COLD stop it.  THE SHOP INVENTORY IS THE READOUT — no UI for grid points is
+// needed anywhere.  The player learns the system by noticing the Arsenal has
+// more brass this week.
+export fn settle_ammo_rate(p_st: object): i32 {
+    let st: object = p_st;
+    let o: i32 = settle_output_tier(st);
+    let base: i32 = 0;
+    if (o == 1) { base = 60; }
+    if (o == 2) { base = 120; }
+    if (o == 3) { base = 200; }
+    if (o == 4) { base = 300; }
+    if (o == 5) { base = 420; }
+    if (st.industry == SET_IND_FLICKER) { base = idiv(base, 2); }
+    if (st.industry == SET_IND_BROWNOUT) { base = 0; }
+    if (st.industry == SET_IND_COLD) { base = 0; }
+    if (st.ind_warm_ticks > 0) { base = 0; }
+    let out: i32 = base;
+    return out;
+}
+
+export fn settle_industry(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.industry;
+    return out;
+}
+
+export fn settle_ammo_stock(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.ammo_stock;
+    return out;
+}
+
+// The three-stage degradation ladder, §4.3.  NONE OF THESE DISARMS THE PLAYER:
+// the bolt-action, the revolver, the pump shotgun and the pipe-SMG are crafted
+// at Mabel's bench from world materials and have never depended on the city.
+// Losing the city costs RATE OF FIRE AND REACH, not the ability to play.
+export fn settle_industry_eval(p_st: object): i32 {
+    let st: object = p_st;
+    let prev: i32 = st.industry;
+
+    if (st.tier_ever < SET_TIER_CITY) {
+        st.industry = SET_IND_COLD;
+        st.ind_fail_ticks = 0;
+        let ev: i32 = 0;
+        if (prev != st.industry) { ev = SET_EV_INDUSTRY; }
+        return ev;
+    }
+
+    let gate: i32 = settle_foundry_gate(st);
+    let pts: i32 = settle_grid_points(st);
+
+    // COLD is absorbing until an explicit relight (§4.3): 200 Ember, a fully
+    // lit feeder line and one in-game day of warm-up.  The LATCH is what
+    // distinguishes "the fire went out" from "the Foundry has not been built
+    // yet" — both read as COLD, and without the latch a settlement that reaches
+    // CITY would demand a 200-Ember relight it never earned.
+    if (prev == SET_IND_COLD) {
+        if (st.ind_cold_latch == 1) {
+            let ev0: i32 = 0;
+            return ev0;
+        }
+    }
+
+    if (gate == 15) {
+        st.ind_fail_ticks = 0;
+        st.industry = SET_IND_RUNNING;
+    } else {
+        if (pts < SET_COLD_POINTS) {
+            st.industry = SET_IND_COLD;
+            st.ind_cold_ticks = 0;
+            st.ind_cold_latch = 1;
+        } else {
+            if (st.ind_fail_ticks >= SET_COLD_REAL_TICKS) {
+                st.industry = SET_IND_COLD;
+                st.ind_cold_ticks = 0;
+                st.ind_cold_latch = 1;
+            } else {
+                if (st.ind_fail_ticks >= DAY_TICKS) { st.industry = SET_IND_BROWNOUT; }
+                else { st.industry = SET_IND_FLICKER; }
+            }
+        }
+    }
+    let ev: i32 = 0;
+    if (prev != st.industry) { ev = SET_EV_INDUSTRY; }
+    return ev;
+}
+
+// Relight a COLD Foundry.  Returns the Ember cost consumed (0 = refused).
+// Refuses unless the four gates are met right now — the fire does not come back
+// on a promise.
+export fn settle_relight(p_st: object, p_ember: i32): i32 {
+    let st: object = p_st;
+    if (st.industry != SET_IND_COLD) { let no: i32 = 0; return no; }
+    if (p_ember < SET_RELIGHT_EMBER) { let no2: i32 = 0; return no2; }
+    if (settle_foundry_gate(st) != 15) { let no3: i32 = 0; return no3; }
+    st.industry = SET_IND_RUNNING;
+    st.ind_cold_latch = 0;
+    st.ind_fail_ticks = 0;
+    st.ind_cold_ticks = 0;
+    st.ind_warm_ticks = DAY_TICKS;
+    let out: i32 = SET_RELIGHT_EMBER;
+    return out;
+}
+
+// ===========================================================================
+// 13.  THE TICK  (§2.4, §8.4)
+// ===========================================================================
+// Runs at frame-graph step (h), ONE TICK IN 60.  Re-integrates SET_SLICE
+// lanterns per call on a rotating slice indexed by the tick, so a 200-lantern
+// grid fully refreshes in 25 s and never costs more than 8 distance evaluations
+// per second.  The slice index is tick/60 mod ceil(n/8), so the lag is
+// DETERMINISTIC and hashes.
+//
+// Returns a SET_EV_* bitmask.
+
+export fn settle_step(p_st: object, p_tick: i32): i32 {
+    let st: object = p_st;
+    let tick: i32 = p_tick;
+    if (tick % SET_STEP_EVERY != 0) { let skip: i32 = 0; return skip; }
+    let dt: i32 = tick - st.tick;
+    if (dt < 0) { dt = 0; }
+    if (dt > DAY_TICKS) { dt = DAY_TICKS; }
+    st.tick = tick;
+    let ev: i32 = 0;
+
+    // ---- the rotating slice ----------------------------------------------
+    let n: i32 = st.lan_n;
+    let nsl: i32 = idiv(n + SET_SLICE - 1, SET_SLICE);
+    if (nsl < 1) { nsl = 1; }
+    let sl: i32 = idiv(tick, SET_STEP_EVERY) % nsl;
+    if (sl == 0) { st.acc_core = 0.0; st.acc_grid = 0.0; st.acc_valid = 1; }
+
+    let a: array<f64> = st.lan;
+    let link: array<i32> = st.lan_link;
+    let ring: f64 = settle_ring_m(st.tier_ever);
+    let r2: f64 = ring * ring;
+    let i0: i32 = sl * SET_SLICE;
+    let i1: i32 = i0 + SET_SLICE;
+    if (i1 > n) { i1 = n; }
+    let i: i32 = i0;
+    while (i < i1) {
+        link[i] = settle_link_of(st, i);
+        let wick: f64 = a[i * 4 + 3];
+        if (wick > 0.0) {
+            let c: f64 = wick;
+            if (link[i] == 1) { c = wick * 2.0; }
+            let r: f64 = settle_lantern_radius(i32(a[i * 4 + 2]));
+            let d: f64 = 0.0;
+            d = dist(st.cx, st.cz, a[i * 4], a[i * 4 + 1]);
+            if (d < r) { st.acc_core = st.acc_core + c * (1.0 - d / r); }
+            if (d * d <= r2) { st.acc_grid = st.acc_grid + c; }
+        }
+        i++;
+    }
+    if (sl == nsl - 1 && st.acc_valid == 1) {
+        let cacc: f64 = st.acc_core;
+        if (cacc > f64(SET_CL_MAX)) { cacc = f64(SET_CL_MAX); }
+        // palls are few and cheap; they are integrated whole, every sweep
+        let pa: array<f64> = st.pall;
+        let pn: i32 = st.pall_n;
+        let gacc: f64 = st.acc_grid;
+        let k: i32 = 0;
+        while (k < pn) {
+            let s: f64 = pa[k * 4 + 3];
+            let pr: f64 = pa[k * 4 + 2];
+            if (s > 0.0) {
+                if (pr > 0.0) {
+                    let d: f64 = 0.0;
+                    d = dist(st.cx, st.cz, pa[k * 4], pa[k * 4 + 1]);
+                    if (d < pr) { cacc = cacc - s * (1.0 - d / pr); }
+                }
+            }
+            if (dist2(pa[k * 4], pa[k * 4 + 1], st.cx, st.cz) <= r2) { gacc = gacc - s; }
+            k++;
+        }
+        if (gacc < 0.0) { gacc = 0.0; }
+        st.core_lux = clampi(floori(cacc), 0 - SET_CL_MAX, SET_CL_MAX);
+        st.grid_lux = floori(gacc);
+        st.acc_valid = 0;
+    }
+
+    // ---- brownout, which is instant in both directions --------------------
+    let bo: i32 = settle_brownout_check(st);
+    if (bo != st.brownout) {
+        st.brownout = bo;
+        if (bo == 1) { ev = ev | SET_EV_BROWNOUT_IN; }
+        else { ev = ev | SET_EV_BROWNOUT_OUT; }
+    }
+
+    // ---- promotion: held for one continuous in-game day --------------------
+    // The hold prevents a promotion firing off a transient spike during a night
+    // hold.  It resets the moment the field stops justifying the next tier.
+    let want: i32 = settle_promote_check(st);
+    if (want > st.tier_ever) {
+        st.hold_ticks = st.hold_ticks + dt;
+        if (st.hold_ticks >= DAY_TICKS) {
+            st.hold_ticks = 0;
+            settle_grow_to(st, st.tier_ever + 1);
+            ev = ev | SET_EV_PROMOTED | SET_EV_STAKED;
+        }
+    } else {
+        st.hold_ticks = 0;
+    }
+
+    // ---- construction: one state per in-game day per work site -------------
+    // A construction step only fires while the tier's threshold is HELD.  If the
+    // grid falls, the work stops where it stands, and a half-clad house on the
+    // green is the most legible possible reminder that somebody has to do the
+    // rounds.
+    if (st.brownout == 0) {
+        st.work_ticks = st.work_ticks + dt;
+        while (st.work_ticks >= DAY_TICKS) {
+            st.work_ticks = st.work_ticks - DAY_TICKS;
+            let sites: i32 = settle_worksite_count(st);
+            let done: i32 = 0;
+            let b: i32 = 0;
+            while (b < st.n_bld) {
+                if (done >= sites) { b = st.n_bld; }
+                else {
+                    if (settle_is_ruin(b) == 0) {
+                        let r: i32 = settle_building_advance(st, b);
+                        if (r >= 0) {
+                            done++;
+                            ev = ev | SET_EV_BUILD_ADVANCE;
+                            if (r == SET_CON_DONE) { ev = ev | SET_EV_BUILD_DONE; }
+                        }
+                    }
+                    b++;
+                }
+            }
+        }
+    }
+
+    // ---- industry, once per in-game day ------------------------------------
+    if (st.ind_warm_ticks > 0) {
+        st.ind_warm_ticks = st.ind_warm_ticks - dt;
+        if (st.ind_warm_ticks < 0) { st.ind_warm_ticks = 0; }
+    }
+    if (st.industry != SET_IND_RUNNING) { st.ind_fail_ticks = st.ind_fail_ticks + dt; }
+    if (st.industry == SET_IND_COLD) { st.ind_cold_ticks = st.ind_cold_ticks + dt; }
+    if (tick % DAY_TICKS == 0) { settle_feeder_eval(st); }
+    ev = ev | settle_industry_eval(st);
+    if (tick % DAY_TICKS == 0) {
+        let rate: i32 = settle_ammo_rate(st);
+        let stock: i32 = st.ammo_stock + rate;
+        if (stock > 100000) { stock = 100000; }
+        st.ammo_stock = stock;
+    }
+    let out: i32 = ev;
+    return out;
+}
+
+// ===========================================================================
+// 14.  COLLISION  (§8.3)
+// ===========================================================================
+// Buildings are static within a construction state, so this is a caller-owned
+// flat array of 6-f64 AABBs, exactly what `move_apply_ex` already takes.
+// A STAKED plot is a dirt pad and has no collider.
+
+fn settle_arch_px(p_kind: i32): f64 {
+    let k: i32 = p_kind;
+    if (k == SET_B_COTTAGE) { let a: f64 = 8.0; return a; }
+    if (k == SET_B_HOUSE) { let b: f64 = 8.0; return b; }
+    if (k == SET_B_HALL) { let c: f64 = 12.0; return c; }
+    if (k == SET_B_WORKS) { let d: f64 = 16.0; return d; }
+    let out: f64 = 4.0;                       // shack, tower, stack, well
+    return out;
+}
+
+fn settle_arch_pz(p_kind: i32): f64 {
+    let k: i32 = p_kind;
+    if (k == SET_B_HOUSE) { let a: f64 = 8.0; return a; }
+    if (k == SET_B_HALL) { let b: f64 = 8.0; return b; }
+    if (k == SET_B_WORKS) { let c: f64 = 12.0; return c; }
+    let out: f64 = 4.0;
+    return out;
+}
+
+export fn settle_arch_eaves(p_kind: i32): f64 {
+    let k: i32 = p_kind;
+    if (k == SET_B_COTTAGE) { let a: f64 = 2.8; return a; }
+    if (k == SET_B_HOUSE) { let b: f64 = 3.4; return b; }
+    if (k == SET_B_HALL) { let c: f64 = 4.2; return c; }
+    if (k == SET_B_TOWER) { let d: f64 = 9.0; return d; }
+    if (k == SET_B_STACK) { let e: f64 = 12.0; return e; }
+    if (k == SET_B_WORKS) { let f: f64 = 5.4; return f; }
+    if (k == SET_B_WELL) { let g: f64 = 1.2; return g; }
+    let out: f64 = 2.6;                       // shack
+    return out;
+}
+
+// Fills `p_out` with 6 f64 per solid: minx, miny, minz, maxx, maxy, maxz.
+// Returns the number of solids written.  Axis-aligned bounds of the yawed
+// footprint — a rotated box needs a rotated collider the mover does not have,
+// and an AABB of the rotation is the conservative answer.
+export fn settle_solids_fill(p_st: object, p_cam_x: f64, p_cam_z: f64,
+                             p_out: array<f64>): i32 {
+    let st: object = p_st;
+    let cap: i32 = idiv(p_out.length, 6);
+    let n: i32 = 0;
+    let pxa: array<f64> = st.plot_x;
+    let pza: array<f64> = st.plot_z;
+    let pya: array<f64> = st.plot_y;
+    let pyw: array<f64> = st.plot_yaw;
+    let apid: array<i32> = st.a_pid;
+    let akind: array<i32> = st.a_kind;
+    let bcon: array<i32> = st.b_con;
+    let i: i32 = 0;
+    while (i < st.n_bld) {
+        if (n >= cap) { i = st.n_bld; }
+        else {
+            let pid: i32 = apid[i];
+            if (pid >= 0) {
+                if (bcon[i] > SET_CON_STAKED) {
+                    let bx: f64 = pxa[pid];
+                    let bz: f64 = pza[pid];
+                    if (dist2(bx, bz, p_cam_x, p_cam_z) <= 484.0) {   // 22 m
+                        let k: i32 = akind[i];
+                        let hx: f64 = settle_arch_px(k) * 0.5;
+                        let hz: f64 = settle_arch_pz(k) * 0.5;
+                        let yaw: f64 = pyw[pid];
+                        let ca: f64 = __abs(__cos(yaw));
+                        let sa: f64 = __abs(__sin(yaw));
+                        let ex: f64 = hx * ca + hz * sa;
+                        let ez: f64 = hx * sa + hz * ca;
+                        let by: f64 = pya[pid];
+                        let o: i32 = n * 6;
+                        p_out[o] = bx - ex;
+                        p_out[o + 1] = by - 1.4;
+                        p_out[o + 2] = bz - ez;
+                        p_out[o + 3] = bx + ex;
+                        p_out[o + 4] = by + settle_arch_eaves(k);
+                        p_out[o + 5] = bz + ez;
+                        n++;
+                    }
+                }
+            }
+            i++;
+        }
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 15.  THE DELTA LOG  (§8.5)
+// ===========================================================================
+// SAVE_T_SETTLE       rows = building count, cols_i32 = 4:
+//                       pid, kind, con_state, con_progress_ticks
+// SAVE_T_SETTLE_META  rows = 1, cols_i32 = 8:
+//                       tier, tier_ever, industry, industry_cold_ticks,
+//                       ammo_stock, feeder_head_id, worksite_cursor, brownout
+//
+// Rows are emitted SORTED BY pid, never in insertion order, so equal state
+// produces equal bytes — the same canonicalisation CHUNKRING already uses.
+//
+// NOT PERSISTED, because it is f(seed): the site, the terrace height, the name,
+// the roads, all 72 plot positions and yaws, plot validity, the entire
+// accretion order and the entire kind assignment.  This is the identical
+// argument save.hml already makes for chunk heights, and it is what makes a
+// shard `seed + deltas`.
+
+export fn settle_save_rows(p_st: object): i32 {
+    let st: object = p_st;
+    let out: i32 = st.n_bld;
+    return out;
+}
+
+export fn settle_save_fill(p_st: object, p_out: array<i32>): i32 {
+    let st: object = p_st;
+    let n: i32 = st.n_bld;
+    if (p_out.length < n * SET_SAVE_COLS) { let bad: i32 = -1; return bad; }
+    let apid: array<i32> = st.a_pid;
+    let akind: array<i32> = st.a_kind;
+    let bcon: array<i32> = st.b_con;
+    let bprog: array<i32> = st.b_prog;
+    // selection sort of the building indices by pid — n <= 28, cold, and it
+    // makes the byte stream canonical
+    let idx: array<i32> = [];
+    let i: i32 = 0;
+    while (i < n) { idx.push(i); i++; }
+    let s: i32 = 0;
+    while (s < n) {
+        let best: i32 = s;
+        let t: i32 = s + 1;
+        while (t < n) {
+            if (apid[idx[t]] < apid[idx[best]]) { best = t; }
+            t++;
+        }
+        let tmp: i32 = idx[s]; idx[s] = idx[best]; idx[best] = tmp;
+        s++;
+    }
+    let r: i32 = 0;
+    while (r < n) {
+        let b: i32 = idx[r];
+        let o: i32 = r * SET_SAVE_COLS;
+        p_out[o] = apid[b];
+        p_out[o + 1] = akind[b];
+        p_out[o + 2] = bcon[b];
+        p_out[o + 3] = bprog[b];
+        r++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+export fn settle_meta_fill(p_st: object, p_out: array<i32>): i32 {
+    let st: object = p_st;
+    if (p_out.length < SET_META_COLS) { let bad: i32 = -1; return bad; }
+    let head: i32 = -1;
+    if (st.feeder_n > 0) { let f: array<i32> = st.feeder; head = f[0]; }
+    p_out[0] = st.tier;
+    p_out[1] = st.tier_ever;
+    p_out[2] = st.industry;
+    p_out[3] = st.ind_cold_ticks;
+    p_out[4] = st.ammo_stock;
+    p_out[5] = head;
+    p_out[6] = st.worksite_cursor;
+    p_out[7] = st.brownout;
+    let out: i32 = SET_META_COLS;
+    return out;
+}
+
+// Restore.  `p_rows` is SET_SAVE_COLS i32 per building in pid order; `p_meta` is
+// SET_META_COLS.  The layout is NOT read back — it is regenerated from the seed
+// by `settle_new_at`, and the pid column is used only to re-key the rows onto
+// the regenerated assignment.  A row whose pid is not in the assignment is
+// DROPPED rather than trusted: that is a save from a different seed.
+export fn settle_load(p_st: object, p_rows: array<i32>, p_nrows: i32,
+                      p_meta: array<i32>): i32 {
+    let st: object = p_st;
+    let nr: i32 = p_nrows;
+    if (nr < 0) { let bad: i32 = -1; return bad; }
+    if (nr > SET_BLD_MAX) { let bad2: i32 = -1; return bad2; }
+    if (p_rows.length < nr * SET_SAVE_COLS) { let bad3: i32 = -1; return bad3; }
+    if (p_meta.length < SET_META_COLS) { let bad4: i32 = -1; return bad4; }
+
+    let tier: i32 = clampi(p_meta[0], SET_TIER_CAMP, SET_TIER_CITY);
+    let ever: i32 = clampi(p_meta[1], SET_TIER_CAMP, SET_TIER_CITY);
+    if (ever < tier) { ever = tier; }
+    settle_grow_to(st, ever);
+    st.tier = tier;
+    st.tier_ever = ever;
+
+    let apid: array<i32> = st.a_pid;
+    let bcon: array<i32> = st.b_con;
+    let bprog: array<i32> = st.b_prog;
+    let applied: i32 = 0;
+    let r: i32 = 0;
+    while (r < nr) {
+        let o: i32 = r * SET_SAVE_COLS;
+        let pid: i32 = p_rows[o];
+        let b: i32 = 0;
+        while (b < st.n_bld) {
+            if (apid[b] == pid) {
+                bcon[b] = clampi(p_rows[o + 2], SET_CON_STAKED, SET_CON_DONE);
+                bprog[b] = p_rows[o + 3];
+                applied++;
+                b = st.n_bld;
+            } else { b++; }
+        }
+        r++;
+    }
+    st.industry = clampi(p_meta[2], SET_IND_COLD, SET_IND_RUNNING);
+    st.ind_cold_ticks = p_meta[3];
+    st.ammo_stock = p_meta[4];
+    st.worksite_cursor = p_meta[6];
+    st.brownout = clampi(p_meta[7], 0, 1);
+    settle_refresh(st);
+    let out: i32 = applied;
+    return out;
+}
+
+// Folded into `sim_hash`.  Covers every field the delta log carries and nothing
+// that is f(seed) — a hash over regenerated data would only ever restate the
+// seed.  32-bit FNV-style mixing in u64 (A13: i32 `*` TRAPS on overflow).
+fn hmix(p_h: u64, p_v: i32): u64 {
+    let h: u64 = p_h;
+    let v: u64 = 0;
+    if (p_v >= 0) { v = u64(p_v); } else { v = u64(f64(p_v) + 4294967296.0); }
+    let out: u64 = ((h ^ v) * 1099511628141) & 4294967295;
+    return out;
+}
+
+export fn settle_hash(p_st: object): i32 {
+    let st: object = p_st;
+    let h: u64 = 2166136261;
+    h = hmix(h, st.seed);
+    h = hmix(h, st.gx);
+    h = hmix(h, st.gz);
+    h = hmix(h, st.site_k);
+    h = hmix(h, st.name);
+    h = hmix(h, st.tier);
+    h = hmix(h, st.tier_ever);
+    h = hmix(h, st.brownout);
+    h = hmix(h, st.industry);
+    h = hmix(h, st.ind_cold_ticks);
+    h = hmix(h, st.ammo_stock);
+    h = hmix(h, st.worksite_cursor);
+    h = hmix(h, st.n_bld);
+    h = hmix(h, st.core_lux);
+    h = hmix(h, st.grid_lux);
+    let rows: array<i32> = [];
+    let need: i32 = st.n_bld * SET_SAVE_COLS;
+    let i: i32 = 0;
+    while (i < need) { rows.push(0); i++; }
+    settle_save_fill(st, rows);
+    let k: i32 = 0;
+    while (k < need) { h = hmix(h, rows[k]); k++; }
+    let out: i32 = i32(h & 2147483647);
+    return out;
+}

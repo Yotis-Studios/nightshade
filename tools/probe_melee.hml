@@ -1,0 +1,1579 @@
+// =============================================================================
+//  probe_melee.hml — acceptance probe for src/sim/melee.hml + the melee half
+//                    of src/sim/weapons.hml.        DIRECTION.md §10.
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT, and BOTH ways — the golden hashes are
+//  what make running it twice mean anything:
+//
+//      hemlockc -O1 tools/probe_melee.hml -o /tmp/pmel && /tmp/pmel
+//      hemlock  tools/probe_melee.hml
+//
+//  It exits 1 on any failure AND on an assertion-COUNT mismatch.  A probe that
+//  silently stops running half its checks is worse than no probe.
+//
+//  WHAT IT IS TRYING TO PROVE, in the order the design cares about:
+//
+//    A  the TABLE is the design — the role orderings, against LITERALS
+//    B  TTK against ai.hml's real HP column, against LITERALS
+//    C  a sweep cannot pass through the smallest body in the game
+//    D  the swing state machine: one strike per swing, buffered input, ticks
+//    E  hit registration is combat.hml's, not a second copy of it
+//    F  cleave, dedupe and the nearest-first cap
+//    G  reach is the spear's identity and it is measurable
+//    H  heads, plates and flanks behave exactly as they do for a bullet
+//    I  terrain occludes a swing
+//    J  NO DURABILITY — blow 1 and blow 10 000 are the same blow
+//    K  melee consumes ZERO randomness
+//    L  stagger: magnitude order, max-not-sum, decay, and not on a corpse
+//    M  the GAME_DESIGN §2.5 five-signal contract, on every swing shape
+//    N  determinism: same seed identical, different seed different,
+//       compiled == interpreted
+//    O  cost, with the loadavg printed next to it
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos, PI } from "@stdlib/math";
+
+import { g_TICK_DT, g_WORLD_SEED_DEFAULT, g_CHUNK_CACHE,
+         g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK, g_ENEMY_SPITTER,
+         g_ENEMY_WARDEN, g_ENEMY_BULWARK
+       } from "../src/core/config.hml";
+
+import { world_new_cap, world_spawn, world_spawn_player, world_despawn,
+         world_id_of, world_set_tick, world_set_seed, world_count,
+         KIND_AI, EF_DEAD, EF_INVULN
+       } from "../src/sim/world.hml";
+
+import { cmd_new, cmd_set, cmd_yaw, BTN_MELEE, BTN_FIRE
+       } from "../src/sim/command.hml";
+
+import { chunk_store_new_cap, chunk_set_source, chunk_pin_ring,
+         chunk_height_at, CHUNK_H_MISS } from "../src/sim/chunk.hml";
+
+import { worldgen_chunk_at, worldgen_poi_roll } from "../src/sim/worldgen.hml";
+
+import { rng_state_hash } from "../src/sim/rng.hml";
+
+import { mel_valid, mel_dmg, mel_dmg_hit, mel_hs_mult, mel_reach,
+         mel_arc_deg, mel_arc_half_rad, mel_rays, mel_targets,
+         mel_windup, mel_active, mel_recover, mel_cycle, mel_dps,
+         mel_stagger_len, mel_tier, mel_ttk_hits, mel_ttk_ms,
+         mel_ray_gap_m, mel_dtype, mel_uses_ammo,
+         mel_to_mainhand, mel_from_mainhand,
+         MEL_CLUB, MEL_SPEAR, MEL_SWORD, MEL_COUNT, MEL_NONE,
+         MH_MELEE_BASE, MEL_HAS_DURABILITY, MEL_DTYPE_KINETIC,
+         wpn_valid, WPN_COUNT
+       } from "../src/sim/weapons.hml";
+
+import { combat_new_cap, combat_set_weapon_source, combat_events,
+         combat_begin_tick, combat_raycast, combat_body_h, combat_body_r,
+         combat_plate_hp, combat_feedback_ok, combat_stat, combat_is_dead,
+         combat_ray_scratch,
+         evbus_count, evbus_type, evbus_sub, evbus_target, evbus_actor,
+         evbus_hash, evbus_count_for,
+         EV_HIT, EV_KILL, EV_SOUND, EV_HITMARKER, EV_HIT_FLASH,
+         EV_DAMAGE_NUMBER, EV_IMPACT,
+         HM_HEAD, HM_KILL, HM_ARMOR,
+         SURF_TERRAIN, SURF_FLESH, SURF_ARMOR,
+         SFX_KILL_CHIME, SFX_IMPACT_WORLD, SFX_IMPACT_ARMOR,
+         DMG_MELEE, DMG_SUB_BASE, WARDEN_PLATE_HP, PLATE_DR,
+         RAY_T, RAY_KIND, RAY_SLOT, RAY_TERRAIN, RAY_ENTITY,
+         STAT_KILLS
+       } from "../src/sim/combat.hml";
+
+import { wpn_dmg_at, wpn_hs_mult, wpn_pellets, wpn_spread_half_rad
+       } from "../src/sim/weapons.hml";
+
+import { melee_new_cap, melee_equip, melee_unequip, melee_equipped,
+         melee_mainhand, melee_phase, melee_phase_t, melee_swings,
+         melee_hits, melee_can_swing, melee_tick,
+         melee_stagger_of, melee_staggered, melee_stagger_step,
+         melee_stagger_clear, melee_phase_len, melee_cycle_len,
+         melee_state_hash, melee_hash, melee_stat, melee_invariants_ok,
+         melee_sfx_for,
+         MS_IDLE, MS_WINDUP, MS_ACTIVE, MS_RECOVER, MS_FIELDS,
+         MEL_MAX_RAYS, EV_STAGGER,
+         SFX_MELEE_CLUB, SFX_MELEE_SPEAR, SFX_MELEE_SWORD, SFX_MELEE_WHIFF,
+         MSTAT_SWINGS, MSTAT_STRIKES, MSTAT_HITS, MSTAT_WHIFFS,
+         MSTAT_TERRAIN_HITS, MSTAT_STAGGERS, MSTAT_RAYS_CAST
+       } from "../src/sim/melee.hml";
+
+// ---------------------------------------------------------------------------
+//  EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green.
+// ---------------------------------------------------------------------------
+let g_expect_asserts = 187;
+
+let g_asserts = 0;
+let g_pass = 0;
+let g_fail = 0;
+
+fn ck(p_cond: bool, p_name: string, p_detail: string) {
+    g_asserts = g_asserts + 1;
+    if (p_cond) {
+        g_pass = g_pass + 1;
+    } else {
+        g_fail = g_fail + 1;
+        print(`  FAIL  ${p_name}  --  ${p_detail}`);
+    }
+}
+
+fn s2(p_v: f64): string {
+    let out: string = `${p_v}`;
+    return out;
+}
+
+fn near(p_a: f64, p_b: f64, p_eps: f64): bool {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = 0.0 - d; }
+    return d <= p_eps;
+}
+
+fn is_compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+// ===========================================================================
+//  THE REFERENCE NUMBERS.  Transcribed HERE, in the test, from ai.hml's class
+//  table and from `combat.hml`'s hitbox block — deliberately not read from the
+//  modules under test, so an anchor cannot drift with the thing it anchors.
+// ===========================================================================
+let g_EN_HP: array<i32>  = [15, 30, 90, 70, 220, 900];
+let g_EN_H: array<f64>   = [0.70, 0.90, 1.85, 1.60, 2.30, 3.20];
+let g_EN_R: array<f64>   = [0.35, 0.45, 0.40, 0.45, 0.65, 1.10];
+// ai.hml's attack-range column.  The spear must beat all of it except Bulwark.
+let g_EN_RANGE: array<f64> = [1.00, 1.00, 1.80, 30.0, 2.20, 5.00];
+// The smallest body in the game, across.  The ray fan must not have a hole
+// wider than this or a club can swing THROUGH a Wisp.
+let g_SMALLEST_BODY_M: f64 = 0.70;
+let g_EYE_Y: f64 = 1.62;
+
+// ===========================================================================
+//  WORLD HELPERS
+// ===========================================================================
+// The chunk store's source contract (chunk.hml `slot_fill`): SEVEN arguments,
+// in this order.  `worldgen_chunk_at` writes straight into the store's own
+// buffers at the slot's offset, so there is no scratch copy.
+fn ns_chunk_src(p_hbuf: buffer, p_hoff: i32, p_abuf: buffer, p_aoff: i32,
+                p_cx: i32, p_cz: i32, p_seed: i32): i32 {
+    worldgen_chunk_at(p_seed, p_cx, p_cz, p_hbuf, p_hoff, p_abuf, p_aoff);
+    let meta: i32 = worldgen_poi_roll(p_seed, p_cx, p_cz);
+    return meta;
+}
+
+// Feet height that puts the eye ray through the TORSO (45 % of body height —
+// the head volume is the top 22 %, so 45 % can never be a headshot).
+fn torso_feet(p_cls: i32): f64 {
+    let out: f64 = g_EYE_Y - g_EN_H[p_cls] * 0.45;
+    return out;
+}
+
+// Feet height that puts the eye ray through the HEAD volume (89 % of height).
+fn head_feet(p_cls: i32): f64 {
+    let out: f64 = g_EYE_Y - g_EN_H[p_cls] * 0.89;
+    return out;
+}
+
+fn spawn_enemy(p_w: object, p_cls: i32, p_x: f64, p_y: f64, p_z: f64,
+               p_yaw: f64): i32 {
+    let wr: object = p_w;
+    let s: i32 = world_spawn(wr, KIND_AI, 0);
+    if (s < 0) { let bad: i32 = 0 - 1; return bad; }
+    let px = wr.px;  px[s] = p_x;
+    let py = wr.py;  py[s] = p_y;
+    let pz = wr.pz;  pz[s] = p_z;
+    let yw = wr.yaw; yw[s] = p_yaw;
+    let md = wr.model; md[s] = p_cls;
+    let hp = wr.hp;    hp[s] = g_EN_HP[p_cls];
+    let hm = wr.hp_max; hm[s] = g_EN_HP[p_cls];
+    let ar = wr.armor; ar[s] = combat_plate_hp(p_cls);
+    let tm = wr.team;  tm[s] = 2;
+    let out: i32 = s;
+    return out;
+}
+
+fn spawn_swinger(p_w: object, p_x: f64, p_z: f64): i32 {
+    let wr: object = p_w;
+    let s: i32 = world_spawn_player(wr, 1);
+    let px = wr.px;  px[s] = p_x;
+    let py = wr.py;  py[s] = 0.0;
+    let pz = wr.pz;  pz[s] = p_z;
+    let hp = wr.hp;  hp[s] = 100;
+    let hm = wr.hp_max; hm[s] = 100;
+    let tm = wr.team; tm[s] = 1;
+    let out: i32 = s;
+    return out;
+}
+
+fn hp_of(p_w: object, p_slot: i32): i32 {
+    let wr: object = p_w;
+    let hp = wr.hp;
+    let out: i32 = hp[p_slot];
+    return out;
+}
+
+fn set_hp(p_w: object, p_slot: i32, p_v: i32) {
+    let wr: object = p_w;
+    let hp = wr.hp;
+    hp[p_slot] = p_v;
+}
+
+// A command aimed along -Z (yaw 0, pitch 0), with BTN_MELEE optionally held.
+fn mk_cmd(p_tick: i32, p_yaw: f64, p_melee: i32): object {
+    let c: object = cmd_new();
+    let btn: i32 = 0;
+    if (p_melee != 0) { btn = BTN_MELEE; }
+    cmd_set(c, p_tick, 16, 0.0, 0.0, p_yaw, 0.0, btn, 0, 0);
+    let out: object = c;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  A WHOLE SWING, DRIVEN THE WAY THE SIM WILL DRIVE IT.
+//  Presses BTN_MELEE on tick 0, releases on tick 1, then runs `p_ticks` ticks.
+//  Returns the total victims struck.  The bus is NOT reset between ticks unless
+//  `p_reset` says so, because the §2.5 contract is a within-tick property and
+//  the caller usually wants to inspect the tick the blow landed on.
+// ---------------------------------------------------------------------------
+fn run_swing(p_mx: object, p_cx: object, p_w: object, p_cs,
+             p_pslot: i32, p_eslot: i32, p_yaw: f64, p_ticks: i32,
+             p_reset: i32): i32 {
+    let wr: object = p_w;
+    let mx: object = p_mx;
+    let total: i32 = 0;
+    let strikes0: i32 = melee_stat(mx, MSTAT_STRIKES);
+    let t: i32 = 0;
+    while (t < p_ticks) {
+        world_set_tick(wr, t);
+        // The bus is cleared at the top of every tick UNTIL the blow lands,
+        // and then left alone.  "All five signals in the SAME tick" is a
+        // within-tick property, so the caller has to be able to look at the
+        // tick it happened on — and clearing it on the following tick, which
+        // the real sim does, would hide exactly the thing under test.
+        if (p_reset != 0) {
+            if (melee_stat(mx, MSTAT_STRIKES) == strikes0) {
+                combat_begin_tick(p_cx);
+            }
+        }
+        let hold: i32 = 0;
+        if (t == 0) { hold = 1; }
+        let c: object = mk_cmd(t, p_yaw, hold);
+        total = total + melee_tick(mx, p_cx, wr, p_cs, p_pslot, p_eslot,
+                                   g_EYE_Y, c);
+        melee_stagger_step(mx);
+        t++;
+    }
+    let out: i32 = total;
+    return out;
+}
+
+// The tick index on which the strike resolves, given the press on tick 0.
+fn strike_tick(p_m: i32): i32 {
+    let out: i32 = melee_phase_len(p_m, 1) - 1;
+    return out;
+}
+
+fn new_cx(): object {
+    let cx: object = combat_new_cap(512);
+    combat_set_weapon_source(cx, wpn_dmg_at, wpn_hs_mult, wpn_pellets,
+                             wpn_spread_half_rad);
+    let out: object = cx;
+    return out;
+}
+
+// ===========================================================================
+//  A — THE TABLE IS THE DESIGN
+// ===========================================================================
+fn sec_a() {
+    print("");
+    print("A  the melee table — roles, not damage numbers (DIRECTION.md §10)");
+
+    ck(MEL_COUNT == 3, "A0 three melee weapons", `${MEL_COUNT}`);
+    ck(MEL_CLUB == 0 && MEL_SPEAR == 1 && MEL_SWORD == 2,
+       "A1 club/spear/sword are 0/1/2",
+       `${MEL_CLUB},${MEL_SPEAR},${MEL_SWORD}`);
+    ck(MEL_NONE == 0 - 1, "A2 MEL_NONE is -1", `${MEL_NONE}`);
+    ck(mel_valid(MEL_CLUB) == 1 && mel_valid(MEL_SWORD) == 1,
+       "A3 the three ids validate", "");
+    ck(mel_valid(0 - 1) == 0 && mel_valid(3) == 0 && mel_valid(99) == 0,
+       "A4 out-of-range ids do not validate", "");
+
+    // --- the id spaces are disjoint and both fit the wire ------------------
+    ck(WPN_COUNT == 6, "A5 the GUN table is still six wide (unmoved)",
+       `${WPN_COUNT}`);
+    ck(MH_MELEE_BASE == 6, "A6 melee main-hand ids start at 6",
+       `${MH_MELEE_BASE}`);
+    ck(mel_to_mainhand(MEL_CLUB) == 6 && mel_to_mainhand(MEL_SPEAR) == 7
+       && mel_to_mainhand(MEL_SWORD) == 8,
+       "A7 main-hand ids are 6, 7, 8", "");
+    ck(mel_to_mainhand(MEL_SWORD) <= 15,
+       "A8 the widest melee id fits CMD_MAX_WEAPON = 15",
+       `${mel_to_mainhand(MEL_SWORD)}`);
+    ck(wpn_valid(6) == 0 && wpn_valid(7) == 0 && wpn_valid(8) == 0,
+       "A9 no gun query accepts a melee id", "");
+    ck(mel_from_mainhand(6) == MEL_CLUB && mel_from_mainhand(8) == MEL_SWORD,
+       "A10 main-hand -> melee round-trips", "");
+    ck(mel_from_mainhand(0) == 0 - 1 && mel_from_mainhand(5) == 0 - 1
+       && mel_from_mainhand(9) == 0 - 1,
+       "A11 gun ids do not decode as melee", "");
+
+    // --- the numbers, pinned to literals ----------------------------------
+    ck(mel_dmg(MEL_CLUB) == 34.0, "A12 club damage is 34",
+       s2(mel_dmg(MEL_CLUB)));
+    ck(mel_dmg(MEL_SPEAR) == 46.0, "A13 spear damage is 46",
+       s2(mel_dmg(MEL_SPEAR)));
+    ck(mel_dmg(MEL_SWORD) == 62.0, "A14 sword damage is 62",
+       s2(mel_dmg(MEL_SWORD)));
+    ck(mel_reach(MEL_CLUB) == 1.90, "A15 club reach is 1.90 m",
+       s2(mel_reach(MEL_CLUB)));
+    ck(mel_reach(MEL_SPEAR) == 3.40, "A16 spear reach is 3.40 m",
+       s2(mel_reach(MEL_SPEAR)));
+    ck(mel_reach(MEL_SWORD) == 2.30, "A17 sword reach is 2.30 m",
+       s2(mel_reach(MEL_SWORD)));
+    ck(mel_stagger_len(MEL_CLUB) == 27, "A18 club stagger is 27 ticks",
+       `${mel_stagger_len(MEL_CLUB)}`);
+    ck(mel_stagger_len(MEL_SPEAR) == 9, "A19 spear stagger is 9 ticks",
+       `${mel_stagger_len(MEL_SPEAR)}`);
+    ck(mel_stagger_len(MEL_SWORD) == 16, "A20 sword stagger is 16 ticks",
+       `${mel_stagger_len(MEL_SWORD)}`);
+
+    // --- THE ORDERINGS.  These are the design, and they are what a retune
+    //     must not silently invert.
+    ck(mel_cycle(MEL_CLUB) < mel_cycle(MEL_SWORD)
+       && mel_cycle(MEL_SWORD) < mel_cycle(MEL_SPEAR),
+       "A21 the club is the FASTEST and the spear the slowest",
+       `${s2(mel_cycle(MEL_CLUB))} < ${s2(mel_cycle(MEL_SWORD))} < ${s2(mel_cycle(MEL_SPEAR))}`);
+    ck(mel_reach(MEL_SPEAR) > mel_reach(MEL_SWORD)
+       && mel_reach(MEL_SWORD) > mel_reach(MEL_CLUB),
+       "A22 the spear has the LONGEST reach", "");
+    ck(mel_reach(MEL_SPEAR) - mel_reach(MEL_SWORD) >= 1.0,
+       "A23 the spear out-reaches the next weapon by >= 1.00 m",
+       s2(mel_reach(MEL_SPEAR) - mel_reach(MEL_SWORD)));
+    ck(mel_dmg(MEL_SWORD) > mel_dmg(MEL_SPEAR)
+       && mel_dmg(MEL_SPEAR) > mel_dmg(MEL_CLUB),
+       "A24 the sword does the MOST damage per blow", "");
+    ck(mel_stagger_len(MEL_CLUB) > mel_stagger_len(MEL_SWORD)
+       && mel_stagger_len(MEL_SWORD) > mel_stagger_len(MEL_SPEAR),
+       "A25 the club has the MOST stagger", "");
+    ck(mel_dps(MEL_SWORD) > mel_dps(MEL_CLUB)
+       && mel_dps(MEL_CLUB) > mel_dps(MEL_SPEAR),
+       "A26 dps order is sword > club > spear — 'fast and weak' is a real position, not a strictly worse one",
+       `${s2(mel_dps(MEL_SWORD))} / ${s2(mel_dps(MEL_CLUB))} / ${s2(mel_dps(MEL_SPEAR))}`);
+    ck(mel_arc_deg(MEL_CLUB) > mel_arc_deg(MEL_SWORD)
+       && mel_arc_deg(MEL_SWORD) > mel_arc_deg(MEL_SPEAR),
+       "A27 the club has the WIDEST sweep and the spear the narrowest", "");
+    ck(mel_targets(MEL_CLUB) == 3, "A28 the club cleaves three bodies",
+       `${mel_targets(MEL_CLUB)}`);
+    ck(mel_tier(MEL_CLUB) == 0 && mel_tier(MEL_SPEAR) == 1
+       && mel_tier(MEL_SWORD) == 2,
+       "A29 tiers are scavenged / crafted / forged, in that order", "");
+
+    // --- the spear's reach is a fact about the ENEMY table -----------------
+    let beats: i32 = 0;
+    let fails: i32 = 0;
+    let c: i32 = 0;
+    while (c < 6) {
+        if (c != g_ENEMY_SPITTER) {
+            if (c != g_ENEMY_BULWARK) {
+                if (mel_reach(MEL_SPEAR) > g_EN_RANGE[c]) { beats++; } else { fails++; }
+            }
+        }
+        c++;
+    }
+    ck(beats == 4 && fails == 0,
+       "A30 the spear out-reaches every contact class (Wisp/Mote/Husk/Warden)",
+       `${beats} beaten, ${fails} not`);
+    ck(mel_reach(MEL_SPEAR) < g_EN_RANGE[g_ENEMY_BULWARK],
+       "A31 the spear does NOT out-reach the Bulwark — you cannot poke the wall",
+       `${s2(mel_reach(MEL_SPEAR))} vs ${s2(g_EN_RANGE[g_ENEMY_BULWARK])}`);
+
+    // --- affinity ---------------------------------------------------------
+    ck(mel_dtype(MEL_CLUB) == MEL_DTYPE_KINETIC
+       && mel_dtype(MEL_SPEAR) == MEL_DTYPE_KINETIC
+       && mel_dtype(MEL_SWORD) == MEL_DTYPE_KINETIC,
+       "A32 all three are KINETIC (MAGIC_KINETIC §1.2)", "");
+    ck(MEL_DTYPE_KINETIC == 0, "A33 DTYPE_KINETIC is 0", "");
+
+    // --- no ammunition, no durability -------------------------------------
+    ck(MEL_HAS_DURABILITY == 0, "A34 there is no durability column", "");
+    ck(mel_uses_ammo(MEL_CLUB) == 0 && mel_uses_ammo(MEL_SWORD) == 0,
+       "A35 melee consumes no ammunition — it is the thing that always works", "");
+    ck(melee_invariants_ok() == 1,
+       "A36 melee.hml's own structural invariants hold", "");
+    ck(MS_FIELDS == 7, "A37 the swing record is 7 fields and none is ammo",
+       `${MS_FIELDS}`);
+
+    // --- bad ids return safe zeroes, never trap ---------------------------
+    ck(mel_dmg(0 - 1) == 0.0 && mel_reach(9) == 0.0 && mel_rays(0 - 1) == 0,
+       "A38 a bad melee id yields a safe zero, never a trap", "");
+    ck(mel_hs_mult(0 - 1) == 1.0, "A39 a bad id's headshot multiplier is 1.0", "");
+}
+
+// ===========================================================================
+//  B — TTK AGAINST THE REAL ENEMY HP COLUMN
+// ===========================================================================
+fn sec_b() {
+    print("");
+    print("B  TTK against ai.hml's HP column [15, 30, 90, 70, 220, 900]");
+
+    ck(mel_ttk_hits(MEL_CLUB, 15.0, 0) == 1,
+       "B0 the club ONE-SHOTS a Wisp (15) — the first night with a stick works",
+       `${mel_ttk_hits(MEL_CLUB, 15.0, 0)}`);
+    ck(mel_ttk_hits(MEL_CLUB, 30.0, 0) == 1,
+       "B1 the club one-shots a Mote (30)",
+       `${mel_ttk_hits(MEL_CLUB, 30.0, 0)}`);
+    ck(mel_ttk_hits(MEL_CLUB, 90.0, 0) == 3,
+       "B2 the club takes THREE blows on a Husk (90) and never one",
+       `${mel_ttk_hits(MEL_CLUB, 90.0, 0)}`);
+    ck(mel_dmg(MEL_CLUB) < 90.0,
+       "B3 the club can never one-shot a Husk, headshot or not",
+       s2(mel_dmg_hit(MEL_CLUB, 1)));
+    ck(mel_dmg_hit(MEL_CLUB, 1) < 90.0,
+       "B4 not even a club headshot one-shots a Husk",
+       s2(mel_dmg_hit(MEL_CLUB, 1)));
+    ck(mel_ttk_hits(MEL_SPEAR, 90.0, 0) == 2,
+       "B5 the spear takes two blows on a Husk",
+       `${mel_ttk_hits(MEL_SPEAR, 90.0, 0)}`);
+    ck(mel_ttk_hits(MEL_SWORD, 90.0, 0) == 2,
+       "B6 the sword takes two BODY blows on a Husk",
+       `${mel_ttk_hits(MEL_SWORD, 90.0, 0)}`);
+    ck(mel_ttk_hits(MEL_SWORD, 90.0, 1) == 1,
+       "B7 the sword one-shots a Husk ON THE HEAD (62 x 1.50 = 93 >= 90)",
+       s2(mel_dmg_hit(MEL_SWORD, 1)));
+    ck(mel_ttk_hits(MEL_SWORD, 220.0, 0) == 4
+       && mel_ttk_hits(MEL_SPEAR, 220.0, 0) == 5,
+       "B8 on a Warden the sword needs 4 blows and the spear 5 — the sword is the answer to a big body",
+       "");
+    ck(mel_ttk_ms(MEL_SWORD, 90.0, 0) < mel_ttk_ms(MEL_SPEAR, 90.0, 0)
+       && mel_ttk_ms(MEL_SPEAR, 90.0, 0) < mel_ttk_ms(MEL_CLUB, 90.0, 0),
+       "B9 time-to-kill a Husk orders sword < spear < club",
+       `${s2(mel_ttk_ms(MEL_SWORD, 90.0, 0))} / ${s2(mel_ttk_ms(MEL_SPEAR, 90.0, 0))} / ${s2(mel_ttk_ms(MEL_CLUB, 90.0, 0))} ms`);
+    ck(mel_ttk_ms(MEL_CLUB, 15.0, 0) == 0.0,
+       "B10 a one-blow kill reads 0 ms, as the GDD matrix does", "");
+
+    // The club buys SPACE: 0.45 s of stagger against a Husk at 3.0 m/s.
+    let space: f64 = f64(mel_stagger_len(MEL_CLUB)) * g_TICK_DT * 3.0;
+    ck(space >= 1.0,
+       "B11 a club stagger buys >= 1.00 m of space against a Husk (3.0 m/s)",
+       `${s2(space)} m`);
+    ck(space > f64(mel_stagger_len(MEL_SPEAR)) * g_TICK_DT * 3.0 * 2.0,
+       "B12 the club buys more than twice the space the spear does", "");
+}
+
+// ===========================================================================
+//  C — THE SWEEP CANNOT PASS THROUGH THE SMALLEST BODY
+// ===========================================================================
+fn sec_c() {
+    print("");
+    print("C  ray fan coverage (chord between adjacent rays at reach)");
+    let m: i32 = 0;
+    while (m < MEL_COUNT) {
+        let gap: f64 = mel_ray_gap_m(m);
+        ck(gap < g_SMALLEST_BODY_M,
+           `C${m} weapon ${m} gap ${s2(gap)} m < 0.70 m (a Wisp cannot fit through)`,
+           s2(gap));
+        ck(mel_rays(m) >= 1 && mel_rays(m) <= MEL_MAX_RAYS,
+           `C${m}b ray count fits the scratch`, `${mel_rays(m)}`);
+        m++;
+    }
+    ck(mel_rays(MEL_CLUB) == 7 && mel_rays(MEL_SPEAR) == 3
+       && mel_rays(MEL_SWORD) == 5,
+       "C3 ray counts are 7 / 3 / 5", "");
+    ck(mel_ray_gap_m(MEL_SPEAR) < g_SMALLEST_BODY_M,
+       "C4 even the narrow spear thrust cannot thread past a Wisp",
+       s2(mel_ray_gap_m(MEL_SPEAR)));
+    ck(near(mel_arc_half_rad(MEL_CLUB), 55.0 * PI / 180.0, 1.0e-12),
+       "C5 the sweep half-angle converts degrees exactly once", "");
+}
+
+// ===========================================================================
+//  D — THE SWING STATE MACHINE
+// ===========================================================================
+fn sec_d() {
+    print("");
+    print("D  the swing state machine (fixed 60 Hz, no measured delta)");
+
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 7);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+
+    ck(melee_equipped(mx, 1) == 0 - 1,
+       "D0 a fresh slot holds nothing", `${melee_equipped(mx, 1)}`);
+    ck(melee_can_swing(mx, 1) == 0,
+       "D1 an empty hand cannot swing", "");
+    ck(melee_equip(mx, 1, MEL_CLUB) == 1, "D2 equipping the club succeeds", "");
+    ck(melee_equipped(mx, 1) == MEL_CLUB, "D3 the club is in hand", "");
+    ck(melee_mainhand(mx, 1) == 6, "D4 the main-hand id is 6",
+       `${melee_mainhand(mx, 1)}`);
+    ck(melee_can_swing(mx, 1) == 1,
+       "D5 a melee weapon can ALWAYS swing — no ammo check exists to fail", "");
+    ck(melee_equip(mx, 1, 9) == 0, "D6 equipping a bad id is refused", "");
+    ck(melee_equip(mx, 9, MEL_CLUB) == 0, "D7 a bad slot is refused", "");
+
+    // phase ticks
+    ck(melee_phase_len(MEL_CLUB, MS_WINDUP) == 6,
+       "D8 the club's windup is 6 ticks (0.10 s)",
+       `${melee_phase_len(MEL_CLUB, MS_WINDUP)}`);
+    ck(melee_cycle_len(MEL_CLUB) == 22,
+       "D9 the club's full cycle is 22 ticks (0.367 s)",
+       `${melee_cycle_len(MEL_CLUB)}`);
+    ck(melee_cycle_len(MEL_SPEAR) == 38,
+       "D10 the spear's cycle is 38 ticks", `${melee_cycle_len(MEL_SPEAR)}`);
+    ck(melee_cycle_len(MEL_SWORD) == 32,
+       "D11 the sword's cycle is 32 ticks", `${melee_cycle_len(MEL_SWORD)}`);
+    ck(melee_cycle_len(MEL_CLUB) < melee_cycle_len(MEL_SWORD)
+       && melee_cycle_len(MEL_SWORD) < melee_cycle_len(MEL_SPEAR),
+       "D12 the tick-quantized cycle preserves the design ordering", "");
+
+    // walk one whole swing tick by tick, against thin air
+    let seen_windup: i32 = 0;
+    let seen_active: i32 = 0;
+    let seen_recover: i32 = 0;
+    let struck_ticks: i32 = 0;
+    let t: i32 = 0;
+    while (t < 30) {
+        world_set_tick(wr, t);
+        combat_begin_tick(cx);
+        let hold: i32 = 0;
+        if (t == 0) { hold = 1; }
+        let c: object = mk_cmd(t, 0.0, hold);
+        let n: i32 = melee_tick(mx, cx, wr, null, 1, ps, g_EYE_Y, c);
+        if (n > 0) { struck_ticks++; }
+        let ph: i32 = melee_phase(mx, 1);
+        if (ph == MS_WINDUP) { seen_windup++; }
+        if (ph == MS_ACTIVE) { seen_active++; }
+        if (ph == MS_RECOVER) { seen_recover++; }
+        t++;
+    }
+    ck(melee_swings(mx, 1) == 1, "D13 one press starts exactly one swing",
+       `${melee_swings(mx, 1)}`);
+    // Observed AFTER melee_tick, so the tick the windup ENDS on already reads
+    // ACTIVE: 6 windup decrements show as 5 observations of MS_WINDUP.
+    ck(seen_windup == 5, "D14 six windup decrements, observed as 5 windup ticks",
+       `${seen_windup}`);
+    ck(seen_active == 4, "D15 four ticks of active were observed",
+       `${seen_active}`);
+    ck(seen_recover == 12, "D16 twelve ticks of recovery were observed",
+       `${seen_recover}`);
+    ck(melee_phase(mx, 1) == MS_IDLE, "D17 the swing returns to idle", "");
+    ck(struck_ticks == 0,
+       "D18 a swing at nothing damages nothing", `${struck_ticks}`);
+    ck(melee_stat(mx, MSTAT_STRIKES) == 1,
+       "D19 the strike resolved exactly ONCE, however the ticks fell",
+       `${melee_stat(mx, MSTAT_STRIKES)}`);
+    ck(melee_stat(mx, MSTAT_WHIFFS) == 1,
+       "D20 the whiff was counted", `${melee_stat(mx, MSTAT_WHIFFS)}`);
+    ck(melee_stat(mx, MSTAT_RAYS_CAST) == 7,
+       "D21 a club swing casts exactly 7 rays",
+       `${melee_stat(mx, MSTAT_RAYS_CAST)}`);
+
+    // holding the button does NOT auto-repeat: the edge is what fires
+    let mx2: object = melee_new_cap(4, 64);
+    melee_equip(mx2, 1, MEL_CLUB);
+    let t2: i32 = 0;
+    while (t2 < 60) {
+        world_set_tick(wr, t2);
+        combat_begin_tick(cx);
+        let c2: object = mk_cmd(t2, 0.0, 1);
+        melee_tick(mx2, cx, wr, null, 1, ps, g_EYE_Y, c2);
+        t2++;
+    }
+    ck(melee_swings(mx2, 1) == 1,
+       "D22 HOLDING the button swings once — the press EDGE is what fires",
+       `${melee_swings(mx2, 1)}`);
+
+    // a press during the swing is buffered ONE deep and fires on recovery end
+    let mx3: object = melee_new_cap(4, 64);
+    melee_equip(mx3, 1, MEL_CLUB);
+    let t3: i32 = 0;
+    while (t3 < 44) {
+        world_set_tick(wr, t3);
+        combat_begin_tick(cx);
+        let hold3: i32 = 0;
+        if (t3 == 0) { hold3 = 1; }
+        if (t3 == 10) { hold3 = 1; }      // mid-swing press
+        if (t3 == 12) { hold3 = 1; }      // and another, still mid-swing
+        let c3: object = mk_cmd(t3, 0.0, hold3);
+        melee_tick(mx3, cx, wr, null, 1, ps, g_EYE_Y, c3);
+        t3++;
+    }
+    ck(melee_swings(mx3, 1) == 2,
+       "D23 two mid-swing presses buffer ONE extra swing, not two",
+       `${melee_swings(mx3, 1)}`);
+    ck(melee_stat(mx3, MSTAT_STRIKES) == 2,
+       "D24 the buffered swing resolved its own single strike",
+       `${melee_stat(mx3, MSTAT_STRIKES)}`);
+
+    // the edge bit lives in the STATE, not in a caller local
+    let h_before: i32 = melee_state_hash(mx3, 1);
+    ck(h_before != 0, "D25 the swing state hashes", `${h_before}`);
+    melee_unequip(mx3, 1);
+    ck(melee_equipped(mx3, 1) == 0 - 1, "D26 unequip empties the hand", "");
+    ck(melee_state_hash(mx3, 1) != h_before,
+       "D27 unequipping changes the fingerprint", "");
+}
+
+// ===========================================================================
+//  E / F / G / H — HIT REGISTRATION THROUGH combat.hml
+// ===========================================================================
+fn sec_e() {
+    print("");
+    print("E  hit registration is combat.hml's authority, not a second copy");
+
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 11);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_SWORD);
+
+    // A Husk 1.5 m along -Z, torso height.
+    let es: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, torso_feet(g_ENEMY_HUSK),
+                              -1.5, 0.0);
+    let hp0: i32 = hp_of(wr, es);
+    ck(hp0 == 90, "E0 the Husk starts at 90 HP", `${hp0}`);
+
+    // Confirm the geometry with combat's OWN raycast before swinging, so a
+    // failure below cannot be blamed on the test's aim.
+    let ray = combat_ray_scratch();
+    let k: i32 = combat_raycast(cx, wr, null, 0.0, g_EYE_Y, 0.0,
+                                0.0, 0.0, -1.0, 3.0, world_id_of(wr, ps), ray);
+    ck(k == RAY_ENTITY, "E1 combat_raycast sees the Husk straight ahead",
+       `${k}`);
+    ck(i32(ray[RAY_SLOT]) == es, "E2 and it is the right slot", "");
+
+    let struck: i32 = run_swing(mx, cx, wr, null, 1, ps, 0.0, 12, 1);
+    ck(struck == 1, "E3 the sword struck exactly one body", `${struck}`);
+    let hp1: i32 = hp_of(wr, es);
+    ck(hp0 - hp1 == 62,
+       "E4 the Husk lost exactly the table's 62 HP — the damage went through combat_apply_damage",
+       `${hp0} -> ${hp1}`);
+    ck(melee_hits(mx, 1) == 1, "E5 the per-slot hit counter moved",
+       `${melee_hits(mx, 1)}`);
+
+    // the bus of the tick the blow landed on
+    let bus: object = combat_events(cx);
+    let vid: i32 = world_id_of(wr, es);
+    ck(evbus_count_for(bus, EV_HIT, vid) == 1,
+       "E6 EV_HIT — the authoritative fact — is on the bus", "");
+    ck(evbus_count_for(bus, EV_HITMARKER, vid) == 1, "E7 EV_HITMARKER", "");
+    ck(evbus_count_for(bus, EV_HIT_FLASH, vid) == 1, "E8 EV_HIT_FLASH", "");
+    ck(evbus_count_for(bus, EV_DAMAGE_NUMBER, vid) == 1, "E9 EV_DAMAGE_NUMBER", "");
+    ck(evbus_count_for(bus, EV_IMPACT, vid) == 1, "E10 EV_IMPACT", "");
+    ck(evbus_count_for(bus, EV_SOUND, vid) == 1, "E11 EV_SOUND", "");
+    ck(combat_feedback_ok(cx) == 0,
+       "E12 the GAME_DESIGN §2.5 five-signal contract holds for a melee blow",
+       `${combat_feedback_ok(cx)}`);
+
+    // EV_HIT.sub must say MELEE, not "weapon 8"
+    let want_sub: i32 = DMG_SUB_BASE + DMG_MELEE;
+    let found: i32 = 0;
+    let i: i32 = 0;
+    let n: i32 = evbus_count(bus);
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_HIT) {
+            if (evbus_sub(bus, i) == want_sub) { found = 1; }
+        }
+        i++;
+    }
+    ck(found == 1,
+       "E13 EV_HIT.sub is DMG_SUB_BASE + DMG_MELEE (65), so a packet dump can tell a club from a rifle",
+       `${want_sub}`);
+
+    // the damage number is the damage actually dealt
+    let dn: i32 = 0 - 1;
+    i = 0;
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_DAMAGE_NUMBER) { dn = evbus_sub(bus, i); }
+        i++;
+    }
+    ck(dn == 62, "E14 the damage number carries the real 62", `${dn}`);
+
+    // the audio id names the weapon
+    let sfx_seen: i32 = 0;
+    i = 0;
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_SOUND) {
+            if (evbus_sub(bus, i) == SFX_MELEE_SWORD) { sfx_seen = 1; }
+        }
+        i++;
+    }
+    ck(sfx_seen == 1, "E15 the blow sounds like a SWORD, not like a bullet", "");
+    ck(melee_sfx_for(MEL_CLUB) == SFX_MELEE_CLUB
+       && melee_sfx_for(MEL_SPEAR) == SFX_MELEE_SPEAR
+       && melee_sfx_for(MEL_SWORD) == SFX_MELEE_SWORD,
+       "E16 each weapon has its own voice", "");
+
+    // --- a dead body is not hit again -------------------------------------
+    set_hp(wr, es, 10);
+    run_swing(mx, cx, wr, null, 1, ps, 0.0, 40, 1);
+    ck(combat_is_dead(wr, es) == 1, "E17 the second blow killed it", "");
+    ck(combat_stat(cx, STAT_KILLS) == 1, "E18 combat counted the kill",
+       `${combat_stat(cx, STAT_KILLS)}`);
+    let before_hits: i32 = melee_stat(mx, MSTAT_HITS);
+    run_swing(mx, cx, wr, null, 1, ps, 0.0, 40, 1);
+    ck(melee_stat(mx, MSTAT_HITS) == before_hits,
+       "E19 a corpse cannot be struck again — combat's EF_DEAD gate does the work",
+       `${melee_stat(mx, MSTAT_HITS)}`);
+
+    // --- an invulnerable body takes nothing -------------------------------
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 12);
+    let cx2: object = new_cx();
+    let mx2: object = melee_new_cap(4, 64);
+    let ps2: i32 = spawn_swinger(wr2, 0.0, 0.0);
+    melee_equip(mx2, 1, MEL_SWORD);
+    let iv: i32 = spawn_enemy(wr2, g_ENEMY_HUSK, 0.0, torso_feet(g_ENEMY_HUSK),
+                              -1.5, 0.0);
+    let fl = wr2.flags; fl[iv] = fl[iv] | EF_INVULN;
+    run_swing(mx2, cx2, wr2, null, 1, ps2, 0.0, 12, 1);
+    ck(hp_of(wr2, iv) == 90,
+       "E20 EF_INVULN is honoured, because melee never touches hp itself",
+       `${hp_of(wr2, iv)}`);
+}
+
+fn sec_f() {
+    print("");
+    print("F  cleave, dedupe and the nearest-first cap");
+
+    // Four Husks in a wide arc, all inside the club's 1.9 m reach.
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 21);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_CLUB);
+
+    let fy: f64 = torso_feet(g_ENEMY_HUSK);
+    // -Z is forward.  Place them at increasing distance so the cap is testable.
+    let a: i32 = spawn_enemy(wr, g_ENEMY_HUSK,  0.00, fy, -1.00, 0.0);
+    let b: i32 = spawn_enemy(wr, g_ENEMY_HUSK, -0.80, fy, -1.10, 0.0);
+    let c: i32 = spawn_enemy(wr, g_ENEMY_HUSK,  0.80, fy, -1.20, 0.0);
+    let d: i32 = spawn_enemy(wr, g_ENEMY_HUSK, -1.20, fy, -1.30, 0.0);
+
+    let struck: i32 = run_swing(mx, cx, wr, null, 1, ps, 0.0, 12, 1);
+    ck(struck == 3,
+       "F0 a club sweep cleaves exactly THREE bodies, its table cap, out of four in the arc",
+       `${struck}`);
+    let hit_count: i32 = 0;
+    if (hp_of(wr, a) < 90) { hit_count++; }
+    if (hp_of(wr, b) < 90) { hit_count++; }
+    if (hp_of(wr, c) < 90) { hit_count++; }
+    if (hp_of(wr, d) < 90) { hit_count++; }
+    ck(hit_count == 3, "F1 exactly three bodies actually lost HP",
+       `${hit_count}`);
+    ck(hp_of(wr, a) == 90 - 34,
+       "F2 the NEAREST body is always one of them", `${hp_of(wr, a)}`);
+    ck(hp_of(wr, d) == 90,
+       "F3 the FURTHEST of four is the one dropped by the cap",
+       `${hp_of(wr, d)}`);
+
+    // dedupe: one body caught by several rays is ONE blow
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 22);
+    let cx2: object = new_cx();
+    let mx2: object = melee_new_cap(4, 64);
+    let ps2: i32 = spawn_swinger(wr2, 0.0, 0.0);
+    melee_equip(mx2, 1, MEL_CLUB);
+    // A Bulwark is 1.10 m in radius — the club's 7-ray fan will catch it many
+    // times over.  It must lose 34 HP, not 34 x rays.
+    let big: i32 = spawn_enemy(wr2, g_ENEMY_BULWARK, 0.0,
+                               torso_feet(g_ENEMY_BULWARK), -1.4, 0.0);
+    run_swing(mx2, cx2, wr2, null, 1, ps2, 0.0, 12, 1);
+    ck(hp_of(wr2, big) == 900 - 34,
+       "F4 a body caught by several rays takes ONE blow, not one per ray",
+       `${900 - hp_of(wr2, big)} dealt`);
+    let bus2: object = combat_events(cx2);
+    let vidb: i32 = world_id_of(wr2, big);
+    ck(evbus_count_for(bus2, EV_IMPACT, vidb) == 1,
+       "F5 and it produces ONE impact billboard — a club is not a shotgun", "");
+    ck(evbus_count_for(bus2, EV_DAMAGE_NUMBER, vidb) == 1,
+       "F6 and ONE damage number", "");
+    ck(combat_feedback_ok(cx2) == 0, "F7 §2.5 still holds on the wide body", "");
+
+    // the spear does NOT cleave three
+    let wr3: object = world_new_cap(64);
+    world_set_seed(wr3, 23);
+    let cx3: object = new_cx();
+    let mx3: object = melee_new_cap(4, 64);
+    let ps3: i32 = spawn_swinger(wr3, 0.0, 0.0);
+    melee_equip(mx3, 1, MEL_SPEAR);
+    spawn_enemy(wr3, g_ENEMY_HUSK,  0.00, fy, -1.00, 0.0);
+    spawn_enemy(wr3, g_ENEMY_HUSK, -0.80, fy, -1.10, 0.0);
+    spawn_enemy(wr3, g_ENEMY_HUSK,  0.80, fy, -1.20, 0.0);
+    let sp_struck: i32 = run_swing(mx3, cx3, wr3, null, 1, ps3, 0.0, 16, 1);
+    ck(sp_struck <= 2,
+       "F8 the spear's narrow thrust never cleaves three — reach is bought with width",
+       `${sp_struck}`);
+}
+
+fn sec_g() {
+    print("");
+    print("G  reach IS the spear (the whole point of tier 0 rung two)");
+
+    let fy: f64 = torso_feet(g_ENEMY_HUSK);
+    // A Husk at 3.0 m: inside the spear's 3.40, outside the sword's 2.30 and
+    // the club's 1.90.  This is the design claim, tested as behaviour.
+    let m: i32 = 0;
+    while (m < MEL_COUNT) {
+        let wr: object = world_new_cap(64);
+        world_set_seed(wr, 30 + m);
+        let cx: object = new_cx();
+        let mx: object = melee_new_cap(4, 64);
+        let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+        melee_equip(mx, 1, m);
+        let es: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, fy, -3.00, 0.0);
+        run_swing(mx, cx, wr, null, 1, ps, 0.0, 44, 1);
+        let dealt: i32 = 90 - hp_of(wr, es);
+        if (m == MEL_SPEAR) {
+            ck(dealt == 46,
+               "G0 the SPEAR reaches a Husk at 3.00 m and hits it for 46",
+               `${dealt}`);
+        } else {
+            ck(dealt == 0,
+               `G${m + 1} weapon ${m} cannot reach 3.00 m and deals nothing`,
+               `${dealt}`);
+        }
+        m++;
+    }
+
+    // Just inside vs just outside a weapon's own reach.
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 40);
+    let cx2: object = new_cx();
+    let mx2: object = melee_new_cap(4, 64);
+    let ps2: i32 = spawn_swinger(wr2, 0.0, 0.0);
+    melee_equip(mx2, 1, MEL_CLUB);
+    // Husk body radius 0.40, so its near face at centre -2.50 is at -2.10 —
+    // just outside the club's 1.90 reach.
+    let far: i32 = spawn_enemy(wr2, g_ENEMY_HUSK, 0.0, fy, -2.50, 0.0);
+    run_swing(mx2, cx2, wr2, null, 1, ps2, 0.0, 24, 1);
+    ck(hp_of(wr2, far) == 90,
+       "G4 a body 0.20 m beyond the club's reach is untouched", "");
+    ck(melee_stat(mx2, MSTAT_WHIFFS) == 1,
+       "G5 and the swing is counted as a whiff", "");
+    let bus2: object = combat_events(cx2);
+    let whiff_sfx: i32 = 0;
+    let i: i32 = 0;
+    let n: i32 = evbus_count(bus2);
+    while (i < n) {
+        if (evbus_type(bus2, i) == EV_SOUND) {
+            if (evbus_sub(bus2, i) == SFX_MELEE_WHIFF) { whiff_sfx = 1; }
+        }
+        i++;
+    }
+    ck(whiff_sfx == 1, "G6 a whiff still makes a sound — the swing is felt", "");
+
+    // A body behind the player is never hit, whatever the sweep width.
+    let wr3: object = world_new_cap(64);
+    world_set_seed(wr3, 41);
+    let cx3: object = new_cx();
+    let mx3: object = melee_new_cap(4, 64);
+    let ps3: i32 = spawn_swinger(wr3, 0.0, 0.0);
+    melee_equip(mx3, 1, MEL_CLUB);
+    let behind: i32 = spawn_enemy(wr3, g_ENEMY_HUSK, 0.0, fy, 1.20, 0.0);
+    run_swing(mx3, cx3, wr3, null, 1, ps3, 0.0, 24, 1);
+    ck(hp_of(wr3, behind) == 90,
+       "G7 a 110-degree sweep is still a FRONT arc — nothing behind is hit", "");
+}
+
+fn sec_h() {
+    print("");
+    print("H  heads, plates and flanks behave exactly as for a bullet");
+
+    // --- headshot ---------------------------------------------------------
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 50);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_SWORD);
+    let hs: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, head_feet(g_ENEMY_HUSK),
+                              -1.5, 0.0);
+    run_swing(mx, cx, wr, null, 1, ps, 0.0, 12, 1);
+    ck(combat_is_dead(wr, hs) == 1,
+       "H0 a sword to a Husk's head is a ONE-BLOW KILL (93 >= 90)",
+       `${hp_of(wr, hs)}`);
+    let bus: object = combat_events(cx);
+    let vid: i32 = world_id_of(wr, hs);
+    let hm: i32 = 0 - 1;
+    let i: i32 = 0;
+    let n: i32 = evbus_count(bus);
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_HITMARKER) {
+            if (evbus_target(bus, i) == vid) { hm = evbus_sub(bus, i); }
+        }
+        i++;
+    }
+    ck((hm & HM_HEAD) != 0, "H1 the hitmarker carries HM_HEAD", `${hm}`);
+    ck((hm & HM_KILL) != 0, "H2 and HM_KILL", `${hm}`);
+    let kill_sfx: i32 = 0;
+    i = 0;
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_SOUND) {
+            if (evbus_sub(bus, i) == SFX_KILL_CHIME) { kill_sfx = 1; }
+        }
+        i++;
+    }
+    ck(kill_sfx == 1, "H3 a killing blow rings the kill chime", "");
+    ck(evbus_count_for(bus, EV_KILL, vid) == 1, "H4 EV_KILL is on the bus", "");
+    ck(combat_feedback_ok(cx) == 0, "H5 §2.5 holds on a killing headshot", "");
+
+    // --- club headshot must still not one-shot a Husk ---------------------
+    let wr1: object = world_new_cap(64);
+    world_set_seed(wr1, 51);
+    let cx1: object = new_cx();
+    let mx1: object = melee_new_cap(4, 64);
+    let ps1: i32 = spawn_swinger(wr1, 0.0, 0.0);
+    melee_equip(mx1, 1, MEL_CLUB);
+    let ch: i32 = spawn_enemy(wr1, g_ENEMY_HUSK, 0.0, head_feet(g_ENEMY_HUSK),
+                              -1.4, 0.0);
+    run_swing(mx1, cx1, wr1, null, 1, ps1, 0.0, 12, 1);
+    ck(combat_is_dead(wr1, ch) == 0,
+       "H6 a club to the head does NOT kill a Husk — the ladder still has rungs",
+       `${hp_of(wr1, ch)}`);
+    ck(hp_of(wr1, ch) == 90 - 39,
+       "H7 it deals 34 x 1.15 = 39, rounded", `${90 - hp_of(wr1, ch)}`);
+
+    // --- the Warden front plate ------------------------------------------
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 52);
+    let cx2: object = new_cx();
+    let mx2: object = melee_new_cap(4, 64);
+    let ps2: i32 = spawn_swinger(wr2, 0.0, 0.0);
+    melee_equip(mx2, 1, MEL_SWORD);
+    // Warden at -Z facing +Z (yaw = PI), i.e. facing the player: front plate.
+    let wd: i32 = spawn_enemy(wr2, g_ENEMY_WARDEN, 0.0,
+                              torso_feet(g_ENEMY_WARDEN), -1.6, PI);
+    let ar2 = wr2.armor;
+    ck(ar2[wd] == WARDEN_PLATE_HP, "H8 the Warden spawns with its 80-point plate",
+       `${ar2[wd]}`);
+    run_swing(mx2, cx2, wr2, null, 1, ps2, 0.0, 12, 1);
+    let dealt_front: i32 = 220 - hp_of(wr2, wd);
+    ck(dealt_front == 16,
+       "H9 a sword into the front plate is reduced 75 % (62 -> 16)",
+       `${dealt_front}`);
+    ck(ar2[wd] == WARDEN_PLATE_HP - 62,
+       "H10 and the plate pool ate the full 62", `${ar2[wd]}`);
+    let bus2: object = combat_events(cx2);
+    let vid2: i32 = world_id_of(wr2, wd);
+    let hm2: i32 = 0;
+    i = 0;
+    n = evbus_count(bus2);
+    while (i < n) {
+        if (evbus_type(bus2, i) == EV_HITMARKER) {
+            if (evbus_target(bus2, i) == vid2) { hm2 = evbus_sub(bus2, i); }
+        }
+        i++;
+    }
+    ck((hm2 & HM_ARMOR) != 0, "H11 the hitmarker says ARMOR", `${hm2}`);
+    let armor_surf: i32 = 0;
+    i = 0;
+    while (i < n) {
+        if (evbus_type(bus2, i) == EV_IMPACT) {
+            if (evbus_sub(bus2, i) == SURF_ARMOR) { armor_surf = 1; }
+        }
+        i++;
+    }
+    ck(armor_surf == 1, "H12 the impact is tinted as ARMOR, not FLESH", "");
+    let armor_sfx: i32 = 0;
+    i = 0;
+    while (i < n) {
+        if (evbus_type(bus2, i) == EV_SOUND) {
+            if (evbus_sub(bus2, i) == SFX_IMPACT_ARMOR) { armor_sfx = 1; }
+        }
+        i++;
+    }
+    ck(armor_sfx == 1, "H13 and it CLANGS instead of thudding", "");
+    ck(combat_feedback_ok(cx2) == 0, "H14 §2.5 holds on a plated blow", "");
+
+    // --- the flank works --------------------------------------------------
+    let wr3: object = world_new_cap(64);
+    world_set_seed(wr3, 53);
+    let cx3: object = new_cx();
+    let mx3: object = melee_new_cap(4, 64);
+    let ps3: i32 = spawn_swinger(wr3, 0.0, 0.0);
+    melee_equip(mx3, 1, MEL_SWORD);
+    // Same geometry, Warden facing AWAY (yaw 0): the plate is not presented.
+    let wd3: i32 = spawn_enemy(wr3, g_ENEMY_WARDEN, 0.0,
+                               torso_feet(g_ENEMY_WARDEN), -1.6, 0.0);
+    run_swing(mx3, cx3, wr3, null, 1, ps3, 0.0, 12, 1);
+    ck(220 - hp_of(wr3, wd3) == 62,
+       "H15 a blow into the Warden's BACK does full damage — 'go around' works for a sword too",
+       `${220 - hp_of(wr3, wd3)}`);
+}
+
+// ===========================================================================
+//  I — TERRAIN OCCLUDES A SWING
+// ===========================================================================
+fn sec_i() {
+    print("");
+    print("I  terrain is consulted, through combat's own DDA");
+
+    let cs: object = chunk_store_new_cap(g_CHUNK_CACHE, 256, g_WORLD_SEED_DEFAULT);
+    chunk_set_source(cs, ns_chunk_src);
+    chunk_pin_ring(cs, 0, 0, 2);
+    let gy: f64 = chunk_height_at(cs, 6.0, 9.0);
+    ck(gy > CHUNK_H_MISS, "I0 the chunk store yields real terrain", s2(gy));
+
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 60);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 6.0, 9.0);
+    melee_equip(mx, 1, MEL_CLUB);
+
+    // Stand 0.30 m above the ground and swing horizontally: nothing to hit but
+    // the hillside is close, so at least the centre ray must reach terrain.
+    // Instead of relying on the slope, aim the eye BELOW ground level so the
+    // whole sweep is inside the hill.
+    let t: i32 = 0;
+    while (t < 12) {
+        world_set_tick(wr, t);
+        if (melee_stat(mx, MSTAT_STRIKES) == 0) { combat_begin_tick(cx); }
+        let hold: i32 = 0;
+        if (t == 0) { hold = 1; }
+        let c: object = mk_cmd(t, 0.0, hold);
+        melee_tick(mx, cx, wr, cs, 1, ps, gy - 1.0, c);
+        t++;
+    }
+    ck(melee_stat(mx, MSTAT_TERRAIN_HITS) == 1,
+       "I1 a swing inside the hillside reports a TERRAIN impact, not a whiff",
+       `${melee_stat(mx, MSTAT_TERRAIN_HITS)}`);
+    let bus: object = combat_events(cx);
+    let ter: i32 = 0;
+    let world_sfx: i32 = 0;
+    let i: i32 = 0;
+    let n: i32 = evbus_count(bus);
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_IMPACT) {
+            if (evbus_sub(bus, i) == SURF_TERRAIN) { ter++; }
+        }
+        if (evbus_type(bus, i) == EV_SOUND) {
+            if (evbus_sub(bus, i) == SFX_IMPACT_WORLD) { world_sfx = 1; }
+        }
+        i++;
+    }
+    ck(ter == 1,
+       "I2 ONE terrain spark per swing, from the centre ray — seven is what a shotgun does",
+       `${ter}`);
+    ck(world_sfx == 1, "I3 and it makes the world-impact sound", "");
+
+    // occlusion: a body on the far side of a hill is not struck.  Built by
+    // putting the enemy UNDER the terrain, which is the same test combat's DDA
+    // answers: the ray stops at the surface before it reaches the body.
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 61);
+    let cx2: object = new_cx();
+    let mx2: object = melee_new_cap(4, 64);
+    let ps2: i32 = spawn_swinger(wr2, 6.0, 9.0);
+    melee_equip(mx2, 1, MEL_SPEAR);
+    let deep: i32 = spawn_enemy(wr2, g_ENEMY_HUSK, 6.0, gy - 8.0, 9.0 - 2.5, 0.0);
+    let t2: i32 = 0;
+    while (t2 < 20) {
+        world_set_tick(wr2, t2);
+        if (melee_stat(mx2, MSTAT_STRIKES) == 0) { combat_begin_tick(cx2); }
+        let hold2: i32 = 0;
+        if (t2 == 0) { hold2 = 1; }
+        let c2: object = mk_cmd(t2, 0.0, hold2);
+        melee_tick(mx2, cx2, wr2, cs, 1, ps2, gy - 6.0, c2);
+        t2++;
+    }
+    ck(hp_of(wr2, deep) == 90 || melee_stat(mx2, MSTAT_TERRAIN_HITS) == 1,
+       "I4 a swing underground resolves against terrain, not through it",
+       `${hp_of(wr2, deep)}`);
+}
+
+// ===========================================================================
+//  J — NO DURABILITY
+// ===========================================================================
+fn sec_j() {
+    print("");
+    print("J  NO DURABILITY — reliability is the whole identity (DIRECTION §10)");
+
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 70);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_CLUB);
+    let es: i32 = spawn_enemy(wr, g_ENEMY_BULWARK, 0.0,
+                              torso_feet(g_ENEMY_BULWARK), -1.4, 0.0);
+
+    let first: i32 = 0;
+    let last: i32 = 0;
+    let swings: i32 = 0;
+    let cyc: i32 = melee_cycle_len(MEL_CLUB);
+    let s: i32 = 0;
+    while (s < 10000) {
+        set_hp(wr, es, 900);
+        let fl = wr.flags;
+        // keep the target alive and fresh; the blow under test is the constant
+        let t: i32 = 0;
+        while (t < cyc) {
+            world_set_tick(wr, s * cyc + t);
+            combat_begin_tick(cx);
+            let hold: i32 = 0;
+            if (t == 0) { hold = 1; }
+            let c: object = mk_cmd(t, 0.0, hold);
+            melee_tick(mx, cx, wr, null, 1, ps, g_EYE_Y, c);
+            melee_stagger_step(mx);
+            t++;
+        }
+        let dealt: i32 = 900 - hp_of(wr, es);
+        if (s == 0) { first = dealt; }
+        last = dealt;
+        swings++;
+        s++;
+    }
+    ck(swings == 10000, "J0 ten thousand swings ran", `${swings}`);
+    ck(first == 34, "J1 blow number 1 deals 34", `${first}`);
+    ck(last == 34, "J2 blow number 10 000 deals 34 — nothing wore out",
+       `${last}`);
+    ck(first == last,
+       "J3 there is no degradation of any kind across 10 000 swings", "");
+    ck(melee_stat(mx, MSTAT_STRIKES) == 10000,
+       "J4 every one of them resolved", `${melee_stat(mx, MSTAT_STRIKES)}`);
+    ck(melee_can_swing(mx, 1) == 1,
+       "J5 and the weapon can still swing afterwards — it never breaks", "");
+}
+
+// ===========================================================================
+//  K — MELEE CONSUMES ZERO RANDOMNESS
+// ===========================================================================
+fn sec_k() {
+    print("");
+    print("K  a swing draws nothing from any RNG stream");
+
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 80);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_CLUB);
+    spawn_enemy(wr, g_ENEMY_HUSK, 0.0, torso_feet(g_ENEMY_HUSK), -1.2, 0.0);
+
+    let st = cx.rng;
+    let h0: i32 = rng_state_hash(st);
+    run_swing(mx, cx, wr, null, 1, ps, 0.0, 24, 1);
+    let h1: i32 = rng_state_hash(st);
+    ck(h0 == h1,
+       "K0 combat's spread stream is UNTOUCHED by a melee strike — a swing cannot desync the next bullet",
+       `${h0} vs ${h1}`);
+    ck(melee_stat(mx, MSTAT_HITS) == 1,
+       "K1 (and the swing really did land, so K0 is not vacuous)", "");
+
+    // Same swing, twice, from identical state -> identical everything.
+    let hashes: array<i32> = [];
+    let r: i32 = 0;
+    while (r < 2) {
+        let w2: object = world_new_cap(64);
+        world_set_seed(w2, 80);
+        let c2: object = new_cx();
+        let m2: object = melee_new_cap(4, 64);
+        let p2: i32 = spawn_swinger(w2, 0.0, 0.0);
+        melee_equip(m2, 1, MEL_CLUB);
+        spawn_enemy(w2, g_ENEMY_HUSK, 0.0, torso_feet(g_ENEMY_HUSK), -1.2, 0.0);
+        run_swing(m2, c2, w2, null, 1, p2, 0.0, 24, 0);
+        hashes.push(evbus_hash(combat_events(c2)) ^ melee_hash(m2));
+        r++;
+    }
+    ck(hashes[0] == hashes[1],
+       "K2 the identical swing from identical state is bit-identical",
+       `${hashes[0]}`);
+}
+
+// ===========================================================================
+//  L — STAGGER
+// ===========================================================================
+fn sec_l() {
+    print("");
+    print("L  stagger — the club buys SPACE");
+
+    let wr: object = world_new_cap(64);
+    world_set_seed(wr, 90);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 64);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_CLUB);
+    let es: i32 = spawn_enemy(wr, g_ENEMY_HUSK, 0.0, torso_feet(g_ENEMY_HUSK),
+                              -1.2, 0.0);
+
+    ck(melee_staggered(mx, es) == 0, "L0 nothing starts staggered", "");
+
+    // run the windup only, so the stagger has not decayed yet
+    let strike_t: i32 = strike_tick(MEL_CLUB);
+    let t: i32 = 0;
+    while (t <= strike_t) {
+        world_set_tick(wr, t);
+        combat_begin_tick(cx);
+        let hold: i32 = 0;
+        if (t == 0) { hold = 1; }
+        let c: object = mk_cmd(t, 0.0, hold);
+        melee_tick(mx, cx, wr, null, 1, ps, g_EYE_Y, c);
+        t++;
+    }
+    ck(melee_stagger_of(mx, es) == 27,
+       "L1 a club blow applies its full 27 ticks", `${melee_stagger_of(mx, es)}`);
+    ck(melee_staggered(mx, es) == 1, "L2 and the query says staggered", "");
+
+    let bus: object = combat_events(cx);
+    let vid: i32 = world_id_of(wr, es);
+    ck(evbus_count_for(bus, EV_STAGGER, vid) == 1,
+       "L3 EV_STAGGER is on the bus for the AI and the renderer to read", "");
+    let stag_sub: i32 = 0;
+    let i: i32 = 0;
+    let n: i32 = evbus_count(bus);
+    while (i < n) {
+        if (evbus_type(bus, i) == EV_STAGGER) { stag_sub = evbus_sub(bus, i); }
+        i++;
+    }
+    ck(stag_sub == 27, "L4 and it carries the tick count", `${stag_sub}`);
+
+    // decay
+    let d: i32 = 0;
+    while (d < 27) { melee_stagger_step(mx); d++; }
+    ck(melee_stagger_of(mx, es) == 0, "L5 it decays to zero in exactly 27 ticks",
+       `${melee_stagger_of(mx, es)}`);
+    melee_stagger_step(mx);
+    ck(melee_stagger_of(mx, es) == 0, "L6 and never goes negative", "");
+
+    // MAX, not sum
+    let mx2: object = melee_new_cap(4, 64);
+    let g = mx2.stag;
+    g[3] = 20;
+    ck(melee_stagger_of(mx2, 3) == 20, "L7 (fixture)", "");
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 91);
+    let cx2: object = new_cx();
+    let ps2: i32 = spawn_swinger(wr2, 0.0, 0.0);
+    melee_equip(mx2, 1, MEL_SPEAR);
+    let es2: i32 = spawn_enemy(wr2, g_ENEMY_HUSK, 0.0, torso_feet(g_ENEMY_HUSK),
+                               -1.2, 0.0);
+    // es2 will be slot 1; pre-load it with a longer stagger than a spear gives
+    let g2 = mx2.stag;
+    g2[es2] = 20;
+    let t2: i32 = 0;
+    let st2: i32 = strike_tick(MEL_SPEAR);
+    while (t2 <= st2) {
+        world_set_tick(wr2, t2);
+        combat_begin_tick(cx2);
+        let hold2: i32 = 0;
+        if (t2 == 0) { hold2 = 1; }
+        let c2: object = mk_cmd(t2, 0.0, hold2);
+        melee_tick(mx2, cx2, wr2, null, 1, ps2, g_EYE_Y, c2);
+        t2++;
+    }
+    ck(melee_stagger_of(mx2, es2) == 20,
+       "L8 stagger takes the MAX, never the sum — two hits hold, they do not freeze",
+       `${melee_stagger_of(mx2, es2)}`);
+
+    // no stagger on a corpse
+    let wr3: object = world_new_cap(64);
+    world_set_seed(wr3, 92);
+    let cx3: object = new_cx();
+    let mx3: object = melee_new_cap(4, 64);
+    let ps3: i32 = spawn_swinger(wr3, 0.0, 0.0);
+    melee_equip(mx3, 1, MEL_CLUB);
+    let es3: i32 = spawn_enemy(wr3, g_ENEMY_WISP, 0.0, torso_feet(g_ENEMY_WISP),
+                               -1.2, 0.0);
+    let t3: i32 = 0;
+    let st3: i32 = strike_tick(MEL_CLUB);
+    while (t3 <= st3) {
+        world_set_tick(wr3, t3);
+        combat_begin_tick(cx3);
+        let hold3: i32 = 0;
+        if (t3 == 0) { hold3 = 1; }
+        let c3: object = mk_cmd(t3, 0.0, hold3);
+        melee_tick(mx3, cx3, wr3, null, 1, ps3, g_EYE_Y, c3);
+        t3++;
+    }
+    ck(combat_is_dead(wr3, es3) == 1, "L9 the club one-shot the Wisp", "");
+    ck(melee_stagger_of(mx3, es3) == 0,
+       "L10 a corpse is not staggered", `${melee_stagger_of(mx3, es3)}`);
+    ck(evbus_count_for(combat_events(cx3), EV_STAGGER,
+                       world_id_of(wr3, es3)) == 0,
+       "L11 and no EV_STAGGER is emitted for it", "");
+
+    melee_stagger_clear(mx3, es3);
+    ck(melee_stagger_of(mx3, es3) == 0, "L12 stagger_clear is idempotent", "");
+    ck(melee_stagger_of(mx3, 0 - 1) == 0 && melee_stagger_of(mx3, 99999) == 0,
+       "L13 an out-of-range slot reads zero, never traps", "");
+}
+
+// ===========================================================================
+//  M — THE §2.5 CONTRACT ON EVERY SWING SHAPE
+// ===========================================================================
+fn sec_m() {
+    print("");
+    print("M  the GAME_DESIGN §2.5 contract across every swing shape");
+
+    let shapes: i32 = 0;
+    let m: i32 = 0;
+    while (m < MEL_COUNT) {
+        let cls: i32 = 0;
+        while (cls < 6) {
+            let wr: object = world_new_cap(64);
+            world_set_seed(wr, 100 + m * 8 + cls);
+            let cx: object = new_cx();
+            let mx: object = melee_new_cap(4, 64);
+            let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+            melee_equip(mx, 1, m);
+            let d: f64 = 0.0 - (mel_reach(m) * 0.55);
+            spawn_enemy(wr, cls, 0.0, torso_feet(cls), d, 0.0);
+            spawn_enemy(wr, cls, 0.0 - 0.6, torso_feet(cls), d - 0.1, 0.0);
+            run_swing(mx, cx, wr, null, 1, ps, 0.0, 44, 1);
+            if (combat_feedback_ok(cx) != 0) { shapes++; }
+            cls++;
+        }
+        m++;
+    }
+    ck(shapes == 0,
+       "M0 all 18 weapon x enemy-class swing shapes satisfy the five-signal contract",
+       `${shapes} violations`);
+
+    // and the contract is not vacuous: a swing that never connects has no
+    // EV_HIT, and a swing that connects always has all five.
+    let wr2: object = world_new_cap(64);
+    world_set_seed(wr2, 130);
+    let cx2: object = new_cx();
+    let mx2: object = melee_new_cap(4, 64);
+    let ps2: i32 = spawn_swinger(wr2, 0.0, 0.0);
+    melee_equip(mx2, 1, MEL_CLUB);
+    let es2: i32 = spawn_enemy(wr2, g_ENEMY_HUSK, 0.0,
+                               torso_feet(g_ENEMY_HUSK), -1.2, 0.0);
+    run_swing(mx2, cx2, wr2, null, 1, ps2, 0.0, 12, 1);
+    let bus2: object = combat_events(cx2);
+    let vid2: i32 = world_id_of(wr2, es2);
+    let five: i32 = 0;
+    if (evbus_count_for(bus2, EV_HITMARKER, vid2) >= 1) { five++; }
+    if (evbus_count_for(bus2, EV_HIT_FLASH, vid2) >= 1) { five++; }
+    if (evbus_count_for(bus2, EV_DAMAGE_NUMBER, vid2) >= 1) { five++; }
+    if (evbus_count_for(bus2, EV_IMPACT, vid2) >= 1) { five++; }
+    if (evbus_count_for(bus2, EV_SOUND, vid2) >= 1) { five++; }
+    ck(five == 5, "M1 a connecting blow emits all five signals", `${five}`);
+    ck(evbus_count_for(bus2, EV_HIT, vid2) == 1,
+       "M2 on top of the authoritative EV_HIT", "");
+    ck(EV_STAGGER == 24 && EV_STAGGER > EV_IMPACT,
+       "M3 EV_STAGGER sits above combat's 20..23 block, so a protocol addition cannot collide silently",
+       `${EV_STAGGER}`);
+    ck(SFX_MELEE_CLUB == 9 && SFX_MELEE_WHIFF == 12,
+       "M4 melee sfx ids sit above combat's 1..8", "");
+}
+
+// ===========================================================================
+//  N — DETERMINISM
+// ===========================================================================
+// One scenario, driven from a seed: enemy placement is a pure function of the
+// seed, so a different seed genuinely produces a different fight and the
+// "different seed differs" check is not a tautology.
+fn scenario(p_seed: i32, p_mel: i32): i32 {
+    let wr: object = world_new_cap(96);
+    world_set_seed(wr, p_seed);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 96);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, p_mel);
+
+    // A cheap, fully deterministic placement LCG — no RNG module needed (the
+    // sim's streams are not this test's subject), and deliberately sensitive to
+    // the seed so that "a different seed differs" is not a tautology.  All
+    // mixing in u64: CLAUDE.md A13, i32 `*` TRAPS on overflow.
+    let h: u64 = u64(p_seed & 2147483647) + 1;
+    let k: i32 = 0;
+    while (k < 8) {
+        h = (h * 6364136223846793005 + 1442695040888963407);
+        let r: i32 = i32((h >> 33) & 1073741823);
+        let cls: i32 = r % 6;
+        let ax: f64 = f64((r / 7) % 200 - 100) / 100.0;      // -1 .. 1
+        let az: f64 = 0.0 - 0.8 - f64((r / 13) % 200) / 120.0;
+        spawn_enemy(wr, cls, ax, torso_feet(cls), az, f64((r / 3) % 6));
+        k++;
+    }
+
+    let total: i32 = 0;
+    let ev: i32 = 0;
+    let t: i32 = 0;
+    while (t < 200) {
+        world_set_tick(wr, t);
+        combat_begin_tick(cx);
+        let hold: i32 = 0;
+        if (t % 13 == 0) { hold = 1; }
+        let c: object = mk_cmd(t, f64(t % 5) * 0.06, hold);
+        total = total + melee_tick(mx, cx, wr, null, 1, ps, g_EYE_Y, c);
+        melee_stagger_step(mx);
+        ev = ev ^ evbus_hash(combat_events(cx));
+        t++;
+    }
+
+    // Fold the whole outcome — melee state, stagger table, event stream and
+    // every entity's HP — into one 31-bit number.  u64 throughout (A13).
+    let acc: u64 = 14695981039346656037;
+    acc = (acc ^ u64(melee_hash(mx) & 2147483647)) * 1099511628211;
+    acc = (acc ^ u64(ev & 2147483647)) * 1099511628211;
+    acc = (acc ^ u64(total & 2147483647)) * 1099511628211;
+    let hp = wr.hp;
+    let n: i32 = world_count(wr);
+    let i: i32 = 0;
+    while (i < n) {
+        let v: i32 = hp[i];
+        if (v < 0) { v = 0; }
+        acc = (acc ^ u64(v)) * 1099511628211;
+        acc = acc ^ (acc >> 29);
+        i++;
+    }
+    let res: i32 = i32((acc >> 33) & 2147483647);
+    return res;
+}
+
+fn sec_n() {
+    print("");
+    print("N  determinism");
+
+    let a1: i32 = scenario(1234, MEL_CLUB);
+    let a2: i32 = scenario(1234, MEL_CLUB);
+    ck(a1 == a2, "N0 the same seed is bit-identical", `${a1}`);
+
+    let b1: i32 = scenario(1235, MEL_CLUB);
+    ck(a1 != b1, "N1 a different seed differs", `${a1} vs ${b1}`);
+
+    let c1: i32 = scenario(1234, MEL_SPEAR);
+    let d1: i32 = scenario(1234, MEL_SWORD);
+    ck(a1 != c1 && c1 != d1 && a1 != d1,
+       "N2 the three weapons produce three different fights",
+       `${a1} / ${c1} / ${d1}`);
+
+    // THE GOLDEN HASHES — the compiled and the interpreted run must agree.
+    print(`   golden: club=${a1} spear=${c1} sword=${d1} seed2=${b1}`);
+    ck(a1 == 1817252247, "N3 golden club scenario hash", `${a1}`);
+    ck(c1 == 1631183293, "N4 golden spear scenario hash", `${c1}`);
+    ck(d1 == 163338326, "N5 golden sword scenario hash", `${d1}`);
+    ck(b1 == 448608582, "N6 golden seed-1235 hash", `${b1}`);
+
+    // the melee fingerprint alone is stable too
+    let mx: object = melee_new_cap(4, 32);
+    melee_equip(mx, 1, MEL_SWORD);
+    melee_equip(mx, 2, MEL_CLUB);
+    let g = mx.stag;
+    g[5] = 11;
+    let mh: i32 = melee_hash(mx);
+    print(`   golden: melee_hash=${mh}`);
+    ck(mh == 1665408066, "N7 golden melee_hash of a known state", `${mh}`);
+}
+
+// ===========================================================================
+//  O — COST
+// ===========================================================================
+fn sec_o() {
+    print("");
+    print("O  cost (CLAUDE.md RULE T: __clock CPU time, min of 7 batches)");
+
+    let wr: object = world_new_cap(128);
+    world_set_seed(wr, 200);
+    let cx: object = new_cx();
+    let mx: object = melee_new_cap(4, 128);
+    let ps: i32 = spawn_swinger(wr, 0.0, 0.0);
+    melee_equip(mx, 1, MEL_CLUB);
+    let fy: f64 = torso_feet(g_ENEMY_HUSK);
+    let e: i32 = 0;
+    while (e < 24) {
+        spawn_enemy(wr, g_ENEMY_HUSK, f64(e % 7) * 0.4 - 1.2, fy,
+                    0.0 - 1.0 - f64(e) * 0.05, 0.0);
+        e++;
+    }
+
+    let REPS = 200;
+    let best: f64 = 1.0e30;
+    let trial: i32 = 0;
+    while (trial < 7) {
+        let t0: f64 = __clock();
+        let r: i32 = 0;
+        while (r < REPS) {
+            let hp = wr.hp;
+            let i: i32 = 0;
+            let nn: i32 = world_count(wr);
+            while (i < nn) { hp[i] = 900; i++; }
+            let fl = wr.flags;
+            i = 1;
+            while (i < nn) { fl[i] = fl[i] & 2147483645; i++; }
+            world_set_tick(wr, r);
+            combat_begin_tick(cx);
+            run_swing(mx, cx, wr, null, 1, ps, 0.0, 22, 0);
+            r++;
+        }
+        let dt: f64 = __clock() - t0;
+        if (dt < best) { best = dt; }
+        trial++;
+    }
+    let per_swing_us: f64 = best * 1000000.0 / f64(REPS);
+    let per_tick_ms: f64 = per_swing_us / 22.0 / 1000.0;
+    // RULE T wants the host loadavg beside every timing.  The probe cannot
+    // supply it: `@stdlib/fs`'s read_file sizes the file first and procfs
+    // reports 0 bytes, so `read_file("/proc/loadavg")` returns "".  The RUNNER
+    // must print it; every number below is meaningless without it.
+    print("   STATE THE HOST LOADAVG WITH THE NUMBERS BELOW (the probe cannot read /proc/loadavg)");
+    print(`   one whole 22-tick club swing cycle, 25 entities, 7 rays: ${s2(per_swing_us)} us`);
+    print(`   amortized while swinging non-stop:                       ${s2(per_tick_ms)} ms/tick`);
+    // A REGRESSION GUARD, not a certificate that this box was idle.  Measured
+    // ~217 us under the usual load; 600 us is ~2.8x that, which catches the
+    // kind of regression that matters (an allocation per ray, a per-swing
+    // rebuild) without going red because llama-server took a core.
+    // The game ships COMPILED and compiled is 5-18x faster, so the interpreted
+    // bound is scaled rather than skipped: skipping would change the assertion
+    // count between the two backends and the count is itself a check.
+    let bound_us: f64 = 600.0;
+    let bound_ms: f64 = 0.05;
+    if (is_compiled() == 0) { bound_us = 6000.0; bound_ms = 0.5; }
+    ck(per_swing_us < bound_us,
+       `O0 a whole club swing cycle stays under ${s2(bound_us)} us (regression guard)`,
+       `${s2(per_swing_us)} us`);
+    ck(per_tick_ms < bound_ms,
+       `O1 swinging NON-STOP costs under ${s2(bound_ms)} ms/tick — melee is not a budget item`,
+       `${s2(per_tick_ms)} ms`);
+    ck(melee_stat(mx, MSTAT_RAYS_CAST) > 0, "O2 (the benchmark really swung)",
+       `${melee_stat(mx, MSTAT_RAYS_CAST)}`);
+}
+
+// ===========================================================================
+fn main() {
+    print("== probe_melee.hml — DIRECTION.md §10, club / spear / sword ==");
+    if (is_compiled() == 1) { print("   backend: COMPILED"); }
+    else { print("   backend: INTERPRETED"); }
+
+    sec_a();
+    sec_b();
+    sec_c();
+    sec_d();
+    sec_e();
+    sec_f();
+    sec_g();
+    sec_h();
+    sec_i();
+    sec_j();
+    sec_k();
+    sec_l();
+    sec_m();
+    sec_n();
+    sec_o();
+
+    print("");
+    print(`   asserts ${g_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    let bad: i32 = 0;
+    if (g_fail != 0) { bad = 1; }
+    if (g_asserts != g_expect_asserts) {
+        print(`   ASSERTION COUNT ${g_asserts}, expected ${g_expect_asserts}`);
+        bad = 1;
+    }
+    if (bad != 0) {
+        print("PROBE_MELEE FAIL");
+        exit(1);
+    }
+    print("PROBE_MELEE PASS");
+}
+
+main();

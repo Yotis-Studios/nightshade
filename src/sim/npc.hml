@@ -1,0 +1,2014 @@
+// npc.hml — the villagers.  The Animal Crossing pillar, simulated.
+//
+// ===========================================================================
+// WHAT THIS FILE IS
+// ===========================================================================
+// `DIRECTION.md` §6 is the approved direction and this is its sim half.  Four
+// principles, and every export below serves one of them:
+//
+//   1  NPCs ARE THE CRAFTING AND TRADING INTERFACE, NOT MENUS.  §8 here is an
+//      OFFER TABLE keyed by (who, settlement tier, REGARD).  You do not open a
+//      shop; you ask a person, and what they will do for you depends on
+//      whether they know you.  The bolt-action is Mabel's row 0.
+//
+//   2  THEY ARRIVE AS THE SETTLEMENT GROWS.  §5.  Presence is a pure function
+//      of `settle_tier_ever`: Village brings Mabel, Odo and Grandfather Wick,
+//      Town brings Connie and Pip, and each tier brings ambient villagers.  A
+//      new face is the most legible possible signal that lantern work mattered.
+//
+//   3  THEY REACT TO THE GRID.  §7 and §9.  `npc_dark_scan` samples the civic
+//      light field on eight compass octants and finds the darkest one; the
+//      topic system turns that into "the east road has gone dark again", which
+//      is tutorial, quest hook and entropy readout in one line and needs no UI.
+//
+//   4  NAMED, FEW AND PERSISTENT.  Five people, `GAME_DESIGN` §5's five, each
+//      with a station they stand at, a schedule they keep, and a REGARD score
+//      that only ever goes up.  Ambient villagers are a crowd: no names, no
+//      dialogue, no state — regenerated from the seed, never saved.
+//
+// ===========================================================================
+// THE IMPORT WALL
+// ===========================================================================
+// `src/core/**`, `src/sim/**`, `@stdlib/math`.  Nothing else.  No SDL, no
+// wobbleweed, no `@stdlib/random`, no `__clock`.  This module is part of the
+// future authoritative server: every villager position, topic, offer and
+// regard value is a pure function of (seed, settlement state, tick).
+//
+// It owns NO geometry, NO colour and NO mesh.  `src/art/meshgen.hml` owns the
+// villager assets; the two files agree on the character ids and the triangle
+// ladder by CONSTANT, and `tools/probe_npc.hml` — which is a tool and is
+// therefore not walled — imports both and asserts they have not drifted.
+// That is the same shape `settle.hml` uses against `hubgen.hml`.
+//
+// ===========================================================================
+// THE ONE SENTENCE
+// ===========================================================================
+// Light the grid and people show up; talk to them and they remember; what they
+// will make for you is a function of how well they know you and how bright the
+// town is — so the arsenal arrives through relationships and the relationships
+// are paid for in lanterns.
+//
+// ===========================================================================
+// REGARD NEVER DECAYS, AND THAT IS A DESIGN DECISION, NOT AN OMISSION
+// ===========================================================================
+// Entropy is accepted (`MULTIPLAYER.md` §A) and the dark grows back.  It is
+// tempting to make friendship decay the same way and it would be a mistake.
+// The emotional hook `DIRECTION.md` §6.4 names is *"the town survived because
+// you came back"* — the town, not the friendship.  A world that punishes you
+// for being away by making Odo cold to you converts the one warm thing in the
+// game into another maintenance chore.  So:
+//
+//     THE GRID DECAYS.  THE PEOPLE DO NOT.
+//
+// The lapse shows up in what they SAY (§9's dark-road topic fires the moment a
+// sector goes dark) and in what the town can DO (`settle.hml`'s brownout stops
+// the Foundry), never in whether Mabel will still sell you a rifle.  Regard is
+// a saturating monotone i32, which also makes it trivially replay-safe: no
+// clock, no decay rate, no float drift.
+//
+// ===========================================================================
+// COST — where each function runs
+// ===========================================================================
+//   npc_new()          ONCE.  Allocates five rows.  Off every frame path.
+//   npc_step()         ONE TICK IN 60, beside `settle_step`.  Presence check
+//                      (5 comparisons) plus, one step in 8, an 8-sample light
+//                      scan.  Bar: <= 0.05 ms per call.
+//   npc_topic_fill()   ON INTERACTION ONLY.  Never per frame.
+//   npc_visible_fill() ONCE PER FRAME, and it is the only per-frame function
+//                      here.  Partial selection sort of at most NPC_MAX
+//                      villagers down to NPC_VIS_MAX, then a demotion loop.
+//                      Bar: <= 0.10 ms.  Measured in `probe_npc` section P.
+//
+// ===========================================================================
+// DEVIATIONS, EACH ARGUED
+// ===========================================================================
+// D1  `SETTLEMENT.md` §7.4 caps the visible humanoids at 8 and the LOD0 named
+//     NPCs at 1, and §7.5 budgets the humanoid line at 299 drawn triangles.
+//     Those two caps do NOT imply that number: five named villagers inside
+//     12 m is 210 + 4*90 = 570 drawn and passes both caps.  So the visible-set
+//     builder also carries a TRIANGLE cap, NPC_TRIS_BUDGET = 300, enforced by
+//     DEMOTING the farthest villager one LOD rung at a time until the frame
+//     fits.  §7.6 already chose demotion over dropping for buildings and gave
+//     the reason ("dropping punches a hole in a street and reads as a bug");
+//     the same reason applies with more force to a person.  A demotion is
+//     invisible, a missing villager is a bug report.
+//
+// D2  `SETTLEMENT.md` §3.3 puts 4 / 9 / 18 ambient villagers at Village / Town
+//     / City.  `DIRECTION.md` §6's budget line is written against "a town of
+//     30".  4/9/18 plus five named is 23, not 30.  This file uses the
+//     SETTLEMENT numbers, because they are the ones attached to a building
+//     count, and NPC_MAX is sized at 32 so a City can be raised to 27 ambient
+//     later without touching a cap.  The 30-villager figure is met by the
+//     budget model either way: what costs milliseconds is the VISIBLE set,
+//     which is capped at 8 and at 300 triangles regardless of population.
+//
+// D3  Ambient villagers are NOT SAVED.  They are f(seed, tier, tick) exactly
+//     as the settlement layout is, for the same reason settle.hml gives: a
+//     regenerable crowd costs zero bytes and can never desync from the town it
+//     lives in.  Only the five named rows persist, and they are 4 i32 each.
+//
+// D4  There is no per-villager pathfinding and there is no idle wander state.
+//     A station and a schedule is enough: the schedule is a pure function of
+//     the day phase, and the walk between stations is a LERP the renderer can
+//     read straight out of `npc_x`/`npc_z`.  A villager with a nav state is a
+//     villager whose position is not reproducible from a tick, which would
+//     make this file the one thing in `src/sim` that cannot be replayed.
+// ===========================================================================
+
+import { clampi, floori, xhash2 } from "../core/mathx.hml";
+import { PHASE_DAWN, PHASE_DAY, PHASE_DUSK, PHASE_NIGHT,
+         day_number, day_phase, day_phase_t, day_is_night } from "./daycycle.hml";
+import { SET_TIER_CAMP, SET_TIER_VILLAGE, SET_TIER_TOWN, SET_TIER_CITY,
+         SET_TIER_COUNT, SET_CON_DONE, SET_GREEN_R_M,
+         SET_B_COTTAGE, SET_B_HOUSE, SET_B_HALL, SET_IND_RUNNING,
+         settle_cx, settle_cz, settle_deck_y, settle_bearing,
+         settle_tier, settle_tier_ever, settle_brownout, settle_industry,
+         settle_building_count, settle_building_kind, settle_building_state,
+         settle_assign_pid, settle_man_tier,
+         settle_plot_x, settle_plot_z, settle_plot_y,
+         settle_plot_order, settle_valid_count, settle_worksite_count,
+         settle_lux_at } from "./settle.hml";
+// The ONE thing this file needs from the manufactured arsenal: the id of the
+// gun the Arsenal sells, so `g_off_arg`'s manufactured row is not a magic 0.
+// The four VILLAGE weapons have no ids there yet — see NPC_VW_* below.
+import { WPN_SPARROW } from "./weapons.hml";
+
+// ===========================================================================
+// 1.  THE FIVE, AND THE CROWD
+// ===========================================================================
+// Ids are in ARRIVAL ORDER, which is what makes `npc_present` a comparison
+// rather than a table lookup and what makes the save rows stable.  Mabel, Odo
+// and Wick are the Village; Connie and Pip are the Town.  `GAME_DESIGN` §5
+// names all five and gives each a personality line; those lines are strings
+// and strings are the HUD's business, so what lives here is the id, the
+// station, the schedule and the offer table.
+
+export let NPC_MABEL: i32  = 0;   // gunsmith, ex-lamplighter, two fingers short
+export let NPC_ODO: i32    = 1;   // innkeeper, keeps soup warm past midnight
+export let NPC_WICK: i32   = 2;   // the old lantern-keeper, mostly asleep
+export let NPC_CONNIE: i32 = 3;   // cartographer, runs the bounty board
+export let NPC_PIP: i32    = 4;   // a kid, collects Almanac finds, a liar
+export let NPC_NAMED: i32  = 5;
+export let NPC_NONE: i32   = -1;
+
+// Two humanoid classes, `SETTLEMENT.md` §7.4.  A named NPC gets the rich mesh
+// because you talk to it; an ambient villager gets the cheap one because it
+// only has to read as "a person, doing something".
+export let NPC_CLASS_NAMED: i32   = 0;
+export let NPC_CLASS_AMBIENT: i32 = 1;
+export let NPC_CLASS_COUNT: i32   = 2;
+
+// Population.  §3.3's table, tier-indexed.  NPC_MAX is the cap every array in
+// the store is sized against; it is deliberately 8 above the City figure so a
+// later tier or a festival can raise the crowd without a reallocation.
+export let NPC_AMB_CAMP: i32    = 0;
+export let NPC_AMB_VILLAGE: i32 = 4;
+export let NPC_AMB_TOWN: i32    = 9;
+export let NPC_AMB_CITY: i32    = 18;
+export let NPC_MAX: i32         = 32;    // NPC_NAMED + NPC_AMB_CITY = 23, +9 slack
+
+// ===========================================================================
+// 2.  REGARD — the relationship, and the only number a villager remembers
+// ===========================================================================
+// 0..255, saturating, monotone (see the header).  The bands are what the offer
+// table is written against, so a designer tuning "how well must she know me"
+// picks a BAND, not a magic number.
+export let NPC_REGARD_MAX: i32 = 255;
+
+export let NPC_BAND_STRANGER: i32   = 0;   //   0..31   never met, or barely
+export let NPC_BAND_ACQUAINTED: i32 = 1;   //  32..95   knows your face
+export let NPC_BAND_FRIEND: i32     = 2;   //  96..191  keeps a bowl for you
+export let NPC_BAND_TRUSTED: i32    = 3;   // 192..255  gives you the good stuff
+export let NPC_BAND_COUNT: i32      = 4;
+
+export let NPC_BAND_T_ACQ: i32     = 32;
+export let NPC_BAND_T_FRIEND: i32  = 96;
+export let NPC_BAND_T_TRUSTED: i32 = 192;
+
+// What each thing is worth.  A daily conversation is small and a completed
+// contract is large, deliberately: the fast path to the arsenal is playing the
+// game, and the slow path is saying hello every day, and BOTH work.
+export let NPC_CR_MEET: i32     = 8;    // the first hello, once ever
+export let NPC_CR_TALK: i32     = 6;    // one conversation per in-game day
+export let NPC_CR_LANTERN: i32  = 2;    // a lantern lit, to everyone
+export let NPC_CR_NIGHT: i32    = 3;    // a night survived in the settlement
+export let NPC_CR_CONTRACT: i32 = 20;   // a contract completed
+export let NPC_CR_DONATE: i32   = 12;   // a relic or critter donated
+export let NPC_CR_PROMOTE: i32  = 15;   // the settlement promoted a tier
+
+// credit kinds, for `npc_credit`
+export let NPC_CRK_LANTERN: i32  = 0;   // arg ignored     -> everyone
+export let NPC_CRK_NIGHT: i32    = 1;   // arg ignored     -> everyone
+export let NPC_CRK_PROMOTE: i32  = 2;   // arg ignored     -> everyone
+export let NPC_CRK_CONTRACT: i32 = 3;   // arg = who, or -1 for Connie
+export let NPC_CRK_DONATE: i32   = 4;   // arg = who, or -1 for Pip
+export let NPC_CRK_COUNT: i32    = 5;
+
+// ===========================================================================
+// 3.  TOPICS — the dialogue selector, and the world-state readout
+// ===========================================================================
+// `npc_topic_fill` returns a topic id and an argument.  The STRING is the
+// HUD's; what this file guarantees is that the topic is the most informative
+// true thing that villager could say right now, chosen by a fixed priority so
+// two players on a shard hear the same line in the same state.
+//
+// The order is not arbitrary.  It runs from "you have never met" through the
+// three world-state alarms, then the good news, then the small talk.  An alarm
+// outranks good news because a player who is about to lose the Foundry needs to
+// hear that before they hear that Pip found a beetle.
+export let NPC_T_NONE: i32       = -1;
+export let NPC_T_GREET: i32      = 0;   // arg: who is speaking
+export let NPC_T_BROWNOUT: i32   = 1;   // arg: settlement tier that browned out
+export let NPC_T_DARK_ROAD: i32  = 2;   // arg: NPC_DIR_* of the darkest octant
+export let NPC_T_FOUNDRY: i32    = 3;   // arg: settle_industry() stage
+export let NPC_T_ARRIVAL: i32    = 4;   // arg: who arrived
+export let NPC_T_PROMOTED: i32   = 5;   // arg: the new tier
+export let NPC_T_BUILDING: i32   = 6;   // arg: SET_B_* under construction
+export let NPC_T_OFFER: i32      = 7;   // arg: offer row index, global
+export let NPC_T_NIGHT: i32      = 8;   // arg: who is speaking
+export let NPC_T_DAILY: i32      = 9;   // arg: 0..NPC_LINES-1, the day's line
+export let NPC_T_COUNT: i32      = 10;
+
+// GAME_DESIGN §5.7: "every NPC has one new line per in-game day.  Cheap,
+// enormously effective."  Six flavours per villager is 30 lines of writing for
+// a month of in-game days before a repeat, and the selector is a hash of the
+// day number so it is identical on every client.
+export let NPC_LINES: i32 = 6;
+
+// ===========================================================================
+// 4.  THE COMPASS — how a villager points at a sector of your grid
+// ===========================================================================
+// The project's yaw convention (settle.hml §2, ai.hml, meshgen.hml) is
+// forward(yaw) = (sin yaw, -cos yaw).  So yaw 0 faces -Z and yaw pi/2 faces
+// +X.  NAMING THOSE NORTH AND EAST is the whole of this section, and it is
+// worth stating once in a constant rather than eight times in a comment,
+// because "the east road" has to mean the same direction to the dialogue, the
+// compass rose and the map or the line is a lie.
+export let NPC_DIR_N: i32     = 0;
+export let NPC_DIR_NE: i32    = 1;
+export let NPC_DIR_E: i32     = 2;
+export let NPC_DIR_SE: i32    = 3;
+export let NPC_DIR_S: i32     = 4;
+export let NPC_DIR_SW: i32    = 5;
+export let NPC_DIR_W: i32     = 6;
+export let NPC_DIR_NW: i32    = 7;
+export let NPC_DIR_COUNT: i32 = 8;
+export let NPC_DIR_NONE: i32  = -1;
+
+// Where the scan is taken and what counts as dark.
+//
+// 96 m is chosen, not picked: it is outside the Village ring (64 m) and inside
+// the Town ring (200 m), so the scan is always sampling the FRONTIER of the
+// grid rather than the core the Great Lantern floors at 512 LUX.  A scan at
+// the core would never report anything and a scan at the City ring would
+// report darkness on a fresh Village in every direction.
+export let NPC_DARK_R_M: f64  = 96.0;
+export let NPC_DARK_LUX: i32  = 64;    // a quarter of one lantern at full wick
+export let NPC_DARK_RATIO: i32 = 2;    // brightest octant must be this much
+                                       // brighter, or it is not a DIRECTION,
+                                       // it is just a dark night everywhere
+export let NPC_DARK_EVERY: i32 = 8;    // scans, in npc_step calls (8 s of play)
+
+// ===========================================================================
+// 5.  OFFERS — the crafting and trading interface, which is a person
+// ===========================================================================
+// `DIRECTION.md` §6.1: "NPCs are the crafting and trading interface, not
+// menus.  You get the bolt-action FROM SOMEONE, and that person remembers
+// you."  So an offer is a row of (who, kind, arg, tier, regard) and it opens
+// when the settlement has grown far enough AND that person knows you well
+// enough.  Both gates are diegetic: the town has to be able to support the
+// work, and the worker has to be willing to do it for you.
+export let NPC_OFF_WEAPON: i32   = 0;   // arg = NPC_VW_*   (village-tier gun)
+export let NPC_OFF_MFG: i32      = 1;   // arg = WPN_*      (manufactured gun)
+export let NPC_OFF_AMMO: i32     = 2;   // arg = 0 village, 1 manufactured
+export let NPC_OFF_REPAIR: i32   = 3;
+export let NPC_OFF_ATTACH: i32   = 4;
+export let NPC_OFF_REROLL: i32   = 5;
+export let NPC_OFF_SLEEP: i32    = 6;
+export let NPC_OFF_BANK: i32     = 7;
+export let NPC_OFF_SOUP: i32     = 8;
+export let NPC_OFF_LANTERN: i32  = 9;   // arg = Great Lantern tier unlocked
+export let NPC_OFF_KIT: i32      = 10;  // player-placeable lantern kits
+export let NPC_OFF_TRAVEL: i32   = 11;
+export let NPC_OFF_CONTRACT: i32 = 12;  // arg = contracts per day
+export let NPC_OFF_MAP: i32      = 13;
+export let NPC_OFF_ALMANAC: i32  = 14;
+export let NPC_OFF_CHARM: i32    = 15;  // arg = charm slot
+export let NPC_OFF_KIND_COUNT: i32 = 16;
+
+// The village-tier arsenal, `DIRECTION.md` §3's village row.
+//
+// >>> THESE ARE NOT `weapons.hml`'s WPN_* IDS AND MUST NOT BE CONFUSED WITH
+// >>> THEM.  `weapons.hml` carries the six MANUFACTURED guns (Sparrow, Tinker,
+// >>> Bellows, Longshadow, Kestrel, Emberlance) — the city row.  The four
+// >>> village weapons do not exist in `weapons.hml` yet.  This is REPORTED,
+// >>> not invented: when the village row lands there, these four constants
+// >>> become an alias of it and `npc_offer_arg` does not change shape. <<<
+export let NPC_VW_BOLT: i32     = 0;   // bolt-action rifle
+export let NPC_VW_REVOLVER: i32 = 1;
+export let NPC_VW_PUMP: i32     = 2;   // pump shotgun
+export let NPC_VW_PIPESMG: i32  = 3;   // crude pipe-SMG
+export let NPC_VW_COUNT: i32    = 4;
+
+export let NPC_OFF_ROWS: i32 = 21;
+
+// ===========================================================================
+// 6.  EVENTS, LOD, AND THE SAVE SHAPE
+// ===========================================================================
+export let NPC_EV_NONE: i32     = 0;
+export let NPC_EV_ARRIVED: i32  = 1;    // a named villager appeared
+export let NPC_EV_CROWD: i32    = 2;    // the ambient population changed
+export let NPC_EV_DARK: i32     = 4;    // the darkest octant changed
+export let NPC_EV_BAND: i32     = 8;    // somebody's regard crossed a band
+export let NPC_EV_OFFER: i32    = 16;   // a new offer opened
+
+// The triangle ladder.  These MUST equal `meshgen.hml`'s registered budgets;
+// `probe_npc` section M imports both and asserts it, because a budget model
+// that has quietly drifted from the assets it is modelling is worse than no
+// budget model at all.
+export let NPC_TRIS_NAMED_L0: i32 = 210;
+export let NPC_TRIS_NAMED_L1: i32 = 90;
+export let NPC_TRIS_NAMED_L2: i32 = 28;
+export let NPC_TRIS_AMB_L0: i32   = 48;
+export let NPC_TRIS_AMB_L1: i32   = 28;
+export let NPC_TRIS_AMB_L2: i32   = 12;
+
+// Switch distances, `SETTLEMENT.md` §7.4.  A named villager holds its detail
+// three metres further out than a villager does because it is the one you walk
+// up to and talk to.
+export let NPC_LOD1_NAMED_M: f64 = 12.0;
+export let NPC_LOD2_NAMED_M: f64 = 28.0;
+export let NPC_LOD1_AMB_M: f64   = 10.0;
+export let NPC_LOD2_AMB_M: f64   = 22.0;
+
+// The three caps, §7.4 and §7.6, plus D1's triangle cap.
+export let NPC_VIS_MAX: i32      = 8;
+export let NPC_LOD0_MAX: i32     = 1;
+export let NPC_TRIS_BUDGET: i32  = 300;
+
+// `npc_visible_fill` output stride.  Flat f64, not objects: this runs once per
+// frame and CLAUDE.md §1 rule 2 is unambiguous about per-frame allocation.
+export let NPC_VIS_SLOT: i32   = 0;
+export let NPC_VIS_CLASS: i32  = 1;
+export let NPC_VIS_WHO: i32    = 2;
+export let NPC_VIS_X: i32      = 3;
+export let NPC_VIS_Y: i32      = 4;
+export let NPC_VIS_Z: i32      = 5;
+export let NPC_VIS_YAW: i32    = 6;
+export let NPC_VIS_LOD: i32    = 7;
+export let NPC_VIS_DIST: i32   = 8;
+export let NPC_VIS_STRIDE: i32 = 9;
+
+// Save.  Four i32 per named villager and nothing for the crowd (D3).
+export let NPC_SAVE_COLS: i32 = 4;    // regard, met, last_talk_day, arrived_day
+export let NPC_META_COLS: i32 = 4;    // version, seen_tier, dark_dir, talks
+export let NPC_VERSION: i32   = 1;
+
+// Interaction reach.  A villager you can talk to from 12 m away is a kiosk.
+export let NPC_TALK_M: f64   = 2.6;
+export let NPC_RADIUS_M: f64 = 0.42;
+
+// ===========================================================================
+// 7.  SMALL HELPERS
+// ===========================================================================
+
+fn idiv(p_a: i32, p_b: i32): i32 {
+    let a: f64 = f64(p_a);
+    let b: f64 = f64(p_b);
+    let out: i32 = i32(a / b);
+    return out;
+}
+
+fn dist2(p_ax: f64, p_az: f64, p_bx: f64, p_bz: f64): f64 {
+    let dx: f64 = p_ax - p_bx;
+    let dz: f64 = p_az - p_bz;
+    let out: f64 = dx * dx + dz * dz;
+    return out;
+}
+
+// forward(yaw) = (sin yaw, -cos yaw).  Stated once; used everywhere below.
+fn fwd_x(p_yaw: f64): f64 { let y: f64 = p_yaw; let out: f64 = __sin(y); return out; }
+fn fwd_z(p_yaw: f64): f64 { let y: f64 = p_yaw; let out: f64 = 0.0 - __cos(y); return out; }
+
+fn bearing_of(p_dx: f64, p_dz: f64): f64 {
+    let out: f64 = __atan2(p_dx, 0.0 - p_dz);
+    return out;
+}
+
+// A hash value in [0, 1) from two integers and a salt.  `^`, never `+`:
+// `seed + 31` THROWS on a world seed near 2^31 (settle.hml records the same).
+fn h01i(p_a: i32, p_b: i32, p_salt: i32): f64 {
+    let h: u64 = xhash2(p_a, p_b, p_salt);
+    let hf: f64 = f64(h);
+    let out: f64 = hf * 2.3283064365386963e-10;
+    return out;
+}
+
+fn hpick(p_a: i32, p_b: i32, p_salt: i32, p_n: i32): i32 {
+    let n: i32 = p_n;
+    if (n <= 1) { let z: i32 = 0; return z; }
+    let f: f64 = h01i(p_a, p_b, p_salt);
+    let k: i32 = i32(f * f64(n));
+    let out: i32 = clampi(k, 0, n - 1);
+    return out;
+}
+
+fn lerpd(p_a: f64, p_b: f64, p_t: f64): f64 {
+    let out: f64 = p_a + (p_b - p_a) * p_t;
+    return out;
+}
+
+// ===========================================================================
+// 8.  THE STATIC CHARACTER TABLE
+// ===========================================================================
+// Five rows, parallel arrays, `g_`-prefixed (CLAUDE.md §1 rule 3).
+//
+// `arrive` is the settlement tier at which this person shows up, and it is the
+// whole of principle 2.  `station` is the SET_B_* archetype they stand at;
+// -1 means "the green", which is where Wick (the Great Lantern) and Pip (a
+// stall, not a building) live.  `station_n` disambiguates when a tier stakes
+// more than one building of the same archetype: Mabel's Bench, the Almanac and
+// the Arsenal are all Halls, and Mabel wants the FIRST one.
+//
+// `hearth` is where they go at night.  Wick's is his post, because he has
+// never gone properly to bed (`LORE.md` §7) — and that is not flavour, it is
+// the in-fiction reason `settle.hml` floors CORE_LUX at 512 and the green never
+// browns out.  The one villager whose schedule has no night entry is the one
+// holding the light on.
+
+//
+// EVERY VALUE BELOW IS AN IMPORTED CONSTANT, NEVER A LITERAL.  Written as
+// literals these five rows would encode `settle.hml`'s archetype numbering into
+// this file, and the day somebody inserted an archetype Mabel would silently
+// move into the well.  This is the same reason `settle.hml` derives its own
+// manifest from `settle_man_kind` rather than a table of indices.
+
+let g_npc_arrive: array<i32>  = [SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_VILLAGE,
+                                 SET_TIER_TOWN, SET_TIER_TOWN];
+// Mabel's Bench is a Hall, Odo's Inn is a House, Connie's Board is a Cottage.
+// Wick stands at the Great Lantern and Pip has a stall, not a building: -1.
+let g_npc_station: array<i32> = [SET_B_HALL, SET_B_HOUSE, -1, SET_B_COTTAGE, -1];
+// ...and the MANIFEST TIER that introduced it, which is what disambiguates
+// Mabel's Bench from the Almanac and the Arsenal (all three are Halls) and
+// Connie's Board from the four Village cottages.  `settle_assign_build` swaps
+// archetypes between plots to give every road a service building, but it only
+// ever swaps WITHIN a tier, so (kind, manifest tier) is a stable key and a
+// building INDEX is not.
+let g_npc_stn_tier: array<i32> = [SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_CAMP,
+                                  SET_TIER_TOWN, SET_TIER_CAMP];
+let g_npc_night_in: array<i32> = [1, 1, 0, 1, 1];       // 1 = goes inside at night
+
+// Where a villager with no building stands, as a (radius, bearing offset) on
+// the green.  Wick is AT the Great Lantern; Pip's stall is off to one side of
+// it, on the settlement's own bearing so it faces the High Road.
+let g_npc_green_r: array<f64> = [0.0, 0.0, 1.9, 0.0, 6.4];
+let g_npc_green_a: array<f64> = [0.0, 0.0, 2.6, 0.0, 0.9];
+
+export fn npc_valid(p_who: i32): i32 {
+    let w: i32 = p_who;
+    let out: i32 = 0;
+    if (w >= 0) { if (w < NPC_NAMED) { out = 1; } }
+    return out;
+}
+
+// The settlement tier at which this villager appears.  Principle 2, as one
+// function: a new face IS the promotion, and nothing else has to announce it.
+export fn npc_arrive_tier(p_who: i32): i32 {
+    if (npc_valid(p_who) == 0) { let bad: i32 = SET_TIER_COUNT; return bad; }
+    let out: i32 = g_npc_arrive[p_who];
+    return out;
+}
+
+// How many named villagers a tier carries.  Monotone by construction.
+export fn npc_named_at_tier(p_tier: i32): i32 {
+    let t: i32 = clampi(p_tier, SET_TIER_CAMP, SET_TIER_CITY);
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < NPC_NAMED) {
+        if (g_npc_arrive[i] <= t) { n++; }
+        i++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// The ambient crowd a tier carries (§3.3, D2).
+export fn npc_ambient_at_tier(p_tier: i32): i32 {
+    let t: i32 = clampi(p_tier, SET_TIER_CAMP, SET_TIER_CITY);
+    if (t == SET_TIER_VILLAGE) { let a: i32 = NPC_AMB_VILLAGE; return a; }
+    if (t == SET_TIER_TOWN) { let b: i32 = NPC_AMB_TOWN; return b; }
+    if (t == SET_TIER_CITY) { let c: i32 = NPC_AMB_CITY; return c; }
+    let out: i32 = NPC_AMB_CAMP;
+    return out;
+}
+
+export fn npc_pop_at_tier(p_tier: i32): i32 {
+    let out: i32 = npc_named_at_tier(p_tier) + npc_ambient_at_tier(p_tier);
+    return out;
+}
+
+// ===========================================================================
+// 9.  THE OFFER TABLE
+// ===========================================================================
+// Twenty-one rows.  Read them as sentences:
+//
+//   "Mabel will make you a bolt-action as soon as there is a village at all."
+//   "Mabel will make you a revolver once she knows your face."
+//   "Odo will keep soup for you once he knows your face."           (§5, verbatim)
+//   "Wick hands out lantern kits to people he trusts."
+//   "Connie gives you the second daily contract when she is a friend."
+//   "Pip's third charm slot is for someone he actually trusts."
+//
+// THE FIRST ROW IS THE THESIS.  The bolt-action is Mabel's row 0 at regard 0,
+// which means the very first thing the relationship system does is GIVE you
+// something for having lit enough lanterns to make a village — before it has
+// asked you for anything.  Every gate after that is earned.
+//
+// Manufactured guns are Mabel's rows too, not a separate vendor, and they need
+// SET_TIER_CITY: `DIRECTION.md` §3's whole point is that an assault rifle
+// requires "a well lit city manufacturing them".  The Arsenal building sells
+// them; the person who fits them to you is still the gunsmith who has known
+// you since the village.
+
+let g_off_who: array<i32> = [
+    NPC_MABEL, NPC_MABEL, NPC_MABEL, NPC_MABEL, NPC_MABEL,
+    NPC_MABEL, NPC_MABEL, NPC_MABEL, NPC_MABEL,
+    NPC_ODO, NPC_ODO, NPC_ODO,
+    NPC_WICK, NPC_WICK, NPC_WICK,
+    NPC_CONNIE, NPC_CONNIE, NPC_CONNIE,
+    NPC_PIP, NPC_PIP, NPC_PIP
+];
+let g_off_kind: array<i32> = [
+    NPC_OFF_WEAPON, NPC_OFF_WEAPON, NPC_OFF_WEAPON, NPC_OFF_WEAPON,
+    NPC_OFF_REPAIR, NPC_OFF_AMMO, NPC_OFF_ATTACH, NPC_OFF_REROLL, NPC_OFF_MFG,
+    NPC_OFF_SLEEP, NPC_OFF_BANK, NPC_OFF_SOUP,
+    NPC_OFF_LANTERN, NPC_OFF_KIT, NPC_OFF_TRAVEL,
+    NPC_OFF_CONTRACT, NPC_OFF_MAP, NPC_OFF_CONTRACT,
+    NPC_OFF_ALMANAC, NPC_OFF_CHARM, NPC_OFF_CHARM
+];
+let g_off_arg: array<i32> = [
+    NPC_VW_BOLT, NPC_VW_REVOLVER, NPC_VW_PUMP, NPC_VW_PIPESMG,
+    0, 0, 0, 0, WPN_SPARROW,
+    0, 0, 0,
+    2, 0, 0,                        // Great Lantern tier 2; kits; the anchor
+    1, 0, 2,                        // 1 contract/day ... 2 contracts/day
+    0, 1, 2                         // Almanac; charm slot 1; charm slot 2
+];
+let g_off_tier: array<i32> = [
+    SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_VILLAGE,
+    SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_TOWN, SET_TIER_TOWN, SET_TIER_CITY,
+    SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_VILLAGE,
+    SET_TIER_VILLAGE, SET_TIER_VILLAGE, SET_TIER_TOWN,
+    SET_TIER_TOWN, SET_TIER_TOWN, SET_TIER_TOWN,
+    SET_TIER_TOWN, SET_TIER_TOWN, SET_TIER_TOWN
+];
+let g_off_regard: array<i32> = [
+    0, NPC_BAND_T_ACQ, NPC_BAND_T_FRIEND, NPC_BAND_T_TRUSTED,
+    0, 0, NPC_BAND_T_ACQ, NPC_BAND_T_FRIEND, NPC_BAND_T_FRIEND,
+    0, 0, NPC_BAND_T_ACQ,
+    0, NPC_BAND_T_TRUSTED, 0,
+    0, 0, NPC_BAND_T_FRIEND,
+    0, NPC_BAND_T_ACQ, NPC_BAND_T_TRUSTED
+];
+
+export fn npc_offer_rows(): i32 { let out: i32 = NPC_OFF_ROWS; return out; }
+export fn npc_offer_who(p_r: i32): i32 { let out: i32 = g_off_who[clampi(p_r, 0, NPC_OFF_ROWS - 1)]; return out; }
+export fn npc_offer_kind(p_r: i32): i32 { let out: i32 = g_off_kind[clampi(p_r, 0, NPC_OFF_ROWS - 1)]; return out; }
+export fn npc_offer_arg(p_r: i32): i32 { let out: i32 = g_off_arg[clampi(p_r, 0, NPC_OFF_ROWS - 1)]; return out; }
+export fn npc_offer_tier(p_r: i32): i32 { let out: i32 = g_off_tier[clampi(p_r, 0, NPC_OFF_ROWS - 1)]; return out; }
+export fn npc_offer_regard(p_r: i32): i32 { let out: i32 = g_off_regard[clampi(p_r, 0, NPC_OFF_ROWS - 1)]; return out; }
+
+// The first and last global row index belonging to one villager.  The table is
+// grouped by `who` and stays grouped; this is asserted in probe section O.
+export fn npc_offer_first(p_who: i32): i32 {
+    let w: i32 = p_who;
+    let i: i32 = 0;
+    while (i < NPC_OFF_ROWS) {
+        if (g_off_who[i] == w) { let out: i32 = i; return out; }
+        i++;
+    }
+    let bad: i32 = -1;
+    return bad;
+}
+
+export fn npc_offer_count(p_who: i32): i32 {
+    let w: i32 = p_who;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < NPC_OFF_ROWS) {
+        if (g_off_who[i] == w) { n++; }
+        i++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+// 10.  THE STORE
+// ===========================================================================
+// Flat scalars and flat arrays.  No object graph, no entity reference, no
+// closure — `NETWORKING.md` §3 and CLAUDE.md §7.  Everything here is either a
+// delta-log row (the five named villagers) or a cheap cache of something
+// recomputable (the crowd size, the dark octant), and the cache fields are
+// marked as such so a reader never has to guess which is which.
+
+export fn npc_new(p_st: object): object {
+    let st: object = p_st;
+
+    let regard: array<i32> = [];
+    let met: array<i32> = [];
+    let talkday: array<i32> = [];
+    let arrday: array<i32> = [];
+    let present: array<i32> = [];
+    let i: i32 = 0;
+    while (i < NPC_NAMED) {
+        regard.push(0);
+        met.push(0);
+        talkday.push(-1);
+        arrday.push(-1);
+        present.push(0);
+        i++;
+    }
+
+    let lux: array<i32> = [];
+    let k: i32 = 0;
+    while (k < NPC_DIR_COUNT) { lux.push(0); k++; }
+
+    // The store's own seed is DERIVED FROM THE SETTLEMENT'S PUBLIC POSITION,
+    // not read out of `settle.hml`'s object.  `st.seed` is right there and
+    // reaching for it would work today; it would also make this file depend on
+    // a field name that `settle.hml` never promised anybody, which is precisely
+    // the coupling ARCHITECTURE.md §5's signature table exists to prevent.  The
+    // site is f(world seed) and unique per settlement, so hashing it gives a
+    // per-settlement stream with the same properties and no private access.
+    let seed: i32 = i32(xhash2(floori(settle_cx(st)), floori(settle_cz(st)),
+                               1013904223) & 2147483647);
+
+    let store = {
+        seed: seed,
+
+        // --- the delta log: the only fields that are saved ------------------
+        regard: regard,          // NPC_NAMED, 0..255, monotone
+        met: met,                // NPC_NAMED, 0/1
+        talkday: talkday,        // NPC_NAMED, day number of the last conversation
+        arrday: arrday,          // NPC_NAMED, day number they showed up
+        talks: 0,                // lifetime conversations, for the Almanac
+
+        // --- cache: recomputed by npc_step, never saved (D3) ----------------
+        present: present,        // NPC_NAMED, 0/1, = (tier_ever >= arrive)
+        n_named: 0,
+        n_amb: 0,
+        seen_tier: SET_TIER_CAMP,
+        dark_dir: NPC_DIR_NONE,
+        dark_lux: 0,
+        dark_lux_hi: 0,
+        dark_ring: lux,          // NPC_DIR_COUNT, the last scan
+        last_arrival: NPC_NONE,
+        arrival_day: -1,
+        promote_day: -1,
+        scan_n: 0,
+        tick: 0
+    };
+
+    npc_refresh(store, st);
+    return store;
+}
+
+// Recompute every cached field from the settlement.  Idempotent, and called on
+// construction, on load, and by `npc_step`.  This is the only place presence is
+// decided, so "who is here" has exactly one implementation.
+export fn npc_refresh(p_store: object, p_st: object) {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let ever: i32 = settle_tier_ever(st);
+    let pres: array<i32> = sto.present;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < NPC_NAMED) {
+        let p: i32 = 0;
+        if (g_npc_arrive[i] <= ever) { p = 1; }
+        pres[i] = p;
+        n = n + p;
+        i++;
+    }
+    sto.n_named = n;
+    sto.n_amb = npc_ambient_at_tier(ever);
+    sto.seen_tier = ever;
+}
+
+// ===========================================================================
+// 11.  PRESENCE AND THE ROSTER
+// ===========================================================================
+
+export fn npc_present(p_store: object, p_who: i32): i32 {
+    if (npc_valid(p_who) == 0) { let bad: i32 = 0; return bad; }
+    let sto: object = p_store;
+    let a: array<i32> = sto.present;
+    let out: i32 = a[p_who];
+    return out;
+}
+
+export fn npc_named_count(p_store: object): i32 { let sto: object = p_store; let out: i32 = sto.n_named; return out; }
+export fn npc_ambient_count(p_store: object): i32 { let sto: object = p_store; let out: i32 = sto.n_amb; return out; }
+
+export fn npc_count(p_store: object): i32 {
+    let sto: object = p_store;
+    let out: i32 = sto.n_named + sto.n_amb;
+    return out;
+}
+
+// Slot ordering: every PRESENT named villager in id order, then the crowd.
+// Presence is monotone in `tier_ever` and `tier_ever` is a high-water mark, so
+// a slot index never changes meaning for a villager who is already here — which
+// is what lets a renderer keep per-slot cosmetic state across a frame.
+export fn npc_slot_class(p_store: object, p_i: i32): i32 {
+    let sto: object = p_store;
+    if (p_i < sto.n_named) { let a: i32 = NPC_CLASS_NAMED; return a; }
+    let out: i32 = NPC_CLASS_AMBIENT;
+    return out;
+}
+
+export fn npc_slot_who(p_store: object, p_i: i32): i32 {
+    let sto: object = p_store;
+    let i: i32 = p_i;
+    if (i < 0) { let bad: i32 = NPC_NONE; return bad; }
+    if (i >= sto.n_named) { let amb: i32 = NPC_NONE; return amb; }
+    let pres: array<i32> = sto.present;
+    let seen: i32 = 0;
+    let w: i32 = 0;
+    while (w < NPC_NAMED) {
+        if (pres[w] == 1) {
+            if (seen == i) { let out: i32 = w; return out; }
+            seen++;
+        }
+        w++;
+    }
+    let bad2: i32 = NPC_NONE;
+    return bad2;
+}
+
+// The inverse: a named villager's slot, or -1 if they have not arrived.
+export fn npc_slot_of(p_store: object, p_who: i32): i32 {
+    let sto: object = p_store;
+    if (npc_valid(p_who) == 0) { let bad: i32 = -1; return bad; }
+    let pres: array<i32> = sto.present;
+    if (pres[p_who] == 0) { let gone: i32 = -1; return gone; }
+    let s: i32 = 0;
+    let w: i32 = 0;
+    while (w < p_who) {
+        if (pres[w] == 1) { s++; }
+        w++;
+    }
+    let out: i32 = s;
+    return out;
+}
+
+export fn npc_arrived_day(p_store: object, p_who: i32): i32 {
+    if (npc_valid(p_who) == 0) { let bad: i32 = -1; return bad; }
+    let sto: object = p_store;
+    let a: array<i32> = sto.arrday;
+    let out: i32 = a[p_who];
+    return out;
+}
+
+export fn npc_last_arrival(p_store: object): i32 { let sto: object = p_store; let out: i32 = sto.last_arrival; return out; }
+
+// ===========================================================================
+// 12.  STATIONS — where a named villager works
+// ===========================================================================
+// The station is derived from the settlement layout, never stored, for the same
+// reason `settle.hml` regenerates its plots: a stored position is a position
+// that can disagree with the town it is standing in.
+//
+// `settle_man_tier(n)` gives the manifest tier of building n and
+// `settle_assign_kind(st, n)` its archetype, so "Mabel's Bench" is "the first
+// SET_B_HALL whose manifest tier is VILLAGE" — which is exactly what the
+// manifest says it is, with no new table and no possibility of drift.
+
+fn npc_station_building(p_st: object, p_who: i32): i32 {
+    let st: object = p_st;
+    let w: i32 = p_who;
+    let kind: i32 = g_npc_station[w];
+    if (kind < 0) { let none: i32 = -1; return none; }
+    let want_t: i32 = g_npc_stn_tier[w];
+    let n: i32 = settle_building_count(st);
+    let b: i32 = 0;
+    while (b < n) {
+        if (settle_building_kind(st, b) == kind) {
+            if (settle_man_tier(b) == want_t) { let out: i32 = b; return out; }
+        }
+        b++;
+    }
+    let bad: i32 = -1;
+    return bad;
+}
+
+// Writes the station position into p_out[0..2] as x, y, z.  Falls back to the
+// green when the building has not been staked yet, which is what a villager who
+// has arrived before their workplace has actually does: they stand outside it.
+fn npc_station_pos(p_st: object, p_who: i32, p_out: array<f64>) {
+    let st: object = p_st;
+    let w: i32 = p_who;
+    let b: i32 = npc_station_building(st, w);
+    if (b >= 0) {
+        let pid: i32 = settle_assign_pid(st, b);
+        if (pid >= 0) {
+            // stand in FRONT of the door, not inside the wall: 3.2 m out along
+            // the bearing from the green, which is the side the road is on.
+            let px: f64 = settle_plot_x(st, pid);
+            let pz: f64 = settle_plot_z(st, pid);
+            let cx: f64 = settle_cx(st);
+            let cz: f64 = settle_cz(st);
+            let th: f64 = bearing_of(cx - px, cz - pz);
+            p_out[0] = px + fwd_x(th) * 3.2;
+            p_out[1] = settle_plot_y(st, pid);
+            p_out[2] = pz + fwd_z(th) * 3.2;
+            return;
+        }
+    }
+    let r: f64 = g_npc_green_r[w];
+    let a: f64 = settle_bearing(st) + g_npc_green_a[w];
+    p_out[0] = settle_cx(st) + fwd_x(a) * r;
+    p_out[1] = settle_deck_y(st);
+    p_out[2] = settle_cz(st) + fwd_z(a) * r;
+}
+
+// Where they gather.  The green at dusk (the horn), and the green whenever the
+// settlement is in brownout — which makes a brownout something you can SEE from
+// the road in as a knot of people standing around in the dark, rather than a
+// number that stopped going up.
+fn npc_green_pos(p_st: object, p_slot: i32, p_out: array<f64>) {
+    let st: object = p_st;
+    let n: i32 = p_slot;
+    let a: f64 = settle_bearing(st) + f64(n) * 0.7853981633974483;
+    let r: f64 = SET_GREEN_R_M * 0.42 + f64(n % 3) * 1.1;
+    p_out[0] = settle_cx(st) + fwd_x(a) * r;
+    p_out[1] = settle_deck_y(st);
+    p_out[2] = settle_cz(st) + fwd_z(a) * r;
+}
+
+// ===========================================================================
+// 13.  THE CROWD — ambient villager placement
+// ===========================================================================
+// Two jobs, in priority order:
+//
+//   1  WORK SITES FIRST.  `SETTLEMENT.md` §6 asks for "scaffold + one ambient
+//      villager in a working pose" at every site under construction.  So the
+//      first `settle_worksite_count` ambient villagers stand at the buildings
+//      that are not DONE.  This is the highest-value placement in the file:
+//      it is the difference between a town that is being built and a town with
+//      some unfinished boxes in it.
+//   2  Everyone else gets a home plot from the accretion order and shuttles
+//      between it and the green on a per-villager phase offset.
+//
+// All of it is f(seed, tier, tick).  No state, no save, no nav.
+
+fn npc_amb_worksite(p_st: object, p_k: i32): i32 {
+    let st: object = p_st;
+    let want: i32 = p_k;
+    let cap: i32 = settle_worksite_count(st);
+    if (want >= cap) { let none: i32 = -1; return none; }
+    let n: i32 = settle_building_count(st);
+    let seen: i32 = 0;
+    let b: i32 = 0;
+    while (b < n) {
+        if (settle_building_state(st, b) != SET_CON_DONE) {
+            if (seen == want) { let out: i32 = b; return out; }
+            seen++;
+        }
+        b++;
+    }
+    let bad: i32 = -1;
+    return bad;
+}
+
+fn npc_amb_home_pid(p_st: object, p_k: i32): i32 {
+    let st: object = p_st;
+    let vc: i32 = settle_valid_count(st);
+    if (vc <= 0) { let bad: i32 = -1; return bad; }
+    let n: i32 = p_k % vc;
+    let out: i32 = settle_plot_order(st, n);
+    return out;
+}
+
+// ===========================================================================
+// 14.  POSITIONS AND THE SCHEDULE
+// ===========================================================================
+// `npc_pos_fill(store, st, slot, tick, out)` writes x, y, z, yaw.
+//
+// The schedule is deliberately four lines long:
+//
+//   DAWN, DAY   at the station / the work site
+//   DUSK        on the green.  The dusk horn is the game's loudest clock and
+//               everyone answering it is how the player learns it means
+//               something without a tutorial.
+//   NIGHT       inside (drawn at the hearth, near the station door) — except
+//               Wick, who never leaves the Great Lantern.
+//   BROWNOUT    overrides everything: the green, at any hour.
+//
+// The walk between the two is a smoothed LERP over the phase fraction, so a
+// villager crossing the square is a villager crossing the square and not a
+// villager teleporting on a phase edge.  D4 explains why there is no nav here.
+
+// ---------------------------------------------------------------------------
+// PER-FRAME SCRATCH — allocated once, reused forever (CLAUDE.md A8 / N7)
+// ---------------------------------------------------------------------------
+// `npc_pos_fill` and `npc_visible_fill` are the only functions here that run
+// every frame, and between them they were allocating EIGHT arrays per call:
+// 23 villagers x 2 endpoint vectors, plus six parallel lists in the selection
+// pass. At ~260 ns per literal (CLAUDE.md rule 2) that is real money for
+// nothing, and rule 2 is the second-most expensive mistake on the list.
+//
+// These are module state and they are therefore NOT re-entrant. That is safe
+// and it is worth saying why rather than leaving it to be discovered: the sim
+// is single-threaded by construction (`sim_step` is a fixed system order,
+// ARCHITECTURE §4.3) and nothing in this file calls back into a caller. The
+// selection pass writes them, reads them, and is finished before it returns.
+let g_npc_ax: array<f64> = [0.0, 0.0, 0.0];
+let g_npc_bx: array<f64> = [0.0, 0.0, 0.0];
+let g_vis_px: array<f64> = [];
+let g_vis_py: array<f64> = [];
+let g_vis_pz: array<f64> = [];
+let g_vis_yaw: array<f64> = [];
+let g_vis_key: array<f64> = [];
+let g_vis_taken: array<i32> = [];
+let g_vis_o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+fn smooth01(p_t: f64): f64 {
+    let t: f64 = p_t;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    let out: f64 = t * t * (3.0 - 2.0 * t);
+    return out;
+}
+
+export fn npc_pos_fill(p_store: object, p_st: object, p_slot: i32,
+                       p_tick: i32, p_out: array<f64>): i32 {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let slot: i32 = p_slot;
+    let tick: i32 = p_tick;
+    if (p_out.length < 4) { let bad: i32 = -1; return bad; }
+    if (slot < 0) { let b2: i32 = -1; return b2; }
+    if (slot >= npc_count(sto)) { let b3: i32 = -1; return b3; }
+
+    let ax: array<f64> = g_npc_ax;
+    let bx: array<f64> = g_npc_bx;
+    let who: i32 = npc_slot_who(sto, slot);
+    let phase: i32 = day_phase(tick);
+    let pt: f64 = day_phase_t(tick);
+    let bo: i32 = settle_brownout(st);
+
+    // --- the two endpoints this villager is moving between -------------------
+    if (who >= 0) {
+        npc_station_pos(st, who, ax);
+        if (g_npc_night_in[who] == 0) {
+            // Grandfather Wick.  His post IS his hearth (LORE.md §7).
+            bx[0] = ax[0]; bx[1] = ax[1]; bx[2] = ax[2];
+        } else {
+            npc_green_pos(st, slot, bx);
+        }
+    } else {
+        let k: i32 = slot - sto.n_named;
+        let wb: i32 = npc_amb_worksite(st, k);
+        if (wb >= 0) {
+            let pid: i32 = settle_assign_pid(st, wb);
+            let px: f64 = settle_plot_x(st, pid);
+            let pz: f64 = settle_plot_z(st, pid);
+            let cx: f64 = settle_cx(st);
+            let cz: f64 = settle_cz(st);
+            let th: f64 = bearing_of(cx - px, cz - pz);
+            ax[0] = px + fwd_x(th) * 3.6;
+            ax[1] = settle_plot_y(st, pid);
+            ax[2] = pz + fwd_z(th) * 3.6;
+            // a villager on a work site stays on the work site: the site is
+            // the point, and a scaffold with nobody at it reads as abandoned.
+            bx[0] = ax[0]; bx[1] = ax[1]; bx[2] = ax[2];
+        } else {
+            let pid2: i32 = npc_amb_home_pid(st, k);
+            if (pid2 >= 0) {
+                ax[0] = settle_plot_x(st, pid2);
+                ax[1] = settle_plot_y(st, pid2);
+                ax[2] = settle_plot_z(st, pid2);
+            } else {
+                npc_green_pos(st, slot + 3, ax);
+            }
+            npc_green_pos(st, slot, bx);
+        }
+    }
+
+    // --- how far along the walk we are --------------------------------------
+    // 0 = at the station, 1 = at the green.
+    let t: f64 = 0.0;
+    if (bo == 1) {
+        t = 1.0;                                   // brownout: everyone out
+    } else {
+        if (phase == PHASE_DUSK) { t = smooth01(pt * 2.0); }
+        if (phase == PHASE_NIGHT) { t = 1.0 - smooth01(pt * 3.0); }
+        if (phase == PHASE_DAWN) { t = 0.0; }
+        if (phase == PHASE_DAY) { t = 0.0; }
+    }
+    // a per-villager offset so thirty people do not move as one body
+    let jit: f64 = h01i(slot, sto.seed, 8675309) * 0.18 - 0.09;
+    t = t + jit;
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+
+    let x: f64 = lerpd(ax[0], bx[0], t);
+    let y: f64 = lerpd(ax[1], bx[1], t);
+    let z: f64 = lerpd(ax[2], bx[2], t);
+
+    // Facing.  Moving villagers face where they are going; stationary ones face
+    // the green, because a villager whose back is to the square is furniture.
+    let dx: f64 = bx[0] - ax[0];
+    let dz: f64 = bx[2] - ax[2];
+    let moving: i32 = 0;
+    if (dx * dx + dz * dz > 0.25) { if (t > 0.02) { if (t < 0.98) { moving = 1; } } }
+    let yaw: f64 = 0.0;
+    if (moving == 1) {
+        yaw = bearing_of(dx, dz);
+    } else {
+        yaw = bearing_of(settle_cx(st) - x, settle_cz(st) - z);
+        // ...except Wick, who faces OUT from the lantern, down the High Road,
+        // which is the direction the dark comes from.
+        if (who == NPC_WICK) { yaw = settle_bearing(st); }
+    }
+
+    p_out[0] = x;
+    p_out[1] = y;
+    p_out[2] = z;
+    p_out[3] = yaw;
+    let ok: i32 = 0;
+    return ok;
+}
+
+export fn npc_x(p_store: object, p_st: object, p_slot: i32, p_tick: i32): f64 {
+    let o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    npc_pos_fill(p_store, p_st, p_slot, p_tick, o);
+    let out: f64 = o[0];
+    return out;
+}
+export fn npc_y(p_store: object, p_st: object, p_slot: i32, p_tick: i32): f64 {
+    let o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    npc_pos_fill(p_store, p_st, p_slot, p_tick, o);
+    let out: f64 = o[1];
+    return out;
+}
+export fn npc_z(p_store: object, p_st: object, p_slot: i32, p_tick: i32): f64 {
+    let o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    npc_pos_fill(p_store, p_st, p_slot, p_tick, o);
+    let out: f64 = o[2];
+    return out;
+}
+export fn npc_yaw(p_store: object, p_st: object, p_slot: i32, p_tick: i32): f64 {
+    let o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    npc_pos_fill(p_store, p_st, p_slot, p_tick, o);
+    let out: f64 = o[3];
+    return out;
+}
+
+// Who, if anyone, is close enough to talk to.  Returns a SLOT, not a `who`,
+// because an ambient villager can be the nearest body and the caller has to be
+// told that the nearest body has nothing to say.
+export fn npc_nearest(p_store: object, p_st: object, p_x: f64, p_z: f64,
+                      p_tick: i32): i32 {
+    let sto: object = p_store;
+    let n: i32 = npc_count(sto);
+    let best: i32 = -1;
+    let bestd: f64 = 1.0e18;
+    let o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    let i: i32 = 0;
+    while (i < n) {
+        npc_pos_fill(sto, p_st, i, p_tick, o);
+        let d: f64 = dist2(p_x, p_z, o[0], o[2]);
+        if (d < bestd) { bestd = d; best = i; }
+        i++;
+    }
+    let out: i32 = best;
+    return out;
+}
+
+// The one a `use` press should open a conversation with: the nearest NAMED
+// villager inside NPC_TALK_M.  Returns a `who`, or NPC_NONE.
+export fn npc_talk_target(p_store: object, p_st: object, p_x: f64, p_z: f64,
+                          p_tick: i32): i32 {
+    let sto: object = p_store;
+    let n: i32 = sto.n_named;
+    let lim: f64 = NPC_TALK_M * NPC_TALK_M;
+    let best: i32 = NPC_NONE;
+    let bestd: f64 = lim;
+    let o: array<f64> = [0.0, 0.0, 0.0, 0.0];
+    let i: i32 = 0;
+    while (i < n) {
+        npc_pos_fill(sto, p_st, i, p_tick, o);
+        let d: f64 = dist2(p_x, p_z, o[0], o[2]);
+        if (d <= bestd) { bestd = d; best = npc_slot_who(sto, i); }
+        i++;
+    }
+    let out: i32 = best;
+    return out;
+}
+
+// ===========================================================================
+// 15.  THE GRID READOUT — "the east road has gone dark again"
+// ===========================================================================
+// Principle 3, and the single most valuable function in this file.
+//
+// Eight point queries of the civic light field on a ring at NPC_DARK_R_M, one
+// per compass octant.  The darkest octant is the answer.  It is reported only
+// when there is CONTRAST — the brightest octant must be NPC_DARK_RATIO times
+// the darkest — because "the east road is dark" is information and "everywhere
+// is dark" is just a Camp, and a villager who says the second one every night
+// is a villager the player stops listening to.
+//
+// This is the whole of the entropy UI.  There is no meter, no minimap overlay
+// and no nag.  Under `MULTIPLAYER.md` §A's accepted entropy, a player learns
+// their maintenance is slipping because Connie mentions it.
+
+export fn npc_dir_bearing(p_dir: i32): f64 {
+    let d: i32 = clampi(p_dir, 0, NPC_DIR_COUNT - 1);
+    let out: f64 = f64(d) * 0.7853981633974483;
+    return out;
+}
+
+// Quantize a world bearing to an octant.  Used by the probe and by anything
+// that wants to name the direction of a lantern rather than a sector.
+export fn npc_dir_of_bearing(p_yaw: f64): i32 {
+    let twopi: f64 = 6.283185307179586;
+    let y: f64 = p_yaw;
+    let k: f64 = __floor(y / twopi);
+    y = y - k * twopi;
+    let q: i32 = i32(__floor(y / 0.7853981633974483 + 0.5));
+    let out: i32 = q % NPC_DIR_COUNT;
+    return out;
+}
+
+// Fill p_out[0..7] with the LUX sampled on each octant.  Returns the index of
+// the darkest, always — the CONTRAST test is applied by `npc_step`, so a caller
+// that wants the raw field can have it.
+export fn npc_dark_scan(p_st: object, p_out: array<i32>): i32 {
+    let st: object = p_st;
+    if (p_out.length < NPC_DIR_COUNT) { let bad: i32 = NPC_DIR_NONE; return bad; }
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    let r: f64 = NPC_DARK_R_M;
+    let lo: i32 = 2147483647;
+    let best: i32 = 0;
+    let d: i32 = 0;
+    while (d < NPC_DIR_COUNT) {
+        let a: f64 = npc_dir_bearing(d);
+        let v: i32 = settle_lux_at(st, cx + fwd_x(a) * r, cz + fwd_z(a) * r);
+        p_out[d] = v;
+        if (v < lo) { lo = v; best = d; }
+        d++;
+    }
+    let out: i32 = best;
+    return out;
+}
+
+export fn npc_dark_dir(p_store: object): i32 { let sto: object = p_store; let out: i32 = sto.dark_dir; return out; }
+export fn npc_dark_lux(p_store: object): i32 { let sto: object = p_store; let out: i32 = sto.dark_lux; return out; }
+export fn npc_dark_ring(p_store: object, p_dir: i32): i32 {
+    let sto: object = p_store;
+    let a: array<i32> = sto.dark_ring;
+    let out: i32 = a[clampi(p_dir, 0, NPC_DIR_COUNT - 1)];
+    return out;
+}
+
+// The contrast test, exported so the probe can assert it directly rather than
+// through the step function.
+export fn npc_dark_reportable(p_lo: i32, p_hi: i32): i32 {
+    let lo: i32 = p_lo;
+    let hi: i32 = p_hi;
+    let out: i32 = 0;
+    if (lo < NPC_DARK_LUX) {
+        if (hi >= NPC_DARK_LUX * NPC_DARK_RATIO) { out = 1; }
+    }
+    return out;
+}
+
+// ===========================================================================
+// 16.  REGARD
+// ===========================================================================
+
+export fn npc_band_of(p_regard: i32): i32 {
+    let r: i32 = p_regard;
+    if (r >= NPC_BAND_T_TRUSTED) { let a: i32 = NPC_BAND_TRUSTED; return a; }
+    if (r >= NPC_BAND_T_FRIEND) { let b: i32 = NPC_BAND_FRIEND; return b; }
+    if (r >= NPC_BAND_T_ACQ) { let c: i32 = NPC_BAND_ACQUAINTED; return c; }
+    let out: i32 = NPC_BAND_STRANGER;
+    return out;
+}
+
+export fn npc_regard(p_store: object, p_who: i32): i32 {
+    if (npc_valid(p_who) == 0) { let bad: i32 = 0; return bad; }
+    let sto: object = p_store;
+    let a: array<i32> = sto.regard;
+    let out: i32 = a[p_who];
+    return out;
+}
+
+export fn npc_band(p_store: object, p_who: i32): i32 {
+    let out: i32 = npc_band_of(npc_regard(p_store, p_who));
+    return out;
+}
+
+export fn npc_met(p_store: object, p_who: i32): i32 {
+    if (npc_valid(p_who) == 0) { let bad: i32 = 0; return bad; }
+    let sto: object = p_store;
+    let a: array<i32> = sto.met;
+    let out: i32 = a[p_who];
+    return out;
+}
+
+export fn npc_talks(p_store: object): i32 { let sto: object = p_store; let out: i32 = sto.talks; return out; }
+
+export fn npc_last_talk_day(p_store: object, p_who: i32): i32 {
+    if (npc_valid(p_who) == 0) { let bad: i32 = -1; return bad; }
+    let sto: object = p_store;
+    let a: array<i32> = sto.talkday;
+    let out: i32 = a[p_who];
+    return out;
+}
+
+// Add regard.  Saturating and monotone: a negative delta is CLAMPED AWAY, not
+// applied, so there is no path by which this file can take a friendship back.
+// That is enforced here rather than by discipline at the call sites.
+fn npc_add(p_store: object, p_who: i32, p_d: i32): i32 {
+    let sto: object = p_store;
+    let w: i32 = p_who;
+    if (npc_valid(w) == 0) { let bad: i32 = 0; return bad; }
+    let d: i32 = p_d;
+    if (d <= 0) { let z: i32 = 0; return z; }
+    let a: array<i32> = sto.regard;
+    let b0: i32 = npc_band_of(a[w]);
+    let v: i32 = a[w] + d;
+    if (v > NPC_REGARD_MAX) { v = NPC_REGARD_MAX; }
+    a[w] = v;
+    let b1: i32 = npc_band_of(v);
+    let out: i32 = 0;
+    if (b1 != b0) { out = NPC_EV_BAND; }
+    return out;
+}
+
+// A conversation.  Returns the topic that was said, or NPC_T_NONE if this
+// villager is not here.  One regard step per in-game day: talking twice in a
+// day is free and worth nothing, which is exactly the Animal Crossing shape.
+export fn npc_talk(p_store: object, p_st: object, p_who: i32, p_tick: i32): i32 {
+    let sto: object = p_store;
+    let w: i32 = p_who;
+    if (npc_present(sto, w) == 0) { let bad: i32 = NPC_T_NONE; return bad; }
+    let topic: array<i32> = [0, 0];
+    npc_topic_fill(sto, p_st, w, p_tick, topic);
+    let day: i32 = day_number(p_tick);
+    let met: array<i32> = sto.met;
+    let td: array<i32> = sto.talkday;
+    if (met[w] == 0) {
+        met[w] = 1;
+        npc_add(sto, w, NPC_CR_MEET);
+    } else {
+        if (td[w] != day) { npc_add(sto, w, NPC_CR_TALK); }
+    }
+    td[w] = day;
+    sto.talks = sto.talks + 1;
+    let out: i32 = topic[0];
+    return out;
+}
+
+// Is there a NEW line today?  GAME_DESIGN §5.7's "one new line per in-game
+// day" as a query, so the HUD can put a small mark over someone worth visiting.
+export fn npc_has_new_line(p_store: object, p_who: i32, p_tick: i32): i32 {
+    let sto: object = p_store;
+    if (npc_present(sto, p_who) == 0) { let bad: i32 = 0; return bad; }
+    let td: array<i32> = sto.talkday;
+    let out: i32 = 0;
+    if (td[p_who] != day_number(p_tick)) { out = 1; }
+    return out;
+}
+
+// Credit from the rest of the game.  `p_arg` is a `who` for the targeted kinds
+// and is ignored otherwise; -1 routes to that kind's owner (Connie for
+// contracts, Pip for donations), which is who the fiction says would care.
+export fn npc_credit(p_store: object, p_kind: i32, p_arg: i32): i32 {
+    let sto: object = p_store;
+    let k: i32 = p_kind;
+    let ev: i32 = 0;
+    if (k == NPC_CRK_LANTERN || k == NPC_CRK_NIGHT || k == NPC_CRK_PROMOTE) {
+        let d: i32 = NPC_CR_LANTERN;
+        if (k == NPC_CRK_NIGHT) { d = NPC_CR_NIGHT; }
+        if (k == NPC_CRK_PROMOTE) { d = NPC_CR_PROMOTE; }
+        let w: i32 = 0;
+        while (w < NPC_NAMED) {
+            if (npc_present(sto, w) == 1) { ev = ev | npc_add(sto, w, d); }
+            w++;
+        }
+        let outa: i32 = ev;
+        return outa;
+    }
+    let who: i32 = p_arg;
+    let amt: i32 = 0;
+    if (k == NPC_CRK_CONTRACT) {
+        amt = NPC_CR_CONTRACT;
+        if (who < 0) { who = NPC_CONNIE; }
+    }
+    if (k == NPC_CRK_DONATE) {
+        amt = NPC_CR_DONATE;
+        if (who < 0) { who = NPC_PIP; }
+    }
+    if (amt > 0) {
+        if (npc_present(sto, who) == 1) { ev = ev | npc_add(sto, who, amt); }
+    }
+    let out: i32 = ev;
+    return out;
+}
+
+// ===========================================================================
+// 17.  OFFERS — is it open, and who has it
+// ===========================================================================
+
+export fn npc_offer_open(p_store: object, p_st: object, p_row: i32): i32 {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let r: i32 = p_row;
+    if (r < 0) { let bad: i32 = 0; return bad; }
+    if (r >= NPC_OFF_ROWS) { let b2: i32 = 0; return b2; }
+    let who: i32 = g_off_who[r];
+    if (npc_present(sto, who) == 0) { let b3: i32 = 0; return b3; }
+    // The TIER gate reads `settle_tier`, not `tier_ever`.  A town in brownout
+    // has stopped being able to do the work; the buildings are still standing
+    // and the high-water mark still holds, but the bench is cold.  That is
+    // exactly `SETTLEMENT.md` §3.2's "shops lose restock", and it is why the
+    // player feels a lapse instead of reading about one.
+    if (settle_tier(st) < g_off_tier[r]) { let b4: i32 = 0; return b4; }
+    if (settle_brownout(st) == 1) { let b5: i32 = 0; return b5; }
+    let reg: array<i32> = sto.regard;
+    if (reg[who] < g_off_regard[r]) { let b6: i32 = 0; return b6; }
+    // Manufactured guns need the Foundry actually running, not merely a City.
+    if (g_off_kind[r] == NPC_OFF_MFG) {
+        if (settle_industry(st) != SET_IND_RUNNING) { let b7: i32 = 0; return b7; }
+    }
+    let out: i32 = 1;
+    return out;
+}
+
+// A bitmask of this villager's LOCAL offer indices that are open right now.
+// Local, not global, so a caller iterating one person's rows does not have to
+// know where in the table they start.
+export fn npc_offers_open(p_store: object, p_st: object, p_who: i32): i32 {
+    let w: i32 = p_who;
+    let first: i32 = npc_offer_first(w);
+    if (first < 0) { let bad: i32 = 0; return bad; }
+    let n: i32 = npc_offer_count(w);
+    let m: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (npc_offer_open(p_store, p_st, first + i) == 1) { m = m | (1 << i); }
+        i++;
+    }
+    let out: i32 = m;
+    return out;
+}
+
+export fn npc_offer_open_count(p_store: object, p_st: object, p_who: i32): i32 {
+    let first: i32 = npc_offer_first(p_who);
+    if (first < 0) { let bad: i32 = 0; return bad; }
+    let n: i32 = npc_offer_count(p_who);
+    let c: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        c = c + npc_offer_open(p_store, p_st, first + i);
+        i++;
+    }
+    let out: i32 = c;
+    return out;
+}
+
+// >>> THE THESIS, AS A FUNCTION. <<<
+// "Who will make me a bolt-action?"  Returns a `who`, or NPC_NONE if nobody
+// can yet.  `DIRECTION.md` §6.1 in one call: the arsenal is not a menu, it is
+// a person, and the answer changes as the town grows and as they get to know
+// you.  `npc_weapon_gate` says WHY the answer is no.
+export fn npc_weapon_source(p_store: object, p_st: object, p_vw: i32): i32 {
+    let vw: i32 = p_vw;
+    let r: i32 = 0;
+    while (r < NPC_OFF_ROWS) {
+        if (g_off_kind[r] == NPC_OFF_WEAPON) {
+            if (g_off_arg[r] == vw) {
+                if (npc_offer_open(p_store, p_st, r) == 1) {
+                    let out: i32 = g_off_who[r];
+                    return out;
+                }
+            }
+        }
+        r++;
+    }
+    let bad: i32 = NPC_NONE;
+    return bad;
+}
+
+// 0 open, 1 nobody here yet, 2 settlement tier too low, 3 they do not know you
+// well enough, 4 the town is browned out.  A REASON, because "no" without a
+// reason is the menu this design is trying not to be.
+export fn npc_weapon_gate(p_store: object, p_st: object, p_vw: i32): i32 {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let vw: i32 = p_vw;
+    let r: i32 = 0;
+    while (r < NPC_OFF_ROWS) {
+        if (g_off_kind[r] == NPC_OFF_WEAPON) {
+            if (g_off_arg[r] == vw) {
+                let who: i32 = g_off_who[r];
+                if (npc_present(sto, who) == 0) { let a: i32 = 1; return a; }
+                if (settle_tier(st) < g_off_tier[r]) { let b: i32 = 2; return b; }
+                if (settle_brownout(st) == 1) { let c: i32 = 4; return c; }
+                let reg: array<i32> = sto.regard;
+                if (reg[who] < g_off_regard[r]) { let d: i32 = 3; return d; }
+                let e: i32 = 0;
+                return e;
+            }
+        }
+        r++;
+    }
+    let bad: i32 = 1;
+    return bad;
+}
+
+// ===========================================================================
+// 18.  TOPICS
+// ===========================================================================
+// One function, one fixed priority, no randomness except the daily flavour
+// index (which is a hash of the day number, so it is the same on every client).
+//
+// Writes p_out[0] = topic, p_out[1] = argument.
+
+export fn npc_topic_fill(p_store: object, p_st: object, p_who: i32,
+                         p_tick: i32, p_out: array<i32>): i32 {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let w: i32 = p_who;
+    if (p_out.length < 2) { let bad: i32 = -1; return bad; }
+    p_out[0] = NPC_T_NONE;
+    p_out[1] = 0;
+    if (npc_present(sto, w) == 0) { let b2: i32 = -1; return b2; }
+
+    let day: i32 = day_number(p_tick);
+    let met: array<i32> = sto.met;
+
+    // 1 — never met.  Outranks everything: you cannot warn a stranger about the
+    //     east road before you have told them your name.
+    if (met[w] == 0) {
+        p_out[0] = NPC_T_GREET;
+        p_out[1] = w;
+        let ok0: i32 = 0;
+        return ok0;
+    }
+
+    // 2 — brownout.  The loudest true thing in the settlement.
+    if (settle_brownout(st) == 1) {
+        p_out[0] = NPC_T_BROWNOUT;
+        p_out[1] = settle_tier(st);
+        let ok1: i32 = 0;
+        return ok1;
+    }
+
+    // 3 — a sector of the grid has lapsed.  Principle 3.
+    if (sto.dark_dir != NPC_DIR_NONE) {
+        p_out[0] = NPC_T_DARK_ROAD;
+        p_out[1] = sto.dark_dir;
+        let ok2: i32 = 0;
+        return ok2;
+    }
+
+    // 4 — the Foundry is not running, in a settlement that is a City.
+    if (settle_tier(st) >= SET_TIER_CITY) {
+        if (settle_industry(st) != SET_IND_RUNNING) {
+            p_out[0] = NPC_T_FOUNDRY;
+            p_out[1] = settle_industry(st);
+            let ok3: i32 = 0;
+            return ok3;
+        }
+    }
+
+    // 5 — somebody arrived today or yesterday.  The good news that IS the
+    //     progression readout (principle 2): a new face beats a number.
+    if (sto.last_arrival != NPC_NONE) {
+        if (day - sto.arrival_day <= 1) {
+            if (sto.last_arrival != w) {
+                p_out[0] = NPC_T_ARRIVAL;
+                p_out[1] = sto.last_arrival;
+                let ok4: i32 = 0;
+                return ok4;
+            }
+        }
+    }
+
+    // 6 — the settlement promoted today or yesterday.
+    if (sto.promote_day >= 0) {
+        if (day - sto.promote_day <= 1) {
+            p_out[0] = NPC_T_PROMOTED;
+            p_out[1] = settle_tier_ever(st);
+            let ok5: i32 = 0;
+            return ok5;
+        }
+    }
+
+    // 7 — a new offer is open that was not open at the last conversation.  The
+    //     crafting interface announcing itself in dialogue, which is the whole
+    //     of principle 1: you find out you can have a revolver because the
+    //     gunsmith mentions it, not because a menu row lit up.
+    let first: i32 = npc_offer_first(w);
+    if (first >= 0) {
+        let n: i32 = npc_offer_count(w);
+        let reg: array<i32> = sto.regard;
+        let i: i32 = 0;
+        while (i < n) {
+            let r: i32 = first + i;
+            if (npc_offer_open(sto, st, r) == 1) {
+                // "new" = the regard gate is the one that just cleared, and it
+                // cleared within one step of the current value.  Cheap, exact,
+                // and it needs no second copy of the offer state in the save.
+                if (g_off_regard[r] > 0) {
+                    if (reg[w] - g_off_regard[r] < NPC_CR_TALK + NPC_CR_MEET) {
+                        p_out[0] = NPC_T_OFFER;
+                        p_out[1] = r;
+                        let ok6: i32 = 0;
+                        return ok6;
+                    }
+                }
+            }
+            i++;
+        }
+    }
+
+    // 8 — a building is going up.  Visible progress, named.
+    let bn: i32 = settle_building_count(st);
+    let b: i32 = 0;
+    while (b < bn) {
+        if (settle_building_state(st, b) != SET_CON_DONE) {
+            p_out[0] = NPC_T_BUILDING;
+            p_out[1] = settle_building_kind(st, b);
+            let ok7: i32 = 0;
+            return ok7;
+        }
+        b++;
+    }
+
+    // 9 — it is dark out and you are still outside.
+    if (day_is_night(p_tick) == 1) {
+        p_out[0] = NPC_T_NIGHT;
+        p_out[1] = w;
+        let ok8: i32 = 0;
+        return ok8;
+    }
+
+    // 10 — the day's line.
+    p_out[0] = NPC_T_DAILY;
+    p_out[1] = hpick(day, w, sto.seed ^ 1013904223, NPC_LINES);
+    let ok9: i32 = 0;
+    return ok9;
+}
+
+export fn npc_topic(p_store: object, p_st: object, p_who: i32, p_tick: i32): i32 {
+    let o: array<i32> = [0, 0];
+    npc_topic_fill(p_store, p_st, p_who, p_tick, o);
+    let out: i32 = o[0];
+    return out;
+}
+
+export fn npc_topic_arg(p_store: object, p_st: object, p_who: i32, p_tick: i32): i32 {
+    let o: array<i32> = [0, 0];
+    npc_topic_fill(p_store, p_st, p_who, p_tick, o);
+    let out: i32 = o[1];
+    return out;
+}
+
+// ===========================================================================
+// 19.  THE VISIBLE SET — the caps, enforced rather than hoped for
+// ===========================================================================
+// This is the only per-frame function in the file and it is what keeps a town
+// of thirty inside the triangle budget.  Three caps, applied in order:
+//
+//   NPC_VIS_MAX = 8       the nearest 8, named first.  §7.4.
+//   NPC_LOD0_MAX = 1      only the nearest named villager gets the 210-triangle
+//                         mesh.  §7.4: "you only ever talk to one person".
+//   NPC_TRIS_BUDGET = 300 demote the FARTHEST villager one rung at a time until
+//                         the frame fits.  D1.
+//
+// Never drop, always demote.  A villager that vanishes because a ninth person
+// walked into frame is the bug report §7.6 warns about; a villager that quietly
+// loses its satchel at 24 m is nothing.
+
+fn npc_lod_for(p_class: i32, p_d: f64): i32 {
+    let d: f64 = p_d;
+    let l1: f64 = NPC_LOD1_NAMED_M;
+    let l2: f64 = NPC_LOD2_NAMED_M;
+    if (p_class == NPC_CLASS_AMBIENT) { l1 = NPC_LOD1_AMB_M; l2 = NPC_LOD2_AMB_M; }
+    if (d >= l2) { let a: i32 = 2; return a; }
+    if (d >= l1) { let b: i32 = 1; return b; }
+    let out: i32 = 0;
+    return out;
+}
+
+export fn npc_tris_of(p_class: i32, p_lod: i32): i32 {
+    let l: i32 = clampi(p_lod, 0, 2);
+    if (p_class == NPC_CLASS_AMBIENT) {
+        if (l == 0) { let a: i32 = NPC_TRIS_AMB_L0; return a; }
+        if (l == 1) { let b: i32 = NPC_TRIS_AMB_L1; return b; }
+        let c: i32 = NPC_TRIS_AMB_L2;
+        return c;
+    }
+    if (l == 0) { let d: i32 = NPC_TRIS_NAMED_L0; return d; }
+    if (l == 1) { let e: i32 = NPC_TRIS_NAMED_L1; return e; }
+    let out: i32 = NPC_TRIS_NAMED_L2;
+    return out;
+}
+
+export fn npc_visible_fill(p_store: object, p_st: object,
+                           p_cx: f64, p_cz: f64, p_tick: i32,
+                           p_out: array<f64>, p_max: i32): i32 {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let cx: f64 = p_cx;
+    let cz: f64 = p_cz;
+    let total: i32 = npc_count(sto);
+    let want: i32 = p_max;
+    if (want > NPC_VIS_MAX) { want = NPC_VIS_MAX; }
+    if (want < 0) { want = 0; }
+    if (p_out.length < want * NPC_VIS_STRIDE) { let bad: i32 = -1; return bad; }
+    if (total <= 0) { let z: i32 = 0; return z; }
+
+    // --- partial selection of the nearest `want`, named first ---------------
+    // At most 8 passes over at most 32 candidates: 256 distance comparisons,
+    // no allocation past the two scratch arrays, no closure, no array.sort.
+    // "Named first" is §7.4's priority and it is applied as a KEY BIAS rather
+    // than a separate pass, so one loop does both.
+    let px: array<f64> = g_vis_px;
+    let py: array<f64> = g_vis_py;
+    let pz: array<f64> = g_vis_pz;
+    let pyaw: array<f64> = g_vis_yaw;
+    let key: array<f64> = g_vis_key;
+    let taken: array<i32> = g_vis_taken;
+    let o: array<f64> = g_vis_o;
+    px.clear(); py.clear(); pz.clear(); pyaw.clear(); key.clear(); taken.clear();
+    let i: i32 = 0;
+    while (i < total) {
+        npc_pos_fill(sto, st, i, p_tick, o);
+        px.push(o[0]); py.push(o[1]); pz.push(o[2]); pyaw.push(o[3]);
+        let d: f64 = 0.0;
+        d = __sqrt(dist2(cx, cz, o[0], o[2]));
+        // A named villager sorts as if it were 40 m nearer.  40 is past the
+        // LOD2 switch for both classes, so the bias can never promote a distant
+        // named NPC into a LOD it has not earned — it only wins TIES FOR A SLOT.
+        let k: f64 = d;
+        if (i < sto.n_named) { k = d - 40.0; }
+        key.push(k);
+        taken.push(0);
+        i++;
+    }
+
+    // `exhausted` rather than `n = want`: a settlement with fewer than
+    // NPC_VIS_MAX people must return the number of rows WRITTEN, not the number
+    // asked for. Setting the loop counter to the target exits the loop and
+    // reports rows that were never filled — probe_npc H caught a Village
+    // claiming 8 villagers out of a population of 7, and the caller would have
+    // emitted one uninitialised humanoid at the world origin.
+    let n: i32 = 0;
+    let exhausted: i32 = 0;
+    while (n < want && exhausted == 0) {
+        let best: i32 = -1;
+        let bestk: f64 = 1.0e18;
+        let j: i32 = 0;
+        while (j < total) {
+            if (taken[j] == 0) {
+                if (key[j] < bestk) { bestk = key[j]; best = j; }
+            }
+            j++;
+        }
+        if (best < 0) { exhausted = 1; }
+        else {
+            taken[best] = 1;
+            let cls: i32 = npc_slot_class(sto, best);
+            let d: f64 = 0.0;
+            d = __sqrt(dist2(cx, cz, px[best], pz[best]));
+            let base: i32 = n * NPC_VIS_STRIDE;
+            p_out[base + NPC_VIS_SLOT] = f64(best);
+            p_out[base + NPC_VIS_CLASS] = f64(cls);
+            p_out[base + NPC_VIS_WHO] = f64(npc_slot_who(sto, best));
+            p_out[base + NPC_VIS_X] = px[best];
+            p_out[base + NPC_VIS_Y] = py[best];
+            p_out[base + NPC_VIS_Z] = pz[best];
+            p_out[base + NPC_VIS_YAW] = pyaw[best];
+            p_out[base + NPC_VIS_LOD] = f64(npc_lod_for(cls, d));
+            p_out[base + NPC_VIS_DIST] = d;
+            n++;
+        }
+    }
+
+    // --- cap 2: at most NPC_LOD0_MAX named villagers at LOD0 ----------------
+    // The list is already in nearest-first order with named biased forward, so
+    // the first named LOD0 encountered is the nearest one and every later one
+    // is demoted.  §7.4: "nobody at 320x240 will tell."
+    let l0: i32 = 0;
+    let r: i32 = 0;
+    while (r < n) {
+        let base: i32 = r * NPC_VIS_STRIDE;
+        if (i32(p_out[base + NPC_VIS_CLASS]) == NPC_CLASS_NAMED) {
+            if (i32(p_out[base + NPC_VIS_LOD]) == 0) {
+                if (l0 >= NPC_LOD0_MAX) { p_out[base + NPC_VIS_LOD] = 1.0; }
+                else { l0++; }
+            }
+        }
+        r++;
+    }
+
+    // --- cap 3: the triangle budget, by demotion (D1) -----------------------
+    let guard: i32 = 0;
+    let sum: i32 = npc_vis_tris(p_out, n);
+    while (sum > NPC_TRIS_BUDGET) {
+        if (guard > NPC_VIS_MAX * 2 + 2) { sum = 0; }
+        else {
+            guard++;
+            // demote the FARTHEST villager that is not already at LOD2
+            let far: i32 = -1;
+            let fard: f64 = -1.0;
+            let q: i32 = 0;
+            while (q < n) {
+                let b2: i32 = q * NPC_VIS_STRIDE;
+                if (i32(p_out[b2 + NPC_VIS_LOD]) < 2) {
+                    if (p_out[b2 + NPC_VIS_DIST] > fard) {
+                        fard = p_out[b2 + NPC_VIS_DIST];
+                        far = q;
+                    }
+                }
+                q++;
+            }
+            if (far < 0) { sum = 0; }
+            else {
+                let b3: i32 = far * NPC_VIS_STRIDE;
+                p_out[b3 + NPC_VIS_LOD] = p_out[b3 + NPC_VIS_LOD] + 1.0;
+                sum = npc_vis_tris(p_out, n);
+            }
+        }
+    }
+
+    let out: i32 = n;
+    return out;
+}
+
+// Sum the drawn triangles of a filled visible set.  Exported because it is the
+// number the budget is stated in and a probe that cannot read it cannot assert
+// the budget.
+export fn npc_vis_tris(p_vis: array<f64>, p_n: i32): i32 {
+    let n: i32 = p_n;
+    let s: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let b: i32 = i * NPC_VIS_STRIDE;
+        s = s + npc_tris_of(i32(p_vis[b + NPC_VIS_CLASS]), i32(p_vis[b + NPC_VIS_LOD]));
+        i++;
+    }
+    let out: i32 = s;
+    return out;
+}
+
+// ===========================================================================
+// 20.  THE STEP
+// ===========================================================================
+// One tick in 60, beside `settle_step`.  Three jobs: notice arrivals, notice
+// promotions, and re-scan the light field on a slower cadence.
+
+export fn npc_step(p_store: object, p_st: object, p_tick: i32): i32 {
+    let sto: object = p_store;
+    let st: object = p_st;
+    let tick: i32 = p_tick;
+    if (tick % 60 != 0) { let skip: i32 = 0; return skip; }
+    sto.tick = tick;
+    let day: i32 = day_number(tick);
+    let ev: i32 = 0;
+
+    // --- arrivals ----------------------------------------------------------
+    let ever: i32 = settle_tier_ever(st);
+    let pres: array<i32> = sto.present;
+    let arr: array<i32> = sto.arrday;
+    let before_amb: i32 = sto.n_amb;
+    let before_tier: i32 = sto.seen_tier;
+    let w: i32 = 0;
+    while (w < NPC_NAMED) {
+        let want: i32 = 0;
+        if (g_npc_arrive[w] <= ever) { want = 1; }
+        if (want == 1) {
+            if (pres[w] == 0) {
+                pres[w] = 1;
+                if (arr[w] < 0) { arr[w] = day; }
+                sto.last_arrival = w;
+                sto.arrival_day = day;
+                ev = ev | NPC_EV_ARRIVED;
+            }
+        }
+        w++;
+    }
+    npc_refresh(sto, st);
+    if (sto.n_amb != before_amb) { ev = ev | NPC_EV_CROWD; }
+
+    // --- promotion notice --------------------------------------------------
+    // A promotion is a change of `tier_ever` and nothing else.  `before_tier`
+    // is captured above because `npc_refresh` overwrites `seen_tier` — reading
+    // it afterwards compares a value with itself, which is a condition that can
+    // never fire and is the kind of dead branch that looks like a feature for
+    // three waves.
+    if (ever != before_tier) {
+        sto.promote_day = day;
+        ev = ev | npc_credit(sto, NPC_CRK_PROMOTE, -1);
+    }
+
+    // --- the light scan, one step in NPC_DARK_EVERY ------------------------
+    sto.scan_n = sto.scan_n + 1;
+    if (sto.scan_n >= NPC_DARK_EVERY) {
+        sto.scan_n = 0;
+        let ring: array<i32> = sto.dark_ring;
+        let lo_i: i32 = npc_dark_scan(st, ring);
+        let lo: i32 = ring[lo_i];
+        let hi: i32 = lo;
+        let d: i32 = 0;
+        while (d < NPC_DIR_COUNT) {
+            if (ring[d] > hi) { hi = ring[d]; }
+            d++;
+        }
+        let was: i32 = sto.dark_dir;
+        let now: i32 = NPC_DIR_NONE;
+        if (npc_dark_reportable(lo, hi) == 1) { now = lo_i; }
+        sto.dark_dir = now;
+        sto.dark_lux = lo;
+        sto.dark_lux_hi = hi;
+        if (now != was) { ev = ev | NPC_EV_DARK; }
+    }
+
+    let out: i32 = ev;
+    return out;
+}
+
+// ===========================================================================
+// 21.  SAVE / LOAD / HASH
+// ===========================================================================
+// Five rows of four i32 and a four-i32 meta block.  Twenty-four integers for
+// the entire social state of a City — because presence, the crowd, every
+// position and every offer is regenerated (D3), and only what the player DID
+// is written down.
+
+export fn npc_save_rows(): i32 { let out: i32 = NPC_NAMED; return out; }
+
+export fn npc_save_fill(p_store: object, p_out: array<i32>): i32 {
+    let sto: object = p_store;
+    if (p_out.length < NPC_NAMED * NPC_SAVE_COLS) { let bad: i32 = -1; return bad; }
+    let reg: array<i32> = sto.regard;
+    let met: array<i32> = sto.met;
+    let td: array<i32> = sto.talkday;
+    let ad: array<i32> = sto.arrday;
+    let i: i32 = 0;
+    while (i < NPC_NAMED) {
+        let o: i32 = i * NPC_SAVE_COLS;
+        p_out[o] = reg[i];
+        p_out[o + 1] = met[i];
+        p_out[o + 2] = td[i];
+        p_out[o + 3] = ad[i];
+        i++;
+    }
+    let out: i32 = NPC_NAMED;
+    return out;
+}
+
+export fn npc_meta_fill(p_store: object, p_out: array<i32>): i32 {
+    let sto: object = p_store;
+    if (p_out.length < NPC_META_COLS) { let bad: i32 = -1; return bad; }
+    p_out[0] = NPC_VERSION;
+    p_out[1] = sto.talks;
+    p_out[2] = sto.last_arrival;
+    p_out[3] = sto.arrival_day;
+    let out: i32 = NPC_META_COLS;
+    return out;
+}
+
+// Restore.  Clamped on every field, because a save is untrusted input and a
+// regard of 2^31 would make every offer open forever.
+export fn npc_load(p_store: object, p_st: object, p_rows: array<i32>,
+                   p_nrows: i32, p_meta: array<i32>): i32 {
+    let sto: object = p_store;
+    let nr: i32 = p_nrows;
+    if (nr < 0) { let bad: i32 = -1; return bad; }
+    if (nr > NPC_NAMED) { let b2: i32 = -1; return b2; }
+    if (p_rows.length < nr * NPC_SAVE_COLS) { let b3: i32 = -1; return b3; }
+    if (p_meta.length < NPC_META_COLS) { let b4: i32 = -1; return b4; }
+    if (p_meta[0] != NPC_VERSION) { let b5: i32 = -1; return b5; }
+
+    let reg: array<i32> = sto.regard;
+    let met: array<i32> = sto.met;
+    let td: array<i32> = sto.talkday;
+    let ad: array<i32> = sto.arrday;
+    let i: i32 = 0;
+    while (i < nr) {
+        let o: i32 = i * NPC_SAVE_COLS;
+        reg[i] = clampi(p_rows[o], 0, NPC_REGARD_MAX);
+        met[i] = clampi(p_rows[o + 1], 0, 1);
+        td[i] = p_rows[o + 2];
+        ad[i] = p_rows[o + 3];
+        i++;
+    }
+    sto.talks = p_meta[1];
+    sto.last_arrival = clampi(p_meta[2], NPC_NONE, NPC_NAMED - 1);
+    sto.arrival_day = p_meta[3];
+    npc_refresh(sto, p_st);
+    let out: i32 = nr;
+    return out;
+}
+
+// 32-bit FNV-style mixing in u64.  A13: i32 `*` TRAPS on overflow.
+fn hmix(p_h: u64, p_v: i32): u64 {
+    let h: u64 = p_h;
+    let v: u64 = 0;
+    if (p_v >= 0) { v = u64(p_v); } else { v = u64(f64(p_v) + 4294967296.0); }
+    let out: u64 = ((h ^ v) * 1099511628141) & 4294967295;
+    return out;
+}
+
+// Folded into `sim_hash`.  Covers the delta log and nothing that is f(seed) or
+// f(settlement) — a hash over the crowd would only ever restate the tier.
+export fn npc_hash(p_store: object): i32 {
+    let sto: object = p_store;
+    let h: u64 = 2166136261;
+    h = hmix(h, NPC_VERSION);
+    h = hmix(h, sto.talks);
+    h = hmix(h, sto.last_arrival);
+    h = hmix(h, sto.arrival_day);
+    let rows: array<i32> = [];
+    let need: i32 = NPC_NAMED * NPC_SAVE_COLS;
+    let i: i32 = 0;
+    while (i < need) { rows.push(0); i++; }
+    npc_save_fill(sto, rows);
+    let k: i32 = 0;
+    while (k < need) { h = hmix(h, rows[k]); k++; }
+    let out: i32 = i32(h & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// 22.  SELF-CHECK
+// ===========================================================================
+// Returns a bitmask of BROKEN invariants; 0 is healthy.  Cheap enough to call
+// from a probe or a debug key, and it checks the things that would otherwise
+// only fail in a screenshot three waves later.
+export let NPCCHK_ARRIVE: i32  = 1;    // arrival tiers are not monotone in id
+export let NPCCHK_OFFER: i32   = 2;    // the offer table is not grouped by who
+export let NPCCHK_BAND: i32    = 4;    // the band thresholds are not ordered
+export let NPCCHK_POP: i32     = 8;    // a tier's population exceeds NPC_MAX
+export let NPCCHK_TRIS: i32    = 16;   // the LOD ladder is not descending
+export let NPCCHK_LOD: i32     = 32;   // a LOD switch distance is not ascending
+
+export fn npc_selfcheck(): i32 {
+    let bad: i32 = 0;
+
+    let i: i32 = 1;
+    while (i < NPC_NAMED) {
+        if (g_npc_arrive[i] < g_npc_arrive[i - 1]) { bad = bad | NPCCHK_ARRIVE; }
+        i++;
+    }
+
+    let seen: i32 = 0;
+    let last: i32 = -1;
+    let r: i32 = 0;
+    while (r < NPC_OFF_ROWS) {
+        let w: i32 = g_off_who[r];
+        if (w != last) {
+            if ((seen & (1 << w)) != 0) { bad = bad | NPCCHK_OFFER; }
+            seen = seen | (1 << w);
+            last = w;
+        }
+        r++;
+    }
+
+    if (NPC_BAND_T_ACQ >= NPC_BAND_T_FRIEND) { bad = bad | NPCCHK_BAND; }
+    if (NPC_BAND_T_FRIEND >= NPC_BAND_T_TRUSTED) { bad = bad | NPCCHK_BAND; }
+    if (NPC_BAND_T_TRUSTED > NPC_REGARD_MAX) { bad = bad | NPCCHK_BAND; }
+
+    let t: i32 = 0;
+    while (t < SET_TIER_COUNT) {
+        if (npc_pop_at_tier(t) > NPC_MAX) { bad = bad | NPCCHK_POP; }
+        t++;
+    }
+
+    let c: i32 = 0;
+    while (c < NPC_CLASS_COUNT) {
+        if (npc_tris_of(c, 0) <= npc_tris_of(c, 1)) { bad = bad | NPCCHK_TRIS; }
+        if (npc_tris_of(c, 1) <= npc_tris_of(c, 2)) { bad = bad | NPCCHK_TRIS; }
+        c++;
+    }
+
+    if (NPC_LOD1_NAMED_M >= NPC_LOD2_NAMED_M) { bad = bad | NPCCHK_LOD; }
+    if (NPC_LOD1_AMB_M >= NPC_LOD2_AMB_M) { bad = bad | NPCCHK_LOD; }
+    // An ambient villager must never hold detail further out than a named one:
+    // it is the cheap asset and it is the one there are twenty-five of.
+    if (NPC_LOD1_AMB_M > NPC_LOD1_NAMED_M) { bad = bad | NPCCHK_LOD; }
+    if (NPC_LOD2_AMB_M > NPC_LOD2_NAMED_M) { bad = bad | NPCCHK_LOD; }
+
+    let out: i32 = bad;
+    return out;
+}

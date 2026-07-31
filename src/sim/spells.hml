@@ -1,0 +1,1599 @@
+// spells.hml — THE SPELL SCHOOL.  Healing, fire blasts, cloaking, and the
+// three light verbs.                                          Owned by W5-SPELL.
+//
+// DIRECTION.md §2 is the directive and it is the owner speaking:
+//
+//     "The owner wants the character to LEARN abilities: healing, fire blasts,
+//      cloaking, and more.  The lantern stays and is always in hand.  It is the
+//      anchor of the magic side."
+//
+//     "Consolidation opportunity: the Emberlance is currently a GUN that does
+//      60 impact + 12/s burn over 5 s with a 3.5 m AoE.  That is a fire blast.
+//      It should probably move to the spell side."
+//
+// MAGIC_KINETIC.md §1.9 is the spec: seven spells, three equipped slots, ONE
+// resource (oil), no mana, no new input field, no new dynamic light, and every
+// spell is either a volume test or a stat change with a timer.  DIRECTION.md §9
+// adds the stat: **Attunement governs spell slots, potency and cooldown**.
+//
+// ---------------------------------------------------------------------------
+// SIM SIDE ONLY, AND HARDER THAN THAT
+// ---------------------------------------------------------------------------
+// The import wall (CLAUDE.md §3) allows this directory `@stdlib/math`, other
+// `src/sim/**` and `src/core/**`.  There is no SDL symbol, no wobbleweed
+// module, no `@stdlib/random`, no `__clock()` and no `print` below.
+//
+// **This module draws NO random numbers at all — not even a seeded one.**  Like
+// `progression.hml`, it is a pure function of the ordered sequence of events
+// applied to it, which is a stronger determinism claim than "same seed, same
+// result": there is no stream to desync and nothing to reseed on rollback.
+//
+// **It renders nothing.**  Every visible consequence leaves as an event on the
+// combat bus (§7) and the renderer derives the picture from that.  The one
+// exception in the other direction is the fire blast's bolt, which is spawned
+// through `projectiles.hml` — the projectile itself is UNCHANGED, exactly as
+// MAGIC_KINETIC §12 demands ("only its CALLER changes; do not take the
+// opportunity to improve it").
+//
+// ---------------------------------------------------------------------------
+// DESIGN 1 — THE STATE IS A FLAT ARRAY OF i32, AND THAT IS THE SAVE FORMAT
+// ---------------------------------------------------------------------------
+// `spell_new()` returns an `array` of `SP_FIELDS` integers and nothing else.
+// No object graph, no strings, no floats, no closures (CLAUDE.md §7: "no entity
+// state in a closure" — closures cannot be snapshotted, rewound, or
+// delta-compressed).  MAGIC_KINETIC §5.4 requires exactly this shape so that
+// v2 multiplayer costs nothing later.
+//
+// **Oil is stored as CENTI-OIL (x100).**  That is what makes the whole vector
+// i32.  Regen is applied through an integer carry (`SP_REGEN_ACC`), so the
+// design's +0.8/s is exact — 80 centi-oil per second over 60 ticks, carried,
+// never rounded — and identical on both backends forever.
+//
+// Slot 0 is `SPELL_VERSION`, checked by `spell_deserialize`, so a stale save is
+// REJECTED rather than reinterpreted.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 2 — A SPELL IS A DELIVERY MECHANISM; A DAMAGE TYPE IS A SEPARATE AXIS
+// ---------------------------------------------------------------------------
+// MAGIC_KINETIC §1.1, and it is load-bearing.  Six of the seven spells are
+// `g_DTYPE_MAGIC`.  **The fire blast is `g_DTYPE_KINETIC`** — fire burns
+// *matter*; it is not light calling anything back.  That is not an oversight
+// and it is not a compromise: it is the reason a solo player is never stuck
+// behind a resistance, because the fire blast is *a kinetic answer in the lamp
+// hand* (§5.3, and DIRECTION.md §4's "never solo-hostile").
+//
+// Three of the seven do no damage at all.  Those three — Mend, Guttering,
+// Kindling — are the real answer to "why would a player ever raise the weaker
+// hand", and they are better than any resistance number.
+//
+// ---------------------------------------------------------------------------
+// DESIGN 3 — CLOAKING HAS A TELL, AND THE TELL IS THE LANTERN
+// ---------------------------------------------------------------------------
+// DIRECTION.md §10: "the lantern lives permanently in the OFF-HAND ... the
+// light never leaves the player."  A cloaked lamplighter is still carrying a
+// lit lamp.  So Guttering does NOT make you invisible:
+//
+//   * beyond `g_CLOAK_GLOW_M` (6 m) AI aggro radius is scaled by 0.15;
+//   * INSIDE 6 m the cloak does nothing at all — the glow gives you away;
+//   * the lantern dims to `g_CLOAK_LIGHT_MULT` (0.35) but NEVER goes out, so
+//     other players and the renderer can both see the tell.
+//
+// Two numbers, no new system, and the counterplay is legible without a word of
+// UI: *the thing in your other hand is a light.*
+//
+// ---------------------------------------------------------------------------
+// DESIGN 4 — SATISFYING SOLO, BETTER IN A PARTY, NEVER SOLO-HOSTILE
+// ---------------------------------------------------------------------------
+// DIRECTION.md §4 is a hard constraint, not a preference.  Nothing in this file
+// requires a second player, no spell targets an ally, and no cast is gated on
+// anything a solo player cannot reach.  What a party gains is *parallelism*:
+// spells are main-hand (DIRECTION.md §10) so one player is sequential — heal or
+// shoot, never both — while two players are not.  That is `MAGIC_KINETIC` §5.2's
+// ~1.5x, and it is delivered by the swap timer alone.
+//
+// ---------------------------------------------------------------------------
+// CONVENTIONS
+// ---------------------------------------------------------------------------
+//   * Booleans are i32 0/1.  The wire has no bool (CLAUDE.md §7).
+//   * Every timer is in TICKS.  `TICK_DT` is a compile-time constant and no
+//     gameplay function here ever sees a measured delta (CLAUDE.md §7).
+//   * All hash mixing is in u64 with explicit masks — i32/i64 `* + -` TRAP on
+//     overflow in Hemlock (A13).
+//   * Ids are `i32` entity ids, never object references (CLAUDE.md §7).
+
+import { sqrt, sin, cos } from "@stdlib/math";
+
+import {
+    g_TICK_HZ, g_EYE_STAND,
+    g_DTYPE_KINETIC, g_DTYPE_MAGIC, g_DTYPE_COUNT,
+    g_SPELL_COUNT, g_SPELL_FLARE, g_SPELL_SHUTTER, g_SPELL_EMBERLANCE,
+    g_SPELL_MEND, g_SPELL_GUTTERING, g_SPELL_LANCE, g_SPELL_KINDLING,
+    g_SPELL_ITEM_BASE, g_SPELL_SWAP_IN_S, g_SPELL_SWAP_OUT_S,
+    g_OIL_TANK_T1, g_OIL_TANK_T2, g_OIL_TANK_T3, g_OIL_TANK_TIERS,
+    g_OIL_REGEN_LIT, g_OIL_REGEN_DAY, g_OIL_REGEN_DARK,
+    g_ATTUNE_MAX, g_ATTUNE_COST_PER, g_ATTUNE_COST_FLOOR,
+    g_ATTUNE_CD_PER, g_ATTUNE_CD_FLOOR, g_ATTUNE_POT_PER,
+    g_ATTUNE_PER_SLOT, g_SPELL_SLOTS_MIN, g_SPELL_SLOTS_MAX,
+    g_MAGIC_PHASE_DAWN, g_MAGIC_PHASE_DAY, g_MAGIC_PHASE_DUSK,
+    g_MAGIC_PHASE_NIGHT, g_MAGIC_WINDUP_MULT, g_MAGIC_FLOOR_MULT,
+    g_MAGIC_BEAM_HZ, g_MAGIC_REACH_CAP,
+    g_MEND_HP, g_MEND_CHANNEL_S, g_CLOAK_S, g_CLOAK_AGGRO_MULT,
+    g_CLOAK_GLOW_M, g_CLOAK_LIGHT_MULT,
+    g_KINDLING_S, g_KINDLING_R, g_KINDLING_OIL_S
+} from "../core/config.hml";
+
+import {
+    KIND_AI, EF_DEAD, EF_INVULN, ID_NONE, SLOT_NONE,
+    world_slot_of, world_id_of
+} from "./world.hml";
+
+import {
+    combat_apply_damage, combat_events, combat_body_h, evbus_push, ev_q,
+    EV_HITMARKER, EV_HIT_FLASH, EV_DAMAGE_NUMBER, EV_IMPACT, EV_SOUND,
+    HM_KILL, HIT_FLASH_CS, SURF_FLESH, SFX_HIT_BLIP, SFX_KILL_CHIME
+} from "./combat.hml";
+
+import { AI_ST_WINDUP } from "./ai.hml";
+
+import { PHASE_DAY, PHASE_COUNT } from "./daycycle.hml";
+
+import { proj_spawn_aim, PROJ_EMBERLANCE } from "./projectiles.hml";
+
+// ===========================================================================
+// §0  LOCAL MATH  (ai.hml carries its own copies for the same reason: the
+//     innermost loops must call nothing they do not own)
+// ===========================================================================
+let g_DEG: f64 = 0.017453292519943295;    // pi / 180
+
+fn cl_i(p_v: i32, p_lo: i32, p_hi: i32): i32 {
+    let v: i32 = p_v;
+    if (v < p_lo) { let a: i32 = p_lo; return a; }
+    if (v > p_hi) { let b: i32 = p_hi; return b; }
+    let out: i32 = v;
+    return out;
+}
+
+fn cl_f(p_v: f64, p_lo: f64, p_hi: f64): f64 {
+    let v: f64 = p_v;
+    if (v < p_lo) { let a: f64 = p_lo; return a; }
+    if (v > p_hi) { let b: f64 = p_hi; return b; }
+    let out: f64 = v;
+    return out;
+}
+
+// Truncating integer division.  Hemlock's `/` yields f64; the round trip is
+// exact for every magnitude this file can reach and identical on both backends.
+fn idiv(p_a: i32, p_b: i32): i32 {
+    let a: f64 = f64(p_a);
+    let b: f64 = f64(p_b);
+    let out: i32 = i32(a / b);
+    return out;
+}
+
+// Round-half-up to i32.  One place, so a potency multiply can never disagree
+// with a cost multiply about what 0.5 means.
+fn rnd_i(p_v: f64): i32 {
+    let v: f64 = p_v;
+    let out: i32 = i32(v + 0.5);
+    return out;
+}
+
+fn secs_to_ticks(p_s: f64): i32 {
+    let out: i32 = rnd_i(p_s * f64(g_TICK_HZ));
+    return out;
+}
+
+// The metre-taking event push.  `evbus_push_m` is private to combat.hml, so
+// this is the same four lines, quantized at the boundary exactly as it is
+// there — `projectiles.hml` carries its own copy for the identical reason.
+fn ev_push_m(p_b: object, p_tick: i32, p_type: i32, p_sub: i32,
+             p_actor: i32, p_target: i32,
+             p_x: f64, p_y: f64, p_z: f64): i32 {
+    let out: i32 = evbus_push(p_b, p_tick, p_type, p_sub, p_actor, p_target,
+                              ev_q(p_x), ev_q(p_y), ev_q(p_z));
+    return out;
+}
+
+// ===========================================================================
+// §1  THE STATE VECTOR
+// ===========================================================================
+// Slot ids are API: `save.hml`, `snapshot.hml` and the HUD index this array
+// directly.  APPEND ONLY, and bump SPELL_VERSION when you do.
+
+export let SPELL_VERSION: i32 = 1;      // save-format version, lives in slot 0
+
+export let SP_VER: i32          = 0;    // == SPELL_VERSION
+export let SP_OIL_X100: i32     = 1;    // current oil * 100
+export let SP_TANK_TIER: i32    = 2;    // 0/1/2 -> 100 / 150 / 200
+export let SP_ATTUNE: i32       = 3;    // the DIRECTION.md §9 stat, 0..20
+export let SP_REGEN_ACC: i32    = 4;    // integer carry, 0..g_TICK_HZ-1
+export let SP_EQUIP_0: i32      = 5;    // spell id, or -1
+export let SP_EQUIP_1: i32      = 6;
+export let SP_EQUIP_2: i32      = 7;
+export let SP_ACTIVE: i32       = 8;    // equipped slot in the MAIN HAND, or -1
+export let SP_SWAP_T: i32       = 9;    // ticks left in a main-hand swap
+export let SP_CD_0: i32         = 10;   // ..16, one cooldown per spell
+export let SP_CH_SPELL: i32     = 17;   // spell being channelled, or -1
+export let SP_CH_T: i32         = 18;   // ticks left in the channel
+export let SP_CH_ACC: i32       = 19;   // channel carry (centi-HP)
+export let SP_CH_TOTAL: i32     = 20;   // channel length in ticks, for the HUD
+export let SP_CLOAK_T: i32      = 21;   // ticks of cloak left
+export let SP_BEAM_T: i32       = 22;   // ticks the beam stays lit after a cast
+export let SP_BEAM_ACC: i32     = 23;   // beam tick carry
+export let SP_POOL_T: i32       = 24;   // ticks of Kindling pool left
+export let SP_POOL_X_CM: i32    = 25;   // pool centre, centimetres
+export let SP_POOL_Y_CM: i32    = 26;
+export let SP_POOL_Z_CM: i32    = 27;
+export let SP_LIT: i32          = 28;   // 1 = inside a lit lantern radius / town
+export let SP_PHASE: i32        = 29;   // daycycle PHASE_*
+export let SP_LAST_SPELL: i32   = 30;   // the last cast attempted
+export let SP_LAST_RESULT: i32  = 31;   // SPELL_OK or a SPELL_ERR_*
+export let SP_LAST_TARGETS: i32 = 32;   // entities the last cast touched
+export let SP_LAST_DAMAGE: i32  = 33;   // HP the last cast removed
+export let SP_LAST_HEAL: i32    = 34;   // HP the last heal restored
+export let SP_CASTS: i32        = 35;   // lifetime successful casts
+export let SP_OIL_SPENT: i32    = 36;   // lifetime centi-oil spent
+export let SP_REFUSALS: i32     = 37;   // lifetime refused casts
+export let SP_BREAKS: i32       = 38;   // lifetime cloak breaks
+export let SP_FIELDS: i32       = 39;
+
+// Cast results.  A refusal is never silent and never a trap.
+export let SPELL_OK: i32               = 0;
+export let SPELL_ERR_UNKNOWN: i32      = 1;   // no such spell id
+export let SPELL_ERR_NOT_EQUIPPED: i32 = 2;   // not in the main hand
+export let SPELL_ERR_LOCKED: i32       = 3;   // level too low
+export let SPELL_ERR_COOLDOWN: i32     = 4;
+export let SPELL_ERR_OIL: i32          = 5;
+export let SPELL_ERR_BUSY: i32         = 6;   // swapping, or already channelling
+export let SPELL_ERR_NO_CASTER: i32    = 7;   // caster id is not in the world
+export let SPELL_ERR_NO_DELIVERY: i32  = 8;   // the bolt needs projectiles.hml
+export let SPELL_ERR_UNBOUND: i32      = 9;   // no world / combat bound
+
+// ===========================================================================
+// §2  THE DAMAGE KINDS
+// ===========================================================================
+// MAGIC_KINETIC §1.1 reserves three new `DMG_*` delivery kinds at 6, 7, 8 and
+// they are typed here VERBATIM.  `combat_apply_damage` computes
+// `sub = DMG_SUB_BASE + kind` for every non-bullet kind, so these ride on the
+// wire at 70 / 71 / 72 exactly as the design says, **with no edit to
+// combat.hml and no wire change at all.**
+//
+// combat.hml still says `DMG_KIND_COUNT = 6`.  Raising it to 9 belongs to
+// whoever owns that file; nothing here depends on the count, only on the three
+// values, and those are the design's own.
+export let SPELL_DMG_BURST: i32 = 6;    // the flare
+export let SPELL_DMG_BEAM: i32  = 7;    // the shutter
+export let SPELL_DMG_LANCE: i32 = 8;    // the lance
+
+// `EV_HITMARKER` sub bits.  MAGIC_KINETIC §2.1 RULE C: a magic hit must LOOK
+// magic in the same frame, and a resisted one must look resisted.  Both ride in
+// the existing `sub` field alongside HM_HEAD=1 / HM_KILL=2 / HM_FALLOFF=4 /
+// HM_ARMOR=8.  Zero new events, zero new packet fields.
+export let HM_MAGIC: i32    = 16;   // 4-petal bloom marker, UI_AMBER number
+export let HM_RESISTED: i32 = 32;   // half-size UI_DIM number, dull thock
+
+// Spell-school events.  Above combat.hml's cosmetic block (20..23) and far
+// below `DMG_SUB_BASE`, so a future protocol addition cannot collide silently.
+// The renderer consumes these; this module draws nothing.
+export let EV_SPELL_CAST: i32    = 30;  // sub = spell id
+export let EV_SPELL_CHANNEL: i32 = 31;  // sub = spell*4 + CHAN_*
+export let EV_SPELL_CLOAK: i32   = 32;  // sub = 1 up, 0 down
+export let EV_SPELL_HEAL: i32    = 33;  // sub = HP restored this tick
+export let EV_SPELL_POOL: i32    = 34;  // sub = 1 placed, 0 expired
+
+export let CHAN_START: i32  = 0;
+export let CHAN_CANCEL: i32 = 1;
+export let CHAN_DONE: i32   = 2;
+
+// ===========================================================================
+// §3  THE SEVEN SPELLS  (MAGIC_KINETIC §1.9.2, parallel arrays)
+// ===========================================================================
+// config.hml deliberately carries no per-row tables ("the six weapons live in
+// sim/weapons.hml, the six enemies in sim/ai.hml"), so the school's rows live
+// here — the seven ids themselves are in config because other modules index by
+// them.
+//
+// The shapes.  Every spell is a volume test or a stat change with a timer;
+// nothing here summons, shields, or stacks a status (§11 out-of-scope 8b).
+export let SHAPE_SPHERE: i32 = 0;   // 360 degrees, centred on the caster
+export let SHAPE_CONE: i32   = 1;   // aimed cone from the eye
+export let SHAPE_BOLT: i32   = 2;   // the one projectile in the game
+export let SHAPE_SELF: i32   = 3;   // a stat change with a timer
+export let SHAPE_PLACE: i32  = 4;   // drops a volume in the world
+
+// Channel modes.
+export let CHMODE_NONE: i32   = 0;
+export let CHMODE_TICK: i32   = 1;  // the effect lands every tick (Mend)
+export let CHMODE_FINISH: i32 = 2;  // the effect lands on completion (Lance)
+
+let g_sp_name = [
+    "Flare", "Shutter", "Emberlance", "Mend", "Guttering", "Lance", "Kindling"
+];
+
+// Six MAGIC, one KINETIC.  See DESIGN 2 — this row is the whole reason the
+// consolidation of the Emberlance into the school was nearly free.
+let g_sp_dtype = [
+    g_DTYPE_MAGIC,      // Flare
+    g_DTYPE_MAGIC,      // Shutter
+    g_DTYPE_KINETIC,    // Emberlance — THE FIRE BLAST.  Fire burns matter.
+    g_DTYPE_MAGIC,      // Mend       (no damage; the type is flavour)
+    g_DTYPE_MAGIC,      // Guttering  (no damage)
+    g_DTYPE_MAGIC,      // Lance
+    g_DTYPE_MAGIC       // Kindling   (no damage)
+];
+
+let g_sp_shape = [
+    SHAPE_SPHERE, SHAPE_CONE, SHAPE_BOLT, SHAPE_SELF, SHAPE_SELF,
+    SHAPE_CONE, SHAPE_PLACE
+];
+
+// Oil, in CENTI-OIL.  MAGIC_KINETIC §1.9.2's column, verbatim; the Shutter's
+// 22 oil per SECOND is 2.2 per beam tick at g_MAGIC_BEAM_HZ = 10.
+let g_sp_oil_x100 = [1800, 220, 3000, 4500, 3500, 4000, 2500];
+
+// Cooldowns in ticks at 60 Hz.  Flare 0.60 s and Lance 1.5 s are the design's.
+// **The Emberlance's 1.5 s is DERIVED, not guessed:** it is 60/40 s from the
+// weapon table's `g_wpn_rpm[WPN_EMBERLANCE] = 40`, so moving the fire blast out
+// of the gun slots does not change how fast it can be thrown.
+// Mend 6 s, Guttering 12 s and Kindling 10 s are FIRST-PASS numbers — the
+// design states outright (§13.11) that these are the numbers it has least
+// confidence in.  They are specific so they can be changed in one place.
+let g_sp_cd_ticks = [36, 0, 90, 360, 720, 90, 600];
+
+// Reach, in metres.  r0 is where full damage stops, r1 is the outer edge.
+// Nothing magic reaches past g_MAGIC_REACH_CAP (24 m), ever.
+let g_sp_r0 = [ 2.0,  8.0, 0.0, 0.0, 0.0, 18.0, 0.0];
+let g_sp_r1 = [ 6.0, 14.0, 0.0, 0.0, 0.0, 24.0, 0.0];
+
+// Damage at r0 and at r1, in CENTI-HP.  Falloff is LINEAR, not smoothstepped:
+// the player must be able to FEEL the edge of the cone (§1.5).
+let g_sp_d0_x100 = [2800, 300, 0, 0, 0, 5500, 0];
+let g_sp_d1_x100 = [1400, 150, 0, 0, 0, 2700, 0];
+
+// Cone half-angle in DEGREES — the design anchor.  The cosine is derived once
+// at module load, never per cast.
+let g_sp_half_deg = [180.0, 22.0, 0.0, 0.0, 0.0, 5.0, 0.0];
+
+// Channel: the Lance's 1.2 s locked wind-up and Mend's 1.2 s channel are the
+// same machinery with different resolution modes.
+let g_sp_chan_ticks = [0, 0, 0, 72, 0, 72, 0];
+let g_sp_chan_mode  = [CHMODE_NONE, CHMODE_NONE, CHMODE_NONE, CHMODE_TICK,
+                       CHMODE_NONE, CHMODE_FINISH, CHMODE_NONE];
+
+// The unlock ladder (§7.2).  Flare is level 1 because MAGIC_KINETIC §7.1 grants
+// it by LIGHTING THE FIRST LANTERN, not by a level-up card — that gate is
+// `sim.hml`'s (`sim.lanterns_lit == 1`) and deliberately not re-implemented
+// here, because a second copy of a gate is a second thing to get wrong.
+let g_sp_unlock_lv = [1, 3, 12, 7, 15, 17, 19];
+
+// Derived once.  A sphere's "cone" accepts everything, so its cosine is -1.
+let g_sp_coshalf: array<f64> = [
+    cos(180.0 * g_DEG), cos(22.0 * g_DEG), 1.0, 1.0, 1.0,
+    cos(5.0 * g_DEG), 1.0
+];
+
+let g_beam_period: i32 = idiv(g_TICK_HZ, g_MAGIC_BEAM_HZ);
+let g_swap_in_ticks: i32 = secs_to_ticks(g_SPELL_SWAP_IN_S);
+let g_swap_out_ticks: i32 = secs_to_ticks(g_SPELL_SWAP_OUT_S);
+let g_beam_hold_ticks: i32 = 3;     // a cast keeps the beam lit for 3 ticks;
+                                    // holding FIRE re-casts and keeps it lit
+
+// The four regen rates, in centi-oil per second, resolved once at module load
+// rather than three `rnd_i` calls on every tick of every player (A4).
+let g_regen_dark_x100: i32 = rnd_i(g_OIL_REGEN_DARK * 100.0);
+let g_regen_day_x100: i32 = rnd_i(g_OIL_REGEN_DAY * 100.0);
+let g_regen_lit_x100: i32 = rnd_i(g_OIL_REGEN_LIT * 100.0);
+let g_regen_pool_x100: i32 = rnd_i(g_KINDLING_OIL_S * 100.0);
+
+let g_phase_mult: array<f64> = [
+    g_MAGIC_PHASE_DAWN, g_MAGIC_PHASE_DAY, g_MAGIC_PHASE_DUSK, g_MAGIC_PHASE_NIGHT
+];
+let g_tank_x100: array<i32> = [
+    rnd_i(g_OIL_TANK_T1 * 100.0),
+    rnd_i(g_OIL_TANK_T2 * 100.0),
+    rnd_i(g_OIL_TANK_T3 * 100.0)
+];
+
+// ---- table accessors.  Out of range is a defined answer, never a trap. -----
+fn sp_ok(p_id: i32): i32 {
+    let s: i32 = p_id;
+    let out: i32 = 1;
+    if (s < 0) { out = 0; }
+    if (s >= g_SPELL_COUNT) { out = 0; }
+    return out;
+}
+
+export fn spell_name(p_id: i32): string {
+    if (sp_ok(p_id) == 0) { let bad: string = "?"; return bad; }
+    let out: string = g_sp_name[p_id];
+    return out;
+}
+
+export fn spell_dtype(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = -1; return bad; }
+    let out: i32 = g_sp_dtype[p_id];
+    return out;
+}
+
+export fn spell_shape(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = -1; return bad; }
+    let out: i32 = g_sp_shape[p_id];
+    return out;
+}
+
+export fn spell_base_oil_x100(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = 0; return bad; }
+    let out: i32 = g_sp_oil_x100[p_id];
+    return out;
+}
+
+export fn spell_base_cd_ticks(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = 0; return bad; }
+    let out: i32 = g_sp_cd_ticks[p_id];
+    return out;
+}
+
+export fn spell_unlock_level(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = 9999; return bad; }
+    let out: i32 = g_sp_unlock_lv[p_id];
+    return out;
+}
+
+export fn spell_reach_m(p_id: i32): f64 {
+    if (sp_ok(p_id) == 0) { let bad: f64 = 0.0; return bad; }
+    let out: f64 = g_sp_r1[p_id];
+    return out;
+}
+
+export fn spell_half_angle_deg(p_id: i32): f64 {
+    if (sp_ok(p_id) == 0) { let bad: f64 = 0.0; return bad; }
+    let out: f64 = g_sp_half_deg[p_id];
+    return out;
+}
+
+export fn spell_channel_ticks(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = 0; return bad; }
+    let out: i32 = g_sp_chan_ticks[p_id];
+    return out;
+}
+
+export fn spell_channel_mode(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = CHMODE_NONE; return bad; }
+    let out: i32 = g_sp_chan_mode[p_id];
+    return out;
+}
+
+// The main-hand item id a spell occupies in `InputCommand.weapon`
+// (DIRECTION.md §10 — everything but the lantern is main-hand and swaps).
+export fn spell_item_id(p_id: i32): i32 {
+    if (sp_ok(p_id) == 0) { let bad: i32 = -1; return bad; }
+    let out: i32 = g_SPELL_ITEM_BASE + p_id;
+    return out;
+}
+
+export fn spell_of_item(p_item: i32): i32 {
+    let s: i32 = p_item - g_SPELL_ITEM_BASE;
+    if (sp_ok(s) == 0) { let bad: i32 = -1; return bad; }
+    let out: i32 = s;
+    return out;
+}
+
+// ===========================================================================
+// §4  ATTUNEMENT  (DIRECTION.md §9: "spell slots, potency, cooldown")
+// ===========================================================================
+// The stat trees do not exist yet.  DIRECTION.md §9's trap is explicit —
+// "unlocks decide WHAT YOU HAVE, stats decide HOW WELL YOU USE IT" — so
+// Attunement never unlocks a spell and never grants access to anything.  It
+// only moves three numbers, and each moves in one direction with a floor so a
+// high-Attunement caster can never reach a free or instant spell.
+//
+//   cost     x (1 - 0.020*A), floored at 0.55   ->  x0.60 at A=20
+//   cooldown x (1 - 0.015*A), floored at 0.65   ->  x0.70 at A=20
+//   potency  x (1 + 0.040*A)                    ->  x1.80 at A=20
+//   slots    1 + A/7, clamped 1..3              ->  3 at A>=14
+//
+// ---------------------------------------------------------------------------
+// ⚠ OVERLAP WITH `src/sim/stats.hml` — REPORTED, NOT SILENTLY RESOLVED
+// ---------------------------------------------------------------------------
+// A concurrent task is building the DIRECTION.md §9 stat trees in
+// `src/sim/stats.hml`, and it already exports `stats_spell_slots`,
+// `stats_potency_mult` and `stats_cooldown_mult` off `SK_ATTUNEMENT`.  **That is
+// a second curve for the same stat, and two curves for one stat is exactly the
+// second source of truth this project keeps getting burned by.**
+//
+// It is not resolved here because that file is not this task's to edit
+// (CLAUDE.md §3).  The seam is deliberately one line wide so whoever ratifies
+// the curve pays one edit and not a rewrite:
+//
+//   * `spell_set_attunement(st, stats_get(prog, SK_ATTUNEMENT))` is the ONLY
+//     write to `SP_ATTUNE`.  Wire the stat in there, once, in `sim.hml`.
+//   * If `stats.hml`'s curves win, exactly FOUR functions below are deleted and
+//     forwarded: `spell_cost_mult`, `spell_cd_mult`, `spell_potency`,
+//     `spell_slots`.  Nothing else in this file reads the raw stat.
+//
+// The curve kept here is the one this task can defend from the design: it has a
+// floor on both penalties (§9's "stats decide HOW WELL", never "whether"), and
+// its slot breakpoints are the 1/2/3 that MAGIC_KINETIC §1.9.2 requires.
+
+export fn spell_attune_of(p_st: array): i32 {
+    let st: array = p_st;
+    let out: i32 = cl_i(st[SP_ATTUNE], 0, g_ATTUNE_MAX);
+    return out;
+}
+
+export fn spell_set_attunement(p_st: array, p_a: i32) {
+    let st: array = p_st;
+    st[SP_ATTUNE] = cl_i(p_a, 0, g_ATTUNE_MAX);
+}
+
+export fn spell_cost_mult(p_st: array): f64 {
+    let a: f64 = f64(spell_attune_of(p_st));
+    let out: f64 = cl_f(1.0 - g_ATTUNE_COST_PER * a, g_ATTUNE_COST_FLOOR, 1.0);
+    return out;
+}
+
+export fn spell_cd_mult(p_st: array): f64 {
+    let a: f64 = f64(spell_attune_of(p_st));
+    let out: f64 = cl_f(1.0 - g_ATTUNE_CD_PER * a, g_ATTUNE_CD_FLOOR, 1.0);
+    return out;
+}
+
+// Potency multiplies damage, healing and every buff DURATION, so Attunement is
+// worth taking for a caster who never deals a point of damage.  That is the
+// point of a school with healing and cloaking in it.
+export fn spell_potency(p_st: array): f64 {
+    let a: f64 = f64(spell_attune_of(p_st));
+    let out: f64 = 1.0 + g_ATTUNE_POT_PER * a;
+    return out;
+}
+
+export fn spell_slots(p_st: array): i32 {
+    let a: i32 = spell_attune_of(p_st);
+    let n: i32 = g_SPELL_SLOTS_MIN + idiv(a, g_ATTUNE_PER_SLOT);
+    let out: i32 = cl_i(n, g_SPELL_SLOTS_MIN, g_SPELL_SLOTS_MAX);
+    return out;
+}
+
+export fn spell_oil_cost_x100(p_st: array, p_id: i32): i32 {
+    let base: i32 = spell_base_oil_x100(p_id);
+    if (base <= 0) { let z: i32 = 0; return z; }
+    let out: i32 = rnd_i(f64(base) * spell_cost_mult(p_st));
+    if (out < 1) { out = 1; }
+    return out;
+}
+
+export fn spell_cooldown_ticks(p_st: array, p_id: i32): i32 {
+    let base: i32 = spell_base_cd_ticks(p_id);
+    if (base <= 0) { let z: i32 = 0; return z; }
+    let out: i32 = rnd_i(f64(base) * spell_cd_mult(p_st));
+    if (out < 1) { out = 1; }
+    return out;
+}
+
+// ===========================================================================
+// §5  LIFECYCLE, OIL AND THE EQUIP SCREEN
+// ===========================================================================
+
+export fn spell_reset(p_st: array) {
+    let st: array = p_st;
+    let i: i32 = 0;
+    while (i < SP_FIELDS) { st[i] = 0; i = i + 1; }
+    st[SP_VER] = SPELL_VERSION;
+    st[SP_EQUIP_0] = -1;
+    st[SP_EQUIP_1] = -1;
+    st[SP_EQUIP_2] = -1;
+    st[SP_ACTIVE] = -1;
+    st[SP_CH_SPELL] = -1;
+    st[SP_LAST_SPELL] = -1;
+    st[SP_PHASE] = PHASE_DAY;
+    st[SP_OIL_X100] = g_tank_x100[0];
+}
+
+export fn spell_new(): array {
+    let st = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0];
+    spell_reset(st);
+    return st;
+}
+
+export fn spell_copy(p_dst: array, p_src: array) {
+    let dst: array = p_dst;
+    let src: array = p_src;
+    let i: i32 = 0;
+    while (i < SP_FIELDS) { dst[i] = src[i]; i = i + 1; }
+}
+
+export fn spell_tank_x100(p_st: array): i32 {
+    let st: array = p_st;
+    let t: i32 = cl_i(st[SP_TANK_TIER], 0, g_OIL_TANK_TIERS - 1);
+    let out: i32 = g_tank_x100[t];
+    return out;
+}
+
+export fn spell_set_tank_tier(p_st: array, p_tier: i32) {
+    let st: array = p_st;
+    st[SP_TANK_TIER] = cl_i(p_tier, 0, g_OIL_TANK_TIERS - 1);
+    let cap: i32 = spell_tank_x100(st);
+    if (st[SP_OIL_X100] > cap) { st[SP_OIL_X100] = cap; }
+}
+
+export fn spell_oil(p_st: array): f64 {
+    let st: array = p_st;
+    let out: f64 = f64(st[SP_OIL_X100]) / 100.0;
+    return out;
+}
+
+export fn spell_oil_x100(p_st: array): i32 {
+    let st: array = p_st;
+    let out: i32 = st[SP_OIL_X100];
+    return out;
+}
+
+// Add (or, negative, remove) centi-oil.  Clamps to [0, tank]; never traps.
+export fn spell_add_oil_x100(p_st: array, p_amt: i32): i32 {
+    let st: array = p_st;
+    let cap: i32 = spell_tank_x100(st);
+    let cur: i32 = st[SP_OIL_X100];
+    let want: i32 = cur + p_amt;
+    if (want < 0) { want = 0; }
+    if (want > cap) { want = cap; }
+    st[SP_OIL_X100] = want;
+    let out: i32 = want - cur;
+    return out;
+}
+
+export fn spell_fill(p_st: array) {
+    let st: array = p_st;
+    st[SP_OIL_X100] = spell_tank_x100(st);
+}
+
+// The two inputs `sim.hml` owns and this module only reads.  Both are in the
+// hash, because a replay that disagrees about whether you were standing in the
+// light must diverge loudly rather than quietly.
+export fn spell_set_lit(p_st: array, p_lit: i32) {
+    let st: array = p_st;
+    let v: i32 = 0;
+    if (p_lit != 0) { v = 1; }
+    st[SP_LIT] = v;
+}
+
+export fn spell_set_phase(p_st: array, p_phase: i32) {
+    let st: array = p_st;
+    st[SP_PHASE] = cl_i(p_phase, 0, PHASE_COUNT - 1);
+}
+
+// ---- the equip screen (three slots, swappable in town or at a lantern) -----
+fn equip_slot_id(p_i: i32): i32 {
+    let out: i32 = SP_EQUIP_0 + cl_i(p_i, 0, g_SPELL_SLOTS_MAX - 1);
+    return out;
+}
+
+export fn spell_equipped(p_st: array, p_slot: i32): i32 {
+    let st: array = p_st;
+    if (p_slot < 0) { let bad: i32 = -1; return bad; }
+    if (p_slot >= g_SPELL_SLOTS_MAX) { let bad2: i32 = -1; return bad2; }
+    let out: i32 = st[equip_slot_id(p_slot)];
+    return out;
+}
+
+// Equip `p_id` into `p_slot`.  Refuses a locked spell, a slot the caster's
+// Attunement has not opened, and a duplicate.  Returns SPELL_OK or a
+// SPELL_ERR_*.  `p_level` is the progression level; this module does not hold
+// a second copy of it.
+export fn spell_equip(p_st: array, p_slot: i32, p_id: i32, p_level: i32): i32 {
+    let st: array = p_st;
+    let slot: i32 = p_slot;
+    let id: i32 = p_id;
+    if (slot < 0) { let e: i32 = SPELL_ERR_UNKNOWN; return e; }
+    if (slot >= spell_slots(st)) { let e2: i32 = SPELL_ERR_LOCKED; return e2; }
+    if (id == -1) {
+        st[equip_slot_id(slot)] = -1;
+        if (st[SP_ACTIVE] == slot) { st[SP_ACTIVE] = -1; }
+        let ok0: i32 = SPELL_OK;
+        return ok0;
+    }
+    if (sp_ok(id) == 0) { let e3: i32 = SPELL_ERR_UNKNOWN; return e3; }
+    if (p_level < g_sp_unlock_lv[id]) { let e4: i32 = SPELL_ERR_LOCKED; return e4; }
+    let i: i32 = 0;
+    while (i < g_SPELL_SLOTS_MAX) {
+        if (i != slot) {
+            if (st[equip_slot_id(i)] == id) { let e5: i32 = SPELL_ERR_UNKNOWN; return e5; }
+        }
+        i = i + 1;
+    }
+    st[equip_slot_id(slot)] = id;
+    let ok: i32 = SPELL_OK;
+    return ok;
+}
+
+// Raise an equipped slot into the MAIN HAND (DIRECTION.md §10).  -1 lowers it.
+// The swap is the entire party-composition answer: solo is sequential.
+export fn spell_select(p_st: array, p_slot: i32): i32 {
+    let st: array = p_st;
+    let want: i32 = p_slot;
+    if (want == st[SP_ACTIVE]) { let same: i32 = SPELL_OK; return same; }
+    if (want == -1) {
+        st[SP_ACTIVE] = -1;
+        st[SP_SWAP_T] = g_swap_out_ticks;
+        spell_cancel_channel(st);
+        st[SP_BEAM_T] = 0;
+        let ok0: i32 = SPELL_OK;
+        return ok0;
+    }
+    if (want < 0) { let e: i32 = SPELL_ERR_UNKNOWN; return e; }
+    if (want >= spell_slots(st)) { let e2: i32 = SPELL_ERR_LOCKED; return e2; }
+    if (st[equip_slot_id(want)] < 0) { let e3: i32 = SPELL_ERR_NOT_EQUIPPED; return e3; }
+    st[SP_ACTIVE] = want;
+    st[SP_SWAP_T] = g_swap_in_ticks;
+    spell_cancel_channel(st);
+    st[SP_BEAM_T] = 0;
+    let ok: i32 = SPELL_OK;
+    return ok;
+}
+
+// The spell currently in the main hand, or -1.
+export fn spell_active(p_st: array): i32 {
+    let st: array = p_st;
+    let a: i32 = st[SP_ACTIVE];
+    if (a < 0) { let none: i32 = -1; return none; }
+    let out: i32 = st[equip_slot_id(a)];
+    return out;
+}
+
+export fn spell_cd_left(p_st: array, p_id: i32): i32 {
+    let st: array = p_st;
+    if (sp_ok(p_id) == 0) { let bad: i32 = 0; return bad; }
+    let out: i32 = st[SP_CD_0 + p_id];
+    return out;
+}
+
+// ===========================================================================
+// §6  THE BINDING  (which world / combat / projectile system a cast resolves in)
+// ===========================================================================
+// A small object holding three references, exactly as `proj_set_combat` and
+// `proj_set_chunks` do it.  It is NOT player state, it is NOT serialised, and
+// it holds no numbers — so nothing about the save or the hash depends on it.
+
+export fn spell_ctx_new(): object {
+    let ctx: object = {
+        wr: 0,
+        cx: 0,
+        ps: 0,
+        has_world: 0,
+        has_proj: 0
+    };
+    let out: object = ctx;
+    return out;
+}
+
+export fn spell_bind(p_ctx: object, p_w: object, p_cx: object): i32 {
+    let ctx: object = p_ctx;
+    ctx.wr = p_w;
+    ctx.cx = p_cx;
+    ctx.has_world = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn spell_bind_projectiles(p_ctx: object, p_ps: object): i32 {
+    let ctx: object = p_ctx;
+    ctx.ps = p_ps;
+    ctx.has_proj = 1;
+    let out: i32 = 1;
+    return out;
+}
+
+export fn spell_has_world(p_ctx: object): i32 {
+    let ctx: object = p_ctx;
+    let out: i32 = ctx.has_world;
+    return out;
+}
+
+export fn spell_has_projectiles(p_ctx: object): i32 {
+    let ctx: object = p_ctx;
+    let out: i32 = ctx.has_proj;
+    return out;
+}
+
+// ===========================================================================
+// §7  THE DAMAGE EQUATION  (MAGIC_KINETIC §1.8)
+// ===========================================================================
+//   raw   = base_for_verb
+//   mult  = potency(Attunement)
+//           * (WINDUP_MULT if MAGIC and the target is mid-tell)
+//           * (PHASE_MULT[phase] if MAGIC)
+//           * falloff(r)                       -- linear, felt, learnable
+//   applied = raw * mult
+//
+// Then the existing `combat_apply_damage` body runs unchanged: the plate
+// branch, the round, the "a hit never does zero" floor, the HP write,
+// EF_HIT_FLASH, EV_HIT, EV_KILL.  **One insertion point, one multiply.**
+//
+// The affinity table itself (`g_affinity[class][dtype]`) belongs to combat.hml
+// and does not exist yet.  This module supplies the axis (`spell_dtype`) that
+// indexes it and deliberately does NOT carry a second copy — a resistance table
+// in two files is a resistance table that will disagree.
+
+// The phase multiplier in force.  Inside a lit radius it is forced to the DAY
+// value, for the same reason the shade tier is forced to 0: there is no dark
+// there to contrast against.  This is not a nerf the player resents — it is why
+// you leave.
+export fn spell_phase_mult(p_st: array): f64 {
+    let st: array = p_st;
+    if (st[SP_LIT] == 1) { let lit: f64 = g_MAGIC_PHASE_DAY; return lit; }
+    let ph: i32 = cl_i(st[SP_PHASE], 0, PHASE_COUNT - 1);
+    let out: f64 = g_phase_mult[ph];
+    return out;
+}
+
+// Linear falloff between r0 and r1.  1.0 inside r0, 0.0 outside r1.
+export fn spell_falloff(p_id: i32, p_dist: f64): f64 {
+    if (sp_ok(p_id) == 0) { let bad: f64 = 0.0; return bad; }
+    let r0: f64 = g_sp_r0[p_id];
+    let r1: f64 = g_sp_r1[p_id];
+    let dist: f64 = p_dist;
+    if (r1 <= r0) { let z: f64 = 0.0; return z; }
+    if (dist <= r0) { let one: f64 = 1.0; return one; }
+    if (dist >= r1) { let zero: f64 = 0.0; return zero; }
+    let out: f64 = 1.0 - (dist - r0) / (r1 - r0);
+    return out;
+}
+
+// Damage this spell does to a target at `p_dist`, before affinity.  Exposed so
+// a probe can assert the design's own table without reaching inside a cast.
+export fn spell_damage_at(p_st: array, p_id: i32, p_dist: f64, p_windup: i32): f64 {
+    if (sp_ok(p_id) == 0) { let bad: f64 = 0.0; return bad; }
+    let d0: f64 = f64(g_sp_d0_x100[p_id]) / 100.0;
+    let d1: f64 = f64(g_sp_d1_x100[p_id]) / 100.0;
+    if (d0 <= 0.0) { let z: f64 = 0.0; return z; }
+    // Past r1 there is NOTHING.  d1 is the damage AT the edge, not a floor that
+    // follows you out of the volume — a spell that still hurt at 100 m would
+    // make the 24 m reach cap a lie.
+    if (p_dist > g_sp_r1[p_id]) { let out0: f64 = 0.0; return out0; }
+    let k: f64 = spell_falloff(p_id, p_dist);
+    let base: f64 = d1 + (d0 - d1) * k;
+    let mult: f64 = spell_potency(p_st);
+    if (g_sp_dtype[p_id] == g_DTYPE_MAGIC) {
+        mult = mult * spell_phase_mult(p_st);
+        if (p_windup == 1) { mult = mult * g_MAGIC_WINDUP_MULT; }
+    }
+    let out: f64 = base * mult;
+    return out;
+}
+
+// ===========================================================================
+// §8  THE FIVE SIGNALS  (CLAUDE.md §9 — non-negotiable)
+// ===========================================================================
+// "Every bullet that connects produces, WITHIN THE SAME FRAME, all five of —
+//  hitmarker, enemy flash, damage number, impact billboard, audio blip."
+// A spell is not exempt.  `combat_apply_damage` already emits EV_HIT / EV_KILL
+// and sets EF_HIT_FLASH; these are the five cosmetic derivations, in the same
+// order and with the same payloads `combat_fire` uses, so `combat_feedback_ok`
+// passes on a spell hit exactly as it does on a bullet.
+fn feedback(p_ctx: object, p_tick: i32, p_actor: i32, p_vid: i32,
+            p_slot: i32, p_dealt: i32, p_hm: i32,
+            p_x: f64, p_y: f64, p_z: f64) {
+    let ctx: object = p_ctx;
+    let wr: object = ctx.wr;
+    let bus: object = combat_events(ctx.cx);
+    let tick: i32 = p_tick;
+    let hm: i32 = p_hm;
+
+    // 1. hitmarker — HM_MAGIC turns the cross into the 4-petal bloom.
+    ev_push_m(bus, tick, EV_HITMARKER, hm, p_actor, p_vid, p_x, p_y, p_z);
+
+    // 2. enemy flash, at the body centre because the whole body flashes.
+    let pxs = wr.px;
+    let pys = wr.py;
+    let pzs = wr.pz;
+    let bh: f64 = combat_body_h(wr, p_slot);
+    ev_push_m(bus, tick, EV_HIT_FLASH, HIT_FLASH_CS, p_actor, p_vid,
+              pxs[p_slot], pys[p_slot] + bh * 0.5, pzs[p_slot]);
+
+    // 3. damage number
+    let shown: i32 = p_dealt;
+    if (shown > 255) { shown = 255; }
+    ev_push_m(bus, tick, EV_DAMAGE_NUMBER, shown, p_actor, p_vid, p_x, p_y, p_z);
+
+    // 4. impact billboard
+    ev_push_m(bus, tick, EV_IMPACT, SURF_FLESH, p_actor, p_vid, p_x, p_y, p_z);
+
+    // 5. audio blip.  MAGIC_KINETIC §2.4: the +2-semitone pitch chain is a
+    //    reward for the RIGHT hand and does not advance here — a spell hit is
+    //    step 0, always.  The chain belongs to combat.hml and is not touched.
+    let sfx: i32 = SFX_HIT_BLIP;
+    if ((hm & HM_KILL) != 0) { sfx = SFX_KILL_CHIME; }
+    ev_push_m(bus, tick, EV_SOUND, sfx, p_actor, p_vid, p_x, p_y, p_z);
+}
+
+// ===========================================================================
+// §9  THE VOLUME TEST  (sphere and cone; no projectile, no travel time)
+// ===========================================================================
+// One pass over live entities.  At the director's 14-alive cap this is 14
+// distance tests at at most 10 Hz — MAGIC_KINETIC §8.3 predicted it would be
+// unmeasurable and the probe measures it rather than repeating the prediction.
+fn resolve_volume(p_st: array, p_ctx: object, p_caster: i32, p_id: i32): i32 {
+    let st: array = p_st;
+    let ctx: object = p_ctx;
+    let wr: object = ctx.wr;
+    let cxo: object = ctx.cx;
+    let id: i32 = p_id;
+
+    let cslot: i32 = world_slot_of(wr, p_caster);
+    if (cslot == SLOT_NONE) { let none: i32 = 0; return none; }
+
+    let pxs = wr.px;
+    let pys = wr.py;
+    let pzs = wr.pz;
+    let yaws = wr.yaw;
+    let pitches = wr.pitch;
+    let kinds = wr.kind;
+    let flags = wr.flags;
+    let aist = wr.ai_state;
+
+    let ox: f64 = pxs[cslot];
+    let oy: f64 = pys[cslot] + g_EYE_STAND;
+    let oz: f64 = pzs[cslot];
+    let yaw: f64 = yaws[cslot];
+    let pit: f64 = pitches[cslot];
+    let cp: f64 = cos(pit);
+    let fx: f64 = sin(yaw) * cp;
+    let fy: f64 = sin(pit);
+    let fz: f64 = 0.0 - cos(yaw) * cp;
+
+    let r1: f64 = g_sp_r1[id];
+    let coshalf: f64 = g_sp_coshalf[id];
+    let is_cone: i32 = 0;
+    if (g_sp_shape[id] == SHAPE_CONE) { is_cone = 1; }
+
+    let dkind: i32 = SPELL_DMG_BURST;
+    if (id == g_SPELL_SHUTTER) { dkind = SPELL_DMG_BEAM; }
+    if (id == g_SPELL_LANCE) { dkind = SPELL_DMG_LANCE; }
+
+    let tick: i32 = wr.tick;
+    let item: i32 = g_SPELL_ITEM_BASE + id;
+    let n: i32 = wr.count;
+    let hits: i32 = 0;
+    let total: i32 = 0;
+
+    let i: i32 = 0;
+    while (i < n) {
+        if (kinds[i] == KIND_AI) {
+            let fl: i32 = flags[i];
+            if ((fl & EF_DEAD) == 0 && (fl & EF_INVULN) == 0) {
+                let bh2: f64 = combat_body_h(wr, i) * 0.5;
+                let dx: f64 = pxs[i] - ox;
+                let dy: f64 = pys[i] + bh2 - oy;
+                let dz: f64 = pzs[i] - oz;
+                let d2: f64 = dx * dx + dy * dy + dz * dz;
+                if (d2 <= r1 * r1) {
+                    let dist: f64 = sqrt(d2);
+                    let inside: i32 = 1;
+                    if (is_cone == 1) {
+                        if (dist > 0.0001) {
+                            let dot: f64 = (dx * fx + dy * fy + dz * fz) / dist;
+                            if (dot < coshalf) { inside = 0; }
+                        }
+                    }
+                    if (inside == 1) {
+                        let wind: i32 = 0;
+                        if (aist[i] == AI_ST_WINDUP) { wind = 1; }
+                        let raw: f64 = spell_damage_at(st, id, dist, wind);
+                        if (raw > 0.0) {
+                            let hm: i32 = HM_MAGIC;
+                            if (g_sp_dtype[id] == g_DTYPE_KINETIC) { hm = 0; }
+                            let ndx: f64 = 0.0;
+                            let ndz: f64 = 0.0;
+                            let hl: f64 = sqrt(dx * dx + dz * dz);
+                            if (hl > 0.0001) { ndx = dx / hl; ndz = dz / hl; }
+                            let hy: f64 = pys[i] + bh2;
+                            let vid: i32 = world_id_of(wr, i);
+                            let dealt: i32 = combat_apply_damage(
+                                cxo, wr, p_caster, i, raw, item, dkind, hm,
+                                ndx, ndz, pxs[i], hy, pzs[i]);
+                            if ((flags[i] & EF_DEAD) != 0) { hm = hm | HM_KILL; }
+                            feedback(ctx, tick, p_caster, vid, i, dealt, hm,
+                                     pxs[i], hy, pzs[i]);
+                            hits = hits + 1;
+                            total = total + dealt;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    st[SP_LAST_TARGETS] = hits;
+    st[SP_LAST_DAMAGE] = total;
+    let out: i32 = hits;
+    return out;
+}
+
+// ===========================================================================
+// §10  CASTING
+// ===========================================================================
+
+// Cancel a channel.  MAGIC_KINETIC §1.9.2: Mend is "channelled, cancelled by
+// damage", and the Lance's 1.2 s locked wind-up is "cancelled by damage" too —
+// the same machinery, so the same one line cancels both.
+export fn spell_cancel_channel(p_st: array) {
+    let st: array = p_st;
+    st[SP_CH_SPELL] = -1;
+    st[SP_CH_T] = 0;
+    st[SP_CH_ACC] = 0;
+    st[SP_CH_TOTAL] = 0;
+}
+
+// Break the cloak.  MAGIC_KINETIC §1.9.2: it breaks on firing, on any spell,
+// and on taking damage.  Every one of those three is an explicit call so the
+// break is never an accident of ordering.
+export fn spell_break_cloak(p_st: array): i32 {
+    let st: array = p_st;
+    if (st[SP_CLOAK_T] <= 0) { let z: i32 = 0; return z; }
+    st[SP_CLOAK_T] = 0;
+    st[SP_BREAKS] = st[SP_BREAKS] + 1;
+    let out: i32 = 1;
+    return out;
+}
+
+// The player fired the gun.  DIRECTION.md §10 makes guns and spells share the
+// main hand, so this can only happen with no spell raised — but the cloak
+// survives a hand swap and must not survive a shot.
+export fn spell_notify_fired(p_st: array): i32 {
+    let out: i32 = spell_break_cloak(p_st);
+    return out;
+}
+
+// The player took damage.  Cancels the channel AND breaks the cloak.
+export fn spell_notify_damaged(p_st: array): i32 {
+    let st: array = p_st;
+    let broke: i32 = 0;
+    if (st[SP_CH_T] > 0) { spell_cancel_channel(st); broke = broke + 1; }
+    if (spell_break_cloak(st) == 1) { broke = broke + 1; }
+    let out: i32 = broke;
+    return out;
+}
+
+fn cast_fail(p_st: array, p_id: i32, p_err: i32): i32 {
+    let st: array = p_st;
+    st[SP_LAST_SPELL] = p_id;
+    st[SP_LAST_RESULT] = p_err;
+    st[SP_LAST_TARGETS] = 0;
+    st[SP_LAST_DAMAGE] = 0;
+    st[SP_LAST_HEAL] = 0;
+    st[SP_REFUSALS] = st[SP_REFUSALS] + 1;
+    let out: i32 = p_err;
+    return out;
+}
+
+// THE entry point.  Cast whatever is in the main hand.  Three arguments: the
+// caster's position, aim, tick and every other input come from the world.
+//
+// Returns SPELL_OK or a SPELL_ERR_*.  It never traps and never partially
+// spends: oil is debited only after every refusal has been checked.
+export fn spell_cast(p_st: array, p_ctx: object, p_caster: i32): i32 {
+    let st: array = p_st;
+    let ctx: object = p_ctx;
+
+    let id: i32 = spell_active(st);
+    if (id < 0) { let e: i32 = cast_fail(st, -1, SPELL_ERR_NOT_EQUIPPED); return e; }
+    if (ctx.has_world == 0) { let e0: i32 = cast_fail(st, id, SPELL_ERR_UNBOUND); return e0; }
+
+    let wr: object = ctx.wr;
+    let cslot: i32 = world_slot_of(wr, p_caster);
+    if (cslot == SLOT_NONE) { let e1: i32 = cast_fail(st, id, SPELL_ERR_NO_CASTER); return e1; }
+
+    // Swapping hands, or already committed to a channel.
+    if (st[SP_SWAP_T] > 0) { let e2: i32 = cast_fail(st, id, SPELL_ERR_BUSY); return e2; }
+    if (st[SP_CH_T] > 0) { let e3: i32 = cast_fail(st, id, SPELL_ERR_BUSY); return e3; }
+    if (st[SP_CD_0 + id] > 0) { let e4: i32 = cast_fail(st, id, SPELL_ERR_COOLDOWN); return e4; }
+
+    // THE HELD BEAM.  The shutter is the one spell with no cooldown: holding
+    // BTN_FIRE re-casts it every tick, and a re-cast on a beam that is already
+    // lit is a FREE REFRESH, never a second charge.  Damage and oil land at
+    // g_MAGIC_BEAM_HZ (10 Hz) in `spell_step` and nowhere else — if this
+    // returned early after charging, a 60 Hz caller would pay 6x the design's
+    // 22 oil/s and the beam would out-damage the lance.
+    let is_beam: i32 = 0;
+    if (g_sp_shape[id] == SHAPE_CONE) {
+        if (g_sp_chan_ticks[id] == 0) { is_beam = 1; }
+    }
+    if (is_beam == 1) {
+        if (st[SP_BEAM_T] > 0) {
+            st[SP_BEAM_T] = g_beam_hold_ticks;
+            st[SP_LAST_SPELL] = id;
+            st[SP_LAST_RESULT] = SPELL_OK;
+            let okb: i32 = SPELL_OK;
+            return okb;
+        }
+    }
+
+    // The bolt is delivered by projectiles.hml.  If nothing is bound the cast
+    // is REFUSED, loudly, rather than silently doing nothing.
+    if (g_sp_shape[id] == SHAPE_BOLT) {
+        if (ctx.has_proj == 0) {
+            let e5: i32 = cast_fail(st, id, SPELL_ERR_NO_DELIVERY);
+            return e5;
+        }
+    }
+
+    let cost: i32 = spell_oil_cost_x100(st, id);
+    if (st[SP_OIL_X100] < cost) { let e6: i32 = cast_fail(st, id, SPELL_ERR_OIL); return e6; }
+
+    // ---- committed from here.  Debit, then deliver. ---------------------
+    st[SP_OIL_X100] = st[SP_OIL_X100] - cost;
+    st[SP_OIL_SPENT] = st[SP_OIL_SPENT] + cost;
+    st[SP_CASTS] = st[SP_CASTS] + 1;
+    st[SP_LAST_SPELL] = id;
+    st[SP_LAST_RESULT] = SPELL_OK;
+    st[SP_LAST_TARGETS] = 0;
+    st[SP_LAST_DAMAGE] = 0;
+    st[SP_LAST_HEAL] = 0;
+    st[SP_CD_0 + id] = spell_cooldown_ticks(st, id);
+
+    // Casting anything breaks the cloak (§1.9.2).  Guttering itself is checked
+    // first so re-cloaking does not count as a break.
+    if (id != g_SPELL_GUTTERING) { spell_break_cloak(st); }
+
+    let pxs = wr.px;
+    let pys = wr.py;
+    let pzs = wr.pz;
+    let yaws = wr.yaw;
+    let pitches = wr.pitch;
+    let ox: f64 = pxs[cslot];
+    let oy: f64 = pys[cslot] + g_EYE_STAND;
+    let oz: f64 = pzs[cslot];
+    let tick: i32 = wr.tick;
+    let bus: object = combat_events(ctx.cx);
+    ev_push_m(bus, tick, EV_SPELL_CAST, id, p_caster, ID_NONE, ox, oy, oz);
+
+    let shape: i32 = g_sp_shape[id];
+    let chan: i32 = g_sp_chan_ticks[id];
+
+    // A channelled spell commits the caster and resolves later (§10.2).
+    if (chan > 0) {
+        st[SP_CH_SPELL] = id;
+        st[SP_CH_T] = chan;
+        st[SP_CH_TOTAL] = chan;
+        st[SP_CH_ACC] = 0;
+        ev_push_m(bus, tick, EV_SPELL_CHANNEL, id * 4 + CHAN_START,
+                  p_caster, ID_NONE, ox, oy, oz);
+        let okc: i32 = SPELL_OK;
+        return okc;
+    }
+
+    if (shape == SHAPE_SPHERE) {
+        resolve_volume(st, ctx, p_caster, id);
+        let ok1: i32 = SPELL_OK;
+        return ok1;
+    }
+
+    if (shape == SHAPE_CONE) {
+        // Lighting the beam.  The oil just debited pays for THIS application,
+        // which lands now — a beam that costs before it burns would feel like a
+        // misfire at 320x240.  Every later application is charged in
+        // `spell_step`, once per 10 Hz period.
+        resolve_volume(st, ctx, p_caster, id);
+        st[SP_BEAM_T] = g_beam_hold_ticks;
+        st[SP_BEAM_ACC] = 0;
+        let ok2: i32 = SPELL_OK;
+        return ok2;
+    }
+
+    if (shape == SHAPE_BOLT) {
+        // THE FIRE BLAST.  DIRECTION.md §2: "the Emberlance ... is a fire
+        // blast.  It should probably move to the spell side."  It has.  The
+        // BOLT is untouched — 6.0 m/s arcing, 3.5 m AoE, 60 impact, 12/s burn
+        // for 5 s, straight out of projectiles.hml's measured tables.  Only its
+        // CALLER changed, which is exactly what MAGIC_KINETIC §12 asks for.
+        proj_spawn_aim(ctx.ps, wr, PROJ_EMBERLANCE, p_caster,
+                       ox, oy, oz, yaws[cslot], pitches[cslot]);
+        let ok3: i32 = SPELL_OK;
+        return ok3;
+    }
+
+    if (shape == SHAPE_SELF) {
+        // Guttering — THE CLOAK.  Duration scales with potency, so Attunement
+        // is worth taking for a caster who deals no damage at all.
+        if (id == g_SPELL_GUTTERING) {
+            let dur: i32 = rnd_i(g_CLOAK_S * f64(g_TICK_HZ) * spell_potency(st));
+            st[SP_CLOAK_T] = dur;
+            ev_push_m(bus, tick, EV_SPELL_CLOAK, 1, p_caster, ID_NONE, ox, oy, oz);
+        }
+        let ok4: i32 = SPELL_OK;
+        return ok4;
+    }
+
+    if (shape == SHAPE_PLACE) {
+        // Kindling — a 3 m light pool for 8 s.  It is world state in v1 only in
+        // the sense that the caster carries it; a placed pool that outlives its
+        // caster is a v2 question and is deliberately not answered here.
+        let dur2: i32 = rnd_i(g_KINDLING_S * f64(g_TICK_HZ) * spell_potency(st));
+        st[SP_POOL_T] = dur2;
+        st[SP_POOL_X_CM] = rnd_i(ox * 100.0);
+        st[SP_POOL_Y_CM] = rnd_i(pys[cslot] * 100.0);
+        st[SP_POOL_Z_CM] = rnd_i(oz * 100.0);
+        ev_push_m(bus, tick, EV_SPELL_POOL, 1, p_caster, ID_NONE,
+                  ox, pys[cslot], oz);
+        let ok5: i32 = SPELL_OK;
+        return ok5;
+    }
+
+    let ok: i32 = SPELL_OK;
+    return ok;
+}
+
+// ===========================================================================
+// §11  THE PER-TICK STEP
+// ===========================================================================
+// Called once per player per tick from `sim.hml`'s tick order.  It advances
+// every timer, resolves the channel and the beam, and regenerates oil.  There
+// is no allocation, no call into the renderer, and no wall clock.
+
+// Heal `p_hp_x100` centi-HP into the caster, clamped at hp_max.  Returns the HP
+// actually restored (whole points, so the HUD number and the state agree).
+fn heal_caster(p_ctx: object, p_caster: i32, p_hp: i32): i32 {
+    let ctx: object = p_ctx;
+    let wr: object = ctx.wr;
+    let slot: i32 = world_slot_of(wr, p_caster);
+    if (slot == SLOT_NONE) { let z: i32 = 0; return z; }
+    let hp = wr.hp;
+    let hpm = wr.hp_max;
+    let cur: i32 = hp[slot];
+    let cap: i32 = hpm[slot];
+    let gain: i32 = p_hp;
+    if (cur + gain > cap) { gain = cap - cur; }
+    if (gain < 0) { gain = 0; }
+    hp[slot] = cur + gain;
+    let out: i32 = gain;
+    return out;
+}
+
+export fn spell_step(p_st: array, p_ctx: object, p_caster: i32): i32 {
+    let st: array = p_st;
+    let ctx: object = p_ctx;
+    if (ctx.has_world == 0) { let e: i32 = SPELL_ERR_UNBOUND; return e; }
+    let wr: object = ctx.wr;
+    let tick: i32 = wr.tick;
+    let bus: object = combat_events(ctx.cx);
+
+    let cslot: i32 = world_slot_of(wr, p_caster);
+    let ox: f64 = 0.0;
+    let oy: f64 = 0.0;
+    let oz: f64 = 0.0;
+    if (cslot != SLOT_NONE) {
+        let pxs = wr.px;
+        let pys = wr.py;
+        let pzs = wr.pz;
+        ox = pxs[cslot];
+        oy = pys[cslot];
+        oz = pzs[cslot];
+    }
+
+    // ---- 1. the main-hand swap ------------------------------------------
+    if (st[SP_SWAP_T] > 0) { st[SP_SWAP_T] = st[SP_SWAP_T] - 1; }
+
+    // ---- 2. cooldowns ----------------------------------------------------
+    let i: i32 = 0;
+    while (i < g_SPELL_COUNT) {
+        let c: i32 = st[SP_CD_0 + i];
+        if (c > 0) { st[SP_CD_0 + i] = c - 1; }
+        i = i + 1;
+    }
+
+    // ---- 3. the cloak, and its tell --------------------------------------
+    if (st[SP_CLOAK_T] > 0) {
+        st[SP_CLOAK_T] = st[SP_CLOAK_T] - 1;
+        if (st[SP_CLOAK_T] == 0) {
+            ev_push_m(bus, tick, EV_SPELL_CLOAK, 0, p_caster, ID_NONE, ox, oy, oz);
+        }
+    }
+
+    // ---- 4. the Kindling pool -------------------------------------------
+    if (st[SP_POOL_T] > 0) {
+        st[SP_POOL_T] = st[SP_POOL_T] - 1;
+        if (st[SP_POOL_T] == 0) {
+            ev_push_m(bus, tick, EV_SPELL_POOL, 0, p_caster, ID_NONE, ox, oy, oz);
+        }
+    }
+
+    // ---- 5. the channel  (Mend heals per tick; the Lance lands at the end)
+    st[SP_LAST_HEAL] = 0;
+    if (st[SP_CH_T] > 0) {
+        let cid: i32 = st[SP_CH_SPELL];
+        st[SP_CH_T] = st[SP_CH_T] - 1;
+        let mode: i32 = CHMODE_NONE;
+        if (sp_ok(cid) == 1) { mode = g_sp_chan_mode[cid]; }
+
+        if (mode == CHMODE_TICK) {
+            // +40 HP over 1.2 s, scaled by potency.  HP is an INTEGER in the
+            // world, so the schedule is computed from elapsed ticks rather than
+            // accumulated per-tick — `40/72` per tick truncates to zero and the
+            // heal would silently do nothing.  SP_CH_ACC holds the whole HP
+            // already delivered, so the channel's total is EXACT (40, never 39)
+            // and identical on both backends.
+            let total_x100: i32 = rnd_i(g_MEND_HP * 100.0 * spell_potency(st));
+            let dur: i32 = st[SP_CH_TOTAL];
+            if (dur < 1) { dur = 1; }
+            let elapsed: i32 = dur - st[SP_CH_T];
+            let owed: i32 = idiv(total_x100 * elapsed, dur * 100);
+            let give: i32 = owed - st[SP_CH_ACC];
+            if (give > 0) {
+                let got: i32 = heal_caster(ctx, p_caster, give);
+                st[SP_CH_ACC] = st[SP_CH_ACC] + got;
+                if (got > 0) {
+                    st[SP_LAST_HEAL] = got;
+                    ev_push_m(bus, tick, EV_SPELL_HEAL, got, p_caster, p_caster,
+                              ox, oy, oz);
+                }
+            }
+        }
+
+        if (st[SP_CH_T] == 0) {
+            if (mode == CHMODE_FINISH) { resolve_volume(st, ctx, p_caster, cid); }
+            ev_push_m(bus, tick, EV_SPELL_CHANNEL, cid * 4 + CHAN_DONE,
+                      p_caster, ID_NONE, ox, oy, oz);
+            st[SP_CH_SPELL] = -1;
+            st[SP_CH_ACC] = 0;
+            st[SP_CH_TOTAL] = 0;
+        }
+    }
+
+    // ---- 6. the beam  (10 Hz, never 60) ----------------------------------
+    if (st[SP_BEAM_T] > 0) {
+        st[SP_BEAM_T] = st[SP_BEAM_T] - 1;
+        st[SP_BEAM_ACC] = st[SP_BEAM_ACC] + 1;
+        if (st[SP_BEAM_ACC] >= g_beam_period) {
+            st[SP_BEAM_ACC] = st[SP_BEAM_ACC] - g_beam_period;
+            let bcost: i32 = spell_oil_cost_x100(st, g_SPELL_SHUTTER);
+            if (st[SP_OIL_X100] >= bcost) {
+                st[SP_OIL_X100] = st[SP_OIL_X100] - bcost;
+                st[SP_OIL_SPENT] = st[SP_OIL_SPENT] + bcost;
+                resolve_volume(st, ctx, p_caster, g_SPELL_SHUTTER);
+            } else {
+                st[SP_BEAM_T] = 0;         // the tank ran dry; the beam shutters
+            }
+        }
+    }
+
+    // ---- 7. oil regen  (MAGIC_KINETIC §1.6) ------------------------------
+    // Rates do NOT stack: a Kindling pool inside a lit radius is not 4.5/s.
+    // Take the best one.  The carry makes +0.8/s exact.
+    let rate: i32 = g_regen_dark_x100;
+    if (st[SP_PHASE] == PHASE_DAY) {
+        if (g_regen_day_x100 > rate) { rate = g_regen_day_x100; }
+    }
+    if (st[SP_POOL_T] > 0) {
+        if (cslot != SLOT_NONE) {
+            let dxp: f64 = ox - f64(st[SP_POOL_X_CM]) / 100.0;
+            let dzp: f64 = oz - f64(st[SP_POOL_Z_CM]) / 100.0;
+            if (dxp * dxp + dzp * dzp <= g_KINDLING_R * g_KINDLING_R) {
+                if (g_regen_pool_x100 > rate) { rate = g_regen_pool_x100; }
+            }
+        }
+    }
+    if (st[SP_LIT] == 1) {
+        if (g_regen_lit_x100 > rate) { rate = g_regen_lit_x100; }
+    }
+    if (rate > 0) {
+        let acc2: i32 = st[SP_REGEN_ACC] + rate;
+        let gain: i32 = idiv(acc2, g_TICK_HZ);
+        st[SP_REGEN_ACC] = acc2 - gain * g_TICK_HZ;
+        if (gain > 0) { spell_add_oil_x100(st, gain); }
+    }
+
+    let out: i32 = SPELL_OK;
+    return out;
+}
+
+// ===========================================================================
+// §12  WHAT THE REST OF THE SIM READS
+// ===========================================================================
+// These are the numbers `ai.hml`, the renderer and the HUD consume.  **The sim
+// owns them; nothing outside recomputes them.**  Each is one line at the call
+// site and each is reported in the task report as an unwired hook.
+
+// The multiplier on an AI's aggro radius against this caster, at `p_dist_m`.
+//
+// THE TELL.  Cloaked, you are 0.15x as visible — *until you are close enough
+// that the lantern in your off-hand gives you away*, at which point the cloak
+// does nothing at all.  DIRECTION.md §10 put the lamp permanently in that hand
+// and said "the light never leaves the player"; this is that sentence with a
+// number on it.
+export fn spell_aggro_mult(p_st: array, p_dist_m: f64): f64 {
+    let st: array = p_st;
+    if (st[SP_CLOAK_T] <= 0) { let one: f64 = 1.0; return one; }
+    if (p_dist_m <= g_CLOAK_GLOW_M) { let seen: f64 = 1.0; return seen; }
+    let out: f64 = g_CLOAK_AGGRO_MULT;
+    return out;
+}
+
+// The lantern's intensity multiplier.  It DIMS while cloaked and never reaches
+// zero — the residual glow is the tell, for the renderer and for other players.
+// It adds no light slot: MAGIC_KINETIC §8.2's 2-cap is untouched.
+export fn spell_light_mult(p_st: array): f64 {
+    let st: array = p_st;
+    if (st[SP_CLOAK_T] > 0) { let dim: f64 = g_CLOAK_LIGHT_MULT; return dim; }
+    let out: f64 = 1.0;
+    return out;
+}
+
+export fn spell_cloaked(p_st: array): i32 {
+    let st: array = p_st;
+    let out: i32 = 0;
+    if (st[SP_CLOAK_T] > 0) { out = 1; }
+    return out;
+}
+
+export fn spell_channelling(p_st: array): i32 {
+    let st: array = p_st;
+    let out: i32 = st[SP_CH_SPELL];
+    if (st[SP_CH_T] <= 0) { out = -1; }
+    return out;
+}
+
+// 0.0 .. 1.0 for the HUD channel ring.  Never divides by zero.
+export fn spell_channel_frac(p_st: array): f64 {
+    let st: array = p_st;
+    let total: i32 = st[SP_CH_TOTAL];
+    if (total <= 0) { let z: f64 = 0.0; return z; }
+    let left: f64 = f64(st[SP_CH_T]);
+    let out: f64 = 1.0 - left / f64(total);
+    return out;
+}
+
+export fn spell_pool_active(p_st: array): i32 {
+    let st: array = p_st;
+    let out: i32 = 0;
+    if (st[SP_POOL_T] > 0) { out = 1; }
+    return out;
+}
+
+export fn spell_pool_x(p_st: array): f64 { let st: array = p_st; let o: f64 = f64(st[SP_POOL_X_CM]) / 100.0; return o; }
+export fn spell_pool_y(p_st: array): f64 { let st: array = p_st; let o: f64 = f64(st[SP_POOL_Y_CM]) / 100.0; return o; }
+export fn spell_pool_z(p_st: array): f64 { let st: array = p_st; let o: f64 = f64(st[SP_POOL_Z_CM]) / 100.0; return o; }
+export fn spell_pool_radius(): f64 { let o: f64 = g_KINDLING_R; return o; }
+
+export fn spell_casts(p_st: array): i32    { let st: array = p_st; let o: i32 = st[SP_CASTS]; return o; }
+export fn spell_refusals(p_st: array): i32 { let st: array = p_st; let o: i32 = st[SP_REFUSALS]; return o; }
+export fn spell_breaks(p_st: array): i32   { let st: array = p_st; let o: i32 = st[SP_BREAKS]; return o; }
+export fn spell_last_result(p_st: array): i32  { let st: array = p_st; let o: i32 = st[SP_LAST_RESULT]; return o; }
+export fn spell_last_targets(p_st: array): i32 { let st: array = p_st; let o: i32 = st[SP_LAST_TARGETS]; return o; }
+export fn spell_last_damage(p_st: array): i32  { let st: array = p_st; let o: i32 = st[SP_LAST_DAMAGE]; return o; }
+export fn spell_last_heal(p_st: array): i32    { let st: array = p_st; let o: i32 = st[SP_LAST_HEAL]; return o; }
+
+// ===========================================================================
+// §13  SERIALISATION AND THE DETERMINISM HASH
+// ===========================================================================
+// The state IS the wire format: SP_FIELDS little-endian i32.  `save.hml` gets a
+// version word to fail on and one place to change if the vector ever grows.
+// MAGIC_KINETIC §12's trap, honoured: **Mend and Guttering are sim state with
+// timers, so they are in the hash and in the save, or a replay diverges.**
+
+export fn spell_serialize(p_st: array, p_out: array, p_off: i32): i32 {
+    let st: array = p_st;
+    let out: array = p_out;
+    let off: i32 = p_off;
+    let i: i32 = 0;
+    while (i < SP_FIELDS) { out[off + i] = st[i]; i = i + 1; }
+    let n: i32 = SP_FIELDS;
+    return n;
+}
+
+// Returns the number of ints consumed, or -1 if the version word does not
+// match — rejected cleanly, never reinterpreted.
+export fn spell_deserialize(p_st: array, p_src: array, p_off: i32): i32 {
+    let st: array = p_st;
+    let src: array = p_src;
+    let off: i32 = p_off;
+    if (src[off + SP_VER] != SPELL_VERSION) { let bad: i32 = -1; return bad; }
+    let i: i32 = 0;
+    while (i < SP_FIELDS) { st[i] = src[off + i]; i = i + 1; }
+    let n: i32 = SP_FIELDS;
+    return n;
+}
+
+// A 31-bit fingerprint of the whole state.  Order-sensitive: two states that
+// differ in any one slot hash differently.  All mixing in u64 — i32 and i64
+// `* + -` TRAP on overflow in Hemlock (A13).
+export fn spell_hash(p_st: array): i32 {
+    let st: array = p_st;
+    let h: u64 = 14695981039346656037;
+    let i: i32 = 0;
+    while (i < SP_FIELDS) {
+        let v: i32 = st[i];
+        let u: u64 = 0;
+        if (v >= 0) { u = u64(v); } else { u = u64(f64(v) + 4294967296.0); }
+        h = (h ^ u) * 1099511628211;
+        h = h ^ (h >> 29);
+        i = i + 1;
+    }
+    h = h ^ (h >> 31);
+    h = h * 13787848793156543929;
+    h = h ^ (h >> 33);
+    let out: i32 = i32((h >> 33) & 2147483647);
+    return out;
+}
+
+// ===========================================================================
+// §14  SELF-CHECK  (tools and CI; never called in play)
+// ===========================================================================
+// 0 = consistent.  Each bit names a broken invariant of the tables above, so a
+// bad edit fails loudly at a named rule rather than showing up three hours
+// later as a spell that costs nothing.
+export let SPCHK_TABLE_LEN: i32   = 1;    // a parallel array is the wrong width
+export let SPCHK_REACH: i32       = 2;    // r1 > the 24 m cap, or r1 <= r0
+export let SPCHK_FALLOFF: i32     = 4;    // damage rises with distance
+export let SPCHK_ITEM_SPACE: i32  = 8;    // spell ids collide with CMD_MAX_WEAPON
+export let SPCHK_UNLOCK: i32      = 16;   // an unlock outside levels 1..30
+export let SPCHK_DTYPE: i32       = 32;   // a dtype outside the axis
+export let SPCHK_FIELDS: i32      = 64;   // the state vector is the wrong width
+export let SPCHK_FLOOR: i32       = 128;  // a phase multiplier below THE LAW
+
+export fn spell_selfcheck(): i32 {
+    let bad: i32 = 0;
+    let n: i32 = g_SPELL_COUNT;
+
+    if (g_sp_name.length != n)       { bad = bad + SPCHK_TABLE_LEN; }
+    if (g_sp_dtype.length != n)      { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_shape.length != n)      { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_oil_x100.length != n)   { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_cd_ticks.length != n)   { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_r0.length != n)         { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_r1.length != n)         { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_d0_x100.length != n)    { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_d1_x100.length != n)    { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_half_deg.length != n)   { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_coshalf.length != n)    { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_chan_ticks.length != n) { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_chan_mode.length != n)  { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+    if (g_sp_unlock_lv.length != n)  { if ((bad & SPCHK_TABLE_LEN) == 0) { bad = bad + SPCHK_TABLE_LEN; } }
+
+    if (SP_FIELDS != 39) { bad = bad + SPCHK_FIELDS; }
+    if (SP_CD_0 + n > SP_CH_SPELL) {
+        if ((bad & SPCHK_FIELDS) == 0) { bad = bad + SPCHK_FIELDS; }
+    }
+
+    let i: i32 = 0;
+    while (i < n) {
+        let r1: f64 = g_sp_r1[i];
+        if (r1 > g_MAGIC_REACH_CAP) {
+            if ((bad & SPCHK_REACH) == 0) { bad = bad + SPCHK_REACH; }
+        }
+        if (r1 > 0.0) {
+            if (r1 <= g_sp_r0[i]) {
+                if ((bad & SPCHK_REACH) == 0) { bad = bad + SPCHK_REACH; }
+            }
+            if (g_sp_d1_x100[i] > g_sp_d0_x100[i]) {
+                if ((bad & SPCHK_FALLOFF) == 0) { bad = bad + SPCHK_FALLOFF; }
+            }
+        }
+        let dt: i32 = g_sp_dtype[i];
+        if (dt < 0) { if ((bad & SPCHK_DTYPE) == 0) { bad = bad + SPCHK_DTYPE; } }
+        if (dt >= g_DTYPE_COUNT) { if ((bad & SPCHK_DTYPE) == 0) { bad = bad + SPCHK_DTYPE; } }
+        let lv: i32 = g_sp_unlock_lv[i];
+        if (lv < 1) { if ((bad & SPCHK_UNLOCK) == 0) { bad = bad + SPCHK_UNLOCK; } }
+        if (lv > 30) { if ((bad & SPCHK_UNLOCK) == 0) { bad = bad + SPCHK_UNLOCK; } }
+        i = i + 1;
+    }
+
+    // Spell ids must fit under CMD_MAX_WEAPON (15) alongside the six guns AND
+    // the three melee weapons (weapons.hml `MH_MELEE_BASE = 6`, ids 6..8).
+    if (g_SPELL_ITEM_BASE + n - 1 > 15) { bad = bad + SPCHK_ITEM_SPACE; }
+    if (g_SPELL_ITEM_BASE < 9) { if ((bad & SPCHK_ITEM_SPACE) == 0) { bad = bad + SPCHK_ITEM_SPACE; } }
+
+    // §5.3 THE LAW: no multiplier in the game is ever below FLOOR_MULT.
+    let p: i32 = 0;
+    while (p < PHASE_COUNT) {
+        if (g_phase_mult[p] < g_MAGIC_FLOOR_MULT) {
+            if ((bad & SPCHK_FLOOR) == 0) { bad = bad + SPCHK_FLOOR; }
+        }
+        p = p + 1;
+    }
+
+    let out: i32 = bad;
+    return out;
+}
