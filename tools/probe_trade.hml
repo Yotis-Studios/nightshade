@@ -1,0 +1,909 @@
+// =============================================================================
+//  probe_trade.hml — W7. A TRADE A PLAYER CAN COMPLETE, END TO END.
+// -----------------------------------------------------------------------------
+//  The gate that produced this task measured, on a live session:
+//
+//      villagers show `[E] PIP / [T] TRADE`,  14 villagers,  5 named,
+//      1 TRADE ATTEMPTED,  0 COMPLETED.
+//
+//  Everything downstream of that number — DIRECTION.md §3's weapon ladder,
+//  §6's "the arsenal is a person", §7's carry capacity — was unreachable.
+//  This probe is the regression test for the whole of it, and every assertion
+//  below is one clause of the task:
+//
+//      open a trade . see what is offered and what it costs . pay for it .
+//      carry it . be slowed by carrying it . put it back down in the world .
+//      save it . load it . get the same answer twice from the same seed .
+//
+//  It drives `src/game/server.hml` with real `InputCommand`s and nothing else:
+//  no client, no renderer, no SDL. `probe_game.hml`'s `nm | grep -c SDL_ == 0`
+//  argument applies unchanged.
+//
+//  Run:  hemlockc -O1 tools/probe_trade.hml -o /tmp/pt && /tmp/pt
+//  Exits 1 on any failure, and on an assertion COUNT that is not
+//  `EXPECTED_ASSERTIONS` — a probe that silently stops running half its checks
+//  is worse than one that fails.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, atan2 } from "@stdlib/math";
+
+import { server_new, server_tick, server_local, server_world,
+         server_apply_command, server_settle, server_npcs,
+         server_settle_boot_tier, server_trades, server_trades_refused,
+         server_ui_panel, server_ui_row, server_w6_hash,
+         server_stats, server_spawn_x, server_spawn_z, server_t0,
+         server_purse, server_salvage_earned, server_salvage_spent,
+         server_load_kg, server_carry_kg, server_overload, server_move_mult,
+         server_fit, server_pack_items, server_kits_placed,
+         server_grant_salvage, server_lantern_x, server_lantern_z,
+         SV_PSLOT, SV_XP_PER_SALVAGE, SV_KG_GUN, SV_KG_LANTERN,
+         SV_KG_PER_ROUND, SV_TRADE_AMMO, SV_BOOT_SALVAGE,
+         UI_PANEL_NONE, UI_PANEL_TRADE,
+         UI_MSG_TRADED, UI_MSG_UNBUILT, UI_MSG_NO_SALVAGE,
+         UI_MSG_HAVE, UI_MSG_HEAVY }
+       from "../src/game/server.hml";
+
+import { cmd_new, cmd_set, BTN_USE, BTN_GRENADE, BTN_SWITCH, BTN_BUILD }
+       from "../src/sim/command.hml";
+
+import { npc_new, npc_named_count, npc_count, npc_x, npc_z, npc_slot_of,
+         npc_offer_rows, npc_offer_who, npc_offer_kind, npc_offer_arg,
+         npc_offer_tier, npc_offer_regard, npc_offer_first, npc_offer_count,
+         npc_offer_class, npc_offer_price, npc_offer_fit, npc_offer_kg,
+         npc_offer_find, npc_offer_open,
+         npc_purse, npc_purse_add, npc_purse_take, npc_earned, npc_spent,
+         npc_fit_mask, npc_pack_count, npc_pack_kg, npc_pack_items,
+         npc_pack_spend, npc_pack_find_kind, npc_regard,
+         npc_trade_check, npc_trade_take, npc_trade_first_open,
+         npc_trade_takeable, npc_talk, npc_selfcheck, npc_hash,
+         npc_save_rows, npc_save_fill, npc_meta_fill, npc_load,
+         NPC_NONE, NPC_NAMED, NPC_MABEL, NPC_ODO, NPC_WICK, NPC_CONNIE, NPC_PIP,
+         NPC_OFF_ROWS, NPC_OFF_KIT, NPC_OFF_AMMO, NPC_OFF_BANK, NPC_OFF_ATTACH,
+         NPC_OFF_WEAPON, NPC_OFF_SOUP, NPC_OFF_LANTERN, NPC_OFF_SLEEP,
+         NPC_OFF_MFG,
+         NPC_OC_SERVICE, NPC_OC_STOCK, NPC_OC_FIT, NPC_OC_UNBUILT,
+         NPC_TR_OK, NPC_TR_BADROW, NPC_TR_CLOSED, NPC_TR_POOR,
+         NPC_TR_HAVE, NPC_TR_UNBUILT,
+         NPC_SAVE_COLS, NPC_META_COLS, NPC_VERSION, NPC_SALVAGE_MAX,
+         NPC_BAND_T_ACQ, NPC_BAND_T_FRIEND, NPC_BAND_T_TRUSTED,
+         NPCCHK_TRADE }
+       from "../src/sim/npc.hml";
+
+import { settle_cx, settle_cz, settle_tier, settle_new, settle_load,
+         SET_TIER_CAMP, SET_TIER_VILLAGE, SET_TIER_TOWN, SET_TIER_CITY,
+         SET_SAVE_COLS, SET_META_COLS }
+       from "../src/sim/settle.hml";
+
+import { stats_carry_kg_at, stats_move_mult_at, stats_get,
+         SK_EQ_NONE, SK_EQ_BANDOLIER, SK_EQ_POUCHES, SK_EQ_PACK, SK_EQ_ALL,
+         SK_CAPACITY } from "../src/sim/stats.hml";
+
+import { sim_predicted, sim_progression, sim_weapon_state, sim_player_id }
+       from "../src/sim/sim.hml";
+import { move_px, move_pz } from "../src/sim/movement.hml";
+import { world_slot_of, KIND_LANTERN, EF_DEAD } from "../src/sim/world.hml";
+import { WS_RES0, WS_MAG0, WS_FIELDS, wpn_cur } from "../src/sim/weapons.hml";
+import { prog_add_xp, prog_xp_total, XPS_KILL } from "../src/sim/progression.hml";
+import { transport_loopback } from "../src/net/transport.hml";
+
+// >>> THE ASSERTION COUNT. <<< Raise it when you add a check; a probe whose
+// count drifts is a probe that stopped running something and told nobody.
+let EXPECTED_ASSERTIONS: i32 = 165;
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+fn ck(p_c: bool, p_m: string) {
+    g_n = g_n + 1;
+    if (p_c) { g_ok = g_ok + 1; }
+    else { print(`  FAIL  ${p_m}`); }
+}
+fn ck_i(p_a: i32, p_b: i32, p_m: string) {
+    g_n = g_n + 1;
+    if (p_a == p_b) { g_ok = g_ok + 1; }
+    else { print(`  FAIL  ${p_m}  (got ${p_a}, want ${p_b})`); }
+}
+fn near(p_a: f64, p_b: f64, p_e: f64): bool {
+    let d: f64 = p_a - p_b;
+    if (d < 0.0) { d = 0.0 - d; }
+    let out: bool = d <= p_e;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// A SETTLEMENT AT A CHOSEN TIER, HEALTHY. Same fixture probe_npc.hml uses:
+// `settle_load` with zero building rows and a full-wick lantern feed is the
+// only way to reach a tier without simulating the hours it takes to earn one.
+// ---------------------------------------------------------------------------
+fn mk_settle(p_seed: i32, p_tier: i32): object {
+    let st: object = settle_new(p_seed);
+    let rows: array<i32> = [];
+    let meta: array<i32> = [];
+    let i: i32 = 0;
+    while (i < SET_META_COLS) { meta.push(0); i++; }
+    meta[0] = p_tier;
+    meta[1] = p_tier;
+    meta[2] = 0;                 // SET_IND_COLD — no manufactured rifles
+    meta[5] = -1;
+    meta[7] = 0;                 // NOT browned out
+    settle_load(st, rows, 0, meta);
+    let out: object = st;
+    return out;
+}
+
+fn befriend(p_s: object, p_st: object, p_who: i32, p_to: i32) {
+    let day: i32 = 0;
+    let guard: i32 = 0;
+    while (npc_regard(p_s, p_who) < p_to && guard < 400) {
+        npc_talk(p_s, p_st, p_who, day * 57600 + 100);
+        day++;
+        guard++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE SESSION HARNESS. Identical in shape to probe_w6.hml's.
+// ---------------------------------------------------------------------------
+let g_c = cmd_new();
+let g_tick: i32 = 0;
+
+fn step(p_sv: object, p_btn: i32, p_mx: f64, p_my: f64, p_yaw: f64) {
+    cmd_set(g_c, g_tick, 16, p_mx, p_my, p_yaw, 0.0, p_btn, 4, g_tick);
+    server_apply_command(p_sv, SV_PSLOT, g_c);
+    server_tick(p_sv, g_tick);
+    g_tick = g_tick + 1;
+}
+
+fn walk_to(p_sv: object, p_x: f64, p_z: f64, p_max: i32): f64 {
+    let w = server_world(p_sv);
+    let i: i32 = 0;
+    let d: f64 = 1.0e18;
+    while (i < p_max) {
+        let ps = sim_predicted(w, SV_PSLOT);
+        let px: f64 = move_px(ps);
+        let pz: f64 = move_pz(ps);
+        let dx: f64 = p_x - px;
+        let dz: f64 = p_z - pz;
+        d = sqrt(dx * dx + dz * dz);
+        if (d < 2.0) { i = p_max; }
+        else {
+            let yaw: f64 = atan2(dx, 0.0 - dz);
+            step(p_sv, 0, 0.0, 1.0, yaw);
+            i++;
+        }
+    }
+    let out: f64 = d;
+    return out;
+}
+
+// WALK AT A PERSON, NOT AT A COORDINATE. Villagers keep a schedule — they
+// stand at a bench in the day and go inside at night — so a target sampled
+// once and walked at for 300 ticks is a target that has moved. Re-aim every
+// step and stop when the AUTHORITY says they are in talk range, which is the
+// only definition of "close enough" that matters.
+fn walk_to_npc(p_sv: object, p_who: i32, p_max: i32): f64 {
+    let sv: object = p_sv;
+    let sto: object = server_npcs(sv);
+    let st: object = server_settle(sv);
+    let slot: i32 = npc_slot_of(sto, p_who);
+    let w = server_world(sv);
+    let d: f64 = 1.0e18;
+    let i: i32 = 0;
+    while (i < p_max) {
+        let tx: f64 = npc_x(sto, st, slot, g_tick);
+        let tz: f64 = npc_z(sto, st, slot, g_tick);
+        let ps = sim_predicted(w, SV_PSLOT);
+        let dx: f64 = tx - move_px(ps);
+        let dz: f64 = tz - move_pz(ps);
+        d = sqrt(dx * dx + dz * dz);
+        if (server_local(sv).talk_who == p_who) { i = p_max; }
+        else if (d < 1.2) { i = p_max; }
+        else {
+            let yaw: f64 = atan2(dx, 0.0 - dz);
+            step(sv, 0, 0.0, 1.0, yaw);
+            i++;
+        }
+    }
+    let out: f64 = d;
+    return out;
+}
+
+fn px_of(p_sv: object): f64 {
+    let ps = sim_predicted(server_world(p_sv), SV_PSLOT);
+    let out: f64 = move_px(ps);
+    return out;
+}
+fn pz_of(p_sv: object): f64 {
+    let ps = sim_predicted(server_world(p_sv), SV_PSLOT);
+    let out: f64 = move_pz(ps);
+    return out;
+}
+
+// Move the panel cursor onto a LOCAL row.
+fn cursor_to(p_sv: object, p_row: i32): i32 {
+    let guard: i32 = 0;
+    while (server_ui_row(p_sv) != p_row && guard < 40) {
+        step(p_sv, BTN_SWITCH, 0.0, 0.0, 0.0);
+        step(p_sv, 0, 0.0, 0.0, 0.0);
+        guard++;
+    }
+    let out: i32 = server_ui_row(p_sv);
+    return out;
+}
+
+fn lantern_count(p_sv: object): i32 {
+    let w = server_world(p_sv);
+    let n: i32 = w.count;
+    let kd = w.kind;
+    let fl = w.flags;
+    let c: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        if (kd[i] == KIND_LANTERN) {
+            if ((fl[i] & EF_DEAD) == 0) { c++; }
+        }
+        i++;
+    }
+    let out: i32 = c;
+    return out;
+}
+
+// ===========================================================================
+// A.  THE TABLE — three new columns over twenty-one unchanged rows
+// ===========================================================================
+fn section_table() {
+    print("A  the trade columns (npc.hml §9b/§9c)");
+    ck_i(npc_offer_rows(), 21, "the offer table is still 21 rows");
+    ck_i(npc_selfcheck() & NPCCHK_TRADE, 0, "the trade columns pass selfcheck");
+
+    // (kind, arg) is a KEY. `client_offer_label` prices a row from nothing
+    // else, and `npc_offer_find` would silently price the wrong one.
+    let dup: i32 = 0;
+    let r: i32 = 0;
+    while (r < NPC_OFF_ROWS) {
+        if (npc_offer_find(npc_offer_kind(r), npc_offer_arg(r)) != r) { dup++; }
+        r++;
+    }
+    ck_i(dup, 0, "(kind, arg) is unique across all 21 rows");
+    ck_i(npc_offer_find(99, 0), -1, "an unknown pair finds nothing");
+
+    // Every row has a class, and the classes partition the table.
+    let ns: i32 = 0;
+    let nk: i32 = 0;
+    let nf: i32 = 0;
+    let nu: i32 = 0;
+    let i: i32 = 0;
+    while (i < NPC_OFF_ROWS) {
+        let c: i32 = npc_offer_class(i);
+        if (c == NPC_OC_SERVICE) { ns++; }
+        if (c == NPC_OC_STOCK) { nk++; }
+        if (c == NPC_OC_FIT) { nf++; }
+        if (c == NPC_OC_UNBUILT) { nu++; }
+        i++;
+    }
+    print(`   ${ns} service, ${nk} stock, ${nf} fit, ${nu} UNBUILT`);
+    ck_i(ns + nk + nf + nu, NPC_OFF_ROWS, "every row has exactly one class");
+    ck(nu > 0, "the honest class is not empty");
+    ck_i(nu, 13, "thirteen rows are honestly UNBUILT (npc.hml §9c names them)");
+    ck_i(ns + nk + nf, 8, "eight rows do something measurable");
+
+    // THE FOUR VILLAGE GUNS ARE STILL UNBUILT, AND THEY ARE STILL FREE.
+    // `weapons.hml` has six City-tier rows and belongs to W6-6. A price on a
+    // row that grants nothing is the worst thing in the file.
+    let g: i32 = 0;
+    while (g < 4) {
+        ck_i(npc_offer_class(g), NPC_OC_UNBUILT, `village gun row ${g} is UNBUILT`);
+        ck_i(npc_offer_price(g), 0, `village gun row ${g} costs nothing`);
+        g++;
+    }
+
+    // Mass belongs to STOCK and to nothing else.
+    let kit: i32 = npc_offer_find(NPC_OFF_KIT, 0);
+    ck(kit >= 0, "the lantern kit is in the table");
+    ck_i(npc_offer_class(kit), NPC_OC_STOCK, "a lantern kit is STOCK");
+    ck(npc_offer_kg(kit) > 0.0, "and it weighs something");
+    ck(near(npc_offer_kg(kit), 6.0, 0.001), "six kilogrammes of it");
+    let ammo: i32 = npc_offer_find(NPC_OFF_AMMO, 0);
+    ck_i(npc_offer_class(ammo), NPC_OC_SERVICE, "brass is a SERVICE");
+    ck(near(npc_offer_kg(ammo), 0.0, 0.0001), "a service has no mass of its own");
+
+    // PRICES CLIMB WITH THE TIER THE ROW NEEDS. "A Village trades village-tier
+    // goods" as arithmetic: the dearest Village row is cheaper than the
+    // cheapest City row.
+    let vmax: i32 = 0;
+    let cmin: i32 = 999999;
+    let t: i32 = 0;
+    while (t < NPC_OFF_ROWS) {
+        if (npc_offer_class(t) != NPC_OC_UNBUILT) {
+            let p: i32 = npc_offer_price(t);
+            if (npc_offer_tier(t) == SET_TIER_VILLAGE) {
+                if (p > vmax) { vmax = p; }
+            }
+            if (npc_offer_tier(t) == SET_TIER_CITY) {
+                if (p < cmin) { cmin = p; }
+            }
+        }
+        t++;
+    }
+    print(`   dearest Village row ${vmax}, cheapest City row ${cmin}`);
+    ck(vmax < cmin, "a City row costs more than any Village row");
+    ck(vmax > 0, "Village rows are not free");
+
+    // The two FIT rows grant DIFFERENT bits, and only FIT rows grant any.
+    let att: i32 = npc_offer_find(NPC_OFF_ATTACH, 0);
+    let bank: i32 = npc_offer_find(NPC_OFF_BANK, 0);
+    ck_i(npc_offer_class(att), NPC_OC_FIT, "Mabel's attachment row is FIT");
+    ck_i(npc_offer_class(bank), NPC_OC_FIT, "Odo's storage row is FIT");
+    ck_i(npc_offer_fit(att), SK_EQ_BANDOLIER, "...and it is stats.hml's BANDOLIER");
+    ck_i(npc_offer_fit(bank), SK_EQ_PACK, "...and storage is the PACK");
+    ck(npc_offer_fit(att) != npc_offer_fit(bank), "the two grant different bits");
+    ck_i(npc_offer_fit(ammo), 0, "a service grants no equipment");
+}
+
+// ===========================================================================
+// B.  THE PURSE — saturating both ways, all-or-nothing on the way out
+// ===========================================================================
+fn section_purse() {
+    print("B  the purse");
+    let st: object = mk_settle(3, SET_TIER_VILLAGE);
+    let s: object = npc_new(st);
+
+    ck_i(npc_purse(s), 0, "a new store has an empty purse");
+    ck_i(npc_earned(s), 0, "...and has earned nothing");
+    npc_purse_add(s, 100);
+    ck_i(npc_purse(s), 100, "salvage goes in");
+    ck_i(npc_earned(s), 100, "lifetime earnings track it");
+    npc_purse_add(s, -50);
+    ck_i(npc_purse(s), 100, "a negative credit is refused, not subtracted");
+
+    ck_i(npc_purse_take(s, 140), 0, "you cannot pay what you do not have");
+    ck_i(npc_purse(s), 100, "...and a refused payment takes NOTHING");
+    ck_i(npc_purse_take(s, 40), 1, "a payment you can afford goes through");
+    ck_i(npc_purse(s), 60, "and the purse is exactly that much lighter");
+    ck_i(npc_spent(s), 40, "lifetime spending tracks it");
+    ck_i(npc_purse_take(s, 0), 1, "a free row is always paid for");
+
+    // A13: i32 `+` TRAPS on overflow, and a purse is the counter a long
+    // session grows without anybody watching. Saturate, never trap.
+    npc_purse_add(s, NPC_SALVAGE_MAX);
+    ck_i(npc_purse(s), NPC_SALVAGE_MAX, "the purse saturates rather than trapping");
+    npc_purse_add(s, NPC_SALVAGE_MAX);
+    ck_i(npc_purse(s), NPC_SALVAGE_MAX, "...and stays saturated");
+}
+
+// ===========================================================================
+// C.  THE PACK — mass, counts, and putting something back down
+// ===========================================================================
+fn section_pack() {
+    print("C  the pack");
+    let st: object = mk_settle(5, SET_TIER_VILLAGE);
+    let s: object = npc_new(st);
+    let kit: i32 = npc_offer_find(NPC_OFF_KIT, 0);
+
+    ck(near(npc_pack_kg(s), 0.0, 0.0001), "an empty pack weighs nothing");
+    ck_i(npc_pack_items(s), 0, "...and holds nothing");
+    ck_i(npc_pack_find_kind(s, NPC_OFF_KIT), -1, "no kit to find");
+
+    // Wick's kit needs TRUSTED; buy it the honest way.
+    befriend(s, st, NPC_WICK, NPC_BAND_T_TRUSTED);
+    npc_purse_add(s, 200);
+    ck_i(npc_trade_take(s, st, kit), NPC_TR_OK, "a trusted Wick sells a lantern kit");
+    ck_i(npc_pack_count(s, kit), 1, "one kit in the pack");
+    ck(near(npc_pack_kg(s), 6.0, 0.001), "the pack weighs 6 kg");
+    ck_i(npc_pack_find_kind(s, NPC_OFF_KIT), kit, "the kit is findable by kind");
+    ck_i(npc_trade_take(s, st, kit), NPC_TR_OK, "and you can buy a second");
+    ck(near(npc_pack_kg(s), 12.0, 0.001), "twelve kilogrammes of lamp");
+    ck_i(npc_pack_items(s), 2, "two things in the pack");
+
+    ck_i(npc_pack_spend(s, kit), 1, "one goes back down in the world");
+    ck(near(npc_pack_kg(s), 6.0, 0.001), "and the pack is 6 kg lighter");
+    ck_i(npc_pack_spend(s, kit), 1, "so does the other");
+    ck_i(npc_pack_spend(s, kit), 0, "and there is no third to spend");
+    ck_i(npc_pack_find_kind(s, NPC_OFF_KIT), -1, "an empty pack finds no kit");
+}
+
+// ===========================================================================
+// D.  WHY A TRADE DID NOT HAPPEN — one code per reason, never a bare zero
+// ===========================================================================
+fn section_reasons() {
+    print("D  the refusal codes");
+    let camp: object = mk_settle(9, SET_TIER_CAMP);
+    let sc: object = npc_new(camp);
+    let ammo: i32 = npc_offer_find(NPC_OFF_AMMO, 0);
+    let bolt: i32 = npc_offer_find(NPC_OFF_WEAPON, 0);
+    let soup: i32 = npc_offer_find(NPC_OFF_SOUP, 0);
+    let bank: i32 = npc_offer_find(NPC_OFF_BANK, 0);
+
+    ck_i(npc_trade_check(sc, camp, -1), NPC_TR_BADROW, "row -1 is not a row");
+    ck_i(npc_trade_check(sc, camp, NPC_OFF_ROWS), NPC_TR_BADROW, "nor is one past the end");
+    ck_i(npc_trade_check(sc, camp, ammo), NPC_TR_CLOSED, "at a Camp Mabel is not here");
+
+    let vil: object = mk_settle(9, SET_TIER_VILLAGE);
+    let s: object = npc_new(vil);
+    // >>> THE ORDER MATTERS. <<< An UNBUILT row must say so even with an empty
+    // purse, or the game charges the player's attention for a system that does
+    // not exist.
+    ck_i(npc_purse(s), 0, "the fixture starts broke");
+    ck_i(npc_trade_check(s, vil, bolt), NPC_TR_UNBUILT,
+         "the bolt-action says NOT FORGED before it says NO SALVAGE");
+    ck_i(npc_trade_check(s, vil, ammo), NPC_TR_POOR, "brass costs money you do not have");
+    npc_purse_add(s, npc_offer_price(ammo) - 1);
+    ck_i(npc_trade_check(s, vil, ammo), NPC_TR_POOR, "one short is still short");
+    npc_purse_add(s, 1);
+    ck_i(npc_trade_check(s, vil, ammo), NPC_TR_OK, "exactly enough is enough");
+    ck_i(npc_trade_take(s, vil, ammo), NPC_TR_OK, "and it goes through");
+    ck_i(npc_purse(s), 0, "the price came out of the purse");
+    ck_i(npc_trade_check(s, vil, ammo), NPC_TR_POOR, "and now you are broke again");
+
+    // A FIT you are wearing must beat "you cannot afford it": a player with an
+    // empty purse is otherwise told the wrong thing about a pack they own.
+    npc_purse_add(s, npc_offer_price(bank));
+    ck_i(npc_trade_take(s, vil, bank), NPC_TR_OK, "Odo sells the pack");
+    ck_i(npc_fit_mask(s) & SK_EQ_PACK, SK_EQ_PACK, "and you are wearing it");
+    ck_i(npc_purse(s), 0, "it was not free");
+    ck_i(npc_trade_check(s, vil, bank), NPC_TR_HAVE,
+         "a second pack says ALREADY YOURS, not NO SALVAGE");
+    npc_purse_add(s, 9999);
+    ck_i(npc_trade_check(s, vil, bank), NPC_TR_HAVE, "...and a full purse does not change that");
+
+    // The regard gate is untouched and still comes before the price.
+    let pump: i32 = npc_offer_find(NPC_OFF_WEAPON, 2);
+    ck_i(npc_trade_check(s, vil, pump), NPC_TR_CLOSED,
+         "the pump shotgun is shut at regard 0 — CLOSED, not UNBUILT");
+
+    // Taking a refused row moves nothing.
+    let p0: i32 = npc_purse(s);
+    ck(npc_trade_take(s, vil, bolt) != NPC_TR_OK, "an unbuilt row cannot be taken");
+    ck_i(npc_purse(s), p0, "and a refused trade costs nothing");
+    ck_i(npc_pack_count(s, bolt), 0, "and grants nothing");
+
+    // The cursor helper: the first row you could actually take.
+    let f: i32 = npc_trade_first_open(s, vil, NPC_MABEL);
+    ck(f >= 0, "Mabel has a takeable row");
+    let gm: i32 = npc_offer_first(NPC_MABEL) + f;
+    ck_i(npc_trade_check(s, vil, gm), NPC_TR_OK, "...and the helper points at it");
+    ck(f > 3, "...and it is NOT the bolt-action the panel used to open on");
+    ck(npc_trade_takeable(s, vil, NPC_MABEL) > 0, "she has at least one");
+    ck_i(npc_trade_first_open(s, vil, NPC_NONE), -1, "nobody offers nothing");
+}
+
+// ===========================================================================
+// E.  SAVE / LOAD — bit-identical, and a trade is visible in the hash
+// ===========================================================================
+fn section_save() {
+    print("E  save / load / hash");
+    let st: object = mk_settle(13, SET_TIER_TOWN);
+    let a: object = npc_new(st);
+
+    befriend(a, st, NPC_MABEL, NPC_BAND_T_ACQ);
+    befriend(a, st, NPC_WICK, NPC_BAND_T_TRUSTED);
+    npc_purse_add(a, 500);
+    let h_before: i32 = npc_hash(a);
+    ck_i(npc_trade_take(a, st, npc_offer_find(NPC_OFF_KIT, 0)), NPC_TR_OK, "buy a kit");
+    ck_i(npc_trade_take(a, st, npc_offer_find(NPC_OFF_AMMO, 0)), NPC_TR_OK, "buy brass");
+    ck_i(npc_trade_take(a, st, npc_offer_find(NPC_OFF_BANK, 0)), NPC_TR_OK, "buy the pack");
+    ck(npc_hash(a) != h_before, "a trade is visible in npc_hash");
+
+    let rows: array<i32> = [];
+    let i: i32 = 0;
+    while (i < NPC_NAMED * NPC_SAVE_COLS) { rows.push(0); i++; }
+    let meta: array<i32> = [];
+    i = 0;
+    while (i < NPC_META_COLS) { meta.push(0); i++; }
+    ck_i(npc_save_fill(a, rows), NPC_NAMED, "save_fill writes every villager");
+    ck_i(npc_meta_fill(a, meta), NPC_META_COLS, "meta_fill writes the block");
+    ck_i(meta[0], NPC_VERSION, "the version is in slot 0");
+    ck_i(NPC_VERSION, 2, "the ledger bumped the version to 2");
+
+    let b: object = npc_new(st);
+    ck(npc_hash(b) != npc_hash(a), "a fresh store is not the saved one");
+    ck_i(npc_load(b, st, rows, NPC_NAMED, meta), NPC_NAMED, "load applies");
+    ck_i(npc_hash(b), npc_hash(a), ">>> SAVE -> LOAD IS HASH-IDENTICAL <<<");
+    ck_i(npc_purse(b), npc_purse(a), "the purse round-trips");
+    ck_i(npc_spent(b), npc_spent(a), "so does what you have spent");
+    ck_i(npc_earned(b), npc_earned(a), "so does what you have earned");
+    ck_i(npc_fit_mask(b), npc_fit_mask(a), "so does the equipment you are wearing");
+    ck(near(npc_pack_kg(b), npc_pack_kg(a), 0.0001), "so does what the pack weighs");
+    ck_i(npc_pack_items(b), npc_pack_items(a), "so does what is in it");
+
+    // Field-for-field, not just hash-for-hash.
+    let rows2: array<i32> = [];
+    i = 0;
+    while (i < NPC_NAMED * NPC_SAVE_COLS) { rows2.push(0); i++; }
+    let meta2: array<i32> = [];
+    i = 0;
+    while (i < NPC_META_COLS) { meta2.push(0); i++; }
+    npc_save_fill(b, rows2);
+    npc_meta_fill(b, meta2);
+    let diff: i32 = 0;
+    i = 0;
+    while (i < NPC_NAMED * NPC_SAVE_COLS) { if (rows2[i] != rows[i]) { diff++; } i++; }
+    i = 0;
+    while (i < NPC_META_COLS) { if (meta2[i] != meta[i]) { diff++; } i++; }
+    ck_i(diff, 0, ">>> EVERY SAVED INTEGER IS BIT-IDENTICAL <<<");
+
+    // A save is untrusted input.
+    let evil: array<i32> = [];
+    i = 0;
+    while (i < NPC_META_COLS) { evil.push(meta[i]); i++; }
+    evil[4] = 2000000000;
+    let c: object = npc_new(st);
+    npc_load(c, st, rows, NPC_NAMED, evil);
+    ck(npc_purse(c) <= NPC_SALVAGE_MAX, "a monstrous purse is clamped, not trusted");
+    evil[0] = NPC_VERSION + 1;
+    ck_i(npc_load(c, st, rows, NPC_NAMED, evil), -1, "a foreign version is refused");
+}
+
+// ===========================================================================
+// F.  END TO END — a player walks up, opens the panel, and completes a trade
+// ===========================================================================
+fn section_session() {
+    print("F  the session: T then C completes a trade");
+    let sv = server_new(4242, transport_loopback());
+    g_tick = server_t0(sv);
+    server_settle_boot_tier(sv, SET_TIER_TOWN);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    for (let q = 0; q < 130; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
+
+    let st = server_settle(sv);
+    let sto = server_npcs(sv);
+    ck_i(settle_tier(st), SET_TIER_TOWN, "the fixture is a Town");
+    ck(npc_named_count(sto) >= 3, "villagers arrived with the tier");
+
+    // ---- income. Kills pay, at a fixed and stated rate. -------------------
+    // `--town` is a FIXTURE and it grants the purse that a real Town would
+    // have been built with; see `server_settle_boot_tier`. Drain it, so that
+    // what follows measures INCOME and not the fixture.
+    ck_i(server_purse(sv), SV_BOOT_SALVAGE * SET_TIER_TOWN,
+         "the --town fixture grants a purse to match the tier it fabricates");
+    npc_purse_take(sto, server_purse(sv));
+    ck_i(server_purse(sv), 0, "drained, so the next number is earnings");
+    let pr: array = sim_progression(server_world(sv), SV_PSLOT);
+    let xp0: i32 = prog_xp_total(pr);
+    prog_add_xp(pr, 1000);
+    for (let q2 = 0; q2 < 70; q2++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    let want: i32 = i32(f64(prog_xp_total(pr) - xp0) / f64(SV_XP_PER_SALVAGE));
+    print(`   ${prog_xp_total(pr) - xp0} XP earned -> ${server_purse(sv)} salvage (rate 1/${SV_XP_PER_SALVAGE})`);
+    ck_i(server_purse(sv), want, ">>> KILLS PAY SALVAGE, at the stated rate <<<");
+    ck_i(server_salvage_earned(sv), want + SV_BOOT_SALVAGE * SET_TIER_TOWN,
+         "lifetime earnings are the fixture plus what was earned");
+    let p_flat: i32 = server_purse(sv);
+    for (let q3 = 0; q3 < 130; q3++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    ck_i(server_purse(sv), p_flat, "standing still earns nothing");
+
+    // ---- walk to Odo. Every one of his three rows is real. ----------------
+    let d: f64 = walk_to_npc(sv, NPC_ODO, 30000);
+    print(`   walked to Odo, ${d} m`);
+    ck(d < 4.0, "reached the innkeeper on foot");
+    ck_i(server_local(sv).talk_who, NPC_ODO, "Odo is the talk target");
+
+    // ---- the panel opens ON SOMETHING YOU CAN TAKE ------------------------
+    server_grant_salvage(sv, 300);
+    step(sv, BTN_BUILD, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    ck_i(server_ui_panel(sv), UI_PANEL_TRADE, "T opens the trade panel");
+    let l = server_local(sv);
+    print(`   rows ${l.ui_rows}, cursor ${l.ui_row}, takeable ${l.trade_ok}, this row costs ${l.trade_price} (why ${l.trade_why})`);
+    ck(l.ui_rows > 0, "Odo has rows");
+    ck(l.trade_ok > 0, "...and at least one is takeable");
+    ck_i(l.trade_why, NPC_TR_OK,
+         ">>> THE CURSOR OPENS ON A ROW THE CONFIRM WILL ACCEPT <<<");
+    ck(l.trade_price > 0, "and the panel knows what it costs");
+
+    // ---- press C. This is the assertion the gate could not make. ----------
+    let t0: i32 = server_trades(sv);
+    let purse0: i32 = server_purse(sv);
+    let price: i32 = l.trade_price;
+    step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    print(`   trades ${t0} -> ${server_trades(sv)}, purse ${purse0} -> ${server_purse(sv)}, msg ${server_local(sv).ui_msg}`);
+    ck_i(server_trades(sv), t0 + 1, ">>> T THEN C COMPLETES A TRADE <<<");
+    ck_i(server_purse(sv), purse0 - price, "and it cost exactly the price shown");
+    ck(server_local(sv).ui_msg == UI_MSG_TRADED ||
+       server_local(sv).ui_msg == UI_MSG_HEAVY, "and the panel says so in words");
+    ck_i(server_salvage_spent(sv), price + SV_BOOT_SALVAGE * SET_TIER_TOWN,
+         "lifetime spending counts the drain and the trade");
+
+    // ---- every takeable row of Odo's goes through --------------------------
+    let first: i32 = npc_offer_first(NPC_ODO);
+    let cnt: i32 = npc_offer_count(NPC_ODO);
+    let done: i32 = 0;
+    for (let k = 0; k < cnt; k++) {
+        if (npc_trade_check(sto, st, first + k) != NPC_TR_OK) { continue; }
+        cursor_to(sv, k);
+        let tb: i32 = server_trades(sv);
+        step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+        step(sv, 0, 0.0, 0.0, 0.0);
+        if (server_trades(sv) > tb) { done++; }
+    }
+    print(`   ${done} further rows of Odo's completed`);
+    ck(done > 0, "his other open rows complete too");
+    ck_i(server_fit(sv) & SK_EQ_PACK, SK_EQ_PACK, "one of them was the PACK");
+
+    // ---- the honest row still says so -------------------------------------
+    // Walk to Mabel and take the bolt-action deliberately.
+    step(sv, BTN_BUILD, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    let dm: f64 = walk_to_npc(sv, NPC_MABEL, 30000);
+    ck_i(server_local(sv).talk_who, NPC_MABEL, "reached the gunsmith");
+    step(sv, BTN_BUILD, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    ck_i(server_ui_panel(sv), UI_PANEL_TRADE, "her bench opens");
+    ck(server_ui_row(sv) > 3, "the cursor skips past the four unforged guns");
+    let ref0: i32 = server_trades_refused(sv);
+    let pm: i32 = server_purse(sv);
+    cursor_to(sv, 0);
+    step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    print(`   bolt-action -> msg ${server_local(sv).ui_msg} (UNBUILT=${UI_MSG_UNBUILT})`);
+    ck_i(server_local(sv).ui_msg, UI_MSG_UNBUILT, "the bolt-action still says NOT FORGED YET");
+    ck_i(server_trades_refused(sv), ref0 + 1, "and it counts as a refusal");
+    ck_i(server_purse(sv), pm, ">>> AND IT DOES NOT TAKE YOUR MONEY <<<");
+
+    // ---- being broke says so ----------------------------------------------
+    let brk = server_new(4242, transport_loopback());
+    g_tick = server_t0(brk);
+    server_settle_boot_tier(brk, SET_TIER_TOWN);
+    for (let q4 = 0; q4 < 131; q4++) { step(brk, 0, 0.0, 0.0, 0.0); }
+    let bst = server_settle(brk);
+    let bsto = server_npcs(brk);
+    walk_to_npc(brk, NPC_ODO, 30000);
+    npc_purse_take(bsto, server_purse(brk));
+    step(brk, BTN_BUILD, 0.0, 0.0, 0.0);
+    step(brk, 0, 0.0, 0.0, 0.0);
+    ck_i(server_purse(brk), 0, "this session never killed anything");
+    let bt: i32 = server_trades(brk);
+    step(brk, BTN_GRENADE, 0.0, 0.0, 0.0);
+    step(brk, 0, 0.0, 0.0, 0.0);
+    print(`   broke: msg ${server_local(brk).ui_msg} (NO_SALVAGE=${UI_MSG_NO_SALVAGE})`);
+    ck_i(server_local(brk).ui_msg, UI_MSG_NO_SALVAGE, "a broke player is told they are broke");
+    ck_i(server_trades(brk), bt, "and nothing changed hands");
+}
+
+// ===========================================================================
+// G.  CARRY CAPACITY — DIRECTION §7, as metres per second
+// ===========================================================================
+fn section_carry() {
+    print("G  carry capacity (DIRECTION §7)");
+    let sv = server_new(777, transport_loopback());
+    g_tick = server_t0(sv);
+    server_settle_boot_tier(sv, SET_TIER_TOWN);
+    for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    let st = server_settle(sv);
+    let sto = server_npcs(sv);
+
+    // What the authority thinks you are carrying, checked against the parts.
+    let w = server_world(sv);
+    let wst: array = sim_weapon_state(w);
+    let off: i32 = (SV_PSLOT - 1) * WS_FIELDS;
+    let cur: i32 = wpn_cur(wst, off);
+    let rounds: f64 = wst[off + WS_RES0 + cur] + wst[off + WS_MAG0 + cur];
+    let expect: f64 = SV_KG_GUN + SV_KG_LANTERN + rounds * SV_KG_PER_ROUND;
+    print(`   load ${server_load_kg(sv)} kg of ${server_carry_kg(sv)} kg, ${rounds} rounds in hand`);
+    ck(near(server_load_kg(sv), expect, 0.01), "load = gun + lantern + the brass in hand");
+    ck(near(server_carry_kg(sv), stats_carry_kg_at(0, 0, SK_EQ_NONE), 0.01),
+       "capacity is stats.hml's, at Capacity 0 with no equipment");
+    ck(server_load_kg(sv) < server_carry_kg(sv), "a fresh lamplighter is not overloaded");
+    ck(near(server_overload(sv), 0.0, 0.0001), "so overload is zero");
+    ck(near(server_move_mult(sv), 1.0, 0.0001), "and nothing is slowing them");
+
+    // THE PACK IS EQUIPMENT AND IT RAISES THE LIMIT.
+    let cap0: f64 = server_carry_kg(sv);
+    server_grant_salvage(sv, 4000);
+    ck_i(npc_trade_take(sto, st, npc_offer_find(NPC_OFF_BANK, 0)), NPC_TR_OK, "buy the pack");
+    for (let q2 = 0; q2 < 61; q2++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    print(`   capacity ${cap0} -> ${server_carry_kg(sv)} kg with the pack`);
+    ck(server_carry_kg(sv) > cap0, ">>> EQUIPMENT RAISES CARRY CAPACITY <<<");
+    ck(near(server_carry_kg(sv), stats_carry_kg_at(0, 0, SK_EQ_PACK), 0.01),
+       "...by exactly what stats.hml says a pack is worth");
+
+    // NOW LOAD IT UP. Wick sells six kilogrammes at a time.
+    befriend(sto, st, NPC_WICK, NPC_BAND_T_TRUSTED);
+    let kit: i32 = npc_offer_find(NPC_OFF_KIT, 0);
+    let load0: f64 = server_load_kg(sv);
+    ck_i(npc_trade_take(sto, st, kit), NPC_TR_OK, "buy one kit");
+    for (let q3 = 0; q3 < 61; q3++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    print(`   load ${load0} -> ${server_load_kg(sv)} kg with one kit`);
+    ck(near(server_load_kg(sv) - load0, 6.0, 0.01), "one kit is six kilogrammes on your back");
+
+    let bought: i32 = 1;
+    while (server_move_mult(sv) > 0.80 && bought < 16) {
+        npc_trade_take(sto, st, kit);
+        bought++;
+        for (let q4 = 0; q4 < 61; q4++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    }
+    print(`   ${bought} kits: ${server_load_kg(sv)} kg of ${server_carry_kg(sv)} kg, overload ${server_overload(sv)}, move x${server_move_mult(sv)}`);
+    ck(server_overload(sv) > 0.0, "enough of them and you are over your limit");
+    ck(server_load_kg(sv) > server_carry_kg(sv), "...which is what over means");
+    ck(server_move_mult(sv) < 1.0, ">>> AND BEING OVER SLOWS YOU DOWN <<<");
+    ck(server_move_mult(sv) > 0.0, "...but never to a stop (stats.hml §8)");
+    ck(near(server_move_mult(sv),
+            stats_move_mult_at(0, 0, SK_EQ_PACK, server_load_kg(sv)), 0.001),
+       "and the multiplier is exactly stats_move_mult");
+
+    // >>> THE PENALTY IS REAL, IN METRES. <<< The multiplier is worthless if
+    // nothing applies it. Walk 120 ticks loaded, then again unloaded, and
+    // compare the ground covered.
+    let x0: f64 = px_of(sv);
+    let z0: f64 = pz_of(sv);
+    for (let s1 = 0; s1 < 120; s1++) { step(sv, 0, 0.0, 1.0, 0.0); }
+    let dx1: f64 = px_of(sv) - x0;
+    let dz1: f64 = pz_of(sv) - z0;
+    let slow: f64 = sqrt(dx1 * dx1 + dz1 * dz1);
+
+    // Put every kit down out of the world's way and walk the same two seconds.
+    let g: i32 = 0;
+    while (g < bought) { npc_pack_spend(sto, kit); g++; }
+    for (let q5 = 0; q5 < 61; q5++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    ck(near(server_move_mult(sv), 1.0, 0.0001), "an emptied pack is not overloaded");
+    let x1: f64 = px_of(sv);
+    let z1: f64 = pz_of(sv);
+    for (let s2 = 0; s2 < 120; s2++) { step(sv, 0, 0.0, 1.0, 0.0); }
+    let dx2: f64 = px_of(sv) - x1;
+    let dz2: f64 = pz_of(sv) - z1;
+    let fast: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
+    print(`   two seconds of walking: ${slow} m loaded, ${fast} m empty`);
+    ck(fast > slow, ">>> AN OVERLOADED PLAYER COVERS LESS GROUND <<<");
+    ck(slow > 0.0, "...and is not stopped");
+}
+
+// ===========================================================================
+// H.  THE LOOP CLOSES — buy a post, carry it out, put it down
+// ===========================================================================
+fn section_kit() {
+    print("H  a lantern kit goes back into the world");
+    let sv = server_new(2024, transport_loopback());
+    g_tick = server_t0(sv);
+    server_settle_boot_tier(sv, SET_TIER_TOWN);
+    for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    let st = server_settle(sv);
+    let sto = server_npcs(sv);
+    let kit: i32 = npc_offer_find(NPC_OFF_KIT, 0);
+
+    ck_i(server_kits_placed(sv), 0, "nothing placed yet");
+    let lan0: i32 = lantern_count(sv);
+    step(sv, BTN_USE, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    ck_i(lantern_count(sv), lan0, "USE with an empty pack plants nothing");
+
+    server_grant_salvage(sv, 4000);
+    befriend(sto, st, NPC_WICK, NPC_BAND_T_TRUSTED);
+    ck_i(npc_trade_take(sto, st, kit), NPC_TR_OK, "buy a kit");
+    ck_i(npc_pack_count(sto, kit), 1, "it is in the pack");
+
+    // Walk well clear of the town's own lamps first.
+    walk_to(sv, settle_cx(st) + 90.0, settle_cz(st) + 90.0, 30000);
+    let lan1: i32 = lantern_count(sv);
+    step(sv, BTN_USE, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    print(`   lanterns ${lan1} -> ${lantern_count(sv)}, placed ${server_kits_placed(sv)}`);
+    ck_i(lantern_count(sv), lan1 + 1, ">>> A POST GOES DOWN IN THE WORLD <<<");
+    ck_i(server_kits_placed(sv), 1, "and the authority counted it");
+    ck_i(npc_pack_count(sto, kit), 0, "and the pack is one kit lighter");
+
+    // No stacking: a second USE on the same square metre does nothing.
+    step(sv, BTN_USE, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    ck_i(server_kits_placed(sv), 1, "an empty pack plants nothing more");
+    npc_purse_add(sto, 500);
+    ck_i(npc_trade_take(sto, st, kit), NPC_TR_OK, "buy another");
+    step(sv, BTN_USE, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    ck_i(server_kits_placed(sv), 1, ">>> POSTS DO NOT STACK ON ONE SPOT <<<");
+    ck_i(npc_pack_count(sto, kit), 1, "and the unplaced kit is still yours");
+}
+
+// ===========================================================================
+// I.  DETERMINISM — the same seed and the same keys give the same trade
+// ===========================================================================
+fn drive_session(p_seed: i32): i32 {
+    let sv = server_new(p_seed, transport_loopback());
+    g_tick = server_t0(sv);
+    server_settle_boot_tier(sv, SET_TIER_TOWN);
+    for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    let st = server_settle(sv);
+    let sto = server_npcs(sv);
+    let pr: array = sim_progression(server_world(sv), SV_PSLOT);
+    prog_add_xp(pr, 5000);
+    for (let q2 = 0; q2 < 70; q2++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    walk_to_npc(sv, NPC_ODO, 30000);
+    step(sv, BTN_BUILD, 0.0, 0.0, 0.0);
+    step(sv, 0, 0.0, 0.0, 0.0);
+    for (let k = 0; k < 4; k++) {
+        step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);
+        step(sv, 0, 0.0, 0.0, 0.0);
+        step(sv, BTN_SWITCH, 0.0, 0.0, 0.0);
+        step(sv, 0, 0.0, 0.0, 0.0);
+    }
+    let out: i32 = server_w6_hash(sv);
+    return out;
+}
+
+fn section_determinism() {
+    print("I  determinism");
+    let a: i32 = drive_session(31337);
+    let b: i32 = drive_session(31337);
+    let c: i32 = drive_session(31338);
+    print(`   seed 31337 -> ${a} and ${a == b}, seed 31338 -> ${c}`);
+    ck_i(a, b, ">>> SAME SEED, SAME KEYS, SAME TRADE <<<");
+    ck(a != c, "a different seed is a different session");
+}
+
+// ===========================================================================
+// J.  THE `--demo-ui` ROBOT — why the shipping demo still reports `trades 0`
+// ---------------------------------------------------------------------------
+//  `main.hml`'s `demo_ui_drive` presses, in this order: BTN_BUILD, then FIVE
+//  BTN_SWITCH, then BTN_GRENADE. That script was written when the cursor
+//  opened on row 0, where five switches happened to land on Mabel's brass.
+//  The cursor now opens on the first TAKEABLE row, so the same five switches
+//  walk OFF it — and the demo's one confirm lands on a closed row.
+//
+//  This is the difference between "trading is broken" and "the robot presses
+//  the wrong key", and the two look identical in the report line. So it is
+//  MEASURED here rather than argued: the same session, the same seed, the same
+//  villager, with and without the five presses.
+//
+//  `main.hml` is not this task's file. The fix is to delete the five
+//  `sw = 1` lines between ut 16.6 and 19.2 in `demo_ui_drive`, or to move them
+//  after the confirm.
+// ===========================================================================
+fn demo_like(p_switches: i32): i32 {
+    let sv = server_new(4242, transport_loopback());
+    g_tick = server_t0(sv);
+    server_settle_boot_tier(sv, SET_TIER_TOWN);
+    for (let q = 0; q < 131; q++) { step(sv, 0, 0.0, 0.0, 0.0); }
+    walk_to_npc(sv, NPC_MABEL, 30000);
+    if (server_local(sv).talk_who != NPC_MABEL) { let miss: i32 = 0 - 1; return miss; }
+    step(sv, BTN_USE, 0.0, 0.0, 0.0);            // the demo talks first
+    step(sv, 0, 0.0, 0.0, 0.0);
+    step(sv, BTN_BUILD, 0.0, 0.0, 0.0);          // T
+    step(sv, 0, 0.0, 0.0, 0.0);
+    let k: i32 = 0;
+    while (k < p_switches) {
+        step(sv, BTN_SWITCH, 0.0, 0.0, 0.0);     // X
+        step(sv, 0, 0.0, 0.0, 0.0);
+        k++;
+    }
+    step(sv, BTN_GRENADE, 0.0, 0.0, 0.0);        // C
+    step(sv, 0, 0.0, 0.0, 0.0);
+    let out: i32 = server_trades(sv);
+    return out;
+}
+
+fn section_demo() {
+    print("J  the --demo-ui key script");
+    let with5: i32 = demo_like(5);
+    let with0: i32 = demo_like(0);
+    print(`   T + 5x X + C -> ${with5} trades;   T + C -> ${with0} trades`);
+    ck_i(with0, 1, ">>> T THEN C, THE WAY A PLAYER WOULD, COMPLETES A TRADE <<<");
+    ck_i(with5, 0, "...and the demo's five extra X presses walk off the row");
+}
+
+// ===========================================================================
+fn main() {
+    print("");
+    print("W7 TRADE — the economy, end to end");
+    section_table();
+    section_purse();
+    section_pack();
+    section_reasons();
+    section_save();
+    section_session();
+    section_carry();
+    section_kit();
+    section_determinism();
+    section_demo();
+    print("");
+    print(`ASSERTIONS  ran ${g_n}  expected ${EXPECTED_ASSERTIONS}  pass ${g_ok}  fail ${g_n - g_ok}`);
+    if (g_n != EXPECTED_ASSERTIONS) {
+        print(`FAIL  assertion COUNT drifted: ran ${g_n}, expected ${EXPECTED_ASSERTIONS}`);
+        exit(1);
+    }
+    if (g_ok != g_n) {
+        print(`FAIL  ${g_n - g_ok} of ${g_n}`);
+        exit(1);
+    }
+    print(`PASS  ${g_ok}/${g_n} assertions`);
+}
+
+main();

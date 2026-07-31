@@ -1,0 +1,483 @@
+// ---------------------------------------------------------------------------
+// probe_nightanchor.hml — THE NIGHT'S BRIGHT HALF.            (night-anchor)
+//
+//   hemlockc -O1 tools/probe_nightanchor.hml -o /tmp/probe_nightanchor
+//   SDL_VIDEODRIVER=dummy /tmp/probe_nightanchor
+//
+// Exits 0 only if every assertion held AND the number of assertions executed is
+// exactly the number this file says it should — a skipped branch cannot shrink
+// numerator and denominator together and read green.
+//
+// No window is opened.  `skygen_init` / `skygen_bake_all` are explicitly
+// windowless ("No SDL: the panorama can be baked and inspected with no window
+// open"), and this file never calls `skygen_build`.  SDL is still LINKED,
+// because skygen imports `BLEND_NONE` from wobbleweed's sdl.hml, which is why
+// the dummy driver is on the command line; nothing here touches a surface.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS PROBE IS FOR
+// ---------------------------------------------------------------------------
+// CLAUDE.md §8: "every frame needs something below luminance 30 and something
+// above 220.  No darks and no lights means no contrast anchor, and the image
+// reads as a toy."  After the night veil landed, the night owned the dark half
+// outright and had NOTHING for the bright half: measured over 49 in-game night
+// frames, zero carried a >= 40 px contiguous WORLD region above 220, and the
+// brightest world pixel in a night frame was 208.9 — a tier-1 star, not a body.
+//
+// The cause was not brightness.  It was two of them:
+//
+//   1. THE NIGHT SKY WAS DRAWING THE SUN.  skygen decided sun-vs-moon from the
+//      SIGN of the key direction's elevation; tod.hml's night rows store the
+//      key ALREADY NEGATED ("direction negated: this is the moon"), so at 22:00
+//      the body was above the horizon and got SUN_DISC (255,244,200) with a
+//      warm SUN_HALO corona.  Reproduce on the pre-fix build with
+//      `shot --scene ridge_golden --tod 22 --look 201,25`: a golden sun at
+//      midnight, and its disc measured 243.2 on screen.
+//   2. THE MOON WAS ABOVE THE TOP OF THE SCREEN.  The NIGHT keyframe put the
+//      body at 33.0 degrees elevation.  A camera's visible band is
+//      `fov/2 + pitch` — 30 degrees on `ns_bloom`, 27 on `flat_debug` — so even
+//      once it WAS a moon it was out of shot in every authored night frame.
+//
+// So this file pins, with literals (CLAUDE.md rule 5):
+//   [1] the moon is selected at night and the sun at noon, through tod.hml's
+//       own TODSKY_MOON flag rather than through a sign test;
+//   [2] the baked disc clears the ART_BIBLE 220 bar, and clears it by enough
+//       texels that a 40-px screen region is arithmetically guaranteed;
+//   [3] the whole disc is inside the visible band of a normal playing pitch;
+//   [4] the corona implies light on its surroundings without dissolving the
+//       hard limb §11.3 asks for;
+//   [5] the crossfade into the moon is continuous and monotone;
+//   [6] the NIGHT keyframe's FLAT-GROUND light is what it was before the moon
+//       came down, which is the number the inversion is graded on;
+//   [7] the day did not move.
+//
+// >>> WHAT THIS PROBE CANNOT DO, STATED PLAINLY.
+// It cannot measure a SCREEN pixel or a contiguous region.  "a >= 40 px world
+// region above 220" is a rendered-frame measurement made with `tools/shot.hml`
+// and reported in the task's anchor table.  What this file pins is everything
+// that has to be true for that measurement to keep reproducing: the selection,
+// the placement, the disc's own luminance, and the ground it must not brighten.
+// ---------------------------------------------------------------------------
+
+import { exit } from "@stdlib/process";
+import { floor, sqrt, asin, atan2 } from "@stdlib/math";
+
+import { SKY_W, SKY_H,
+         SKYK_ZEN, SKYK_MID, SKYK_HOR, SKYK_CLOUD_LIT, SKYK_CLOUD_SHADOW,
+         SKYK_FOG, SKYK_STAR_ALPHA, SKYK_SUN, SKYK_HALO_R, SKYK_HALO_EXP,
+         SKYK_MOON_PHASE, SKYK_CLOUD_COVER, SKYK_COUNT,
+         skygen_init, skygen_keys_new, skygen_set_keys, skygen_set_clock,
+         skygen_bake_all, skygen_atlas, skygen_body_uv, skygen_body_moon,
+         skygen_sun_is_up } from "../src/art/skygen.hml";
+
+import { tod_eval, tod_reset, tod_set_weather, tod_key_anchor, tod_sky_keys,
+         TOD_NOON, TOD_GOLDEN, TOD_DUSK, TOD_NIGHT, TOD_DEEP,
+         WX_CLEAR, WX_BLOOM,
+         TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
+         TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R,
+         TODSKY_STAR_ALPHA, TODSKY_HALO, TODSKY_MOON,
+         TODSKY_BODY_X, TODSKY_BODY_Y, TODSKY_CLOUD_COVER,
+         TODSKY_COUNT } from "../src/art/tod.hml";
+
+import { env_new, env_field,
+         ENV_FOG_R, ENV_FOG_G, ENV_FOG_B,
+         ENV_AMB_R, ENV_AMB_G, ENV_AMB_B,
+         ENV_SUN_R, ENV_SUN_G, ENV_SUN_B,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z } from "../../wobbleweed/src/shade.hml";
+
+import { pal_r, pal_g, pal_b, g_MOON_DISC, g_SUN_DISC } from "../src/art/palette.hml";
+
+let g_EXPECTED_ASSERTIONS = 25;
+
+let g_pass: i32 = 0;
+let g_n: i32 = 0;
+let g_notes: array = [];
+
+fn ok(label: string, cond: bool) {
+    g_n = g_n + 1;
+    if (cond) { g_pass = g_pass + 1; } else { print(`  FAIL  ${label}`); }
+}
+fn note(s: string) { g_notes.push(s); }
+
+fn f4(p_x: f64): string {
+    let x: f64 = p_x;
+    let neg: i32 = 0;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let scaled: i64 = i64(x * 10000.0 + 0.5);
+    let whole: i64 = scaled / 10000;
+    let frac: i64 = scaled - whole * 10000;
+    let fs: string = `${frac}`;
+    while (fs.length < 4) { fs = `0${fs}`; }
+    let s: string = `${whole}.${fs}`;
+    if (neg == 1) { s = `-${s}`; }
+    return s;
+}
+
+fn adiff(a: f64, b: f64): f64 {
+    let d: f64 = a - b;
+    if (d < 0.0) { d = 0.0 - d; }
+    return d;
+}
+
+// Rec.709, the weights every ground measurement in src/art/tod.hml quotes.
+fn luma709(p_r: f64, p_g: f64, p_b: f64): f64 {
+    let out: f64 = 0.2126 * p_r + 0.7152 * p_g + 0.0722 * p_b;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE tod -> skygen BRIDGE.  Byte-for-byte what tools/shot.hml, tools/walk.hml
+// and src/game/main.hml all do (all three carry the same eight lines; see
+// benchframe's note about it).  Copied rather than invented, because a probe
+// that bridges DIFFERENTLY from the frame is a probe of nothing.
+// ---------------------------------------------------------------------------
+let g_env: array<f64> = env_new();
+let g_todsky: array<f64> = [];
+let g_skyk: array<f64> = [];
+
+fn clamp01(p_x: f64): f64 {
+    let x: f64 = p_x;
+    if (x < 0.0) { x = 0.0; }
+    if (x > 1.0) { x = 1.0; }
+    return x;
+}
+
+fn bake_at(p_key: i32, p_wx: i32) {
+    tod_reset();
+    tod_set_weather(p_wx);
+    tod_eval(g_env, tod_key_anchor(p_key), p_wx);
+    tod_sky_keys(g_todsky);
+    for (let c = 0; c < 3; c++) {
+        g_skyk[SKYK_ZEN + c] = g_todsky[TODSKY_ZENITH_R + c] * 255.0;
+        g_skyk[SKYK_MID + c] = g_todsky[TODSKY_MID_R + c] * 255.0;
+        g_skyk[SKYK_HOR + c] = g_todsky[TODSKY_HORIZON_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_LIT + c] = g_todsky[TODSKY_CLOUD_LIT_R + c] * 255.0;
+        g_skyk[SKYK_CLOUD_SHADOW + c] = g_todsky[TODSKY_CLOUD_SHADOW_R + c] * 255.0;
+        g_skyk[SKYK_SUN + c] = g_todsky[TODSKY_BODY_X + c];
+    }
+    g_skyk[SKYK_SUN] = 0.0 - g_todsky[TODSKY_BODY_X];
+    g_skyk[SKYK_FOG] = env_field(g_env, ENV_FOG_R);
+    g_skyk[SKYK_FOG + 1] = env_field(g_env, ENV_FOG_G);
+    g_skyk[SKYK_FOG + 2] = env_field(g_env, ENV_FOG_B);
+    g_skyk[SKYK_STAR_ALPHA] = g_todsky[TODSKY_STAR_ALPHA];
+    let halo: f64 = g_todsky[TODSKY_HALO];
+    g_skyk[SKYK_HALO_R] = 34.0 + 22.0 * halo;
+    g_skyk[SKYK_HALO_EXP] = 1.8 - 0.6 * halo;
+    g_skyk[SKYK_MOON_PHASE] = 0.5;
+    let occ: f64 = clamp01((g_todsky[TODSKY_CLOUD_COVER] - 0.25) / 0.75);
+    g_skyk[SKYK_CLOUD_COVER] = occ * 0.45;
+    skygen_set_keys(g_skyk);
+    skygen_bake_all();
+}
+
+// ---------------------------------------------------------------------------
+// panorama readers
+// ---------------------------------------------------------------------------
+fn px_luma(p_x: i32, p_y: i32): f64 {
+    let d: buffer = skygen_atlas().data;
+    let xx: i32 = p_x % SKY_W;
+    if (xx < 0) { xx = xx + SKY_W; }
+    let o: i32 = (p_y * SKY_W + xx) * 4;
+    let out: f64 = luma709(f64(d[o]), f64(d[o + 1]), f64(d[o + 2]));
+    return out;
+}
+
+// How many texels within `p_r` of the body clear `p_th` luminance.  The screen
+// area follows from it: the panorama is 512 texels over 360 degrees and the
+// frame is 320 px over an 86.1 degree horizontal fov, so ONE SKY TEXEL IS
+// 2.613 x 2.613 SCREEN PIXELS -- 6.83 px of area, and 6 texels already exceed
+// the 40 px the contrast rule asks for.
+fn body_texels_over(p_r: f64, p_th: f64): i32 {
+    let uv: array<f64> = [0.0, 0.0];
+    skygen_body_uv(uv, 0);
+    let cu: f64 = uv[0];
+    let cv: f64 = uv[1];
+    let r: f64 = p_r;
+    let n: i32 = 0;
+    let y0: i32 = i32(floor(cv - r));
+    let y1: i32 = i32(floor(cv + r)) + 1;
+    if (y0 < 0) { y0 = 0; }
+    if (y1 > SKY_H - 1) { y1 = SKY_H - 1; }
+    let y: i32 = y0;
+    while (y <= y1) {
+        let x: i32 = i32(floor(cu - r)) - 1;
+        let xe: i32 = i32(floor(cu + r)) + 1;
+        while (x <= xe) {
+            let dx: f64 = f64(x) - cu;
+            let dy: f64 = f64(y) - cv;
+            if (dx * dx + dy * dy <= r * r) {
+                if (px_luma(x, y) >= p_th) { n = n + 1; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// The panorama's V is elevation: v = (1 - el/90deg) * (SKY_H - 1).
+fn v_to_elev_deg(p_v: f64): f64 {
+    let out: f64 = (1.0 - p_v / f64(SKY_H - 1)) * 90.0;
+    return out;
+}
+
+fn main() {
+    print("probe_nightanchor — the night's BRIGHT half (CLAUDE.md §8)");
+    print("");
+
+    g_todsky = [];
+    for (let i = 0; i < TODSKY_COUNT; i++) { g_todsky.push(0.0); }
+    g_skyk = skygen_keys_new();
+    skygen_init();
+    skygen_set_clock(0.0);
+
+    let uv: array<f64> = [0.0, 0.0];
+
+    // -----------------------------------------------------------------------
+    print("[1] the body at night is the MOON, and at noon it is the SUN");
+    // -----------------------------------------------------------------------
+    // The flag comes from tod.hml, which has carried it since W2-4 and which
+    // no caller has ever forwarded. It is read here through exactly the bridge
+    // the frame uses, so if a caller ever DOES forward it this still holds.
+    bake_at(TOD_NOON, WX_CLEAR);
+    let noon_moon: f64 = skygen_body_moon();
+    print(`  noon  body_moon ${f4(noon_moon)}   sun_is_up ${skygen_sun_is_up()}`);
+    ok("noon draws the sun", noon_moon == 0.0);
+
+    bake_at(TOD_NIGHT, WX_CLEAR);
+    let night_moon: f64 = skygen_body_moon();
+    skygen_body_uv(uv, 0);
+    let nu: f64 = uv[0];
+    let nv: f64 = uv[1];
+    print(`  22:00 body_moon ${f4(night_moon)}   body u,v = ${f4(nu)}, ${f4(nv)}`);
+    ok("22:00 draws the moon", night_moon == 1.0);
+
+    bake_at(TOD_DEEP, WX_CLEAR);
+    ok("02:00 draws the moon", skygen_body_moon() == 1.0);
+
+    // The one weather that shares the night with the flagship violet scene.
+    // `ns_bloom` renders at 22:00 under WX_BLOOM; if the flag did not survive
+    // the weather blend the money shot would keep its golden midnight sun.
+    bake_at(TOD_NIGHT, WX_BLOOM);
+    ok("22:00 under the nightshade bloom still draws the moon",
+       skygen_body_moon() == 1.0);
+
+    // -----------------------------------------------------------------------
+    print("[2] the disc clears the ART_BIBLE §8 bar of 220, with margin");
+    // -----------------------------------------------------------------------
+    bake_at(TOD_NIGHT, WX_CLEAR);
+    skygen_body_uv(uv, 0);
+    let cu: f64 = uv[0];
+    let cv: f64 = uv[1];
+    let centre: f64 = px_luma(i32(cu + 0.5), i32(cv + 0.5));
+    let moon_alb: f64 = luma709(f64(pal_r(g_MOON_DISC)), f64(pal_g(g_MOON_DISC)),
+                                f64(pal_b(g_MOON_DISC)));
+    print(`  MOON_DISC albedo luminance ${f4(moon_alb)}   baked centre ${f4(centre)}`);
+    // MOON_DISC is (220,228,240) = 227.2 by Rec.709. The bar is a LITERAL 220,
+    // not `moon_alb - epsilon`: a bound derived from the thing it guards passes
+    // for ever. The panorama reaches the screen UNDARKENED (measured: SUN_DISC
+    // lands as exactly (255,244,200) on a rendered frame), so a texel over 220
+    // here is a pixel over 220 there.
+    ok("the baked disc centre is at or above 220", centre >= 220.0);
+    ok("the disc is the MOON's colour, not the SUN's",
+       adiff(centre, moon_alb) < 1.5);
+
+    // 6 texels is 41 screen px, so this is the >= 40 px contiguous region the
+    // rule asks for, arithmetically. 120 is ~30x that: the assertion is that
+    // the disc is a DISC, not that some texel got lucky.
+    let over220: i32 = body_texels_over(11.0, 220.0);
+    let disc_px: f64 = f64(over220) * 6.83;
+    print(`  disc texels >= 220: ${over220}  ==  ${f4(disc_px)} screen px`);
+    note(`the 22:00 moon carries ${over220} sky texels over luminance 220 == ${f4(disc_px)} screen px`);
+    ok("the disc is a large contiguous region, not a sparkle", over220 >= 120);
+
+    // The mare are MOON_MARE (168,180,200) = 178.6 and are BELOW the bar on
+    // purpose: a disc with no internal structure is a sticker. This checks
+    // they did not eat the disc.
+    let over178: i32 = body_texels_over(11.0, 178.0);
+    ok("the mare are darker than the disc but do not eat it",
+       over178 > over220 && over220 * 100 > over178 * 60);
+
+    // -----------------------------------------------------------------------
+    print("[3] the moon is INSIDE the visible band of a playing camera");
+    // -----------------------------------------------------------------------
+    // A camera's visible elevation band is fov/2 + pitch. The five authored
+    // night cameras run pitch -8 (`flat_debug`) to 0 (`ridge_golden`) at a 70
+    // degree fov, so the tightest band top is 27 degrees. The disc's own radius
+    // is MOON_DISC_R = 11 texels = 6.19 degrees, and it must clear the top of
+    // that band by its whole radius or it is a half-moon clipped by the screen
+    // edge -- which is what 33.0 degrees was.
+    let el: f64 = v_to_elev_deg(cv);
+    print(`  22:00 moon elevation ${f4(el)} deg   (band top: 27 deg at pitch -8)`);
+    note(`the 22:00 moon sits at ${f4(el)} deg elevation, disc top ${f4(el + 6.19)} deg`);
+    ok("the whole disc is below the tightest authored band top (27 deg)",
+       el + 6.19 < 27.0);
+    // ... and not so low that it is buried in the fog band and the terrain.
+    // The stars themselves fade out by v = 0.80 of the panorama, which is
+    // elevation 18 degrees; a moon under 10 degrees would sit in the mist.
+    ok("the moon is clear of the horizon mist (> 10 deg)", el > 10.0);
+
+    // 02:00 is allowed to be the hour the moon is overhead: probe_tod pins
+    // DEEP's body.y above 0.5 and this file does not fight it. Asserted so the
+    // gap is VISIBLE rather than forgotten.
+    bake_at(TOD_DEEP, WX_CLEAR);
+    skygen_body_uv(uv, 0);
+    let el_deep: f64 = v_to_elev_deg(uv[1]);
+    print(`  02:00 moon elevation ${f4(el_deep)} deg  — OUT of the playing band, by design`);
+    note(`02:00's moon is at ${f4(el_deep)} deg and is NOT a screen anchor; probe_tod pins DEEP body.y > 0.5`);
+    ok("02:00's moon is higher than 22:00's (the moon rises)", el_deep > el);
+
+    // -----------------------------------------------------------------------
+    print("[4] the corona implies light, and the limb stays hard");
+    // -----------------------------------------------------------------------
+    bake_at(TOD_NIGHT, WX_CLEAR);
+    skygen_body_uv(uv, 0);
+    cu = uv[0];
+    cv = uv[1];
+    // Sampled along +U at the body's own row, so the gradient row is identical
+    // for all three and only the corona differs.
+    let just_out: f64 = px_luma(i32(cu + 13.0), i32(cv + 0.5));
+    let mid_out: f64 = px_luma(i32(cu + 22.0), i32(cv + 0.5));
+    let far_out: f64 = px_luma(i32(cu + 40.0), i32(cv + 0.5));
+    print(`  luminance at r = 13 / 22 / 40 texels: ${f4(just_out)} / ${f4(mid_out)} / ${f4(far_out)}`);
+    note(`moon corona: ${f4(just_out)} at the limb, ${f4(mid_out)} mid, ${f4(far_out)} clear sky`);
+    ok("the corona lifts the sky next to the limb", just_out > far_out + 20.0);
+    ok("the corona falls off monotonically",
+       just_out > mid_out && mid_out > far_out);
+    // MOON_HALO_R is 30, so at r = 40 the corona contributes exactly zero and
+    // what is left is the night sky's own gradient. The bound is a literal
+    // fifth of the disc rather than a delta against another sample, because
+    // every other sample on this row can carry a cloud or a star.
+    ok("the corona is spent by r = 40 (MOON_HALO_R is 30)",
+       far_out < centre * 0.20);
+    // A corona brighter than about half the disc reads as a pale hole in the
+    // sky rather than as a glow, and the hard limb §11.3 asks for is gone.
+    ok("the limb is still a STEP: the corona is under half the disc",
+       just_out * 2.0 < centre);
+
+    // -----------------------------------------------------------------------
+    print("[5] the sun -> moon crossfade is continuous and monotone");
+    // -----------------------------------------------------------------------
+    // tod.hml's KF_MOON lerps 0 -> 1 across the DUSK -> NIGHT segment, so the
+    // swap is a dissolve, not a one-frame colour pop. Walked at the keyframe
+    // anchors plus the two ends.
+    let d0: f64 = tod_key_anchor(TOD_DUSK);
+    let d1: f64 = tod_key_anchor(TOD_NIGHT);
+    let prev: f64 = -1.0;
+    let bad_mono: i32 = 0;
+    let max_step: f64 = 0.0;
+    let i: i32 = 0;
+    while (i <= 40) {
+        let t: f64 = d0 + (d1 - d0) * (f64(i) / 40.0);
+        tod_reset();
+        tod_set_weather(WX_CLEAR);
+        tod_eval(g_env, t, WX_CLEAR);
+        tod_sky_keys(g_todsky);
+        let m: f64 = g_todsky[TODSKY_MOON];
+        if (m < prev - 0.000000001) { bad_mono = bad_mono + 1; }
+        if (prev >= 0.0) {
+            let s: f64 = adiff(m, prev);
+            if (s > max_step) { max_step = s; }
+        }
+        prev = m;
+        i = i + 1;
+    }
+    print(`  worst step over 1/40 of the DUSK->NIGHT segment: ${f4(max_step)}`);
+    ok("the moon amount never goes backwards into the night", bad_mono == 0);
+    ok("the moon amount is a dissolve, not a step", max_step < 0.20);
+    ok("the segment ends at a full moon and starts at none", prev == 1.0);
+
+    // -----------------------------------------------------------------------
+    print("[6] THE GROUND DID NOT MOVE — the inversion is graded on it");
+    // -----------------------------------------------------------------------
+    // Flat ground catches `ambient + dir.y * key`. The NIGHT key came down from
+    // 33.0 to 18.06 degrees so the moon would be in shot, and the key colour
+    // was rescaled by 0.5446/0.3100 in the two channels with headroom so this
+    // product is unchanged. These are the PRE-CHANGE products, written as
+    // literals: 0.5446*0.30 = 0.163380 and 0.5446*0.32 = 0.174272.
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    tod_eval(g_env, tod_key_anchor(TOD_NIGHT), WX_CLEAR);
+    let ny: f64 = env_field(g_env, ENV_SUN_Y);
+    let kr: f64 = env_field(g_env, ENV_SUN_R);
+    let kg: f64 = env_field(g_env, ENV_SUN_G);
+    let kb: f64 = env_field(g_env, ENV_SUN_B);
+    let ar: f64 = env_field(g_env, ENV_AMB_R);
+    let ag: f64 = env_field(g_env, ENV_AMB_G);
+    let ab: f64 = env_field(g_env, ENV_AMB_B);
+    print(`  22:00 key dir.y ${f4(ny)}  key rgb (${f4(kr)}, ${f4(kg)}, ${f4(kb)})`);
+    print(`        flat-ground gain (${f4(ar + ny * kr)}, ${f4(ag + ny * kg)}, ${f4(ab + ny * kb)})`);
+    note(`22:00 flat-ground light (${f4(ar + ny * kr)}, ${f4(ag + ny * kg)}, ${f4(ab + ny * kb)}) at key elevation ${f4(asin(ny) * 57.29577951308232)} deg`);
+    ok("the red the ground catches is what it was", adiff(ny * kr, 0.163380) < 0.0005);
+    ok("the green the ground catches is what it was", adiff(ny * kg, 0.174272) < 0.0005);
+    // Blue CANNOT be rescaled: the ambient's blue is 0.91 and `ambient + sun`
+    // is capped at 1 per channel, so the key's blue is pinned at 0.09. The cost
+    // is bounded here rather than left to be discovered.
+    ok("the blue the ground gives up is under a quarter of a byte of albedo",
+       (0.163380 / 0.30 * 0.09 - ny * kb) * 32.0 < 0.75);
+    // The whole point of the veil is that night is the darkest ground of the
+    // day; a key change that lifted it would undo the inversion.
+    ok("ambient + key still fits the multiply-only budget",
+       ar + kr <= 1.0 && ag + kg <= 1.0 && ab + kb <= 1.0);
+
+    tod_reset();
+    tod_set_weather(WX_CLEAR);
+    tod_eval(g_env, tod_key_anchor(TOD_DEEP), WX_CLEAR);
+    let dy2: f64 = env_field(g_env, ENV_SUN_Y);
+    let deep_g: f64 = env_field(g_env, ENV_AMB_G) + dy2 * env_field(g_env, ENV_SUN_G);
+    let night_g: f64 = ag + ny * kg;
+    print(`  flat-ground GREEN: 22:00 ${f4(night_g)}   02:00 ${f4(deep_g)}`);
+    ok("02:00 is still darker than 22:00 on flat ground", deep_g < night_g);
+
+    // >>> WHAT IS DELIBERATELY *NOT* ASSERTED HERE.
+    // "night is darker than golden hour" is NOT a statement about this number.
+    // Flat-ground GAIN at 22:00 (green 0.5642) is legitimately higher than at
+    // golden hour (a 9-degree key puts almost nothing on flat ground), and it
+    // always was — what makes the night dark is THE VEIL, which multiplies the
+    // whole world down afterwards and which `tools/probe_night.hml` owns. An
+    // assertion here would be measuring the wrong stage and would fail on a
+    // correct build. The elevation itself is pinned instead, because that is
+    // what this task changed and what a future edit would silently undo.
+    ok("the 22:00 key elevation is the one the moon is placed at",
+       adiff(ny, 0.3100) < 0.0001);
+
+    // -----------------------------------------------------------------------
+    print("[7] the day did not move");
+    // -----------------------------------------------------------------------
+    // The noon body must still be the SUN, at full strength.  It is measured as
+    // a COUNT of texels at or above 240 inside SUN_DISC_R, not as the centre
+    // texel: pass 5 draws the clouds AFTER the body and at NOON the coverage is
+    // 0.25, so the centre texel is often cloud (measured 189.4).  240 separates
+    // the two bodies outright — SUN_DISC is 243.2 and MOON_DISC is 227.2 — so
+    // a non-zero count is proof the sun is there and is unfaded.
+    bake_at(TOD_NOON, WX_CLEAR);
+    let sun_alb: f64 = luma709(f64(pal_r(g_SUN_DISC)), f64(pal_g(g_SUN_DISC)),
+                               f64(pal_b(g_SUN_DISC)));
+    let sun_hot: i32 = body_texels_over(9.0, 240.0);
+    print(`  noon: ${sun_hot} texels >= 240 inside SUN_DISC_R  (SUN_DISC albedo ${f4(sun_alb)})`);
+    note(`the noon sun still bakes ${sun_hot} texels at or above 240; MOON_DISC could not reach it (227.2)`);
+    // MEASURED 16 of the 254 texels inside SUN_DISC_R, because NOON's cloud
+    // coverage buries most of the disc — that is pre-existing and correct, and
+    // it is why the bound is 8 and not 200. Independently confirmed: every
+    // rendered frame from 05:30 through 19:30 is FNV-IDENTICAL before and after
+    // this task (ridge_golden at tod 5.5 / 12.0 / 18.25 / 19.5).
+    ok("the noon sun disc is still SUN_DISC, hard and unfaded", sun_hot >= 8);
+
+    print("");
+    print("--- notes ---");
+    let ni: i32 = 0;
+    while (ni < g_notes.length) { print(`  ${g_notes[ni]}`); ni = ni + 1; }
+    print("");
+    if (g_n != g_EXPECTED_ASSERTIONS) {
+        print(`FAIL assertion count: ran ${g_n}, expected ${g_EXPECTED_ASSERTIONS} — a branch was skipped`);
+        exit(1);
+    }
+    if (g_pass == g_n) { print(`PASS ${g_pass}/${g_n}`); }
+    else {
+        print(`FAIL ${g_pass}/${g_n}`);
+        exit(1);
+    }
+}
+
+main();

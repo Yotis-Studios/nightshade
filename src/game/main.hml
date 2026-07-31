@@ -204,7 +204,8 @@ import { FX_EMBER, FX_XP_MOTE, FX_GLOW_S, FX_GLOW_L, FX_RAIN,
 import { hudgen_uv, hudgen_rect, hud_font_micro, hud_font_big,
          HUD_SOLID, HUD_XH_TICK_V, HUD_XH_TICK_H, HUD_XH_DOT, HUD_HITMARK,
          HUD_CHEVRON, HUD_TICK_MINOR, HUD_TICK_MAJOR, HUD_ICON_LANTERN,
-         HUD_ICON_DIAMOND, HUD_ICON_ARROW, HUD_ICON_AMMO, HUD_ICON_HEART }
+         HUD_ICON_DIAMOND, HUD_ICON_ARROW, HUD_ICON_AMMO, HUD_ICON_HEART,
+         hudgen_xh_place, hudgen_cx, hudgen_cy, hudgen_bot }
        from "../art/hudgen.hml";
 import { meshgen_villager_mesh, meshgen_villager_lod1_m,
          meshgen_villager_lod2_m } from "../art/meshgen.hml";
@@ -415,7 +416,12 @@ let g_win = null;
 let g_target = null;
 let g_in = null;
 let g_bhud = null;
-let g_fb: ptr = alloc(320 * 240 * 4);
+// The ARGB8888 readback buffer, sized FROM THE CONFIGURED FRAME, not from a
+// literal. It read `alloc(320 * 240 * 4)` until 2026-07-31, which survived the
+// 16:9 change only because 320x180 needs LESS memory than 320x240 — it would
+// have been a silent heap overflow in the other direction. Six other files in
+// the repo still carry the literal; see the task report.
+let g_fb: ptr = alloc(g_RES_W * g_RES_H * 4);
 
 let g_atlas_world = null;
 let g_atlas_fx = null;
@@ -427,6 +433,9 @@ let g_tex_sky = null;
 let g_uvq: array<f64> = [0.0, 0.0, 0.0, 0.0];
 let g_uvw: array<f64> = [0.0, 0.0, 0.0, 0.0];
 let g_rect: array<i32> = [0, 0, 0, 0];
+// The four crosshair arm positions hudgen_xh_place fills in. Retained, not
+// allocated per frame (CLAUDE.md N6).
+let g_xh: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0];
 let g_skyk: array<f64> = [];
 let g_todsky: array<f64> = [];
 
@@ -1452,6 +1461,49 @@ let g_TB_BANNER: i32 = 88;
 let g_TB_CARD: i32 = 80;
 let g_TB_PROMPT: i32 = 108;
 let g_TB_DBG: i32 = 120;
+
+// ===========================================================================
+//  THE TWO TRANSIENT BANDS, RE-LAID FOR 320x180
+// ---------------------------------------------------------------------------
+// Everything on this HUD is anchored to one of four things: the frame's TOP
+// edge (compass, objective diamond, wave readout, debug plate — all unchanged,
+// a shorter frame does not move its own top), the frame's BOTTOM edge (the
+// health/oil/ammo/XP cluster — `hudgen_bot`, at the draw site), the RETICLE
+// (crosshair, hitmarker, reload and channel bars — `cx`/`cy`, free), or one of
+// the two TRANSIENT BANDS below, which is everything celebratory or narrative.
+//
+// The bands are what actually got squeezed. At 4:3 there were 120 px above the
+// reticle and 120 below it; at 16:9 there are 90 and 90, and the bottom cluster
+// eats 40 of the lower 90. So the bands are re-laid rather than scaled, and the
+// constraint each one is solved against is written down here:
+//
+//   UPPER BAND — between the objective-marker row (ends y 21) and the topmost
+//   pixel the crosshair can reach. The widest legal crosshair is spread 9,
+//   whose top arm ink begins at cy - 12 = 78. Usable: 22..78, 56 px.
+//     24  banner      FONT_BIG, 12 px      -> 24..36
+//     40  toast       FONT_MICRO, 7 px     -> 40..47
+//     50  unlock card plate, 20 px         -> 50..70, and x >= 192 always
+//     62  LEVEL n     FONT_BIG, 12 px      -> 62..74, x 132..188, clears the card
+//   The card and the level line share rows 62..70 exactly as they did at 4:3,
+//   and exactly as at 4:3 they cannot collide because the card slides in from
+//   the right edge (`x0 = RES_W - 128*slide`, so x0 >= 192) and the level line
+//   is centred and at most 56 px wide.
+//
+//   LOWER BAND — between the reticle and the bottom cluster's topmost element
+//   (the spell name at y 140). The reload and channel bars own cy+12..cy+23,
+//   i.e. 102..113. Usable: 114..140, 26 px, and it has to hold a 22 px prompt
+//   plate, its 3 px charge bar and an 11 px speech plate — 36 px of content in
+//   26 px of room. It does not fit, so the speech line MOVED OUT of the band:
+//   it now sits at 144, alongside the bottom cluster rather than above it, and
+//   is NARROWED from 184 px to 160 px (cx-80, so x 80..240) so it clears the
+//   oil/health bars on the left (x 9..71) and the ammo plate on the right
+//   (x 238..314). MEASURED against those three rects, not estimated.
+let g_Y_BANNER: f64 = 24.0;
+let g_Y_TOAST: f64 = 40.0;
+let g_Y_CARD: f64 = 50.0;
+let g_Y_LEVEL: f64 = 62.0;
+let g_Y_PROMPT: f64 = 114.0;
+let g_Y_TALKLINE: f64 = 144.0;
 let g_hud_tris: i32 = 0;
 let g_hud_over: i32 = 0;
 // Frames in which the unlock card had to drop glyphs. MUST STAY 0 — see the
@@ -1534,6 +1586,26 @@ fn hud_centre_big(p_y: f64, p_s: string, p_c: i32, p_budget: i32): i32 {
 //  the cap.
 // ===========================================================================
 
+// THE PANEL PLATE, RE-SIZED FOR 320x180.
+// At 4:3 it was 280x150 at (20, 40): 62 % of the frame's height, with a 40 px
+// margin above and 50 below, and "the world dims but never disappears" was
+// legible in those margins. Keeping 150 in a 180-tall frame would leave 15 px
+// top and bottom and make the claim a lie -- SETTLEMENT.md's whole point is
+// that the trade is happening in a town you are STANDING IN.
+//
+// 128 at y 26 keeps the same 71 %-of-what's-left feel with a symmetric 26 px
+// margin, and every internal offset below is expressed FROM THE PLATE so the
+// row pitch (14 px, which the 9 px selection bar needs) never has to be
+// re-derived. What fits, measured against the plate rather than asserted:
+//     title      +8                       ->  34 .. 41
+//     5 rows     +26 + i*14, 7 px each    ->  52 .. 115  (bar +25 .. +116)
+//     footer     +100                     -> 126 .. 133
+//     message    +114                     -> 140 .. 147
+//     plate ends +128                     -> 154, so 7 px of plate under the
+//                                            message, as at 4:3
+let g_PANEL_Y: f64 = 26.0;
+let g_PANEL_H: f64 = 128.0;
+
 let g_PANEL_ROWS_VISIBLE: i32 = 3;
 
 // EVERY STRING IN A PANEL GOES THROUGH HERE, and here counts the frames in
@@ -1577,23 +1649,23 @@ fn hud_panel(p_budget: i32): i32 {
     // The world dims but never disappears: SETTLEMENT.md's whole point is that
     // the town is a place you are STANDING IN, and a menu that blacks it out
     // makes the trade happen in an inventory rather than at a bench.
-    n = n + hud_rect(20.0, 40.0, 280.0, 150.0, g_UI_BLACK, 205);
+    n = n + hud_rect(20.0, g_PANEL_Y, 280.0, g_PANEL_H, g_UI_BLACK, 205);
 
     let row: i32 = client_ui_row(g_cl);
     let rows: i32 = client_ui_rows(g_cl);
 
     if (panel == UI_PANEL_CHAR) {
-        n = n + hud_panel_text(34.0, 48.0, "CHARACTER", g_UI_AMBER,
+        n = n + hud_panel_text(34.0, g_PANEL_Y + 8.0, "CHARACTER", g_UI_AMBER,
                                clampi(p_budget - n, 0, 40));
         let pts: i32 = client_points(g_cl);
         let pc: i32 = g_UI_DIM;
         if (pts > 0) { pc = g_UI_XP; }
-        n = n + hud_panel_text(216.0, 48.0, `${pts} PTS`, pc,
+        n = n + hud_panel_text(216.0, g_PANEL_Y + 8.0, `${pts} PTS`, pc,
                                clampi(p_budget - n, 0, 32));
         for (let i = 0; i < 5; i++) {
             let sel: i32 = 0;
             if (i == row) { sel = 1; }
-            n = n + hud_panel_row(70.0 + f64(i) * 14.0, sel,
+            n = n + hud_panel_row(g_PANEL_Y + 26.0 + f64(i) * 14.0, sel,
                                   client_stat_short(i),
                                   `${client_stat(g_cl, i)}`,
                                   g_UI_DIM, p_budget - n);
@@ -1602,17 +1674,17 @@ fn hud_panel(p_budget: i32): i32 {
         // close key is deliberately NOT on this line: TAB opens and TAB
         // closes, `controls_print` says so, and the two glyphs it would cost
         // are the two that made the line truncate.
-        n = n + hud_panel_text(34.0, 160.0, "X NEXT   C SPEND", g_UI_DIM,
+        n = n + hud_panel_text(34.0, g_PANEL_Y + 100.0, "X NEXT   C SPEND", g_UI_DIM,
                                clampi(p_budget - n, 0, 56));
     } else {
         let who: i32 = client_talk_who(g_cl);
         if (who < 0) {
-            n = n + hud_centre(110.0, "NOBODY HERE", g_UI_DIM,
+            n = n + hud_centre(g_PANEL_Y + g_PANEL_H * 0.5 - 3.0, "NOBODY HERE", g_UI_DIM,
                                clampi(p_budget - n, 0, 48));
         } else {
-            n = n + hud_panel_text(34.0, 48.0, client_npc_name(who), g_UI_AMBER,
+            n = n + hud_panel_text(34.0, g_PANEL_Y + 8.0, client_npc_name(who), g_UI_AMBER,
                                    clampi(p_budget - n, 0, 32));
-            n = n + hud_panel_text(150.0, 48.0, client_npc_place(who), g_UI_DIM,
+            n = n + hud_panel_text(150.0, g_PANEL_Y + 8.0, client_npc_place(who), g_UI_DIM,
                                    clampi(p_budget - n, 0, 48));
             // THE WINDOW. Three rows, scrolled to keep the cursor inside. A
             // villager can have nine offers and nine rows is 460 triangles.
@@ -1644,15 +1716,15 @@ fn hud_panel(p_budget: i32): i32 {
                 let g: i32 = npc_offer_first(who) + k;
                 let lab: string = client_offer_label(npc_offer_kind(g),
                                                      npc_offer_arg(g));
-                n = n + hud_panel_row(72.0 + f64(shown) * 14.0, sel, lab, "",
+                n = n + hud_panel_row(g_PANEL_Y + 28.0 + f64(shown) * 14.0, sel, lab, "",
                                       c, p_budget - n);
                 shown++;
             }
             if (rows > g_PANEL_ROWS_VISIBLE) {
-                n = n + hud_text(286.0, 48.0, `${row + 1}`, g_UI_DIM,
+                n = n + hud_text(286.0, g_PANEL_Y + 8.0, `${row + 1}`, g_UI_DIM,
                                  clampi(p_budget - n, 0, 12));
             }
-            n = n + hud_panel_text(34.0, 160.0, "X NEXT   C TAKE", g_UI_DIM,
+            n = n + hud_panel_text(34.0, g_PANEL_Y + 100.0, "X NEXT   C TAKE", g_UI_DIM,
                                    clampi(p_budget - n, 0, 56));
         }
     }
@@ -1661,7 +1733,7 @@ fn hud_panel(p_budget: i32): i32 {
     // menu the player stops trusting.
     let msg: i32 = client_ui_msg(g_cl);
     if (msg != 0) {
-        n = n + hud_centre(176.0, client_ui_msg_text(msg), g_UI_AMBER,
+        n = n + hud_centre(g_PANEL_Y + 114.0, client_ui_msg_text(msg), g_UI_AMBER,
                            clampi(p_budget - n, 0, 60));
     }
 
@@ -1694,7 +1766,7 @@ fn hud_build() {
         used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
                                g_UI_BLACK, clampi(i32(fade * 255.0), 0, 255));
         if (fade > 0.35) {
-            used = used + hud_centre(112.0, "THE LAMPS WENT OUT ON A TUESDAY",
+            used = used + hud_centre(cy - 20.0, "THE LAMPS WENT OUT ON A TUESDAY",
                                      g_UI_DIM, clampi(cap - used, 0, 128));
         }
     }
@@ -1732,14 +1804,43 @@ fn hud_build() {
     // ---- the crosshair, with real spread bloom --------------------------
     // The gap grows with hipfire bloom, exactly as ART_BIBLE §9.3 asks. ADS
     // pulls it in; a dry magazine turns it red (GDD §7.12).
-    let spread: f64 = 3.0 + 4.0 * (1.0 - client_ads(g_cl));
-    if (client_speed(g_cl) > 5.6) { spread = spread + 3.0; }
+    //
+    // >>> THIS WAS THE COPY THAT WAS WRONG. <<<  Until the 16:9 change the four
+    // arms were hand-placed here as `cx - 6 - spread` / `cx + 2 + spread`,
+    // which is NOT symmetric: hudgen bakes each tick's ink one texel inside its
+    // own rect, so the left arm's ink ended at cx - 2 - spread while the right
+    // arm's began at cx + 3 + spread — two pixels further out.
+    //
+    // MEASURED, not reasoned: `--demo 8 --shots`, hipfire, native readback of
+    // the old 320x240 build.
+    //     horizontal ink  cols 148..151 and 170..173  -> midpoint 160.5
+    //     vertical   ink  rows 108..111 and 130..133  -> midpoint 120.5
+    // The aim axis is at 160.0/120.0, so the correct midpoints are 159.5/119.5:
+    // the whole cross sat ONE PIXEL right and one down, with a 8 px gap on the
+    // left and a 10 px gap on the right. shot.hml and walk.hml, measuring
+    // 151..154 / 165..168 (midpoint 159.5), were correct all along. Three hand
+    // copies, one wrong, and no test that could see it because each file agreed
+    // with itself.
+    //
+    // The same readback on THIS code at 320x180 gives 148..151 and 168..171,
+    // midpoint 159.5, and rows 78..81 / 98..101, midpoint 89.5 — the left and
+    // top arms land on exactly the pixels they always did and the right and
+    // bottom ones move IN by two to meet them.
+    //
+    // `hudgen_xh_place` is now the only implementation. Its `spread` is
+    // ART_BIBLE §9.3's own 0..9 and the gap from the aim axis is 3 + spread, so
+    // the mapping below reproduces this HUD's LEFT-arm gaps exactly — 4 px at
+    // full ADS, 8 px at the hip, 11 px sprinting — and the right and bottom
+    // arms move IN by two pixels to meet them.
+    let sp: i32 = clampi(i32(1.0 + 4.0 * (1.0 - client_ads(g_cl))), 0, 9);
+    if (client_speed(g_cl) > 5.6) { sp = clampi(sp + 3, 0, 9); }
     let xc: i32 = g_UI_WHITE;
     if (client_ammo(g_cl) <= 0) { xc = g_UI_DANGER; }
-    used = used + hud_sprite(HUD_XH_TICK_H, cx - 6.0 - spread, cy - 1.0, xc, 255);
-    used = used + hud_sprite(HUD_XH_TICK_H, cx + 2.0 + spread, cy - 1.0, xc, 255);
-    used = used + hud_sprite(HUD_XH_TICK_V, cx - 1.0, cy - 6.0 - spread, xc, 255);
-    used = used + hud_sprite(HUD_XH_TICK_V, cx - 1.0, cy + 2.0 + spread, xc, 255);
+    hudgen_xh_place(hudgen_cx(), hudgen_cy(), sp, g_xh, 0);
+    used = used + hud_sprite(HUD_XH_TICK_H, f64(g_xh[0]), f64(g_xh[1]), xc, 255);
+    used = used + hud_sprite(HUD_XH_TICK_H, f64(g_xh[2]), f64(g_xh[3]), xc, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, f64(g_xh[4]), f64(g_xh[5]), xc, 255);
+    used = used + hud_sprite(HUD_XH_TICK_V, f64(g_xh[6]), f64(g_xh[7]), xc, 255);
     used = used + hud_sprite(HUD_XH_DOT, cx - 1.0, cy - 1.0, xc, 255);
 
     // ---- the hitmarker (GDD §7.4) ----------------------------------------
@@ -1792,21 +1893,41 @@ fn hud_build() {
         used = used + hud_sprite(HUD_ICON_DIAMOND, spx - 3.0, 14.0, smc, 200);
     }
 
+    // ---- THE BOTTOM CLUSTER, RE-ANCHORED FOR 16:9 -----------------------
+    // 320x180 moved the bottom edge up 60 px. Every y below is now measured
+    // FROM THAT EDGE through `hudgen_bot(height, clearance)` instead of being a
+    // literal that silently meant "240 minus something". The CLEARANCES are
+    // carried over from 4:3 unchanged, so the stack keeps its own internal
+    // spacing exactly — it is 34 px tall in both frames, it just starts higher
+    // up a shorter one (78 % down the frame instead of 83 %).
+    //
+    //   element                   4:3 y   16:9 y   clearance under it
+    //     spell name              200      140      —
+    //     oil track (6 px)        209      149      25 px
+    //     oil cooldown hairline   216      156      —
+    //     health track (6 px)     219      159      15 px
+    //     health numeral          228      168      —
+    //     XP track (3 px)         237      177       0 px  (it IS the edge)
+    let y_xp: f64 = hudgen_bot(3.0, 0.0);          // 177
+    let y_hp: f64 = hudgen_bot(6.0, 15.0);         // 159
+    let y_oil: f64 = hudgen_bot(6.0, 25.0);        // 149
+    let y_am: f64 = hudgen_bot(16.0, 6.0);         // 158
+
     // ---- health ----------------------------------------------------------
     let hp01: f64 = client_hp01(g_cl);
-    used = used + hud_rect(9.0, 219.0, 62.0, 6.0, g_UI_BLACK, 190);
+    used = used + hud_rect(9.0, y_hp, 62.0, 6.0, g_UI_BLACK, 190);
     let hc2: i32 = g_UI_GOOD;
     if (f64(client_hp(g_cl)) <= g_LOW_HP) { hc2 = g_UI_DANGER; }
-    used = used + hud_rect(10.0, 220.0, 60.0 * hp01, 4.0, hc2, 255);
-    used = used + hud_text(10.0, 228.0, `${client_hp(g_cl)}`, hc2, g_TB_HP);
+    used = used + hud_rect(10.0, y_hp + 1.0, 60.0 * hp01, 4.0, hc2, 255);
+    used = used + hud_text(10.0, y_hp + 9.0, `${client_hp(g_cl)}`, hc2, g_TB_HP);
 
     // ---- ammo: GDD §8 says the counter reads 6 / 12 ----------------------
     let ammo: i32 = client_ammo(g_cl);
     let ac: i32 = g_UI_WHITE;
     if (ammo <= 1) { ac = g_UI_DANGER; }
     let astr: string = `${ammo} / ${client_reserve(g_cl)}`;
-    used = used + hud_rect(238.0, 218.0, 76.0, 16.0, g_UI_BLACK, 170);
-    used = used + hud_text_big(242.0, 220.0, astr, ac, g_TB_AMMO);
+    used = used + hud_rect(238.0, y_am, 76.0, 16.0, g_UI_BLACK, 170);
+    used = used + hud_text_big(242.0, y_am + 2.0, astr, ac, g_TB_AMMO);
 
     // ---- W6: THE OFF HAND ------------------------------------------------
     // The lantern hand. MAGIC_KINETIC's oil is the second resource in the game
@@ -1816,16 +1937,16 @@ fn hud_build() {
     // nothing, and the bar APPEARING is part of the 0:30 payoff.
     let sid: i32 = client_spell_id(g_cl);
     if (client_spell_have(g_cl) != 0) {
-        used = used + hud_rect(9.0, 209.0, 62.0, 6.0, g_UI_BLACK, 190);
+        used = used + hud_rect(9.0, y_oil, 62.0, 6.0, g_UI_BLACK, 190);
         let o01: f64 = client_oil01(g_cl);
-        used = used + hud_rect(10.0, 210.0, 60.0 * o01, 4.0, g_NS_HALO, 255);
+        used = used + hud_rect(10.0, y_oil + 1.0, 60.0 * o01, 4.0, g_NS_HALO, 255);
         if (sid >= 0) {
             let cd: f64 = client_spell_cd01(g_cl);
             // The cooldown is a BAR, not a number, and it is 2 triangles, so
             // it is never the thing that yields: "can I cast" has to survive
             // the busiest frame in the game.
             if (cd > 0.0) {
-                used = used + hud_rect(9.0, 216.0, 62.0 * cd, 1.0, g_UI_DIM, 220);
+                used = used + hud_rect(9.0, y_oil + 7.0, 62.0 * cd, 1.0, g_UI_DIM, 220);
             }
             // THE NAME YIELDS. "EMBERLANCE" is 10 glyphs and therefore 40
             // triangles EVERY FRAME, and adding it unconditionally took the
@@ -1837,22 +1958,22 @@ fn hud_build() {
             if (used + 48 <= cap) {
                 let cdc: i32 = g_UI_AMBER;
                 if (cd > 0.0) { cdc = g_UI_DIM; }
-                used = used + hud_text(10.0, 200.0, client_spell_name(sid), cdc,
+                used = used + hud_text(10.0, y_oil - 9.0, client_spell_name(sid), cdc,
                                        clampi(cap - used, 0, 48));
             }
         }
         // Standing in light is what halves the phase multiplier. Say so with
         // one pixel of colour rather than a word.
         if (client_in_light(g_cl) == 1) {
-            used = used + hud_rect(72.0, 210.0, 2.0, 4.0, g_UI_AMBER, 255);
+            used = used + hud_rect(72.0, y_oil + 1.0, 2.0, 4.0, g_UI_AMBER, 255);
         }
     }
     // The channel bar for Mend and the Lance. Centre screen, because you
     // cannot move while it runs.
     let chan: f64 = client_spell_chan01(g_cl);
     if (chan > 0.0) {
-        used = used + hud_rect(cx - 24.0, cy + 26.0, 48.0, 3.0, g_UI_BLACK, 200);
-        used = used + hud_rect(cx - 23.0, cy + 27.0, 46.0 * chan, 1.0, g_NS_HALO, 255);
+        used = used + hud_rect(cx - 24.0, cy + 20.0, 48.0, 3.0, g_UI_BLACK, 200);
+        used = used + hud_rect(cx - 23.0, cy + 21.0, 46.0 * chan, 1.0, g_NS_HALO, 255);
     }
 
     // ---- W6: the melee hand ----------------------------------------------
@@ -1861,17 +1982,17 @@ fn hud_build() {
     // the only moment it is worth 20 triangles.
     let mw: i32 = client_mel_wpn(g_cl);
     if (mw >= 0 && ammo <= 0) {
-        used = used + hud_text(242.0, 210.0, client_melee_name(mw),
+        used = used + hud_text(242.0, y_am - 8.0, client_melee_name(mw),
                                g_UI_AMBER, clampi(cap - used, 0, 24));
     }
 
     // ---- the reload bar --------------------------------------------------
     let rt: f64 = client_reloading(g_cl);
     if (rt > 0.0) {
-        used = used + hud_rect(cx - 24.0, cy + 16.0, 48.0, 3.0, g_UI_BLACK, 200);
+        used = used + hud_rect(cx - 24.0, cy + 12.0, 48.0, 3.0, g_UI_BLACK, 200);
         let f: f64 = clamp01(1.0 - rt / 1.6);
-        used = used + hud_rect(cx - 23.0, cy + 17.0, 46.0 * f, 1.0, g_UI_AMBER, 255);
-        used = used + hud_centre(cy + 22.0, "RELOADING", g_UI_DIM, 40);
+        used = used + hud_rect(cx - 23.0, cy + 13.0, 46.0 * f, 1.0, g_UI_AMBER, 255);
+        used = used + hud_centre(cy + 16.0, "RELOADING", g_UI_DIM, 40);
     }
 
     // ---- the XP bar ------------------------------------------------------
@@ -1879,33 +2000,33 @@ fn hud_build() {
     let into: i32 = client_xp_into(g_cl);
     let xf: f64 = 0.0;
     if (need > 0) { xf = clamp01(f64(into) / f64(need)); }
-    used = used + hud_rect(0.0, 237.0, f64(g_RES_W), 3.0, g_UI_BLACK, 170);
-    used = used + hud_rect(0.0, 238.0, f64(g_RES_W) * xf, 1.0, g_NS_HALO, 255);
+    used = used + hud_rect(0.0, y_xp, f64(g_RES_W), 3.0, g_UI_BLACK, 170);
+    used = used + hud_rect(0.0, y_xp + 1.0, f64(g_RES_W) * xf, 1.0, g_NS_HALO, 255);
 
     // ---- the damage vignette + direction arc (GDD §7.13) -----------------
     let dt2: f64 = client_damage_t(g_cl);
     if (dt2 > 0.0) {
         let a: i32 = clampi(i32(dt2 / 1.2 * 90.0 * (1.0 - hp01 + 0.35)), 0, 130);
         used = used + hud_rect(0.0, 0.0, f64(g_RES_W), 5.0, g_UI_DANGER, a);
-        used = used + hud_rect(0.0, 235.0, f64(g_RES_W), 5.0, g_UI_DANGER, a);
+        used = used + hud_rect(0.0, hudgen_bot(5.0, 0.0), f64(g_RES_W), 5.0, g_UI_DANGER, a);
         let br2: f64 = client_damage_dir(g_cl) - g_yaw_deg * g_D2R;
         used = used + hud_sprite(HUD_ICON_ARROW,
                                  cx + clampf(sin(br2) * 40.0, -44.0, 44.0),
-                                 cy - 34.0, g_UI_DANGER,
+                                 cy - 26.0, g_UI_DANGER,
                                  clampi(i32(dt2 / 1.2 * 255.0), 0, 255));
     }
 
     // ---- the interact prompt.  GAME_DESIGN §8 at 0:24. -------------------
     if (client_prompt(g_cl) == 1) {
         let ch: f64 = client_chan01(g_cl);
-        used = used + hud_rect(cx - 62.0, 150.0, 124.0, 22.0, g_UI_BLACK, 190);
-        used = used + hud_centre(154.0, "HOLD [E] - LIGHT THE LANTERN",
+        used = used + hud_rect(cx - 62.0, g_Y_PROMPT, 124.0, 22.0, g_UI_BLACK, 190);
+        used = used + hud_centre(g_Y_PROMPT + 4.0, "HOLD [E] - LIGHT THE LANTERN",
                                  g_UI_WHITE, clampi(cap - used, 0, g_TB_PROMPT));
-        used = used + hud_centre(162.0, "IT'S GOING TO GET THEIR ATTENTION",
+        used = used + hud_centre(g_Y_PROMPT + 12.0, "IT'S GOING TO GET THEIR ATTENTION",
                                  g_UI_DIM, clampi(cap - used, 0, g_TB_PROMPT));
         if (ch > 0.0) {
-            used = used + hud_rect(cx - 40.0, 172.0, 80.0, 3.0, g_UI_BLACK, 210);
-            used = used + hud_rect(cx - 39.0, 173.0, 78.0 * ch, 1.0, g_UI_AMBER, 255);
+            used = used + hud_rect(cx - 40.0, g_Y_PROMPT + 22.0, 80.0, 3.0, g_UI_BLACK, 210);
+            used = used + hud_rect(cx - 39.0, g_Y_PROMPT + 23.0, 78.0 * ch, 1.0, g_UI_AMBER, 255);
         }
     }
 
@@ -1915,17 +2036,17 @@ fn hud_build() {
     // person, not the verb, and the second line is what they are for.
     if (client_talk_prompt(g_cl) == 1) {
         let who: i32 = client_talk_who(g_cl);
-        used = used + hud_rect(cx - 62.0, 150.0, 124.0, 22.0, g_UI_BLACK, 190);
-        used = used + hud_centre(154.0, `[E] ${client_npc_name(who)}`,
+        used = used + hud_rect(cx - 62.0, g_Y_PROMPT, 124.0, 22.0, g_UI_BLACK, 190);
+        used = used + hud_centre(g_Y_PROMPT + 4.0, `[E] ${client_npc_name(who)}`,
                                  g_UI_WHITE, clampi(cap - used, 0, 48));
         if (client_talk_offers(g_cl) != 0) {
-            used = used + hud_centre(162.0, "[T] TRADE", g_UI_AMBER,
+            used = used + hud_centre(g_Y_PROMPT + 12.0, "[T] TRADE", g_UI_AMBER,
                                      clampi(cap - used, 0, 36));
         }
         // GAME_DESIGN §5.7's "one new line per in-game day", as a mark. This
         // is the whole of the "worth visiting" UI and it is two triangles.
         if (client_talk_new(g_cl) == 1) {
-            used = used + hud_sprite(HUD_ICON_DIAMOND, cx + 54.0, 152.0,
+            used = used + hud_sprite(HUD_ICON_DIAMOND, cx + 54.0, g_Y_PROMPT + 2.0,
                                      g_UI_AMBER, 230);
         }
     }
@@ -1935,8 +2056,8 @@ fn hud_build() {
         let line: string = client_talk_line(client_talk_who(g_cl),
                                             client_talk_topic(g_cl),
                                             client_talk_arg(g_cl));
-        used = used + hud_rect(cx - 92.0, 178.0, 184.0, 11.0, g_UI_BLACK, 200);
-        used = used + hud_centre(181.0, line, g_UI_WHITE,
+        used = used + hud_rect(cx - 80.0, g_Y_TALKLINE, 160.0, 11.0, g_UI_BLACK, 200);
+        used = used + hud_centre(g_Y_TALKLINE + 3.0, line, g_UI_WHITE,
                                  clampi(cap - used, 0, 96));
     }
 
@@ -1958,7 +2079,7 @@ fn hud_build() {
     }
     let lvt: f64 = client_level_t(g_cl);
     if (lvt > 0.0 && used + 60 <= cap) {
-        used = used + hud_centre_big(96.0, `LEVEL ${client_level(g_cl)}`,
+        used = used + hud_centre_big(g_Y_LEVEL, `LEVEL ${client_level(g_cl)}`,
                                      g_UI_AMBER, clampi(cap - used, 0, 60));
     }
     let ct: f64 = client_card_t(g_cl);
@@ -1973,11 +2094,11 @@ fn hud_build() {
     // the report; the cap is 250 and the reserve above keeps 6 back.
     if (ct > 0.0 && used + 114 <= cap) {
         let slide: f64 = clampf((1.0 - ct / 2.5) * 6.0, 0.0, 1.0);
-        let x0: f64 = 320.0 - 128.0 * slide;
-        used = used + hud_rect(x0, 60.0, 126.0, 20.0, g_UI_BLACK, 200);
-        used = used + hud_text(x0 + 4.0, 63.0, "UNLOCKED", g_UI_AMBER,
+        let x0: f64 = f64(g_RES_W) - 128.0 * slide;
+        used = used + hud_rect(x0, g_Y_CARD, 126.0, 20.0, g_UI_BLACK, 200);
+        used = used + hud_text(x0 + 4.0, g_Y_CARD + 3.0, "UNLOCKED", g_UI_AMBER,
                                clampi(cap - used, 0, 36));
-        used = used + hud_text(x0 + 4.0, 71.0, client_card(g_cl), g_UI_WHITE,
+        used = used + hud_text(x0 + 4.0, g_Y_CARD + 11.0, client_card(g_cl), g_UI_WHITE,
                                clampi(cap - used, 0, g_TB_CARD));
         // THE REGRESSION SIGNAL FOR THE BUDGET ABOVE. `font_text_shadowed`
         // reports whether it had to drop glyphs, and this is the one line of
@@ -1993,19 +2114,19 @@ fn hud_build() {
     // ---- banners: waves, the horn, the clear -----------------------------
     let bt: f64 = client_banner_t(g_cl);
     if (bt > 0.0 && used + 96 <= cap) {
-        used = used + hud_centre_big(40.0, client_banner(g_cl), g_UI_AMBER,
+        used = used + hud_centre_big(g_Y_BANNER, client_banner(g_cl), g_UI_AMBER,
                                      clampi(cap - used, 0, g_TB_BANNER));
     }
     let tt: f64 = client_toast_t(g_cl);
     if (tt > 0.0 && used + 60 <= cap) {
-        used = used + hud_centre(56.0, client_toast(g_cl), g_UI_DIM,
+        used = used + hud_centre(g_Y_TOAST, client_toast(g_cl), g_UI_DIM,
                                  clampi(cap - used, 0, 60));
     }
 
     // ---- death -----------------------------------------------------------
     if (client_dead(g_cl) == 1 && used + 62 <= cap) {
         used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H), g_UI_DANGER, 60);
-        used = used + hud_centre_big(110.0, "THE DARK TOOK YOU", g_UI_WHITE,
+        used = used + hud_centre_big(cy - 10.0, "THE DARK TOOK YOU", g_UI_WHITE,
                                      clampi(cap - used, 0, 60));
     }
 

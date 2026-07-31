@@ -170,6 +170,8 @@ import { spell_new, spell_ctx_new, spell_bind, spell_bind_projectiles,
 import { stats_new, stats_get, stats_raise, stats_unspent, stats_can_raise,
          stats_spent, stats_rank_up, stats_can_rank, stats_rank,
          stats_hp_max, stats_channel_s, stats_light_radius_mult,
+         stats_carry_kg, stats_overload01, stats_move_mult, stats_equip_kg,
+         SK_EQ_NONE, SK_EQ_BANDOLIER, SK_EQ_POUCHES, SK_EQ_PACK, SK_EQ_ALL,
          SK_HANDLING, SK_CAPACITY, SK_LANTERN, SK_VITALITY, SK_ATTUNEMENT,
          SK_COUNT } from "../sim/stats.hml";
 
@@ -200,7 +202,16 @@ import { npc_new, npc_step, npc_refresh, npc_count, npc_named_count,
          NPC_OFF_WEAPON, NPC_OFF_MFG, NPC_OFF_AMMO, NPC_OFF_KIT,
          NPC_OFF_LANTERN, NPC_OFF_SOUP, NPC_OFF_SLEEP,
          NPC_VW_BOLT, NPC_VW_REVOLVER, NPC_VW_PUMP, NPC_VW_PIPESMG,
-         NPC_CRK_LANTERN, NPC_CRK_NIGHT, NPC_EV_ARRIVED
+         NPC_CRK_LANTERN, NPC_CRK_NIGHT, NPC_EV_ARRIVED,
+         npc_offer_class, npc_offer_price, npc_offer_fit, npc_offer_kg,
+         npc_purse, npc_purse_add, npc_purse_take, npc_earned, npc_spent,
+         npc_fit_mask, npc_pack_count, npc_pack_kg, npc_pack_items,
+         npc_pack_spend, npc_pack_find_kind,
+         npc_trade_check, npc_trade_take, npc_trade_first_open,
+         npc_trade_takeable, npc_offer_find,
+         NPC_OC_SERVICE, NPC_OC_STOCK, NPC_OC_FIT, NPC_OC_UNBUILT,
+         NPC_TR_OK, NPC_TR_BADROW, NPC_TR_CLOSED, NPC_TR_POOR,
+         NPC_TR_HAVE, NPC_TR_UNBUILT
        } from "../sim/npc.hml";
 
 // ===========================================================================
@@ -312,7 +323,10 @@ export let UI_MSG_TRADED: i32     = 4;   // arg = offer kind
 export let UI_MSG_NO_TRADE: i32   = 5;   // the row closed under you
 export let UI_MSG_UNBUILT: i32    = 6;   // THE HONEST ONE — see §7b.5
 export let UI_MSG_NOBODY: i32     = 7;
-export let UI_MSG_COUNT: i32      = 8;
+export let UI_MSG_NO_SALVAGE: i32 = 8;   // the price is real and you are short
+export let UI_MSG_HAVE: i32       = 9;   // equipment you are already wearing
+export let UI_MSG_HEAVY: i32      = 10;  // taken, and now you are over your limit
+export let UI_MSG_COUNT: i32      = 11;
 
 // How long a UI message stays up, in ticks.
 export let UI_MSG_TICKS: i32 = 150;
@@ -347,6 +361,67 @@ export let SV_LAN_CAP: i32 = 96;
 // is game policy and belongs in the script file.
 export let SV_TRADE_AMMO: i32 = 24;          // two Kestrel reserves
 export let SV_TRADE_MFG_RESERVE: i32 = 120;  // the Sparrow is ammo-hungry
+
+// ===========================================================================
+//  1c. W7 — SALVAGE, THE PACK, AND WHAT A KILOGRAMME COSTS
+// ---------------------------------------------------------------------------
+//  DIRECTION.md §7, as three numbers.
+//
+//  SALVAGE is earned from the only two things the player does: killing what is
+//  in the dark and lighting the dark. Both already land in ONE counter —
+//  `prog_xp_total` — so income is a DELTA on a number the world already keeps,
+//  not a second economy running alongside it. That matters more than it looks:
+//  a separate kill hook would need its own save field, its own replay coverage
+//  and its own answer to "what happens on a level-up", and every one of those
+//  is a chance for the purse to disagree with the score.
+//
+//  `SV_XP_PER_SALVAGE` is the whole exchange rate. Lighting one lantern is
+//  `g_XP_LANTERN` = 350 XP = 14 salvage = exactly one trade of brass. That is
+//  not a coincidence and it is not tuned: it is the sentence "a lit lamp pays
+//  for a magazine", written as division.
+export let SV_XP_PER_SALVAGE: i32 = 25;
+
+//  WHAT THE PLAYER IS ALREADY CARRYING BEFORE THEY BUY ANYTHING. A lamplighter
+//  walks out of town with a gun, a lantern and whatever brass they can hold,
+//  and `stats.hml`'s base is 18.0 kg at Capacity 0 — "a rifle, a lantern and a
+//  day of brass", in its own words. These three numbers are that sentence.
+export let SV_KG_GUN: f64      = 3.8;    // the weapon in your hands
+export let SV_KG_LANTERN: f64  = 1.2;    // the one you never put down
+export let SV_KG_PER_ROUND: f64 = 0.045; // brass. 120 rounds is 5.4 kg.
+
+//  THE MOVEMENT PENALTY, AND WHY IT IS APPLIED HERE.
+//
+//  `stats.hml` §8 is explicit: "Overloading SLOWS you; it never stops you." It
+//  exposes `stats_move_mult` and NOTHING CALLS IT. `PredictedState` has no
+//  speed-multiplier field and adding one moves `PS_FIELDS`, which moves
+//  `SAVE_C_PLAYER_F` — and neither `movement.hml` nor `save.hml` is this
+//  task's to move.
+//
+//  So the authority applies it where an authority is allowed to: to the
+//  MOVEMENT AXES of the command, on receipt, before the command is queued.
+//  `move_apply_ex` computes `wish = wish * mag` where `mag` is the axis
+//  magnitude, and `dq_axis` is linear, so scaling the quantised axis scales
+//  the wish speed by exactly the same factor. The sprint cone tests the RATIO
+//  of the two axes and both scale together, so a loaded player still sprints —
+//  slowly, which is the point.
+//
+//  This is server-authoritative and it is published (`local.move_mult`) so a
+//  v2 predicting client can apply the identical number. It is NOT a second
+//  input channel: nine integers still arrive, and one of them is smaller.
+export let SV_LOAD_MIN_MULT: f64 = 0.55;   // == stats.hml's 1.0 - g_OVERLOAD_SLOW
+
+//  A LANTERN KIT IS A THING YOU CARRY OUT AND PUT DOWN. Wick's `NPC_OFF_KIT`
+//  row is the one STOCK item in the table and this is what makes it stock: you
+//  buy it in the light, you carry six kilogrammes of it into the dark, and
+//  `BTN_USE` with nothing else in reach plants an UNLIT post you then have to
+//  hold E on. That closes the loop the whole game is: trade -> carry -> place
+//  -> light -> CORE_LUX -> tier -> a new face at the bench.
+export let SV_KIT_MIN_GAP_M: f64 = 12.0;   // no stacking posts on one spot
+
+//  WHAT THE `--town` DEV FLAG HANDS YOU, PER TIER. Fixture money and nothing
+//  else — see `server_settle_boot_tier`'s tail for why a fabricated Town needs
+//  a fabricated purse to be a coherent fixture at all.
+export let SV_BOOT_SALVAGE: i32 = 40;
 
 // The one spell that is held rather than tapped. Named so `sv_w6_tick` reads
 // as prose instead of as a magic number.
@@ -518,6 +593,21 @@ fn sv_local_new(): object {
         ui_rows: 0,
         ui_msg: UI_MSG_NONE,
         ui_arg: 0,
+        // ---- W7: the purse, the pack and what it costs you to walk ---------
+        purse: 0,           // salvage in hand
+        salvage_earned: 0,  // lifetime
+        salvage_spent: 0,   // lifetime
+        fit: 0,             // SK_EQ_* mask bought from villagers
+        load_kg: 0.0,       // gun + lantern + brass + pack
+        carry_kg: 0.0,      // stats_carry_kg at this Capacity and this kit
+        overload: 0.0,      // 0 .. 1, where 1 is twice what you can hold
+        move_mult: 1.0,     // what the authority is scaling your axes by
+        pack_items: 0,
+        pack_kits: 0,       // lantern kits, the one STOCK row
+        kits_placed: 0,
+        trade_ok: 0,        // rows on this villager you could take right now
+        trade_why: 0,       // NPC_TR_* for the row under the cursor
+        trade_price: 0,     // its price in salvage
         // ---- this tick's cosmetics ----------------------------------------
         fx_n: 0,
         fx_kind: zeros_i(SV_FX_CAP),
@@ -644,6 +734,15 @@ export fn server_new(p_seed: i32, p_transport): object {
         sp_granted: 0,          // bitmask of spell ids the player has been given
         sp_last_casts: 0,
         sp_cast_edge: 0,
+
+        // ---- W7: the economy ----------------------------------------------
+        // `xp_seen` is the high-water mark income has already been paid on. It
+        // is a SERVER field and not an npc-store one because it is a cursor
+        // into `prog_xp_total`, which is the world's; the purse it feeds is in
+        // the store, where it saves and hashes with the rest of the ledger.
+        xp_seen: 0,
+        move_mult: 1.0,
+        kits_placed: 0,
 
         // counters, so every refusal is visible (combat.hml's rule)
         trades: 0,
@@ -1068,7 +1167,13 @@ fn sv_lantern_supply(p_sv: object) {
 // never aliased.
 export fn server_apply_command(p_sv: object, p_pslot: i32, p_cmd: object): i32 {
     let sv: object = p_sv;
-    let out: i32 = sim_queue_command(sv.world, p_pslot, p_cmd);
+    // W7: the overload penalty is applied to a COPY. Mutating the caller's
+    // command would tax it twice if a tool re-sent it, and would quietly
+    // change an object the caller still owns.
+    let c: object = sv.rxcmd;
+    cmd_copy(c, p_cmd);
+    if (p_pslot == sv.pslot) { sv_load_scale_cmd(sv, c); }
+    let out: i32 = sim_queue_command(sv.world, p_pslot, c);
     if (out == 1) { sv.cmds_in = sv.cmds_in + 1; }
     return out;
 }
@@ -1106,6 +1211,10 @@ fn sv_drain_transport(p_sv: object): i32 {
         c.buttons = qb[i];
         c.weapon_sel = qw[i];
         c.dt_ms = qd[i];
+        // W7: the carry-capacity penalty, §1c. Applied AFTER the wire is
+        // decoded and BEFORE the sim sees it, which is the only place an
+        // authority may put it and still call the wire value authoritative.
+        sv_load_scale_cmd(sv, c);
         if (sim_queue_command(sv.world, sv.pslot, c) == 1) { got++; }
         i++;
     }
@@ -1289,6 +1398,16 @@ fn sv_w6_tick(p_sv: object) {
         }
     }
 
+    // ---- 2c. W7: THE PURSE AND THE PACK ----------------------------------
+    // Before the UI, so a kill on the same tick as a confirm is money the
+    // confirm can spend. Once a second, on the same cadence as everything
+    // else in this block: `prog_xp_total` cannot move without a kill and a
+    // pack cannot get heavier without a trade.
+    if (tick % 60 == 0) {
+        sv_salvage_tick(sv);
+        sv_load_tick(sv);
+    }
+
     // ---- 3. THE MODAL UI -------------------------------------------------
     sv_ui_tick(sv, edge, px, pz, tick);
 
@@ -1436,6 +1555,146 @@ fn sv_lan_gather(p_sv: object) {
 }
 
 // ---------------------------------------------------------------------------
+// W7 — THE ECONOMY. Three functions: what you earned, what you are carrying,
+// and what carrying it costs you.
+// ---------------------------------------------------------------------------
+
+// INCOME. One delta on `prog_xp_total`, converted at a fixed rate, with the
+// remainder LEFT ON THE COUNTER — `xp_seen` only advances by whole salvage, so
+// eleven kills worth 24 XP each pay eleven times over rather than rounding
+// away to nothing. Called once a second, not once a tick: the purse is not a
+// per-frame quantity and `prog_xp_total` cannot change without a kill.
+fn sv_salvage_tick(p_sv: object) {
+    let sv: object = p_sv;
+    if (sv.npcs == null) { return; }
+    let pr: array = sim_progression(sv.world, sv.pslot);
+    let total: i32 = prog_xp_total(pr);
+    let seen: i32 = sv.xp_seen;
+    if (total <= seen) { return; }
+    let gained: i32 = total - seen;
+    let coins: i32 = idivi(gained, SV_XP_PER_SALVAGE);
+    if (coins <= 0) { return; }
+    npc_purse_add(sv.npcs, coins);
+    sv.xp_seen = seen + coins * SV_XP_PER_SALVAGE;
+}
+
+// Integer divide. `/` in Hemlock always yields f64 (CLAUDE.md §4's API
+// corrections), and an f64 round-trip on a counter is how a purse loses a coin
+// once every few hours.
+fn idivi(p_a: i32, p_b: i32): i32 {
+    let out: i32 = i32(f64(p_a) / f64(p_b));
+    return out;
+}
+
+// WHAT YOU ARE CARRYING, IN KILOGRAMMES. The gun in your hands, the lantern
+// you never put down, the brass FOR THAT GUN, and the pack.
+//
+// >>> ONLY THE WEAPON IN HAND. <<<  `wpn_state_new` hands every slot all six
+// guns with full reserves — 709 rounds — and the boot path only trims the
+// Kestrel to the GDD's twelve. Weighing all six would put the player 26 kg
+// over a Capacity-0 limit of 18 before they had made a single decision, which
+// is not a packing decision, it is a permanent tax on existing. DIRECTION §7
+// asks what you BRING; the answer is the gun you brought and its brass.
+fn sv_load_kg(p_sv: object): f64 {
+    let sv: object = p_sv;
+    let wst: array = sim_weapon_state(sv.world);
+    let off: i32 = (sv.pslot - 1) * WS_FIELDS;
+    let cur: i32 = wpn_cur(wst, off);
+    let rounds: f64 = 0.0;
+    if (cur >= 0 && cur < 6) {
+        rounds = wst[off + WS_RES0 + cur] + wst[off + WS_MAG0 + cur];
+    }
+    let kg: f64 = SV_KG_GUN + SV_KG_LANTERN + rounds * SV_KG_PER_ROUND;
+    if (sv.npcs != null) { kg = kg + npc_pack_kg(sv.npcs); }
+    let out: f64 = kg;
+    return out;
+}
+
+// The equipment mask the character is WEARING: whatever they have bought.
+// `stats.hml` prices the bandolier, the pouches and the pack in kilogrammes of
+// extra capacity, and this is the only thing in the game that sets that mask.
+fn sv_fit_mask(p_sv: object): i32 {
+    let sv: object = p_sv;
+    if (sv.npcs == null) { let none: i32 = SK_EQ_NONE; return none; }
+    let out: i32 = npc_fit_mask(sv.npcs) & SK_EQ_ALL;
+    return out;
+}
+
+// Recompute load, capacity, overload and the movement multiplier. Once a
+// second alongside income: the multiplier is applied to every command, but
+// what it IS only changes when the pack or the reserve does.
+fn sv_load_tick(p_sv: object) {
+    let sv: object = p_sv;
+    let fit: i32 = sv_fit_mask(sv);
+    let load: f64 = sv_load_kg(sv);
+    let l: object = sv.local;
+    l.load_kg = load;
+    l.carry_kg = stats_carry_kg(sv.sk, fit);
+    l.overload = stats_overload01(sv.sk, fit, load);
+    let m: f64 = stats_move_mult(sv.sk, fit, load);
+    if (m < SV_LOAD_MIN_MULT) { m = SV_LOAD_MIN_MULT; }
+    if (m > 1.0) { m = 1.0; }
+    sv.move_mult = m;
+    l.move_mult = m;
+    l.fit = fit;
+}
+
+// THE PENALTY, APPLIED. Scales the quantised movement axes of a command in
+// place. See §1c: `dq_axis` is linear and `move_apply_ex` multiplies the wish
+// speed by the axis magnitude, so this is exactly `stats_move_mult` and not an
+// approximation of it. A multiplier of 1.0 returns immediately, which is every
+// command the player sends before their first trade.
+fn sv_load_scale_cmd(p_sv: object, p_c: object) {
+    let sv: object = p_sv;
+    let m: f64 = sv.move_mult;
+    if (m >= 0.9999) { return; }
+    let c: object = p_c;
+    c.move_x = i32(f64(c.move_x) * m);
+    c.move_y = i32(f64(c.move_y) * m);
+}
+
+// PLACE A LANTERN KIT. `BTN_USE` with no panel open, no lantern in reach and
+// no villager in reach — three conditions that are already computed, and a
+// fourth key the input map does not have. Returns 1 if a post went down.
+//
+// The gap check is not politeness: `sv_lan_gather` integrates every lit post
+// inside the ring and `settle.hml` saturates CORE_LUX, so a pile of twelve
+// posts on one square metre would read as one lantern's worth of light and
+// look like a bug in the settlement rather than in the player.
+fn sv_place_kit(p_sv: object, p_x: f64, p_z: f64): i32 {
+    let sv: object = p_sv;
+    if (sv.npcs == null) { let no: i32 = 0; return no; }
+    let row: i32 = npc_pack_find_kind(sv.npcs, NPC_OFF_KIT);
+    if (row < 0) { let none: i32 = 0; return none; }
+
+    let w: object = sv.world;
+    let gap: f64 = SV_KIT_MIN_GAP_M * SV_KIT_MIN_GAP_M;
+    let cnt: i32 = world_count(w);
+    let kd = w.kind;
+    let fl = w.flags;
+    let xs = w.px;
+    let zs = w.pz;
+    let slot: i32 = 0;
+    while (slot < cnt) {
+        if (kd[slot] == KIND_LANTERN && (fl[slot] & EF_DEAD) == 0) {
+            let dx: f64 = xs[slot] - p_x;
+            let dz: f64 = zs[slot] - p_z;
+            if (dx * dx + dz * dz < gap) { let close: i32 = 0; return close; }
+        }
+        slot++;
+    }
+
+    if (sv_spawn_lantern(sv, p_x, p_z, SIM_LANTERN_UNLIT) == ID_NONE) {
+        let full: i32 = 0;
+        return full;
+    }
+    npc_pack_spend(sv.npcs, row);
+    sv.kits_placed = sv.kits_placed + 1;
+    let ok: i32 = 1;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // THE MODAL UI. Four edges and a cursor. Everything it does is a call into a
 // module that already existed; nothing here re-implements a rule.
 // ---------------------------------------------------------------------------
@@ -1471,7 +1730,20 @@ fn sv_ui_tick(p_sv: object, p_edge: i32, p_px: f64, p_pz: f64, p_tick: i32) {
         if (sv.ui_panel == UI_PANEL_TRADE) { sv.ui_panel = UI_PANEL_NONE; }
         else {
             if (who == NPC_NONE) { sv_ui_say(sv, UI_MSG_NOBODY, tick); }
-            else { sv.ui_panel = UI_PANEL_TRADE; sv.ui_row = 0; }
+            else {
+                sv.ui_panel = UI_PANEL_TRADE;
+                // >>> THE CURSOR OPENS ON SOMETHING YOU CAN ACTUALLY TAKE. <<<
+                // This one line is the bug the gate found. Mabel's row 0 is
+                // the bolt-action — the thesis row, correctly first, and NOT
+                // BUILT — so a cursor that opened on 0 meant "press T, press
+                // C, nothing happens" on the most important villager in the
+                // game. Opening on the first row `npc_trade_check` says yes to
+                // makes T-then-C a completed trade, and the ladder above the
+                // cursor is still drawn, still gated, still visible.
+                let f: i32 = npc_trade_first_open(sv.npcs, sv.set, who);
+                if (f < 0) { f = 0; }
+                sv.ui_row = f;
+            }
         }
     }
 
@@ -1497,6 +1769,12 @@ fn sv_ui_tick(p_sv: object, p_edge: i32, p_px: f64, p_pz: f64, p_tick: i32) {
                 sv.talk_arg = npc_topic_arg(sv.npcs, sv.set, who, tick);
                 sv.talk_tick = tick;
                 sv.talks = sv.talks + 1;
+            } else {
+                // NOBODY AND NOTHING IN REACH: plant a lantern kit if you are
+                // carrying one. Third in the priority order and last for a
+                // reason — the lantern wins, then the person, then the post
+                // you brought with you. No new key, no new wire field.
+                sv_place_kit(sv, p_px, p_pz);
             }
         }
     }
@@ -1551,15 +1829,24 @@ fn sv_ui_spend(p_sv: object, p_stat: i32, p_tick: i32) {
 // it into the global one, because the trade panel iterates one person's rows
 // and has no business knowing where in the table they start.
 //
-// >>> §7b.5 — THE HONEST GAP, AND IT IS DELIBERATE <<<
+// >>> W7 — THE DECISION IS `npc.hml`'s; THE EFFECT IS THIS FILE'S. <<<
+// `npc_trade_take` checks the gate, the price, the class and the "you already
+// own that", debits the purse and moves the goods. It returns `NPC_TR_OK` or
+// the reason it did not, and by then the player has ALREADY BEEN CHARGED — so
+// every path below `NPC_TR_OK` must apply an effect, and none of them may
+// refuse. Splitting it the other way (effect first, charge after) is how a
+// shop gives away a rifle when a `wpn_swap_begin` fails.
+//
+// >>> §7b.5 — THE HONEST GAP, AND IT IS STILL HERE <<<
 // `NPC_OFF_WEAPON`'s four arguments are `NPC_VW_BOLT`, `NPC_VW_REVOLVER`,
 // `NPC_VW_PUMP`, `NPC_VW_PIPESMG` -- DIRECTION.md §3's village-tier guns.
-// **None of the four exists in `weapons.hml`.** That file has six rows and
-// DIRECTION.md §3 says outright that Longshadow is NOT the bolt-action. So
-// taking one of those rows returns `UI_MSG_UNBUILT` and grants nothing, and
-// the HUD says so in words. Mapping a bolt-action onto the Longshadow because
-// both are rifles would make the trade panel look finished and the game a
-// liar, which is CLAUDE.md rule 6 exactly.
+// **None of the four exists in `weapons.hml`.** That file has six rows, all
+// City-tier; DIRECTION.md §3 says outright that Longshadow is NOT the
+// bolt-action; and `weapons.hml` belongs to BUILD_PLAN W6-6. So those four
+// rows are `NPC_OC_UNBUILT`, they cost NOTHING, and taking one says NOT FORGED
+// YET in the player's own words. Mapping a bolt-action onto the Longshadow
+// because both are rifles would make the trade panel look finished and the
+// game a liar, which is CLAUDE.md rule 6 exactly.
 fn sv_ui_trade(p_sv: object, p_who: i32, p_row: i32, p_tick: i32) {
     let sv: object = p_sv;
     let who: i32 = p_who;
@@ -1567,78 +1854,92 @@ fn sv_ui_trade(p_sv: object, p_who: i32, p_row: i32, p_tick: i32) {
     let first: i32 = npc_offer_first(who);
     if (first < 0) { sv_ui_say(sv, UI_MSG_NO_TRADE, p_tick); return; }
     let g: i32 = first + p_row;
-    if (npc_offer_open(sv.npcs, sv.set, g) == 0) {
+
+    // ---- the money and the goods ------------------------------------------
+    let why: i32 = npc_trade_take(sv.npcs, sv.set, g);
+    if (why != NPC_TR_OK) {
         sv.trades_refused = sv.trades_refused + 1;
-        sv_ui_say(sv, UI_MSG_NO_TRADE, p_tick);
+        if (why == NPC_TR_UNBUILT) { sv_ui_say(sv, UI_MSG_UNBUILT, p_tick); }
+        else if (why == NPC_TR_POOR) { sv_ui_say(sv, UI_MSG_NO_SALVAGE, p_tick); }
+        else if (why == NPC_TR_HAVE) { sv_ui_say(sv, UI_MSG_HAVE, p_tick); }
+        else { sv_ui_say(sv, UI_MSG_NO_TRADE, p_tick); }
         return;
     }
 
+    // ---- the effect. Charged already; every branch delivers. ---------------
     let kind: i32 = npc_offer_kind(g);
     let arg: i32 = npc_offer_arg(g);
+    let cls: i32 = npc_offer_class(g);
     let w: object = sv.world;
-    let took: i32 = 0;
 
     if (kind == NPC_OFF_AMMO) {
-        // REAL, and the everyday one. DIRECTION.md §7: "the city as CHEAP
-        // RESUPPLY rather than the sole source of ammunition." The reserve is
-        // the currency, so the reserve is what a trade moves.
+        // DIRECTION.md §7: "the city as CHEAP RESUPPLY rather than the sole
+        // source of ammunition." The reserve is what a trade moves — and now
+        // the brass WEIGHS something, so a full resupply is a real decision
+        // and not a free button.
         let wst: array = sim_weapon_state(w);
         let off: i32 = (sv.pslot - 1) * WS_FIELDS;
         let cur: i32 = wpn_cur(wst, off);
         wst[off + WS_RES0 + cur] = wst[off + WS_RES0 + cur] + f64(SV_TRADE_AMMO);
-        took = 1;
     } else if (kind == NPC_OFF_MFG) {
-        // REAL. `arg` is a genuine WPN_* id and the Foundry gate is
-        // `npc_offer_open`'s, already checked above.
+        // `arg` is a genuine WPN_* id and the Foundry gate is
+        // `npc_offer_open`'s, already checked inside `npc_trade_take`.
         let wst2: array = sim_weapon_state(w);
         let off2: i32 = (sv.pslot - 1) * WS_FIELDS;
         if (arg >= 0 && arg < 6) {
             wst2[off2 + WS_RES0 + arg] = f64(SV_TRADE_MFG_RESERVE);
             wpn_swap_begin(wst2, off2, arg);
-            took = 1;
         }
     } else if (kind == NPC_OFF_SOUP) {
-        // REAL, and it is Odo's whole character. GAME_DESIGN §5: "keeps soup
-        // warm past midnight."
-        let slot: i32 = SLOT_NONE;
-        let idp: i32 = sim_player_id(w, sv.pslot);
-        if (idp != ID_NONE) { slot = world_slot_of(w, idp); }
-        if (slot != SLOT_NONE) {
-            let hp = w.hp;
-            let hpm = w.hp_max;
-            hp[slot] = hpm[slot];
-            took = 1;
-        }
+        // Odo's whole character. GAME_DESIGN §5: "keeps soup warm past
+        // midnight."
+        sv_heal_full(sv);
+    } else if (kind == NPC_OFF_SLEEP) {
+        // A BED. Heals like the soup does and refills the oil tank, because
+        // sleeping is the one thing in the game that should restore BOTH
+        // resources — and `spell_fill` is `spells.hml`'s own word for it.
+        sv_heal_full(sv);
+        spell_fill(sv.sp);
     } else if (kind == NPC_OFF_LANTERN) {
-        // REAL. Wick raises the Great Lantern's tier, which widens the ring
-        // every lit post is integrated over -- the single most load-bearing
-        // number in SETTLEMENT.md's ladder.
+        // Wick raises the Great Lantern's tier, which widens the ring every
+        // lit post is integrated over -- the single most load-bearing number
+        // in SETTLEMENT.md's ladder.
         let a: array<f64> = sv.lan;
         let t: f64 = a[2] + 1.0;
         if (t > f64(g_LANTERN_TIERS)) { t = f64(g_LANTERN_TIERS); }
         a[2] = t;
         settle_lanterns_set(sv.set, a, sv.lan_n);
-        took = 1;
-    } else if (kind == NPC_OFF_WEAPON) {
-        // NOT BUILT. See §7b.5 above. This is the only branch that says so.
-        sv.trades_refused = sv.trades_refused + 1;
-        sv_ui_say(sv, UI_MSG_UNBUILT, p_tick);
-        return;
-    } else {
-        // Repair, attachments, rerolls, banking, sleep, travel, contracts,
-        // maps, the Almanac and charms are all rows in `npc.hml`'s table with
-        // no system behind them yet. They are shown, they are gated correctly,
-        // and taking one says UNBUILT rather than pretending.
-        sv.trades_refused = sv.trades_refused + 1;
-        sv_ui_say(sv, UI_MSG_UNBUILT, p_tick);
-        return;
     }
+    // `NPC_OC_FIT` and `NPC_OC_STOCK` need NOTHING here. The equipment bit and
+    // the pack count are already set by `npc_trade_take`, and `sv_load_tick`
+    // reads both next second. That is the point of putting the ledger in one
+    // place: a bandolier is a number in a mask, not a special case in a switch.
 
-    if (took == 1) {
-        sv.trades = sv.trades + 1;
-        sv.ui_msg = UI_MSG_TRADED;
-        sv.ui_msg_tick = p_tick;
-    }
+    sv.trades = sv.trades + 1;
+    // TAKEN, or TAKEN AND NOW YOU ARE OVER YOUR LIMIT. `stats.hml` §8 is
+    // explicit that overloading is a COST and never a refusal, so this is a
+    // different WORD for the same successful trade, not a different outcome.
+    sv_load_tick(sv);
+    let msg: i32 = UI_MSG_TRADED;
+    if (sv.local.overload > 0.0) { msg = UI_MSG_HEAVY; }
+    sv.ui_msg = msg;
+    sv.ui_msg_tick = p_tick;
+    sv.ui_arg = cls;
+}
+
+// Top the player back up to their (stat-scaled) maximum. Two callers, one
+// implementation, because "soup heals to full" and "a bed heals to full"
+// disagreeing by a hit point is a bug nobody would ever find.
+fn sv_heal_full(p_sv: object) {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let idp: i32 = sim_player_id(w, sv.pslot);
+    if (idp == ID_NONE) { return; }
+    let slot: i32 = world_slot_of(w, idp);
+    if (slot == SLOT_NONE) { return; }
+    let hp = w.hp;
+    let hpm = w.hp_max;
+    hp[slot] = hpm[slot];
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,6 +2208,36 @@ fn sv_publish_w6(p_sv: object, p_l: object) {
     l.ui_rows = sv.ui_rows;
     l.ui_msg = sv.ui_msg;
     l.ui_arg = sv.ui_row;
+
+    // ---- W7: the purse and the pack ---------------------------------------
+    // `load_kg`, `carry_kg`, `overload`, `move_mult` and `fit` are written by
+    // `sv_load_tick` on the 60-tick cadence and by `sv_ui_trade` the instant a
+    // trade lands, so they are NOT recomputed here — the panel must read the
+    // number the trade produced, not one a second old. Everything below is a
+    // straight copy of a counter.
+    l.purse = npc_purse(sto);
+    l.salvage_earned = npc_earned(sto);
+    l.salvage_spent = npc_spent(sto);
+    l.pack_items = npc_pack_items(sto);
+    l.kits_placed = sv.kits_placed;
+    let kitrow: i32 = npc_offer_find(NPC_OFF_KIT, 0);
+    l.pack_kits = 0;
+    if (kitrow >= 0) { l.pack_kits = npc_pack_count(sto, kitrow); }
+    // What the cursor is sitting on, as a REASON. The panel colours a row from
+    // `talk_offers`; this is the one row the confirm key would act on, and it
+    // is how a player finds out the price before they press it.
+    l.trade_why = NPC_TR_BADROW;
+    l.trade_price = 0;
+    l.trade_ok = 0;
+    if (who != NPC_NONE) {
+        l.trade_ok = npc_trade_takeable(sto, st, who);
+        let gfirst: i32 = npc_offer_first(who);
+        if (gfirst >= 0) {
+            let grow: i32 = gfirst + sv.ui_row;
+            l.trade_why = npc_trade_check(sto, st, grow);
+            l.trade_price = npc_offer_price(grow);
+        }
+    }
 }
 
 // ===========================================================================
@@ -1983,6 +2314,26 @@ export fn server_trades_refused(p_sv: object): i32 { let sv: object = p_sv; let 
 export fn server_points_spent(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.points_spent; return o; }
 export fn server_talks(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.talks; return o; }
 export fn server_ui_panel(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.ui_panel; return o; }
+export fn server_ui_row(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.ui_row; return o; }
+
+// ---- W7: the economy, for probes and the report line ----------------------
+export fn server_purse(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_purse(sv.npcs); return o; }
+export fn server_salvage_earned(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_earned(sv.npcs); return o; }
+export fn server_salvage_spent(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_spent(sv.npcs); return o; }
+export fn server_load_kg(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.local.load_kg; return o; }
+export fn server_carry_kg(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.local.carry_kg; return o; }
+export fn server_overload(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.local.overload; return o; }
+export fn server_move_mult(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.move_mult; return o; }
+export fn server_fit(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_fit_mask(sv.npcs); return o; }
+export fn server_pack_items(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_pack_items(sv.npcs); return o; }
+export fn server_kits_placed(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.kits_placed; return o; }
+// The direct grant, for probes and for `--town`: a fixture that has to reach a
+// 180-salvage rifle cannot be made to farm 4500 XP first.
+export fn server_grant_salvage(p_sv: object, p_n: i32): i32 {
+    let sv: object = p_sv;
+    let out: i32 = npc_purse_add(sv.npcs, p_n);
+    return out;
+}
 export fn server_settle_tier(p_sv: object): i32 {
     let sv: object = p_sv;
     let out: i32 = settle_tier(sv.set);
@@ -2006,6 +2357,13 @@ export fn server_w6_hash(p_sv: object): i32 {
     h = ((h ^ u64(sv.sp_granted)) * 16777619) & 4294967295;
     h = ((h ^ u64(sv.trades)) * 16777619) & 4294967295;
     h = ((h ^ u64(sv.points_spent)) * 16777619) & 4294967295;
+    // W7. `npc_hash` already carries the purse, the pack and the equipment
+    // mask -- they are the store's. These two are the SERVER's half of the
+    // economy and would otherwise be the only trade state a hash could not
+    // see: `xp_seen` decides what the next second of play is worth, and a
+    // placed post is a permanent change to the world.
+    h = ((h ^ u64(sv.xp_seen)) * 16777619) & 4294967295;
+    h = ((h ^ u64(sv.kits_placed)) * 16777619) & 4294967295;
     let out: i32 = i32(h & 2147483647);
     return out;
 }
@@ -2153,6 +2511,24 @@ export fn server_settle_boot_tier(p_sv: object, p_tier: i32): i32 {
     settle_lanterns_set(sv.set, a, n);
     settle_refresh(sv.set);
     npc_refresh(sv.npcs, sv.set);
+
+    // ---- W7: AND THE PURSE THAT CAME WITH IT ------------------------------
+    // >>> FIXTURE MONEY, AND IT IS ONLY EVER FIXTURE MONEY. <<<
+    // This flag fabricates a settlement that would have taken a player hours
+    // of lantern work to earn. Salvage is paid for exactly that work
+    // (`sv_salvage_tick`, one coin per `SV_XP_PER_SALVAGE` of XP), so a Town
+    // that boots with an EMPTY purse is not a mid-game state — it is a
+    // teleport into poverty, and every trade row in it answers NO SALVAGE.
+    // The `--town` flag would then look like a broken shop rather than an
+    // absent wallet, which is precisely the failure mode the block above this
+    // one was written to stop (a browned-out fixture shutting every row).
+    //
+    // The grant is per tier and it is deliberately modest: `SV_BOOT_SALVAGE`
+    // at a Village buys brass and soup, and it takes THREE tiers to afford the
+    // Great Lantern's next wick. Nothing in the shipping game calls this — it
+    // is reached only through `--town`, `probe_w6` and `probe_trade`.
+    npc_purse_add(sv.npcs, SV_BOOT_SALVAGE * t);
+
     let out: i32 = t;
     return out;
 }

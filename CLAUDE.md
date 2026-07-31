@@ -1,7 +1,7 @@
 # NIGHTSHADE — rules for every agent working in this repo
 
 PS1/N64-aesthetic open-world FPS. Hemlock, on the Wobbleweed engine. **Ships compiled.**
-**60 fps is the floor. 2500 triangles is the budget. 320×240 is the resolution.**
+**60 fps is the floor. 2500 triangles is the budget. 320×180 (16:9) is the resolution.**
 
 ---
 
