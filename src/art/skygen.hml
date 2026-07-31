@@ -157,6 +157,21 @@ import { pal_r, pal_g, pal_b,
 import { tod_flash, tod_bolt_seed, tod_sky_keys,
          TODSKY_MOON, TODSKY_COUNT } from "./tod.hml";
 
+// (moon-anchor)  THE CAMERA, FROM THE ONE PLACE THAT OWNS IT.
+//
+// The moon's elevation ceiling is a CAMERA fact, not a sky fact: a body is
+// clipped by the top of the screen when its elevation plus its own angular
+// radius exceeds `pitch + fov/2`.  The night-anchor pass sized that against
+// `fov = 70`, which was the 4:3 value; the 16:9 conversion moved the shipping
+// vertical fov to 58 and nobody re-checked, so an 18.06-degree moon with a
+// 6.2-degree radius overran a 21-degree band top and shipped CLIPPED BY THE
+// TOP EDGE in `flat_debug` and `hub_dawn` (blob rows 0..30 and 0..41).
+//
+// So the ceiling is now DERIVED FROM `g_FOV_HIP` AND `g_RES_H`, and the next
+// aspect-ratio change moves the moon by itself.  See `skygen_moon_el_max`.
+// The import wall allows src/art -> src/core (ci_imports.sh R1, zone `art`).
+import { g_FOV_HIP, g_RES_H } from "../core/config.hml";
+
 // W1-8.
 import { atlas_new, atlas_upload, atlas_update_rows, atlas_mark_rows,
          atlas_tex, atlas_free } from "../../../wobbleweed/src/atlas.hml";
@@ -316,6 +331,71 @@ const MOON_DISC_R = 11.0;
 const MOON_HALO_R = 30.0;
 const MOON_HALO_MAX = 0.38;
 const MOON_DARK_T = 0.18;               // unlit limb blend toward MOON_MARE
+
+// ===========================================================================
+// (moon-anchor)  WHERE THE MOON IS ALLOWED TO SIT, AND WHY IT IS DERIVED
+// ---------------------------------------------------------------------------
+// The night's only bright object has to be ON SCREEN to be the night's anchor.
+// The camera's visible elevation band is `pitch - fov/2 .. pitch + fov/2`, so
+// the moon fits when
+//
+//     elevation + disc_radius + hud_band  <=  fov/2 + pitch
+//
+// and every term on the right belongs to `src/core/config.hml`, not here.  The
+// two constants below are the only judgements in it; everything else is read
+// from the shipping camera at bake time.
+//
+//   MOON_PITCH_FLOOR   the steepest DOWNWARD pitch the moon must survive.  The
+//                      authored night cameras are ridge_golden 0, storm -2,
+//                      muzzle_fog -3, hub_dawn -4, ns_bloom -5, flat_debug -8;
+//                      -8 is the whole set, so -8 is the floor.  Look further
+//                      down than that and you are looking at your boots, and
+//                      the sky is legitimately not in shot.
+//   MOON_TOP_BAND_PX   the HUD's top band — shot.hml's label plate and the
+//                      compass strip, measured at 320x180 as rows 0..13.  A
+//                      moon behind the compass is not a focal point, so the
+//                      band is reserved even though the gate's WORLD-ONLY
+//                      measurement would not notice it.
+//
+// THE CLAMP IS APPLIED TO THE DRAWN DISC, NOT TO THE KEY DIRECTION.  tod.hml's
+// NIGHT/DEEP rows are the LIGHT — flat ground catches `ambient + dir.y * key`
+// and the night inversion is graded on exactly that number — so moving the key
+// would move the ground and the inversion with it.  This file draws the body;
+// it can lower the body by itself and leave every luminance in the frame
+// untouched.  The cost is stated plainly: at 02:00 the key is 64 degrees up
+// and the disc is drawn at ~10, so the moon and its own shading disagree by
+// about 54 degrees at the darkest hour.  A moon you can SEE that lights faces
+// from too high beats a correctly-placed moon nobody has ever seen, but the
+// real fix is for tod.hml's owner to bring DEEP's `dir.y` down and rescale the
+// key the way NIGHT's row already does.  Reported, not worked around.
+// ===========================================================================
+const MOON_PITCH_FLOOR = -8.0;
+const MOON_TOP_BAND_PX = 14.0;
+
+// The disc's own angular radius, in DEGREES OF ELEVATION.  The panorama's V
+// axis carries 90 degrees over SKY_H-1 rows, so one texel is 90/(SKY_H-1)
+// degrees vertically — 0.566 at SKY_H 160, and the 11-texel disc is 6.23 deg.
+// (The disc is a circle in TEXEL space and the U axis is coarser — 360/SKY_W
+// = 0.703 deg — so on screen it is a slightly WIDE ellipse.  Only the vertical
+// half-extent can be clipped by the top of the frame, so only it appears here.)
+export fn skygen_moon_disc_deg(): f64 {
+    let out: f64 = MOON_DISC_R * 90.0 / f64(SKY_H - 1);
+    return out;
+}
+
+// The highest elevation the drawn disc is allowed to reach, in degrees.
+// DERIVED — at 320x180 with g_FOV_HIP 58 this is 10.26 deg; at the old 4:3
+// 320x240 / fov 70 it would be 20.90, which is why nothing looked wrong then.
+export fn skygen_moon_el_max(): f64 {
+    let pxdeg: f64 = f64(g_RES_H) / g_FOV_HIP;   // target pixels per degree, vertical
+    let e: f64 = g_FOV_HIP * 0.5 + MOON_PITCH_FLOOR
+               - skygen_moon_disc_deg() - MOON_TOP_BAND_PX / pxdeg;
+    // A lens narrow enough to leave no room at all: hug the horizon rather than
+    // return a negative elevation and bake the moon underground.
+    if (e < 2.0) { e = 2.0; }
+    let out: f64 = e;
+    return out;
+}
 
 const STAR_SEED = 20260728;             // FIXED.  The constellations never change.
 const STAR_CROSS = 0.40;                // §11.4 the 1-px cross, 40 % brightness
@@ -996,6 +1076,31 @@ fn sky_snapshot() {
     // tod.hml says is the moon) behaves differently.
     if (g_sky_sun_up == 0 && mm == 0.0) { mm = 1.0; }
     g_sky_body_moon = mm;
+
+    // (moon-anchor)  BRING THE DISC DOWN INTO THE FRAME.
+    //
+    // Applied to `g_sky_body_v` ONLY — `g_sky_sun_v`, `g_sky_moon_v` and the
+    // key direction are untouched, so `skygen_sun_uv` / `skygen_moon_uv` still
+    // report the true antipodes (probe_skygen D4/D6) and no luminance in the
+    // lit world moves by a bit.  The SUN is never lowered: a sun clipped by
+    // the top of the frame is a sun you are squinting past, which is correct,
+    // and daylight already has a hundred things over luminance 220.
+    //
+    // The lerp by `mm` is what keeps it CONTINUOUS.  `mm` is tod.hml's own
+    // sun -> moon crossfade, 0 through dusk and 1 by 22:00, so the body slides
+    // from its true elevation to the capped one over the same minutes it turns
+    // from a sun into a moon.  A bare `min()` here would TELEPORT the disc the
+    // instant the flag crossed a threshold.
+    if (mm > 0.0) {
+        let bel: f64 = el;
+        if (g_sky_sun_up == 0) { bel = mel; }
+        let bdeg: f64 = bel * 57.29577951308232;
+        let cap: f64 = skygen_moon_el_max();
+        let cdeg: f64 = bdeg;
+        if (cdeg > cap) { cdeg = cap; }
+        let fin: f64 = bdeg + (cdeg - bdeg) * mm;
+        g_sky_body_v = (1.0 - fin / 90.0) * f64(SKY_H - 1);
+    }
 
     // --- per-snapshot precomputation ---------------------------------------
     // Cloud drift (§11.2, 0.6 and 1.4 px/s) shifts the sample point, not the

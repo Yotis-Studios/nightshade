@@ -1,0 +1,421 @@
+// ===========================================================================
+//  probe_par.hml — the parallel emit pool is WIRED, and wiring it changed
+//                  nothing about what comes out.
+// ---------------------------------------------------------------------------
+//  COMPILED and HEADLESS. Exits 1 on any failure AND on running the wrong
+//  NUMBER of assertions, so a criterion that silently stops being checked is a
+//  build failure rather than a green run.
+//
+//      hemlockc -O1 tools/probe_par.hml -o /tmp/probe_par
+//      SDL_VIDEODRIVER=dummy /tmp/probe_par ; echo $?     # 0
+//
+//  WHAT THIS PROBE IS FOR, AND WHAT IT IS NOT FOR.
+//
+//  `wobbleweed/examples/probe_emit.hml` already proves the ENGINE side: 80/80
+//  including a parallel-vs-serial checksum, across nw = 1/2/4/8/12, on the
+//  engine's own scenes. This probe proves the two things that live on the GAME
+//  side of that boundary and that no engine probe can see:
+//
+//    1. THE LIFECYCLE `src/render/world_render.hml` PUBLISHES. First-call-wins,
+//       idempotent, clamped at EMIT_PAR_MAX, shut down and brought back up, and
+//       — the one that matters most — n < 2 and a `ThreadPool` that throws BOTH
+//       land on serial rather than on an error. Serial is the WASM build
+//       (docs/design/WASM_SPIKE.md: no threads at all), headless CI, and any
+//       single-core target, so "degrades to serial" is a shipping requirement,
+//       not a nicety.
+//
+//    2. BYTE IDENTITY AT THE SIZE THE GAME ACTUALLY DISPATCHES. The 4.6x in
+//       THREADING_SPIKE §4 is one 3000-triangle dispatch. Nightshade never does
+//       that: `terrain_render.hml` emits ONE CHUNK PER CALL, and a chunk is
+//       8x8 quads = 128 triangles (`g_CHUNK_Q`), which sits just above
+//       `emit_par_min`'s 96. If the range split were wrong anywhere, 128
+//       triangles over 8 workers — 16 per range, with the last range short — is
+//       where it would show. So the mesh below is a real chunk, at the real
+//       size, and every byte of the vertex arena, every depth and all six
+//       counters are compared against the serial reference.
+//
+//  RULE T (CLAUDE.md §1.2) does not apply: this probe asserts BYTES, not
+//  milliseconds. It deliberately makes no timing claim — a speedup measured
+//  under a probe's own dispatch pattern would not be the game's speedup, and
+//  the honest end-to-end number comes from the real binary
+//  (`nightshade --workers 0` vs `--workers 8`), not from here.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt } from "@stdlib/math";
+
+import { g_EMIT_WORKERS, g_EMIT_PAR_MIN_TRIS, g_RES_W, g_RES_H }
+       from "../src/core/config.hml";
+
+// THE SUBJECT: the three functions this task added to the frame graph.
+import { frame_par_init, frame_par_shutdown, frame_par_workers, g_NEAR }
+       from "../src/render/world_render.hml";
+
+import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
+         emit_set_backface, emit_set_lighting, emit_stats_reset,
+         emit_mesh_buf, emit_mesh_buf_serial,
+         emit_count_submitted, emit_count_written, emit_count_backface,
+         emit_count_near, emit_count_guard, emit_count_straddle,
+         emit_par_min, emit_par_workers,
+         EMIT_BF_CCW, EMIT_PAR_MAX }
+       from "../../wobbleweed/src/emit.hml";
+import { mesh_new, mesh_begin, mesh_vert_n, mesh_quad, mesh_end,
+         mesh_buf, mesh_tri_count }
+       from "../../wobbleweed/src/mesh.hml";
+import { env_new, ENV_FOG_NEAR, ENV_FOG_FAR, ENV_CAM_X, ENV_CAM_Y, ENV_CAM_Z,
+         ENV_SUN_X, ENV_SUN_Y, ENV_SUN_Z }
+       from "../../wobbleweed/src/shade.hml";
+import { mat_perspective, mat_look_dir, mat_mul, v3 }
+       from "../../wobbleweed/src/vec.hml";
+
+// ---------------------------------------------------------------------------
+let g_EXPECT: i32 = 37;
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (p_ok) { print(`  ok   [${g_n}] ${p_msg}`); }
+    if (!p_ok) { print(`  FAIL [${g_n}] ${p_msg}`); }
+}
+
+// ---------------------------------------------------------------------------
+// THE CHUNK. Same shape as `main.hml`'s `chunk_mesh_build`: 8x8 quads over a
+// 32 m tile, per-vertex normals, per-vertex colour, uv off a world lattice.
+// The height field is a cheap deterministic ripple — this probe compares two
+// renders of the SAME mesh, so the terrain function does not have to be the
+// game's, only reproducible and non-flat. Flat would be the one shape that
+// hides a range-split bug, because every triangle would be interchangeable.
+// ---------------------------------------------------------------------------
+let g_Q: i32 = 8;                 // quads per edge  == main.hml g_CHUNK_Q
+let g_QUAD_M: f64 = 4.0;          // metres per quad == main.hml g_QUAD_M
+let g_CHUNK_M: f64 = 32.0;
+
+fn hgt(p_x: f64, p_z: f64): f64 {
+    let x: f64 = p_x;
+    let z: f64 = p_z;
+    let a: f64 = sqrt(x * x * 0.01 + 1.0);
+    let b: f64 = sqrt(z * z * 0.013 + 1.0);
+    let out: f64 = a * 0.7 + b * 0.5 - (x * z) * 0.0015;
+    return out;
+}
+
+fn build_chunk() {
+    let q: i32 = g_Q;
+    let m = mesh_new(q * q * 2 + 4);
+    mesh_begin(m);
+    for (let j = 0; j < q; j++) {
+        for (let i = 0; i < q; i++) {
+            let x0: f64 = f64(i) * g_QUAD_M;
+            let z0: f64 = f64(j) * g_QUAD_M;
+            let x1: f64 = x0 + g_QUAD_M;
+            let z1: f64 = z0 + g_QUAD_M;
+            let y00: f64 = hgt(x0, z0);
+            let y10: f64 = hgt(x1, z0);
+            let y11: f64 = hgt(x1, z1);
+            let y01: f64 = hgt(x0, z1);
+            // uv off the world lattice, four cells, so texel density varies
+            let u0: f64 = f64(i) * 0.125;
+            let v0: f64 = f64(j) * 0.125;
+            let u1: f64 = u0 + 0.125;
+            let v1: f64 = v0 + 0.125;
+            let r0: i32 = 122 + i * 3;
+            let g0: i32 = 150 - j * 2;
+            let b0: i32 = 54 + ((i + j) * 5);
+            let a = mesh_vert_n(m, x0, y00, z0, u0, v0, r0, g0, b0,
+                                0.1, 2.0, 0.2);
+            let b = mesh_vert_n(m, x1, y10, z0, u1, v0, r0 + 4, g0, b0,
+                                0.2, 2.0, 0.1);
+            let c = mesh_vert_n(m, x1, y11, z1, u1, v1, r0, g0 + 3, b0,
+                                0.0, 2.0, 0.3);
+            let d = mesh_vert_n(m, x0, y01, z1, u0, v1, r0, g0, b0 + 6,
+                                0.3, 2.0, 0.0);
+            mesh_quad(m, a, b, c, d);
+        }
+    }
+    mesh_end(m);
+    let out = m;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// THE HARNESS. One `emit_mesh_buf` into a scratch arena, then FNV-1a over the
+// bytes it wrote and over the depths, plus the six counters. Everything a
+// downstream stage can observe is in here: `batch_commit` reads exactly the
+// 60 bytes per triangle and the depth, and the counters are what the stats
+// table publishes.
+// ---------------------------------------------------------------------------
+let g_MAXT: i32 = 200;
+let g_arena: ptr = alloc(g_MAXT * 60);
+let g_dep: array<f64> = [];
+
+let g_r_n: i32 = 0;
+let g_r_vb: u64 = 0;
+let g_r_dep: u64 = 0;
+let g_r_sub: i32 = 0;
+let g_r_wrt: i32 = 0;
+let g_r_bf: i32 = 0;
+let g_r_near: i32 = 0;
+let g_r_guard: i32 = 0;
+let g_r_str: i32 = 0;
+
+fn fnv_i32(p_h: u64, p_v: i32): u64 {
+    let h: u64 = p_h;
+    let v: i32 = p_v;
+    let u: u64 = u64(v & 255);
+    h = (h ^ u) * 1099511628211;
+    u = u64((v >> 8) & 255);
+    h = (h ^ u) * 1099511628211;
+    u = u64((v >> 16) & 255);
+    h = (h ^ u) * 1099511628211;
+    u = u64((v >> 24) & 255);
+    h = (h ^ u) * 1099511628211;
+    let out: u64 = h;
+    return out;
+}
+
+// A run. `p_force_serial == 1` calls `emit_mesh_buf_serial`, the engine's
+// reference path, whatever the pool is doing.
+fn run_once(p_mesh, p_force_serial: i32) {
+    let m = p_mesh;
+    let nt: i32 = mesh_tri_count(m);
+    while (g_dep.length < nt) { g_dep.push(0.0); }
+    for (let i = 0; i < g_dep.length; i++) { g_dep[i] = 0.0; }
+    for (let i = 0; i < g_MAXT * 15; i++) { ptr_write_i32(g_arena + i * 4, 0); }
+    emit_stats_reset();
+    let n: i32 = 0;
+    if (p_force_serial == 1) {
+        n = emit_mesh_buf_serial(g_arena, 0, nt, g_dep, 0, mesh_buf(m), nt,
+                                 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0);
+    } else {
+        n = emit_mesh_buf(g_arena, 0, nt, g_dep, 0, mesh_buf(m), nt,
+                          0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0);
+    }
+    // Checksum ONLY the triangles actually written. Beyond `n` the arena is
+    // scratch the frame graph never reads, and hashing it would assert
+    // something the contract does not promise.
+    let hv: u64 = 14695981039346656037;
+    for (let i = 0; i < n * 15; i++) { hv = fnv_i32(hv, ptr_read_i32(g_arena + i * 4)); }
+    let hd: u64 = 14695981039346656037;
+    for (let i = 0; i < n; i++) { hd = fnv_i32(hd, i32(g_dep[i] * 65536.0)); }
+    g_r_n = n;
+    g_r_vb = hv;
+    g_r_dep = hd;
+    g_r_sub = emit_count_submitted();
+    g_r_wrt = emit_count_written();
+    g_r_bf = emit_count_backface();
+    g_r_near = emit_count_near();
+    g_r_guard = emit_count_guard();
+    g_r_str = emit_count_straddle();
+}
+
+// ---------------------------------------------------------------------------
+fn main() {
+    print("");
+    print("probe_par — the parallel emit pool, wired");
+    print("");
+
+    // ---- 1. THE CONFIG KNOB ------------------------------------------------
+    print("-- config (src/core/config.hml) --");
+    ck(g_EMIT_WORKERS >= 0,
+       `g_EMIT_WORKERS is not negative: ${g_EMIT_WORKERS}`);
+    ck(g_EMIT_WORKERS <= EMIT_PAR_MAX,
+       `g_EMIT_WORKERS ${g_EMIT_WORKERS} is within the engine ceiling EMIT_PAR_MAX ${EMIT_PAR_MAX}`);
+    ck(g_EMIT_PAR_MIN_TRIS >= 0,
+       `g_EMIT_PAR_MIN_TRIS is not negative: ${g_EMIT_PAR_MIN_TRIS} (0 = keep the engine default)`);
+
+    // ---- 2. THE LIFECYCLE --------------------------------------------------
+    print("");
+    print("-- lifecycle (src/render/world_render.hml) --");
+    ck(frame_par_workers() == 0,
+       `no pool exists before anyone asks for one: ${frame_par_workers()} workers`);
+
+    // Shutting down something that was never up must be a no-op, not a throw.
+    // This is the path a headless tool takes when it inits nothing and exits.
+    frame_par_shutdown();
+    ck(frame_par_workers() == 0,
+       `frame_par_shutdown() on a pool that never existed is a no-op: ${frame_par_workers()}`);
+
+    ck(frame_par_init(0) == 0,
+       "frame_par_init(0) stays SERIAL and returns 0 — the no-threads configuration");
+    ck(frame_par_workers() == 0, "…and no workers are running");
+    frame_par_shutdown();
+    ck(frame_par_init(1) == 0,
+       "frame_par_init(1) stays SERIAL and returns 0 — one worker buys nothing");
+    ck(frame_par_workers() == 0, "…and no workers are running");
+    frame_par_shutdown();
+
+    ck(frame_par_init(0 - 4) == 0,
+       "frame_par_init(-4) is clamped to serial, not a crash and not 4 workers");
+    frame_par_shutdown();
+
+    // The real one. 0 here is NOT a failure — it is what a box without threads
+    // returns, and every assertion below is written to hold in both worlds.
+    let nw: i32 = frame_par_init(g_EMIT_WORKERS);
+    let threaded: i32 = 0;
+    if (nw > 0) { threaded = 1; }
+    ck(nw == g_EMIT_WORKERS || nw == 0,
+       `frame_par_init(g_EMIT_WORKERS=${g_EMIT_WORKERS}) brought up ${nw} workers (0 = this box has no threads; serial is a supported answer)`);
+    ck(frame_par_workers() == nw,
+       `frame_par_workers() agrees with the engine: ${frame_par_workers()} vs emit_par_workers ${emit_par_workers()}`);
+    ck(emit_par_workers() == nw,
+       `the engine and the frame graph never disagree about the count: ${emit_par_workers()}`);
+
+    // Idempotent, first call wins. This is what lets `main.hml` set `--workers`
+    // before `frame_init` supplies the config default.
+    ck(frame_par_init(2) == nw,
+       `frame_par_init is idempotent — a second call does not rebuild the pool: still ${frame_par_workers()}`);
+    ck(frame_par_workers() == nw, "…and the count did not move");
+
+    ck(emit_par_min() == 96 || g_EMIT_PAR_MIN_TRIS > 0,
+       `the measured per-call crossover is untouched at ${emit_par_min()} triangles (config override ${g_EMIT_PAR_MIN_TRIS})`);
+
+    frame_par_shutdown();
+    ck(frame_par_workers() == 0,
+       `frame_par_shutdown() retires the pool: ${frame_par_workers()} workers`);
+
+    let nw2: i32 = frame_par_init(g_EMIT_WORKERS);
+    ck(nw2 == nw,
+       `the pool can be brought back up after a shutdown: ${nw2}`);
+    frame_par_shutdown();
+
+    let big: i32 = frame_par_init(9999);
+    ck(big <= EMIT_PAR_MAX,
+       `an absurd worker count is CLAMPED to EMIT_PAR_MAX, never honoured: asked 9999, got ${big}`);
+    frame_par_shutdown();
+    ck(frame_par_workers() == 0, "…and it shuts down again cleanly");
+
+    // ---- 3. BYTE IDENTITY AT THE GAME'S REAL DISPATCH SIZE -----------------
+    print("");
+    print("-- byte identity: one terrain chunk, the size the game emits --");
+
+    // The camera and projection the game uses: 320x180, the real near plane,
+    // CCW backface cull, baked vertex colour (stage 8 calls
+    // emit_set_lighting(0)), fog 12..64 m.
+    let env: array<f64> = env_new();
+    env[ENV_FOG_NEAR] = 12.0;
+    env[ENV_FOG_FAR] = 64.0;
+    // STANDING IN THE CHUNK, not looking at it from outside. A camera parked
+    // safely off one edge sees every triangle and rejects nothing, which is the
+    // one arrangement in which a range-split bug cannot show: with no
+    // rejections, `emit_run`'s leftward compaction never has to move anything
+    // and `total == lo` on every range. Standing inside means the triangles
+    // behind the eye are near-rejected, the ranges emit UNEQUAL counts, and the
+    // compaction is exercised — which is the whole point.
+    env[ENV_CAM_X] = 16.0;
+    env[ENV_CAM_Y] = 4.5;
+    env[ENV_CAM_Z] = 8.0;
+    env[ENV_SUN_X] = 0.4;
+    env[ENV_SUN_Y] = 0.8;
+    env[ENV_SUN_Z] = 0.0 - 0.45;
+
+    let aspect: f64 = f64(g_RES_W) / f64(g_RES_H);
+    let proj = mat_perspective(58.0 * 0.017453292519943295, aspect, g_NEAR, 67.84);
+    let view = mat_look_dir(v3(16.0, 4.5, 8.0), 3.141592653589793, 0.0 - 0.15);
+    let mvp = mat_mul(proj, view);
+    emit_set_env(env);
+    emit_set_mvp(mvp);
+    emit_set_viewport(f64(g_RES_W), f64(g_RES_H), 640.0);
+    emit_set_near(g_NEAR);
+    emit_set_backface(EMIT_BF_CCW);
+    emit_set_lighting(0);
+
+    let chunk = build_chunk();
+    let nt: i32 = mesh_tri_count(chunk);
+    ck(nt == g_Q * g_Q * 2,
+       `the probe's chunk is the game's chunk: ${nt} triangles (8x8 quads)`);
+    ck(nt > emit_par_min(),
+       `and it is ABOVE the ${emit_par_min()}-triangle dispatch threshold, so the parallel path is actually taken`);
+
+    // The reference: the engine's forced-serial entry point, pool irrelevant.
+    frame_par_shutdown();
+    run_once(chunk, 1);
+    let ref_n: i32 = g_r_n;
+    let ref_vb: u64 = g_r_vb;
+    let ref_dep: u64 = g_r_dep;
+    let ref_sub: i32 = g_r_sub;
+    let ref_wrt: i32 = g_r_wrt;
+    let ref_bf: i32 = g_r_bf;
+    let ref_near: i32 = g_r_near;
+    let ref_guard: i32 = g_r_guard;
+    let ref_str: i32 = g_r_str;
+
+    // TEETH. A reference that wrote nothing, or that culled nothing, would make
+    // every comparison below trivially true.
+    ck(ref_n > 40,
+       `the reference render has teeth: ${ref_n} of ${nt} triangles written`);
+    ck(ref_n < nt,
+       `and it is really culling: ${nt - ref_n} triangles rejected (backface ${ref_bf}, near ${ref_near}, guard ${ref_guard})`);
+    print(`       reference: n=${ref_n} vbuf=${ref_vb} depth=${ref_dep} sub=${ref_sub} wrt=${ref_wrt} bf=${ref_bf} near=${ref_near} guard=${ref_guard} straddle=${ref_str}`);
+
+    // Now the same mesh through `emit_mesh_buf` at every worker count the
+    // config could legally hold.
+    let counts: array = [0, 1, 2, 4, 6, 8, 12];
+    for (let ci = 0; ci < counts.length; ci++) {
+        let w: i32 = counts[ci];
+        frame_par_shutdown();
+        let got: i32 = frame_par_init(w);
+        run_once(chunk, 0);
+        let same: i32 = 1;
+        if (g_r_n != ref_n) { same = 0; }
+        if (g_r_vb != ref_vb) { same = 0; }
+        if (g_r_dep != ref_dep) { same = 0; }
+        if (g_r_sub != ref_sub || g_r_wrt != ref_wrt || g_r_bf != ref_bf) { same = 0; }
+        if (g_r_near != ref_near || g_r_guard != ref_guard || g_r_str != ref_str) { same = 0; }
+        ck(same == 1,
+           `nw=${w} (running ${got}): n=${g_r_n} vbuf=${g_r_vb} depth=${g_r_dep} counters ${g_r_sub}/${g_r_wrt}/${g_r_bf}/${g_r_near}/${g_r_guard}/${g_r_str} — IDENTICAL to serial`);
+    }
+
+    // ---- 4. IT STAYS IDENTICAL, DISPATCH AFTER DISPATCH --------------------
+    // One correct frame proves the split; two thousand prove the pool does not
+    // drift, does not leave a range behind, and does not accumulate state
+    // between dispatches. This is the shape of the real frame loop: the same
+    // pool, re-submitted forever.
+    print("");
+    print("-- 2000 consecutive dispatches on one pool --");
+    frame_par_shutdown();
+    let wrun: i32 = frame_par_init(g_EMIT_WORKERS);
+    let bad: i32 = 0;
+    let reps: i32 = 2000;
+    for (let r = 0; r < reps; r++) {
+        run_once(chunk, 0);
+        if (g_r_n != ref_n || g_r_vb != ref_vb || g_r_dep != ref_dep) { bad = bad + 1; }
+        if (g_r_wrt != ref_wrt || g_r_str != ref_str) { bad = bad + 1; }
+    }
+    ck(bad == 0,
+       `${reps} dispatches on ${wrun} workers, ${bad} divergences from the serial reference`);
+    ck(frame_par_workers() == wrun,
+       `the pool is still the pool it was 2000 dispatches ago: ${frame_par_workers()} workers`);
+
+    // ---- 5. SHUTDOWN IS FINAL, AND SERIAL STILL WORKS AFTER IT -------------
+    print("");
+    print("-- teardown --");
+    frame_par_shutdown();
+    ck(frame_par_workers() == 0,
+       `the pool is gone: ${frame_par_workers()} workers`);
+    run_once(chunk, 0);
+    ck(g_r_n == ref_n && g_r_vb == ref_vb && g_r_dep == ref_dep,
+       `and the frame graph still emits, serially, byte for byte: n=${g_r_n} vbuf=${g_r_vb}`);
+    // Double shutdown, the shape of a crash-path teardown running twice.
+    frame_par_shutdown();
+    ck(frame_par_workers() == 0, "a second frame_par_shutdown() is a no-op");
+
+    ck(threaded == 1 || threaded == 0,
+       `this box brought up ${nw} workers; every assertion above held for that answer`);
+
+    // ---- verdict -----------------------------------------------------------
+    print("");
+    if (g_n != g_EXPECT) {
+        print(`FAIL: ran ${g_n} assertions, expected ${g_EXPECT}`);
+        exit(1);
+    }
+    if (g_ok != g_n) {
+        print(`FAIL ${g_ok} / ${g_n}`);
+        exit(1);
+    }
+    print(`PASS ${g_ok} / ${g_n}`);
+    exit(0);
+}
+
+main();

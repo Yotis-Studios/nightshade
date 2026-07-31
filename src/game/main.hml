@@ -118,6 +118,7 @@ import { frame_init, frame_render, frame_present, frame_begin,
          frame_set_capture,
          frame_set_hud_solid_uv, frame_set_vignette_colour,
          frame_set_flash_colour, frame_env, frame_mvp, frame_batch_hud,
+         frame_par_init, frame_par_shutdown, frame_par_workers,
          world_clear, world_chunk_add, world_prop_add, world_fx_add,
          world_prop_count, world_prop_tag, world_prop_x, world_prop_y,
          world_prop_z,
@@ -139,7 +140,8 @@ import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_FRAME_BUDGET_MS,
          g_FOG_FAR_CAP, g_MIST_HEIGHT, g_UPSCALE_DEFAULT, g_TICK_MS,
          g_WORLD_SEED_DEFAULT, g_DAY_TICKS, g_EYE_STAND, g_LOW_HP,
          g_BUDGET_SIM_MS, g_TICK_DT, g_ENEMY_WISP, g_ENEMY_MOTE,
-         g_ENEMY_HUSK, g_LANTERN_R_T1, g_XP_LANTERN, g_LANTERN_CHANNEL_S }
+         g_ENEMY_HUSK, g_LANTERN_R_T1, g_XP_LANTERN, g_LANTERN_CHANNEL_S,
+         g_EMIT_WORKERS }
        from "../core/config.hml";
 import { clamp01, lerpf, clampi, clampf } from "../core/mathx.hml";
 
@@ -239,7 +241,7 @@ import { BTN_GRENADE, BTN_SWITCH, BTN_BUILD, BTN_INV } from "../sim/command.hml"
 // W6 — the ten systems reach the picture and the HUD here.
 import { npc_offer_first, npc_offer_kind, npc_offer_arg, npc_count,
          npc_slot_who, npc_slot_class, npc_x, npc_y, npc_z, npc_yaw,
-         NPC_CLASS_NAMED } from "../sim/npc.hml";
+         NPC_CLASS_NAMED, NPC_MABEL } from "../sim/npc.hml";
 import { settle_building_count, settle_building_pid, settle_plot_x,
          settle_plot_z, settle_tier_ever, settle_grid_lux,
          settle_cx as w6_settle_cx, settle_cz as w6_settle_cz
@@ -2326,11 +2328,26 @@ fn boot_window(): i32 {
     }
     target_set_border(g_target, 0, 0, 0);
     target_set_shake(g_target, 0.0, 0.0);
+
+    // ---- THE PARALLEL EMIT POOL --------------------------------------------
+    // Before `frame_init`, because `frame_par_init` is first-call-wins: this is
+    // where `--workers N` beats the `g_EMIT_WORKERS` default that `frame_init`
+    // would otherwise supply. `g_workers < 0` means "no flag given" and lets
+    // the config default through untouched.
+    //
+    // The return is the count ACTUALLY RUNNING and 0 is a legitimate answer —
+    // `--workers 0/1`, a build without threads, a `ThreadPool` that threw. The
+    // serial path is byte-identical to the parallel one (docs/design/
+    // THREADING_SPIKE.md, and this repo's nine goldens), so there is nothing to
+    // report as an error and nothing to abort for. It is printed, not checked.
+    if (g_workers >= 0) { frame_par_init(g_workers); }
+
     if (frame_init(g_win, g_target, g_fb) != 0) {
         eprint("nightshade: frame_init failed");
         let bad3: i32 = -1;
         return bad3;
     }
+    g_emit_workers = frame_par_workers();
     g_bhud = frame_batch_hud();
     let ok: i32 = 0;
     return ok;
@@ -2522,6 +2539,11 @@ fn boot_game() {
 fn shutdown() {
     if (g_in != null) { input_set_relative(g_in, 0); }
     if (g_audio_on == 1) { audio_shutdown(); }
+    // The emit pool goes down FIRST, and before the render target it writes
+    // into. It is a no-op when the stage ran serial. `emit_run` joins every
+    // range before it returns, so by the time the loop has exited no task can
+    // be in flight and this only has to retire idle workers.
+    frame_par_shutdown();
     if (g_target != null) { target_free(g_target); g_target = null; }
     if (g_win != null) { window_close(g_win); g_win = null; }
 }
@@ -2686,19 +2708,37 @@ let g_shot_every: f64 = 5.0;
 // and a panel nothing ever opens is a panel whose cost nobody has measured.
 fn demo_ui_drive(p_t: f64, p_dt: f64): i32 {
     let st: object = server_settle(g_sv);
-    // Steer at the NEAREST NAMED VILLAGER, not at the green: the trade panel
-    // has to be about somebody, and "walk to the middle and hope" put the
-    // measurement 14 m short of anyone on the first attempt.
+    // Steer at a NAMED VILLAGER, not at the green: the trade panel has to be
+    // about somebody, and "walk to the middle and hope" put the measurement
+    // 14 m short of anyone on the first attempt.
+    //
+    // >>> AND IT STEERS AT THE GUNSMITH SPECIFICALLY, WHICH IS NEW. <<<
+    // "Nearest named villager" is not a person, it is an accident of the
+    // settlement layout, and the accident was PIP: his stall is on the green
+    // 6.4 m from the centre (`npc.hml` `g_npc_green_r`) while Mabel's Bench is
+    // a Hall out on a road, so every `--demo-ui` run since this code was
+    // written measured the trade loop against a child who sells an Almanac
+    // that does not exist. That is why the run reported `trades 0 (1 refused)`
+    // and why it would have gone on reporting it with a fully stocked
+    // gunsmith. The panel exists to measure the TRADE LOOP, the trade loop is
+    // DIRECTION.md §6.1's "you get the bolt-action FROM SOMEONE", and that
+    // someone is Mabel. Nearest-named is kept as the fallback for the tier
+    // where she has not arrived yet.
     let tgx: f64 = w6_settle_cx(st);
     let tgz: f64 = w6_settle_cz(st);
     let sto: object = server_npcs(g_sv);
     if (sto != null) {
         let nn: i32 = npc_count(sto);
         let bd: f64 = 1.0e30;
+        let got: i32 = 0;
         for (let i = 0; i < nn; i++) {
             if (npc_slot_class(sto, i) != NPC_CLASS_NAMED) { continue; }
             let vx: f64 = npc_x(sto, st, i, g_tick);
             let vz: f64 = npc_z(sto, st, i, g_tick);
+            if (npc_slot_who(sto, i) == NPC_MABEL) {
+                tgx = vx; tgz = vz; got = 1;
+                break;
+            }
             let ex: f64 = vx - client_px(g_cl);
             let ez: f64 = vz - client_pz(g_cl);
             let dd: f64 = ex * ex + ez * ez;
@@ -2744,24 +2784,39 @@ fn demo_ui_drive(p_t: f64, p_dt: f64): i32 {
     let sw: i32 = 0;
     let cf: i32 = 0;
     let mel: i32 = 0;
+    // THE SCHEDULE IS 6 s TIGHTER THAN IT WAS AND IT CONFIRMS TWICE.  Steering
+    // at Mabel rather than at whoever happens to be nearest adds about four
+    // seconds of walking, and the old schedule spent its last press at
+    // ut 21.2 -- which ran off the end of a 30 s `--demo` and reported
+    // `TRADE peak 0` as though the panel were broken.  Gaps went 0.6 -> 0.5 s
+    // and 0.2 s windows are 12 frames at 60 Hz, so every press is still many
+    // frames wide.
+    //
+    // TWO CONFIRMS, ON PURPOSE.  The first is pressed the moment the panel
+    // opens, on the row the cursor opens on -- which `sv_ui_tick` guarantees
+    // is the first row you can actually take, and for the gunsmith at a
+    // Village that is row 0, THE BOLT-ACTION.  The second is pressed after
+    // five cursor moves, which is the brass.  A gun and its ammunition, from
+    // the person DIRECTION.md §6.1 says you get them from, inside 30 seconds.
     if (ut > 6.0 && ut < 6.2)   { cf = 1; }        // cast (refused: no spell yet)
-    if (ut > 9.0 && ut < 9.2)   { mel = 1; }       // swing the club
     // TALK ON ARRIVAL, NOT ON THE CLOCK. The first version pressed USE at a
     // fixed 12.0 s and the walk was still four metres short, so `talks` read 0
     // and looked like a broken feature rather than a mistimed robot.
-    if (ut > 8.0 && ut < 9.0) { use = 1; }         // talk
-    if (ut > 13.0 && ut < 13.2) { inv = 1; }       // open the sheet
-    if (ut > 13.6 && ut < 13.8) { sw = 1; }        // next stat
-    if (ut > 14.2 && ut < 14.4) { cf = 1; }        // spend
-    if (ut > 15.0 && ut < 15.2) { inv = 1; }       // close it
-    if (ut > 16.0 && ut < 16.2) { bld = 1; }       // open the trade panel
-    if (ut > 16.6 && ut < 16.8) { sw = 1; }        // next row
-    if (ut > 17.2 && ut < 17.4) { sw = 1; }
-    if (ut > 17.8 && ut < 18.0) { sw = 1; }
-    if (ut > 18.4 && ut < 18.6) { sw = 1; }
-    if (ut > 19.0 && ut < 19.2) { sw = 1; }
-    if (ut > 19.6 && ut < 19.8) { cf = 1; }        // take it
-    if (ut > 21.0 && ut < 21.2) { bld = 1; }       // close
+    if (ut > 6.5 && ut < 7.3)   { use = 1; }       // talk
+    if (ut > 7.6 && ut < 7.8)   { mel = 1; }       // swing the club
+    if (ut > 8.1 && ut < 8.3)   { inv = 1; }       // open the sheet
+    if (ut > 8.6 && ut < 8.8)   { sw = 1; }        // next stat
+    if (ut > 9.1 && ut < 9.3)   { cf = 1; }        // spend
+    if (ut > 9.6 && ut < 9.8)   { inv = 1; }       // close it
+    if (ut > 10.1 && ut < 10.3) { bld = 1; }       // open the trade panel
+    if (ut > 10.6 && ut < 10.8) { cf = 1; }        // TAKE THE BOLT-ACTION
+    if (ut > 11.1 && ut < 11.3) { sw = 1; }        // next row
+    if (ut > 11.6 && ut < 11.8) { sw = 1; }
+    if (ut > 12.1 && ut < 12.3) { sw = 1; }
+    if (ut > 12.6 && ut < 12.8) { sw = 1; }
+    if (ut > 13.1 && ut < 13.3) { sw = 1; }
+    if (ut > 13.6 && ut < 13.8) { cf = 1; }        // TAKE THE BRASS
+    if (ut > 14.1 && ut < 14.3) { bld = 1; }       // close
     client_set_button(g_cl, BTN_INV, inv);
     client_set_button(g_cl, BTN_BUILD, bld);
     client_set_button(g_cl, BTN_USE, use);
@@ -3113,6 +3168,15 @@ fn run_loop() {
         print(`   whole frame  mean ${f1(loop_ms / n2)} ms -> ${f1(1000.0 * n2 / loop_ms)} fps  (${ms_n} frames in ${f1(loop_ms / 1000.0)} s of loop)`);
         print(`   frames over 16.67 ms: ${over} of ${ms_n}`);
         print(`   where the frame goes, mean: input+tick ${f1(pre_acc / n2)} ms (sim CPU ${f1(sim_acc2 / n2)})  render ${f1(ms_acc / n2)}  body ${f1(body_acc / n2)}`);
+        // The emit stage is 82-88 % of the render frame, so this line is the
+        // one to read next to the two above. 0 == serial.
+        //
+        // AND READ THE WALL NUMBER, NOT THE CPU ONE. `__clock()` is CPU time
+        // and SUMS ACROSS THREADS (CLAUDE.md rule T), so with the pool on it
+        // counts every worker's share and will look WORSE than serial while the
+        // frame gets faster. "render, wall" and "whole frame" above are the
+        // honest comparison; "render, CPU" is the efficiency column.
+        print(`   parallel emit: ${g_emit_workers} workers (0 = serial; --workers N to change, config g_EMIT_WORKERS = ${g_EMIT_WORKERS})`);
         print(`   triangles: PEAK ${tri_peak} of ${g_TRIS_STEADY}   HUD peak ${hud_peak} of ${g_HUD_TRI_CAP}   viewmodel peak ${vm_peak}`);
         print(`   sim+net: worst ${f1(sim_worst)} ms of the ${f1(g_BUDGET_SIM_MS)} ms budget   ticks ${g_tick - server_t0(g_sv)}`);
         print(`   stalls ${sim_accum_stalls(g_acc)}  forgiven ${sim_accum_forgiven(g_acc)}  cmds ${client_cmds_sent(g_cl)}  packets ${client_packets(g_cl)}  decode-fail ${client_decode_fail(g_cl)}`);
@@ -3169,6 +3233,9 @@ fn usage() {
     print("  --vm <0|1|2>      viewmodel: off / frame-graph static / driven");
     print("  --no-audio        do not open an audio device");
     print("  --headless        SDL_VIDEODRIVER=dummy is expected; no mouse grab");
+    print("  --workers <0..12> parallel emit workers (default from config: 8).");
+    print("                    0 or 1 = serial, which is byte-identical output");
+    print("                    and the no-threads path. Clamped to 12.");
     print("  --selftest        headless smoke test; exits 0 on pass");
     print("  --at-town         DEV: start standing in the settlement");
     print("  --demo-ui         DEV: with --demo, open both modal panels on a");
@@ -3181,6 +3248,16 @@ fn usage() {
 
 let g_no_audio: i32 = 0;
 let g_selftest: i32 = 0;
+// `--workers N`. -1 means "no flag", i.e. take `g_EMIT_WORKERS` from
+// src/core/config.hml. 0 and 1 both mean SERIAL, which is a supported
+// configuration and the WASM/single-core path, not a failure. Anything above
+// EMIT_PAR_MAX (12) is clamped by the engine.
+//
+// This flag exists so the pool can be measured against itself in the real game
+// on the real box -- `--workers 0` vs `--workers 8` on the same binary, same
+// seed, same demo -- which is the only before/after that is worth anything.
+let g_workers: i32 = -1;
+let g_emit_workers: i32 = 0;    // what `emit.hml` actually brought up
 // `--town N`. A DEV FLAG, and `server_settle_boot_tier`'s header says exactly
 // why it has to exist and exactly what it does not do.
 let g_town_tier: i32 = 0;
@@ -3200,7 +3277,7 @@ let g_demo_ui_t0: f64 = 1.0e30;
 //
 // Exit status is the contract: 0 iff every assertion passed AND the expected
 // NUMBER of assertions ran.
-let g_ST_EXPECT: i32 = 19;   // 12 from W4-11, +7 for W6
+let g_ST_EXPECT: i32 = 21;   // 12 from W4-11, +7 for W6, +2 for the emit pool
 let g_st_n: i32 = 0;
 let g_st_ok: i32 = 0;
 let g_st_tri_peak: i32 = 0;
@@ -3277,6 +3354,26 @@ fn selftest_report(): i32 {
     stck(g_panel_trunc == 0,
          `no panel string was truncated: ${g_panel_trunc} dropped glyphs`);
 
+    // ---- THE PARALLEL EMIT POOL IS WIRED -----------------------------------
+    // Two assertions, and note what the FIRST one deliberately does NOT say.
+    // It does not require workers > 0, because 0 is correct on a machine
+    // without threads and on the WASM build, and a selftest that fails there
+    // would be asserting the platform rather than the code. What it asserts is
+    // that the count `emit.hml` is running is the count this shell ASKED for,
+    // clamped: no silent divergence between the config and the engine.
+    let want_w: i32 = g_EMIT_WORKERS;
+    if (g_workers >= 0) { want_w = g_workers; }
+    if (want_w > 12) { want_w = 12; }
+    if (want_w < 2) { want_w = 0; }
+    stck(g_emit_workers == want_w || g_emit_workers == 0,
+         `the emit pool runs the count that was asked for: asked ${want_w}, running ${g_emit_workers}`);
+    // And the pool never changes the picture. If it did, `g_st_tri_peak` and
+    // the HUD/budget assertions above would still pass while the frame was
+    // wrong -- so this asserts the thing that actually varies: the frame graph
+    // still produced triangles, with the pool in whatever state it is in.
+    stck(g_st_tri_peak > 200,
+         `the world still draws with ${g_emit_workers} emit workers: peak ${g_st_tri_peak} triangles`);
+
     if (g_st_n != g_ST_EXPECT) {
         print(`FAIL: ran ${g_st_n} assertions, expected ${g_ST_EXPECT}`);
         let bad: i32 = 1;
@@ -3309,6 +3406,7 @@ fn parse_args(): i32 {
         else if (a == "--demo-ui") { g_demo_ui = 1; }
         else if (a == "--no-audio") { g_no_audio = 1; }
         else if (a == "--headless") { g_headless = 1; }
+        else if (a == "--workers" && i + 1 < n) { i++; g_workers = clampi(i32(num_or(args[i], f64(g_EMIT_WORKERS))), 0, 12); }
         else if (a == "--selftest") { g_headless = 1; g_no_audio = 1; g_demo_s = 3.0; g_selftest = 1; }
         else { eprint(`nightshade: unknown argument '${a}'`); usage(); let bad: i32 = 2; return bad; }
         i++;
@@ -3354,7 +3452,7 @@ fn main() {
         }
     }
 
-    print(`nightshade: boot ${f1(boot_ms)} ms, ${assets_texture_count()} textures, audio ${g_audio_on}, seed ${g_seed}`);
+    print(`nightshade: boot ${f1(boot_ms)} ms, ${assets_texture_count()} textures, audio ${g_audio_on}, seed ${g_seed}, emit workers ${g_emit_workers}`);
     print(`nightshade: spawn (${i32(server_spawn_x(g_sv))}, ${i32(server_spawn_z(g_sv))})  tier ${server_tier_at(g_sv, server_spawn_x(g_sv), server_spawn_z(g_sv), 0)}  lantern ${i32(server_lantern_x(g_sv))}, ${i32(server_lantern_z(g_sv))}  vm ${vm_mesh_tris(g_vm)} tris`);
 
     run_loop();

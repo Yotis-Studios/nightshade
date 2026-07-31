@@ -216,6 +216,40 @@ export let g_BUDGET_CHUNKGEN_MS: f64 = 2.0;          // amortised, per frame
 export let g_BUDGET_OVERDRAW: i32 = 4;               // screenfuls; 0.8 ms each
 export let g_BUDGET_RSS_MB: i32 = 96;                // after 10 000 frames
 
+// ---------------------------------------------------------------------------
+// 4.1 THE PARALLEL EMIT STAGE — worker count, tunable per platform
+// ---------------------------------------------------------------------------
+// `emit.hml`'s transform-and-pack kernel splits one `emit_mesh_buf` call across
+// a persistent `ThreadPool` created once at boot. This is the ONLY knob the
+// game has on it, and it lives here so a platform port changes one number.
+//
+// THE MEASURED CURVE (docs/design/THREADING_SPIKE.md §4/§5, wall clock, one
+// 3000-triangle dispatch, 24 cores, loadavg 7.2-7.8):
+//
+//     workers   1      2      4      6      8     12     16
+//     speedup  0.99   1.90   3.42   4.41   4.66   5.54   ~6.0
+//     CPU cost  --    +?     +11%   +23%   +36%   +49%   +75%
+//
+// 8 is the default because efficiency is >=83 % through 8 and falls off a cliff
+// at 12->16 (58 % -> 51 %). What caps the curve is NOT memory bandwidth: it is
+// `ThreadPool.submit*` costing ~1.2-2.5 us per task SERIALLY on the submitting
+// thread (§6), so past ~12 workers the dispatch loop is the bottleneck.
+// `emit_par_init` clamps to EMIT_PAR_MAX = 12 regardless of what is set here.
+//
+// **A VALUE OF 0 OR 1 IS A SUPPORTED CONFIGURATION, NOT A FAILURE.** It runs
+// the serial path, which `probe_emit` asserts is byte-identical to the parallel
+// one. That is the WASM build (docs/design/WASM_SPIKE.md: no threads at all),
+// a single-core target, and any environment where `ThreadPool` throws — the
+// engine falls back to it on its own and never brings the frame down.
+export let g_EMIT_WORKERS: i32 = 8;
+
+// The per-call triangle count below which a dispatch is not worth its ~28 us
+// fork-join. 0 means "keep the engine's own measured default", which is 96 —
+// chosen so an 8x8-quad terrain chunk (132 triangles) qualifies with margin
+// while billboards, contact blobs and debris never pay a round trip they cannot
+// amortise. Override only with a re-measured crossover table, never by guess.
+export let g_EMIT_PAR_MIN_TRIS: i32 = 0;
+
 // ===========================================================================
 // 5. CAMERA, FOG AND LIGHT  (ART_BIBLE §2.6 §6, ARCHITECTURE D2 D7)
 // ===========================================================================
@@ -967,13 +1001,19 @@ export let g_MELEE_LIGHT_MULT: f64 = 1.5;            // vs Wisp / Mote
 // The 6x14 stat table itself is `sim/weapons.hml` (parallel arrays).  What
 // lives here is what other systems need to size themselves against, plus the
 // two model constants that are not per-weapon.
-export let g_WPN_COUNT: i32 = 6;
+// W6-6: the table grew from six rows to eight.  Ids 0..5 did NOT move.
+// DIRECTION.md §3's VILLAGE tier is { BLACKTHORN, KESTREL, BELLOWS, NETTLE };
+// the Kestrel and the Bellows were reclassified rather than duplicated, so
+// only two ids are new.  The tier itself is `weapons.hml`'s `g_wpn_tier`.
+export let g_WPN_COUNT: i32 = 8;
 export let g_WPN_SPARROW: i32 = 0;
 export let g_WPN_TINKER: i32 = 1;
 export let g_WPN_BELLOWS: i32 = 2;
 export let g_WPN_LONGSHADOW: i32 = 3;
 export let g_WPN_KESTREL: i32 = 4;
 export let g_WPN_EMBERLANCE: i32 = 5;
+export let g_WPN_BLACKTHORN: i32 = 6;                // bolt-action, village
+export let g_WPN_NETTLE: i32 = 7;                    // crude pipe-SMG, village
 export let g_WPN_MAX_PELLETS: i32 = 9;               // Bellows, +1 by affix
 export let g_RECOIL_SETTLE_S: f64 = 0.16;            // before recovery starts
 export let g_HITSCAN_MAX_M: f64 = 140.0;             // ray length ceiling
@@ -1345,17 +1385,29 @@ export let g_SPELL_KINDLING: i32 = 6;      // placed light pool  (no damage)
 // InputCommand that a gun does, and needs zero wire change (MAGIC_KINETIC
 // §1.9.1).
 //
-// THE MAIN-HAND ID SPACE IS NOW FULL, EXACTLY:
-//     0..5   the six guns          (weapons.hml)
-//     6..8   club, spear, sword    (weapons.hml `MH_MELEE_BASE = 6`)
-//     9..15  the seven spells      (here)
-// 9 + 7 - 1 = 15 = CMD_MAX_WEAPON.  There is ZERO headroom left in the field,
-// so the next main-hand item of any kind needs CMD_MAX_WEAPON raised — which is
-// a wire-format decision, not a table edit.  Flagged rather than pre-empted.
+// THE MAIN-HAND ID SPACE, AFTER W6-6:
+//     0..7    the eight guns        (weapons.hml — six city, two new village)
+//     8..10   club, spear, sword    (weapons.hml `MH_MELEE_BASE = 8`)
+//     11..17  the seven spells      (here)
+// 11 + 7 - 1 = 17 = CMD_MAX_WEAPON.
+//
+// >>> THE OLD NOTE HERE SAID RAISING THIS CAP WAS "a wire-format decision,
+// >>> not a table edit".  IT IS NOT, AND THAT WAS WORTH MEASURING. <<<
+// `weapon_sel` is a **u8** at byte +18 of the 20-byte command record
+// (`packing.hml` §11.2, `protocol.hml`'s map).  The field has always held
+// 0..255; `CMD_MAX_WEAPON` is a POLICY CLAMP inside `cmd_set` and
+// `cmd_wire_ok`, not the width of anything.  Raising it 15 -> 17 changed no
+// packed byte, no stride, no checksum and no protocol version — verified by
+// `tools/packetdump.hml` round-tripping unchanged.  There are 238 main-hand
+// ids still spare.
 //
 // (This base was 8 for one build, which collided with the sword.  Caught by
-// reading `weapons.hml`'s own id-space comment, not by a compiler.)
-export let g_SPELL_ITEM_BASE: i32 = 9;
+// reading `weapons.hml`'s own id-space comment, not by a compiler.  It moved
+// to 11 in W6-6 for exactly the same reason: guns 6 and 7 became real, so
+// melee moved to 8..10 and the spells had to move out of its way.  `sim.hml`
+// swaps the held gun to `weapon_sel` EVERY TICK, so an overlap here is not a
+// naming clash, it is a live weapon swap you did not ask for.)
+export let g_SPELL_ITEM_BASE: i32 = 11;
 export let g_SPELL_SWAP_IN_S: f64 = 0.30;            // raising a spell
 export let g_SPELL_SWAP_OUT_S: f64 = 0.22;           // lowering it
 

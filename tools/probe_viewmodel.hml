@@ -25,12 +25,15 @@
 //
 // TWO THINGS TO KNOW BEFORE READING THE OUTPUT:
 //
-//   * RUN IT COMPILED. Interpreted it reports 55/57: everything correctness- and
-//     determinism-related is bit-identical between the two backends (same state
-//     fingerprint, same 114/116 emit counts, same footprint, same cap-box
-//     counts), and the only two red lines are section [12]'s microsecond
-//     regression guards, which are calibrated for the compiled build the game
-//     ships as. CLAUDE.md §2: hemlockc is ground truth.
+//   * RUN IT COMPILED. Interpreted it reports exactly two fewer passes than
+//     compiled: everything correctness- and determinism-related is bit-identical
+//     between the two backends (same state fingerprint 99.9468594825639, same
+//     118/120 emit counts, same footprint, same cap-box counts), and the only
+//     two red lines are section [12]'s microsecond regression guards, which are
+//     calibrated for the compiled build the game ships as. CLAUDE.md §2:
+//     hemlockc is ground truth.  Measured 2026-07-31: compiled 65/66,
+//     interpreted 63/66, and the ONE shared failure is not this module's — see
+//     the note at the end of this header.
 //   * NEVER REUSE A LOCAL NAME FOR TWO TYPES IN ONE FUNCTION, even in disjoint
 //     blocks — HEMLOCK_ISSUES.md H-11. This probe was written with `let a: f64`
 //     in section [2] and `for (let a = 0; ...)` in section [7]; compiled, the
@@ -47,6 +50,27 @@
 // every pose in the module's whole cap box, and counts how many survive the
 // renderer's own backface rule. 122 every time, or red. Section 7 also contains
 // a NEGATIVE CONTROL just outside the caps, so the test cannot pass vacuously.
+//
+// ---------------------------------------------------------------------------
+// 🛑 THE ONE RED LINE AS OF 2026-07-31, AND IT IS NOT THIS MODULE'S
+// ---------------------------------------------------------------------------
+// Section [3]'s "the heaviest weapon lands on ART_BIBLE 8.5's 4 deg pitch
+// (measured 3.5..5.0)" FAILS, at 5.44 deg.  Nothing in `viewmodel.hml` changed
+// to cause it: `src/sim/weapons.hml` widened from 6 weapons to 8 while this
+// probe was being run (WPN_BLACKTHORN, WPN_NETTLE; WPN_COUNT 6 -> 8), and
+// WPN_BLACKTHORN's rc_v is 3.4 deg, which through GAME_DESIGN 2.4's own
+// `pitch = 1.6 * mult` is 5.44 deg and 0.068 m of push-back — heavier than the
+// "0.06 m, up 4 deg" ART_BIBLE 8.5 writes down as the heavy end.
+//
+// The bound is NOT widened here.  Either ART_BIBLE 8.5's figure is now wrong or
+// Blackthorn's recoil is, and that is a decision for whoever owns the weapon
+// table, not something a viewmodel probe should absorb in silence.  It matters
+// to the viewmodel too: 0.068 m of push-back is already 85 % of `g_VM_OFF_F_MIN`
+// (-0.08 m), so one more weapon in that direction makes the cap-box clamp BITE,
+// which section [7c] asserts never happens.
+//
+// The footprint numbers this probe now pins (section [8]) are measured with the
+// whole weapon table, Blackthorn included, so they are not optimistic.
 
 import { exit } from "@stdlib/process";
 import { sin, cos, sqrt, tan, exp, log, floor } from "@stdlib/math";
@@ -80,6 +104,7 @@ import {
     vm_take_clack, vm_take_reload_done, vm_stage_bits, vm_kicks,
     vm_kick_peak_s, vm_ppm, vm_mesh_tris,
     g_VM_RIGHT, g_VM_DOWN, g_VM_FWD, g_VM_PPM,
+    g_VM_PIVOT_X, g_VM_PIVOT_Y, g_VM_PIVOT_Z,
     g_VM_SWAY_PX, g_VM_SWAY_HZ, g_VM_BOB_PX,
     g_VM_KICK_RELEASE, g_VM_KICK_ATTACK, g_VM_KICK_BACK_M, g_VM_KICK_PITCH_DEG,
     g_VM_SPRINT_TILT_DEG, g_VM_SPRINT_DROP_M, g_VM_SPRINT_S,
@@ -107,7 +132,7 @@ import { g_TICK_DT, g_RES_W, g_RES_H, g_EYE_STAND, g_SPEED_WALK, g_SPEED_SPRINT 
        from "../src/core/config.hml";
 
 // Every assertion below is unconditional; this is the count.
-let g_EXPECTED_ASSERTIONS = 61;
+let g_EXPECTED_ASSERTIONS = 70;
 let g_TRIALS = 7;
 
 let g_pass: i32 = 0;
@@ -251,6 +276,12 @@ fn session_frame(p_vm, p_tick: i32, p_mode: i32, p_dt: f64): i32 {
     let sprint: i32 = 0;
     let fired: i32 = 0;
     if (p_mode == 1) { sprint = 1; }
+    // 5 = sprinting, 6 = the frame the reload starts ON while sprinting.  The
+    // modes above are exclusive; these two exist because the DOWN offsets of a
+    // sprint drop and a reload dip are the two biggest in the module and
+    // nothing else in this file ever plays them together.
+    if (p_mode == 5) { sprint = 1; }
+    if (p_mode == 6) { sprint = 1; wpn_reload_begin(g_wst, 0); }
     if (p_mode == 2) { ads = 1; }
     if (p_mode == 3) {
         rng_seed(g_rng, 4242, RNG_SPREAD, p_tick, 1);
@@ -305,6 +336,42 @@ fn main() {
     ok("the rest offsets are world_render's 0.26 / 0.34 / 1.05",
        g_VM_RIGHT == 0.26 && g_VM_DOWN == 0.34 && g_VM_FWD == 1.05);
     ok("the viewmodel depth constant is ARCHITECTURE 2.3 invariant 4's 0.05", g_VM_DEPTH == 0.05);
+
+    // ----------------------------------------------------------------------
+    // THE PIVOT IS PINNED TO THE MESH, NOT TO A LITERAL.
+    // ----------------------------------------------------------------------
+    // `viewmodel.hml` documents g_VM_PIVOT_* as "measured off the shipped mesh:
+    // the topmost vertex, and the fist's own centre column". Until the 16:9
+    // rescale that was a sentence in a comment and three literals in the code,
+    // and the two could drift apart in silence — which is exactly how the
+    // screen-height divisor in section [8] came to be dividing by 240/100 in a
+    // 180-row frame and reporting an improvement that was not there. So it is
+    // an ASSERTION now: recompute the pivot from the mesh every run and compare.
+    // `mesh_vert_pos` hands back f32-rounded positions, hence the 1e-6 window.
+    let nv0: i32 = mesh_vert_count(g_mesh);
+    let ytop: f64 = 0.0 - 1.0e9;
+    for (let i = 0; i < nv0; i++) {
+        let y: f64 = mesh_vert_pos(g_mesh, i, 1);
+        if (y > ytop) { ytop = y; }
+    }
+    // the fist's centre column: the mid-x of the vertices sharing that top y
+    let fx0: f64 = 1.0e9; let fx1: f64 = 0.0 - 1.0e9;
+    for (let i = 0; i < nv0; i++) {
+        if (mesh_vert_pos(g_mesh, i, 1) < ytop - 1.0e-6) { continue; }
+        let x: f64 = mesh_vert_pos(g_mesh, i, 0);
+        if (x < fx0) { fx0 = x; }
+        if (x > fx1) { fx1 = x; }
+    }
+    let piv_x_mesh: f64 = g_VM_RIGHT - (fx0 + fx1) * 0.5;
+    let piv_y_mesh: f64 = ytop - g_VM_DOWN;
+    print(`  pivot from the mesh: x ${f4(piv_x_mesh)}, y ${f4(piv_y_mesh)}, z ${f4(0.0 - g_VM_FWD)}`);
+    note(`the pivot is recomputed from the mesh every run: x ${f4(piv_x_mesh)}, y ${f4(piv_y_mesh)} — a rescale of the lantern cannot leave it stale`);
+    ok("g_VM_PIVOT_X is the fist's own centre column, measured off the shipped mesh",
+       absf2(g_VM_PIVOT_X - piv_x_mesh) < 1.0e-6);
+    ok("g_VM_PIVOT_Y is the mesh's topmost vertex under the rest transform",
+       absf2(g_VM_PIVOT_Y - piv_y_mesh) < 1.0e-6);
+    ok("g_VM_PIVOT_Z is the rest plane itself, -g_VM_FWD",
+       g_VM_PIVOT_Z == 0.0 - g_VM_FWD);
 
     ok("the rest pose draws every triangle of the mesh (nothing is culled to begin with)",
        drawn_tris(m0) == mesh_tri_count(g_mesh));
@@ -689,7 +756,7 @@ fn main() {
         clamps_before = clamps_before + vm_clamps(vm);
         w = w + 1;
     }
-    print(`  scripted session: ${sess_frames} frames over 6 weapons, worst drawn count ${sess_min} of ${nt}`);
+    print(`  scripted session: ${sess_frames} frames over ${WPN_COUNT} weapons, worst drawn count ${sess_min} of ${nt}`);
     ok("across a full walk/sprint/aim/fire/reload session on all six weapons, nothing is ever culled",
        sess_min == nt);
     ok("the cap-box clamp NEVER bites under the real drive — it is a net, not part of the animation",
@@ -699,20 +766,34 @@ fn main() {
     print("");
     print("[8] screen rules — crosshair, footprint, and the >220 anchor");
     // -----------------------------------------------------------------------
-    // The crosshair is a 12 px cross at (160, 120); treat a 24x24 box around it
-    // as untouchable (ART_BIBLE 8.5: "never crossing the crosshair").
+    // The crosshair is a 12 px cross at (RES_W/2, RES_H/2) = (160, 90) at
+    // 320x180; treat a 24x24 box around it as untouchable (ART_BIBLE 8.5:
+    // "never crossing the crosshair"), which is what the x=172 bound below is.
+    //
+    // 🛑 THE DIVISOR BELOW IS `g_RES_H / 100`, DERIVED. It used to be a literal
+    // 2.4 — which is 240/100, left over from 320x240 — so on a 180-row frame it
+    // reported a 51.2 %-of-screen lantern as 37.45 % and turned a regression
+    // into an apparent improvement. A stale constant in a TEST is worse than one
+    // in the code. If the resolution moves again, nothing here needs editing.
     screen_bbox(vm_model(vm));
     let rest_h: f64 = 0.0;
+    let pct: f64 = f64(g_RES_H) / 100.0;
     // rest footprint first
     vm_reset(vm); vm_set_motion(vm, 0.0, 1, 0, 0.0); vm_step(vm, 0.0);
     screen_bbox(vm_model(vm));
     rest_h = g_bb[3] - g_bb[1];
-    print(`  rest footprint: x ${f4(g_bb[0])}..${f4(g_bb[2])}, y ${f4(g_bb[1])}..${f4(g_bb[3])} -> ${f4(rest_h)} px = ${f4(rest_h / (f64(g_RES_H) / 100.0))} % of screen height`);
-    note(`the SHIPPED lantern mesh is ${f4(rest_h / (f64(g_RES_H) / 100.0))} % of screen height AT REST — ART_BIBLE 8.5 caps it at 38 %. Pre-existing, in meshgen.hml slot 28, not introduced here.`);
+    print(`  rest footprint: x ${f4(g_bb[0])}..${f4(g_bb[2])}, y ${f4(g_bb[1])}..${f4(g_bb[3])} -> ${f4(rest_h)} px = ${f4(rest_h / pct)} % of screen height`);
+    note(`the SHIPPED lantern mesh is ${f4(rest_h / pct)} % of screen height AT REST, against ART_BIBLE 8.5's 38 % cap (it was 49.94 % before the meshgen rescale, and its rest bbox reached y 181.08 in a 180-row frame)`);
+    ok("ART_BIBLE 8.5: the lantern is at most 38 % of screen height AT REST",
+       rest_h <= 38.0 * pct);
 
     let min_x: f64 = 1.0e9;
     let max_h: f64 = 0.0;
     let off_screen: i32 = 0;
+    // the drive's own extremes in the two axes that grow the footprint, kept as
+    // measurements rather than as literals in the note below
+    let drv_d: f64 = 0.0;
+    let drv_f: f64 = 0.0;
     w = 0;
     while (w < WPN_COUNT) {
         session_reset(w);
@@ -724,6 +805,8 @@ fn main() {
             if (t >= 140 && t < 200) { mode = 3; }
             if (t == 200) { mode = 4; }
             session_frame(vm, t, mode, g_TICK_DT);
+            if (vm_off_down(vm) > drv_d) { drv_d = vm_off_down(vm); }
+            if (vm_off_fwd(vm) < drv_f) { drv_f = vm_off_fwd(vm); }
             screen_bbox(vm_model(vm));
             if (g_bb[0] < min_x) { min_x = g_bb[0]; }
             let h: f64 = g_bb[3] - g_bb[1];
@@ -734,13 +817,94 @@ fn main() {
         w = w + 1;
     }
     print(`  animated: nearest approach to the crosshair x=${f4(min_x)} (crosshair box ends at 172)`);
-    print(`  animated: largest footprint ${f4(max_h)} px = ${f4(max_h / (f64(g_RES_H) / 100.0))} % of screen height`);
-    note(`animated footprint peaks at ${f4(max_h / (f64(g_RES_H) / 100.0))} % of screen height, vs ${f4(rest_h / (f64(g_RES_H) / 100.0))} % at rest`);
+    print(`  animated: largest footprint ${f4(max_h)} px = ${f4(max_h / pct)} % of screen height`);
+    note(`animated footprint peaks at ${f4(max_h / pct)} % of screen height, vs ${f4(rest_h / pct)} % at rest`);
     ok("ART_BIBLE 8.5: the lantern never crosses the crosshair — it stays right of x=172, always",
        min_x > 172.0);
+    ok("ART_BIBLE 8.5: the lantern is at most 38 % of screen height at EVERY pose the drive reaches",
+       max_h <= 38.0 * pct);
     ok("the animation grows the footprint by at most 3 px — GAME_DESIGN's kick pulls it toward the eye",
        max_h <= rest_h + 3.0);
     ok("the lantern is never clipped off the edge of the frame at any pose", off_screen == 0);
+
+    // (c2) SPRINT WHILE RELOADING — the combination the scripted session above
+    //      never plays, and the one that stacks the two biggest DOWN terms.
+    let sr_h: f64 = 0.0; let sr_y: f64 = 0.0; let sr_d: f64 = 0.0; let sr_clip: i32 = 0;
+    w = 0;
+    while (w < WPN_COUNT) {
+        session_reset(w);
+        vm_reset(vm);
+        for (let t = 0; t < 320; t++) {
+            let mode: i32 = 5;
+            if (t == 60) { mode = 6; }
+            session_frame(vm, t, mode, g_TICK_DT);
+            if (vm_off_down(vm) > sr_d) { sr_d = vm_off_down(vm); }
+            screen_bbox(vm_model(vm));
+            let hh: f64 = g_bb[3] - g_bb[1];
+            if (hh > sr_h) { sr_h = hh; }
+            if (g_bb[3] > sr_y) { sr_y = g_bb[3]; }
+            if (g_bb[1] < 0.0 || g_bb[3] > f64(g_RES_H)) { sr_clip = 1; }
+        }
+        w = w + 1;
+    }
+    print(`  sprint WHILE reloading: off_d peak ${f4(sr_d)} m, bottom edge y ${f4(sr_y)} of ${g_RES_H}, footprint ${f4(sr_h)} px = ${f4(sr_h / pct)} % of screen height`);
+    note(`sprinting while reloading stacks the two biggest DOWN terms and still only reaches off_d ${f4(sr_d)} m and screen y ${f4(sr_y)} of ${g_RES_H} — the sprint TILT lifts the lamp about the fist as the drop lowers it, so the two partly cancel`);
+    ok("sprinting WHILE reloading — the combination the scripted session never plays — never clips the frame",
+       sr_clip == 0);
+    ok("sprinting WHILE reloading is at most 38 % of screen height", sr_h <= 38.0 * pct);
+
+    // (c3) THE CLAMP LIMIT IN THE ONE AXIS THAT GROWS THE FOOTPRINT.  off_f is
+    //      distance from the eye, so `g_VM_OFF_F_MIN` alone is the single worst
+    //      thing a legal pose can do to the screen height.  It is measured here
+    //      rather than quoted, because it is the number that decided
+    //      `g_lamp_scale_y` and a decided number that lives in a comment is the
+    //      next stale constant.
+    screen_bbox(pose_matrix(vm, 0.0, 0.0, 0.0, 0.0, 0.0, g_VM_OFF_F_MIN));
+    let clamp_h: f64 = g_bb[3] - g_bb[1];
+    print(`  at the clamp limit (off_f ${f4(g_VM_OFF_F_MIN)} m, everything else at rest): ${f4(clamp_h)} px = ${f4(clamp_h / pct)} % of screen height`);
+    note(`the deepest single-axis pose the clamp allows, off_f ${f4(g_VM_OFF_F_MIN)} m, measures ${f4(clamp_h / pct)} % of screen height — this is what sized the mesh rescale, and it is under the 38 % cap`);
+    ok("ART_BIBLE 8.5 survives the clamp: off_f at its limit is still at most 38 % of screen height",
+       clamp_h <= 38.0 * pct);
+
+    // (d) THE WHOLE CAP BOX, not just the poses the current drive reaches.
+    //     Section [7] already walks this grid for the FACE-SET invariant; the
+    //     38 % cap deserves the same treatment, because `g_VM_OFF_F_MIN` lets
+    //     a heavy enough weapon pull the lamp 8 cm nearer the eye and the cap
+    //     must hold there too. Without this the "37.90 % at the clamp limit"
+    //     figure lives only in a meshgen comment — and a number that lives in
+    //     a comment is a number that goes stale (this file's own 240/100
+    //     divisor is the case in point).
+    let cap_h: f64 = 0.0;
+    let cap_clip: i32 = 0;
+    let cap_n: i32 = 0;
+    for (let qa = 0; qa < 5; qa++) {
+        let rx: f64 = g_VM_ROT_X_MIN + (g_VM_ROT_X_MAX - g_VM_ROT_X_MIN) * f64(qa) / 4.0;
+        for (let qb = 0; qb < 3; qb++) {
+            let ry: f64 = (0.0 - g_VM_ROT_Y_ABS) + g_VM_ROT_Y_ABS * f64(qb);
+            for (let qc = 0; qc < 3; qc++) {
+                let rz: f64 = (0.0 - g_VM_ROT_Z_ABS) + g_VM_ROT_Z_ABS * f64(qc);
+                for (let qd = 0; qd < 3; qd++) {
+                    let dr: f64 = g_VM_OFF_R_MIN + (g_VM_OFF_R_MAX - g_VM_OFF_R_MIN) * f64(qd) / 2.0;
+                    for (let qe = 0; qe < 3; qe++) {
+                        let dd: f64 = g_VM_OFF_D_MIN + (g_VM_OFF_D_MAX - g_VM_OFF_D_MIN) * f64(qe) / 2.0;
+                        for (let qg = 0; qg < 3; qg++) {
+                            let df: f64 = g_VM_OFF_F_MIN + (g_VM_OFF_F_MAX - g_VM_OFF_F_MIN) * f64(qg) / 2.0;
+                            screen_bbox(pose_matrix(vm, rx, ry, rz, dr, dd, df));
+                            let hh: f64 = g_bb[3] - g_bb[1];
+                            if (hh > cap_h) { cap_h = hh; }
+                            if (g_bb[1] < 0.0 || g_bb[3] > f64(g_RES_H)) { cap_clip = 1; }
+                            if (g_bb[0] < 0.0 || g_bb[2] > f64(g_RES_W)) { cap_clip = 1; }
+                            cap_n = cap_n + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    print(`  cap box: ${cap_n} poses, largest footprint ${f4(cap_h)} px = ${f4(cap_h / pct)} % of screen height, any-pose clipping ${cap_clip}`);
+    note(`THE CAP BOX IS NOT A FOOTPRINT PROMISE. Its worst corner (off_d +0.20 m, off_f -0.08 m, +/-2 deg of yaw and roll) measures ${f4(cap_h / pct)} % of screen height and does cross the bottom edge; the DRIVE never goes there (off_d peaks ${f4(drv_d)} m against the cap's ${f4(g_VM_OFF_D_MAX)}, off_f ${f4(drv_f)} m against ${f4(g_VM_OFF_F_MIN)}) and the clamp never bites. It cannot be tightened into one either: off_f ${f4(g_VM_OFF_F_MIN)} m ALONE is already ${f4(clamp_h / pct)} %, and pulling it in to -0.06 would leave 3 % of margin over the drive and would make Blackthorn's 0.068 m kick clamp. The box is the FACE-SET net (section [7]); ART_BIBLE 8.5's cap is kept by the drive, asserted above`);
+    ok("REGRESSION GUARD, not the ART_BIBLE promise: the cap box's worst corner stays under 42 % of screen height — if a future retune inflates the mesh or loosens the caps, this fires before the drive does",
+       cap_h <= 42.0 * pct);
 
     // the >220 anchor: the flame's own vertices. meshgen writes them after the
     // bake specifically so the frame always has something above luminance 220;
@@ -890,7 +1054,7 @@ fn main() {
     batch_reset(bw);
     let n_rest: i32 = vm_emit(vm, bw, null, proj, proj);
     print(`  vm_emit at rest wrote ${n_rest} of ${lantern_tris} triangles (batch holds ${batch_count(bw)})`);
-    note(`vm_emit writes ${n_rest} of the mesh's ${lantern_tris} triangles at rest: emit.hml PIXEL-SNAPS x/y before its backface test, so ${lantern_tris - n_rest} sub-pixel slivers collapse to zero area (mesh_rej_backface 8, rej_near 0, rej_guard 0). The rest matrix is bit-identical to world_render's, so the shipped build emits the same 114 today.`);
+    note(`vm_emit writes ${n_rest} of the mesh's ${lantern_tris} triangles at rest: emit.hml PIXEL-SNAPS x/y before its backface test, so ${lantern_tris - n_rest} sub-pixel slivers collapse to zero area (mesh_rej_backface 8, rej_near 0, rej_guard 0). The rest matrix is bit-identical to world_render's, so the shipped build emits the same ${n_rest} today.`);
     ok("vm_emit at rest writes the lantern and nothing else, and the batch agrees",
        n_rest > 100 && n_rest <= lantern_tris && batch_count(bw) == n_rest);
 

@@ -134,7 +134,9 @@ import { emit_set_mvp, emit_set_env, emit_set_viewport, emit_set_near,
          emit_set_backface, emit_set_lighting,
          emit_stats_reset, emit_count_backface, emit_count_near,
          emit_count_guard, emit_count_straddle, emit_count_submitted,
-         emit_quad_world, EMIT_BF_CCW }
+         emit_quad_world, EMIT_BF_CCW,
+         emit_par_init, emit_par_shutdown, emit_par_workers, emit_par_set_min,
+         EMIT_PAR_MAX }
        from "../../../wobbleweed/src/emit.hml";
 import { atlas_cell_uv } from "../../../wobbleweed/src/atlas.hml";
 import { env_new, env_field, env_far_plane, ENV_FOG_FAR,
@@ -184,7 +186,8 @@ import { g_RES_W, g_RES_H,
          g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY,
          gate_darkness, fog_tint_luma,
          g_LANTERN_POOL_DIV, g_LANTERN_POOL_SPAN, g_LANTERN_POOL_SCALE,
-         g_LANTERN_POOL_HDIV, g_LANTERN_POOL_LIFT }
+         g_LANTERN_POOL_HDIV, g_LANTERN_POOL_LIFT,
+         g_EMIT_WORKERS, g_EMIT_PAR_MIN_TRIS }
        from "../core/config.hml";
 import { clampi, clampf } from "../core/mathx.hml";
 
@@ -382,6 +385,69 @@ export fn frame_batches(): i32 {
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// 1b. THE PARALLEL EMIT POOL — one persistent ThreadPool, brought up at boot
+// ---------------------------------------------------------------------------
+// `emit.hml` splits an `emit_mesh_buf` call across N workers, each writing a
+// DISJOINT byte range of the same vertex arena. The engine side is finished and
+// proven (`probe_emit` asserts parallel-vs-serial byte identity, and all nine
+// scene goldens are unchanged with it on); this is the game's switch for it.
+//
+// WHY THE SWITCH LIVES HERE. `src/render/world_render.hml` is the only file in
+// the game that owns the frame graph's lifecycle, and the pool is frame-graph
+// state: it must exist before the first `emit_mesh_buf` and be gone after the
+// last. Putting it in `frame_init` means no consumer of the frame graph — the
+// game, `shot.hml`, `benchframe.hml`, `walk.hml` — can forget it, which is
+// exactly the failure this task was filed against.
+//
+// THREE PROPERTIES THAT MAKE THIS SAFE TO TURN ON:
+//   1. IT CANNOT CHANGE A PIXEL. `emit_run`'s parallel path compacts the range
+//      outputs leftward in range order, which is source order, so the vertex
+//      arena, the depth array, the straddle list and all six counters come out
+//      in exactly the serial layout. That is asserted upstream and re-verified
+//      here against all nine goldens by fnv1a and PNG md5.
+//   2. IT DEGRADES, IT DOES NOT CRASH. `emit_par_init(n)` with n < 2 stays
+//      serial and returns 0; if `ThreadPool` throws — no pthreads, a WASM build
+//      with no threads at all (docs/design/WASM_SPIKE.md), a hostile sandbox —
+//      the engine catches it, stays serial and returns 0. Serial is the
+//      verified-equivalent fallback, never an error path.
+//   3. IT IS IDEMPOTENT AND FIRST-CALL-WINS. A caller that wants a different
+//      worker count (the game's `--workers`, a probe sweeping 1/2/4/8/12) calls
+//      `frame_par_init` BEFORE `frame_init` and that choice stands.
+//
+// The count itself is NOT decided here — it is `g_EMIT_WORKERS` in
+// `src/core/config.hml`, one number, so a platform port changes one line.
+//
+// -1 means "nobody has asked yet", which is what lets `frame_init` supply the
+// default without overriding an explicit earlier call.
+let g_par_asked: i32 = -1;
+
+// Returns the worker count ACTUALLY running. 0 means the stage stayed serial,
+// which is a success, not a failure — read it, print it, do not branch on it
+// as if it were an error code.
+export fn frame_par_init(p_workers: i32): i32 {
+    let want: i32 = p_workers;
+    if (want < 0) { want = 0; }
+    if (want > EMIT_PAR_MAX) { want = EMIT_PAR_MAX; }
+    if (g_EMIT_PAR_MIN_TRIS > 0) { emit_par_set_min(g_EMIT_PAR_MIN_TRIS); }
+    let nw: i32 = emit_par_init(want);
+    g_par_asked = nw;
+    let out: i32 = nw;
+    return out;
+}
+
+// Workers in use right now. 0 == serial.
+export fn frame_par_workers(): i32 { let out: i32 = emit_par_workers(); return out; }
+
+// Retire the pool. SHUTDOWN ONLY — never in a frame (rule N6), and never while
+// a dispatch is in flight, which cannot happen because `emit_run` joins every
+// range before it returns. After this the stage is serial again and a later
+// `frame_par_init` may bring it back up.
+export fn frame_par_shutdown() {
+    emit_par_shutdown();
+    g_par_asked = -1;
+}
+
 // p_fb is the caller's ARGB8888 readback buffer, RES_W * RES_H * 4 bytes. It
 // stays the caller's because the caller is the one that turns it into a PNG or
 // blits it; the frame graph only fills it — and only on the frames the caller
@@ -395,6 +461,13 @@ export fn frame_init(p_win, p_target, p_fb: ptr): i32 {
         return bad;
     }
     let rc: i32 = frame_batches();
+    // The default wiring. Skipped if a caller already chose a count — see
+    // "first-call-wins" above — and skipped if the batches failed, because then
+    // nothing will ever emit and a pool would be eight idle threads in a
+    // process that is about to exit. Never fatal: `frame_par_init` returning 0
+    // is the serial path, and the serial path is what every consumer had
+    // before this change.
+    if (rc == 0 && g_par_asked < 0) { frame_par_init(g_EMIT_WORKERS); }
     return rc;
 }
 
