@@ -52,6 +52,7 @@
 import { exit } from "@stdlib/process";
 import { sin, cos, sqrt, atan2, floor, TAU } from "@stdlib/math";
 
+import { g_CHUNK_M } from "../src/core/config.hml";
 import { g_TICK_DT, g_TICK_HZ, g_FOV_HIP, g_BUDGET_SIM_MS, g_SHADE_TIER_MAX,
          g_DIR_ALIVE_CAP, g_DIR_ONSCREEN_CAP, g_DIR_SPAWN_MIN_M,
          g_DIR_SPAWN_MAX_M, g_DIR_SPAWN_CADENCE_S, g_DIR_WAVE_GAP_S,
@@ -68,11 +69,19 @@ import { world_new_cap, world_spawn, world_spawn_player, world_despawn,
          KIND_AI, SLOT_NONE } from "../src/sim/world.hml";
 
 import { day_phase, PHASE_TICK_NIGHT, PHASE_TICK_DUSK, HORN_TICK, DAY_TICKS,
-         PHASE_NIGHT, PHASE_DAWN } from "../src/sim/daycycle.hml";
+         PHASE_NIGHT, PHASE_DAWN, PHASE_DUSK, PHASE_DAY,
+         day_tier_bonus_of_phase } from "../src/sim/daycycle.hml";
 
-import { ai_cost_of, ai_speed_of, ai_hp_of } from "../src/sim/ai.hml";
+import { ai_cost_of, ai_speed_of, ai_hp_of, ai_xp_of, ai_ember_of } from "../src/sim/ai.hml";
+
+// Section R4 measures the world's own danger gradient, so it asks worldgen
+// rather than restating it. `tools/**` is not walled (ci_imports.sh scans it
+// for R2/R3/R6 only), and this is a read-only pure query either way.
+import { worldgen_shade_tier, worldgen_chunk_dist } from "../src/sim/worldgen.hml";
 
 import { director_new, director_reset, director_set_anchor, director_set_tier,
+         director_set_tier_at_phase, director_set_holds_done, director_ramp_cap,
+         director_tier, director_tier_world, director_tier_phase,
          director_step, director_bind, director_begin,
          director_budget, director_cost, director_weight, director_min_cost,
          director_bulwark_guaranteed, director_table_ok, director_roll_kind,
@@ -85,6 +94,7 @@ import { director_new, director_reset, director_set_anchor, director_set_tier,
          director_req_x, director_req_y, director_req_z, director_hash,
          director_roster_count, director_roster_id, director_roster_kind,
          DIR_IDLE, DIR_ARMED, DIR_SPAWNING, DIR_CLEARING, DIR_GAP, DIR_DONE,
+         DIR_EV_SPAWN,
          DIR_EV_HORN, DIR_EV_HOLD_START, DIR_EV_WAVE_START, DIR_EV_WAVE_CLEAR,
          DIR_EV_HOLD_DONE, DIR_EV_DAWN, DIR_CADENCE_TICKS, DIR_GAP_TICKS,
          DIR_HALF_FOV } from "../src/sim/director.hml";
@@ -112,17 +122,24 @@ let g_PD_MS_GUARD: f64        = 0.0015;   // compiled   (2.0x of 0.742 us loaded
 let g_PD_MS_GUARD_INTERP: f64 = 0.0130;   // interpreted (2.05x of 6.343 us loaded)
 
 // The determinism anchor. Compiled and interpreted must both print this.
-// REGENERATED 2026-07-30 for the on-ramp retune (budget 0 + 36*tier + 96*wave,
-// cadence 1.15 s). Verified identical on both backends before pinning:
+// REGENERATED 2026-07-31 for DESIGN 7 (the night's tier + the ramp). NOTHING
+// ABOUT THE SPEND LOOP MOVED — the drift is entirely two new fields in
+// `director_hash` (`tier_world`, `tier_phase`) and `ref_hold`'s fixture now
+// setting `holds_done` so the ramp is not the thing under test. Verified
+// identical on both backends before pinning:
 //   hemlockc -O1 tools/probe_director.hml -o /tmp/pd && /tmp/pd | grep GOLDEN
 //   hemlock  tools/probe_director.hml               | grep GOLDEN
-// Both print 14098403043616770913. Any change to the six spawn costs, the five
+// Both print 7985246912008184374. The previous anchor was
+// 14098403043616770913 (2026-07-30, the on-ramp retune). Any change to the six spawn costs, the five
 // composition rows, the budget constants, the cadence, the gap, the ring or the
 // two caps moves this number — which is the point: it is the one assertion that
 // a silent retune cannot slip past.
-let g_PD_GOLDEN: u64 = 14098403043616770913;
+let g_PD_GOLDEN: u64 = 7985246912008184374;
 
-let g_PD_EXPECT_ASSERTS: i32 = 75;   // asserted against g_n at the bottom (71 + 2 on-ramp + 2 statue split)
+// 75 + 17 for section R (the-same-night-again: R1 roster 6, R2 ladder 4,
+// R3 the night's tier 6, R4 danger-vs-distance 3 = 19). Asserted against g_n
+// at the bottom, so a section that silently stops running is a FAILURE.
+let g_PD_EXPECT_ASSERTS: i32 = 94;
 
 // ---------------------------------------------------------------------------
 // ASSERTIONS
@@ -145,6 +162,17 @@ fn compiled(): i32 {
     let a0: string = args[0];
     let out: i32 = 1;
     if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+// Right-aligned integer, for the section-R tables.
+fn pi(p_v: i32, p_w: i32): string {
+    let t: string = sv(p_v);
+    let n: i32 = p_w - t.length;
+    let pad: string = "";
+    let i: i32 = 0;
+    while (i < n) { pad = pad + " "; i++; }
+    let out: string = pad + t;
     return out;
 }
 
@@ -244,7 +272,15 @@ fn ref_hold(p_seed: i32, p_tier: i32, p_acq: f64, p_kill: i32, p_out: array): i3
     let t0: i32 = HORN_TICK - 60;
     director_reset(d, seed, t0);
     director_set_anchor(d, ax, ay, az);
-    director_set_tier(d, tier);
+    // DESIGN 7. Two lines, and both are FIXTURE SETUP rather than behaviour:
+    //   * the phase is STATED, so `director_begin`'s night re-base is a no-op
+    //     and `tier` means exactly `tier` for every assertion below, as it did
+    //     before the re-base existed;
+    //   * the ramp is pushed out of the way, because this function's job is to
+    //     measure a tier-t hold and the ramp's job is to decide WHICH tier you
+    //     are allowed. Section R2 tests the ramp from zero, on its own.
+    director_set_tier_at_phase(d, tier, PHASE_NIGHT);
+    director_set_holds_done(d, g_SHADE_TIER_MAX);
 
     let dt: f64 = g_TICK_DT;
     let engage: f64 = g_DIR_SPAWN_MIN_M;
@@ -1126,7 +1162,8 @@ fn main() {
     fpx[pf] = 0.0; fpz[pf] = 0.0;
     director_reset(df, g_PD_SEED, PHASE_TICK_NIGHT);
     director_set_anchor(df, 0.0, 0.0, 0.0);
-    director_set_tier(df, 1);
+    director_set_tier_at_phase(df, 1, PHASE_NIGHT);
+    director_set_holds_done(df, g_SHADE_TIER_MAX);
     director_begin(df, PHASE_TICK_NIGHT);
     let tf: i32 = PHASE_TICK_NIGHT;
     let ff: i32 = 0;
@@ -1166,7 +1203,8 @@ fn main() {
     world_spawn_player(w2, 1);
     director_reset(d2, g_PD_SEED, PHASE_TICK_DUSK - 600);
     director_set_anchor(d2, 0.0, 0.0, 0.0);
-    director_set_tier(d2, 2);
+    director_set_tier_at_phase(d2, 2, PHASE_NIGHT);
+    director_set_holds_done(d2, g_SHADE_TIER_MAX);
 
     let seen_horn_tick: i32 = -1;
     let seen_start_tick: i32 = -1;
@@ -1191,7 +1229,8 @@ fn main() {
     // Tier 0 — a lit lantern — refuses to hold at all.
     let d3: object = director_new();
     director_reset(d3, g_PD_SEED, PHASE_TICK_NIGHT - 1);
-    director_set_tier(d3, 0);
+    director_set_tier_at_phase(d3, 0, PHASE_NIGHT);
+    director_set_holds_done(d3, g_SHADE_TIER_MAX);
     director_set_anchor(d3, 0.0, 0.0, 0.0);
     let tq2: i32 = PHASE_TICK_NIGHT - 1;
     let spawned0: i32 = 0;
@@ -1230,7 +1269,8 @@ fn main() {
     bpx[pb] = 0.0; bpz[pb] = 0.0;
     director_reset(db, g_PD_SEED, PHASE_TICK_NIGHT);
     director_set_anchor(db, 0.0, 0.0, 0.0);
-    director_set_tier(db, 2);
+    director_set_tier_at_phase(db, 2, PHASE_NIGHT);
+    director_set_holds_done(db, g_SHADE_TIER_MAX);
     // The lantern-lit path: begin the hold explicitly, the way W5-6 will.
     ck(director_begin(db, PHASE_TICK_NIGHT) == 1, "director_begin starts a hold on demand");
     ck(director_begin(db, PHASE_TICK_NIGHT) == 0, "director_begin refuses to restart a live hold");
@@ -1291,6 +1331,300 @@ fn main() {
        + " (guard is ~2x the loaded measurement, not an idle-box certification)");
     ck(per * f64(g_DIR_WAVES_PER_HOLD) < g_BUDGET_SIM_MS,
        "the director must not eat the sim budget");
+    print("");
+
+    // =======================================================================
+    //  R. THE ESCALATION — the-same-night-again, 2026-07-31.  DESIGN 7.
+    // =======================================================================
+    //  Four sections, and every one of them was written against a MEASURED
+    //  failure rather than against a design document.  Each has been verified
+    //  by SABOTAGE (CLAUDE.md §8): the feature was broken in a scratch copy of
+    //  the tree and the section confirmed RED before being kept.  The sabotage
+    //  and the red line it produced are named in each block.
+    // =======================================================================
+
+    // -----------------------------------------------------------------------
+    print("--- R1. the roster: what each tier can ever ship --------");
+    // WHAT THIS GUARDS: that the six classes are actually reachable through the
+    // composition tables, and at which tier each one first becomes reachable.
+    // A 45-minute session at HEAD spawned 346 bodies and three of the six
+    // classes were 0.  That was not the tables' fault — it was DESIGN 7's
+    // latch — but nothing in this file could have told you the tables were
+    // fine, because nothing asked them.
+    let first_at: array<i32> = [];
+    let fa: i32 = 0;
+    while (fa < g_ENEMY_KIND_COUNT) { first_at.push(-1); fa++; }
+    let r_rt: i32 = 0;
+    while (r_rt <= g_SHADE_TIER_MAX) {
+        let rk: i32 = 0;
+        while (rk < g_ENEMY_KIND_COUNT) {
+            if (director_weight(r_rt, rk) > 0) {
+                if (first_at[rk] < 0) { first_at[rk] = r_rt; }
+            }
+            rk++;
+        }
+        r_rt++;
+    }
+    print("  class     Wisp Mote Husk Spit Ward Bulw");
+    print("  first at  " + pi(first_at[0], 4) + pi(first_at[1], 5) + pi(first_at[2], 5)
+        + pi(first_at[3], 5) + pi(first_at[4], 5) + pi(first_at[5], 5));
+    // Expectation per tier: bodies, field HP, XP and ember for a whole 3-wave
+    // hold, from the shipped cost / composition / ai tables and nothing else.
+    print("  tier  budget  bodies  fieldHP     XP  ember   guaranteed-Bulwark");
+    let esc_bodies: array<f64> = [];
+    let esc_xp: array<f64> = [];
+    let et: i32 = 0;
+    while (et <= g_SHADE_TIER_MAX) {
+        let bud: i32 = 0;
+        let ev: i32 = 0;
+        while (ev < g_DIR_WAVES_PER_HOLD) { bud = bud + director_budget(et, ev); ev++; }
+        let mcost: f64 = 0.0; let mhp: f64 = 0.0; let mxp: f64 = 0.0; let mem: f64 = 0.0;
+        let ek: i32 = 0;
+        while (ek < g_ENEMY_KIND_COUNT) {
+            let wgt: f64 = f64(director_weight(et, ek)) * 0.01;
+            mcost = mcost + wgt * f64(director_cost(ek));
+            mhp   = mhp   + wgt * f64(ai_hp_of(ek));
+            mxp   = mxp   + wgt * f64(ai_xp_of(ek));
+            mem   = mem   + wgt * f64(ai_ember_of(ek));
+            ek++;
+        }
+        let nb: f64 = 0.0;
+        if (mcost > 0.0) { nb = f64(bud) / mcost; }
+        esc_bodies.push(nb);
+        esc_xp.push(nb * mxp);
+        let gb: string = "-";
+        let gw: i32 = 0;
+        while (gw < g_DIR_WAVES_PER_HOLD) {
+            if (director_bulwark_guaranteed(et, gw) == 1) {
+                if (gb == "-") { gb = "wave " + sv(gw + 1); }
+                else { gb = gb + "+" + sv(gw + 1); }
+            }
+            gw++;
+        }
+        print("  " + pi(et, 4) + pi(bud, 8) + "  " + pi(i32(nb + 0.5), 6)
+            + pi(i32(nb * mhp + 0.5), 9) + pi(i32(nb * mxp + 0.5), 7)
+            + pi(i32(nb * mem + 0.5), 7) + "   " + gb);
+        et++;
+    }
+    ck(first_at[g_ENEMY_WISP] == 1 && first_at[g_ENEMY_MOTE] == 1 && first_at[g_ENEMY_HUSK] == 1,
+       "R1 the tier-1 pool is Wisp/Mote/Husk and nothing else");
+    ck(first_at[g_ENEMY_SPITTER] == 2, "R1 the Spitter first becomes reachable at tier 2");
+    ck(first_at[g_ENEMY_WARDEN] == 3, "R1 the Warden first becomes reachable at tier 3");
+    ck(first_at[g_ENEMY_BULWARK] == 5 && director_bulwark_guaranteed(3, 2) == 1,
+       "R1 the Bulwark is in the pool only at tier 5, and guaranteed from tier 3");
+    // ESCALATION IS BY KIND, NOT BY COUNT — CLAUDE.md §9.15, and this is the
+    // assertion that keeps it that way. A deeper tier must put FEWER bodies on
+    // the field, not more, or the frame gets busier exactly when it is hardest.
+    // SABOTAGE: set g_DIR_BUDGET_PER_TIER to 200 in a scratch config; body
+    //   count then RISES with tier and this line goes red
+    //   ("R1 a deeper tier must put FEWER bodies on the field ... 118 -> 202").
+    let bodies_fall: i32 = 1;
+    let bf: i32 = 2;
+    while (bf <= g_SHADE_TIER_MAX) {
+        if (esc_bodies[bf] > esc_bodies[bf - 1]) { bodies_fall = 0; }
+        bf++;
+    }
+    ck(bodies_fall == 1, "R1 a deeper tier must put FEWER bodies on the field, not more"
+       + " (tier 1 " + sv(i32(esc_bodies[1] + 0.5)) + " -> tier 5 "
+       + sv(i32(esc_bodies[g_SHADE_TIER_MAX] + 0.5)) + ")");
+    // ...and it must still pay more, or there is no reason to be there.
+    let xp_rises: i32 = 1;
+    let xr: i32 = 2;
+    while (xr <= g_SHADE_TIER_MAX) {
+        if (esc_xp[xr] <= esc_xp[xr - 1]) { xp_rises = 0; }
+        xr++;
+    }
+    ck(xp_rises == 1, "R1 a deeper tier must pay strictly more XP per night"
+       + " (tier 1 " + sv(i32(esc_xp[1] + 0.5)) + " -> tier 5 "
+       + sv(i32(esc_xp[g_SHADE_TIER_MAX] + 0.5)) + ")");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- R2. the ladder: night N+1 is one step, never three --");
+    // WHAT THIS GUARDS: DESIGN 7's ramp. A fresh director standing on ground the
+    // world calls tier 5 must still open at tier 1 and climb one rung per night
+    // SURVIVED. Before this, the first hold was pinned by `sim.hml` and the
+    // second was whatever the chunk rolled — THE_HOUR §1 measured that as
+    // 1 -> 3 -> 1 -> 2 across four nights, with 20 player deaths in the tier-3
+    // one. A flap, not a ladder.
+    // SABOTAGE: delete the `if (ramp < t_hold) { t_hold = ramp; }` line in
+    //   director_begin; the sequence becomes 5 5 5 5 5 5 5 and this goes red
+    //   ("R2 the ladder climbs one rung per night survived: got 5555555").
+    let dl: object = director_new();
+    let wl: object = world_new_cap(8);
+    let ladder: string = "";
+    let ladder_ok: i32 = 1;
+    let prev_t: i32 = 0;
+    let ln: i32 = 0;
+    while (ln <= g_SHADE_TIER_MAX + 1) {
+        director_reset(dl, g_PD_SEED, PHASE_TICK_NIGHT);
+        director_set_holds_done(dl, ln);
+        director_set_tier_at_phase(dl, g_SHADE_TIER_MAX, PHASE_NIGHT);
+        director_begin(dl, PHASE_TICK_NIGHT);
+        let got: i32 = director_tier(dl);
+        ladder = ladder + sv(got);
+        if (got < prev_t) { ladder_ok = 0; }
+        if (got > prev_t + 1) { ladder_ok = 0; }
+        prev_t = got;
+        ln++;
+    }
+    print("  nights survived 0..6 on tier-5 ground -> hold tier  " + ladder);
+    ck(ladder_ok == 1, "R2 the ladder climbs one rung per night survived and never jumps: got " + ladder);
+    ck(director_ramp_cap(dl) >= 1, "R2 the ramp cap is never below 1");
+    // The tutorial rung. `sim.hml` also pins the first hold to tier 1; the two
+    // agree exactly, and NEITHER depends on the other being there.
+    director_reset(dl, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dl, 0);
+    director_set_tier_at_phase(dl, g_SHADE_TIER_MAX, PHASE_NIGHT);
+    director_begin(dl, PHASE_TICK_NIGHT);
+    ck(director_tier(dl) == 1, "R2 night one is tier 1 even on tier-5 ground (a tutorial that kills you is not one)");
+    // THE CEILING IS THE WORLD, NOT THE COUNTER. Survive ten nights on tier-2
+    // ground and it is still a tier-2 night: the only way deeper is to walk.
+    director_reset(dl, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dl, 10);
+    director_set_tier_at_phase(dl, 2, PHASE_NIGHT);
+    director_begin(dl, PHASE_TICK_NIGHT);
+    ck(director_tier(dl) == 2, "R2 ten nights survived on tier-2 ground is still a tier-2 night"
+       + " (the ramp is a ceiling on SPEED; the world is the ceiling on DEPTH)");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- R3. the night's tier is the NIGHT's tier ------------");
+    // WHAT THIS GUARDS: the headline bug. `sim.hml` samples the tier in stage
+    // (h) and this director starts the hold in stage (e), so on the first night
+    // tick the sample in hand is a DUSK sample and `g_TIER_PHASE_NIGHT` never
+    // reached the director at all. Measured at HEAD, seed 1337, all three hold
+    // starts of a 45-minute session: director_tier 1 while sim_tier was 2.
+    // SABOTAGE: delete the three `phased` lines in director_begin; the dusk row
+    //   below returns the tier it was given and this goes red
+    //   ("R3 a dusk sample of tier 2 must open the night at tier 3: got 2").
+    let dn: object = director_new();
+    print("  sampled in   given  ->  hold opens at   (night bonus "
+        + sv(day_tier_bonus_of_phase(PHASE_NIGHT)) + ", dusk bonus "
+        + sv(day_tier_bonus_of_phase(PHASE_DUSK)) + ")");
+    let ph_list: array<i32> = [PHASE_DAY, PHASE_DUSK, PHASE_NIGHT];
+    let ph_name: array<string> = ["day  ", "dusk ", "night"];
+    let pq: i32 = 0;
+    while (pq < 3) {
+        director_reset(dn, g_PD_SEED, PHASE_TICK_NIGHT);
+        director_set_holds_done(dn, g_SHADE_TIER_MAX);
+        director_set_tier_at_phase(dn, 2, ph_list[pq]);
+        director_begin(dn, PHASE_TICK_NIGHT);
+        print("  " + ph_name[pq] + "            2  ->  " + sv(director_tier(dn))
+            + "               (world sample kept at " + sv(director_tier_world(dn)) + ")");
+        pq++;
+    }
+    director_reset(dn, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dn, g_SHADE_TIER_MAX);
+    director_set_tier_at_phase(dn, 2, PHASE_DUSK);
+    director_begin(dn, PHASE_TICK_NIGHT);
+    ck(director_tier(dn) == 3, "R3 a DUSK sample of tier 2 must open the night at tier 3: got "
+       + sv(director_tier(dn)));
+    ck(director_tier_world(dn) == 2, "R3 the raw world sample survives the re-base for the readout");
+    // Idempotent: a second begin with no fresh sample must not deepen again.
+    let t_once: i32 = director_tier(dn);
+    director_begin(dn, PHASE_TICK_NIGHT + 1);
+    ck(director_tier(dn) == t_once, "R3 the re-base is idempotent — a second begin cannot deepen the night twice");
+    // THE TIER-0 REFUSAL SURVIVES THE RE-BASE. A lit lantern forces tier 0 and
+    // tier 0 r_means the dark does not come; if the re-base ran first, a lantern's
+    // safe circle would become a tier-1 hold. This is the CLAUDE.md §5 guard.
+    // SABOTAGE: move the `if (d.tier <= 0)` refusal below the re-base; this
+    //   goes red ("R3 tier 0 still refuses ... began 1").
+    let dz: object = director_new();
+    director_reset(dz, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dz, g_SHADE_TIER_MAX);
+    director_set_tier_at_phase(dz, 0, PHASE_DUSK);
+    ck(director_begin(dz, PHASE_TICK_NIGHT) == 0,
+       "R3 tier 0 still refuses after the re-base — a lit lantern's circle is not a tier-1 hold");
+    ck(director_hold_active(dz) == 0, "R3 the refused tier-0 hold left no live state");
+    // A saturated sample cannot be pushed down and back up: the delta form is
+    // exact at the ceiling, which the un-bake-and-re-bake form would not be.
+    director_reset(dn, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dn, g_SHADE_TIER_MAX);
+    director_set_tier_at_phase(dn, g_SHADE_TIER_MAX, PHASE_DUSK);
+    director_begin(dn, PHASE_TICK_NIGHT);
+    ck(director_tier(dn) == g_SHADE_TIER_MAX,
+       "R3 a sample already at the tier ceiling stays there through the re-base");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- R4. danger vs distance: the gradient the ramp opens -");
+    // WHAT THIS GUARDS: that walking out is worth something and that the
+    // director tracks it. `worldgen_shade_tier` is floor(d/200) + jitter + phase
+    // and it is the ONLY axis left once the ramp has caught up with the ground
+    // you are standing on. This section measures the curve rather than assuming
+    // it, and asserts the two properties the design depends on: it rises with
+    // distance, and the hold tier follows it.
+    // SABOTAGE: return a constant from worldgen_shade_tier in a scratch copy;
+    //   the monotone assertion goes red ("R4 mean night tier must rise with
+    //   distance from town: 2.0 at 80 m, 2.0 at 1000 m").
+    print("   r(m)   mean night tier over the chunks in the band   n");
+    let radii: array<f64> = [80.0, 160.0, 240.0, 320.0, 400.0, 600.0, 800.0, 1000.0];
+    let r_means: array<f64> = [];
+    let rq: i32 = 0;
+    while (rq < radii.length) {
+        let rr: f64 = radii[rq];
+        let acc_t: f64 = 0.0;
+        let nn: i32 = 0;
+        let crr: i32 = i32(rr / g_CHUNK_M) + 2;
+        let ccx: i32 = 0 - crr;
+        while (ccx <= crr) {
+            let ccz: i32 = 0 - crr;
+            while (ccz <= crr) {
+                let dd2: f64 = worldgen_chunk_dist(ccx, ccz);
+                if (dd2 >= rr - 16.0) {
+                    if (dd2 < rr + 16.0) {
+                        acc_t = acc_t + f64(worldgen_shade_tier(g_PD_SEED, ccx, ccz,
+                                            day_tier_bonus_of_phase(PHASE_NIGHT)));
+                        nn = nn + 1;
+                    }
+                }
+                ccz++;
+            }
+            ccx++;
+        }
+        let mm: f64 = 0.0;
+        if (nn > 0) { mm = acc_t / f64(nn); }
+        r_means.push(mm);
+        print("  " + pi(i32(rr), 5) + "        " + sv(floor(mm * 100.0) / 100.0)
+            + "                                 " + sv(nn));
+        rq++;
+    }
+    // THE CURVE IS NOT MONOTONE FROM THE FIRST SAMPLE AND THE ASSERTION SAYS SO
+    // RATHER THAN PRETENDING. `worldgen_shade_tier` forces tier 0 inside 64 m
+    // (the town island) and the {-1,0,0,+1} chunk jitter is +-1 everywhere, so
+    // the 80 m and 160 m bands are dominated by jitter over a base of 0 and the
+    // measured means DIP: 2.04 at 80 m, 1.82 at 160 m. That is the world doing
+    // what it was designed to do — "pockets of too deep, too soon", worldgen's
+    // own words — and an assertion that demanded monotonicity from 80 m would
+    // be an assertion demanding the jitter be deleted. So: monotone from 240 m,
+    // which is past the island's influence and is where the player lives.
+    let r_mono: i32 = 1;
+    let mq: i32 = 3;
+    while (mq < r_means.length) {
+        if (r_means[mq] < r_means[mq - 1] - 0.001) { r_mono = 0; }
+        mq++;
+    }
+    ck(r_mono == 1, "R4 mean night tier must rise monotonically from 240 m out: "
+       + sv(floor(r_means[2] * 100.0) / 100.0) + " at 240 m, "
+       + sv(floor(r_means[r_means.length - 1] * 100.0) / 100.0) + " at 1000 m");
+    ck(r_means[r_means.length - 1] - r_means[0] >= 1.0,
+       "R4 the gradient must be worth walking: at least one full tier from 80 m to 1000 m");
+    // And the director must actually follow it. Same nights survived, two
+    // different places: the far one must be the deeper night.
+    let dg: object = director_new();
+    director_reset(dg, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dg, g_SHADE_TIER_MAX);
+    director_set_tier_at_phase(dg, 2, PHASE_NIGHT);
+    director_begin(dg, PHASE_TICK_NIGHT);
+    let t_near: i32 = director_tier(dg);
+    director_reset(dg, g_PD_SEED, PHASE_TICK_NIGHT);
+    director_set_holds_done(dg, g_SHADE_TIER_MAX);
+    director_set_tier_at_phase(dg, 5, PHASE_NIGHT);
+    director_begin(dg, PHASE_TICK_NIGHT);
+    let t_far: i32 = director_tier(dg);
+    ck(t_far > t_near, "R4 the same player on deeper ground gets a deeper night: "
+       + sv(t_near) + " -> " + sv(t_far));
     print("");
 
     // -----------------------------------------------------------------------

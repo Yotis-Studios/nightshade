@@ -1,0 +1,1022 @@
+// =============================================================================
+//  probe_lanfeed.hml — THE TEST THAT DID NOT EXIST
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT:
+//
+//      hemlockc -O1 tools/probe_lanfeed.hml -o /tmp/plan && /tmp/plan
+//      /tmp/plan --seeds 16 --minutes 30        (a wider, slower sweep)
+//
+//  It exits 1 on any failure AND on an assertion-count mismatch.
+//
+//  -------------------------------------------------------------------------
+//  WHY IT EXISTS, WHICH IS THE ONLY INTERESTING THING ABOUT IT
+//  -------------------------------------------------------------------------
+//  `probe_w6` was 31/31 green and `probe_settle` 231/231 green for four waves
+//  WHILE THE SHIPPING GAME'S TOWN WAS DEAD. `sv_lan_gather` read `w.model`
+//  where it must read `w.anim`, so the test was `90 == 1` and every session
+//  gathered zero lanterns, CORE_LUX never moved, and seventeen buildings and
+//  fourteen villagers sat in memory unrendered for every frame of every hour
+//  anyone ever played.
+//
+//  Neither probe noticed, and the reason is the same in both: THEY REACH THEIR
+//  TOWN THROUGH `server_settle_boot_tier`, A FIXTURE. The fixture writes the
+//  lantern array itself. `sv_lan_gather` — the one function that decides
+//  whether a real session's town lives — had ZERO assertions in the entire
+//  suite. It was not under-tested. It was untested.
+//
+//  So this probe has exactly one rule, and every section obeys it:
+//
+//      >>> NO FIXTURE. EVER. NOT ONCE. <<<
+//
+//  There is no `server_settle_boot_tier` call in this file, no `settle_load`,
+//  no `settle_lanterns_set`, no `server_grant_salvage`, no `befriend`. Every
+//  number below came out of `server_new` -> `server_tick` -> a bot pressing
+//  buttons, which is the only path a player has. If a section cannot be
+//  reached that way, the game cannot be played that way, and the probe says so
+//  instead of reaching around.
+//
+//  -------------------------------------------------------------------------
+//  HOW IT DRIVES, AND WHAT THAT CANNOT TELL YOU
+//  -------------------------------------------------------------------------
+//  ARM PLANT. `src/game/demobot.hml` — the SHIPPING driver, imported and not
+//  ported — runs first on every single frame, so aim, trigger discipline,
+//  reload and break-contact are the game's own. The probe then OVERRIDES the
+//  movement and the interaction buttons when the player is travelling,
+//  planting or lighting. Combat policy is therefore identical to the shipping
+//  demo and the ONLY difference is WHERE THE PLAYER GOES AND WHAT THEY PRESS
+//  WHEN THEY GET THERE — which is precisely the variable under test.
+//
+//  ARM PLANT IS AN ORACLE PLAYER AND THAT IS DECLARED, NOT HIDDEN, exactly as
+//  probe_session's ARM WALK declared it. It reads the settlement centre from
+//  `settle_cx` rather than finding it on screen, and it knows a lit post is
+//  worth more inside 64 m than outside. A human learns the first in their first
+//  five minutes; the second is a thing the game does not currently teach at
+//  all, and THAT GAP IS A FINDING, not a probe defect — it is reported in
+//  section F and it is not asserted, because discoverability is measured with
+//  eyes and this file has none.
+//
+//  What this probe therefore CAN say: whether the loop closes when it is
+//  driven correctly, how many seeds it closes on, and how long it takes.
+//  What it CANNOT say: whether a player would ever work out to do it.
+//
+//  -------------------------------------------------------------------------
+//  IMPORTS: `src/game/**`, `src/sim/**`, `src/core/**`, `src/net/**`,
+//  `@stdlib/math`, `@stdlib/process`. No SDL, no wobbleweed, no wall clock:
+//  `nm /tmp/plan | grep -c SDL_` is 0.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos, atan2, floor } from "@stdlib/math";
+
+import { g_WICKLINE_M, g_LANTERN_R_T1 } from "../src/core/config.hml";
+
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha, sim_director,
+         sim_stat_lanterns, SIM_LANTERN_LIT } from "../src/sim/sim.hml";
+
+import { world_count, KIND_LANTERN, EF_DEAD } from "../src/sim/world.hml";
+
+import { director_holds_done } from "../src/sim/director.hml";
+
+import { day_phase, PHASE_DAWN } from "../src/sim/daycycle.hml";
+
+import { BTN_FIRE, BTN_USE, BTN_ADS, BTN_SPRINT, BTN_RELOAD,
+         BTN_BUILD, BTN_SWITCH, BTN_GRENADE, BTN_INV } from "../src/sim/command.hml";
+
+import { settle_cx, settle_cz, settle_core_lux,
+         settle_grid_points, settle_tier, settle_building_count,
+         SET_TIER_CAMP, SET_TIER_VILLAGE, SET_RING_CAMP_M, SET_WICK_FULL,
+         SET_LUX_PER_POINT, SET_PTS_VILLAGE,
+         SET_CORE_VILLAGE } from "../src/sim/settle.hml";
+
+import { npc_pack_count, npc_pack_find_kind, npc_offer_find,
+         NPC_OFF_KIT } from "../src/sim/npc.hml";
+
+import { transport_loopback } from "../src/net/transport.hml";
+
+import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+
+import { server_new, server_tick, server_snapshot, server_local, server_t0,
+         server_spawn_yaw, server_spawn_x, server_spawn_z,
+         server_lantern_x, server_lantern_z, server_beat, server_beat_name,
+         server_world, server_settle, server_npcs, server_kits_placed,
+         server_lan_count, server_path_lit, server_tick_now,
+         server_load_kg, server_carry_kg, server_move_mult,
+         SV_PATH_N, SV_PATH_KEEP_M, SV_PATH_END_M, SV_PATH_BOW_M,
+         SV_OPEN_KITS, SV_HOLD_KITS, SV_PATH_STEP_MAX, SV_PATH_STEP_MIN,
+         SV_BEAT_PATH } from "../src/game/server.hml";
+
+import { client_new, client_set_angles, client_set_move, client_set_button,
+         client_send_command, client_apply, client_frame, client_build_render,
+         client_px, client_pz, client_dead, client_lantern_lit,
+         client_pack_kits } from "../src/game/client.hml";
+
+// ---------------------------------------------------------------------------
+//  CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_SEEDS: i32    = 8;         // --seeds N
+// 30, not 24. `settle_step` requires the threshold to be HELD one continuous
+// in-game day (16 min) before it promotes, and the fourth post lands at ~8-9
+// min, so the Village arrives at 24:45-25:08. At 24 this probe stopped ~45 s
+// before the thing it exists to assert and exited 1 on a tree where all 8
+// seeds promote. The default must outlast what it measures.
+let g_MINUTES: i32  = 30;        // --minutes N, per seed, of GAME time
+let g_WIDE: i32     = 128;       // --wide N, the boot-only geometry sweep
+let g_DT_MS: f64    = 16.667;
+// THE ASSERTION COUNT, AS A FORMULA. Sections A, C, D and E are fixed;
+// section B runs PL_PER_SEED of them per seed. Pinned from a real run and then
+// checked on every run, because a probe that silently stops running half its
+// checks is worse than no probe.
+let PL_FIXED: i32    = 26;
+let PL_PER_SEED: i32 = 13;
+
+// The lamplighter's numbers.
+let PL_PLANT_R_M: f64  = 30.0;   // the ring they plant on: outside the 16 m
+                                 // green, well inside the 64 m Camp ring, and
+                                 // 42 m of chord apart so SV_KIT_MIN_GAP_M
+                                 // (12 m) can never refuse the next one.
+let PL_ARRIVE_M: f64   = 1.4;
+let PL_SETTLE_LAG: i32 = 180;    // 3 s: four settle sweeps after the beat
+let PL_CHANNEL_T: i32  = 170;    // 2.5 s at 60 Hz is 150; 170 is slack for the
+                                 // frame the plant itself consumed.
+
+// ---------------------------------------------------------------------------
+//  ASSERTIONS
+// ---------------------------------------------------------------------------
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn f1(p_x: f64): string { let out: string = sv(floor(p_x * 10.0) / 10.0); return out; }
+
+fn padl(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = " " + s; }
+    let out: string = s;
+    return out;
+}
+fn padr(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = s + " "; }
+    let out: string = s;
+    return out;
+}
+fn pi(p_v: i32, p_w: i32): string { let out: string = padl(sv(p_v), p_w); return out; }
+fn pf(p_v: f64, p_w: i32): string { let out: string = padl(f1(p_v), p_w); return out; }
+
+// Ticks are ABSOLUTE: a session starts at `server_t0`, which is SV_T0_DAY --
+// about 9 minutes into the 16-minute day, so that the dusk horn lands on the
+// GDD's 0:33. The first version of this file printed raw ticks and reported
+// the opening's path beat at "9:24"; every time below is ELAPSED.
+fn mmss(p_t: i32): string {
+    let s: i32 = p_t / 60;
+    let m: i32 = s / 60;
+    let r: i32 = s - m * 60;
+    let pad: string = "";
+    if (r < 10) { pad = "0"; }
+    let out: string = sv(m) + ":" + pad + sv(r);
+    return out;
+}
+
+fn dist(p_ax: f64, p_az: f64, p_bx: f64, p_bz: f64): f64 {
+    let dx: f64 = p_ax - p_bx;
+    let dz: f64 = p_az - p_bz;
+    let out: f64 = sqrt(dx * dx + dz * dz);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  THE SESSION — `main.hml`'s run_loop with the window, the renderer and the
+//  wall clock removed. Identical in shape to probe_session §HARNESS on
+//  purpose: a probe that drives a different loop tests a loop nobody ships.
+// ---------------------------------------------------------------------------
+let PL_HOLD: i32  = 0;
+let PL_IN: i32    = 1;
+let PL_PLANT: i32 = 2;
+let PL_OUT: i32   = 3;
+
+fn session_new(p_seed: i32): object {
+    let net: object = transport_loopback();
+    let sv2: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    let s: object = {
+        seed: p_seed,
+        net: net, sv: sv2, cl: cl,
+        acc: sim_accum_new(),
+        t0: server_t0(sv2),
+        tick: server_t0(sv2),
+        bot: demobot_new(cl, sv2),
+        // --- the lamplighter's state machine -------------------------------
+        st: PL_HOLD,
+        spot: 0,            // which of the plant ring's positions it is on
+        chan: -1,           // ticks of USE held on the post under its feet
+        planted: 0,         // posts this session put down
+        lit: 0,             // ...and lit
+        // --- what the run measured -----------------------------------------
+        path_tick: -1,      // the tick SV_BEAT_PATH fired
+        path_at: -1,        // ...and the tick the settlement was read at
+        path_tier: -1, path_core: -1, path_pts: -1, path_fed: -1,
+        path_kits: -1, path_load: 0.0, path_cap: 0.0, path_mult: 0.0,
+        path_d0: 0.0,       // first post -> green, the number the spacing solves
+        auth: [], auth_n: 0,   // the AUTHORED posts, surveyed at the beat
+        vill_tick: -1,      // the tick the town first read VILLAGE
+        vill_posts: -1,     // ...and how many the player had planted by then
+        hold1_tick: -1,     // the tick the first hold completed
+        hold2_tick: -1,
+        kits_peak: 0,
+        end_core: 0, end_pts: 0, end_tier: 0, end_fed: 0, end_bld: 0,
+        holds: 0,
+        trace: []           // "tick core pts fed" rows, one per plant
+    };
+    s.auth = zeros(4 * 64);
+    client_set_angles(cl, server_spawn_yaw(sv2), 0.0);
+    server_tick(sv2, s.tick);
+    client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+    s.tick = s.tick + 1;
+    let out: object = s;
+    return out;
+}
+
+fn session_frame(p_s: object): i32 {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let n: i32 = sim_accum_advance(s.acc, g_DT_MS);
+    let i: i32 = 0;
+    while (i < n) {
+        client_send_command(cl, s.tick);
+        server_tick(sv2, s.tick);
+        client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+        s.tick = s.tick + 1;
+        i++;
+    }
+    client_frame(cl, g_DT_MS * 0.001, s.tick);
+    // >>> NOT OPTIONAL, AND IT COST AN HOUR TO FIND OUT. <<< `demobot.hml`
+    // picks its target from `client_ent_count` / `client_ent_*`, which read
+    // `cl.rs` -- the RENDER snapshot, filled only here. A headless harness that
+    // skips this call has a bot that can see nothing, never fires, never clears
+    // wave 1, and therefore never reaches SV_BEAT_PATH. It fails silently and
+    // it looks exactly like a broken director.
+    client_build_render(cl, sim_accum_alpha(s.acc));
+    let out: i32 = n;
+    return out;
+}
+
+// Move in a WORLD direction. forward = (sin yaw, -cos yaw), right =
+// (cos yaw, sin yaw) [view.hml], so the two axes are the projections.
+fn move_world(p_cl: object, p_yaw: f64, p_wx: f64, p_wz: f64) {
+    let wx: f64 = p_wx;
+    let wz: f64 = p_wz;
+    let m: f64 = sqrt(wx * wx + wz * wz);
+    if (m < 0.0001) { client_set_move(p_cl, 0.0, 0.0); return; }
+    let ux: f64 = wx / m;
+    let uz: f64 = wz / m;
+    let sy: f64 = sin(p_yaw);
+    let cy: f64 = cos(p_yaw);
+    let fwd: f64 = ux * sy + uz * (0.0 - cy);
+    let str: f64 = ux * cy + uz * sy;
+    client_set_move(p_cl, fwd, str);
+}
+
+fn clear_ui(p_cl: object) {
+    client_set_button(p_cl, BTN_BUILD, 0);
+    client_set_button(p_cl, BTN_SWITCH, 0);
+    client_set_button(p_cl, BTN_GRENADE, 0);
+    client_set_button(p_cl, BTN_INV, 0);
+}
+
+// ---------------------------------------------------------------------------
+//  ARM PLANT — THE LAMPLIGHTER WHO CARRIES ONE HOME
+// ---------------------------------------------------------------------------
+//  HOLD  : the shipping demobot owns the player. Leave at dawn, carrying kits.
+//  IN    : walk to the plant ring around the green.
+//  PLANT : stand on a ring position, tap USE (which is `sv_place_kit`), then
+//          HOLD USE for the 2.5 s channel (`sim.hml` stage (g)). Step round to
+//          the next position. Repeat until the pack is empty.
+//  OUT   : walk back to the post and resume the hold, which is where the next
+//          night's kits are earned.
+//
+//  Nothing here writes a settlement field, a lantern array, a purse or a
+//  regard. Every effect this arm has on the town goes through BTN_USE.
+// ---------------------------------------------------------------------------
+fn plant_spot_x(p_s: object, p_i: i32): f64 {
+    let st: object = server_settle(p_s.sv);
+    let a: f64 = f64(p_i) * 1.5707963267948966;      // 90 degrees apart
+    let out: f64 = settle_cx(st) + sin(a) * PL_PLANT_R_M;
+    return out;
+}
+fn plant_spot_z(p_s: object, p_i: i32): f64 {
+    let st: object = server_settle(p_s.sv);
+    let a: f64 = f64(p_i) * 1.5707963267948966;
+    let out: f64 = settle_cz(st) - cos(a) * PL_PLANT_R_M;
+    return out;
+}
+
+fn arm_plant(p_s: object) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+
+    // 1. the shipping driver runs first, always.
+    demobot_frame(s.bot, client_px(cl), client_pz(cl));
+    clear_ui(cl);
+
+    if (client_dead(cl) == 1) { s.chan = -1; return; }
+    // Until the first lantern is lit the opening script owns the player.
+    if (client_lantern_lit(cl) == 0) { return; }
+
+    let px: f64 = client_px(cl);
+    let pz: f64 = client_pz(cl);
+    let tick: i32 = server_tick_now(sv2);
+    let ph: i32 = day_phase(tick);
+
+    // 2. WHEN DOES A LAMPLIGHTER GO HOME? At dawn, and only carrying something
+    //    worth the walk. Nights are for holding the post: the light is the
+    //    ammunition (demobot.hml's header) and walking out of it mid-hold is
+    //    the documented way to lose.
+    if (s.st == PL_HOLD) {
+        if (ph == PHASE_DAWN && client_pack_kits(cl) > 0) {
+            s.st = PL_IN;
+            s.spot = 0;
+            s.chan = -1;
+        }
+        return;                       // the demobot's movement stands
+    }
+
+    if (s.st == PL_IN || s.st == PL_PLANT) {
+        if (client_pack_kits(cl) <= 0 && s.chan < 0) {
+            s.st = PL_OUT;
+            return;
+        }
+        let tx: f64 = plant_spot_x(s, s.spot);
+        let tz: f64 = plant_spot_z(s, s.spot);
+        let dx: f64 = tx - px;
+        let dz: f64 = tz - pz;
+        let d: f64 = sqrt(dx * dx + dz * dz);
+        client_set_angles(cl, atan2(dx, 0.0 - dz), 0.0);
+        client_set_button(cl, BTN_FIRE, 0);
+        client_set_button(cl, BTN_ADS, 0);
+
+        if (s.chan < 0) {
+            // travelling to the spot
+            if (d > PL_ARRIVE_M) {
+                move_world(cl, atan2(dx, 0.0 - dz), dx, dz);
+                client_set_button(cl, BTN_SPRINT, 1);
+                client_set_button(cl, BTN_USE, 0);   // released, so the next
+                                                     // press is a RISING EDGE
+                s.st = PL_IN;
+                return;
+            }
+            // arrived: stand still and start pressing.
+            client_set_move(cl, 0.0, 0.0);
+            client_set_button(cl, BTN_SPRINT, 0);
+            client_set_button(cl, BTN_USE, 1);       // the edge -> sv_place_kit
+            s.chan = 0;
+            s.st = PL_PLANT;
+            return;
+        }
+
+        // holding USE on the post now under our feet: sim.hml stage (g).
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 0);
+        client_set_button(cl, BTN_USE, 1);
+        s.chan = s.chan + 1;
+        if (s.chan >= PL_CHANNEL_T) {
+            client_set_button(cl, BTN_USE, 0);
+            s.chan = -1;
+            s.spot = s.spot + 1;
+            if (s.spot >= 8) { s.st = PL_OUT; }
+        }
+        return;
+    }
+
+    // 4. WALK BACK OUT to the post and resume the hold.
+    if (s.st == PL_OUT) {
+        client_set_button(cl, BTN_USE, 0);
+        let lx: f64 = server_lantern_x(sv2);
+        let lz: f64 = server_lantern_z(sv2);
+        let dx2: f64 = lx - px;
+        let dz2: f64 = lz - pz;
+        let d2: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
+        if (d2 > 8.0) {
+            client_set_angles(cl, atan2(dx2, 0.0 - dz2), 0.0);
+            move_world(cl, atan2(dx2, 0.0 - dz2), dx2, dz2);
+            client_set_button(cl, BTN_SPRINT, 1);
+            return;
+        }
+        client_set_button(cl, BTN_SPRINT, 0);
+        s.st = PL_HOLD;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  THE LANTERN SURVEY — every KIND_LANTERN body in the world, from the world,
+//  not from the settlement's copy of it.
+// ---------------------------------------------------------------------------
+fn lan_survey(p_s: object, p_out: array<f64>): i32 {
+    let s: object = p_s;
+    let w: object = server_world(s.sv);
+    let st: object = server_settle(s.sv);
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    let cnt: i32 = world_count(w);
+    let kd = w.kind; let fl = w.flags; let an = w.anim;
+    let xs = w.px; let zs = w.pz;
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < cnt) {
+        if (kd[i] == KIND_LANTERN && (fl[i] & EF_DEAD) == 0) {
+            p_out[n * 4] = xs[i];
+            p_out[n * 4 + 1] = zs[i];
+            p_out[n * 4 + 2] = f64(an[i]);
+            p_out[n * 4 + 3] = dist(xs[i], zs[i], cx, cz);
+            n++;
+        }
+        i++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+fn zeros(p_n: i32): array<f64> {
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0.0); i++; }
+    let out: array<f64> = a;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  RUN ONE SEED. Everything below reads what this produced.
+// ---------------------------------------------------------------------------
+fn run_seed(p_seed: i32, p_minutes: i32): object {
+    let s: object = session_new(p_seed);
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let st: object = server_settle(sv2);
+    let frames: i32 = p_minutes * 60 * 60;
+
+    let f: i32 = 0;
+    while (f < frames) {
+        arm_plant(s);
+        session_frame(s);
+
+        // ---- the sampling that costs nothing --------------------------------
+        let tick: i32 = server_tick_now(sv2);
+        if (s.path_tick < 0) {
+            if (server_beat(sv2) >= SV_BEAT_PATH) {
+                // THE MOMENT THE PATH LIGHTS. The GEOMETRY is surveyed here,
+                // on the frame of the beat, because by the end of the run the
+                // player has planted posts of their own and the two would be
+                // indistinguishable.
+                s.path_tick = tick;
+                s.auth_n = lan_survey(s, s.auth);
+                s.path_d0 = dist(server_lantern_x(sv2), server_lantern_z(sv2),
+                                 settle_cx(st), settle_cz(st));
+            }
+        }
+        // ...and the settlement is read PL_SETTLE_LAG ticks later, because
+        // `sv_lan_gather` runs one tick in SV_SETTLE_EVERY and `settle_step`
+        // one in SET_STEP_EVERY. Reading CORE_LUX on the beat frame itself
+        // measures the sweep's phase, not the design. Three seconds is four
+        // sweeps, and the player is still 275 m from the green.
+        if (s.path_tick >= 0 && s.path_at < 0 && tick >= s.path_tick + PL_SETTLE_LAG) {
+            s.path_at = tick;
+            s.path_tier = settle_tier(st);
+            s.path_core = settle_core_lux(st);
+            s.path_pts = settle_grid_points(st);
+            s.path_fed = server_lan_count(sv2);
+            s.path_kits = client_pack_kits(cl);
+            s.path_load = server_load_kg(sv2);
+            s.path_cap = server_carry_kg(sv2);
+            s.path_mult = server_move_mult(sv2);
+        }
+        let hd: i32 = director_holds_done(sim_director(server_world(sv2)));
+        if (hd > s.holds) {
+            if (s.holds == 0) { s.hold1_tick = tick; }
+            if (s.holds == 1) { s.hold2_tick = tick; }
+            s.holds = hd;
+        }
+        let k: i32 = client_pack_kits(cl);
+        if (k > s.kits_peak) { s.kits_peak = k; }
+        let placed: i32 = server_kits_placed(sv2);
+        if (placed > s.planted) {
+            s.planted = placed;
+        }
+        if (s.vill_tick < 0) {
+            if (settle_tier(st) >= SET_TIER_VILLAGE) {
+                s.vill_tick = tick;
+                s.vill_posts = placed;
+            }
+        }
+        f++;
+    }
+
+    s.end_core = settle_core_lux(st);
+    s.end_pts = settle_grid_points(st);
+    s.end_tier = settle_tier(st);
+    s.end_fed = server_lan_count(sv2);
+    s.end_bld = settle_building_count(st);
+    // lanterns_lit counts the tutorial post too; subtract it.
+    s.lit = sim_stat_lanterns(server_world(sv2)) - 1;
+    let out: object = s;
+    return out;
+}
+
+// ===========================================================================
+//  A.  THE ARITHMETIC OF A VILLAGE, STATED AS A LITERAL
+// ---------------------------------------------------------------------------
+//  Everything the rest of the file argues about rests on one number and it is
+//  worth pinning where a reader can see it: FOUR lit posts inside the Camp
+//  ring is a Village. These assertions restate `settle.hml`'s design anchors
+//  so that a later edit which moves one of them fails HERE, with a sentence,
+//  rather than three sections later as a mysterious tier that stopped coming.
+// ===========================================================================
+fn section_a() {
+    print("");
+    print("A  the arithmetic: what a Village costs");
+    print("   ring " + f1(SET_RING_CAMP_M) + " m   wick " + sv(SET_WICK_FULL)
+        + "   lux/point " + sv(SET_LUX_PER_POINT)
+        + "   village " + sv(SET_PTS_VILLAGE) + " pts / " + sv(SET_CORE_VILLAGE) + " core");
+
+    ck(SET_RING_CAMP_M == 64.0, "the Camp ring is 64 m (SETTLEMENT.md §3.1)");
+    ck(SET_WICK_FULL == 256, "a lit post is 256 of wick");
+    ck(SET_LUX_PER_POINT == 256, "and 256 of GRID LUX is one grid point");
+    ck(SET_PTS_VILLAGE == 10, "a Village wants 10 grid points");
+    ck(SET_CORE_VILLAGE == 512, "...and 512 CORE_LUX");
+
+    // The Great Lantern is row 0 of the feed and it is inside its own ring, so
+    // n player posts inside 64 m makes (n+1) rows, every one of them on a wick
+    // line with the others (64 < 90 = g_WICKLINE_M) and therefore DOUBLED.
+    let need_rows: i32 = SET_PTS_VILLAGE * SET_LUX_PER_POINT / (SET_WICK_FULL * 2);
+    print("   -> " + sv(need_rows) + " wick-linked rows inside the ring, of which one is the"
+        + " Great Lantern");
+    ck(need_rows == 5, "10 points / (256 x 2 per linked row) is five rows");
+    ck(need_rows - 1 == 4, ">>> FOUR LIT POSTS INSIDE 64 m OF THE GREEN IS A VILLAGE <<<");
+    ck(g_WICKLINE_M > SET_RING_CAMP_M,
+       "every post inside the ring is on a wick line with the Great Lantern: "
+       + f1(g_WICKLINE_M) + " m link vs a " + f1(SET_RING_CAMP_M) + " m ring");
+    // CORE_LUX comes free once ONE post is inside the link distance: the Great
+    // Lantern sits at d = 0 of its own radius, so a doubled row is 512 exactly.
+    ck(SET_WICK_FULL * 2 == SET_CORE_VILLAGE,
+       "and CORE_LUX 512 is the Great Lantern doubled, so the first post buys it");
+
+    // The supply, against the same arithmetic.
+    print("   supply: " + sv(SV_OPEN_KITS) + " at the 0:58 beat + " + sv(SV_HOLD_KITS)
+        + " per completed hold");
+    ck(SV_OPEN_KITS + SV_HOLD_KITS >= need_rows - 1,
+       "the opening's kits + ONE hold's kits reach the four a Village needs: "
+       + sv(SV_OPEN_KITS) + " + " + sv(SV_HOLD_KITS));
+    ck(SV_OPEN_KITS < need_rows - 1,
+       ">>> AND THE OPENING'S KITS ALONE DO NOT <<< " + sv(SV_OPEN_KITS) + " of "
+       + sv(need_rows - 1) + " — the Village is EARNED by surviving a night");
+}
+
+// ===========================================================================
+//  B.  THE OPENING POINTS HOME AND GIVES NOTHING AWAY
+// ---------------------------------------------------------------------------
+//  Driven, not fixtured: the session plays itself to SV_BEAT_PATH and then the
+//  world's own lantern bodies are surveyed.
+// ===========================================================================
+fn section_b(p_runs: array) {
+    print("");
+    print("B  the path at 0:58 — aimed at the town, and worth nothing");
+    print("   seed    beat@path   posts  nearest   farthest   maxgap   tier core pts  fed");
+
+    let i: i32 = 0;
+    while (i < p_runs.length) {
+        let s: object = p_runs[i];
+        let sv2: object = s.sv;
+        let buf: array<f64> = s.auth;
+        let n: i32 = s.auth_n;
+
+        // the AUTHORED posts are every lantern that exists before the player
+        // plants anything; the tutorial post plus SV_PATH_N.
+        let near: f64 = 1.0e30;
+        let far: f64 = 0.0;
+        let j: i32 = 0;
+        while (j < n) {
+            let d: f64 = buf[j * 4 + 3];
+            if (d < near) { near = d; }
+            if (d > far) { far = d; }
+            j++;
+        }
+        // the largest gap between consecutive posts along the chain, which is
+        // what the Wick Line cares about.
+        let maxgap: f64 = 0.0;
+        let a: i32 = 0;
+        while (a < n) {
+            let best: f64 = 1.0e30;
+            let b: i32 = 0;
+            while (b < n) {
+                if (b != a) {
+                    let dd: f64 = dist(buf[a * 4], buf[a * 4 + 1], buf[b * 4], buf[b * 4 + 1]);
+                    if (dd < best) { best = dd; }
+                }
+                b++;
+            }
+            if (n > 1 && best > maxgap) { maxgap = best; }
+            a++;
+        }
+
+        print("   " + padl(sv(s.seed), 6) + "   " + padl(mmss(s.path_tick - s.t0), 9)
+            + "   " + pi(n, 5) + "  " + pf(near, 7) + "   " + pf(far, 8)
+            + "   " + pf(maxgap, 6) + "   " + pi(s.path_tier, 4)
+            + " " + pi(s.path_core, 4) + " " + pi(s.path_pts, 3)
+            + "  " + pi(s.path_fed, 3));
+
+        ck(server_path_lit(sv2) == SV_PATH_N,
+           "seed " + sv(s.seed) + ": the path is " + sv(SV_PATH_N) + " posts; got "
+           + sv(server_path_lit(sv2)));
+        ck(n == SV_PATH_N + 1,
+           "seed " + sv(s.seed) + ": " + sv(SV_PATH_N + 1)
+           + " authored posts exist in the world; got " + sv(n));
+        ck(near >= SV_PATH_KEEP_M,
+           "seed " + sv(s.seed) + ": >>> NO AUTHORED POST IS INSIDE THE "
+           + f1(SV_PATH_KEEP_M) + " m KEEP-OUT <<< nearest " + f1(near));
+        ck(near > SET_RING_CAMP_M,
+           "seed " + sv(s.seed) + ": ...so none of them is a grid point ("
+           + f1(near) + " m vs a " + f1(SET_RING_CAMP_M) + " m ring)");
+        ck(near > g_WICKLINE_M,
+           "seed " + sv(s.seed) + ": ...and none of them links the Great Lantern ("
+           + f1(near) + " m vs a " + f1(g_WICKLINE_M) + " m line)");
+        ck(near > g_LANTERN_R_T1,
+           "seed " + sv(s.seed) + ": ...and none adds CORE_LUX at the green ("
+           + f1(near) + " m vs a " + f1(g_LANTERN_R_T1) + " m radius)");
+        ck(maxgap <= g_WICKLINE_M,
+           "seed " + sv(s.seed) + ": the path is one unbroken wick line, max gap "
+           + f1(maxgap) + " of " + f1(g_WICKLINE_M) + " m");
+        ck(near < far,
+           "seed " + sv(s.seed) + ": >>> IT LEADS SOMEWHERE <<< the near end is "
+           + f1(far - near) + " m closer to the green than the far end");
+        // THE ARITHMETIC, NOT THE HAPPY NUMBER. The spacing clamp means a
+        // town further than SV_PATH_END_M + N * SV_PATH_STEP_MAX from the
+        // first post cannot be reached in SV_PATH_N steps, and the path then
+        // falls honestly short rather than stretching its wick line. Asserting
+        // a flat 135 would false-fail such a seed, which CLAUDE.md §1.2 is
+        // explicit about; asserting max(END, d0 - N*STEP_MAX) cannot.
+        let reach: f64 = s.path_d0 - f64(SV_PATH_N) * SV_PATH_STEP_MAX;
+        let want: f64 = SV_PATH_END_M;
+        if (reach > want) { want = reach; }
+        ck(near <= want + SV_PATH_BOW_M + 1.0,
+           "seed " + sv(s.seed) + ": ...and it gets as close as five posts can: "
+           + f1(near) + " m, mark " + f1(want) + " m (town " + f1(s.path_d0)
+           + " m from the first post)");
+
+        // >>> THE VILLAGE IS NOT GIVEN. <<<
+        ck(s.path_tier == SET_TIER_CAMP,
+           "seed " + sv(s.seed) + ": >>> THE TOWN IS STILL A CAMP AT 0:58 <<< tier "
+           + sv(s.path_tier));
+        ck(s.path_core < SET_CORE_VILLAGE,
+           "seed " + sv(s.seed) + ": ...core " + sv(s.path_core) + " of "
+           + sv(SET_CORE_VILLAGE));
+        ck(s.path_pts < SET_PTS_VILLAGE,
+           "seed " + sv(s.seed) + ": ...points " + sv(s.path_pts) + " of "
+           + sv(SET_PTS_VILLAGE));
+
+        // >>> AND THE FEED IS ALIVE. <<< This is the assertion whose absence
+        // let `w.model` live for four waves: a REAL session, no fixture, and
+        // `sv_lan_gather` has to have found the posts the script lit.
+        ck(s.path_fed >= SV_PATH_N + 1,
+           "seed " + sv(s.seed) + ": >>> sv_lan_gather FED THE TOWN IN A REAL SESSION <<< "
+           + sv(s.path_fed) + " rows, " + sv(SV_PATH_N + 1) + " expected");
+        i++;
+    }
+}
+
+// ===========================================================================
+//  C.  THE SUPPLY EXISTS AND IT IS EARNED
+// ===========================================================================
+fn section_c(p_runs: array) {
+    print("");
+    print("C  the kits — where they come from");
+
+    // A REAL BOOT, ticked 130 times because `sv_load_tick` runs one tick in
+    // sixty and a load read on tick 0 is "0.0 kg of 0.0 kg" -- a number that
+    // says nothing and looks like a pass.
+    let boot: object = session_new(1337);
+    let s0: object = boot.sv;
+    let bf: i32 = 0;
+    while (bf < 130) { session_frame(boot); bf++; }
+    let sto = server_npcs(s0);
+    let row: i32 = npc_offer_find(NPC_OFF_KIT, 0);
+    ck(row >= 0, "Wick's kit row is findable: row " + sv(row));
+    ck(npc_pack_count(sto, row) == 0,
+       ">>> THE PACK IS EMPTY AT BOOT <<< and probe_trade §G and §H both say so"
+       + " in their own words; got " + sv(npc_pack_count(sto, row)));
+    ck(npc_pack_find_kind(sto, NPC_OFF_KIT) < 0,
+       "...so `sv_place_kit` finds nothing to plant on tick 1");
+
+    // The kits arrive at SV_BEAT_PATH. Read off EVERY real run, at the beat,
+    // and aggregated to the worst case so the assertion count stays fixed.
+    let bad_kits: i32 = 0;
+    let worst_slack: f64 = 1.0e30;
+    let worst_mult: f64 = 1.0e30;
+    let worst_load: f64 = 0.0;
+    let worst_cap: f64 = 0.0;
+    let q: i32 = 0;
+    while (q < p_runs.length) {
+        let r: object = p_runs[q];
+        if (r.path_kits != SV_OPEN_KITS) { bad_kits++; }
+        if (r.path_cap - r.path_load < worst_slack) {
+            worst_slack = r.path_cap - r.path_load;
+            worst_load = r.path_load;
+            worst_cap = r.path_cap;
+        }
+        if (r.path_mult < worst_mult) { worst_mult = r.path_mult; }
+        q++;
+    }
+    print("   at 0:58, worst of " + sv(p_runs.length) + " seeds: "
+        + sv(p_runs[0].path_kits) + " kits, load " + f1(worst_load) + " of "
+        + f1(worst_cap) + " kg, move x" + f1(worst_mult));
+    ck(bad_kits == 0,
+       "the 0:58 beat hands over " + sv(SV_OPEN_KITS) + " kits on every seed; "
+       + sv(bad_kits) + " disagreed");
+    ck(worst_slack >= 0.0,
+       ">>> AND TWO KITS DOES NOT OVERLOAD A LAMPLIGHTER <<< worst "
+       + f1(worst_load) + " of " + f1(worst_cap) + " kg, "
+       + f1(worst_slack) + " kg to spare");
+    ck(worst_mult >= 0.9999,
+       "...so nothing is slowing them on the walk home: worst move x"
+       + f1(worst_mult));
+
+    // The hold pays. Read off the real runs.
+    print("   seed   hold 1 done   hold 2 done   kits peak   planted   lit");
+    let i: i32 = 0;
+    let paid: i32 = 0;
+    while (i < p_runs.length) {
+        let s: object = p_runs[i];
+        let h1: string = "     -";
+        let h2: string = "     -";
+        if (s.hold1_tick >= 0) { h1 = padl(mmss(s.hold1_tick - s.t0), 6); }
+        if (s.hold2_tick >= 0) { h2 = padl(mmss(s.hold2_tick - s.t0), 6); }
+        print("   " + padl(sv(s.seed), 5) + "   " + padl(h1, 11) + "   " + padl(h2, 11)
+            + "   " + pi(s.kits_peak, 9) + "   " + pi(s.planted, 7) + "   " + pi(s.lit, 3));
+        if (s.hold1_tick >= 0 && s.kits_peak >= SV_OPEN_KITS + SV_HOLD_KITS) { paid++; }
+        i++;
+    }
+    ck(paid > 0,
+       ">>> A COMPLETED HOLD PAYS IN LANTERNS <<< " + sv(paid) + " of "
+       + sv(p_runs.length) + " seeds reached " + sv(SV_OPEN_KITS + SV_HOLD_KITS)
+       + " kits in the pack");
+}
+
+// ===========================================================================
+//  D.  A REAL SESSION REACHES VILLAGE
+// ---------------------------------------------------------------------------
+//  The headline, and the honest half of it is the seeds that do not.
+// ===========================================================================
+fn section_d(p_runs: array): i32 {
+    print("");
+    print("D  >>> DOES A REAL SESSION'S TOWN GROW? <<<  (no fixture anywhere)");
+    print("   seed   village at   posts then   end tier   core     pts     fed   bld");
+
+    let got: i32 = 0;
+    let i: i32 = 0;
+    while (i < p_runs.length) {
+        let s: object = p_runs[i];
+        let at: string = "        -";
+        if (s.vill_tick >= 0) { at = padl(mmss(s.vill_tick - s.t0), 9); got++; }
+        print("   " + padl(sv(s.seed), 5) + "   " + at
+            + "   " + pi(s.vill_posts, 10)
+            + "   " + pi(s.end_tier, 8)
+            + "   " + pi(s.end_core, 5) + "/" + sv(SET_CORE_VILLAGE)
+            + "  " + pi(s.end_pts, 3) + "/" + sv(SET_PTS_VILLAGE)
+            + "   " + pi(s.end_fed, 3) + "   " + pi(s.end_bld, 3));
+        i++;
+    }
+    print("   -> " + sv(got) + " of " + sv(p_runs.length) + " seeds promoted to VILLAGE in "
+        + sv(g_MINUTES) + " game minutes");
+    // EVERY POST IN THE WORLD AT THE END, WITH ITS DISTANCE FROM THE GREEN AND
+    // WHETHER IT IS LIT. This is the row that tells you WHY a seed did or did
+    // not promote, and it is printed for every seed either way.
+    let buf2: array<f64> = zeros(4 * 512);
+    let q: i32 = 0;
+    while (q < p_runs.length) {
+        let s2: object = p_runs[q];
+        let n2: i32 = lan_survey(s2, buf2);
+        let inring: i32 = 0;
+        let line: string = "";
+        let r: i32 = 0;
+        while (r < n2) {
+            let d: f64 = buf2[r * 4 + 3];
+            let tag: string = "unlit";
+            if (buf2[r * 4 + 2] >= 1.0) {
+                tag = "LIT";
+                if (d <= SET_RING_CAMP_M) { inring++; }
+            }
+            if (d <= SET_RING_CAMP_M) { line = line + " [" + tag + " " + f1(d) + "]"; }
+            else { line = line + " " + tag + " " + f1(d); }
+            r++;
+        }
+        print("   " + padl(sv(s2.seed), 5) + "  " + pi(inring, 2)
+            + " lit inside the ring:" + line);
+        q++;
+    }
+    ck(got > 0,
+       ">>> A REAL SESSION, NO FIXTURE, REACHES VILLAGE <<< " + sv(got) + " of "
+       + sv(p_runs.length) + " seeds");
+    let out: i32 = got;
+    return out;
+}
+
+// ===========================================================================
+//  E.  THE PROMOTION WAS PAID FOR BY PLANTING, AND NOTHING ELSE
+// ---------------------------------------------------------------------------
+//  A probe that only asserted "tier >= VILLAGE" would pass if a future edit
+//  simply promoted the town on a timer. This section asserts the CAUSE.
+// ===========================================================================
+fn section_e(p_runs: array) {
+    print("");
+    print("E  the promotion was bought with posts");
+
+    // AGGREGATED ON PURPOSE, so the assertion COUNT does not depend on how
+    // many seeds happened to promote. A probe whose count moves with its data
+    // cannot assert its own count, and a probe that cannot do that is one that
+    // can silently stop running half its checks.
+    let n: i32 = 0;
+    let min_posts: i32 = 999;
+    let after_path: i32 = 1;
+    let after_hold: i32 = 1;
+    let min_bld: i32 = 999;
+    let i: i32 = 0;
+    while (i < p_runs.length) {
+        let s: object = p_runs[i];
+        if (s.vill_tick >= 0) {
+            n++;
+            if (s.vill_posts < min_posts) { min_posts = s.vill_posts; }
+            if (s.end_bld < min_bld) { min_bld = s.end_bld; }
+            if (s.vill_tick <= s.path_tick) { after_path = 0; }
+            if (s.hold1_tick < 0 || s.vill_tick <= s.hold1_tick) { after_hold = 0; }
+            print("   " + padl(sv(s.seed), 5) + "   " + pi(s.vill_posts, 2)
+                + " posts planted, promoted " + mmss(s.vill_tick - s.t0)
+                + ", opening ended " + mmss(s.path_tick - s.t0)
+                + ", night survived " + mmss(s.hold1_tick - s.t0)
+                + ", " + sv(s.end_bld) + " buildings");
+        }
+        i++;
+    }
+    if (n == 0) { min_posts = -1; min_bld = -1; after_path = 0; after_hold = 0; }
+    ck(min_posts >= 4,
+       ">>> EVERY PROMOTION COST AT LEAST FOUR PLANTED POSTS <<< fewest "
+       + sv(min_posts) + ", and four is the arithmetic's floor");
+    ck(after_path == 1,
+       "every promotion is AFTER the opening ended — the town is never given at 0:58");
+    ck(after_hold == 1,
+       "every promotion is AFTER a night was survived — the fourth kit is the hold's");
+    ck(min_bld > 2,
+       "and the town BUILT something it had not built as a Camp: fewest "
+       + sv(min_bld) + " buildings, against 2 at boot");
+}
+
+// ===========================================================================
+//  G.  THE FALLBACK, SURVEYED WIDE
+// ---------------------------------------------------------------------------
+//  `sv_light_the_path` has a branch for a settlement so close to the first post
+//  that five steps toward it could not clear the keep-out, and in that case it
+//  turns away exactly as the shipped version did. A branch nobody has ever
+//  measured taking is a branch nobody knows the shape of, so this counts it
+//  over a wide seed sweep. `server_new` only -- no session is simulated, which
+//  is why 128 seeds costs seconds rather than an hour.
+// ===========================================================================
+fn section_g(p_n: i32) {
+    print("");
+    print("G  the fallback branch, over " + sv(p_n) + " seeds (boot only, no session)");
+    let fb: i32 = 0;
+    let clamped: i32 = 0;
+    let dmin: f64 = 1.0e30;
+    let dmax: f64 = 0.0;
+    let dsum: f64 = 0.0;
+    let landmax: f64 = 0.0;
+    let trip: f64 = SV_PATH_KEEP_M + f64(SV_PATH_N) * SV_PATH_STEP_MIN;
+    let k: i32 = 0;
+    while (k < p_n) {
+        let seed: i32 = 1337 + k * 7919;         // a coprime stride, not a run
+        let sx: object = server_new(seed, transport_loopback());
+        let st: object = server_settle(sx);
+        let d0: f64 = dist(server_lantern_x(sx), server_lantern_z(sx),
+                           settle_cx(st), settle_cz(st));
+        if (d0 < dmin) { dmin = d0; }
+        if (d0 > dmax) { dmax = d0; }
+        dsum = dsum + d0;
+        if (d0 < trip) { fb++; }
+        else {
+            let reach: f64 = d0 - f64(SV_PATH_N) * SV_PATH_STEP_MAX;
+            if (reach > SV_PATH_END_M) {
+                clamped++;
+                if (reach > landmax) { landmax = reach; }
+            }
+        }
+        k++;
+    }
+    print("   first post -> green: min " + f1(dmin) + " m, mean "
+        + f1(dsum / f64(p_n)) + " m, max " + f1(dmax) + " m"
+        + "   (fallback trips below " + f1(trip) + " m)");
+    print("   -> fallback taken on " + sv(fb) + " of " + sv(p_n)
+        + " seeds; spacing clamp binds on " + sv(clamped)
+        + ", worst landing " + f1(landmax) + " m");
+    ck(fb == 0,
+       "the fallback branch is DEAD CODE on every seed measured: " + sv(fb)
+       + " of " + sv(p_n) + " -- reported, and it stays in because the seed that"
+       + " needs it would otherwise put lit posts on the green");
+    ck(dmin >= trip,
+       "...and the closest town of " + sv(p_n) + " is " + f1(dmin)
+       + " m from the first post, against a " + f1(trip) + " m trip");
+    ck(clamped == 0,
+       "the spacing clamp binds on " + sv(clamped) + " of " + sv(p_n)
+       + " seeds, so every path lands its nearest post on SV_PATH_END_M");
+}
+
+// ===========================================================================
+//  F.  WHAT THIS PROBE CANNOT SAY — reported, never asserted
+// ===========================================================================
+fn section_f(p_runs: array) {
+    print("");
+    print("F  reported, not asserted");
+    print("   * ARM PLANT knows the green is at settle_cx and that a post is worth");
+    print("     more inside 64 m. The game teaches NEITHER. There is no map, no");
+    print("     marker and no line of dialogue that says the ring exists, so a human");
+    print("     with these four kits has no way to learn where to put them. That is a");
+    print("     DISCOVERABILITY gap and it is the next thing this loop needs.");
+    let i: i32 = 0;
+    let slowest: i32 = -1;
+    let fastest: i32 = -1;
+    while (i < p_runs.length) {
+        let s: object = p_runs[i];
+        if (s.vill_tick >= 0) {
+            let el: i32 = s.vill_tick - s.t0;
+            if (slowest < 0 || el > slowest) { slowest = el; }
+            if (fastest < 0 || el < fastest) { fastest = el; }
+        }
+        i++;
+    }
+    if (fastest >= 0) {
+        print("   * driven correctly, the Village lands between " + mmss(fastest)
+            + " and " + mmss(slowest) + " elapsed.");
+        print("     A human who has to FIND all of that will take longer, and this file");
+        print("     cannot tell you how much longer.");
+    }
+    print("   * the four posts ARM PLANT puts down are 4 x 48 = 192 triangles of");
+    print("     MESH_LANTERN inside the fog radius, worst case, against a 3000 budget.");
+}
+
+// ---------------------------------------------------------------------------
+//  MAIN
+// ---------------------------------------------------------------------------
+fn main() {
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--seeds" && i + 1 < args.length) { g_SEEDS = i32(args[i + 1]); i++; }
+        else if (a == "--minutes" && i + 1 < args.length) { g_MINUTES = i32(args[i + 1]); i++; }
+        else if (a == "--wide" && i + 1 < args.length) { g_WIDE = i32(args[i + 1]); i++; }
+        i++;
+    }
+
+    print("== probe_lanfeed: the lantern feed, driven, with no fixture ==");
+    print("   " + sv(g_SEEDS) + " seeds x " + sv(g_MINUTES) + " game minutes, "
+        + (compiled() == 1 ? "compiled" : "INTERPRETED"));
+
+    let seeds: array<i32> = [1337, 2, 7, 48851, 99991, 4242, 31337, 777,
+                             5, 12345, 90210, 65535, 8675309, 101, 2718, 31415];
+    let runs: array = [];
+    let k: i32 = 0;
+    while (k < g_SEEDS && k < seeds.length) {
+        runs.push(run_seed(seeds[k], g_MINUTES));
+        k++;
+    }
+
+    section_a();
+    section_b(runs);
+    section_c(runs);
+    section_d(runs);
+    section_e(runs);
+    section_g(g_WIDE);
+    section_f(runs);
+
+    print("");
+    print("ASSERTIONS  ran " + sv(g_n) + "  pass " + sv(g_ok) + "  fail " + sv(g_n - g_ok));
+    if (g_ok != g_n) { print("FAIL"); exit(1); }
+    let want: i32 = PL_FIXED + PL_PER_SEED * runs.length;
+    if (g_n != want) {
+        print("FAIL: expected " + sv(want) + " assertions (" + sv(PL_FIXED) + " + "
+            + sv(PL_PER_SEED) + " x " + sv(runs.length) + "), ran " + sv(g_n));
+        exit(1);
+    }
+    print("PASS  " + sv(g_ok) + "/" + sv(g_n) + " assertions");
+}
+main();

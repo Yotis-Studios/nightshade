@@ -174,6 +174,11 @@ export let g_TRIS_CEILING: i32 = 3500;
 export let g_MAX_TRIS_SKY: i32 = 16;
 export let g_MAX_TRIS_WORLD: i32 = 3500;
 export let g_MAX_TRIS_FX: i32 = 768;
+// ⚠ THIS ONE IS READ BY NOTHING.  `src/render/world_render.hml` builds the HUD
+// batch at its own `g_CAP_HUD = 512` literal, not from here, so 768 has never
+// been the HUD layer's capacity and a plan made against it would be 256
+// triangles wrong.  Reported rather than changed: world_render.hml is not this
+// task's file, and moving THIS number would only make the disagreement quieter.
 export let g_MAX_TRIS_HUD: i32 = 768;
 
 // Typical occupancy, for the budget report and the `budget_worst` scene.
@@ -182,8 +187,59 @@ export let g_TYP_TRIS_WORLD: i32 = 1900;
 export let g_TYP_TRIS_FX: i32 = 120;
 export let g_TYP_TRIS_HUD: i32 = 250;
 
-// The HUD is hard-capped: ART_BIBLE §9 totals ~240 tris worst case.
-export let g_HUD_TRI_CAP: i32 = 250;
+// ---------------------------------------------------------------------------
+// THE HUD CONTENT CAP.  250 -> 334, 2026-07-31 (about-to-break).
+// ---------------------------------------------------------------------------
+// The old comment said "ART_BIBLE §9 totals ~240 tris worst case".  That was an
+// estimate, it had been overrun, and the overrun was invisible because of what
+// the cap actually does when it is hit.
+//
+// >>> 248 OF 250 WAS NOT A WARNING THAT THE HUD WAS NEARLY FULL.  IT WAS THE
+// >>> HUD ALREADY TRUNCATING TEXT, EVERY RUN, WITH NOTHING COUNTING IT.
+// `hud_build` hands every optional line `clampi(cap - used, 0, N)` as its TEXT
+// budget and `font_text_shadowed` TRUNCATES at its budget rather than
+// overspending.  So a saturated HUD does not drop a triangle -- IT SHORTENS
+// WORDS -- and 248 is `g_HUD_TRI_CAP - 6` (the 6-triangle reserve at the top of
+// `hud_build`) plus the four fixed triangles emitted after the last clamped
+// line.  The number was pinned to the cap, not to the content.
+//
+// MEASURED, one constant apart, SAME 45-second opening, seed 1337:
+//     cap 250   HUD peak 248 of 250      <- clamped
+//     cap 320   HUD peak 294 of 320
+//     cap 334   HUD peak 294 of 334      <- unchanged: 294 IS the content
+// **46 triangles -- up to eleven glyphs of the game's own text -- were being
+// dropped out of the opening of every session that has ever run.**  Only the
+// unlock card (`g_hud_card_trunc`) and the two modal panels (`g_panel_trunc`)
+// count their truncations; the interact prompt, the villager prompt and the
+// speech line count nothing.
+//
+// WHY 334 AND NOT A ROUNDER NUMBER: IT IS THE CEILING, AND THE CEILING IS
+// DERIVED.  LAYER_HUD is `g_CAP_HUD` = 512 triangles (world_render.hml) and
+// three emitters share it -- stage 23's vignette, stage 15's viewmodel and
+// stage 24's HUD.  `batch_reserve` refuses and DROPS at 512 and nothing between
+// here and there notices, so:
+//     512 - g_POSTFX_TRI_CAP (50) - a viewmodel reserve of 128 (the measured
+//     122-triangle MESH_LANTERN_VM rounded up) = 334
+// and the floor is the measured content peak plus a headroom that covers twice
+// the largest UNGATED element in `hud_build` (the 18-triangle owned-weapon pip
+// strip): 294 + 36 = 330.
+//
+// >>> SO THE WHOLE LEGAL RANGE IS 330..334 -- FIVE TRIANGLES WIDE.  The HUD is
+// >>> not "about to break"; it is FULL.  The next HUD element of any size needs
+// >>> `g_CAP_HUD` raised in `src/render/world_render.hml`, and that file is not
+// >>> this task's.  REPORTED, not worked around.
+//
+// Cost: the cap grew 84, so worst case 1857 + 84 = 1941 of the 3000-triangle
+// g_TRIS_STEADY, and ~0.07 ms/frame at probe_hudlayer's measured per-HUD-
+// triangle rate.  Measured frame peak actually moved 1787 -> 1801 on the 420 s
+// panel demo, because the extra triangles are TEXT that was already budgeted
+// for and truncated away.
+//
+// Also not fixed by this number, and named: the must-never-yield set WITH the
+// lantern prompt in it ("HOLD [E] - LIGHT THE LANTERN" plus its second line,
+// 206 triangles of plate and text) prices at 418 and does not fit in 334 at any
+// cap.  `tools/probe_hud.hml` asserts that gap so it stays on the record.
+export let g_HUD_TRI_CAP: i32 = 334;
 export let g_POSTFX_TRI_CAP: i32 = 50;
 
 // Painter sort: counting-sort buckets over the view-space depth range.
@@ -1344,6 +1400,55 @@ export let g_DIR_SPAWN_CADENCE_S: f64 = 1.15;
 export let g_DIR_WAVE_GAP_S: f64 = 8.0;
 export let g_DIR_WAVES_PER_HOLD: i32 = 3;
 export let g_DIR_SPAWN_BEHIND_BIAS: f64 = 0.70;      // fraction spawned behind view
+
+// ---------------------------------------------------------------------------
+// THE RAMP — how fast the dark is allowed to deepen.  MEASURED 2026-07-31.
+// ---------------------------------------------------------------------------
+// These two numbers exist because a 45-minute session measured THREE nights at
+// director tier 1 and spawned 346 bodies drawn from three classes:
+//
+//     W 127  M 132  H 87   S 0   A 0   B 0
+//
+// Spitter, Warden and Bulwark shipped ZERO times in 45 minutes, because tier
+// 1's composition row is the only row that contains none of them and the hold
+// never left tier 1.  `sim/director.hml`'s DESIGN 7 has the full diagnosis.
+//
+// `hold_tier = min(night_tier_at_the_anchor, BASE + PER_HOLD * holds_done)`
+//
+//   BASE = 1      night one is a tutorial and a tutorial that kills you is not
+//                 one.  This SUBSUMES `sim.hml`'s own "pin the first hold to
+//                 tier 1" clamp — the two agree exactly at holds_done == 0 and
+//                 neither depends on the other being present.
+//   PER_HOLD = 1  one tier per night SURVIVED.  Not per night STARTED: the
+//                 counter is `holds_done`, which only moves when all three
+//                 waves clear (`director_step`'s DIR_CLEARING branch).  A night
+//                 dawn aborts teaches nothing and advances nothing.
+//
+// WHY min() AND NOT +.  A bonus would let a player standing on one square
+// escalate forever; a CEILING makes the world's own distance gradient
+// (`worldgen_shade_tier` = floor(d/200) + jitter + phase) the thing that
+// decides how deep a night can get, and the ramp only decides how fast you are
+// allowed to approach it.  Measured at seed 1337's spawn post: the post sits in
+// the ONLY tier-2 cell of its 5x5 chunk neighbourhood, and tier 3 is 30 m away,
+// tier 4 is 32 m away and tier 5 is 162 m away.  That is the reason to walk.
+//
+// WHY PER_HOLD IS NOT 2.  I ASSUMED IT WOULD MAKE NO DIFFERENCE — the world's
+// ceiling binds at the spawn post either way — AND I WAS WRONG, so here is the
+// measurement instead of the assumption.  Five seeds, 35-minute sessions, the
+// shipping `demobot.hml` driver, three nights each:
+//
+//                night tiers per seed          player deaths (mean)  kills (mean)
+//   PER_HOLD 1   122 122 122 122 122           45.6  (23..68)         201.0
+//   PER_HOLD 2   122 133 133 133 132           76.4  (44..139)        172.2
+//
+// At 2 the second night jumps straight to tier 3 on four of the five seeds —
+// the Warden's first night is also the player's second — and deaths rise 68 %
+// while kills FALL 14 %, which is the signature of a player who is dying rather
+// than fighting.  The ramp is the guard rail; the world's gradient is the
+// content.  1 keeps both; 2 removes the guard rail and buys one extra tier that
+// the player was going to reach anyway by walking 30 m.
+export let g_DIR_RAMP_BASE: i32     = 1;
+export let g_DIR_RAMP_PER_HOLD: i32 = 1;
 
 // ===========================================================================
 // 12. THE DAY CYCLE  (ARCHITECTURE D6: gamedesign's 16 minutes wins)

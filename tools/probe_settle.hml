@@ -49,7 +49,7 @@ import {
     SET_B_SHACK, SET_B_COTTAGE, SET_B_HOUSE, SET_B_HALL, SET_B_TOWER,
     SET_B_STACK, SET_B_WELL, SET_B_WORKS, SET_BLD_MAX,
     SET_IND_COLD, SET_IND_BROWNOUT, SET_IND_FLICKER, SET_IND_RUNNING,
-    SET_FEEDER_MIN, SET_COLD_POINTS, SET_RELIGHT_EMBER, SET_SLICE,
+    SET_FEEDER_MIN, SET_COLD_POINTS, SET_RELIGHT_EMBER, SET_SLICE, SET_STEP_EVERY,
     SET_SAVE_COLS, SET_META_COLS, SET_SITE_VETO, SET_SITE_CANDS,
     SET_EV_PROMOTED, SET_EV_BUILD_DONE,
     settle_new, settle_new_at, settle_refresh, settle_step,
@@ -96,7 +96,7 @@ import { g_LANTERN_R_T1, g_LANTERN_R_T2, g_LANTERN_R_T3, g_LANTERN_R_T4,
 // ---------------------------------------------------------------------------
 // EXPECTED ASSERTION COUNT — bump deliberately, never to make red go green
 // ---------------------------------------------------------------------------
-let g_expect_asserts = 231;
+let g_expect_asserts = 235;
 
 let g_asserts = 0;
 let g_pass = 0;
@@ -1695,6 +1695,136 @@ fn section_survey() {
 // ===========================================================================
 // O.  PERFORMANCE  (RULE T: __clock CPU time, min of 7; A5, A6)
 // ===========================================================================
+// P.  THE INJECTION CADENCE — the trap `settle_lanterns_set` sets for a caller
+// ---------------------------------------------------------------------------
+// THIS SECTION EXISTS BECAUSE ITS ABSENCE COST A WAVE, and the failure it
+// reproduces is the second half of the same bug as `sv_lan_gather`'s
+// `w.model`: a settlement that was fed correctly, linked correctly, hashed
+// correctly and rendered correctly, and whose CORE_LUX and GRID_LUX had
+// STOPPED MOVING.
+//
+// The mechanism is a contract between two functions that are 600 lines apart:
+//
+//   * `settle_lanterns_set` ends with `acc_valid = 0`. That is CORRECT and
+//     H17 above is why: a sweep in flight was accumulated against the previous
+//     lantern set and committing it would brown the town out for one sweep.
+//   * `settle_step` re-integrates SET_SLICE (8) rows per second on a rotating
+//     slice and commits ONLY on the last slice, `sl == nsl - 1 && acc_valid`.
+//
+// With n <= SET_SLICE there is ONE slice, so reset, integrate and commit all
+// happen inside a single call and an injecting caller never notices. With
+// n > SET_SLICE there are two or more, and a caller that injects on the SAME
+// cadence as `settle_step` -- which is exactly what `src/game/server.hml`'s
+// `sv_lan_gather` does, one tick in SV_SETTLE_EVERY = SET_STEP_EVERY -- clears
+// `acc_valid` before every commit tick. The commit then never happens again
+// for the rest of the session and the field is frozen at the value it held on
+// the last tick the settlement had eight lanterns or fewer.
+//
+// `settle_refresh`'s own header already states the fix -- "used at
+// construction, on load, AFTER A LANTERN SET INJECTION" -- so this section
+// does not change settle.hml's design. It ASSERTS the contract, in both
+// directions, so that the next caller who forgets it fails here instead of
+// four waves later in a session nobody instrumented.
+// ===========================================================================
+fn section_cadence() {
+    print("P. THE INJECTION CADENCE (the contract settle_refresh names)");
+    let st_no = settle_new(31677);
+    let st_yes = settle_new(31677);
+    let cx: f64 = settle_cx(st_no);
+    let cz: f64 = settle_cz(st_no);
+
+    // A growing ring of lit posts, injected once per SET_STEP_EVERY ticks --
+    // the shipping cadence -- into two identical settlements. The only
+    // difference between them is the `settle_refresh` call.
+    let n_max: i32 = 12;
+    let a: array<f64> = [];
+    let z: i32 = 0;
+    while (z < n_max * 4) { a.push(0.0); z++; }
+
+    let tick: i32 = 0;
+    let n: i32 = 0;
+    let froze_at: i32 = -1;
+    let last_no: i32 = -1;
+    while (n < n_max) {
+        // one more lit post on a 20 m ring: inside the 64 m Camp ring, inside
+        // the 90 m Wick Line, so every one of them is worth 512 of GRID LUX.
+        let ang: f64 = f64(n) * 0.9;
+        a[n * 4] = cx + 20.0 * __sin(ang);
+        a[n * 4 + 1] = cz - 20.0 * __cos(ang);
+        a[n * 4 + 2] = 1.0;
+        a[n * 4 + 3] = f64(SET_WICK_FULL);
+        n++;
+
+        // ---- the caller that only injects ---------------------------------
+        settle_lanterns_set(st_no, a, n);
+        settle_step(st_no, tick);
+        // ---- the caller that honours the contract --------------------------
+        settle_lanterns_set(st_yes, a, n);
+        settle_refresh(st_yes);
+        settle_step(st_yes, tick);
+
+        // Let each settlement have a few more sweeps at this size, exactly as
+        // a real second of play would.
+        let q: i32 = 0;
+        while (q < 4) {
+            tick = tick + SET_STEP_EVERY;
+            settle_lanterns_set(st_no, a, n);
+            settle_step(st_no, tick);
+            settle_lanterns_set(st_yes, a, n);
+            settle_refresh(st_yes);
+            settle_step(st_yes, tick);
+            q++;
+        }
+        if (froze_at < 0 && n > SET_SLICE && settle_grid_points(st_no) == last_no) {
+            froze_at = n;
+        }
+        last_no = settle_grid_points(st_no);
+        tick = tick + SET_STEP_EVERY;
+    }
+
+    let pts_no: i32 = settle_grid_points(st_no);
+    let pts_yes: i32 = settle_grid_points(st_yes);
+    // The truth: n rows, every one on a wick line with the others, is 512 each.
+    let want_pts: i32 = n_max * SET_WICK_FULL * 2 / SET_LUX_PER_POINT;
+
+    // ---- REPORTED, NOT ASSERTED -------------------------------------------
+    // The inject-only column is a measurement of a TRAP, not of a defect this
+    // file is entitled to pin. If a later wave makes `settle_step` robust to
+    // being invalidated mid-sweep, that column will move -- and an assertion
+    // on it would then FALSE-FAIL a genuine improvement, which CLAUDE.md §1.2
+    // is explicit about. So the number is printed, loudly, and the assertions
+    // below are the ones that stay true under any such fix.
+    print(`   ${n_max} lit posts injected on the shipping cadence (SET_STEP_EVERY = ${SET_STEP_EVERY}):`);
+    print(`     inject only         grid ${settle_grid_lux(st_no)} -> ${pts_no} points, core ${settle_core_lux(st_no)}   <- froze at n = ${froze_at}`);
+    print(`     inject + refresh    grid ${settle_grid_lux(st_yes)} -> ${pts_yes} points, core ${settle_core_lux(st_yes)}`);
+    print(`     the truth           grid ${want_pts * SET_LUX_PER_POINT} -> ${want_pts} points`);
+    print(`   >>> A CALLER THAT INJECTS ON settle_step's OWN CADENCE MUST CALL settle_refresh. <<<`);
+    print(`       Above SET_SLICE = ${SET_SLICE} rows the commit needs two sweeps and the`);
+    print(`       injection clears acc_valid before the second one lands.`);
+
+    // ---- ASSERTED: the contract, which survives any fix to settle_step -----
+    ck(pts_yes == want_pts,
+       "P1 >>> settle_refresh AFTER settle_lanterns_set SEES EVERY LANTERN <<<"
+       + " this is the contract settle_refresh's own header names",
+       `${pts_yes} points, want ${want_pts}`);
+    ck(settle_core_lux(st_yes) >= SET_CORE_VILLAGE,
+       "P2 ... and the field it produces justifies a Village on 12 posts",
+       `${settle_core_lux(st_yes)} of ${SET_CORE_VILLAGE}`);
+    ck(pts_no <= pts_yes,
+       "P3 an un-refreshed caller may see LESS than it injected, never more",
+       `inject-only ${pts_no} vs refreshed ${pts_yes}`);
+    // Idempotence: refresh is a full recompute, so a second one must not move
+    // the field. If it ever does, the accumulator and the recompute disagree
+    // and every number in this section is measuring the wrong thing.
+    let g1: i32 = settle_grid_lux(st_yes);
+    let c1: i32 = settle_core_lux(st_yes);
+    settle_refresh(st_yes);
+    ck(settle_grid_lux(st_yes) == g1 && settle_core_lux(st_yes) == c1,
+       "P4 settle_refresh is idempotent: a second one moves nothing",
+       `grid ${g1} -> ${settle_grid_lux(st_yes)}, core ${c1} -> ${settle_core_lux(st_yes)}`);
+}
+
+// ===========================================================================
 fn section_perf() {
     print("O. Performance (RULE T: __clock CPU time, min of 7 trials)");
     let TRIALS: i32 = 7;
@@ -1797,6 +1927,7 @@ fn main() {
     section_determinism();print("");
     section_solids();    print("");
     section_survey();    print("");
+    section_cadence();   print("");
     section_perf();      print("");
 
     print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
