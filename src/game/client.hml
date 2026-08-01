@@ -207,6 +207,18 @@ export let CL_PROMPT_M: f64      = 3.2;    // show HOLD [E] from this far out
 
 export let CL_MISS: i32 = -1;
 
+// ---- GDD §7.13's direction indicator, client side --------------------------
+// One slot per segment of the four-segment indicator (`src/render/hud.hml` §3).
+export let CL_DMG_SLOTS: i32 = 4;
+// Two sources inside this many radians of each other are THE SAME THREAT as far
+// as a four-segment indicator can express: 0.79 rad is 45 degrees, which is
+// exactly one segment's half-width, so merging inside it can never collapse two
+// sources that would have lit different segments.
+export let CL_DMG_MERGE_RAD: f64 = 0.7853981633974483;
+// How long a damage NUMBER stays legible. Longer than the 0.5 s world mote
+// (`g_DMGNUM_S`) because a number has to be READ, not just seen.
+export let CL_DMGNUM_S: f64 = 0.85;
+
 // ---- W6 presentation timers, and the reach the words appear at -------------
 export let CL_CAST_S: f64    = 0.28;   // the cast bloom at the eye
 export let CL_ARRIVE_S: f64  = 3.0;    // "somebody moved in"
@@ -348,6 +360,30 @@ export fn client_new(p_transport, p_seed: i32): object {
         hitmark_kill: 0,
         dmg_t: 0.0,
         dmg_dir: 0.0,
+        // ---- GDD §7.13, the four-segment direction indicator ---------------
+        // FOUR INDEPENDENT SOURCES, not one, and that is the whole point of the
+        // upgrade: `cl.dmg_dir` above is a single scalar, so being hit by a Husk
+        // in front and a Wisp behind inside the same 1.2 s produced ONE bearing
+        // -- the last one -- and the player was told about one of the two
+        // things killing them. Each slot holds the WORLD bearing of a source and
+        // its own fade, so the segments stay pinned to the attackers while the
+        // camera turns (the view-relative angle is computed at the draw site,
+        // every frame, from `bearing - yaw`).
+        //
+        // FOUR IS THE RIGHT NUMBER because the indicator has four segments: a
+        // fifth simultaneous source cannot say anything the four cannot already
+        // say. New damage MERGES into a slot within CL_DMG_MERGE_RAD, so a Husk
+        // hitting you six times is one live segment, not six evictions.
+        dmg_bx: zeros_f(CL_DMG_SLOTS),
+        dmg_bt: zeros_f(CL_DMG_SLOTS),
+        dmg_hits: 0,           // EV_DAMAGE_TAKEN events the client has consumed
+        // ---- the §2.5 contract's damage NUMBER -----------------------------
+        // `EV_DAMAGE_NUMBER` carries the value in `sub` and has since combat.hml
+        // was written; the client threw the value away and spawned a white mote.
+        // A mote is a particle, not a number.
+        dmgnum: 0,
+        dmgnum_t: 0.0,
+        dmgnum_crit: 0,
         banner: "",
         banner_t: 0.0,
         card: "",
@@ -539,9 +575,36 @@ export fn client_rsnap(p_cl: object): object { let cl: object = p_cl; let o: obj
 //  waits for a packet. The command then samples `view_aim_*`, which is the
 //  recoil-FREE pair — `view.hml`'s whole reason for having two.
 
+// ===========================================================================
+//  THE DEAD LATCH
+// ---------------------------------------------------------------------------
+//  Gate 9: "when you die the game does not tell you -- it tints the screen the
+//  colour of the sunset it is already showing you AND LETS YOU KEEP WALKING AT
+//  0 HP." That second half was this file's. `cl.control` is set to 1 exactly
+//  once, on the SV_BEAT_STAND edge (`cl_on_beat`), and NOTHING ever set it back
+//  -- so every input gate below asked "has the camera stood up yet?" when the
+//  question it needed to ask was "are you alive?".
+//
+//  MEASURED before the fix, `--demo 45 --stand --seed 1337`:
+//      dead frames 479, 479 of them WITH control.
+//  Not one frame of the 479 refused an input.
+//
+//  One predicate, used by every gate and by `client_has_control` itself, so the
+//  HUD and the input path can never disagree about whether you are playing.
+//  `client_press_fire` / `_reload` / `_use` already checked `cl.dead`
+//  individually, which is exactly how the movement and look paths came to be
+//  missed: four copies of a rule is four chances to forget it.
+fn cl_live(p_cl: object): i32 {
+    let cl: object = p_cl;
+    if (cl.control == 0) { let no: i32 = 0; return no; }
+    if (cl.dead == 1) { let no2: i32 = 0; return no2; }
+    let out: i32 = 1;
+    return out;
+}
+
 export fn client_look(p_cl: object, p_dx: f64, p_dy: f64) {
     let cl: object = p_cl;
-    if (cl.control == 0) { return; }
+    if (cl_live(cl) == 0) { return; }
     let dy: f64 = p_dy;
     if (cl.invert_y != 0) { dy = 0.0 - dy; }
     // g_MOUSE_SENS_RAD was applied HERE and again inside view_look_mouse
@@ -558,26 +621,34 @@ export fn client_look(p_cl: object, p_dx: f64, p_dy: f64) {
 // for the headless demo driver).
 export fn client_look_axis(p_cl: object, p_dyaw: f64, p_dpitch: f64) {
     let cl: object = p_cl;
-    if (cl.control == 0) { return; }
+    if (cl_live(cl) == 0) { return; }
     view_look(cl.view, p_dyaw, p_dpitch);
 }
 
 export fn client_set_move(p_cl: object, p_fwd: f64, p_strafe: f64) {
     let cl: object = p_cl;
-    if (cl.control == 0) { cl.in_fwd = 0.0; cl.in_str = 0.0; return; }
+    if (cl_live(cl) == 0) { cl.in_fwd = 0.0; cl.in_str = 0.0; return; }
     cl.in_fwd = clampf(p_fwd, -1.0, 1.0);
     cl.in_str = clampf(p_strafe, -1.0, 1.0);
 }
 
 export fn client_set_button(p_cl: object, p_bit: i32, p_down: i32) {
     let cl: object = p_cl;
-    if (cl.control == 0) { return; }
+    if (cl_live(cl) == 0) { cl.in_btn = 0; return; }
     if (p_down != 0) { cl.in_btn = cl.in_btn | p_bit; }
     else { cl.in_btn = cl.in_btn & (0 - 1 - p_bit); }
 }
 
 export fn client_buttons(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.in_btn; return o; }
-export fn client_has_control(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.control; return o; }
+// >>> AND THIS IS THE ANSWER THE WHOLE GAME READS. <<< It used to report the
+// SV_BEAT_STAND latch, so a corpse answered 1 and the shot line printed `ctl 1`
+// on all 479 frames Gate 9 photographed at hp 0. "Do you have control" and "did
+// the camera finish standing up" are not the same question.
+export fn client_has_control(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl_live(cl); return o; }
+// The raw latch, for the two callers that genuinely mean "has the opening
+// finished" rather than "are you playing" -- `tools/probe_game.hml`'s 0:00
+// assertion and main.hml's opening trace.
+export fn client_stood_up(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.control; return o; }
 
 // ---------------------------------------------------------------------------
 // THE FRAME-0 SHOT.  This is the whole latency criterion, in one function.
@@ -751,6 +822,18 @@ export fn client_apply(p_cl: object, p_packet: object, p_local: object,
     cl.session = l.session_tick;
     cl.hp = l.hp;
     cl.hp_max = l.hp_max;
+    // THE DEATH EDGE. `cl_live` refuses NEW input from here on, but the button
+    // mask and the movement axes are LATCHED state -- whatever was held down at
+    // the moment of death would otherwise still be in the command the next tick
+    // builds, which is a corpse walking forward with the trigger held. Cleared
+    // on the edge, once, so a held key does not survive the death that
+    // interrupted it.
+    if (l.dead == 1 && cl.dead == 0) {
+        cl.in_fwd = 0.0;
+        cl.in_str = 0.0;
+        cl.in_btn = 0;
+        cl.want_reload = 0;
+    }
     cl.dead = l.dead;
     cl.respawn_t = l.respawn_t;
     cl.px = l.px; cl.py = l.py; cl.pz = l.pz;
@@ -1065,6 +1148,9 @@ fn cl_drain_fx(p_cl: object, p_l: object) {
     let fk = l.fx_kind; let fa = l.fx_a; let fb = l.fx_b;
     let fx = l.fx_x; let fy = l.fx_y; let fz = l.fx_z;
 
+    // How many EV_DAMAGE_NUMBERs this ONE tick's queue has carried. See the
+    // long note at SIM_FX_NUMBER below: the sum window is a tick, not a fade.
+    let num_drain: i32 = 0;
     let i: i32 = 0;
     while (i < n) {
         let k: i32 = fk[i];
@@ -1093,15 +1179,91 @@ fn cl_drain_fx(p_cl: object, p_l: object) {
             cl_spawn(cl, CFX_MOTE, CFXB_BALLISTIC, x, y + 0.3, z,
                      0.0, g_DMGNUM_RISE, 0.0, g_DMGNUM_S, 0.13, 0.05,
                      255, 255, 255, 200);
+            // >>> AND THE VALUE, WHICH THIS BRANCH USED TO DISCARD. <<<
+            // `a` is EV_DAMAGE_NUMBER's `sub` -- the damage combat.hml actually
+            // took off the body, already clamped and already floored at 1 so a
+            // hit that lands can never read 0 (combat.hml:1369). The mote above
+            // is the WORLD's acknowledgement at the hit point; this is the
+            // player's, and CLAUDE.md §9's contract asks for both.
+            //
+            // CONSECUTIVE HITS SUM rather than replace, because a Bellows
+            // volley is nine pellets in one tick and nine numbers flickering
+            // over each other is less readable than one. `combat_fire` already
+            // aggregates per victim, so this only ever adds up hits the player
+            // experienced as one trigger pull.
+            // >>> THE WINDOW IS ONE TICK, NOT ONE FADE, AND THE FIRST VERSION
+            //     OF THIS GOT IT WRONG. <<< It summed into whatever was still
+            //     on screen -- `if (cl.dmgnum_t <= 0.0) { reset }` -- so any
+            //     hit inside the 0.85 s fade extended the SAME number instead
+            //     of starting a new one. `tools/probe_feedback.hml` §A caught
+            //     it by printing the biggest value it ever saw: 225, against a
+            //     Wisp that dies to one Kestrel round. It was reporting
+            //     "damage this engagement", climbing across three separate
+            //     kills, while looking exactly like "damage to that thing".
+            //
+            //     `num_drain` is per CALL, and one call is one tick's fx queue,
+            //     so nine Bellows pellets resolved in the same tick still read
+            //     as one number -- which is the case the summing was FOR --
+            //     and the next trigger pull starts a new one.
+            if (num_drain == 0) {
+                cl.dmgnum = 0;
+                cl.dmgnum_crit = 0;
+                if (cl.hitmark_kill == 1) { cl.dmgnum_crit = 1; }
+            }
+            num_drain = num_drain + 1;
+            cl.dmgnum = cl.dmgnum + a;
+            if (cl.dmgnum > 999) { cl.dmgnum = 999; }
+            cl.dmgnum_t = CL_DMGNUM_S;
         } else if (k == SIM_FX_SHAKE) {
-            // Damage taken. Vignette, direction arc, camera punch away.
+            // Damage taken. Vignette, direction segments, camera punch away.
             cl.dmg_t = g_DMG_DIR_FADE_S;
-            cl.dmg_dir = atan2(x - cl.px, z - cl.pz);
+            let bearing: f64 = atan2(x - cl.px, z - cl.pz);
+            cl.dmg_dir = bearing;
+            cl.dmg_hits = cl.dmg_hits + 1;
+            cl_dmg_slot(cl, bearing);
             view_shake(cl.view, 0.45);
             cl_sound(cl, CSND_HURT, 0.9, 0.0);
         }
         i++;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Book a damage source into one of the four direction slots.
+// ---------------------------------------------------------------------------
+// MERGE FIRST, then take a free slot, then evict the FAINTEST. Evicting the
+// faintest rather than the oldest is deliberate: "oldest" throws away the Husk
+// that has been chewing on you for a second in favour of a single glancing
+// Wisp, and the one that has been hitting you longest is the one you most need
+// to turn around for.
+fn cl_dmg_slot(p_cl: object, p_b: f64) {
+    let cl: object = p_cl;
+    let b: f64 = p_b;
+    let bx = cl.dmg_bx;
+    let bt = cl.dmg_bt;
+
+    let worst: i32 = 0;
+    let worst_t: f64 = 1.0e30;
+    let i: i32 = 0;
+    while (i < CL_DMG_SLOTS) {
+        if (bt[i] > 0.0) {
+            let d: f64 = bx[i] - b;
+            while (d > 3.141592653589793) { d = d - 6.283185307179586; }
+            while (d < -3.141592653589793) { d = d + 6.283185307179586; }
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d < CL_DMG_MERGE_RAD) {
+                // Same threat. Keep the NEW bearing -- it walked -- and reset
+                // the fade.
+                bx[i] = b;
+                bt[i] = g_DMG_DIR_FADE_S;
+                return;
+            }
+        }
+        if (bt[i] < worst_t) { worst_t = bt[i]; worst = i; }
+        i++;
+    }
+    bx[worst] = b;
+    bt[worst] = g_DMG_DIR_FADE_S;
 }
 
 // combat.hml's EV_SOUND sub ids: 1..5 the pitch-chained hit blip, 6 the kill
@@ -1176,6 +1338,19 @@ export fn client_frame(p_cl: object, p_dt: f64, p_tick: i32): i32 {
         if (cl.hitmark_t <= 0.0) { cl.hitmark_t = 0.0; cl.hitmark_kill = 0; }
     }
     if (cl.dmg_t > 0.0) { cl.dmg_t = cl.dmg_t - dt; if (cl.dmg_t < 0.0) { cl.dmg_t = 0.0; } }
+    if (cl.dmgnum_t > 0.0) {
+        cl.dmgnum_t = cl.dmgnum_t - dt;
+        if (cl.dmgnum_t <= 0.0) { cl.dmgnum_t = 0.0; cl.dmgnum = 0; cl.dmgnum_crit = 0; }
+    }
+    let dbt = cl.dmg_bt;
+    let dsi: i32 = 0;
+    while (dsi < CL_DMG_SLOTS) {
+        if (dbt[dsi] > 0.0) {
+            dbt[dsi] = dbt[dsi] - dt;
+            if (dbt[dsi] < 0.0) { dbt[dsi] = 0.0; }
+        }
+        dsi++;
+    }
     if (cl.banner_t > 0.0) { cl.banner_t = cl.banner_t - dt; if (cl.banner_t < 0.0) { cl.banner_t = 0.0; } }
     if (cl.card_t > 0.0) { cl.card_t = cl.card_t - dt; if (cl.card_t < 0.0) { cl.card_t = 0.0; } }
     if (cl.toast_t > 0.0) { cl.toast_t = cl.toast_t - dt; if (cl.toast_t < 0.0) { cl.toast_t = 0.0; } }
@@ -1612,6 +1787,31 @@ export fn client_hitmarker(p_cl: object): f64 { let cl: object = p_cl; let o: f6
 export fn client_hitmarker_kill(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.hitmark_kill; return o; }
 export fn client_damage_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.dmg_t; return o; }
 export fn client_damage_dir(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.dmg_dir; return o; }
+// GDD §7.13's four sources. `_t` is seconds of fade left (0 = the slot is dark)
+// and `_dir` is the WORLD bearing of the source: the draw site subtracts the
+// camera's yaw every frame, so turning around moves the segments, which is the
+// entire behaviour that makes an indicator worth having.
+export fn client_dmg_slots(): i32 { let o: i32 = CL_DMG_SLOTS; return o; }
+export fn client_dmg_slot_t(p_cl: object, p_i: i32): f64 {
+    let cl: object = p_cl;
+    if (p_i < 0 || p_i >= CL_DMG_SLOTS) { let bad: f64 = 0.0; return bad; }
+    let a = cl.dmg_bt;
+    let o: f64 = a[p_i];
+    return o;
+}
+export fn client_dmg_slot_dir(p_cl: object, p_i: i32): f64 {
+    let cl: object = p_cl;
+    if (p_i < 0 || p_i >= CL_DMG_SLOTS) { let bad: f64 = 0.0; return bad; }
+    let a = cl.dmg_bx;
+    let o: f64 = a[p_i];
+    return o;
+}
+export fn client_dmg_hits(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.dmg_hits; return o; }
+// The §2.5 contract's damage number: the value, its fade, and whether it was a
+// kill (GDD §7.8's amber).
+export fn client_dmgnum(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.dmgnum; return o; }
+export fn client_dmgnum_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.dmgnum_t; return o; }
+export fn client_dmgnum_crit(p_cl: object): i32 { let cl: object = p_cl; let o: i32 = cl.dmgnum_crit; return o; }
 export fn client_banner(p_cl: object): string { let cl: object = p_cl; let o: string = cl.banner; return o; }
 export fn client_banner_t(p_cl: object): f64 { let cl: object = p_cl; let o: f64 = cl.banner_t; return o; }
 export fn client_card(p_cl: object): string { let cl: object = p_cl; let o: string = cl.card; return o; }

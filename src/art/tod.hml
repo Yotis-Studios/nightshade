@@ -529,7 +529,8 @@ import {
     g_PHASE_DAWN_END, g_PHASE_DAY_END, g_PHASE_DUSK_END,
     g_LANTERN_LIGHT_R, g_LANTERN_LIGHT_G, g_LANTERN_LIGHT_B,
     g_LANTERN_GAIN, g_LANTERN_RADIUS,
-    g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY
+    g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY,
+    gate_darkness, fog_tint_luma
 } from "../core/config.hml";
 
 // ===========================================================================
@@ -1357,6 +1358,11 @@ let g_tod_lightning: i32 = -1;  // frame index into the flash, -1 = idle
 // ADVANCED g_tod_lightning by the time skygen asks for the sky and a consumer
 // must never have to reason about that.
 let g_tod_flash: f64 = 0.0;
+// The luminance of THIS HOUR's authored fog tint, weather and lightning
+// excluded. `tod_eval` writes it; `tod_lantern_gate` and `tod_hour_tint_luma`
+// read it. It is the day curve of the keyframe table and nothing else, which
+// is the entire point — see `tod_hour_tint_luma`.
+let g_tod_hour_lum: f64 = 0.0;
 // Which strike this is. skygen.hml seeds the bolt's zig-zag from it, so two
 // consecutive strikes are different bolts and the same strike is always the
 // same bolt — which is what keeps a screenshot byte-deterministic. tod_reset
@@ -1749,6 +1755,14 @@ export fn tod_eval(p_env: array<f64>, p_day_t: f64, p_wx: i32) {
     if (g_tod_wx_mix >= 1.0) { g_tod_wx_prev = g_tod_wx_cur; }
 
     tod_sample(t);
+    // ---- THE HOUR'S OWN DARKNESS, CAPTURED BEFORE ANYTHING CAN VEIL IT ------
+    // Read HERE and nowhere else: after `tod_sample` (so it is this hour's
+    // authored keyframe tint) and before `tod_blend_weather` / the weather
+    // multiply / the lightning override (so no weather and no bolt can move
+    // it). See the block above `tod_hour_tint_luma` for why the whole storm
+    // bug is this one line's absence.
+    g_tod_hour_lum = fog_tint_luma(g_tod_s[KF_TINT_R], g_tod_s[KF_TINT_G],
+                                   g_tod_s[KF_TINT_B]);
     tod_blend_weather();
 
     let s: array<f64> = g_tod_s;
@@ -2099,15 +2113,115 @@ export fn tod_lantern_ember_b(): f64 { let out: f64 = f64(pal_b(g_EMBER)) / 255.
 //     clock   11.90  18.25  19.50  22.00  02.00  05.50
 //     foglum  0.855  0.783  0.542  0.480  0.409  0.845
 //     gate    0.000  0.000  0.836  1.000  1.000  0.000
+//
+// (That row is REPRODUCED AS FOUND and its 19:30 column is stale — see the
+// measured table at `tod_hour_tint_luma` below. 0.5998 and a gate of 0.6494
+// are what this tree renders.)
+//
+// ===========================================================================
+// >>> AND THE WORD "TINT" WAS DOING TWO JOBS.        (the-flat-storm, 08-01)
+// ---------------------------------------------------------------------------
+// The table above is WX_CLEAR, and WX_CLEAR is the one weather whose tint
+// multiplier is (1,1,1). Every other row of `g_wp` multiplies the same three
+// numbers by well under 1 — that is what makes a rainy world grey and a storm
+// world blue-black, and it is correct — and the gate above then read the
+// PRODUCT and called it an hour. So:
+//
+//     WEATHERED fog tint luma, read back out of the RenderEnv on the
+//     rendered frame (`tools/shot.hml`'s `darkness` line):
+//                          noon    02:00      lantern gate at noon
+//       WX_CLEAR          0.8576  0.4100            0.0000
+//       WX_OVERCAST       0.7392  0.3536            0.0000
+//       WX_RAIN           0.6205  0.2970            0.4962   <- half, at midday
+//       WX_STORM          0.2775  0.1330            1.0000   <- all of it
+//       WX_BLOOM          0.7934  0.4169            0.0000
+//
+// The gate's band is [0.52, 0.72]. A storm's fog tint is BELOW the night
+// threshold at every hour of the day, so the gate returned 1.0 at noon: the
+// carried lantern burned at midday, and — because `src/render/world_render.hml`
+// hangs the NIGHT VEIL off the same quantity on a narrower band [0.470, 0.545]
+// — the whole world was veiled at midday too. Measured on the rendered frame,
+// `storm_assault --bolt 0 --lantern 0`, ground band rows 112..139, Rec.709:
+//
+//                   02:00    noon   18:15   22:00    range
+//       clear        4.47   77.00   49.93    5.87    72.53
+//       overcast     4.52   55.00   43.45    4.38    50.62
+//       rain         3.75   43.96   35.91    3.72    40.24
+//       storm        4.47    6.11    4.85    4.36     1.75   <- no day at all
+//
+// Storm noon is 6.11 against rain noon's 43.96 — ONE STEP of weather costs 7x
+// the daylight, because the veil switched fully on. That is not a storm, it is
+// a night with rain in it, and CLAUDE.md §8's "something above 220" cannot be
+// met by a frame whose entire ground sits under luminance 7.
+//
+// THE FIX IS THE SIGNAL, NOT THE THRESHOLDS AND NOT THE STORM.
+// Darkness is the HOUR. Weather changes how much light gets through and what
+// colour it is; it does not move the sun. So the gate reads the hour's own
+// authored tint, captured in `tod_eval` before the weather multiply and before
+// the lightning override:
+//
+//   * WX_CLEAR is UNCHANGED BIT FOR BIT — its multiplier is (1,1,1), so the
+//     six-column table above still holds to every digit. The night does not
+//     move.
+//   * A bolt no longer flickers the lantern. The old gate read `KF_TINT_*`
+//     AFTER the §5.2 re-key overwrote it with `TOD_LIGHTNING_TINT_*`
+//     (0.34,0.40,0.56 -> luma 0.4003, deep inside the night band), so a flash
+//     at noon in clear weather switched the lantern on for two frames and off
+//     again. `tools/shot.hml`'s selftest §5b(e) is the assertion for this.
+//   * A storm at noon is a dim day and a storm at midnight is a night, which is
+//     what a storm is.
+//
+// WHAT THIS FUNCTION CANNOT DO, AND IT IS THE IMPORTANT HALF. NOTHING UNDER
+// `src/` CALLS IT. At 74a6ec4 `grep -rn tod_lantern` over the whole repo found
+// TWO COMMENTS AND ZERO CALL SITES; today its only caller is
+// `tools/shot.hml`'s stats line and selftest, which is a measurement, not the
+// game. The light the player actually carries is gated by
+// `src/render/world_render.hml`'s own `lantern_gate`/`dark_gate`, off the
+// RenderEnv's WEATHERED fog tint, and that file may not import this one (the
+// import wall). This function is the art-side mirror and fixing it fixes the
+// mirror. `tod_hour_tint_luma` below is the number the renderer needs; a
+// `src/game/**` caller has to hand it over. See the task report and
+// `docs/shots/README.md` for the exact three-line diff.
 export fn tod_lantern_gate(): f64 {
-    let s: array<f64> = g_tod_s;
-    let lum: f64 = 0.299 * s[KF_TINT_R] + 0.587 * s[KF_TINT_G] + 0.114 * s[KF_TINT_B];
-    let span: f64 = g_LANTERN_GATE_DAY - g_LANTERN_GATE_NIGHT;
-    if (span <= 0.0) { let one: f64 = 1.0; return one; }
-    let u: f64 = (g_LANTERN_GATE_DAY - lum) / span;
-    if (u <= 0.0) { let z: f64 = 0.0; return z; }
-    if (u >= 1.0) { let o: f64 = 1.0; return o; }
-    let out: f64 = u * u * (3.0 - 2.0 * u);
+    let out: f64 = gate_darkness(g_tod_hour_lum, g_LANTERN_GATE_NIGHT,
+                                 g_LANTERN_GATE_DAY);
+    return out;
+}
+
+// THE HOUR'S DARKNESS, as one number in [0,1] of luminance — high is bright.
+//
+// This is the quantity every darkness gate in the project wants and the one
+// none of them can currently reach: the luminance of the fog tint the KEYFRAME
+// TABLE authored for this hour, with no weather multiplier and no lightning
+// re-key on top of it. WX_CLEAR's own fog tint is exactly this, which is why
+// the clear-weather behaviour of every consumer is unchanged by construction.
+//
+// MEASURED on the rendered frame (`tools/shot.hml`'s `darkness` line), not
+// derived on paper, and identical under all five weathers:
+//
+//     clock   05.50   11.90   12.00   18.25   19.50   22.00   02.00
+//     luma   0.8450  0.8559  0.8576  0.7835  0.5998  0.4804  0.4100
+//     lant   0.0000  0.0000  0.0000  0.0000  0.6494  1.0000  1.0000
+//     veil   0.0000  0.0000  0.0000  0.0000  0.0000  0.9476  1.0000
+//
+// >>> THE 19:30 COLUMN DISAGREES WITH THREE FILES AND THEY ARE THE STALE ONES.
+// `core/config.hml` (twice, at `g_VEIL_GATE_*` and `g_LANTERN_GATE_*`) and
+// `render/world_render.hml`'s `lantern_gate` all carry the row
+// `foglum 0.855 0.783 0.542 0.480 0.409 0.845` with 0.542 at 19:30. The DUSK
+// keyframe's tint is (0.74,0.54,0.54) and 0.299*0.74 + 0.587*0.54 +
+// 0.114*0.54 = 0.5998; 0.542 predates CUT 6, which raised dusk. The 0.542 is
+// only ever quoted, never computed, so nothing is broken by it — but the gate
+// it implies at 19:30 is 0.966 and the real one is 0.6494, which is a
+// materially different dusk. `tools/shot.hml`'s own `night01` comment already
+// says 0.650 and is right. Reported, not fixed: those two files are not this
+// task's (CLAUDE.md §3).
+//
+// Feed it to `core/config.hml`'s `gate_darkness` with whichever pair of
+// thresholds the consumer owns (`g_LANTERN_GATE_*` for the carried lantern,
+// `g_VEIL_GATE_*` for the night veil). Valid after the first `tod_eval`;
+// `tod_reset` puts it back to 0.
+export fn tod_hour_tint_luma(): f64 {
+    let out: f64 = g_tod_hour_lum;
     return out;
 }
 

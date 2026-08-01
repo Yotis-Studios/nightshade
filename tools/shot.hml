@@ -64,7 +64,7 @@
 
 import { exit } from "@stdlib/process";
 import { write_file, exists, remove_file, make_dirs } from "@stdlib/fs";
-import { getenv } from "@stdlib/env";
+import { getenv, get_pid } from "@stdlib/env";
 import { sin, cos, sqrt, floor, divi, atan2, asin } from "@stdlib/math";
 
 // ---------------------------------------------------------------------------
@@ -113,11 +113,13 @@ import { stat_set, stat_begin, stat_end, stat_get, stat_ms,
 // the layer order and must not learn it again.
 // ---------------------------------------------------------------------------
 import { frame_init, frame_render, frame_present, frame_begin,
+         frame_set_darkness,
          frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
          frame_set_camera, frame_set_clear, frame_set_sheet_clear,
          frame_set_options, frame_set_capture, frame_set_hud_solid_uv,
          frame_set_vignette_colour, frame_set_flash_colour,
          frame_set_lantern, frame_set_pool_scale,
+         frame_lantern_scale, frame_veil_amount,
          frame_env, frame_batch_hud,
          world_clear, world_chunk_add, world_prop_add, world_fx_add,
          world_chunk_count, world_chunk_mesh, world_prop_count,
@@ -135,7 +137,8 @@ import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_TRIS_CLAMP,
          g_FOG_FAR_CAP, g_MIST_HEIGHT, g_ATLAS_WORLD_PX, g_ATLAS_WORLD_CELLS,
          g_TEXEL_CM_GROUND, g_FOV_HIP, g_FOV_SPRINT,
          gate_darkness, fog_tint_luma,
-         g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY }
+         g_LANTERN_GATE_NIGHT, g_LANTERN_GATE_DAY,
+         g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY }
        from "../src/core/config.hml";
 import { clamp01, lerpf, clampi, clampf } from "../src/core/mathx.hml";
 
@@ -151,6 +154,7 @@ import { pal_r, pal_g, pal_b, pal_pack,
        from "../src/art/palette.hml";
 import { tod_eval, tod_reset, tod_set_weather, tod_set_mist_band,
          tod_sky_keys, tod_lightning_fire, tod_clock_hours, tod_mist_density,
+         tod_hour_tint_luma, tod_lantern_gate,
          WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM, WX_BLOOM,
          TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
          TODSKY_CLOUD_LIT_R, TODSKY_CLOUD_SHADOW_R, TODSKY_STAR_ALPHA,
@@ -683,6 +687,9 @@ fn tod_apply(p_si: i32) {
     // `--bolt 0` is the only way to photograph this storm at an hour.
     if (scene_bolt(si) == 1) { tod_lightning_fire(); }
     tod_eval(env, tod_t_from_hours(scene_f(si, SC_TOD)), wx);
+    // The harness must push the same hour the game does, or every scene
+    // photographed here gates its lantern differently from the shipping frame.
+    frame_set_darkness(tod_hour_tint_luma());
     env_set_camera(env, g_camx, g_camy, g_camz);
 
     // Scene overrides, applied through the engine's own env setters. The cap
@@ -2545,6 +2552,72 @@ fn dirname_of(p_path: string): string {
     return out;
 }
 
+// Four decimals, so the darkness line below is a column and not a wall of
+// float noise. Cold: called five times per PNG.
+fn d4(p_v: f64): string {
+    let v: f64 = p_v;
+    let neg: i32 = 0;
+    if (v < 0.0) { neg = 1; v = 0.0 - v; }
+    let n: i32 = i32(v * 10000.0 + 0.5);
+    let w: i32 = n / 10000;
+    let f: i32 = n - w * 10000;
+    let fs: string = `${f}`;
+    while (fs.length < 4) { fs = "0" + fs; }
+    let out: string = `${w}.${fs}`;
+    if (neg == 1) { out = "-" + out; }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  THE DARKNESS LINE — the instrument the flat-storm bug hid behind.
+// ---------------------------------------------------------------------------
+//  Two different numbers were both called "how dark is it", they agreed on
+//  every clear-weather scene in this harness, and NOTHING PRINTED EITHER OF
+//  THEM.  So a storm that rendered its whole ground under luminance 7 at noon
+//  looked, in the stats file, exactly like a storm that did not.
+//
+//    fogtint / foglum   the WEATHERED fog tint in the RenderEnv.  This is what
+//                       `src/render/world_render.hml` gates the carried lantern
+//                       and the night veil on today, and it is a product of the
+//                       hour AND the weather: WX_STORM multiplies it by
+//                       (0.26,0.32,0.46), which puts every hour of a storm day
+//                       below the night thresholds.
+//    hourlum            `tod_hour_tint_luma()` — the same quantity with the
+//                       weather multiplier and the lightning re-key removed,
+//                       i.e. the hour alone.  Identical to foglum under
+//                       WX_CLEAR with no bolt, by construction.
+//    lantern / veil     the two gates AS THE FRAME ACTUALLY RAN them, read back
+//                       out of the frame graph (`frame_lantern_scale`,
+//                       `frame_veil_amount`) rather than recomputed here — a
+//                       recomputation is exactly how a probe ends up passing
+//                       while the feature is broken.
+//    hour-only          what those two gates WOULD be on `hourlum`.  When these
+//                       disagree with the pair above, the weather is being
+//                       mistaken for the hour, and the size of the gap is the
+//                       size of the bug.
+fn darkness_report(): string {
+    let env: array<f64> = frame_env();
+    let fr: f64 = env_field(env, ENV_FOG_R);
+    let fg: f64 = env_field(env, ENV_FOG_G);
+    let fb: f64 = env_field(env, ENV_FOG_B);
+    let flum: f64 = fog_tint_luma(fr, fg, fb);
+    let hlum: f64 = tod_hour_tint_luma();
+    // tod.hml's own accessor, not a re-transcription of its curve: if the art
+    // module and this harness ever disagree about the hour, the disagreement
+    // must be a compile error, not a quiet second answer.
+    let hl: f64 = tod_lantern_gate();
+    let hv: f64 = gate_darkness(hlum, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY);
+    let s: string = "";
+    s = s + `darkness      fogtint ${d4(fr)},${d4(fg)},${d4(fb)}  foglum ${d4(flum)}  hourlum ${d4(hlum)}\n`;
+    s = s + `              AS RUN: lantern gate ${d4(frame_lantern_scale())}  veil ${d4(frame_veil_amount())}`;
+    s = s + `   ON THE HOUR ALONE: lantern ${d4(hl)}  veil ${d4(hv)}\n`;
+    if (hl < 0.999 && frame_lantern_scale() > hl + 0.01) {
+        s = s + `              >>> THE WEATHER IS BEING READ AS THE HOUR: the lantern is`;
+        s = s + ` ${d4(frame_lantern_scale() - hl)} hotter than this hour asks for. <<<\n`;
+    }
+    return s;
+}
+
 // The report. Scene provenance first (so the PNG is reproducible from the text
 // alone), then the ART provenance (so nobody can ever again wonder whether a
 // screenshot depicts the game's art), then the full §4 counter and stage-timer
@@ -2579,6 +2652,7 @@ fn build_report(p_si: i32, p_out: string, p_checksum: u64, p_headless: i32): str
         s = s + ` day/night table. Use --bolt 0. <<<\n`;
     } else { s = s + `   (no flash; the light is the hour's)\n`; }
     s = s + `fog           near ${g_fog_near} far ${g_fog_far} mist ${tod_mist_density()}\n`;
+    s = s + darkness_report();
     s = s + `far plane     ${env_far_plane(frame_env())}\n`;
     s = s + `image fnv1a   ${p_checksum}\n`;
     s = s + `relative mouse rc ${g_relative_mouse_rc} (non-fatal; always -1 headless)\n`;
@@ -2949,9 +3023,10 @@ fn shot_render(p_si: i32): u64 {
 // trusted by a gate script.
 // ===========================================================================
 
-// 48 -> 53: five for the `--bolt` switch (§3b). Bumped because assertions were
-// ADDED, never to make a red one go green.
-let g_EXPECTED_ASSERTIONS: i32 = 53;
+// 48 -> 53: five for the `--bolt` switch (§3b).
+// 53 -> 59: six for §5b, "darkness is the hour, not the weather".
+// Bumped because assertions were ADDED, never to make a red one go green.
+let g_EXPECTED_ASSERTIONS: i32 = 59;
 let g_TRIALS: i32 = 7;
 // ~2x the loaded measurement (CLAUDE.md §1.2): a probe that false-fails on
 // machine state trains everyone to ignore red.
@@ -3057,6 +3132,116 @@ fn selftest(): i32 {
        tod_clock_hours(tod_t_from_hours(2.0)) - 2.0 < 0.001
        && 2.0 - tod_clock_hours(tod_t_from_hours(2.0)) < 0.001);
 
+    // --- 5b. DARKNESS IS THE HOUR, NOT THE WEATHER -----------------------
+    // The six assertions that would have caught the flat storm. Before
+    // 2026-08-01 the only "how dark is it" number in the project was the
+    // WEATHERED fog tint's luminance, and a storm multiplies that by
+    // (0.26,0.32,0.46) — so a storm's noon scored darker than a clear
+    // midnight, the carried lantern burned at midday, the night veil closed
+    // over the world at midday, and `storm_assault --bolt 0`'s ground band
+    // sat at 6.11 of 255 at 12:00 against 76.99 for the same camera in clear
+    // weather. Nothing in this suite went red.
+    //
+    // These are written against `tod_hour_tint_luma` / `tod_lantern_gate`, the
+    // art-side pair. SABOTAGE VERIFIED — three of them, each in a scratch copy
+    // of the tree, never here — and these are the MEASURED results, not the
+    // ones this comment predicted before it was run:
+    //
+    //   A  revert `tod_lantern_gate` to read `g_tod_s[KF_TINT_*]` (the
+    //      weathered tint: the exact body it had at 74a6ec4)
+    //        -> PASS 57/59, exit 1, FAIL #30 and #32
+    //   B  delete the `g_tod_hour_lum` capture from `tod_eval`
+    //        -> PASS 56/59, exit 1, FAIL #29, #30 and #32
+    //   C  set WX_STORM's tint multiplier to (1,1,1) — i.e. weather stops
+    //      tinting the fog, which would make (a)-(d) pass for the wrong reason
+    //        -> PASS 58/59, exit 1, FAIL #33
+    //
+    // (a) and (d) surviving A is correct and is the point of splitting them:
+    // A breaks the GATE while leaving the hour intact, and at 22:00/02:00 the
+    // two signals agree anyway, so only the daylight assertions may move.
+    let env_d: array<f64> = frame_env();
+    let wxs: array<f64> = [f64(WX_CLEAR), f64(WX_OVERCAST), f64(WX_RAIN),
+                           f64(WX_STORM), f64(WX_BLOOM)];
+    let t_noon: f64 = tod_t_from_hours(12.0);
+
+    // (a) THE HOUR IS THE HOUR. Every weather must report the same darkness at
+    // the same clock reading. This is the whole claim in one line.
+    let hour_same: bool = true;
+    tod_reset(); tod_set_weather(WX_CLEAR);
+    tod_eval(env_d, t_noon, WX_CLEAR);
+    let hl_ref: f64 = tod_hour_tint_luma();
+    for (let i = 0; i < wxs.length; i++) {
+        let w: i32 = i32(wxs[i]);
+        tod_reset(); tod_set_weather(w);
+        tod_eval(env_d, t_noon, w);
+        let d: f64 = tod_hour_tint_luma() - hl_ref;
+        if (d < 0.0) { d = 0.0 - d; }
+        if (d > 0.000001) { hour_same = false; }
+    }
+    ok("the hour's darkness is identical under all five weathers at noon",
+       hour_same);
+
+    // (b) AND IT IS THE AUTHORED DAY CURVE, not some other number that happens
+    // to be weather-invariant. The keyframe table's own noon tint is
+    // (0.72,0.90,1.00); Rec.601 luma 0.8576.
+    ok("the hour's darkness at noon is the NOON keyframe's fog tint luminance",
+       hl_ref > 0.8566 && hl_ref < 0.8586);
+
+    // (c) A LANTERN POOL ON SUNLIT GRASS IS A BUG — in every weather.
+    let noon_off: bool = true;
+    for (let i = 0; i < wxs.length; i++) {
+        let w: i32 = i32(wxs[i]);
+        tod_reset(); tod_set_weather(w);
+        tod_eval(env_d, t_noon, w);
+        if (tod_lantern_gate() > 0.0) { noon_off = false; }
+    }
+    ok("the lantern is fully OFF at noon in all five weathers", noon_off);
+
+    // (d) AND THE NIGHT IS NOT SACRIFICED TO GET THERE. 22:00 and 02:00 must
+    // still be full lantern in every weather — this is the assertion that goes
+    // red if anyone ever "fixes" (c) by widening the gate's band instead.
+    let night_on: bool = true;
+    let t22: f64 = tod_t_from_hours(22.0);
+    let t02: f64 = tod_t_from_hours(2.0);
+    for (let i = 0; i < wxs.length; i++) {
+        let w: i32 = i32(wxs[i]);
+        tod_reset(); tod_set_weather(w);
+        tod_eval(env_d, t22, w);
+        if (tod_lantern_gate() < 0.999) { night_on = false; }
+        tod_reset(); tod_set_weather(w);
+        tod_eval(env_d, t02, w);
+        if (tod_lantern_gate() < 0.999) { night_on = false; }
+    }
+    ok("the lantern is fully ON at 22:00 and 02:00 in all five weathers",
+       night_on);
+
+    // (e) A BOLT IS NOT A SUNSET. The §5.2 re-key overwrites KF_TINT_* with
+    // TOD_LIGHTNING_TINT_* (luma 0.412), so a gate that read the post-override
+    // tint switched the lantern on for two frames in the middle of a clear
+    // noon. The capture happens before the override; this proves it.
+    tod_reset(); tod_set_weather(WX_CLEAR);
+    tod_lightning_fire();
+    tod_eval(env_d, t_noon, WX_CLEAR);
+    ok("a lightning flash at noon does not switch the lantern on",
+       tod_lantern_gate() == 0.0);
+
+    // (f) THE CONTROL. If weather ever stopped tinting the fog at all, (a)-(d)
+    // would pass for the wrong reason and this frame would lose its storm. The
+    // env's WEATHERED tint must still separate clear from storm hard.
+    tod_reset(); tod_set_weather(WX_CLEAR);
+    tod_eval(env_d, t_noon, WX_CLEAR);
+    let lum_clear: f64 = fog_tint_luma(env_field(env_d, ENV_FOG_R),
+                                       env_field(env_d, ENV_FOG_G),
+                                       env_field(env_d, ENV_FOG_B));
+    tod_reset(); tod_set_weather(WX_STORM);
+    tod_eval(env_d, t_noon, WX_STORM);
+    let lum_storm: f64 = fog_tint_luma(env_field(env_d, ENV_FOG_R),
+                                       env_field(env_d, ENV_FOG_G),
+                                       env_field(env_d, ENV_FOG_B));
+    ok("the weather still darkens and cools the fog: storm's noon tint is far"
+       + " below clear's", lum_storm < lum_clear * 0.5 && lum_storm > 0.0);
+    tod_reset();
+
     // --- 6. the RNG is seeded, reproducible and never throws -------------
     rnd_reseed(1337);
     let a1: f64 = rnd01(); let a2: f64 = rnd01();
@@ -3104,7 +3289,11 @@ fn selftest(): i32 {
     eqi("the atlas sheet draws no world geometry", stat_get(STAT_TRIS_WORLD), 0);
 
     // --- 10. the PNG and its stats report are inseparable ----------------
-    let png: string = "/tmp/shot_selftest.png";
+    // PID-QUALIFIED, and for the same reason `--headless` now forces the dummy
+    // video driver: two agents running this selftest at once on the same box
+    // shared one path, and a write_pair race here reads as a harness bug in
+    // whichever run loses. Concurrency on this machine is the normal case.
+    let png: string = `/tmp/shot_selftest_${get_pid()}.png`;
     let sp: string = stats_path_for(png);
     if (exists(png)) { remove_file(png); }
     if (exists(sp)) { remove_file(sp); }

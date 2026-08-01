@@ -40,7 +40,7 @@ SDL_VIDEODRIVER=dummy /tmp/shot --scene list
 SDL_VIDEODRIVER=dummy /tmp/shot --scene ridge_golden --out docs/shots/ridge_golden.png
 SDL_VIDEODRIVER=dummy /tmp/shot --scene muzzle_fog --cam 3,2.1,-8 --look 220,-4 \
                                 --tod 22.0 --weather storm --seed 1337 --out /tmp/a.png
-SDL_VIDEODRIVER=dummy /tmp/shot --selftest        # PASS 29/29, exit 0
+SDL_VIDEODRIVER=dummy /tmp/shot --selftest        # PASS 59/59, exit 0
 
 # 2. the palette contact sheet — built BEFORE texgen, on purpose
 hemlockc -O1 tools/palette_preview.hml -o /tmp/palprev
@@ -171,13 +171,193 @@ exactly (camera positions match to the last printed digit).
 | `muzzle_fog` | ART_BIBLE §12.2 — muzzle flash in the fog. The identity shot. |
 | `hub_dawn` | ART_BIBLE §12.3 — the cozy hub at dawn. |
 | `ns_bloom` | ART_BIBLE §12.4 — nightshade bloom, violet fog, the monolith. |
-| `storm_assault` | ART_BIBLE §12.5 — storm assault on the lightning frame. |
+| `storm_assault` | ART_BIBLE §12.5 — storm assault on the lightning frame. **Its shipping golden is TIME-OF-DAY INVARIANT and must not appear in a day/night table — see below.** |
 | `hud_worst_case` | the HUD over noon sky, snow, a muzzle flash and `CONCRETE_HI`. |
 | `budget_worst` | the densest legal frame: `FOG_FAR` 72 m, every prop class. |
 | `flat_debug` | a quiet reference frame for regression diffs. |
 
 Any of them can be overridden: `--cam x,y,z --look yaw,pitch --tod h --weather w --seed n
 --fov deg --upscale n`.
+
+---
+
+## Two rules for anyone measuring darkness with this harness (2026-08-01)
+
+### 1. `--headless` on the game binary now really is headless
+
+`build/nightshade --headless` used to open a **mapped X window on `:0`** — `boot_window()` ran
+unconditionally and the flag only skipped the mouse grab. Gate 9 counted seven of them on the
+owner's desktop at once, and one agent screenshotted and typed into **another agent's game for
+forty minutes** because the two windows landed at the same geometry.
+
+It now forces `SDL_VIDEODRIVER=dummy` before `SDL_Init`, which is exactly what this directory's
+tools have always been told to do by their caller. Measured, same binary, same box:
+
+```
+                                   NIGHTSHADE windows in `wmctrl -l`   no-DISPLAY boot
+  74a6ec4  --headless --selftest    1                                   SDL_Init failed
+  now      --headless --selftest    0                                   PASS, exit 0
+  now      (no flag)                1   <- unchanged, a window is correct here
+```
+
+The `env -u DISPLAY` column is the stronger proof and it is new capability: the shipping
+binary's `--selftest` can now run on a box with no X server at all.
+
+Two things `--headless` still does **not** do, stated so nobody has to rediscover them:
+it does not close the audio device (add `--no-audio`), and the dummy driver selects SDL's
+**software** renderer, which collapses `BLEND_ADD` to `BLEND` — so glow and muzzle brightness in
+a `--headless --shots` PNG is not what a display shows. That was always true of every headless
+invocation here; it is now implied by a flag instead of typed by a caller.
+
+### 2. `storm_assault`'s shipping golden cannot pass or fail a test about darkness
+
+`--bolt 1` (its default, from `F_LIGHTNING`) renders the **flash frame**, and `tod.hml` §5.2
+replaces the ambient, the key colour, the key *direction*, the fog tint and the fog alpha
+ceiling with constants. After that override nothing in the frame depends on the hour. Measured
+here, `--bolt 1 --nohud --novm --lantern 0 --pool 0 --upscale 1`, ground band rows 112..139,
+Rec.709 mean: **`52.0287` at 02:00, noon, 18:15 and 22:00** — range `0.0000`, six significant
+figures flat. **That is correct physics** (a bolt is the same bolt at any hour) and it must not
+be "fixed".
+
+> Gate 9 reported `53.9064` for this row and `5.54 / 6.88 / 5.83 / 5.34` for the `--bolt 0` row
+> where this file measures `4.4747 / 6.1066 / 4.8534 / 4.3557`. The *finding* reproduces exactly;
+> the absolute values do not, because gate 9 did not state its lantern/pool switches and this
+> harness's `--lantern 0 --pool 0` is a different frame from the shipping default. **Quote the
+> flags with the number or the number is not reproducible** — every table below states them.
+
+**So the shipping `storm_assault` golden is excluded from every day/night comparison table.**
+The row to use is `--bolt 0`, which renders the same storm between bolts, and `--scene list`,
+the scene description and the `.stats.txt` all say so on every render.
+
+The `--bolt 0` row was *also* flat until today, for a completely different and non-deliberate
+reason. Measured on this tree, `--bolt 0 --nohud --novm --lantern 0 --upscale 1`, ground band
+rows 112..139, Rec.709 mean, same camera, weather varied:
+
+```
+                02:00     noon    18:15    22:00     range
+  clear        4.4693  76.9974  49.9303   5.8730    72.53
+  overcast     4.5217  55.0026  43.4540   4.3802    50.62
+  rain         3.7548  43.9591  35.9147   3.7197    40.24
+  storm        4.4747   6.1066   4.8534   4.3557     1.75   <- no day at all
+```
+
+Storm noon is `6.11` against rain noon's `43.96`: **one step of weather costs 7× the daylight**,
+and CLAUDE.md §8's "something above 220" is unreachable in a frame whose entire ground sits
+under luminance 7. The cause is not the sun and not the storm — measured here, a storm returns a
+key direction **identical to clear at 02:00 / noon / 18:15 / 22:00, to every printed digit**;
+weather touches scalars and never `KF_DIR_*`. The cause is that both darkness gates in
+`src/render/world_render.hml` (the carried lantern, and the night veil) read the **weathered**
+fog tint's luminance, and `WX_STORM` multiplies that by `(0.26,0.32,0.46)`:
+
+```
+  WEATHERED fog tint luma    noon    02:00     lantern gate @ noon   veil @ noon
+    WX_CLEAR                0.8576  0.4100           0.0000            0.0000
+    WX_OVERCAST             0.7392  0.3536           0.0000            0.0000
+    WX_RAIN                 0.6205  0.2970           0.4962            0.0000  <- half a lantern at midday
+    WX_STORM                0.2775  0.1330           1.0000            1.0000  <- full night at midday
+    WX_BLOOM                0.7934  0.4169           0.0000            0.0000
+  the HOUR's own luma       0.8576  0.4100           (the gate band is 0.52 .. 0.72)
+```
+
+Every `.stats.txt` now prints that comparison on a `darkness` line — the weathered luma, the
+hour's own luma (`tod_hour_tint_luma()`), both gates **as the frame actually ran them** (read
+back out of the frame graph, not recomputed), and what they would be on the hour alone. When the
+two disagree the line says so in words.
+
+**LOOKED AT, `--bolt 0 --upscale 3`, shipping switches otherwise.** At 02:00 the storm is a
+night: near-black sky, the carried lantern's pool covering roughly the near third of the ground
+and everything past it falling away into the fog, the hostiles on the wall reading as
+silhouettes with violet cores. At noon — on this tree — it is all but the same picture: the same
+near-black sky, the same pool with the same edge in the same place, the same unlit mid-ground,
+and the HUD reading `12H FOG 20M`. The two frames differ by `1.63` of 255 across the ground band.
+It is midday and the game is showing you a night with rain in it.
+
+With the fix below, the noon frame becomes a storm: the whole field is lit to the fog line at
+`49.97`, the wall and its hostiles silhouette against the sky instead of dissolving, the
+lantern's pool stops being the only light in a daylight scene — and the storm ceiling is
+untouched, because the deck is the weather's and it is *supposed* to be dark. The 02:00 frame is
+byte-identical to the one above.
+
+### The fix, measured, and NOT APPLIED — it lands in files this task does not own
+
+Darkness is the **hour**. Weather changes how much light gets through and what colour it is; it
+does not move the sun. `src/art/tod.hml` now captures the hour's own authored fog tint before
+the weather multiply and before the lightning re-key, and exports it:
+
+```hemlock
+export fn tod_hour_tint_luma(): f64
+//  clock   05:30   11:54   12:00   18:15   19:30   22:00   02:00
+//  luma   0.8450  0.8559  0.8576  0.7835  0.5998  0.4804  0.4100     measured, all weathers
+```
+
+`src/render/world_render.hml` may not import `src/art/**` (the import wall), so a `src/game/**`
+caller has to hand it over. That is **one small function in `world_render.hml` and one line in
+`main.hml`** — neither of which is this task's file — so they are written out here rather than
+applied (CLAUDE.md §3: *found a bug in a file you do not own? Report it. Do not fix it*).
+`tools/shot.hml` IS this task's file and its one line is written below too, but it is not in the
+tree either: `frame_set_darkness` does not exist yet, so wiring the harness alone would not
+compile. All three land together or none do.
+
+```hemlock
+// src/render/world_render.hml, beside gate_on_fog_tint:
+let g_dark_lum: f64 = -1.0;                                   // -1 = nobody pushed one
+export fn frame_set_darkness(p_lum: f64) { g_dark_lum = p_lum; }
+
+fn gate_on_fog_tint(p_night: f64, p_day: f64): f64 {
+    let lum: f64 = g_dark_lum;
+    if (lum < 0.0) {                                          // unchanged fallback
+        let env: array<f64> = g_env;
+        lum = fog_tint_luma(env_field(env, ENV_FOG_R),
+                            env_field(env, ENV_FOG_G),
+                            env_field(env, ENV_FOG_B));
+    }
+    let out: f64 = gate_darkness(lum, p_night, p_day);
+    return out;
+}
+
+// src/game/main.hml and tools/shot.hml, one line at stage 6, right after tod_eval:
+frame_set_darkness(tod_hour_tint_luma());
+```
+
+Built in a scratch copy of the whole tree and measured against the table above:
+
+```
+                02:00     noon    18:15    22:00     range
+  clear        4.4693  76.9974  49.9303   5.8730    72.53   <- IDENTICAL, every digit
+  overcast     4.5217  55.0026  43.4540   6.2805    50.62
+  rain         3.7548  43.9591  35.9147   5.1836    40.24
+  storm        4.4747  49.9739  40.6674   6.1752    45.50   <- was 1.75
+```
+
+and lantern ON minus OFF, `--pool 0`, at **noon**:
+
+```
+                     before    after
+  ridge_golden      +0.0000  +0.0000
+  muzzle_fog        +0.0000  +0.0000
+  hub_dawn          +0.0000  +0.0000
+  ns_bloom          +0.0000  +0.0000
+  storm_assault    +43.8574  +0.0000   <- the lantern burning at midday
+```
+
+and at **night**, which is the thing that may not move:
+
+```
+  ridge_golden @ 22:00   OFF  7.2094  ON 43.9221   +36.7127   before AND after
+  ridge_golden @ 02:00   OFF  3.7167  ON 32.1349   +28.4182   before AND after
+  ridge_golden @ 18:15 / 19:30                      +0.0000   before AND after
+  storm_assault @ 02:00  the two PNGs are byte-identical (md5 a544e506…)
+```
+
+`WX_CLEAR`'s tint multiplier is `(1,1,1)`, so **clear weather is unchanged by construction** —
+that is why the night does not move. Only three rows shift at 22:00 (overcast `4.38→6.28`, rain
+`3.72→5.18`, ns_bloom `7.99→5.98`), because 22:00's hour-luma `0.4804` puts the veil at `0.9476`
+rather than pinning it at `1.0`; night is still the darkest ground of the day in every row.
+
+**The obvious wrong fix, so nobody spends an afternoon on it:** gate on the sun's elevation.
+`ENV_SUN_Y` is already in the env and is already weather-invariant — and it is **0.8988 at
+02:00**, higher than at dusk, because the night keyframes carry the *moon*. Sun elevation is not
+a night signal in this table.
 
 ---
 

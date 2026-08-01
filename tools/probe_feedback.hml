@@ -1,0 +1,647 @@
+// ===========================================================================
+//  probe_feedback.hml — CLAUDE.md §9's HIT-FEEDBACK CONTRACT, AND THE THREE
+//  THINGS THE GAME NEVER TOLD THE PLAYER.            (the-feedback-loop, 08-01)
+// ---------------------------------------------------------------------------
+//      hemlockc -O1 tools/probe_feedback.hml -o /tmp/probe_feedback
+//      SDL_VIDEODRIVER=dummy /tmp/probe_feedback
+//
+//  Compiled, headless, no window. SDL is LINKED — §D prices strings through the
+//  SHIPPING fonts (`hudgen.hml` reaches wobbleweed's `atlas.hml`/`font.hml`)
+//  and calls the real `postfx_emit` into a real batch — but nothing presents.
+//  Exits 1 on any failed assertion AND on running the wrong assertion COUNT, so
+//  a section that silently stops running is a failure and not a green run.
+//
+// ---------------------------------------------------------------------------
+//  WHY IT EXISTS.  Gate 9, on the first sixty seconds:
+//
+//    "You wake facing the sky, the beacon you are told to walk to is behind a
+//     hill, standing still to look for it kills you in ~15 seconds, NOTHING ON
+//     SCREEN EVER SAYS AN ENEMY HIT YOU, NOTHING SAYS YOUR SHOTS CONNECTED, and
+//     when you die THE GAME DOES NOT TELL YOU — it tints the screen the colour
+//     of the sunset it is already showing you and lets you keep walking at 0 HP."
+//
+//  Three of those five clauses are this probe's, and every one of them turned
+//  out to be a PRESENTATION failure sitting on top of a simulation that had
+//  been emitting the right events, correctly, the whole time. That is the shape
+//  worth remembering: `combat.hml` has emitted all five §2.5 signals plus
+//  `EV_DAMAGE_TAKEN` since it was written, `sim_effects` has translated them,
+//  the wire has carried them, and the client has received them. The bug was
+//  always in the last ten metres.
+//
+// ---------------------------------------------------------------------------
+//  >>> THE HEADLINE, MEASURED, AND IT IS NEITHER OF THE TWO CANDIDATES <<<
+// ---------------------------------------------------------------------------
+//  The death banner at `main.hml:2826` had never once been on a screen. Two
+//  causes were proposed: (a) `client_dead` never reaching the HUD, and (b) the
+//  banner losing the last 62 triangles of a 334 cap whose measured peak was
+//  318. Both were plausible. Both were wrong. The instrument that settled it
+//  was three counters at the draw site (`g_death_*` in main.hml) and one run:
+//
+//      /tmp/ns --demo 45 --stand --headless --no-audio --seed 1337
+//      FEEDBACK death: dead frames 479 (479 of them WITH control)
+//                      used at the block 78..84 of cap 328
+//                      drawn 479  yielded 0  worst block cost 2 tris
+//
+//  (a) The boolean was FINE — 1 on all 479 frames.
+//  (b) The budget was FINE — `used` arrived at 78-84 against a 328 cap, with
+//      244 triangles spare, and the block yielded on ZERO frames.
+//  (c) The block RAN, DREW, and emitted TWO TRIANGLES: the full-screen wash and
+//      nothing else. `hud_centre_big` renders through FONT_BIG, and FONT_BIG
+//      carries twelve glyphs — `0`-`9`, `/` and `%` (`hud_big_cp` /
+//      `HUD_BIG_N`, src/art/hudgen.hml). IT HAS NO LETTERS. "THE DARK TOOK YOU"
+//      contains no digit, so it cost nothing and drew nothing, on every death
+//      this game has ever had.
+//
+//  `tools/probe_hud.hml` has asserted `cost_big("THE DARK TOOK YOU") == 0` since
+//  about-to-break and filed it "REPORTED, not fixed" because the draw site was
+//  not that task's file. §D below re-measures the same fact from the same fonts
+//  and asserts that the SHIPPING banner is now priced in a font with an
+//  alphabet, so the two probes cannot drift apart.
+//
+//  MORAL, and it is the reason (b) got two-thirds of the way into this task's
+//  brief: a budget that has never been instrumented is the most attractive
+//  suspect in the room, and 318-of-334 is a genuinely alarming number. It was
+//  also completely innocent. Print the value; do not reason about it.
+//
+// ---------------------------------------------------------------------------
+//  WHAT THIS PROBE CANNOT DO, STATED PLAINLY
+// ---------------------------------------------------------------------------
+//  It cannot call `hud_build`. That function lives in `src/game/main.hml`,
+//  which is a PROGRAM (it calls `main()` at top level and needs a window), so
+//  nothing headless can import it. §D is therefore a SECOND DESCRIPTION of the
+//  three new elements and can drift from them — the same wall probe_hud names.
+//  Three things bound that, and they are what make §D worth having:
+//    * the strings are the SAME LITERALS priced through the SAME FONTS;
+//    * the DIRECTION INDICATOR'S BEHAVIOUR is not described twice at all —
+//      `hud_dmg_seg_weight` lives in `src/render/hud.hml` precisely so that §B
+//      tests the shipped implementation rather than a copy of it;
+//    * the live cap check stays where it must be, at the draw site, in
+//      `--selftest`'s `g_st_hud_peak <= g_HUD_TRI_CAP`.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos, floor } from "@stdlib/math";
+
+import { g_HUD_TRI_CAP, g_POSTFX_TRI_CAP, g_TRIS_STEADY, g_RES_W, g_RES_H,
+         g_DMG_DIR_FADE_S, g_RESPAWN_S, g_TICK_DT
+       } from "../src/core/config.hml";
+
+import { g_CAP_HUD, frame_batches, frame_batch_hud
+       } from "../src/render/world_render.hml";
+import { postfx_emit, postfx_set_vignette } from "../src/render/postfx_geo.hml";
+import { batch_reset } from "../../wobbleweed/src/batch.hml";
+
+// THE IMPLEMENTATION UNDER TEST, not a copy of it.
+import { hud_dmg_seg_weight, hud_dmg_seg_bearing,
+         HUD_DMG_SEGS, HUD_DMG_FRONT, HUD_DMG_RIGHT, HUD_DMG_BACK, HUD_DMG_LEFT
+       } from "../src/render/hud.hml";
+
+import { hudgen_build_atlas, hud_font_micro, hud_font_big } from "../src/art/hudgen.hml";
+import { font_tri_cost } from "../../wobbleweed/src/font.hml";
+
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha,
+         sim_combat } from "../src/sim/sim.hml";
+import { combat_feedback_ok } from "../src/sim/combat.hml";
+import { BTN_FIRE } from "../src/sim/command.hml";
+
+import { transport_loopback } from "../src/net/transport.hml";
+
+import { server_new, server_tick, server_snapshot, server_local, server_t0,
+         server_spawn_yaw, server_world, server_deaths
+       } from "../src/game/server.hml";
+
+import { client_new, client_set_angles, client_set_move, client_set_button,
+         client_send_command, client_apply, client_frame, client_build_render,
+         client_px, client_pz, client_hp, client_dead, client_has_control,
+         client_stood_up, client_hitmarker, client_dmgnum, client_dmgnum_t,
+         client_dmg_hits, client_dmg_slots, client_dmg_slot_t,
+         client_dmg_slot_dir, client_fx_count, client_sounds_total,
+         client_ent_count, client_ent_flags, client_fire_shots, client_buttons,
+         client_look_axis, client_cam_yaw
+       } from "../src/game/client.hml";
+
+import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+// The damage-number ceiling in §A is DERIVED from these two, not guessed.
+import { g_wpn_dmg_near, wpn_hs_mult, WPN_KESTREL } from "../src/sim/weapons.hml";
+
+import { RSF_HIT_FLASH } from "../src/render/render_snapshot.hml";
+
+// ---------------------------------------------------------------------------
+let g_EXPECT: i32 = 28;
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; print(`  ok   [${g_n}] ${p_msg}`); }
+    if (!p_ok) { print(`  FAIL [${g_n}] ${p_msg}`); }
+}
+
+fn f2(p_x: f64): string {
+    let s: i32 = i32(p_x * 100.0 + 0.5);
+    let neg: string = "";
+    if (s < 0) { neg = "-"; s = 0 - s; }
+    let w: i32 = i32(f64(s) / 100.0);
+    let f: i32 = s - w * 100;
+    let fs: string = `${f}`;
+    if (f < 10) { fs = "0" + fs; }
+    let o: string = `${neg}${w}.${fs}`;
+    return o;
+}
+
+// FONT_MICRO / FONT_BIG are one quad a glyph and ART_BIBLE §9.8's mandatory
+// 1-px UI_BLACK shadow doubles it. Same method as probe_hud, deliberately.
+fn cost_micro(p_s: string): i32 {
+    let out: i32 = font_tri_cost(hud_font_micro(), p_s) * 2;
+    return out;
+}
+fn cost_big(p_s: string): i32 {
+    let out: i32 = font_tri_cost(hud_font_big(), p_s) * 2;
+    return out;
+}
+
+// ===========================================================================
+//  THE SESSION — `main.hml`'s loop with the window, renderer and clock removed.
+//  Copied from probe_waveone §HARNESS on purpose: a probe that drives a
+//  different loop from the game tests a loop nobody ships.
+// ===========================================================================
+fn session_new(p_seed: i32): object {
+    let net: object = transport_loopback();
+    let sv: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    let s: object = {
+        net: net, sv: sv, cl: cl,
+        acc: sim_accum_new(),
+        tick: server_t0(sv),
+        fb_bad: 0            // §2.5 contract violations seen on the bus
+    };
+    client_set_angles(cl, server_spawn_yaw(sv), 0.0);
+    server_tick(sv, s.tick);
+    client_apply(cl, server_snapshot(sv), server_local(sv), s.tick);
+    s.tick = s.tick + 1;
+    let out: object = s;
+    return out;
+}
+
+fn session_frame(p_s: object, p_frame_ms: f64): i32 {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv: object = s.sv;
+    let n: i32 = sim_accum_advance(s.acc, p_frame_ms);
+    let i: i32 = 0;
+    while (i < n) {
+        client_send_command(cl, s.tick);
+        server_tick(sv, s.tick);
+        // THE AUTHORITY POLICES ITSELF, EVERY TICK. `combat_feedback_ok`
+        // returns the number of MISSING §2.5 signals for every EV_HIT on the
+        // bus with a real target. It is deliberately not called from inside
+        // `combat_fire` — "a contract that polices itself from inside the thing
+        // it polices proves nothing" — so this is the only place in the tree
+        // that runs it against a real session.
+        s.fb_bad = s.fb_bad + combat_feedback_ok(sim_combat(server_world(sv)));
+        client_apply(cl, server_snapshot(sv), server_local(sv), s.tick);
+        s.tick = s.tick + 1;
+        i++;
+    }
+    client_frame(cl, p_frame_ms * 0.001, s.tick);
+    client_build_render(cl, sim_accum_alpha(s.acc));
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+fn main() {
+    print("probe_feedback — the hit-feedback contract, the direction indicator,");
+    print("                 the dead latch, and what they cost");
+    print("");
+
+    // =====================================================================
+    //  A.  THE FIVE SIGNALS, END TO END, IN A REAL SESSION
+    // ---------------------------------------------------------------------
+    //  CLAUDE.md §9: "every bullet that connects produces, WITHIN THE SAME
+    //  FRAME, all five of — hitmarker, enemy flash, damage number, impact
+    //  billboard, audio blip. If any one is missing, the gun is broken
+    //  regardless of how correct the math is."
+    //
+    //  Two halves, and the second is the one the task asked for. The AUTHORITY
+    //  half is `combat_feedback_ok`, run every tick above. The PRESENTATION
+    //  half is below: each of the five is tracked to a distinct piece of client
+    //  state that a triangle or a sample is actually made out of, because an
+    //  event that reaches the client and never reaches a pixel is exactly the
+    //  failure this whole task was given.
+    //
+    //      1  hitmarker         EV_HITMARKER     -> cl.hitmark_t  -> HUD_HITMARK
+    //      2  enemy flash       EV_HIT_FLASH     -> EF_HIT_FLASH  -> RSF_HIT_FLASH
+    //                                            -> main.hml:1139 tint 255
+    //      3  damage number     EV_DAMAGE_NUMBER -> cl.dmgnum     -> FONT_BIG
+    //      4  impact billboard  EV_IMPACT        -> cl_impact     -> CFX_SPARK
+    //      5  audio blip        EV_SOUND         -> cl_combat_sound
+    //
+    //  The player is `src/game/demobot.hml`, the SHIPPING demo bot, so this is
+    //  the game shooting at the game.
+    // =====================================================================
+    print("A. the five signals of the §2.5 contract, end to end");
+    let s: object = session_new(1337);
+    let cl: object = s.cl;
+    let bot: object = demobot_new(cl, s.sv);
+
+    let saw_marker: i32 = 0;
+    let saw_flash: i32 = 0;
+    let saw_number: i32 = 0;
+    let saw_impact: i32 = 0;
+    let best_number: i32 = 0;
+    let frames: i32 = 0;
+    while (frames < 3600) {                       // 60 s at 60 fps
+        demobot_frame(bot, client_px(cl), client_pz(cl));
+        session_frame(s, 16.667);
+        if (client_hitmarker(cl) > 0.0) { saw_marker++; }
+        if (client_dmgnum(cl) > 0) {
+            saw_number++;
+            if (client_dmgnum(cl) > best_number) { best_number = client_dmgnum(cl); }
+        }
+        if (client_fx_count(cl) > 0) { saw_impact++; }
+        let ne: i32 = client_ent_count(cl);
+        for (let e = 0; e < ne; e++) {
+            if ((client_ent_flags(cl, e) & RSF_HIT_FLASH) != 0) { saw_flash++; e = ne; }
+        }
+        frames++;
+    }
+    let sounds: i32 = client_sounds_total(cl);
+    print(`   the bot fired ${client_fire_shots(cl)} rounds over ${frames} frames`);
+    print(`   1 hitmarker        on ${saw_marker} frames`);
+    print(`   2 enemy flash      on ${saw_flash} frames  (RSF_HIT_FLASH in the render snapshot)`);
+    print(`   3 damage number    on ${saw_number} frames, biggest ${best_number}`);
+    print(`   4 impact particles on ${saw_impact} frames`);
+    print(`   5 audio blips      ${sounds} queued`);
+
+    // >>> AND HERE IS SOMETHING THE CONTRACT CHECKER ITSELF GETS WRONG, FOUND
+    //     BY RUNNING IT. <<< `combat_feedback_ok` walks EVERY EV_HIT on the bus
+    // and demands all five signals for each. But `combat_apply_damage`'s own
+    // header says the five are emitted by `combat_fire`, "the only caller that
+    // knows a BULLET was involved -- a burn tick must not paint a hitmarker",
+    // and an AI walking into you goes through `combat_apply_damage` WITHOUT
+    // going through `combat_fire`. So every hit an enemy lands on the PLAYER is
+    // counted as five missing signals by a checker that combat.hml's own
+    // comments exempt it from.
+    //
+    // MEASURED, and it is an exact identity rather than a hand-wave: the
+    // shortfall is 5 x the number of EV_DAMAGE_TAKEN events, i.e. 5 x every hit
+    // taken and 0 x every hit dealt. THAT is the assertion, and it is stronger
+    // than `== 0` would have been: if a BULLET ever loses one of its five, the
+    // identity breaks by 1 and this goes red, while `== 0` could only ever have
+    // been silenced.
+    //
+    // REPORTED, NOT FIXED. `src/sim/combat.hml` is not this task's file
+    // (CLAUDE.md §3). The one-line fix is for `combat_feedback_ok` to skip an
+    // EV_HIT that has an EV_DAMAGE_TAKEN for the same target in the same tick.
+    let taken: i32 = client_dmg_hits(cl);
+    print(`   the authority's own combat_feedback_ok reports ${s.fb_bad} missing signals`);
+    print(`   the player took ${taken} hits; 5 x ${taken} = ${5 * taken}`);
+    ck(s.fb_bad == 5 * taken,
+       `every missing signal the authority reports is a hit the player TOOK, not one it dealt: ${s.fb_bad} == 5 x ${taken}. combat_feedback_ok checks all five against every EV_HIT, and combat_apply_damage's own header exempts non-bullet damage from all five ("a burn tick must not paint a hitmarker") -- so it over-reports by exactly five per enemy contact. REPORTED, not fixed: combat.hml is not this task's file. The identity is the useful assertion: 0 of the ${client_fire_shots(cl)} rounds the bot fired lost a signal`);
+    ck(saw_marker > 0 && saw_flash > 0,
+       `1 HITMARKER and 2 ENEMY FLASH reach the client: marker on ${saw_marker} frames, flash on ${saw_flash}. Both were already wired and this is the regression guard`);
+    ck(saw_impact > 0 && sounds > 0,
+       `4 IMPACT BILLBOARD and 5 AUDIO BLIP reach the client: ${saw_impact} frames with live particles, ${sounds} sounds. Both were already wired`);
+    // >>> THE ONE THAT WAS NOT WIRED. <<< `EV_DAMAGE_NUMBER` carries the value
+    // in its `sub` field and has since combat.hml was written; `cl_drain_fx`
+    // spawned a white CFX_MOTE and THREW THE NUMBER AWAY. A mote is a particle,
+    // not a number, and the §2.5 list has both on it separately. This assertion
+    // is the one that goes red if the value is ever discarded again.
+    // AND THE UPPER BOUND IS THE ASSERTION, not just "> 0", BECAUSE "> 0" WENT
+    // GREEN ON A WRONG NUMBER. The first version of this line only checked that
+    // a number appeared, and it passed while printing `biggest 225` against a
+    // Wisp that dies to one Kestrel round -- the client was summing every hit
+    // inside the 0.85 s FADE instead of inside one TICK, so one numeral climbed
+    // across three separate kills while looking like the damage done to one
+    // body. Fixed in `cl_drain_fx`; the sum window is now one tick.
+    //
+    // THE CEILING IS DERIVED FROM THE WEAPON TABLE, NOT CHOSEN. My second
+    // attempt hardcoded 60 as "generous for a revolver" and went RED at 68 --
+    // and 68 was CORRECT. `g_wpn_dmg_near[KESTREL] * wpn_hs_mult(KESTREL)`
+    // is 45.0 x 1.50 = 67.5, and `combat_apply_damage` rounds to nearest, so 68
+    // is exactly one Kestrel headshot at close range. A guessed bound would
+    // have sent the next reader to look for a bug in a number that was right.
+    //
+    // The Kestrel is the only weapon in this session: the bot starts with it
+    // and the run is 60 s, which is far short of the first trade.
+    let num_ceiling: i32 = i32(g_wpn_dmg_near[WPN_KESTREL] * wpn_hs_mult(WPN_KESTREL) + 0.5);
+    print(`   one Kestrel headshot = ${f2(g_wpn_dmg_near[WPN_KESTREL])} x ${f2(wpn_hs_mult(WPN_KESTREL))} = ${num_ceiling} damage, rounded`);
+    ck(saw_number > 0 && best_number > 0 && best_number <= num_ceiling,
+       `3 DAMAGE NUMBER carries a VALUE, and the RIGHT one: biggest ${best_number} over ${saw_number} frames, against a derived ceiling of ${num_ceiling} -- one Kestrel headshot, which is the most a single trigger pull can do in this session. Before this task the client turned EV_DAMAGE_NUMBER into an anonymous white mote and dropped the number entirely; before the sum window was narrowed to one tick this same run printed 225`);
+
+    // =====================================================================
+    //  B.  THE DIRECTION INDICATOR — TESTED ON THE SHIPPED FUNCTION
+    // ---------------------------------------------------------------------
+    //  What was there: ONE arrow sprite at
+    //      cx + clamp(sin(bearing - yaw) * 40, -44, 44),  cy - 26
+    //  `sin` alone is not a direction. sin(0) = sin(pi) = 0, so an attacker
+    //  dead ahead and an attacker dead behind put the arrow IN THE SAME PIXEL.
+    //  §B1 reproduces that defect from the arrow's own arithmetic and §B2 shows
+    //  the replacement does not have it.
+    // =====================================================================
+    print("");
+    print("B. the four-segment indicator, against the single arrow it replaced");
+    let ax_front: f64 = sin(0.0) * 40.0;
+    let ax_back: f64 = sin(3.141592653589793) * 40.0;
+    print(`   THE OLD ARROW: attacker at 0 deg -> x offset ${f2(ax_front)} px`);
+    print(`                  attacker at 180 deg -> x offset ${f2(ax_back)} px`);
+    ck(ax_front < 0.0001 && ax_back < 0.0001 && ax_back > -0.0001,
+       `THE DEFECT, REPRODUCED: the arrow this replaced placed an attacker in FRONT of you and an attacker BEHIND you at the same offset, ${f2(ax_front)} px and ${f2(ax_back)} px -- the same pixel, two pixels under the crosshair, for the two most different facts in a firefight`);
+
+    let w_f0: f64 = hud_dmg_seg_weight(0.0, HUD_DMG_FRONT);
+    let w_b0: f64 = hud_dmg_seg_weight(0.0, HUD_DMG_BACK);
+    let w_fpi: f64 = hud_dmg_seg_weight(3.141592653589793, HUD_DMG_FRONT);
+    let w_bpi: f64 = hud_dmg_seg_weight(3.141592653589793, HUD_DMG_BACK);
+    print(`   attacker at   0 deg: FRONT ${f2(w_f0)}  BACK ${f2(w_b0)}`);
+    print(`   attacker at 180 deg: FRONT ${f2(w_fpi)}  BACK ${f2(w_bpi)}`);
+    ck(w_f0 > 0.999 && w_b0 < 0.001 && w_fpi < 0.001 && w_bpi > 0.999,
+       `and the replacement separates them completely: in front lights FRONT ${f2(w_f0)} / BACK ${f2(w_b0)}, behind lights FRONT ${f2(w_fpi)} / BACK ${f2(w_bpi)}`);
+
+    let w_r90: f64 = hud_dmg_seg_weight(1.5707963267948966, HUD_DMG_RIGHT);
+    let w_l90: f64 = hud_dmg_seg_weight(-1.5707963267948966, HUD_DMG_LEFT);
+    let w_rl: f64 = hud_dmg_seg_weight(1.5707963267948966, HUD_DMG_LEFT);
+    ck(w_r90 > 0.999 && w_l90 > 0.999 && w_rl < 0.001,
+       `the other axis works and does not bleed: +90 deg lights RIGHT ${f2(w_r90)}, -90 lights LEFT ${f2(w_l90)}, and +90 lights LEFT ${f2(w_rl)}`);
+
+    // The corner. This is the property that makes the indicator READ as a
+    // bearing rather than as four lamps: 45 degrees must light two segments
+    // EQUALLY, so the player sees "front-right" instead of a snap to one side.
+    let w_c1: f64 = hud_dmg_seg_weight(0.7853981633974483, HUD_DMG_FRONT);
+    let w_c2: f64 = hud_dmg_seg_weight(0.7853981633974483, HUD_DMG_RIGHT);
+    let dcorner: f64 = w_c1 - w_c2;
+    if (dcorner < 0.0) { dcorner = 0.0 - dcorner; }
+    ck(dcorner < 0.001 && w_c1 > 0.49 && w_c1 < 0.51,
+       `a source on a CORNER lights its two segments equally at half brightness: FRONT ${f2(w_c1)}, RIGHT ${f2(w_c2)}, apart by ${f2(dcorner)}. cos^2 is what makes 30 deg read 0.75/0.25 instead of plain cos's 0.87/0.50, which at 320x180 reads as "everywhere"`);
+
+    // Wrapping, and the reason it is asserted: the draw site hands in
+    // `slot_bearing - yaw`, and `yaw` is unwrapped, so a player who has spun
+    // twice hands in a bearing difference of 4pi + something.
+    let w_wrap: f64 = hud_dmg_seg_weight(0.0 + 6.283185307179586 * 3.0, HUD_DMG_FRONT);
+    let w_wrapn: f64 = hud_dmg_seg_weight(0.0 - 6.283185307179586 * 3.0, HUD_DMG_FRONT);
+    ck(w_wrap > 0.999 && w_wrapn > 0.999,
+       `it survives an unwrapped yaw: the same source at +6pi and -6pi still lights FRONT ${f2(w_wrap)} / ${f2(w_wrapn)}. The draw site subtracts a yaw nothing normalises`);
+
+    // Never negative, never over 1: the alpha is `i32(w * 255)`, and a negative
+    // weight would wrap to a bright bar on the WRONG side of the screen.
+    let neg: i32 = 0;
+    let over: i32 = 0;
+    for (let i = 0; i < 720; i++) {
+        let rel: f64 = f64(i) * 0.008726646259971648 - 3.141592653589793;
+        for (let sgi = 0; sgi < HUD_DMG_SEGS; sgi++) {
+            let w: f64 = hud_dmg_seg_weight(rel, sgi);
+            if (w < 0.0) { neg++; }
+            if (w > 1.0) { over++; }
+        }
+    }
+    ck(neg == 0 && over == 0,
+       `over 720 bearings x ${HUD_DMG_SEGS} segments the weight never leaves [0,1]: ${neg} negative, ${over} over one. The draw site turns it into alpha with i32(w * 255) and a negative there is a bright bar on the wrong side of the screen`);
+
+    // THE SUM. A source is one threat, so the four segments must not be able to
+    // add up to four times a threat -- this is what stops a single Husk lighting
+    // the whole ring and costing all 16 triangles.
+    let sum_worst: f64 = 0.0;
+    for (let i = 0; i < 720; i++) {
+        let rel: f64 = f64(i) * 0.008726646259971648 - 3.141592653589793;
+        let sum: f64 = 0.0;
+        for (let sgi = 0; sgi < HUD_DMG_SEGS; sgi++) { sum = sum + hud_dmg_seg_weight(rel, sgi); }
+        if (sum > sum_worst) { sum_worst = sum; }
+    }
+    ck(sum_worst < 1.001,
+       `ONE source lights exactly ONE source's worth of light: the worst total over 720 bearings is ${f2(sum_worst)}. cos^2(d) + cos^2(d - pi/2) == 1 identically, so a single attacker can never light more than two segments and never costs more than 8 of the indicator's 16 triangles`);
+
+    // =====================================================================
+    //  C.  THE DEAD LATCH — DRIVEN TO A REAL DEATH
+    // ---------------------------------------------------------------------
+    //  NAIVE_PLAYER.md §T+0:12: "I stood still and turned in place to survey.
+    //  Health went 100 ... 94, 82, 76 over about eleven seconds and then to
+    //  zero." So: stand still, and the game kills you. This section does that
+    //  with NO driver, and then does the thing Gate 9 said you could do -- it
+    //  holds forward and the trigger while dead -- and measures whether the
+    //  corpse moves.
+    // =====================================================================
+    print("");
+    print("C. the dead latch");
+    let s2: object = session_new(1337);
+    let cl2: object = s2.cl;
+    let dead_frames: i32 = 0;
+    let dead_with_control: i32 = 0;
+    let dead_x0: f64 = 0.0;
+    let dead_z0: f64 = 0.0;
+    let dead_drift: f64 = 0.0;
+    let was_dead: i32 = 0;
+    let f2i: i32 = 0;
+    let btn_while_dead: i32 = 0;
+    let yaw_drift: f64 = 0.0;
+    let yaw0: f64 = 0.0;
+    while (f2i < 3000) {                          // 50 s at 60 fps
+        // >>> IT STANDS STILL, AND THAT IS NOT LAZINESS. <<< The first version
+        // of this loop held W the whole way through and the player NEVER DIED
+        // in 50 seconds, which is NAIVE_PLAYER.md §T+0:30's measurement
+        // reproduced by accident: "39 consecutive beats, ~50 s, health pinned
+        // at 100, zero damage taken. Standing still at spawn kills you in 15
+        // seconds; running is free." So the probe stands still to reach the
+        // death path at all -- and then, once dead, holds W AND THE TRIGGER on
+        // every single dead frame, which is precisely the input Gate 9 said a
+        // corpse could still use.
+        if (client_dead(cl2) == 1) {
+            client_set_move(cl2, 1.0, 0.0);
+            client_set_button(cl2, BTN_FIRE, 1);
+            // ...and MOUSE-LOOK, which is the half of "you keep playing" that
+            // the authority cannot refuse for you. See the note on the yaw
+            // assertion below for why this is the load-bearing input.
+            client_look_axis(cl2, 2.0, 0.0);
+            if (client_buttons(cl2) != 0) { btn_while_dead++; }
+        }
+        session_frame(s2, 16.667);
+        if (client_dead(cl2) == 1) {
+            if (was_dead == 0) { dead_x0 = client_px(cl2); dead_z0 = client_pz(cl2); yaw0 = client_cam_yaw(cl2); }
+            was_dead = 1;
+            let dy: f64 = client_cam_yaw(cl2) - yaw0;
+            if (dy < 0.0) { dy = 0.0 - dy; }
+            if (dy > yaw_drift) { yaw_drift = dy; }
+            dead_frames++;
+            if (client_has_control(cl2) == 1) { dead_with_control++; }
+            let dx: f64 = client_px(cl2) - dead_x0;
+            let dz: f64 = client_pz(cl2) - dead_z0;
+            let d: f64 = sqrt(dx * dx + dz * dz);
+            if (d > dead_drift) { dead_drift = d; }
+        } else {
+            was_dead = 0;
+        }
+        f2i++;
+    }
+    print(`   standing still killed the player ${server_deaths(s2.sv)} times in 50 s`);
+    print(`   dead on ${dead_frames} frames, ${dead_with_control} of them still in control`);
+    print(`   furthest the corpse moved while holding W: ${f2(dead_drift)} m  (CONTEXT, not a test -- see below)`);
+    ck(dead_frames > 0,
+       `standing still at spawn kills you, and this probe can reach the death path: ${dead_frames} dead frames over 3000, ${server_deaths(s2.sv)} deaths. NAIVE_PLAYER.md's "standing still was safe -- nothing said otherwise" is still true of the design; this is only about what the screen says when it happens`);
+    ck(dead_with_control == 0,
+       `THE LATCH: not one of the ${dead_frames} dead frames reported control. Before this task it was 479 of 479 -- cl.control was set once on the SV_BEAT_STAND edge and NOTHING ever set it back, so every input gate in client.hml was asking "has the camera stood up yet" when it needed to ask "are you alive"`);
+    // >>> AND HERE IS AN ASSERTION I DELETED FOR HAVING NO TEETH, WHICH IS
+    //     ALSO A CORRECTION TO WHAT I THOUGHT THE BUG WAS. <<<
+    // The first version of this section asserted `dead_drift < 0.30` and called
+    // it "Gate 9's 'lets you keep walking at 0 HP', as a number". It measured
+    // 0.00 m -- and it would have measured 0.00 m WITHOUT THE DEAD LATCH TOO,
+    // because `sim.hml`'s `stage_movement` has always been gated on EF_DEAD:
+    //
+    //     if ((flags[slot] & EF_DEAD) == 0) { move_apply_ex(...); }
+    //
+    // THE AUTHORITY HAS NEVER MOVED A CORPSE ONE CENTIMETRE. A probe that
+    // passes when its feature is deleted is worse than no probe (CLAUDE.md §9
+    // list, item 8), so the drift is now printed as CONTEXT and the assertion
+    // is on the three things the latch actually changes -- all of them client
+    // side, because that is where the defect was:
+    //
+    //   1. `client_has_control` told the game you were playing.   [the latch]
+    //   2. the button mask kept whatever was held at death.       [the edge]
+    //   3. MOUSE-LOOK still turned the camera.                    [this one]
+    //
+    // (3) is the one a player feels, and it is the one the authority cannot fix
+    // for you: yaw and pitch are client-side presentation (`view.hml`), applied
+    // immediately and never round-tripped, so a corpse whose mouse still worked
+    // felt exactly like a living player who had stopped being able to walk.
+    // Combined with "the camera dropping to ankle height, which reads as 'I
+    // fell into a ditch'" (NAIVE_PLAYER.md §T+0:35), that is the whole illusion.
+    print(`   the camera turned ${f2(yaw_drift)} rad while dead with the look axis driven every frame`);
+    ck(yaw_drift < 0.001,
+       `THE HALF THE SERVER CANNOT REFUSE FOR YOU: the camera did not turn while dead -- ${f2(yaw_drift)} rad, with client_look_axis driven at 2 rad/s on every one of the ${dead_frames} dead frames. Yaw is client-side presentation and never round-trips, so before the latch a corpse's mouse still worked and that is what "you keep walking at 0 HP" actually felt like`);
+    ck(btn_while_dead == 0,
+       `and the button mask stays empty: BTN_FIRE was pressed on every one of the ${dead_frames} dead frames and the command carried it ${btn_while_dead} times. The mask and the movement axes are LATCHED state, so refusing new input is not enough -- whatever was held at the moment of death is cleared on the edge, in client_apply, or the next command is a corpse with the trigger down`);
+    ck(client_stood_up(cl2) == 1,
+       `the raw stand-up latch is still readable and still 1, so the two callers that genuinely mean "has the opening finished" (probe_game's 0:00 assertion, main.hml's opening trace) did not silently change meaning when client_has_control did`);
+
+    // The four direction slots, exercised by a real fight rather than by a
+    // constructed one: the player above stood in the open and was chewed on
+    // from several sides for 50 seconds.
+    print(`   EV_DAMAGE_TAKEN events consumed by the client: ${client_dmg_hits(cl2)}`);
+    ck(client_dmg_hits(cl2) > 0 && client_dmg_slots() == HUD_DMG_SEGS,
+       `the client consumed ${client_dmg_hits(cl2)} EV_DAMAGE_TAKEN events into ${client_dmg_slots()} independent direction slots, one per segment. The event has been on the bus, networked, with its position set to where the damage CAME FROM, since combat.hml:1399 -- and until this task the client collapsed all of it into ONE scalar bearing`);
+
+    // =====================================================================
+    //  D.  THE BUDGET.  Every number priced through the shipping fonts.
+    // =====================================================================
+    print("");
+    print("D. what the three new things cost, priced through FONT_MICRO / FONT_BIG");
+    let atlas = hudgen_build_atlas();
+    ck(atlas != null,
+       `the shipping HUD atlas and both fonts built headless, so every string below is priced through the REAL fonts and not counted by hand`);
+
+    // ---- D1. THE FONT_BIG TRIPWIRE, WHICH IS THE WHOLE HEADLINE ----------
+    let c_big_death: i32 = cost_big("THE DARK TOOK YOU");
+    let c_micro_death: i32 = cost_micro("THE DARK TOOK YOU");
+    let c_micro_up: i32 = cost_micro("YOU GET UP AGAIN");
+    print(`   "THE DARK TOOK YOU" in FONT_BIG   ${c_big_death} triangles   <- what shipped`);
+    print(`   "THE DARK TOOK YOU" in FONT_MICRO ${c_micro_death} triangles   <- what ships now`);
+    print(`   "YOU GET UP AGAIN"  in FONT_MICRO ${c_micro_up} triangles`);
+    ck(c_big_death == 0 && c_micro_death > 0 && c_micro_up > 0,
+       `THE CAUSE, RE-MEASURED FROM THE FONTS: the death banner cost ${c_big_death} triangles in FONT_BIG (twelve glyphs, 0-9 / and %, no letters) and costs ${c_micro_death} in FONT_MICRO. It was not the boolean and it was not the budget -- the block drew, every frame, in a font that could not spell it`);
+
+    // ---- D2. THE DEATH SCREEN, PRICED LINE BY LINE -----------------------
+    // It is MODAL -- `hud_build` draws it and returns -- so it does not stack
+    // on anything and this total is the whole frame's stage-24 spend.
+    let d_black: i32 = 2;
+    let d_red: i32 = 2;
+    let d_plate: i32 = 2;
+    let d_bar: i32 = 4;
+    let death_total: i32 = d_black + d_red + d_plate + c_micro_death + c_micro_up + d_bar;
+    print(`   death screen = black wash ${d_black} + danger wash ${d_red} + plate ${d_plate}`);
+    print(`                + "${c_micro_death}" + "${c_micro_up}" + respawn bar ${d_bar}  =  ${death_total}`);
+    // 118 is what the SHIPPING BINARY printed for `banner NNN tris` on the same
+    // run quoted in the header. If the table and the game ever disagree, one of
+    // them has changed and this is the line that says so.
+    ck(death_total == 118,
+       `the death screen prices at ${death_total} triangles, which is exactly what the shipping binary reported as "banner 118 tris" on --demo 45 --stand. A modal screen with 118 triangles in a ${g_HUD_TRI_CAP} budget can never yield, which is the ORDERING half of the fix: it is not first in a queue, THERE IS NO QUEUE`);
+    ck(death_total + 62 < g_HUD_TRI_CAP,
+       `and it is nowhere near the cap: ${death_total} of ${g_HUD_TRI_CAP}. The old block reserved 62 triangles for itself and measured 78-84 of 'used' on arrival -- it was never short, and this assertion exists so nobody re-derives "the banner needs a bigger cap" from the fact that it was invisible`);
+
+    // ---- D3. WHAT THE COMBAT HUD ACTUALLY GREW BY ------------------------
+    // The direction indicator: 4 segments, each a 1-px UI_BLACK plate (2) and
+    // its UI_DANGER bar (2). §B proved ONE source can light at most two, so 16
+    // needs four independent sources inside g_DMG_DIR_FADE_S -- which the game
+    // reached: `--demo 75` printed "peak 4 of 4 lit at once".
+    let seg_worst: i32 = HUD_DMG_SEGS * 4;
+    let arrow_was: i32 = 2;
+    // The damage number: `cl.dmgnum` is clamped to 999, so three FONT_BIG
+    // digits, priced not assumed.
+    let c_num: i32 = cost_big("999");
+    let delta: i32 = seg_worst - arrow_was + c_num;
+    print(`   direction indicator worst case ${seg_worst} (4 segs x (plate 2 + bar 2)), replacing a ${arrow_was}-triangle arrow`);
+    print(`   damage number "999" in FONT_BIG ${c_num}`);
+    print(`   worst-case delta to the combat HUD: ${delta}`);
+    ck(c_num == 12 && delta == 26,
+       `the combat HUD grew by ${delta} triangles worst case: +${seg_worst - arrow_was} for the indicator and +${c_num} for the number. FONT_BIG is the right font for the number for the one reason it exists -- it has the digits -- and it is the wrong font for every WORD in the file`);
+
+    // ---- D4. THE CAP, DERIVED FROM BOTH SIDES ----------------------------
+    // The measured A/B, same command, same seed, one commit apart:
+    let g_PEAK_BEFORE: i32 = 296;     // --demo 75 --headless --no-audio --seed 1337
+    let g_PEAK_AFTER: i32 = 308;      // ...same, with this task's three elements
+    let g_PEAK_VM: i32 = 122;         // stage 15, measured on the same runs
+    let g_VM_RESERVE: i32 = 128;      // that peak rounded up to a multiple of 16
+    let g_HEADROOM_MIN: i32 = 36;     // probe_hud's rule: 2 x the 18-tri pip strip
+    // THE BOUND, and it is a bound and not a measurement: for EVERY frame f,
+    // new(f) = old(f) + delta(f) <= old_peak + max_delta. So one measured peak
+    // plus one priced delta is a real ceiling on the new content, which is the
+    // only honest way to set a cap from a run that cannot visit every frame.
+    let worst: i32 = g_PEAK_BEFORE + delta;
+    let floor_: i32 = worst + g_HEADROOM_MIN;
+    let ceil_: i32 = g_CAP_HUD - g_POSTFX_TRI_CAP - g_VM_RESERVE;
+    print("");
+    print(`   measured content peak  before ${g_PEAK_BEFORE}   after ${g_PEAK_AFTER}   (--demo 75, seed 1337)`);
+    print(`   worst-case BOUND       ${g_PEAK_BEFORE} + ${delta} = ${worst}`);
+    print(`   floor  = worst ${worst} + headroom rule ${g_HEADROOM_MIN}                    = ${floor_}`);
+    print(`   ceiling = g_CAP_HUD ${g_CAP_HUD} - postfx ${g_POSTFX_TRI_CAP} - viewmodel reserve ${g_VM_RESERVE} = ${ceil_}`);
+    print(`   cap ${g_HUD_TRI_CAP}   headroom against the bound ${g_HUD_TRI_CAP - worst}`);
+    ck(g_PEAK_AFTER <= worst,
+       `the measured peak ${g_PEAK_AFTER} is inside the priced bound ${worst}, so the table above is not describing elements hud_build does not have`);
+    // >>> THE TWO-SIDED ASSERTION. <<< It goes RED from BOTH directions, which
+    // is the shape about-to-break left behind when it moved this cap the first
+    // time. At 340 the first clause fails (the content no longer clears its own
+    // worst case by the headroom rule); at 380 the second fails (the cap has
+    // eaten the layer's reserve and batch_reserve can start DROPPING).
+    ck(g_HUD_TRI_CAP >= floor_ && g_HUD_TRI_CAP <= ceil_,
+       `the cap is a CONSEQUENCE and not a preference: ${floor_} <= ${g_HUD_TRI_CAP} <= ${ceil_}. RED AT 340 (headroom ${340 - worst} < ${g_HEADROOM_MIN}) and RED AT 380 (through the layer's reserve). The legal range is ${ceil_ - floor_ + 1} triangles wide`);
+    ck(g_POSTFX_TRI_CAP + g_PEAK_VM + g_HUD_TRI_CAP <= g_CAP_HUD,
+       `and the PHYSICAL wall still holds with a COMPLETELY full HUD: postfx reserve ${g_POSTFX_TRI_CAP} + measured viewmodel ${g_PEAK_VM} + a full ${g_HUD_TRI_CAP} = ${g_POSTFX_TRI_CAP + g_PEAK_VM + g_HUD_TRI_CAP} of g_CAP_HUD ${g_CAP_HUD}, ${g_CAP_HUD - g_POSTFX_TRI_CAP - g_PEAK_VM - g_HUD_TRI_CAP} spare. batch_reserve drops a triangle at ${g_CAP_HUD} and NOTHING between here and there notices`);
+
+    // ---- D5. THE RESERVE THAT PAID FOR IT, MEASURED FROM THE EMITTER -----
+    // `g_POSTFX_TRI_CAP` went 50 -> 24, and this is the assertion that makes
+    // that a measurement rather than a convenience. NOTHING in src/ enforced
+    // the 50: `grep -rn g_POSTFX_TRI_CAP src/` matches one line, its own
+    // definition. So the reserve is now enforced HERE, by calling the real
+    // emitter, which is strictly more protection than 50 ever gave.
+    let rcb: i32 = frame_batches();
+    let b = frame_batch_hud();
+    batch_reset(b);
+    postfx_set_vignette(24, 20, 32);
+    let vig: i32 = postfx_emit(b, 0);
+    batch_reset(b);
+    let vig_l: i32 = postfx_emit(b, 1);
+    print("");
+    print(`   postfx_emit: ${vig} triangles, ${vig_l} with the lightning flash, against a ${g_POSTFX_TRI_CAP} reserve`);
+    ck(rcb == 0 && vig == 16 && vig_l == 18,
+       `stage 23 emits 16 triangles (an 8-segment ring, a pinned literal) and 18 with the flash -- MEASURED from postfx_emit, not assumed. There is no data-dependent path in that function, so 18 is a STRUCTURAL maximum`);
+    ck(vig_l <= g_POSTFX_TRI_CAP && g_POSTFX_TRI_CAP < 50,
+       `so the reserve is now ${g_POSTFX_TRI_CAP} and it is ENFORCED: ${vig_l} <= ${g_POSTFX_TRI_CAP}, with ${g_POSTFX_TRI_CAP - vig_l} spare for three more full-screen quads. It was 50, reserving 32 triangles against an emitter that cannot reach them, inside a 512-triangle layer with 38 spare -- and nothing anywhere checked it. This line goes RED if postfx ever grows past its reserve, which the 50 could not do`);
+
+    // ---- D6. THE FRAME BUDGET -------------------------------------------
+    let g_PEAK_FRAME_BEFORE: i32 = 1719;
+    let g_PEAK_FRAME_AFTER: i32 = 1723;
+    print(`   frame peak ${g_PEAK_FRAME_BEFORE} -> ${g_PEAK_FRAME_AFTER} of ${g_TRIS_STEADY} on the same --demo 75`);
+    ck(g_PEAK_FRAME_AFTER + (g_HUD_TRI_CAP - g_PEAK_AFTER) <= g_TRIS_STEADY,
+       `even a COMPLETELY full HUD leaves the frame inside its budget: ${g_PEAK_FRAME_AFTER} + ${g_HUD_TRI_CAP - g_PEAK_AFTER} unspent HUD = ${g_PEAK_FRAME_AFTER + (g_HUD_TRI_CAP - g_PEAK_AFTER)} of ${g_TRIS_STEADY}`);
+
+    print("");
+    if (g_n != g_EXPECT) {
+        print(`FAIL: ran ${g_n} assertions, expected ${g_EXPECT}`);
+        exit(1);
+    }
+    if (g_ok != g_n) {
+        print(`FAIL ${g_ok} / ${g_n}`);
+        exit(1);
+    }
+    print(`PASS ${g_ok} / ${g_n}`);
+    exit(0);
+}
+
+main();

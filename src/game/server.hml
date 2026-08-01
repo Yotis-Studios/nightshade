@@ -514,9 +514,17 @@ export let SV_HOLD_KITS: i32 = 2;
 //          TO MAKE THAT IMPOSSIBLE IS ONE IMPLEMENTATION. <<<
 //
 //  `sv_ui_tick` CALLS `teach_plant_ready` to decide whether `BTN_USE` plants.
-//  The HUD calls the same function to decide whether to say so. They cannot
-//  drift, because there is nothing to drift from. `tools/probe_teach.hml` §A
-//  sabotages the branch in a scratch copy and confirms the probe goes red.
+//  The HUD calls the same function to decide whether to say so.
+//
+//  >>> AND THAT WAS NOT ENOUGH ON ITS OWN, WHICH IS THE LESSON. <<< One shared
+//  function is only one shared function; it is not one shared PREDICATE unless
+//  neither caller adds a term of its own. The HUD added three
+//  (`speed < 0.6 || inside || grant_t > 0`) and the result was a lantern kit
+//  spent with nothing on screen in 1 of 8 enumerated states. The three terms
+//  now live INSIDE the function, expressed in values both callers already hold,
+//  and `tools/probe_teach.hml` §A walks a real session through all eight states
+//  asserting that "the prompt was up" and "a kit was spent" are the same bit.
+//  §A also sabotages the branch in a scratch copy and confirms the probe reddens.
 //
 //  These are pure functions of scalars, deliberately: `main.hml` passes them
 //  `client_*` values (what is on the wire and therefore what a player can
@@ -532,18 +540,66 @@ export let TEACH_V_NONE: i32    = 0;
 export let TEACH_V_INSIDE: i32  = 1;
 export let TEACH_V_OUTSIDE: i32 = 2;
 
+// THE SPEED UNDER WHICH A LAMPLIGHTER IS STANDING STILL. It is not a new
+// number: `client.hml` already uses 0.6 m/s to decide whether you are moving
+// hard enough to make a footstep, and "am I moving" must have ONE answer in
+// this game, not two.
+export let SV_PLANT_STILL_MS: f64 = 0.6;
+
 // WOULD `BTN_USE` PLANT A POST RIGHT NOW?  This is `sv_ui_tick`'s own priority
 // order and not a second opinion about it: a lantern in reach wins, then a
 // villager in reach, then the post you are carrying. A modal panel eats the
 // key entirely and a corpse presses nothing.
-export fn teach_plant_ready(p_kits: i32, p_in_reach: i32, p_who: i32,
-                            p_panel: i32, p_dead: i32): i32 {
+//
+// >>> THE LAST THREE ARGUMENTS ARE HERE BECAUSE THE OLD FIVE MADE THE COMMENT
+//     ABOVE A LIE, AND GATE 9 COUNTED THE STATES. <<<
+//
+// The block above claimed a prompt disagreeing with the verb was
+// "unrepresentable". It made ONE direction unrepresentable. The HUD drew off
+// `teach_plant_ready(...) && (speed < 0.6 || inside || grant_t > 0)` while the
+// server planted off `teach_plant_ready(...)` alone, so of the eight states of
+// (moving | still) x (inside | outside the reach) x (first post | not), exactly
+// one -- MOVING, OUTSIDE THE REACH, PAST THE GRANT WINDOW -- spent a lantern
+// kit with nothing whatsoever on screen. The naive player hit it at T+3:10 and
+// checked the frame before the press. A comment claiming a failure mode is
+// impossible, beside code where it happens, is worse than no comment.
+//
+// The three extra terms are the HUD's own rule, moved to where both readers
+// can run it, and they say something true about the world rather than about
+// the UI:
+//
+//   p_ring_in  INSIDE THE REACH YOU MAY PLANT ON THE MOVE. That is the place
+//              where planting is the right answer, so it is the place where
+//              the game never asks you to stop and think about it.
+//   p_placed   UNTIL YOU HAVE PLANTED YOUR FIRST POST, EVER, the verb is
+//              offered unconditionally. This replaces the client-only
+//              `g_teach_grant_t` timer, and replaces it with something BOTH
+//              readers can compute: `kits_placed` is the authority's own
+//              monotone counter and it is on the wire. A four-second window
+//              that only the HUD could see was the one clause that could not
+//              be shared -- and a second implementation of it on the server
+//              would have been the identical bug wearing a hat.
+//   p_speed    OTHERWISE YOU HAVE TO STOP. Driving a post into the ground is
+//              not something you do at a dead run, the prompt has always
+//              behaved this way, and it means the prompt being on screen is
+//              now exactly equivalent to the key working.
+//
+// Pure function of scalars, still: `main.hml` feeds it `client_*` (what a
+// player can possibly know), `sv_ui_tick` feeds it `sv.local` (what the wire
+// will carry), and `tools/probe_teach.hml` drives a real session through all
+// eight states and asserts the prompt and the spend agree in every one.
+export fn teach_plant_ready(p_kits: i32, p_lamp_reach: i32, p_who: i32,
+                            p_panel: i32, p_dead: i32,
+                            p_ring_in: i32, p_placed: i32, p_speed: f64): i32 {
     if (p_dead != 0) { let d: i32 = 0; return d; }
     if (p_panel != UI_PANEL_NONE) { let m: i32 = 0; return m; }
-    if (p_in_reach != 0) { let r: i32 = 0; return r; }
+    if (p_lamp_reach != 0) { let r: i32 = 0; return r; }
     if (p_who != NPC_NONE) { let w: i32 = 0; return w; }
     if (p_kits < 1) { let k: i32 = 0; return k; }
-    let out: i32 = 1;
+    if (p_ring_in != 0) { let i: i32 = 1; return i; }
+    if (p_placed < 1) { let f: i32 = 1; return f; }
+    if (p_speed < SV_PLANT_STILL_MS) { let s: i32 = 1; return s; }
+    let out: i32 = 0;
     return out;
 }
 
@@ -2279,9 +2335,18 @@ fn sv_ui_tick(p_sv: object, p_edge: i32, p_px: f64, p_pz: f64, p_tick: i32) {
                 // The pack is read LIVE and not off `sv.local`, which
                 // `sv_publish` writes at the END of the tick and is therefore
                 // one tick stale on the tick you spend your last kit.
+                //
+                // `set_inside` and `speed` ARE read off `sv.local`, and that is
+                // deliberate: they are the exact bytes the client will be
+                // holding when it decides whether to draw the prompt, so the
+                // two readers are looking at the same number rather than at two
+                // measurements of it. `kits_placed` is live because it is the
+                // authority's own counter and the client mirrors it.
                 if (teach_plant_ready(sv_kits_now(sv), sv.local.in_reach,
                                       who, sv.ui_panel,
-                                      sim_player_dead(sv.world, sv.pslot)) == 1) {
+                                      sim_player_dead(sv.world, sv.pslot),
+                                      sv.local.set_inside, sv.kits_placed,
+                                      sv.local.speed) == 1) {
                     sv_place_kit(sv, p_px, p_pz);
                 }
             }

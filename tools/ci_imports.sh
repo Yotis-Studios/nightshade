@@ -3,7 +3,7 @@
 #  ci_imports.sh — NIGHTSHADE's structural gate.            Owned by W2-13.
 # =============================================================================
 #
-#  Six rules, each independently reported, each independently negative-tested
+#  EIGHT rules, each independently reported, each independently negative-tested
 #  by `--selftest`.  Any violation exits 1 and names the rule.
 #
 #   R1  THE IMPORT WALL          CLAUDE.md §3
@@ -12,6 +12,13 @@
 #   R4  NO HEX COLOUR OUTSIDE palette.hml            CLAUDE.md §8
 #   R5  NO @stdlib/random UNDER src/sim/             CLAUDE.md §7
 #   R6  gn.hml IS IMPORTED FROM src/net/ AND NOWHERE ELSE
+#   R7  NO TOOL CARRIES ITS OWN FRAME GRAPH          (see the R7 block below)
+#   R8  NO WALL CLOCK UNDER src/sim/                 CLAUDE.md §7
+#
+#  This header said "Six rules" until 2026-08-01, while R7 and R8 had been in
+#  the file for waves and `--selftest` negative-tested neither of them.  Both
+#  gaps are closed together, because they were the same gap: a rule nobody
+#  lists is a rule nobody tests.
 #
 #  Scanned:  $NS_ROOT/src/**/*.hml   (all six rules)
 #            $NS_ROOT/tools/*.hml    (R2, R3, R6 — tools are not walled, but a
@@ -260,12 +267,50 @@ selftest() {
     local pass=0 total=0
     mkdir -p "$ns"/src/{core,sim,art,render,net,game,data} "$ns"/tools "$tmp"/wobbleweed/src
 
+    # -----------------------------------------------------------------------
+    #  THE FIXTURE SIM FILE IS BIG ON PURPOSE.  Read this before shrinking it.
+    # -----------------------------------------------------------------------
+    #  R8's history is a `sed | grep -q` under `pipefail`: grep exits on the
+    #  first match, sed dies of SIGPIPE, 141 propagates, and `if` reads it as
+    #  NO MATCH.  That failure only manifests when sed still has output
+    #  buffered when grep quits -- i.e. when the violation is EARLY in a file
+    #  bigger than the ~64 KB pipe buffer.  A 5-line fixture with the plant on
+    #  the last line would pass under BOTH the correct rule and the broken one,
+    #  which is exactly the non-test that was shipped the first time.
+    #
+    #  `big_sim` writes ~140 KB with the caller's line planted at LINE 2, so a
+    #  regression to the piped form false-passes it and the selftest goes red.
+    #  Verified by reverting R8 to `sed ... | grep -qE ...` in a scratch copy:
+    #  case "R8 __clock at the TOP of a large file" flips to FAIL, and the two
+    #  cases that plant late do not.  That is what makes it a test.
+    #
+    #  big_sim <path> <line-2 content>
+    big_sim() {
+        local path="$1" plant="$2"
+        {
+            printf 'import { sqrt } from "@stdlib/math";\n'
+            printf '%s\n' "$plant"
+            local i=0
+            while [ "$i" -lt 3000 ]; do
+                printf 'fn pad_%04d(): i32 { let o: i32 = %d; return o; }   // filler, keeps this file over the pipe buffer\n' "$i" "$i"
+                i=$(( i + 1 ))
+            done
+        } > "$path"
+    }
+
     # a minimal, clean tree that every case starts from
     reset_tree() {
         rm -rf "$ns/src" "$ns/tools"; mkdir -p "$ns"/src/{core,sim,art,render,net,game} "$ns"/tools
         printf 'import { sqrt } from "@stdlib/math";\nlet g_ok: i32 = 1;\nfn f(): i32 { let o: i32 = g_ok; return o; }\n' > "$ns/src/core/config.hml"
         printf 'import { sqrt } from "@stdlib/math";\nimport { f } from "../core/config.hml";\nexport let RNG_LOOT = 0;\nlet g_s: i32 = 1;\n' > "$ns/src/sim/rng.hml"
         printf 'import { f } from "../core/config.hml";\nlet g_p: i32 = 8102454;\n' > "$ns/src/art/palette.hml"
+        # R7 only arms itself when BOTH the real frame graph and the harness
+        # that must import it exist, so the clean tree has to carry both or
+        # every R7 case silently tests nothing.
+        printf 'let g_fg: i32 = 0;\nexport fn frame_render(): i32 { let o: i32 = g_fg; return o; }\n' \
+            > "$ns/src/render/world_render.hml"
+        printf 'import { frame_render } from "../src/render/world_render.hml";\nlet g_shot: i32 = 0;\n' \
+            > "$ns/tools/shot.hml"
     }
 
     # run <expect-exit> <expect-tag|-> <label>
@@ -321,11 +366,62 @@ selftest() {
     reset_tree; printf 'import { batch_new } from "../../wobbleweed/src/scene_gpu.hml";\n' > "$ns/tools/bad.hml"
     run_case 1 R2 "R2 tools/*.hml -> frozen legacy scene_gpu.hml"
 
+    # -- R7 : no tool may carry its own copy of the frame graph ---------------
+    # Gate 3a planted `fn frame_render` in tools/walk.hml and the rule (written
+    # when shot.hml was the only consumer) did not catch it.  So this case
+    # plants it in a tool that is NOT shot.hml, which is where it actually went.
+    reset_tree; printf 'let g_w: i32 = 0;\nfn frame_render(): i32 { let o: i32 = g_w; return o; }\n' > "$ns/tools/walk.hml"
+    run_case 1 R7 "R7 a tool other than shot.hml defines its own frame_render"
+
+    reset_tree; printf 'export fn frame_render(): i32 { let o: i32 = 1; return o; }\nimport { frame_render as fr } from "../src/render/world_render.hml";\n' > "$ns/tools/shot.hml"
+    run_case 1 R7 "R7 shot.hml defines frame_render even while importing the real one"
+
+    # The other half of R7: importing the real frame graph is MANDATORY, not
+    # merely "do not define your own".  A harness that renders through nothing
+    # at all photographs nothing at all.
+    reset_tree; printf 'let g_shot: i32 = 0;\n' > "$ns/tools/shot.hml"
+    run_case 1 R7 "R7 shot.hml does not import src/render/world_render.hml"
+
+    # -- R8 : no wall clock under src/sim ------------------------------------
+    # THE PLANT IS AT LINE 2 OF A 3002-LINE FILE, deliberately.  See big_sim
+    # above: the last line is the ONE position where R8's historical
+    # `sed | grep -q` SIGPIPE bug cannot manifest, and it is the position the
+    # rule was originally "verified" at.
+    reset_tree; big_sim "$ns/src/sim/tick.hml" 'fn t(): f64 { let o: f64 = __clock(); return o; }'
+    run_case 1 R8 "R8 __clock at the TOP of a large file (the SIGPIPE position)"
+
+    reset_tree; big_sim "$ns/src/sim/tick.hml" 'let g_pad: i32 = 0;'
+    printf 'fn t2(): f64 { let o: f64 = SDL_GetTicks(); return o; }\n' >> "$ns/src/sim/tick.hml"
+    run_case 1 R8 "R8 SDL_GetTicks appended at EOF (the easy position)"
+
+    reset_tree; big_sim "$ns/src/sim/tick.hml" 'fn t3(): f64 { let o: f64 = now_ms(); return o; }'
+    run_case 1 R8 "R8 now_ms() at the top of a large file"
+
+    # And the exemption R8 depends on: the rule strips `//` comments first, so
+    # the prose that documents the ban must not trip the ban.  Without this
+    # case, "make R8 fire" could be satisfied by grepping for the bare word.
+    reset_tree; big_sim "$ns/src/sim/tick.hml" 'fn t4(): f64 { let o: f64 = ticks(); return o; }'
+    run_case 1 R8 "R8 wobbleweed's own wall clock, a bare ticks()"
+
+    reset_tree; big_sim "$ns/src/sim/tick.hml" '// never call __clock() here — src/sim must be reproducible from a seed'
+    run_case 0 - "R8 '__clock()' inside a comment is NOT a violation"
+
+    # The anchor that makes `ticks` usable as a banned word at all.  src/sim is
+    # full of legitimate `*_ticks()` helpers -- secs_to_ticks, hold_ticks,
+    # sim_accum_ticks, spell_cooldown_ticks -- and a substring grep for
+    # `ticks(` flags every one of them.  tools/probe_sim_core.hml has exactly
+    # that bug and reports eleven violations on a clean tree, which is how a
+    # rule stops being read.
+    reset_tree
+    big_sim "$ns/src/sim/tick.hml" 'fn secs_to_ticks(p_s: f64): i32 { let o: i32 = i32(p_s); return o; }'
+    printf 'fn use_it(): i32 { let o: i32 = secs_to_ticks(2.0); return o; }\n' >> "$ns/src/sim/tick.hml"
+    run_case 0 - "R8 a legitimate *_ticks() helper is NOT a wall clock"
+
     rm -rf "$tmp"
     echo
     echo "SELFTEST $pass/$total"
     [ "$pass" -eq "$total" ] || return 1
-    [ "$total" -eq 12 ] || { echo "SELFTEST case count changed (expected 12)"; return 1; }
+    [ "$total" -eq 21 ] || { echo "SELFTEST case count changed (expected 21)"; return 1; }
     return 0
 }
 
@@ -420,7 +516,18 @@ while IFS= read -r f; do
     # position where the bug cannot manifest. Gate 4b/4c caught it by planting
     # near the top of a real file. Verify guards at the position most likely to
     # break them, not the most convenient one.
-    if grep -qE '(^|[^A-Za-z0-9_])(__clock|time_ms|now_ms|SDL_GetTicks|clock_now)[[:space:]]*\(' < <(sed 's|//.*||' "$f"); then
+    # `ticks` ADDED 2026-08-01.  wobbleweed's wall clock is `ticks()` and R8's
+    # word list did not have it -- the one name in the engine most likely to be
+    # typed by habit was the one name the rule did not cover.  src/sim/sim.hml
+    # line 794 already documents the intent ("catch wobbleweed's wall-clock
+    # ticks()"), and tools/probe_sim_core.hml tries to enforce it with a bare
+    # substring grep for `ticks(` -- which is why that probe reports eleven
+    # violations on a clean HEAD: it matches `secs_to_ticks(`,
+    # `spell_cooldown_ticks(`, `sim_accum_ticks(` and `director_hold_ticks(`.
+    # The left anchor below is what makes the difference: `[^A-Za-z0-9_]`
+    # excludes every `_ticks(` suffix, so this fires on a real `ticks()` call
+    # and on nothing else.  Verified: src/sim is clean under it today.
+    if grep -qE '(^|[^A-Za-z0-9_])(__clock|time_ms|now_ms|SDL_GetTicks|clock_now|ticks)[[:space:]]*\(' < <(sed 's|//.*||' "$f"); then
         err R8 "$(basename "$f") reads a wall clock. src/sim must be reproducible from a seed alone -- use the tick counter, never real time. (__clock is a builtin, so no import rule can catch this.)"
     fi
 done < <(find "$NS_ROOT/src/sim" -name '*.hml' 2>/dev/null)

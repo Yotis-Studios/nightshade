@@ -56,7 +56,7 @@
 // =============================================================================
 
 import { exit } from "@stdlib/process";
-import { getenv } from "@stdlib/env";
+import { getenv, setenv } from "@stdlib/env";
 import { make_dirs } from "@stdlib/fs";
 import { sin, cos, sqrt, floor, atan2, tan, divi } from "@stdlib/math";
 
@@ -114,6 +114,7 @@ import { stat_get, stat_ms, stat_set, stat_begin, stat_end,
 // THE FRAME GRAPH — src/render/world_render.hml. The only one.
 // ---------------------------------------------------------------------------
 import { frame_init, frame_render, frame_present, frame_begin,
+         frame_set_darkness,
          frame_bind_textures, frame_bind_fx_atlas, frame_bind_assets,
          frame_set_camera, frame_set_clear, frame_set_options,
          frame_set_capture,
@@ -127,6 +128,14 @@ import { frame_init, frame_render, frame_present, frame_begin,
          g_D2R, g_NEAR, g_FXK_SPRITE, g_FXK_RAIN, g_FXK_TRACER,
          g_LOD_FOG_CARD }
        from "../render/world_render.hml";
+
+// ---- the-feedback-loop: GDD 7.13's segment math ---------------------------
+// It lives on the HUD layer's own surface rather than at the draw site so that
+// a HEADLESS probe can test the shipped implementation; `hud_build` is in this
+// file, which is a program and cannot be imported. See src/render/hud.hml 3.
+import { hud_dmg_seg_weight, HUD_DMG_SEGS, HUD_DMG_FRONT, HUD_DMG_RIGHT,
+         HUD_DMG_BACK, HUD_DMG_LEFT }
+       from "../render/hud.hml";
 
 import { vm_new, vm_bind_mesh, vm_set_eye_height, vm_set_motion,
          vm_read_weapon, vm_fire, vm_drop_mag, vm_step, vm_emit, vm_model,
@@ -143,6 +152,8 @@ import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_FRAME_BUDGET_MS,
          g_BUDGET_SIM_MS, g_TICK_DT, g_ENEMY_WISP, g_ENEMY_MOTE,
          g_ENEMY_HUSK, g_LANTERN_R_T1, g_XP_LANTERN, g_LANTERN_CHANNEL_S,
          g_EMIT_WORKERS,
+         // (the-feedback-loop) the two fades the hit-feedback contract runs on
+         g_DMG_DIR_FADE_S, g_RESPAWN_S,
          // (the-lamp) "how dark is it", as a FUNCTION rather than as a number
          // copied into three files. `world_render.hml`'s night veil and
          // `tools/probe_night.hml` both drive off exactly these.
@@ -159,6 +170,7 @@ import { pal_r, pal_g, pal_b, pal_pack,
          g_MUZZLE_MID }
        from "../art/palette.hml";
 import { tod_eval, tod_set_weather, tod_set_mist_band, tod_sky_keys,
+         tod_hour_tint_luma,
          tod_lightning_active, tod_clock_hours,
          WX_CLEAR, WX_OVERCAST, WX_RAIN, WX_STORM, WX_BLOOM,
          TODSKY_ZENITH_R, TODSKY_MID_R, TODSKY_HORIZON_R,
@@ -322,7 +334,11 @@ import { client_new, client_bind_fx_cells, client_set_sens, client_look,
          client_alive, client_wave, client_wave_state, client_beat,
          client_session, client_intro_alpha, client_stand01,
          client_hitmarker, client_hitmarker_kill, client_damage_t,
-         client_damage_dir, client_banner, client_banner_t, client_card,
+         // ---- the-feedback-loop: GDD 7.13's four sources and 7.8's number ----
+         client_damage_dir, client_dmg_slots, client_dmg_slot_t,
+         client_dmg_slot_dir, client_dmg_hits,
+         client_dmgnum, client_dmgnum_t, client_dmgnum_crit, CL_DMGNUM_S,
+         client_banner, client_banner_t, client_card,
          client_card_t, client_toast, client_toast_t, client_level_t,
          client_chan01, client_lantern_dist, client_lantern_lit,
          client_lit_ring_t, client_prompt, client_lantern_bearing,
@@ -496,6 +512,11 @@ let g_yaw_deg: f64 = 0.0;
 let g_pitch_deg: f64 = 0.0;
 let g_fov: f64 = 70.0;
 let g_fog_far: f64 = 64.0;
+// The NEAR end of the same fog, published for the same reason the far end is:
+// `reach_ring_push` has to reconstruct the attenuation `fx.hml` is about to
+// charge its cards, and that is a function of both ends. Written in exactly one
+// place, beside `g_fog_far`, so the two cannot describe different fogs.
+let g_fog_near: f64 = 40.0;
 let g_day_t: f64 = 0.5;
 let g_wx: i32 = 0;
 let g_ground_y: f64 = 0.0;
@@ -552,6 +573,11 @@ fn tod_step() {
     let env: array<f64> = frame_env();
     tod_set_mist_band(g_ground_y - 1.1, g_MIST_HEIGHT + 2.0);
     tod_eval(env, g_day_t, g_wx);
+    // THE HOUR, handed to the renderer before the weather multiply. Without
+    // this the lantern and the night veil gate on the WEATHERED fog tint, and
+    // a storm — whose tint is dark at every hour — reads as night at noon.
+    // See the derivation beside `gate_on_fog_tint` in world_render.hml.
+    frame_set_darkness(tod_hour_tint_luma());
     env_set_camera(env, g_camx, g_camy, g_camz);
 
     let fnear: f64 = env_field(env, ENV_FOG_NEAR);
@@ -573,6 +599,7 @@ fn tod_step() {
                 env_field(env, ENV_FOG_R), env_field(env, ENV_FOG_G),
                 env_field(env, ENV_FOG_B), env_field(env, ENV_FOG_ALPHA_MAX));
     g_fog_far = ffar;
+    g_fog_near = fnear;
     sky_keys_from_tod(env);
 }
 
@@ -1321,7 +1348,15 @@ fn villagers_push(): i32 {
 // How long each one-shot signal stays up.
 let g_TEACH_FLASH_S: f64 = 1.30;    // the verdict, at the moment of planting
 let g_TEACH_CROSS_S: f64 = 2.40;    // "you are inside the reach", on crossing
-let g_TEACH_GRANT_S: f64 = 4.00;    // "N lantern kits", when the pack fills
+// `g_TEACH_GRANT_S` USED TO LIVE HERE AND IT IS DELETED ON PURPOSE. It was a
+// four-second client-side window that widened the plant PROMPT past the plant
+// GATE, and it was the one term of the three that the server could not read --
+// the server has no wall clock of its own for a HUD timer, so a second
+// implementation would have been the only way to share it, which is the exact
+// bug this wave exists to remove. Its job (offer the verb loudly on the beat
+// that hands you the kits) is done better by `teach_plant_ready`'s
+// `p_placed < 1` arm: the prompt is unconditional until the FIRST post is
+// planted, which is a longer window and a fact on the wire.
 
 // THE REACH, as marks on the ground. The spacing is in METRES and not a mark
 // count, so a Camp's 64 m ring and a City's 320 m ring read as the same object
@@ -1337,6 +1372,23 @@ let g_TEACH_GRANT_S: f64 = 4.00;    // "N lantern kits", when the pack fills
 let g_RING_STEP_M: f64 = 6.0;
 let g_RING_MIN: i32 = 24;
 let g_RING_MAX: i32 = 96;
+// HOW FAR THE REACH IS VISIBLE, IN METRES, AND IT IS NOT THE FOG. The full
+// argument is at the cull in `reach_ring_push`; the short version is that
+// `g_fog_far` is the TERRAIN triangle budget and collapses to 18 m at night,
+// while this ring is capped at 96 marks x 4 = 384 triangles at any radius and
+// any weather. 128 m because the authored path's nearest post lands 135 m from
+// the green, so the boundary is on screen for the walk it exists to guide.
+let g_RING_VIS_M: f64 = 128.0;
+// `--ringcull fog|nav`. DEV ONLY, defaulting to the shipping rule, and kept
+// for the reason `--workers 0` is kept: so the choice can be re-checked in one
+// binary rather than forgotten. `fog` restores the pre-fix cull exactly.
+let g_RING_CULL_NAV: i32 = 0;
+let g_RING_CULL_FOG: i32 = 1;
+let g_ring_cull: i32 = g_RING_CULL_NAV;
+// `--ringscan`'s A/B handle: one frame with the ring, one without, same camera.
+// It is the ONLY honest way to count a ring in a night frame that also contains
+// the moon, a town's windows and a star field. Never set outside the scan.
+let g_ring_off: i32 = 0;
 // >>> AND THE SIZES ARE SOLVED, NOT TYPED, BECAUSE THE FIRST TWO WERE TYPED
 //     AND BOTH WERE INVISIBLE. <<<  A card of diameter `s` at range `d`
 //     subtends `s/d` radians; the frame is 180 px over a half-height of
@@ -1367,6 +1419,44 @@ let g_RING_S_HAZE: f64 = 1.55;
 let g_RING_S_CORE: f64 = 0.60;
 let g_RING_A_HAZE: f64 = 130.0;
 let g_RING_A_CORE: f64 = 215.0;
+// ===========================================================================
+//  THE FOG HALO — AND UN-CULLING THE RING WAS ONLY HALF THE FIX
+// ---------------------------------------------------------------------------
+//  With the cull corrected the ring DRAWS at night and is still barely
+//  legible, and the first `--ringscan 22` measured exactly why. `fx.hml`'s
+//  `fx_emit` charges every card `alpha * (1 - fa * 0.85)`, and at night with
+//  fog at 30 m EVERY mark of a 64 m ring is past the wall, so every one of them
+//  is at the 15 % floor. Standing 32 m inside the reach, the brightest pixel of
+//  the brightest mark gained 41 luminance and the marks were 1-2 px. Drawn and
+//  not legible is half a fix, and half a fix reported as a fix is the thing
+//  this repo does not do.
+//
+//  >>> AND MORE ALPHA CANNOT SOLVE IT, WHICH IS THE INTERESTING PART. <<<
+//  ATLAS_FX is BLEND_ADD and the vertex alpha is clamped to 255 BEFORE the fog
+//  is applied, so one card's ceiling at the fog floor is
+//  `Rec709(tint) * 255 * 0.15 / 255` = about 37 luminance for the near-white
+//  core, whatever number is authored above. This is `lamp_flame_push`'s ceiling
+//  arithmetic arriving from a different direction: you cannot buy brightness
+//  from a single additive card, you buy AREA.
+//
+//  So a mark deep in fog gets the halo a real light gets in fog: BIGGER and, up
+//  to the clamp, brighter. Both multipliers ride the same fog term and both are
+//  1.0 at the near end, so A MARK THE OLD CULL ALREADY DREW COMES OUT
+//  BIT-FOR-BIT THE SAME. That is measured, not asserted: `--ringscan 18` (fog
+//  64 m, the dusk gate 9 photographed as already correct) reports the same
+//  worst-pixel gain under both cull rules at all eight yaws from inside --
+//  198/198, 214/214, 205/205, 203/203, 174/174 -- and three of the eight yaws
+//  are pixel-for-pixel identical. Everything the NAV rule adds at dusk is a
+//  mark on the FAR side of the ring that the old test threw away.
+//  It costs ZERO extra triangles: the same two cards, drawn larger.
+//
+//  §9.11 forbids bloom and says the hour is better spent on "fog and glow
+//  cards, which are possible and look better". This is that, and it is the one
+//  place in this file where the fog is allowed to make something LARGER.
+let g_RING_FOG_A: f64  = 5.00;   // alpha x this at the fog floor (clamped 255)
+let g_RING_FOG_SH: f64 = 2.20;   // haze DIAMETER x this at the fog floor
+let g_RING_FOG_SC: f64 = 1.60;   // core diameter x this — kept tighter so the
+                                 // mark still has a point rather than a smudge
 // How many lanterns the pack row will draw before it stops counting. The loop's
 // own supply is four (SV_OPEN_KITS + SV_HOLD_KITS) and this is six, so the row
 // is never truncated by anything the economy can currently produce AND a
@@ -1375,14 +1465,12 @@ let g_RING_A_CORE: f64 = 215.0;
 // understated -- stated here rather than discovered in a screenshot.
 let g_TEACH_PACK_MAX: i32 = 6;
 
-let g_teach_kits: i32 = 0;          // pack count last frame
 let g_teach_placed: i32 = -1;       // `client_kits_placed` last frame
 let g_teach_inside: i32 = -1;       // `client_settle_inside` last frame
 let g_teach_verdict: i32 = TEACH_V_NONE;
 let g_teach_d: f64 = 0.0;           // metres to the green at the last plant
 let g_teach_t: f64 = 0.0;
 let g_teach_cross_t: f64 = 0.0;
-let g_teach_grant_t: f64 = 0.0;
 let g_teach_ring_n: i32 = 0;        // marks pushed this frame
 let g_teach_ring_peak: i32 = 0;
 let g_teach_prompt_yield: i32 = 0;  // frames the plant prompt had no room
@@ -1398,15 +1486,15 @@ fn teach_step(p_dt: f64) {
     let dt: f64 = p_dt;
     if (g_teach_t > 0.0) { g_teach_t = g_teach_t - dt; }
     if (g_teach_cross_t > 0.0) { g_teach_cross_t = g_teach_cross_t - dt; }
-    if (g_teach_grant_t > 0.0) { g_teach_grant_t = g_teach_grant_t - dt; }
 
     let kits: i32 = client_pack_kits(g_cl);
     let placed: i32 = client_kits_placed(g_cl);
     let inside: i32 = client_settle_inside(g_cl);
 
-    // ---- the pack filled. The one beat in the game that hands you the verb.
-    if (kits > g_teach_kits) { g_teach_grant_t = g_TEACH_GRANT_S; }
-    g_teach_kits = kits;
+    // ---- the pack filling used to start a four-second HUD-only window here.
+    // It is gone; see `g_TEACH_GRANT_S`'s obituary above the constants. The
+    // beat that hands you the verb is now carried by `teach_plant_ready`'s
+    // `p_placed < 1` arm, which the SERVER can read too.
 
     // ---- a post went into the ground -----------------------------------
     // `kits_placed` is the AUTHORITY's monotone counter, so this edge is a
@@ -1456,10 +1544,22 @@ fn teach_step(p_dt: f64) {
 }
 
 // Is the plant prompt live this frame? ONE call, shared with the server.
+//
+// >>> AND NOTHING MAY BE `&&`-ED ONTO THE RESULT AT THE DRAW SITE. <<< That is
+// not a style note. The draw site used to read
+// `teach_ready() && (client_speed(g_cl) < 0.6 || s_in == 1 || g_teach_grant_t > 0.0)`
+// while `sv_ui_tick` planted off `teach_plant_ready` alone, and gate 9
+// enumerated the eight states: moving, outside the reach, past the grant
+// window spent a kit with nothing on screen. The three terms are now arguments
+// of the shared function (see the TEACH block in `src/game/server.hml`), so
+// this is the whole predicate and the draw site is a bare `if`.
 fn teach_ready(): i32 {
     let out: i32 = teach_plant_ready(client_pack_kits(g_cl), client_prompt(g_cl),
                                      client_talk_who(g_cl), client_ui_panel(g_cl),
-                                     client_dead(g_cl));
+                                     client_dead(g_cl),
+                                     client_settle_inside(g_cl),
+                                     client_kits_placed(g_cl),
+                                     client_speed(g_cl));
     return out;
 }
 
@@ -1479,6 +1579,7 @@ fn teach_ready(): i32 {
 // ring through that path would come out cyan, or not at all.
 fn reach_ring_push(p_t: f64) {
     g_teach_ring_n = 0;
+    if (g_ring_off == 1) { return; }
     // >>> THE `|| g_teach_t > 0` IS A BUG THE SCREENSHOTS FOUND. <<<
     // `teach_ring_show` is the steady-state rule -- the reach answers a wick
     // you are CARRYING -- and on its own it turned the ring off on the exact
@@ -1494,14 +1595,59 @@ fn reach_ring_push(p_t: f64) {
     if (r <= 0.0) { return; }
     let cx: f64 = client_settle_x(g_cl);
     let cz: f64 = client_settle_z(g_cl);
-    // The cheap reject: the whole ring is out of the fog. One square root for a
-    // player who is 400 m away, which is most of a session.
-    let far: f64 = g_fog_far;
+    // ======================================================================
+    // >>> THE CHEAP REJECT USED TO BE `g_fog_far`, AND THAT SWITCHED THE RING
+    //     OFF IN EXACTLY THE CONDITION IT EXISTS FOR. <<<
+    // ----------------------------------------------------------------------
+    // At night `tod_step` floors `g_fog_far` at 18 m and the CAMP ring is
+    // 64 m, so a player 89 m from the green -- with the HUD reading
+    // "25M TO THE REACH" in the same frame -- got `89 > 64 + 18` and ZERO
+    // marks. Gate 9 has the picture and the telemetry line side by side: HUD
+    // 25 m, `reach 0`. At dusk (fog 54-64 m) the identical code renders a
+    // clean arc of ember dots, which is why four waves read this as "the ring
+    // is beautiful" and nobody read it as "the ring is off at night". AND YOU
+    // PLANT AT NIGHT. The naive player independently reported the ring drawn
+    // zero times in a full 8-yaw survey from inside it.
+    //
+    // THE REJECT ITSELF IS NOT WRONG -- a ring 400 m behind you must not cost
+    // triangles, which is most of a session. What was wrong was USING THE FOG
+    // WALL AS THE DISTANCE, and there are three separate reasons it cannot be:
+    //
+    //  1. `g_fog_far` IS THE TERRAIN TRIANGLE BUDGET (CLAUDE.md §6: "fog is
+    //     not an effect; it is the triangle budget", ground tris ~
+    //     (pi/4)*FOG_FAR^2/16*2 -- quadratic in the fog). The ring is not
+    //     quadratic in anything: `g_RING_MAX` caps it at 96 marks x 4 = 384
+    //     triangles at ANY radius and ANY fog. Fog was never protecting this.
+    //  2. FOG DOES NOT DELETE A LIGHT, AND THE ENGINE ALREADY KNOWS THAT.
+    //     `shade.hml`'s `env_fog_factor` saturates at 1.0 and `fx.hml`'s
+    //     `fx_emit` spends it as `alpha * (1 - f * 0.85)` -- an ADDITIVE card
+    //     past the fog wall keeps 15 % of its alpha instead of vanishing. The
+    //     fade to SOMETHING is already implemented one layer down; this cull
+    //     was the only thing throwing the result away before it got there.
+    //     (That is also the answer to "should it fade to nothing or to
+    //     something": something, and by the engine's rule, not a second one.)
+    //  3. THERE IS NO FAR-PLANE REJECTION TO WORRY ABOUT. `world_render.hml`
+    //     says so in its own words at the depth-quantum note: "there is no
+    //     far-plane rejection in emit.hml", only the sort key clamps. A mark
+    //     at 60 m under an 18 m fog still projects correctly.
+    //
+    // So the reject is a NAVIGATION distance instead, and it is honest about
+    // being one. 128 m: the authored path's nearest post lands 135 m from the
+    // green and the last stretch home is the walk the ring exists to guide, so
+    // the boundary is on screen for essentially all of it. Worst case is
+    // therefore bounded and stateable rather than weather-dependent --
+    // 96 marks, 384 triangles of the 3000, and only while you carry a wick.
+    //
+    // `--ringcull fog` puts the old test back, in the same binary, so the
+    // before/after in the report is one flag apart rather than two builds.
+    // ======================================================================
+    let vis: f64 = g_RING_VIS_M;
+    if (g_ring_cull == g_RING_CULL_FOG) { vis = g_fog_far; }
     let ddx: f64 = cx - g_camx;
     let ddz: f64 = cz - g_camz;
     let dc: f64 = sqrt(ddx * ddx + ddz * ddz);
-    if (dc > r + far) { return; }
-    if (dc < r - far) { return; }
+    if (dc > r + vis) { return; }
+    if (dc < r - vis) { return; }
 
     let n: i32 = clampi(i32(6.283185307179586 * r / g_RING_STEP_M),
                         g_RING_MIN, g_RING_MAX);
@@ -1515,7 +1661,18 @@ fn reach_ring_push(p_t: f64) {
     }
     let grow: f64 = 1.0 + 0.90 * f;
     let t: f64 = p_t;
-    let f2: f64 = far * far;
+    let v2: f64 = vis * vis;
+    // THE LAST 20 % OF THE RANGE IS A RAMP, NOT AN EDGE. Without it a mark
+    // crosses `vis` and appears at full alpha in one frame, and a ring that
+    // POPS reads as a bug even when the geometry is right. The fog fade is a
+    // smoothstep and the near marks are already at their floor by 18 m at
+    // night, so this ramp only ever touches the far end nobody is looking at.
+    let vfade: f64 = vis * 0.80;
+    let vinv: f64 = 1.0 / (vis - vfade);
+    // Hoisted (A11/N4): one divide a frame, not one a mark.
+    let fogsp: f64 = g_fog_far - g_fog_near;
+    if (fogsp < 0.001) { fogsp = 0.001; }
+    let fogiv: f64 = 1.0 / fogsp;
     let pushed: i32 = 0;
     for (let i = 0; i < n; i++) {
         let ang: f64 = 6.283185307179586 * f64(i) / f64(n);
@@ -1523,7 +1680,23 @@ fn reach_ring_push(p_t: f64) {
         let mz: f64 = cz - cos(ang) * r;
         let dx: f64 = mx - g_camx;
         let dz: f64 = mz - g_camz;
-        if (dx * dx + dz * dz > f2) { continue; }
+        let d2: f64 = dx * dx + dz * dz;
+        if (d2 > v2) { continue; }
+        let ef: f64 = 1.0;
+        let dm: f64 = sqrt(d2);
+        if (dm > vfade) { ef = (vis - dm) * vinv; }
+        // The fog term `fx_emit` is about to charge this card, reconstructed:
+        // `shade.hml`'s smoothstep over [fog_near, fog_far]. It is the DISTANCE
+        // term only -- `env_fog_factor` maxes it with a HEIGHT-based mist term,
+        // so a mark standing in mist still fades further than this compensates
+        // for, which is correct: mist is a local fact about that ground.
+        let ft: f64 = (dm - g_fog_near) * fogiv;
+        if (ft < 0.0) { ft = 0.0; }
+        if (ft > 1.0) { ft = 1.0; }
+        ft = ft * ft * (3.0 - 2.0 * ft);
+        let ab: f64 = 1.0 + (g_RING_FOG_A - 1.0) * ft;
+        let sh: f64 = 1.0 + (g_RING_FOG_SH - 1.0) * ft;
+        let sc: f64 = 1.0 + (g_RING_FOG_SC - 1.0) * ft;
         // The same slow breath the ambient embers use, phase-shifted round the
         // circle so the ring reads as living light and not as a decal ring. It
         // is FRAME time and it is allowed to be: this is cosmetic and it never
@@ -1533,12 +1706,12 @@ fn reach_ring_push(p_t: f64) {
         let y: f64 = ground_h(mx, mz) + g_RING_Y_M + 0.10 * sin(ph);
         // Submission order is paint order inside one depth bucket, so the core
         // goes LAST and nothing amber is laid over the near-white.
-        fx_push(mx, y, mz, g_RING_S_HAZE * grow * br, FX_GLOW_L, g_FXK_SPRITE,
+        fx_push(mx, y, mz, g_RING_S_HAZE * sh * grow * br, FX_GLOW_L, g_FXK_SPRITE,
                 pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER),
-                clampi(i32(g_RING_A_HAZE * br * (1.0 + 0.55 * f)), 0, 255));
-        fx_push(mx, y, mz, g_RING_S_CORE * grow * br, FX_EMBER, g_FXK_SPRITE,
+                clampi(i32(g_RING_A_HAZE * ab * br * ef * (1.0 + 0.55 * f)), 0, 255));
+        fx_push(mx, y, mz, g_RING_S_CORE * sc * grow * br, FX_EMBER, g_FXK_SPRITE,
                 pal_r(g_MUZZLE_CORE), pal_g(g_MUZZLE_CORE), pal_b(g_MUZZLE_CORE),
-                clampi(i32(g_RING_A_CORE * br * (1.0 + 0.21 * f)), 0, 255));
+                clampi(i32(g_RING_A_CORE * ab * br * ef * (1.0 + 0.21 * f)), 0, 255));
         pushed++;
     }
     g_teach_ring_n = pushed;
@@ -1919,6 +2092,24 @@ let g_TB_BANNER: i32 = 88;
 let g_TB_CARD: i32 = 80;
 let g_TB_PROMPT: i32 = 108;
 let g_TB_DBG: i32 = 120;
+// The damage number is at most 3 FONT_BIG digits (`cl.dmgnum` is clamped to
+// 999) and a FONT_BIG glyph is 4 triangles with its mandatory shadow, so 12 is
+// the exact worst case and 16 is that with one digit of slack.
+let g_TB_DMGNUM: i32 = 16;
+// How many of the four direction segments were lit at once, ever. This is the
+// number the HUD budget for the indicator is sized against, so it is REPORTED
+// rather than assumed: if it ever reads 4, the 20-triangle worst case in the
+// cap note was reached by a real frame and not just by arithmetic.
+let g_DMG_SEGS: i32 = HUD_DMG_SEGS;
+let g_dmg_seg_peak: i32 = 0;
+// Four accumulators, allocated ONCE (CLAUDE.md N6: no buffer per frame). Four
+// f64s would do as locals, but naming them s0..s3 makes the loop below into
+// four copies of one line and that is how a fifth segment gets forgotten.
+let g_seg_w: array<f64> = [0.0, 0.0, 0.0, 0.0];
+// `${n}` is 105 ns (CLAUDE.md N3) and the damage number changes only when a
+// bullet lands, so the string is rebuilt on the VALUE's edge and not per frame.
+let g_dmgnum_shown: i32 = -1;
+let g_l_dmgnum: string = "";
 
 // ===========================================================================
 //  THE TWO TRANSIENT BANDS, RE-LAID FOR 320x180
@@ -1964,6 +2155,30 @@ let g_Y_PROMPT: f64 = 114.0;
 let g_Y_TALKLINE: f64 = 144.0;
 let g_hud_tris: i32 = 0;
 let g_hud_over: i32 = 0;
+// ---- THE DEATH-FRAME INSTRUMENT ---------------------------------------
+// Gate 9 photographed 16 consecutive frames at hp 0, every one with `ctl 1`
+// and none with the banner, and named two candidate causes: the boolean never
+// reaching the HUD, or the banner losing the last 62 triangles of the budget.
+// Reasoning about a chain that "looks correct on paper" is what this instrument
+// replaces. Every number below is counted AT THE DRAW SITE, which is the only
+// place that can see both the boolean and `used` on the same frame.
+let g_death_frames: i32 = 0;      // frames hud_build saw client_dead() == 1
+let g_death_ctl: i32 = 0;         // ...of those, how many still had control
+let g_death_used_worst: i32 = 0;  // worst `used` reaching the death block
+let g_death_used_best: i32 = 9999;
+let g_death_drawn: i32 = 0;       // frames the death block emitted
+let g_death_yield: i32 = 0;       // frames it lost to the cap
+let g_death_tris_worst: i32 = 0;  // what the whole death frame cost
+// ---- THE HIT-FEEDBACK CONTRACT, COUNTED AT THE DRAW SITE --------------
+// CLAUDE.md §9: "every bullet that connects produces, WITHIN THE SAME FRAME,
+// all five of -- hitmarker, enemy flash, damage number, impact billboard,
+// audio blip." `tools/probe_feedback.hml` audits the five on the EVENT BUS,
+// where the authority emits them. These three count the two that are
+// STAGE-24 PIXELS, because an event that reaches the client and never
+// reaches a triangle is exactly the failure this task was given.
+let g_fb_hitmark_frames: i32 = 0;
+let g_fb_dmgnum_frames: i32 = 0;
+let g_fb_seg_frames: i32 = 0;
 // Frames in which the unlock card had to drop glyphs. MUST STAY 0 — see the
 // draw site and the g_TB_CARD comment above.
 let g_hud_card_trunc: i32 = 0;
@@ -2095,6 +2310,68 @@ fn hud_panel_row(p_y: f64, p_sel: i32, p_left: string, p_right: string,
         n = n + hud_panel_text(286.0 - w, p_y, p_right, col,
                                clampi(p_budget - n, 0, 40));
     }
+    let out: i32 = n;
+    return out;
+}
+
+// ===========================================================================
+//  THE DEATH SCREEN.  Modal; see the long note at its call site.
+// ---------------------------------------------------------------------------
+//  PRICED, not estimated. FONT_MICRO is 4 triangles per INK glyph once the
+//  mandatory 1-px shadow is counted (ART_BIBLE §9.8) and spaces are free, so:
+//
+//      black wash                                     2
+//      danger wash                                    2
+//      the plate                                      2
+//      "THE DARK TOOK YOU"    14 ink glyphs x 4      56
+//      "YOU GET UP AGAIN"     13 ink glyphs x 4      52
+//      the respawn track + its drain                  4
+//                                                  ----
+//                                                   118
+//
+//  against a 328 working cap with NOTHING ELSE ON THE FRAME. `tools/
+//  probe_feedback.hml` prices the same six lines through the real font and
+//  asserts the total, so this comment cannot drift away from the code.
+//
+//  WHY THE SECOND LINE IS "YOU GET UP AGAIN" AND NOT WHERE. The obvious line is
+//  "you wake at the lantern", and it would be a LIE for the whole first minute:
+//  `sv_tick`'s respawn only uses the lantern `if (sv.lantern_lit == 1)` and
+//  otherwise puts you back at the spawn, which is precisely the stretch of the
+//  game where this screen is seen most (NAIVE_PLAYER.md: "between T+0:35 and
+//  T+2:10 I died at least five times believing I was merely having a bad
+//  time"). The question a player actually has on their first death is "is that
+//  it?", and this answers that one, truthfully, in four words.
+//
+//  THE BAR IS A BAR AND NOT A COUNTDOWN NUMERAL on purpose: a numeral would be
+//  a template string rebuilt every frame (CLAUDE.md N3 prices one at 165 ns)
+//  or a 4 Hz string that visibly lags its own countdown, and 2 triangles of
+//  drain says "wait, this ends" at 320x180 better than a digit does.
+fn hud_death(p_budget: i32, p_cx: f64, p_cy: f64): i32 {
+    let n: i32 = 0;
+    let cx: f64 = p_cx;
+    let cy: f64 = p_cy;
+
+    // 1. THE WORLD GOES OUT. This is the half Gate 9 said was missing: a red
+    //    tint over a sunset is a sunset, and only taking light away is
+    //    unambiguous.
+    n = n + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H), g_UI_BLACK, 150);
+    // 2. ...and then the red, on top of the dark, so it reads as a state.
+    n = n + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H), g_UI_DANGER, 46);
+
+    // 3. the plate. CLAUDE.md §9.9: no HUD text without a contrast plate, and
+    //    this text sits over whatever the world happened to be.
+    n = n + hud_rect(cx - 64.0, cy - 16.0, 128.0, 31.0, g_UI_BLACK, 215);
+    n = n + hud_centre(cy - 12.0, "THE DARK TOOK YOU", g_UI_WHITE,
+                       clampi(p_budget - n, 0, 72));
+    n = n + hud_centre(cy - 2.0, "YOU GET UP AGAIN", g_UI_AMBER,
+                       clampi(p_budget - n, 0, 68));
+
+    // 4. the respawn drain. `g_RESPAWN_S` counts DOWN from 4.0, so the bar
+    //    empties, which is the direction a wait reads in.
+    let rf: f64 = clamp01(client_respawn_t(g_cl) / g_RESPAWN_S);
+    n = n + hud_rect(cx - 40.0, cy + 8.0, 80.0, 3.0, g_UI_BLACK, 220);
+    n = n + hud_rect(cx - 39.0, cy + 9.0, 78.0 * rf, 1.0, g_UI_AMBER, 255);
+
     let out: i32 = n;
     return out;
 }
@@ -2234,6 +2511,72 @@ fn hud_build() {
         return;
     }
 
+    // =====================================================================
+    //  DEATH IS MODAL, AND IT IS FIRST.
+    // ---------------------------------------------------------------------
+    //  WHAT WAS HERE BEFORE, AND WHERE: 190 lines further down, LAST, behind
+    //  `client_dead(g_cl) == 1 && used + 62 <= cap`, one line of
+    //  `hud_centre_big`. Gate 9 named two candidate causes for its never having
+    //  been seen. IT WAS NEITHER OF THEM, and the instrument that settled it is
+    //  the `g_death_*` counters below. MEASURED, `--demo 45 --stand --seed
+    //  1337`, 479 consecutive dead frames:
+    //
+    //      dead frames 479 (479 of them WITH control)
+    //      used at the block 78..84 of cap 328
+    //      drawn 479   yielded 0   worst block cost 2 tris
+    //
+    //  (a) THE BOOLEAN WAS FINE. `client_dead` was 1 on all 479 frames; the
+    //      EF_DEAD -> reaper -> p_dead -> l.dead -> cl.dead chain works.
+    //  (b) THE BUDGET WAS FINE. `used` reached this block at 78-84 against a
+    //      328 cap. It had 244 triangles spare and yielded on ZERO frames.
+    //  (c) THE BLOCK RAN, DREW, AND EMITTED TWO TRIANGLES: the full-screen
+    //      wash, and NOTHING ELSE. `hud_centre_big` renders through FONT_BIG,
+    //      and FONT_BIG carries twelve glyphs -- `0`-`9`, `/` and `%`
+    //      (`hud_big_cp` / `HUD_BIG_N` in src/art/hudgen.hml). IT HAS NO
+    //      LETTERS. "THE DARK TOOK YOU" contains no digit, so it cost zero
+    //      triangles and drew zero glyphs, on every death this game has ever
+    //      had. `tools/probe_hud.hml` has asserted `cost_big("THE DARK TOOK
+    //      YOU") == 0` since about-to-break and filed it "REPORTED, not fixed"
+    //      because the draw site was not that task's file. It is this one's.
+    //
+    //  So the banner is FONT_MICRO now, which is the font with an alphabet.
+    //
+    //  AND IT IS MODAL FOR THE SAME REASON THE TRADE PANEL IS (see the note
+    //  below it): "a menu has no business having a crosshair". Neither has a
+    //  corpse. A dead player's crosshair, compass, ammo counter, kit icons and
+    //  plant prompt are all instruments for decisions they cannot make, and
+    //  leaving them up is most of why NAIVE_PLAYER.md logged three deaths in a
+    //  row as a lighting change. Making the screen modal also makes the
+    //  ORDERING problem unrepresentable rather than merely fixed: the most
+    //  important message in the game is no longer competing for scraps at the
+    //  end of a budget, it is the only thing in it, and it can never yield.
+    //
+    //  THE WASH IS BLACK FIRST, THEN RED, and that ordering is the fix to Gate
+    //  9's other sentence -- "it tints the screen the colour of the sunset it
+    //  is already showing you". A red tint over a dusk sky is a dusk sky. Black
+    //  at 150 TAKES LIGHT AWAY, which no time of day does instantly, and it is
+    //  also what puts something below luminance 30 in a frame whose every other
+    //  pixel is ochre (CLAUDE.md §8).
+    // =====================================================================
+    if (client_dead(g_cl) == 1) {
+        g_death_frames = g_death_frames + 1;
+        if (client_has_control(g_cl) == 1) { g_death_ctl = g_death_ctl + 1; }
+        if (used > g_death_used_worst) { g_death_used_worst = used; }
+        if (used < g_death_used_best) { g_death_used_best = used; }
+        let d0: i32 = used;
+        used = used + hud_death(cap - used, cx, cy);
+        g_death_drawn = g_death_drawn + 1;
+        if (used - d0 > g_death_tris_worst) { g_death_tris_worst = used - d0; }
+        g_hud_tris = used;
+        if (used > g_HUD_TRI_CAP) {
+            if (g_hud_over == 0) {
+                eprint(`nightshade: HUD death screen emitted ${used} triangles, over the ${g_HUD_TRI_CAP} cap`);
+                g_hud_over = 1;
+            }
+        }
+        return;
+    }
+
     // ---- W6: A MODAL PANEL REPLACES THE COMBAT HUD ----------------------
     // Not "is drawn on top of". ART_BIBLE §9's 250-triangle cap is a HARD cap
     // and a character sheet is 180 triangles by itself; stacking it over a
@@ -2308,6 +2651,7 @@ fn hud_build() {
         if (client_hitmarker_kill(g_cl) == 1) { hc = g_UI_AMBER; }
         used = used + hud_sprite(HUD_HITMARK, cx - 8.0, cy - 8.0, hc,
                                  clampi(i32(hm / 0.09 * 255.0), 0, 255));
+        g_fb_hitmark_frames = g_fb_hitmark_frames + 1;
     }
 
     // ---- the compass -----------------------------------------------------
@@ -2550,17 +2894,115 @@ fn hud_build() {
     used = used + hud_rect(0.0, y_xp, f64(g_RES_W), 3.0, g_UI_BLACK, 170);
     used = used + hud_rect(0.0, y_xp + 1.0, f64(g_RES_W) * xf, 1.0, g_NS_HALO, 255);
 
-    // ---- the damage vignette + direction arc (GDD §7.13) -----------------
+    // ---- WHO IS HITTING YOU, AND FROM WHERE (GDD §7.13) ------------------
+    // The event has been on the bus since combat.hml was written --
+    // `EV_DAMAGE_TAKEN`, with the position field set to where the damage CAME
+    // FROM rather than where it landed, and a comment saying it is for this
+    // indicator. What consumed it was ONE `hud_sprite(HUD_ICON_ARROW, cx +
+    // sin(bearing - yaw) * 40, cy - 26)`, and `sin` alone is not a direction:
+    // sin(0) and sin(pi) are both zero, so a Wisp chewing on the back of your
+    // neck and a Husk directly in front of you put the arrow in the SAME PIXEL,
+    // dead centre, two pixels below the crosshair. NAIVE_PLAYER.md's "in not
+    // one of those frames was there anything on screen that had hit me" was
+    // written about frames that HAD the indicator on them.
+    //
+    // Now: four segments around the crosshair, weighted by the COSINE of the
+    // angle to each source (`hud_dmg_seg_weight`, src/render/hud.hml §3, which
+    // is where the math lives so `tools/probe_feedback.hml` can test the real
+    // implementation instead of a copy of it), fed by FOUR independent source
+    // slots so being hit from two sides shows two sides.
+    //
+    // THE COST, WORST CASE, IS THE FOUR-SOURCE FRAME: two full-width bands at
+    // 2 each, plus 4 segments x (plate 2 + bar 2) = 20 triangles. The plate is
+    // not optional -- CLAUDE.md §9.9, and centre screen at 320x180 is sky as
+    // often as it is grass, so a bare 3-px UI_DANGER bar has a noon sky and a
+    // muzzle flash behind it about half the time. Budgeted in config.hml's
+    // g_HUD_TRI_CAP note and asserted by probe_feedback.
     let dt2: f64 = client_damage_t(g_cl);
     if (dt2 > 0.0) {
         let a: i32 = clampi(i32(dt2 / 1.2 * 90.0 * (1.0 - hp01 + 0.35)), 0, 130);
         used = used + hud_rect(0.0, 0.0, f64(g_RES_W), 5.0, g_UI_DANGER, a);
         used = used + hud_rect(0.0, hudgen_bot(5.0, 0.0), f64(g_RES_W), 5.0, g_UI_DANGER, a);
-        let br2: f64 = client_damage_dir(g_cl) - g_yaw_deg * g_D2R;
-        used = used + hud_sprite(HUD_ICON_ARROW,
-                                 cx + clampf(sin(br2) * 40.0, -44.0, 44.0),
-                                 cy - 26.0, g_UI_DANGER,
-                                 clampi(i32(dt2 / 1.2 * 255.0), 0, 255));
+    }
+    // The segments are OUTSIDE the `dt2` gate, and the reason is NOT that a slot
+    // can outlive `cl.dmg_t` -- it cannot. Both are set to g_DMG_DIR_FADE_S by
+    // the same event, so dmg_t is always >= every slot's fade, and I nearly
+    // shipped a comment here claiming the opposite because it sounded right.
+    // The real reason is that the segments read the SLOTS and nothing else: one
+    // fact, one owner. Gating them on a second timer that happens to agree
+    // today is how the two come to disagree later.
+    // ONE PASS OVER THE SOURCES, not one per segment: the bearing and the fade
+    // are per-SOURCE and recomputing them inside the segment loop reads the
+    // same four slots four times (CLAUDE.md A9b -- a Hemlock call is ~10 ns per
+    // argument and this is the frame path).
+    let yaw_r: f64 = g_yaw_deg * g_D2R;
+    let nslot: i32 = client_dmg_slots();
+    for (let si = 0; si < g_DMG_SEGS; si++) { g_seg_w[si] = 0.0; }
+    for (let sj = 0; sj < nslot; sj++) {
+        let st: f64 = client_dmg_slot_t(g_cl, sj);
+        if (st <= 0.0) { continue; }
+        let rel: f64 = client_dmg_slot_dir(g_cl, sj) - yaw_r;
+        let sfade: f64 = st / g_DMG_DIR_FADE_S;
+        for (let si2 = 0; si2 < g_DMG_SEGS; si2++) {
+            g_seg_w[si2] = g_seg_w[si2] + hud_dmg_seg_weight(rel, si2) * sfade;
+        }
+    }
+    let lit_n: i32 = 0;
+    for (let si = 0; si < g_DMG_SEGS; si++) {
+        let w: f64 = g_seg_w[si];
+        if (w > 1.0) { w = 1.0; }
+        let sa: i32 = i32(w * 255.0);
+        // Below 24 of 255 over a plate this is a dark smudge and not a signal;
+        // dropping it there is what keeps the typical one-attacker frame at
+        // ONE segment (4 triangles) instead of four faint ones.
+        if (sa < 24) { continue; }
+        lit_n = lit_n + 1;
+        // Geometry: a 20x4 bar 22 px out from the aim axis on the two vertical
+        // segments, 4x20 the same distance out on the horizontal ones, each on
+        // its own 1-px UI_BLACK plate. 22 px clears the crosshair's widest
+        // sprinting spread (3 + 9 = 12 px) with room to read as separate.
+        let bx: f64 = cx - 10.0; let by: f64 = cy - 26.0;
+        let bw: f64 = 20.0;      let bh: f64 = 4.0;
+        if (si == HUD_DMG_BACK)  { by = cy + 22.0; }
+        if (si == HUD_DMG_RIGHT) { bx = cx + 22.0; by = cy - 10.0; bw = 4.0; bh = 20.0; }
+        if (si == HUD_DMG_LEFT)  { bx = cx - 26.0; by = cy - 10.0; bw = 4.0; bh = 20.0; }
+        used = used + hud_rect(bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0,
+                               g_UI_BLACK, clampi(sa, 0, 190));
+        used = used + hud_rect(bx, by, bw, bh, g_UI_DANGER, sa);
+    }
+    if (lit_n > g_dmg_seg_peak) { g_dmg_seg_peak = lit_n; }
+    if (lit_n > 0) { g_fb_seg_frames = g_fb_seg_frames + 1; }
+
+    // ---- YOUR SHOT CONNECTED, AND FOR HOW MUCH (GDD §7.8) ----------------
+    // The fifth signal of CLAUDE.md §9's contract. `EV_DAMAGE_NUMBER` has
+    // carried the value in its `sub` field since combat.hml was written and the
+    // client turned it into an anonymous white mote and threw the number away;
+    // a mote is a particle, not a number, and the difference is the whole
+    // sentence "I am doing 18 and it has 40 left" versus "something happened".
+    //
+    // SCREEN-ANCHORED, ABOVE THE CROSSHAIR, AND THAT IS A DELIBERATE DEPARTURE
+    // FROM §7.8's "rising numeral at the hit point", stated rather than hidden:
+    // a world-space numeral needs a glyph billboard in `src/render/fx.hml`,
+    // which this task does not own, AND at 320x180 a Wisp at 20 m is six pixels
+    // across, so a number pinned to it would be unreadable even if it existed.
+    // FONT_BIG is the right font here for the one reason it exists: it carries
+    // `0`-`9`, so unlike every WORD in this file it actually draws.
+    let dnt: f64 = client_dmgnum_t(g_cl);
+    if (dnt > 0.0 && client_dmgnum(g_cl) > 0) {
+        if (client_dmgnum(g_cl) != g_dmgnum_shown) {
+            g_dmgnum_shown = client_dmgnum(g_cl);
+            g_l_dmgnum = `${g_dmgnum_shown}`;
+        }
+        let dc: i32 = g_UI_WHITE;
+        if (client_dmgnum_crit(g_cl) == 1) { dc = g_UI_AMBER; }
+        // It RISES, which is what makes two numbers in a row read as two hits
+        // rather than one flickering one: 6 px over its lifetime.
+        let rise: f64 = (1.0 - dnt / CL_DMGNUM_S) * 6.0;
+        let ds: string = g_l_dmgnum;
+        let dw: f64 = f64(ds.length) * 8.0;
+        used = used + hud_text_big(cx - dw * 0.5, cy - 34.0 - rise, ds, dc,
+                                   clampi(cap - used, 0, g_TB_DMGNUM));
+        g_fb_dmgnum_frames = g_fb_dmgnum_frames + 1;
     }
 
     // ---- the interact prompt.  GAME_DESIGN §8 at 0:24. -------------------
@@ -2606,15 +3048,28 @@ fn hud_build() {
     //
     // >>> IT IS DRAWN OFF `teach_plant_ready`, WHICH IS THE FUNCTION
     //     `sv_ui_tick` USES TO DECIDE WHETHER THE KEY PLANTS. <<< One boolean,
-    // two readers. A prompt promising a key the server ignores is the failure
-    // mode this construction makes unrepresentable.
+    // two readers.
+    //
+    // >>> AND THE OLD VERSION OF THIS COMMENT SAID THAT WAS ENOUGH, BESIDE
+    //     CODE WHERE IT WAS NOT. <<< It read "A prompt promising a key the
+    // server ignores is the failure mode this construction makes
+    // unrepresentable", and then the next four lines `&&`-ed three more terms
+    // onto the shared boolean that the server had never heard of. Gate 9
+    // enumerated the eight states of (moving | still) x (in | out of the reach)
+    // x (first post | not) against the real shipped function and found the one
+    // that mattered: MOVING, OUTSIDE THE REACH, PAST THE GRANT WINDOW spends a
+    // lantern kit with nothing at all on screen. The naive player hit it at
+    // T+3:10 and checked the cropped frame immediately before the press.
     //
     // WHEN IT SHOWS, AND WHY NOT ALWAYS. A prompt that is up for the whole
     // 282 m walk home is noise, and noise is what teaches players to stop
     // reading prompts (§9.9's cousin). It shows when you STOP -- which is when
     // a person deciding where to put something actually stops -- or when you
     // are inside the reach, where the decision is live whether you are moving
-    // or not.
+    // or not, or until you have planted your very first post, when the verb is
+    // still being taught. THOSE ARE NOW THE SERVER'S RULES TOO, argument by
+    // argument, so this is a bare `if` on the shared predicate and the prompt
+    // being on screen is exactly equivalent to the key working.
     //
     // The second line is FACT 2, in metres, at the moment of the decision. It
     // is the sentence the game has never once said.
@@ -2629,17 +3084,12 @@ fn hud_build() {
     // so the gate does not fire in any run made for this report -- and
     // `g_teach_prompt_yield` counts it if it ever does, because a teaching
     // signal that vanishes silently is the defect, not the fix.
-    let plant_ok: i32 = teach_ready();
-    // WHEN THE PACK FILLS, THE GATE OPENS WHETHER YOU ARE MOVING OR NOT, for
-    // `g_TEACH_GRANT_S`. The beat that hands you the verb is the one beat where
-    // "wait until they stop walking" is the wrong answer -- and it is the beat
-    // the deleted grant card below could not afford.
-    let plant_show: i32 = 0;
-    if (plant_ok == 1) {
-        if (client_speed(g_cl) < 0.6 || s_in == 1 || g_teach_grant_t > 0.0) {
-            plant_show = 1;
-        }
-    }
+    // ONE CALL, NOTHING `&&`-ED ONTO IT. If you are ever tempted to add a term
+    // here, add it to `teach_plant_ready` instead -- `probe_teach` §A drives a
+    // real session through all eight states and asserts that "the prompt was
+    // up" and "a kit was spent" are the same bit, so a term added here goes red
+    // rather than costing a player a lantern.
+    let plant_show: i32 = teach_ready();
     if (plant_show == 1 && used + 116 > cap) {
         g_teach_prompt_yield = g_teach_prompt_yield + 1;
     }
@@ -2815,17 +3265,13 @@ fn hud_build() {
     // actually announces the grant in that screenshot is the PROMPT --
     // "[E] PLANT A LANTERN POST", centre screen, in the plate this game has
     // used for instructions since 0:24 -- and it says it better than a card in
-    // the corner would have. So the card is gone and the prompt's gate now
-    // opens for `g_TEACH_GRANT_S` after the pack fills whether you are moving
-    // or not (see the gate above). Same beat, same sentence, 100 fewer
-    // triangles, and it is on screen instead of in a comment.
-
-    // ---- death -----------------------------------------------------------
-    if (client_dead(g_cl) == 1 && used + 62 <= cap) {
-        used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H), g_UI_DANGER, 60);
-        used = used + hud_centre_big(cy - 10.0, "THE DARK TOOK YOU", g_UI_WHITE,
-                                     clampi(cap - used, 0, 60));
-    }
+    // the corner would have. So the card is gone and the prompt carries the
+    // beat: the `p_placed < 1` arm of `teach_plant_ready` holds the prompt open
+    // unconditionally until the player's first post is in the ground, which is
+    // strictly longer than the four-second `g_TEACH_GRANT_S` window it replaced
+    // AND is a fact the server can read, which the timer was not. Same beat,
+    // same sentence, 100 fewer triangles, and it is on screen instead of in a
+    // comment.
 
     // ---- the wave readout ------------------------------------------------
     let ws: i32 = client_wave_state(g_cl);
@@ -3022,7 +3468,61 @@ fn viewmodel_emit() {
 //  11.  BOOT AND SHUTDOWN
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+//  `--headless` MEANS NO WINDOW.  IT DID NOT, AND THAT COST AN AGENT 40 MINUTES.
+// ---------------------------------------------------------------------------
+//  Until 2026-08-01 `--headless` did exactly one thing: it skipped the relative
+//  mouse grab.  `boot_window()` ran unconditionally before any `g_headless`
+//  check, and `window_open_ex` passes `SDL_WINDOW_SHOWN` — so every headless
+//  run MAPPED A REAL WINDOW.  Gate 9 counted SEVEN of them on the owner's
+//  desktop at once, and the naive-player agent spent forty minutes typing into
+//  and screenshotting ANOTHER agent's game before it noticed the geometry
+//  collision, then discarded all forty minutes and re-ran.
+//
+//  THE WINDOW CANNOT SIMPLY BE SKIPPED.  Everything downstream of it needs an
+//  SDL renderer: `assets_build_stage(g_win, s)` uploads the four atlases,
+//  `target_new(g_win, ...)` is a render target texture, `frame_init` binds
+//  both.  A headless build with no window would have to fake all three.
+//
+//  So `--headless` does what `tools/shot.hml` has always been TOLD to do by its
+//  caller, and does it itself: select SDL's `dummy` video driver, which opens
+//  no display connection at all.  SDL reads `SDL_VIDEODRIVER` inside
+//  `SDL_Init`, and `SDL_Init` is inside `window_open_ex`, so setting it here —
+//  the first statement of `boot_window`, before anything touches SDL — is early
+//  enough.  `wmctrl -l` during a `--headless --demo` now lists zero NIGHTSHADE
+//  windows; before this it listed one per run.
+//
+//  THE FLAG WINS OVER THE ENVIRONMENT, deliberately and loudly.  If an operator
+//  exports `SDL_VIDEODRIVER=x11` and then asks for `--headless`, the two
+//  disagree and the safe reading is the explicit flag: a headless run that
+//  quietly opens a window is the exact failure this comment exists to end.  The
+//  override is printed, so a confusing run says why on stdout.
+//
+//  WHAT THIS DOES NOT COVER, stated plainly:
+//    * AUDIO.  `--headless` alone still opens an audio device; `SDL_Init` in
+//      `window_open_ex` asks for `SDL_INIT_AUDIO` and the dummy VIDEO driver
+//      does not touch it.  `--selftest` and `--anchorscan` already set
+//      `g_no_audio`.  Pass `--no-audio` with a bare `--headless` if you want
+//      silence.
+//    * BLEND_ADD.  The dummy driver selects SDL's SOFTWARE renderer, which
+//      collapses BLEND_ADD to BLEND inside `SDL_RenderGeometry`
+//      (`tools/shot.hml` prints this warning on every headless shot).  FX and
+//      glow brightness in a `--headless --shots` PNG is NOT what a real display
+//      shows.  This is not new — every documented headless invocation in this
+//      file already ran under `SDL_VIDEODRIVER=dummy` — but it is now implied
+//      by the flag instead of typed by the caller, so it is written here.
+fn headless_video() {
+    if (g_headless == 0) { return; }
+    let cur = getenv("SDL_VIDEODRIVER");
+    if (cur != null) {
+        if (cur == "dummy") { return; }
+        eprint(`nightshade: --headless overrides SDL_VIDEODRIVER=${cur} with dummy`);
+    }
+    setenv("SDL_VIDEODRIVER", "dummy");
+}
+
 fn boot_window(): i32 {
+    headless_video();
     g_win = window_open_ex("NIGHTSHADE", g_RES_W, g_RES_H, g_upscale, 0);
     if (g_win == null) {
         eprint(`nightshade: window_open failed: ${sdl_error()}`);
@@ -3466,6 +3966,13 @@ let g_running: i32 = 1;
 let g_demo_s: f64 = 0.0;
 let g_next_shot: f64 = 1.0e30;
 let g_shot_every: f64 = 5.0;
+// `--stand`: run the demo clock with NO driver at all. This is Gate 9's repro
+// and NAIVE_PLAYER.md §T+0:12 verbatim -- "I stood still and turned in place to
+// survey ... health went 100 ... 82, 76 and then to zero" -- and it is the only
+// way to reach the death path in CI, because `src/game/demobot.hml` is good
+// enough that a 90 s demo usually never dies. It drives nothing; it only stops
+// `demo_drive` from driving.
+let g_stand: i32 = 0;
 
 // The headless/demo driver: walks to the lantern, lights it, and shoots at
 // whatever is in front. It exists so the first 60 seconds can be RUN in CI, on
@@ -3827,6 +4334,48 @@ fn framebuffer_to_rgb(): buffer {
 let g_shot_pending: i32 = 0;
 let g_shot_tag: string = "";
 
+// The direction indicator, in words, on the stats line beside every screenshot.
+// "You have to LOOK at the frame" is CLAUDE.md rule 7, and this is what makes
+// looking at it CHECKABLE: `dmgseg F-118` says a source is 118 degrees round to
+// your left-and-behind and the BACK segment is the brightest, so the reader can
+// confirm the picture against the number instead of judging a red bar by eye.
+fn dmg_dbg(): string {
+    // The strongest live SOURCE, and separately the dominant SEGMENT. They are
+    // two different questions and an earlier version of this function conflated
+    // them, reporting whichever bearing happened to be in flight when the
+    // segment total crossed the running maximum.
+    let yaw_r: f64 = g_yaw_deg * g_D2R;
+    let nslot: i32 = client_dmg_slots();
+    let brel: f64 = 0.0;
+    let bfade: f64 = 0.0;
+    for (let si = 0; si < g_DMG_SEGS; si++) { g_seg_w[si] = 0.0; }
+    for (let j = 0; j < nslot; j++) {
+        let st: f64 = client_dmg_slot_t(g_cl, j);
+        if (st <= 0.0) { continue; }
+        let rel: f64 = client_dmg_slot_dir(g_cl, j) - yaw_r;
+        let fade: f64 = st / g_DMG_DIR_FADE_S;
+        if (fade > bfade) { bfade = fade; brel = rel; }
+        for (let si2 = 0; si2 < g_DMG_SEGS; si2++) {
+            g_seg_w[si2] = g_seg_w[si2] + hud_dmg_seg_weight(rel, si2) * fade;
+        }
+    }
+    let best: i32 = -1;
+    let bw: f64 = 0.0;
+    for (let i = 0; i < g_DMG_SEGS; i++) {
+        if (g_seg_w[i] > bw) { bw = g_seg_w[i]; best = i; }
+    }
+    if (best < 0) { let none: string = "dmgseg -"; return none; }
+    let nm: string = "FRONT";
+    if (best == HUD_DMG_RIGHT) { nm = "RIGHT"; }
+    if (best == HUD_DMG_BACK)  { nm = "BACK"; }
+    if (best == HUD_DMG_LEFT)  { nm = "LEFT"; }
+    let d: f64 = brel / g_D2R;
+    while (d > 180.0) { d = d - 360.0; }
+    while (d < -180.0) { d = d + 360.0; }
+    let out: string = `dmgseg ${nm}@${i32(d)}deg`;
+    return out;
+}
+
 fn shot_request(p_tag: string) {
     if (g_shot_dir.length == 0) { return; }
     g_shot_pending = 1;
@@ -3841,7 +4390,7 @@ fn shot_flush() {
     let img: buffer = framebuffer_to_rgb();
     let path: string = `${g_shot_dir}/ns_${g_shot_seq}_${g_shot_tag}.png`;
     write_png(path, img, g_RES_W, g_RES_H);
-    print(`nightshade: wrote ${path}  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  hud ${g_hud_tris}  vm ${g_vm_tris}  dc ${stat_get(STAT_DRAW_CALLS)}  beat ${server_beat_name(server_beat(g_sv))}  pos ${i32(client_px(g_cl))},${i32(client_pz(g_cl))}  d ${i32(client_lantern_dist(g_cl))}  kits ${client_pack_kits(g_cl)} reach ${g_teach_ring_n}  hp ${client_hp(g_cl)} ammo ${client_ammo(g_cl)}/${client_reserve(g_cl)} rl ${f1(client_reloading(g_cl))} alive ${client_alive(g_cl)} ctl ${client_has_control(g_cl)} fog ${i32(g_fog_far)} h ${f1(tod_clock_hours(g_day_t))} camy ${f1(g_camy)} gy ${f1(g_ground_y)} p ${i32(g_pitch_deg)}`);
+    print(`nightshade: wrote ${path}  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  hud ${g_hud_tris}  vm ${g_vm_tris}  dc ${stat_get(STAT_DRAW_CALLS)}  beat ${server_beat_name(server_beat(g_sv))}  pos ${i32(client_px(g_cl))},${i32(client_pz(g_cl))}  d ${i32(client_lantern_dist(g_cl))}  kits ${client_pack_kits(g_cl)} reach ${g_teach_ring_n}  hp ${client_hp(g_cl)} ammo ${client_ammo(g_cl)}/${client_reserve(g_cl)} rl ${f1(client_reloading(g_cl))} alive ${client_alive(g_cl)} ctl ${client_has_control(g_cl)} dead ${client_dead(g_cl)} ${dmg_dbg()} hm ${f1(client_hitmarker(g_cl))} dn ${client_dmgnum(g_cl)} fog ${i32(g_fog_far)} h ${f1(tod_clock_hours(g_day_t))} camy ${f1(g_camy)} gy ${f1(g_ground_y)} p ${i32(g_pitch_deg)}`);
     g_shot_seq++;
 }
 
@@ -3894,7 +4443,7 @@ fn run_loop() {
         // -- 1  input_sample: EVERY frame, before the tick loop -------------
         input_sample(g_in, g_win);
         if (g_demo_s > 0.0) {
-            demo_drive(t, dt);
+            if (g_stand == 0) { demo_drive(t, dt); }
             if (input_quit(g_in)) { g_running = 0; }
             if (t >= g_demo_s) { g_running = 0; }
         } else {
@@ -4094,6 +4643,10 @@ fn run_loop() {
         // (one additive card per mark, 2 triangles each) and it is the only new
         // WORLD geometry this task added.
         print(`   TEACH: kits in pack ${client_pack_kits(g_cl)}  planted ${client_kits_placed(g_cl)} (${g_teach_plants_in} inside the reach, ${g_teach_plants_out} outside)  reach PEAK ${g_teach_ring_peak} marks = ${g_teach_ring_peak * 4} tris (2 cards each)  prompt yielded on ${g_teach_prompt_yield} frames  ring ${i32(settle_ring_m(client_settle_tier_ever(g_cl)))} m  server verdict ${server_kit_verdict(g_sv)}/${i32(server_kit_verdict_d(g_sv))}m n${server_kit_verdict_n(g_sv)}`);
+        let dub: i32 = g_death_used_best;
+        if (g_death_frames == 0) { dub = 0; }
+        print(`   FEEDBACK death: dead frames ${g_death_frames} (${g_death_ctl} of them WITH control -- MUST be 0)  used at the block ${dub}..${g_death_used_worst}  drawn ${g_death_drawn}  yielded ${g_death_yield}  banner ${g_death_tris_worst} tris`);
+        print(`   FEEDBACK hits: hitmarker on ${g_fb_hitmark_frames} frames  damage numbers on ${g_fb_dmgnum_frames}  direction segments on ${g_fb_seg_frames} (peak ${g_dmg_seg_peak} of ${g_DMG_SEGS} lit at once)  EV_DAMAGE_TAKEN consumed ${client_dmg_hits(g_cl)}`);
     }
 }
 
@@ -4133,13 +4686,29 @@ fn usage() {
     print("  --sens <f>        mouse sensitivity multiplier");
     print("  --demo <s>        run the scripted first-60-seconds, hands off");
     print("  --shots <dir>     write a PNG every 5 s (with --demo)");
+    print("  --shot-every <s>  change that 5 s");
+    print("  --stand           with --demo: NO driver at all. You wake, you do");
+    print("                    nothing, and about 27 s later the dark takes you.");
+    print("                    NAIVE_PLAYER.md's repro, and the only way to reach");
+    print("                    the death screen in CI -- demobot.hml rarely dies.");
     print("  --vm <0|1|2>      viewmodel: off / frame-graph static / driven");
     print("  --no-audio        do not open an audio device");
-    print("  --headless        SDL_VIDEODRIVER=dummy is expected; no mouse grab");
+    print("  --headless        no window at all: forces SDL_VIDEODRIVER=dummy");
+    print("                    before SDL_Init, and skips the mouse grab. Add");
+    print("                    --no-audio if you also want no audio device.");
     print("  --workers <0..12> parallel emit workers (default from config: 8).");
     print("                    0 or 1 = serial, which is byte-identical output");
     print("                    and the no-threads path. Clamped to 12.");
     print("  --selftest        headless smoke test; exits 0 on pass");
+    print("  --ringscan <h>    the reach ring at hour h, 8 yaws from INSIDE it and");
+    print("                    8 from OUTSIDE, each rendered twice (ring on / ring");
+    print("                    off) so the pixels it adds are counted rather than");
+    print("                    guessed, under BOTH cull rules. Add --shots <dir>.");
+    print("                    DO NOT add --headless: the dummy driver's software");
+    print("                    renderer collapses BLEND_ADD and the ring is additive.");
+    print("  --ringcull <fog|nav>  DEV: which reject reach_ring_push uses. `fog`");
+    print("                    restores the pre-2026-08 test that switched the ring");
+    print("                    off at night. Default `nav`.");
     print("  --anchorscan <h>  headless: the 8-yaw night-anchor table at hour h,");
     print("                    measured UNLIT then LIT, HUD and viewmodel off.");
     print("                    Add --shots <dir> to write the 16 frames.");
@@ -4836,6 +5405,253 @@ fn run_anchorscan(): i32 {
     return rc;
 }
 
+// ===========================================================================
+//  `--ringscan <hour>` — IS THE REACH ON SCREEN, AT NIGHT, FROM BOTH SIDES?
+// ---------------------------------------------------------------------------
+//  Gate 9: "the ring is fog-gated, so it cannot draw at night -- which is when
+//  you plant." That claim and its fix both need the same thing: a survey that
+//  photographs the boundary from INSIDE it and from OUTSIDE it, at eight yaws,
+//  at an hour the caller names, and that says in NUMBERS whether anything of
+//  the ring reached the framebuffer.
+//
+//  >>> IT MEASURES BY TURNING THE RING OFF, WHICH IS THE ONLY HONEST WAY. <<<
+//  Counting "bright warm pixels" in a night frame counts the moon, the town's
+//  windows, the muzzle-flash-coloured stars and the HUD. So every yaw is
+//  rendered TWICE from the identical camera, one frame apart, with `g_ring_off`
+//  the only difference, and what is reported is the DELTA: how many pixels the
+//  ring changed and by how much. A ring that is fog-culled reports 0 and cannot
+//  report anything else; a ring that is drawn cannot report 0. It is the same
+//  construction as `--workers 0` vs `--workers 8` and it is self-sabotaging by
+//  design.
+//
+//  AND IT RUNS BOTH CULL RULES IN ONE BINARY. `--ringcull fog` is the shipped
+//  pre-fix test (`dc > r + g_fog_far`); `nav` is the fix. The scan runs both at
+//  every yaw so the before/after table is one flag apart on one build, not two
+//  builds a report apart.
+//
+//  RUN IT ON A REAL DISPLAY. Do NOT pass `--headless`: that selects SDL's dummy
+//  video driver, whose SOFTWARE renderer collapses BLEND_ADD to BLEND inside
+//  `SDL_RenderGeometry`, and every mark of this ring is an additive card. A
+//  headless ringscan understates the thing it is measuring. Nothing here reads
+//  the X server -- the pixels come from the game's own `frame_set_capture`
+//  readback of its own render target -- so a second copy of the game on the
+//  same display cannot contaminate a number in this table.
+// ===========================================================================
+let g_ringscan: i32 = 0;
+let g_RS_STAND_IN: f64 = 0.50;    // fraction of the ring radius: 32 m at CAMP
+let g_RS_STAND_OUT_M: f64 = 25.0; // metres OUTSIDE the ring: gate 9's frame
+let g_rs_fb2: ptr = alloc(g_RES_W * g_RES_H * 4);
+
+// Copy the readback aside so the next render can be differenced against it.
+fn rs_snapshot() {
+    let n: i32 = g_RES_W * g_RES_H * 4;
+    for (let i = 0; i < n; i++) {
+        ptr_write_u8(ptr_offset(g_rs_fb2, i, 1),
+                     ptr_deref_u8(ptr_offset(g_fb, i, 1)));
+    }
+}
+
+// Luminance of the SAVED frame at byte offset `p_o`. Same B,G,R,A order and the
+// same Rec.709 weights `scan_lum` uses, through one function for the reason
+// `scan_lum` gives.
+fn rs_lum2(p_o: i32): f64 {
+    let b: f64 = f64(ptr_deref_u8(ptr_offset(g_rs_fb2, p_o, 1)));
+    let g: f64 = f64(ptr_deref_u8(ptr_offset(g_rs_fb2, p_o + 1, 1)));
+    let r: f64 = f64(ptr_deref_u8(ptr_offset(g_rs_fb2, p_o + 2, 1)));
+    let out: f64 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return out;
+}
+
+// [changed px, summed luminance added, worst single-pixel delta, warm px].
+let g_rs_d: array<f64> = [0.0, 0.0, 0.0, 0.0];
+
+fn rs_diff() {
+    let n: i32 = g_RES_W * g_RES_H;
+    let px: f64 = 0.0;
+    let acc: f64 = 0.0;
+    let mx: f64 = 0.0;
+    let warm: f64 = 0.0;
+    for (let i = 0; i < n; i++) {
+        let o: i32 = i * 4;
+        let d: f64 = scan_lum(o) - rs_lum2(o);
+        if (d < 1.0) { continue; }
+        px = px + 1.0;
+        acc = acc + d;
+        if (d > mx) { mx = d; }
+        let bb: f64 = f64(ptr_deref_u8(ptr_offset(g_fb, o, 1)));
+        let rr: f64 = f64(ptr_deref_u8(ptr_offset(g_fb, o + 2, 1)));
+        if (rr - bb >= g_SCAN_NOT_COOL) { warm = warm + 1.0; }
+    }
+    g_rs_d[0] = px;
+    g_rs_d[1] = acc;
+    g_rs_d[2] = mx;
+    g_rs_d[3] = warm;
+}
+
+// One yaw, one cull rule: render the ring OFF, keep the frame, render it ON,
+// difference them. Returns the marks pushed on the ON frame.
+fn rs_yaw(p_yaw: f64, p_cull: i32, p_tag: string): i32 {
+    g_ring_cull = p_cull;
+    g_ring_off = 1;
+    frame_set_capture(1);
+    scan_render(p_yaw);
+    frame_set_capture(0);
+    rs_snapshot();
+    g_ring_off = 0;
+    frame_set_capture(1);
+    scan_render(p_yaw);
+    frame_set_capture(0);
+    let marks: i32 = g_teach_ring_n;
+    rs_diff();
+    if (g_shot_dir.length > 0) {
+        let img: buffer = framebuffer_to_rgb();
+        write_png(`${g_shot_dir}/ring_${p_tag}.png`, img, g_RES_W, g_RES_H);
+    }
+    let out: i32 = marks;
+    return out;
+}
+
+fn rs_side(p_label: string, p_x: f64, p_z: f64, p_r: f64): i32 {
+    print("");
+    print(`  --- ${p_label} ------------------------------------------------`);
+    scan_stand_at(p_x, p_z);
+    let dcx: f64 = client_settle_x(g_cl) - g_camx;
+    let dcz: f64 = client_settle_z(g_cl) - g_camz;
+    let dc: f64 = sqrt(dcx * dcx + dcz * dcz);
+    let gap: f64 = dc - p_r;
+    if (gap < 0.0) { gap = 0.0 - gap; }
+    print(`    ${f1(dc)} m from the green, ring ${f1(p_r)} m, so the boundary is ${f1(gap)} m away`);
+    print(`    HUD reads "${g_l_reach}"   inside ${client_settle_inside(g_cl)}   kits ${client_pack_kits(g_cl)}   fog ${i32(g_fog_far)} m`);
+    print("     yaw |  FOG CULL (shipped)      |  NAV CULL (this wave)");
+    print("         | marks  px  lum   worst   | marks  px  lum   worst  warm  tris");
+    let nav_yaws: i32 = 0;
+    for (let y = 0; y < g_SCAN_YAWS; y++) {
+        let yd: f64 = f64(y) * 360.0 / f64(g_SCAN_YAWS);
+        let yr: f64 = yd * g_D2R;
+        scan_settle(yr, 3);
+        let fm: i32 = rs_yaw(yr, g_RING_CULL_FOG, `${p_label}_fog_y${i32(yd)}`);
+        let fpx: i32 = i32(g_rs_d[0]); let flum: i32 = i32(g_rs_d[1]);
+        let fw: i32 = i32(g_rs_d[2]);
+        let nm: i32 = rs_yaw(yr, g_RING_CULL_NAV, `${p_label}_nav_y${i32(yd)}`);
+        let npx: i32 = i32(g_rs_d[0]); let nlum: i32 = i32(g_rs_d[1]);
+        let nw: i32 = i32(g_rs_d[2]); let nwarm: i32 = i32(g_rs_d[3]);
+        if (npx > 0) { nav_yaws = nav_yaws + 1; }
+        print(`     ${i32(yd)}\t|  ${fm}\t${fpx}\t${flum}\t${fw}\t  |  ${nm}\t${npx}\t${nlum}\t${nw}\t${nwarm}\t${stat_get(STAT_TRIS_DRAWN)}`);
+    }
+    let out: i32 = nav_yaws;
+    return out;
+}
+
+// ---- WHAT THE FUNCTION COSTS, ON A BOX THAT IS NEVER IDLE -----------------
+// RULE T, and `__clock` CPU time on purpose: the WALL clock on this machine is
+// unusable today. A `--demo` A/B over 7 trials at loadavg 78-120 came out with
+// the arm that draws 67 MORE marks reporting the FASTER mean (35.1 vs 37.0 ms),
+// which is the noise floor announcing itself rather than a result. CPU time of
+// one function, min of 7 batches, is the honest instrument at this load.
+//
+// THE BASELINE IS THE SAME LOOP WITH `g_ring_off`, so `world_clear` and the
+// call overhead subtract out exactly and what is left is the ring. One flag
+// apart, same binary -- the construction the parallel-emit spike and the
+// `w.model` / `w.anim` A/B both used, for the same reason.
+//
+// It is called from BOTH standpoints because the two answer different
+// questions: from inside, every mark of the ring passes the distance test and
+// the number is the WORST case; from outside, most of the circle is culled and
+// the number is what a walk home actually pays.
+fn rs_cost(p_label: string) {
+    let reps: i32 = 400;
+    let base: f64 = 1.0e30;
+    let full: f64 = 1.0e30;
+    for (let tr = 0; tr < 7; tr++) {
+        g_ring_off = 1;
+        let t0: u64 = clock_now();
+        for (let k = 0; k < reps; k++) { world_clear(); reach_ring_push(f64(k) * 0.016); }
+        let m0: f64 = clock_ms_between(t0, clock_now());
+        if (m0 < base) { base = m0; }
+        g_ring_off = 0;
+        let t1: u64 = clock_now();
+        for (let k = 0; k < reps; k++) { world_clear(); reach_ring_push(f64(k) * 0.016); }
+        let m1: f64 = clock_ms_between(t1, clock_now());
+        if (m1 < full) { full = m1; }
+    }
+    let us: f64 = (full - base) / f64(reps) * 1000.0;
+    print(`    COST from ${p_label}: reach_ring_push ${f1(us)} us/frame at ${g_teach_ring_n} marks drawn`);
+    print(`      = ${f1(us / 16670.0 * 100.0)} % of a 16.67 ms frame, ${g_teach_ring_n * 4} of the ${g_TRIS_STEADY} triangle budget`);
+    print(`      (min of 7 x ${reps}: ring on ${f1(full)} ms, ring off ${f1(base)} ms, __clock CPU)`);
+}
+
+fn run_ringscan(): i32 {
+    g_vm_mode = 0;
+    g_scan_t = scan_t_from_hours(g_scan_h);
+    print("");
+    print("=== REACH-RING SCAN — is the boundary on screen at night, both sides? ===");
+    print(`  clock ${f1(g_scan_h)}h  (day_t ${g_scan_t}, tod_clock_hours ${f1(tod_clock_hours(g_scan_t))})`);
+    print("  px = pixels the ring changed vs the identical frame with it off;");
+    print("  lum = total Rec.709 added; worst = biggest single-pixel gain.");
+
+    // The opening runs out first, for `run_anchorscan`'s two reasons: the
+    // title card is drawn before the HUD's own switch, and control is not
+    // granted until the STAND beat.
+    let opened: i32 = 0;
+    while (opened < 900) {
+        scan_tick(1);
+        opened++;
+        if (client_has_control(g_cl) == 1 && client_intro_alpha(g_cl) <= 0.002) {
+            if (opened > 240) { opened = 900; }
+        }
+    }
+    // A wick in the pack, because the reach only answers a wick you are
+    // carrying (`teach_ring_show`). This IS a fixture and it is a look-review
+    // rig; nothing here asserts a game outcome.
+    if (client_pack_kits(g_cl) < 1) { server_grant_kits(g_sv, 2); }
+    scan_tick(12);
+    let cxs: f64 = client_settle_x(g_cl);
+    let czs: f64 = client_settle_z(g_cl);
+    let r: f64 = settle_ring_m(client_settle_tier_ever(g_cl));
+    print(`  opening done: control ${client_has_control(g_cl)}, beat ${server_beat_name(server_beat(g_sv))}, kits ${client_pack_kits(g_cl)}`);
+    print(`  green ${i32(cxs)}, ${i32(czs)}   tier_ever ${client_settle_tier_ever(g_cl)}   reach ${f1(r)} m`);
+    if (r <= 0.0) {
+        print("  FAIL: no settlement on the wire — nothing to draw a reach around.");
+        let bad: i32 = 1;
+        return bad;
+    }
+
+    let in_n: i32 = rs_side("in", cxs + r * g_RS_STAND_IN, czs, r);
+    rs_cost("INSIDE");
+    let out_n: i32 = rs_side("out", cxs + r + g_RS_STAND_OUT_M, czs, r);
+    rs_cost("OUTSIDE");
+
+    print("");
+    print(`  yaws where the NAV cull put the reach on screen:  INSIDE ${in_n} / ${g_SCAN_YAWS}   OUTSIDE ${out_n} / ${g_SCAN_YAWS}`);
+    print(`  ring peak this run: ${g_teach_ring_peak} marks = ${g_teach_ring_peak * 4} triangles (2 cards each) of the ${g_TRIS_STEADY} budget`);
+
+    // >>> AND IT EXITS 1, SO IT IS A GATE AND NOT A BROCHURE. <<<
+    //
+    // INSIDE the bar is 8 of 8, and it can be, because from inside a ring the
+    // boundary surrounds you: every yaw looks at some of it.
+    //
+    // OUTSIDE the bar is 4 of 8 and the arithmetic is why it is not 8. From
+    // `g_RS_STAND_OUT_M` outside a ring of radius r, the ring subtends
+    // `asin(r / dc)` either side of the green's bearing -- at 25 m outside a
+    // 64 m reach that is +/- 45.9 degrees -- and the horizontal half-fov is
+    // 44.58 degrees at fov 58 / 16:9. So the arc can be in frame only within
+    // 90.5 degrees of the bearing, which is 181 of the 360 and therefore 4 or 5
+    // of 8 evenly spaced yaws. Demanding 8 would be demanding that a boundary
+    // 89 m in FRONT of you also be behind you, and the honest thing is to say
+    // so rather than to widen the ring until the number goes green (§5).
+    let rc: i32 = 0;
+    if (in_n < g_SCAN_YAWS) {
+        print(`  FAIL: the reach must be on screen at every yaw from INSIDE it; ${in_n} of ${g_SCAN_YAWS}`);
+        rc = 1;
+    }
+    if (out_n < 4) {
+        print(`  FAIL: from ${f1(g_RS_STAND_OUT_M)} m OUTSIDE, the arc is geometrically in frame at 4 yaws of ${g_SCAN_YAWS}; only ${out_n} drew`);
+        rc = 1;
+    }
+    if (rc == 0) { print("  PASS"); }
+    return rc;
+}
+
 // ---------------------------------------------------------------------------
 // THE SHELL'S SMOKE TEST.  `tools/probe_game.hml` is the acceptance harness —
 // 81 assertions over the loop, the wire, the latency modes and the sixty
@@ -4847,8 +5663,11 @@ fn run_anchorscan(): i32 {
 //
 // Exit status is the contract: 0 iff every assertion passed AND the expected
 // NUMBER of assertions ran.
-let g_ST_EXPECT: i32 = 28;   // 12 from W4-11, +7 W6, +2 emit pool, +4 W7-3,
-                             // +3 teach-the-verb
+let g_ST_EXPECT: i32 = 32;   // 12 from W4-11, +7 W6, +2 emit pool, +4 W7-3,
+                             // +3 teach-the-verb, +1 the-ring-at-night (the
+                             // 1-of-8 state that used to spend a kit silently),
+                             // +3 the-feedback-loop (front-vs-behind, the dead
+                             // latch, and the FONT_BIG tripwire on the banner)
 let g_st_n: i32 = 0;
 let g_st_ok: i32 = 0;
 let g_st_tri_peak: i32 = 0;
@@ -4934,13 +5753,23 @@ fn selftest_report(): i32 {
     // must answer 1, or the prompt would never appear in the game at all.
     stck(teach_ready() == 0 && client_pack_kits(g_cl) == 0,
          `the plant prompt is silent with an empty pack: kits ${client_pack_kits(g_cl)}, ready ${teach_ready()}`);
-    stck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0) == 1 &&
-         teach_plant_ready(0, 0, -1, UI_PANEL_NONE, 0) == 0 &&
-         teach_plant_ready(1, 1, -1, UI_PANEL_NONE, 0) == 0 &&
-         teach_plant_ready(1, 0, 2, UI_PANEL_NONE, 0) == 0 &&
-         teach_plant_ready(1, 0, -1, UI_PANEL_CHAR, 0) == 0 &&
-         teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 1) == 0,
+    // The five refusals, each with a kit in the pack, standing still, having
+    // planted before -- so the only thing under test is the refusal itself.
+    stck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0, 0, 1, 0.0) == 1 &&
+         teach_plant_ready(0, 0, -1, UI_PANEL_NONE, 0, 0, 1, 0.0) == 0 &&
+         teach_plant_ready(1, 1, -1, UI_PANEL_NONE, 0, 0, 1, 0.0) == 0 &&
+         teach_plant_ready(1, 0, 2, UI_PANEL_NONE, 0, 0, 1, 0.0) == 0 &&
+         teach_plant_ready(1, 0, -1, UI_PANEL_CHAR, 0, 0, 1, 0.0) == 0 &&
+         teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 1, 0, 1, 0.0) == 0,
          "the plant prompt obeys sv_ui_tick's five refusals and the one yes");
+    // AND THE STATE THAT COST A PLAYER A LANTERN KIT: moving, outside the
+    // reach, past the first post. `probe_teach` §A walks all eight in a real
+    // session; this is the one that used to differ between the two readers,
+    // pinned in the shipping binary's own smoke test.
+    stck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0, 0, 1, 5.6) == 0 &&
+         teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0, 1, 1, 5.6) == 1 &&
+         teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0, 0, 0, 5.6) == 1,
+         "moving + outside + not your first post is the ONE refusal that used to spend a kit silently");
     // The reach is the settlement's own ring, read through the wire, and the
     // HUD is never allowed to draw a different one. 64 m at CAMP.
     stck(settle_ring_m(client_settle_tier_ever(g_cl)) > 0.0,
@@ -5003,6 +5832,30 @@ fn selftest_report(): i32 {
     stck(g_st_tri_peak > 200,
          `the world still draws with ${g_emit_workers} emit workers: peak ${g_st_tri_peak} triangles`);
 
+    // ---- the-feedback-loop. THE THREE FACTS THE CONTRACT TURNS ON ----------
+    // (A) has teeth in the 3 s window because it is PURE. It is the defect the
+    // old single-arrow indicator had, stated as an equation: the previous draw
+    // site placed the arrow at `sin(rel)`, and sin(0) == sin(pi) == 0, so an
+    // attacker in front and an attacker behind produced the identical pixel.
+    // This goes RED the day somebody replaces the cosine weight with anything
+    // that cannot tell the two apart.
+    let w_f0: f64 = hud_dmg_seg_weight(0.0, HUD_DMG_FRONT);
+    let w_fb: f64 = hud_dmg_seg_weight(3.141592653589793, HUD_DMG_FRONT);
+    let w_bb: f64 = hud_dmg_seg_weight(3.141592653589793, HUD_DMG_BACK);
+    let w_r: f64  = hud_dmg_seg_weight(1.5707963267948966, HUD_DMG_RIGHT);
+    stck(w_f0 > 0.99 && w_fb < 0.001 && w_bb > 0.99 && w_r > 0.99,
+         `the direction indicator can tell FRONT from BEHIND: front-at-0 ${f1(w_f0)}, front-at-180 ${f1(w_fb)}, back-at-180 ${f1(w_bb)}, right-at-90 ${f1(w_r)}. The arrow it replaced put both of the first two in the same pixel`);
+    // (B) is 0 on a run nobody dies in and it SAYS SO. It has teeth on
+    // `--demo 45 --stand`, where it was 479 of 479 before the dead latch.
+    stck(g_death_ctl == 0,
+         `no frame was ever dead AND in control: ${g_death_ctl} of ${g_death_frames} dead frames (0 dead frames in a 3 s window means this line is watching, not testing -- run --demo 45 --stand)`);
+    // (C) THE FONT_BIG TRIPWIRE. The death banner used to be drawn with
+    // `hud_centre_big`, and FONT_BIG carries no letters, so the block emitted
+    // the 2-triangle wash and nothing else on every death this game has ever
+    // had. Any death frame must now cost three figures.
+    stck(g_death_frames == 0 || g_death_tris_worst >= 100,
+         `the death screen draws WORDS, not just a wash: ${g_death_tris_worst} triangles on its worst frame over ${g_death_frames} dead frames (it was 2, and 2 is what a banner in a font with no letters costs)`);
+
     if (g_st_n != g_ST_EXPECT) {
         print(`FAIL: ran ${g_st_n} assertions, expected ${g_ST_EXPECT}`);
         let bad: i32 = 1;
@@ -5032,6 +5885,8 @@ fn parse_args(): i32 {
         else if (a == "--vm" && i + 1 < n) { i++; g_vm_mode = clampi(i32(num_or(args[i], 2.0)), 0, 2); }
         else if (a == "--town" && i + 1 < n) { i++; g_town_tier = clampi(i32(num_or(args[i], 0.0)), 0, 3); }
         else if (a == "--at-town") { g_at_town = 1; }
+        else if (a == "--stand") { g_stand = 1; }
+        else if (a == "--shot-every" && i + 1 < n) { i++; g_shot_every = num_or(args[i], 5.0); }
         else if (a == "--demo-ui") { g_demo_ui = 1; }
         else if (a == "--demo-plant") { g_demo_plant = 1; }
         else if (a == "--kits" && i + 1 < n) { i++; g_demo_kits = i32(num_or(args[i], 0.0)); }
@@ -5042,6 +5897,18 @@ fn parse_args(): i32 {
         else if (a == "--anchorscan" && i + 1 < n) {
             i++; g_scan = 1; g_scan_h = num_or(args[i], 22.0);
             g_headless = 1; g_no_audio = 1;
+        }
+        // NOT `g_headless = 1`, and the ringscan header says why at length:
+        // the dummy video driver's software renderer collapses BLEND_ADD to
+        // BLEND and every mark of this ring is an additive card.
+        else if (a == "--ringscan" && i + 1 < n) {
+            i++; g_ringscan = 1; g_scan_h = num_or(args[i], 22.0);
+            g_no_audio = 1;
+        }
+        else if (a == "--ringcull" && i + 1 < n) {
+            i++;
+            if (args[i] == "fog") { g_ring_cull = g_RING_CULL_FOG; }
+            else { g_ring_cull = g_RING_CULL_NAV; }
         }
         else { eprint(`nightshade: unknown argument '${a}'`); usage(); let bad: i32 = 2; return bad; }
         i++;
@@ -5094,6 +5961,12 @@ fn main() {
         let src: i32 = run_anchorscan();
         shutdown();
         exit(src);
+    }
+
+    if (g_ringscan == 1) {
+        let rsrc: i32 = run_ringscan();
+        shutdown();
+        exit(rsrc);
     }
 
     run_loop();

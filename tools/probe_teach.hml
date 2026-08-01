@@ -40,6 +40,16 @@
 //    teach_plant_ready(...)  "[E] PLANT A LANTERN POST" -- THE SAME FUNCTION
 //                            `sv_ui_tick` uses to decide whether the key works
 //
+//  >>> AND AN EIGHTH WAS ADDED ON 2026-08-01, DECLARED HERE RATHER THAN
+//      SMUGGLED IN. <<<  `client_speed`. It is not a HUD readout and there is
+//      no pixel to point at, which is exactly why it belongs on the list
+//      instead of being waved through: whether you are moving is the ENTIRE
+//      SCREEN in a first-person game, and it is the one thing a player cannot
+//      fail to know. The verb now requires you to be standing still unless you
+//      are inside the reach or have never planted a post -- see the TEACH block
+//      in `src/game/server.hml` -- so an arm that cannot tell whether it is
+//      running could not obey the prompt it is supposed to be obeying.
+//
 //  `settle_cx` and `settle_cz` ARE NOT IMPORTED BY THIS FILE AT ALL, so
 //  `arm_blind` could not read the settlement's coordinates if it tried -- the
 //  symbols are not in scope. Neither is `server_world` or `server_lantern_x`.
@@ -64,6 +74,10 @@
 
 import { exit } from "@stdlib/process";
 import { floor } from "@stdlib/math";
+// §A3 reads `src/game/main.hml` AS TEXT. It does not import it and could not
+// -- that file needs a window. See §A3 for why a text check is the right shape
+// of instrument for the defect it guards.
+import { read_file, exists } from "@stdlib/fs";
 
 import { sim_accum_new, sim_accum_advance, sim_accum_alpha } from "../src/sim/sim.hml";
 
@@ -95,7 +109,7 @@ import { server_new, server_tick, server_snapshot, server_local, server_t0,
          server_npcs, server_tick_now, server_kit_verdict,
          teach_plant_ready, teach_ring_show, teach_verdict,
          TEACH_V_NONE, TEACH_V_INSIDE, TEACH_V_OUTSIDE,
-         UI_PANEL_NONE, UI_PANEL_CHAR,
+         UI_PANEL_NONE, UI_PANEL_CHAR, SV_PLANT_STILL_MS,
          SV_OPEN_KITS, SV_BEAT_PATH } from "../src/game/server.hml";
 
 import { client_new, client_set_angles, client_set_move, client_set_button,
@@ -103,7 +117,7 @@ import { client_new, client_set_angles, client_set_move, client_set_button,
          client_px, client_pz, client_dead, client_lantern_lit,
          client_cam_yaw, client_prompt, client_talk_who, client_ui_panel,
          client_pack_kits, client_kits_placed, client_settle_bearing,
-         client_settle_inside, client_settle_dist,
+         client_settle_inside, client_settle_dist, client_speed,
          client_settle_tier_ever } from "../src/game/client.hml";
 
 // ---------------------------------------------------------------------------
@@ -119,7 +133,7 @@ let g_DT_MS: f64    = 16.667;
 
 // THE ASSERTION COUNT, AS A FORMULA, checked on every run: a probe that
 // silently stops running half its checks is worse than no probe.
-let PT_FIXED: i32    = 22;   // A 8 + E 3 + F 4 + D 5 + G 2
+let PT_FIXED: i32    = 34;   // A 8 + A1 9 + A2 2 + A3 1 + E 3 + F 4 + D 5 + G 2
 let PT_PER_SEED: i32 = 9;
 
 // The blind lamplighter's numbers. Every one is a thing a person does, not a
@@ -131,6 +145,22 @@ let PT_STEP_TICKS: i32 = 150;    // ~2.5 s of walking between posts: at the run
 let PT_CHANNEL_T: i32  = 170;    // 2.5 s of held E, plus slack for the frame the
                                  // plant itself consumed
 let PT_TURN: f64       = 1.30;   // ~75 degrees. "Step off to one side."
+// A person who stops to put something down does not stop INSTANTLY, and the
+// prompt now waits for them. 90 ticks is a second and a half of standing there
+// with the key ready -- generously past the movement code's own deceleration --
+// after which the arm gives up and walks on, which is also what a person does.
+let PT_STILL_WAIT: i32 = 90;
+// Where in the 150-tick step ARM OUTSIDE presses E ON PURPOSE WHILE RUNNING.
+// This is the state gate 9 enumerated as 1 of 8: moving, outside the reach,
+// past your first post. Before this wave it spent a lantern kit and put nothing
+// whatsoever on screen; §A2 asserts, in a real session on the real wire, that
+// it now spends nothing -- because the prompt is down, and the prompt and the
+// key are finally the same bit.
+let PT_MOVE_PRESS_AT: i32 = 120;
+// Ticks to wait after a press before asking whether a kit was spent. The plant
+// happens on the server the same tick the command lands; the client learns it
+// from the next snapshot. Six is slack, not a guess about latency.
+let PT_SPEND_WAIT: i32 = 6;
 
 // ---------------------------------------------------------------------------
 //  ASSERTIONS
@@ -143,6 +173,27 @@ let g_ok: i32 = 0;
 // its villagers questions. It is a REAL, EARNED session; §F says what it then
 // does to it and why.
 let g_seed0 = null;
+
+// §A2's accumulators, over every seed and both arms.
+let g_ap: array = [0, 0, 0, 0, 0, 0, 0, 0];   // presses of E, per state
+let g_ar: array = [0, 0, 0, 0, 0, 0, 0, 0];   // ...with the PROMPT up
+let g_as: array = [0, 0, 0, 0, 0, 0, 0, 0];   // ...that SPENT a kit
+let g_silent: i32 = 0;      // spent with the prompt DOWN — the gate-9 defect
+let g_promised: i32 = 0;    // prompt UP, nothing spent (explicable; counted)
+
+fn pt_fold(p_r: object) {
+    let r: object = p_r;
+    let pr: array = r.st_pr;
+    let rd: array = r.st_rd;
+    let sp: array = r.st_sp;
+    for (let i = 0; i < 8; i++) {
+        g_ap[i] = g_ap[i] + pr[i];
+        g_ar[i] = g_ar[i] + rd[i];
+        g_as[i] = g_as[i] + sp[i];
+    }
+    g_silent = g_silent + r.silent;
+    g_promised = g_promised + r.promised;
+}
 
 fn ck(p_ok: bool, p_msg: string) {
     g_n = g_n + 1;
@@ -181,6 +232,50 @@ fn mmss(p_t: i32): string {
     let pad: string = "";
     if (r < 10) { pad = "0"; }
     let out: string = sv(m) + ":" + pad + sv(r);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  THE EIGHT STATES, AS ONE INDEX
+// ---------------------------------------------------------------------------
+//  Gate 9 enumerated (moving | still) x (inside | outside the reach) x (your
+//  first post | not) against the real shipped function and found one state --
+//  index 5 below -- where the prompt and the action disagreed. Everything in
+//  §A1 and §A2 is indexed this way so the unit table and the session table can
+//  be read against each other row by row.
+fn pt_state(p_moving: i32, p_inside: i32, p_placed: i32): i32 {
+    let s: i32 = 0;
+    if (p_moving != 0) { s = s + 1; }
+    if (p_inside != 0) { s = s + 2; }
+    if (p_placed > 0) { s = s + 4; }
+    let out: i32 = s;
+    return out;
+}
+
+fn pt_state_name(p_i: i32): string {
+    let i: i32 = p_i;
+    let a: string = "still";
+    if ((i & 1) != 0) { a = "MOVING"; }
+    let b: string = "outside";
+    if ((i & 2) != 0) { b = "inside"; }
+    let c: string = "first post";
+    if ((i & 4) != 0) { c = "planted before"; }
+    let out: string = padr(a, 7) + " " + padr(b, 8) + " " + c;
+    return out;
+}
+
+// The predicate, fed EXACTLY what `main.hml`'s `teach_ready()` feeds it: the
+// client's own numbers, which are the ones a player can possibly have. If this
+// call ever stops matching `teach_ready()` argument for argument, the probe is
+// measuring something the game does not do.
+fn pt_ready(p_cl: object): i32 {
+    let cl: object = p_cl;
+    let out: i32 = teach_plant_ready(client_pack_kits(cl), client_prompt(cl),
+                                     client_talk_who(cl), client_ui_panel(cl),
+                                     client_dead(cl),
+                                     client_settle_inside(cl),
+                                     client_kits_placed(cl),
+                                     client_speed(cl));
     return out;
 }
 
@@ -229,6 +324,17 @@ fn session_new(p_seed: i32, p_arm: i32): object {
         vill_tick: -1,
         end_core: 0, end_pts: 0, end_tier: 0,
         wick_topic: -2,
+        // ---- §A2: every press of E, audited ---------------------------
+        // One row per state of the eight. `pr` counts presses, `rd` counts the
+        // presses where the PROMPT was up, `sp` counts the presses that SPENT a
+        // kit. The finding is the comparison of the last two columns.
+        st_pr: [0, 0, 0, 0, 0, 0, 0, 0],
+        st_rd: [0, 0, 0, 0, 0, 0, 0, 0],
+        st_sp: [0, 0, 0, 0, 0, 0, 0, 0],
+        silent: 0,      // kits spent while the prompt was DOWN — the defect
+        promised: 0,    // prompt UP and the key did nothing
+        wait: 0,        // ticks spent standing still waiting for the prompt
+        pend: 0, pend_t: 0, pend_state: 0, pend_ready: 0, pend_placed: 0,
         // section E: where the wire's `set_inside` actually flips
         edge_lo: 0.0, edge_hi: 1.0e30
     };
@@ -260,6 +366,48 @@ fn session_frame(p_s: object): i32 {
     client_build_render(cl, sim_accum_alpha(s.acc));
     let out: i32 = n;
     return out;
+}
+
+// ---------------------------------------------------------------------------
+//  §A2's INSTRUMENT — RECORD A PRESS, THEN ASK WHETHER IT COST ANYTHING
+// ---------------------------------------------------------------------------
+//  Called by the arms on the RISING EDGE of BTN_USE and nowhere else, because
+//  `sv_ui_tick` plants on the edge and a held key plants nothing. It latches
+//  what the screen was saying at the instant of the press; `run_seed` collects
+//  the answer `PT_SPEND_WAIT` ticks later, once the authority's `kits_placed`
+//  has had time to come back down the wire.
+fn pt_press_begin(p_s: object) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let mv: i32 = 0;
+    if (client_speed(cl) >= SV_PLANT_STILL_MS) { mv = 1; }
+    s.pend = 1;
+    s.pend_t = 0;
+    s.pend_state = pt_state(mv, client_settle_inside(cl), client_kits_placed(cl));
+    s.pend_ready = pt_ready(cl);
+    s.pend_placed = client_kits_placed(cl);
+}
+
+fn pt_press_settle(p_s: object) {
+    let s: object = p_s;
+    if (s.pend == 0) { return; }
+    s.pend_t = s.pend_t + 1;
+    if (s.pend_t < PT_SPEND_WAIT) { return; }
+    s.pend = 0;
+    let spent: i32 = 0;
+    if (client_kits_placed(s.cl) > s.pend_placed) { spent = 1; }
+    let i: i32 = s.pend_state;
+    let pr: array = s.st_pr; pr[i] = pr[i] + 1;
+    if (s.pend_ready == 1) { let rd: array = s.st_rd; rd[i] = rd[i] + 1; }
+    if (spent == 1) { let sp: array = s.st_sp; sp[i] = sp[i] + 1; }
+    // >>> THE ONE THAT IS NEVER EXPLICABLE. <<< A kit spent while the prompt
+    // was down is the gate-9 defect exactly, and nothing else in the game can
+    // produce it. The other direction (prompt up, nothing spent) IS explicable
+    // -- `SV_KIT_MIN_GAP_M` refuses a post within 12 m of another one and the
+    // client cannot see that refusal coming -- so it is COUNTED and printed
+    // rather than asserted, which is the honest bar for it.
+    if (s.pend_ready == 0 && spent == 1) { s.silent = s.silent + 1; }
+    if (s.pend_ready == 1 && spent == 0) { s.promised = s.promised + 1; }
 }
 
 fn clear_ui(p_cl: object) {
@@ -360,14 +508,27 @@ fn arm_blind(p_s: object) {
             // this bot does not press the key. That is the whole point: a bot
             // that presses E regardless would pass on a tree where the prompt
             // is a lie.
-            if (teach_plant_ready(kits, client_prompt(cl), client_talk_who(cl),
-                                  client_ui_panel(cl), client_dead(cl)) == 0) {
+            //
+            // >>> AND IT NOW WAITS INSTEAD OF WALKING AWAY, WHICH IS A REAL
+            //     BEHAVIOUR CHANGE IN THIS PROBE AND IS DECLARED. <<< The verb
+            // requires you to be standing still (outside the reach, past your
+            // first post), and `client_set_move(cl, 0, 0)` one tick ago does
+            // not mean the body has stopped -- the movement code decelerates.
+            // The old arm read the prompt on the frame it stopped ASKING to
+            // move, found it down, and left. A person stops, sees the prompt
+            // appear, and presses. `PT_STILL_WAIT` is that second and a half.
+            if (pt_ready(cl) == 0) {
                 client_set_button(cl, BTN_USE, 0);
+                s.wait = s.wait + 1;
+                if (s.wait < PT_STILL_WAIT) { return; }
+                s.wait = 0;
                 s.st = BL_STEP;
                 s.walk = 0;
                 return;
             }
+            s.wait = 0;
             client_set_button(cl, BTN_USE, 1);      // the rising edge -> plant
+            pt_press_begin(s);
             s.chan = 0;
             return;
         }
@@ -383,7 +544,6 @@ fn arm_blind(p_s: object) {
     }
 
     if (s.st == BL_STEP) {
-        client_set_button(cl, BTN_USE, 0);
         client_set_button(cl, BTN_SPRINT, 0);
         // ARM OUTSIDE steps off but never walks home; it is planting a hedge of
         // posts in the field where it stands.
@@ -391,8 +551,22 @@ fn arm_blind(p_s: object) {
         else { face_bearing(s, PT_TURN); }
         client_set_move(cl, 1.0, 0.0);
         s.walk = s.walk + 1;
+        // ---- §A2: THE PRESS THAT USED TO COST A KIT FOR NOTHING ----------
+        // ARM OUTSIDE, and only ARM OUTSIDE, jabs E in the middle of the step
+        // -- at a dead run, outside the reach, well past its first post. That
+        // is state 5 of the eight, the one gate 9 named. ARM BLIND is left
+        // alone on purpose: section B's eight-of-eight Villages are a measured
+        // outcome and a probe that changes its own control arm to make a new
+        // assertion pass has broken the older one.
+        if (s.arm == ARM_OUTSIDE && s.walk == PT_MOVE_PRESS_AT) {
+            client_set_button(cl, BTN_USE, 1);
+            pt_press_begin(s);
+        } else {
+            client_set_button(cl, BTN_USE, 0);
+        }
         if (s.walk >= PT_STEP_TICKS) {
             s.walk = 0;
+            s.wait = 0;
             if (s.arm == ARM_OUTSIDE) { s.st = BL_PLANT; }
             else { s.st = BL_HOME; }
         }
@@ -425,6 +599,7 @@ fn run_seed(p_seed: i32, p_arm: i32, p_minutes: i32): object {
     while (s.tick < stop) {
         arm_blind(s);
         session_frame(s);
+        pt_press_settle(s);
         let now: i32 = server_tick_now(sv2);
 
         // ---- the beats, and the two predicates the HUD draws off ---------
@@ -530,23 +705,66 @@ fn main() {
     //  copy and this goes red AND section B's Village stops arriving.
     // =======================================================================
     print("A. THE PROMPT AND THE VERB ARE ONE BOOLEAN");
-    ck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0) == 1,
+    // Every call below is standing still, outside the reach, past the first
+    // post (`0, 1, 0.0`), so the only thing under test is the refusal named.
+    ck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0, 0, 1, 0.0) == 1,
        "a kit, nothing in reach, nobody there, no panel, alive -> the verb is offered");
-    ck(teach_plant_ready(0, 0, -1, UI_PANEL_NONE, 0) == 0,
+    ck(teach_plant_ready(0, 0, -1, UI_PANEL_NONE, 0, 0, 1, 0.0) == 0,
        "an empty pack is never offered the verb");
-    ck(teach_plant_ready(4, 1, -1, UI_PANEL_NONE, 0) == 0,
+    ck(teach_plant_ready(4, 1, -1, UI_PANEL_NONE, 0, 0, 1, 0.0) == 0,
        "a lantern in reach OUTRANKS the post in your pack (sv_ui_tick's order)");
-    ck(teach_plant_ready(4, 0, NPC_WICK, UI_PANEL_NONE, 0) == 0,
+    ck(teach_plant_ready(4, 0, NPC_WICK, UI_PANEL_NONE, 0, 0, 1, 0.0) == 0,
        "a villager in reach OUTRANKS the post in your pack");
-    ck(teach_plant_ready(4, 0, -1, UI_PANEL_CHAR, 0) == 0,
+    ck(teach_plant_ready(4, 0, -1, UI_PANEL_CHAR, 0, 0, 1, 0.0) == 0,
        "a modal panel eats the key entirely");
-    ck(teach_plant_ready(4, 0, -1, UI_PANEL_NONE, 1) == 0,
+    ck(teach_plant_ready(4, 0, -1, UI_PANEL_NONE, 1, 0, 1, 0.0) == 0,
        "a corpse presses nothing");
     ck(teach_ring_show(1, 0) == 1 && teach_ring_show(0, 0) == 0 &&
        teach_ring_show(1, 1) == 0,
        "the Great Lantern shows its reach while you carry a wick, and not otherwise");
     ck(teach_verdict(1) == TEACH_V_INSIDE && teach_verdict(0) == TEACH_V_OUTSIDE,
        "the verdict is the wire's `set_inside` and nothing else");
+    print("");
+
+    // =======================================================================
+    //  A1.  THE EIGHT STATES, PINNED
+    // -----------------------------------------------------------------------
+    //  Gate 9's enumeration, as a table this file owns. The expected column is
+    //  the DESIGN, written out once so that changing the design means changing
+    //  a row here and saying so, rather than changing a `||` in the HUD and
+    //  finding out from a player.
+    //
+    //    inside the reach              -> yes, moving or not. It is the place
+    //                                     where planting is the right answer.
+    //    your first post, ever         -> yes, moving or not. The verb is
+    //                                     still being taught.
+    //    otherwise                     -> only standing still.
+    // =======================================================================
+    print("A1. THE EIGHT STATES OF THE NEW CLAUSE, PINNED");
+    print("     state                                  expect  got");
+    let a1_bad: i32 = 0;
+    for (let st8 = 0; st8 < 8; st8++) {
+        let mv: f64 = 0.0;
+        if ((st8 & 1) != 0) { mv = 5.6; }         // a dead run
+        let ins: i32 = 0;
+        if ((st8 & 2) != 0) { ins = 1; }
+        let plc: i32 = 0;
+        if ((st8 & 4) != 0) { plc = 3; }
+        // THE DESIGN, restated independently of the implementation -- if this
+        // expression is just a copy of `teach_plant_ready`'s body the row
+        // proves nothing, so it is written the way the paragraph above reads.
+        let want: i32 = 0;
+        if (ins == 1) { want = 1; }
+        else if (plc == 0) { want = 1; }
+        else if (mv < SV_PLANT_STILL_MS) { want = 1; }
+        let got: i32 = teach_plant_ready(2, 0, -1, UI_PANEL_NONE, 0, ins, plc, mv);
+        print(`     ${pi(st8, 1)}  ${padr(pt_state_name(st8), 34)}  ${want}       ${got}`);
+        ck(got == want,
+           `state ${st8} (${pt_state_name(st8)}): the verb should be ${want}, the shared predicate says ${got}`);
+        if (got != want) { a1_bad = 1; }
+    }
+    ck(teach_plant_ready(2, 0, -1, UI_PANEL_NONE, 0, 0, 3, 5.6) == 0,
+       "and state 5 -- MOVING, outside, past your first post -- is the one gate 9 caught, and it is a NO");
     print("");
 
     // =======================================================================
@@ -566,6 +784,7 @@ fn main() {
         if (s0 > 3) { seed = 1000 + s0; }
         let r: object = run_seed(seed, ARM_BLIND, g_MINUTES);
         seeds_run = seeds_run + 1;
+        pt_fold(r);
 
         let pt: string = "-"; if (r.path_tick > 0) { pt = mmss(r.path_tick - r.t0); }
         let rt: string = "-"; if (r.ready_tick > 0) { rt = mmss(r.ready_tick - r.t0); }
@@ -630,6 +849,7 @@ fn main() {
     // =======================================================================
     print("D. THE CONTROL — the same lamplighter who plants where he stands");
     let c: object = run_seed(1337, ARM_OUTSIDE, g_MINUTES);
+    pt_fold(c);
     print(`     posts ${c.planted}   verdicts ${c.v_in} inside / ${c.v_out} outside   agree ${c.agree}   tier ${c.end_tier}   core ${c.end_core}   pts ${c.end_pts}`);
     ck(c.planted >= 2,
        `the control arm did plant posts: ${c.planted}`);
@@ -641,6 +861,81 @@ fn main() {
        `and the town did NOT promote: tier ${c.end_tier}, core ${c.end_core}/${SET_CORE_VILLAGE}, pts ${c.end_pts}/${SET_PTS_VILLAGE}`);
     ck(c.end_core < SET_CORE_VILLAGE,
        `the difference is real and it is CORE_LUX: ${c.end_core} against the ${SET_CORE_VILLAGE} a Village needs`);
+    print("");
+
+    // =======================================================================
+    //  A2.  EVERY PRESS OF E IN EVERY SESSION, AND WHAT IT COST
+    // -----------------------------------------------------------------------
+    //  §A1 pins the predicate. This pins the GAME: for every rising edge of
+    //  BTN_USE either arm produced, on the real wire, with no fixture -- was
+    //  the prompt up, and did a lantern kit leave the pack? Those two columns
+    //  are the whole task. Before this wave, state 5 read `rd 0  sp N`, which
+    //  is a resource spent with nothing on screen; the naive player found it by
+    //  playing and gate 9 found it by enumerating.
+    //
+    //  ARM OUTSIDE jabs E at a dead run on purpose (`PT_MOVE_PRESS_AT`), which
+    //  is how state 5 gets sampled at all -- ARM BLIND obeys the prompt and so
+    //  can never reach it.
+    //
+    //  WHAT THIS SECTION CANNOT SAY, before anyone quotes it: states 3 and 7
+    //  (MOVING, INSIDE the reach) are not visited by either arm and the table
+    //  will print zeros for them. Both are states the predicate answers YES to,
+    //  so neither can produce the failure this section guards -- a spend with
+    //  the prompt down needs the prompt DOWN. They are covered by §A1's unit
+    //  table and by nothing else, and that is stated rather than papered over.
+    // =======================================================================
+    print("A2. EVERY PRESS OF E, ON THE REAL WIRE, AND WHAT IT COST");
+    print("     state                                  presses  prompt up  kit spent");
+    let a2_seen5: i32 = 0;
+    for (let i = 0; i < 8; i++) {
+        print(`     ${pi(i, 1)}  ${padr(pt_state_name(i), 34)}  ${pi(g_ap[i], 7)}  ${pi(g_ar[i], 9)}  ${pi(g_as[i], 9)}`);
+        if (i == 5 && g_ap[i] > 0) { a2_seen5 = 1; }
+    }
+    print(`     spent with the prompt DOWN: ${g_silent}      prompt up and nothing spent: ${g_promised}`);
+    print("     (the second number is explicable — SV_KIT_MIN_GAP_M refuses a post");
+    print("      within 12 m of another and the client cannot see that coming — so it");
+    print("      is counted and printed, not asserted. The first cannot be explained.)");
+    ck(g_silent == 0,
+       `no press ever spent a lantern kit while the prompt was down: ${g_silent} did`);
+    ck(a2_seen5 == 1,
+       `and the state gate 9 named was actually REACHED, ${g_ap[5]} times, so this section can fail`);
+    print("");
+
+    // =======================================================================
+    //  A3.  THE DRAW SITE IS A BARE CALL, AND A PROBE CAN SEE THAT
+    // -----------------------------------------------------------------------
+    //  §A2 catches the server drifting away from the predicate. It CANNOT catch
+    //  the HUD drifting, because nothing headless can draw a HUD: `main.hml`
+    //  needs a window, so this file cannot import it and there is no boolean to
+    //  ask. And the HUD is precisely where the bug was -- `plant_show` was
+    //  `teach_ready() && (speed < 0.6 || inside || grant_t > 0)`.
+    //
+    //  So this section reads the source. It is a blunt instrument and it is the
+    //  RIGHT blunt instrument: the defect is a textual one -- a term appended
+    //  to a shared predicate at one draw site -- and the only alternative is to
+    //  trust a comment. If `main.hml` is not where this expects it (a probe run
+    //  from another directory), the check SAYS SO and fails rather than quietly
+    //  passing, because a guard that disables itself when it cannot find its
+    //  subject is worse than no guard.
+    // =======================================================================
+    print("A3. THE HUD DRAWS THE PROMPT OFF THE PREDICATE AND NOTHING ELSE");
+    let mp: string = "src/game/main.hml";
+    if (!exists(mp)) { mp = "../src/game/main.hml"; }
+    let a3_ok: i32 = 0;
+    let a3_why: string = `cannot find src/game/main.hml from here (tried "src/game/main.hml" and "../src/game/main.hml") — run this probe from the repo root`;
+    if (exists(mp)) {
+        let src: string = read_file(mp);
+        // The one line that decides whether the sentence is drawn.
+        let want: string = "let plant_show: i32 = teach_ready();";
+        if (src.contains(want)) {
+            a3_ok = 1;
+            a3_why = `"${want}" — no term appended`;
+        } else {
+            a3_why = `the plant-prompt gate in ${mp} is no longer the bare call "${want}". If a term was added, add it to teach_plant_ready instead — that is the whole point of §A1 and §A2.`;
+        }
+    }
+    print(`     ${a3_why}`);
+    ck(a3_ok == 1, a3_why);
     print("");
 
     // =======================================================================
