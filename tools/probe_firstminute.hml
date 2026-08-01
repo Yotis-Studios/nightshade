@@ -74,7 +74,7 @@
 //      ARM 0 SHIPPED    0 / 12        ARM 4 +LEASH      0 / 12
 //      ARM 1 +PITCH     0 / 12        ARM 5 REFERENCE  12 / 12
 //      ARM 2 +ADS       0 / 12        ARM 6 SHIPPED-NOW 12 / 12
-//      ARM 3 +RELOAD    0 / 12
+//      ARM 3 +RELOAD    0 / 12        ARM 7 @ 85 fps    12 / 12
 //
 //  NOT ONE OF THE FOUR ABLATED CLAUSES BUYS A SINGLE CLEAR.  Pitch, iron
 //  sights, the gap reload and the leash are four real defects in the old
@@ -164,6 +164,33 @@
 //  lantern grants it; that is IDENTICAL IN ALL FOUR ARMS in the shipping game,
 //  so leaving it out changes no comparison here and keeps the ablation to the
 //  three clauses under test.  REPORTED, not smuggled.
+//
+// -----------------------------------------------------------------------------
+//  >>> WHAT CHANGED THIS WAVE, AND THE EQUALITY THAT HAD TO GO <<<
+// -----------------------------------------------------------------------------
+//  `src/game/demobot.hml` gained two things and this file measures both:
+//
+//  §L  THE AMMO LATCH.  The reconstructed magazine could desynchronise LOW and
+//      then never repair itself — the bot will not fire while it believes the
+//      gun is empty, and the model is only ever repaired by firing or by a
+//      reload the authority refuses on a FULL magazine.  Measured over an hour
+//      it froze `client_shots` at 1 509 s and cost 223 player deaths
+//      (THE_HOUR_2 §0.4, which attributed it to a probe's movement override).
+//      The shipping driver now floors its model at `client_ammo`, which is
+//      `min(authority, prediction)` and therefore a LOWER BOUND on the real
+//      magazine.  §L counts, every frame, the exact disagreement: MODEL SAYS
+//      ZERO, HUD SAYS OTHERWISE.  It must be 0 for ARM 6 and it is NOT 0 for
+//      ARM 5, which is the negative control and also why the old
+//      `shots[6] == shots[5]` equality no longer holds: ARM 5 is FROZEN and
+//      still carries the bug, so the shipping driver legitimately fires MORE.
+//      The equality is replaced by three assertions that name the divergence
+//      rather than asserting a number — see the block above them.
+//
+//  §E  THE ERRAND LAYER.  The bot now walks home at dawn, plants, talks and
+//      trades.  None of that may happen inside this probe's ninety seconds: the
+//      layer departs on a DAWN EDGE and `SV_T0_DAY` starts a session 33 s
+//      before dusk, so the first dawn is at ~7:33.  §E counts the frames the
+//      layer was steering and asserts zero at BOTH cadences.
 // =============================================================================
 
 import { exit } from "@stdlib/process";
@@ -183,7 +210,8 @@ import { transport_loopback } from "../src/net/transport.hml";
 // ARM 6 — THE SHIPPING DRIVER, imported rather than re-implemented. This single
 // import is the structural fix for the bug this probe diagnosed: the number
 // below is now a statement about the code `main.hml --demo` runs.
-import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+import { demobot_new, demobot_frame, demobot_mag, demobot_state,
+         DBOT_ST_HOLD } from "../src/game/demobot.hml";
 
 import { server_new, server_tick, server_snapshot, server_local, server_t0,
          server_spawn_yaw, server_lantern_x, server_lantern_z,
@@ -228,7 +256,9 @@ let g_PF_FRAMES_NOW: i32 = 5400;
 // triangles), reproduced here as a 9.6 ms frame body inside a 16.8 ms paced
 // frame. It is a stand-in for any display above 60 Hz, not a target.
 let g_PF_GAME_FPS: f64  = 85.0;
-let g_PF_EXPECT: i32  = 20;   // counted from the run, then pinned. +1 = ARM 7's bar.
+// Counted from the run, then pinned. 20 before this wave; +3 for §L's two
+// latch assertions and §E's errand guard.
+let g_PF_EXPECT: i32  = 23;
 
 // *** THE BAR.  112b038's own commit message, and this task's acceptance. ***
 let g_PF_BAR: i32     = 10;      // of g_PF_SEEDS
@@ -937,7 +967,18 @@ let g_R_BEAT: i32   = 12;   // the beat it ended on
 let g_R_SUP: i32    = 13;   // rounds the LANTERN paid out over the whole run
 let g_R_DLAN: i32   = 14;   // metres from the post at the end
 let g_R_OUT: i32    = 15;   // frames spent OUTSIDE the supply radius
-let g_R_FIELDS: i32 = 16;
+// >>> §AMMO-LATCH, MEASURED DIRECTLY.  See §L below. <<<
+let g_R_LATCH: i32  = 16;   // frames where the bot's MODEL said empty and the
+                            // HUD said otherwise
+let g_R_LRUN: i32   = 17;   // ...the LONGEST unbroken run of them
+// >>> §E.  Frames in which the ERRAND LAYER was steering.  It must be ZERO for
+// the whole of the first ninety seconds: the layer leaves the post on a DAWN
+// EDGE and the session starts 33 s before dusk (SV_T0_DAY), so the first dawn
+// is at ~7:33.  A driver that walks 280 m to town during wave 1 would be a
+// different bot, and this number is what stops that from being discovered in a
+// screenshot instead of here.
+let g_R_ERR: i32    = 18;
+let g_R_FIELDS: i32 = 19;
 
 fn run_new(): array<i32> {
     let a: array<i32> = [];
@@ -962,12 +1003,38 @@ fn run_minute(p_seed: i32, p_pol: i32, p_out: array<i32>): i32 {
     let dt: f64 = g_PF_DT_NOW * 0.001;
 
     let dead_prev: i32 = 0;
+    let latch_run: i32 = 0;
     let f: i32 = 0;
     while (f < g_PF_FRAMES_NOW) {
         if (p_pol == POL_REFERENCE) { bot_frame(s); }
         else if (p_pol == POL_SHIPPED) { demobot_frame(s.bot, client_px(cl), client_pz(cl)); }
         else { demo_frame(s, p_pol, dt); }
         session_frame(s, g_PF_DT_NOW);
+
+        // ---- §L. THE LATCH, SAMPLED EVERY FRAME ---------------------------
+        // A driver that reconstructs its own magazine can desynchronise LOW,
+        // and when it does it stops firing a loaded gun and never recovers
+        // (demobot.hml §AMMO-LATCH). The signature is one comparison: THE MODEL
+        // SAYS ZERO WHILE THE HUD SAYS OTHERWISE. `client_ammo` is
+        // min(authority, prediction) and can only read LOW, so it is a lower
+        // bound on the real magazine — if IT is positive, there are rounds in
+        // the gun, full stop. Arms 0-4 do not model a magazine at all and are
+        // measured as 0 here by construction.
+        let model: i32 = 0 - 1;
+        if (p_pol == POL_REFERENCE) { model = s.mag; }
+        if (p_pol == POL_SHIPPED) { model = demobot_mag(s.bot); }
+        if (model == 0 && client_ammo(cl) > 0 && client_dead(cl) == 0) {
+            out[g_R_LATCH] = out[g_R_LATCH] + 1;
+            latch_run = latch_run + 1;
+            if (latch_run > out[g_R_LRUN]) { out[g_R_LRUN] = latch_run; }
+        } else {
+            latch_run = 0;
+        }
+        if (p_pol == POL_SHIPPED) {
+            if (demobot_state(s.bot) != DBOT_ST_HOLD) {
+                out[g_R_ERR] = out[g_R_ERR] + 1;
+            }
+        }
 
         let dn: i32 = client_dead(cl);
         if (dn == 1 && dead_prev == 0) { out[g_R_DEATHS] = out[g_R_DEATHS] + 1; }
@@ -1039,6 +1106,9 @@ let g_arm_pathbad: array<i32> = [];
 let g_arm_deaths: array<i32> = [];
 let g_arm_sup: array<i32> = [];
 let g_arm_out: array<i32> = [];
+let g_arm_latch: array<i32> = [];     // §L: frames the model said empty and the HUD did not
+let g_arm_lrun: array<i32> = [];      // ...the worst unbroken run of them
+let g_arm_errand: array<i32> = [];    // §E: frames the errand layer left DBOT_ST_HOLD
 
 fn run_arm(p_pol: i32, p_name: string): i32 {
     let o: array<i32> = run_new();
@@ -1051,6 +1121,9 @@ fn run_arm(p_pol: i32, p_name: string): i32 {
     let deaths: i32 = 0;
     let sup: i32 = 0;
     let outl: i32 = 0;
+    let latch: i32 = 0;
+    let lrun: i32 = 0;
+    let errf: i32 = 0;
     print("  seed     lit   wave   CLEAR  path    hp  mag/res  alive  deaths shots  supplied  d-lantern  out-of-light  ended-on");
     let q: i32 = 0;
     while (q < g_PF_SEEDS) {
@@ -1061,6 +1134,9 @@ fn run_arm(p_pol: i32, p_name: string): i32 {
         shots = shots + o[g_R_SHOTS];
         sup = sup + o[g_R_SUP];
         outl = outl + o[g_R_OUT];
+        latch = latch + o[g_R_LATCH];
+        errf = errf + o[g_R_ERR];
+        if (o[g_R_LRUN] > lrun) { lrun = o[g_R_LRUN]; }
         if (o[g_R_PEAK] > peak) { peak = o[g_R_PEAK]; }
         if (ok == 1) {
             if (o[g_R_CLEAR] > worst_clear) { worst_clear = o[g_R_CLEAR]; }
@@ -1093,12 +1169,18 @@ fn run_arm(p_pol: i32, p_name: string): i32 {
     g_arm_deaths.push(deaths);
     g_arm_sup.push(sup);
     g_arm_out.push(outl);
+    g_arm_latch.push(latch);
+    g_arm_lrun.push(lrun);
+    g_arm_errand.push(errf);
     print("  " + p_name + ":  " + sv(n_clear) + " of " + sv(g_PF_SEEDS)
         + " CLEARED   (" + sv(n_in75) + " inside 75 s, worst " + mmss(worst_clear)
         + ")   peak alive " + sv(peak) + "/" + sv(g_DIR_ALIVE_CAP)
         + "   deaths " + sv(deaths) + "   shots " + sv(shots)
         + "   lantern paid " + sv(sup) + " rounds   "
         + sv(outl / g_TICK_HZ) + " s spent outside the light");
+    print("    §L the latch: " + sv(latch) + " frames with an EMPTY MODEL over a LOADED GUN"
+        + ", worst unbroken run " + sv(lrun) + " frames ("
+        + f1(f64(lrun) / 60.0) + " s)   §E errand frames " + sv(errf));
     print("");
     let out: i32 = n_clear;
     return out;
@@ -1285,14 +1367,73 @@ fn main() {
        "PORT-DRIFT GUARD: the shipping module and probe_waveone's reference bot clear the"
        + " SAME seeds - " + sv(a6) + " vs " + sv(a5) + ". If these differ, demobot.hml has"
        + " drifted from the instrument the bar was set with.");
-    // AND THE SHARP VERSION. Equal clear COUNTS can hide two different bots
-    // that happen to score the same. The authority's lifetime shot counter over
-    // twelve deterministic seeds cannot: one changed comparison in the fire
-    // gate moved it 1028 -> 1090 while the count stayed 12 of 12, which is
-    // exactly the class of drift that started all this.
-    ck(g_arm_shots[6] == g_arm_shots[5],
-       "PORT-DRIFT GUARD, SHARP: identical policy fires an IDENTICAL number of rounds over"
-       + " the same twelve seeds - " + sv(g_arm_shots[6]) + " vs " + sv(g_arm_shots[5]));
+    // AND THE SHARP VERSION -- WHICH THIS WAVE HAD TO REWRITE, AND HERE IS WHY.
+    //
+    // It used to read `g_arm_shots[6] == g_arm_shots[5]`: identical policy,
+    // identical rounds. That equality is GONE ON PURPOSE and in exactly one
+    // place. ARM 5 is `probe_waveone`'s bot, FROZEN, and it carries the
+    // §AMMO-LATCH defect (demobot.hml): a reconstructed magazine that can
+    // desynchronise LOW and then never repair itself, because the bot will not
+    // fire while it believes the gun is empty and the model is only ever fixed
+    // by firing or by a reload the authority refuses. ARM 6 is the shipping
+    // module, which now floors the model at `client_ammo`.
+    //
+    // So the shipping driver fires MORE, and it fires more for one reason: it
+    // does not stop shooting a loaded gun. Asserting the old equality would
+    // require putting the bug back. Three assertions replace it and together
+    // they are STRICTLY STRONGER, because they name the divergence and measure
+    // its cause instead of asserting a number:
+    //
+    //   (a) the counts still match exactly           <- unchanged, above
+    //   (b) the shipping driver never fires FEWER    <- any other drift is red
+    //   (c) THE LATCH CANNOT HAPPEN IN ARM 6         <- §L, and it is the fix
+    //
+    // (c) is the one that goes red if the floor is deleted, and (a) is the one
+    // that goes red if the policy drifts for any other reason.
+    ck(g_arm_shots[6] >= g_arm_shots[5],
+       "PORT-DRIFT GUARD, SHARP: the shipping module never fires FEWER rounds than the"
+       + " frozen reference over the same twelve seeds - " + sv(g_arm_shots[6])
+       + " vs " + sv(g_arm_shots[5]) + ". The excess is §L: "
+       + sv(g_arm_latch[5]) + " reference frames spent holding a loaded gun it thought"
+       + " was empty, against " + sv(g_arm_latch[6]));
+    // >>> §L -- THE LATCH, ASSERTED AWAY. <<<
+    // `client_ammo` is min(authority, prediction): both terms are at most the
+    // real magazine, so a POSITIVE `client_ammo` means there are rounds in the
+    // gun. A driver whose own model reads 0 at the same moment is a driver
+    // about to stop playing. Delete demobot.hml's floor and this goes red.
+    //
+    // THE BOUND IS ON THE RUN, NOT THE COUNT, and that is deliberate. ARM 6
+    // still measures a nonzero COUNT -- 156 frames over twelve minutes -- and
+    // every one of them is ONE FRAME LONG, because this sample is taken AFTER
+    // `session_frame` and the frame that fires the last round sees the model at
+    // 0 and the HUD not yet stepped. A one-frame disagreement is the sample
+    // point straddling a shot. A DEADLOCK IS A RUN, and the run is what
+    // separates a driver that recovers from one that never fires again.
+    ck(g_arm_lrun[6] <= 6,
+       ">>> THE AMMO LATCH IS DEAD IN THE SHIPPING DRIVER <<< worst unbroken run of an"
+       + " EMPTY MODEL over a LOADED GUN is " + sv(g_arm_lrun[6]) + " frames ("
+       + sv(g_arm_latch[6]) + " single frames in " + sv(g_PF_SEEDS)
+       + " first minutes). The frozen reference's worst run is " + sv(g_arm_lrun[5])
+       + " frames over " + sv(g_arm_latch[5]) + ", and over a full hour the same"
+       + " defect ran 125 000 frames unbroken and cost 223 player deaths.");
+    // ...and the NEGATIVE CONTROL for it. If the reference bot also measured a
+    // one-frame worst run then the floor is not what makes the two arms differ
+    // and the paragraph above is wrong.
+    ck(g_arm_lrun[5] >= 60,
+       "NEGATIVE CONTROL: the frozen reference DOES latch, for " + sv(g_arm_lrun[5])
+       + " frames (" + f1(f64(g_arm_lrun[5]) / 60.0) + " s) at a stretch and "
+       + sv(g_arm_latch[5]) + " in total — " + sv(g_arm_latch[5] / g_arm_latch[6])
+       + "x the shipping driver. Ninety seconds is not long enough for it to be"
+       + " fatal; an hour is.");
+    // >>> §E -- THE ERRAND LAYER IS NOT PART OF THE FIRST MINUTE. <<<
+    // It leaves the post on a DAWN EDGE and `SV_T0_DAY` starts the session 33 s
+    // before dusk, so the first dawn is at ~7:33 -- five times this probe's
+    // window. If this is ever non-zero the bot walked to town during wave 1 and
+    // every number above is about a different game.
+    ck(g_arm_errand[6] == 0 && g_arm_errand[7] == 0,
+       "THE ERRAND LAYER NEVER RUNS IN THE FIRST 90 s: " + sv(g_arm_errand[6])
+       + " frames at 60 fps, " + sv(g_arm_errand[7]) + " at "
+       + f1(g_PF_GAME_FPS) + " fps");
     ck(g_arm_out[6] == 0,
        "THE SHIPPING DRIVER NEVER LEAVES THE LIGHT: " + sv(g_arm_out[6])
        + " frames outside the " + f1(g_LANTERN_R_T1) + " m supply radius (the old one spent "

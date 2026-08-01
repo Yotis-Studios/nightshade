@@ -1,0 +1,728 @@
+// =============================================================================
+//  probe_teach.hml — CAN A PLAYER WHO IS TOLD NOTHING LEARN THE SECOND VERB?
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT:
+//
+//      hemlockc -O1 tools/probe_teach.hml -o /tmp/pt && /tmp/pt
+//      /tmp/pt --seeds 8 --minutes 40          (a wider, slower sweep)
+//
+//  It exits 1 on any failure AND on an assertion-count mismatch.
+//
+//  -------------------------------------------------------------------------
+//  WHY IT EXISTS
+//  -------------------------------------------------------------------------
+//  `probe_lanfeed` proved the loop closes and then printed, in its own output,
+//  the reason that did not make it a game:
+//
+//      "Four kits, and four posts inside 64 m is a Village. The game teaches
+//       NEITHER. There is no map, no marker and no line of dialogue that says
+//       the ring exists, so a human with these four kits has no way to learn
+//       where to put them."
+//
+//  `probe_lanfeed`'s ARM PLANT reads `settle_cx` / `settle_cz` off the server
+//  and knows a post is worth more inside 64 m. It says so itself and calls
+//  itself an oracle. This probe is the other half: the same loop, driven by a
+//  player who is allowed to know ONLY WHAT THE SCREEN SAYS.
+//
+//  -------------------------------------------------------------------------
+//  >>> THE ONE RULE. ARM BLIND MAY READ SEVEN NUMBERS AND NO OTHERS. <<<
+//  -------------------------------------------------------------------------
+//  Every navigational decision `arm_blind` makes comes from this list, and each
+//  entry names the pixels a human reads it off:
+//
+//    client_settle_bearing   the compass diamond (main.hml, the objective row)
+//    client_settle_inside    the diamond's COLOUR: amber inside, green outside
+//    client_settle_dist      the prompt's second line, "48M TO THE REACH"
+//    client_pack_kits        the pack row: one lantern icon per kit
+//    client_prompt           "HOLD [E] - LIGHT THE LANTERN"
+//    client_dead / client_lantern_lit   the two things nobody can miss
+//    teach_plant_ready(...)  "[E] PLANT A LANTERN POST" -- THE SAME FUNCTION
+//                            `sv_ui_tick` uses to decide whether the key works
+//
+//  `settle_cx` and `settle_cz` ARE NOT IMPORTED BY THIS FILE AT ALL, so
+//  `arm_blind` could not read the settlement's coordinates if it tried -- the
+//  symbols are not in scope. Neither is `server_world` or `server_lantern_x`.
+//  The arm walks the compass bearing down to zero and plants when the screen
+//  says it is inside the reach, which is exactly the procedure the HUD now
+//  describes to a player.
+//
+//  So this probe CAN say: is the information now on screen SUFFICIENT to close
+//  the loop? It CANNOT say whether the information is LEGIBLE -- whether a
+//  human looking at a 320x180 frame notices the diamond change colour. That is
+//  measured with eyes and screenshots, this file has none, and the task report
+//  carries that half.
+//
+//  -------------------------------------------------------------------------
+//  NO FIXTURE. `server_settle_boot_tier`, `settle_load`, `settle_lanterns_set`,
+//  `server_grant_kits` and `server_teleport` appear nowhere below. Every kit
+//  this probe plants was earned by surviving the beat that pays for it.
+//
+//  IMPORTS: `src/game/**`, `src/sim/**`, `src/core/**`, `src/net/**`,
+//  `@stdlib/math`, `@stdlib/process`. No SDL, no wobbleweed, no wall clock.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { floor } from "@stdlib/math";
+
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha } from "../src/sim/sim.hml";
+
+import { day_phase, PHASE_DAWN } from "../src/sim/daycycle.hml";
+
+import { BTN_FIRE, BTN_USE, BTN_ADS, BTN_SPRINT, BTN_RELOAD,
+         BTN_BUILD, BTN_SWITCH, BTN_GRENADE, BTN_INV } from "../src/sim/command.hml";
+
+// OUTCOME reads only -- what the town became, never where it is.
+// >>> `settle_cx` AND `settle_cz` ARE NOT IMPORTED AT ALL, ANYWHERE IN THIS
+//     FILE. <<< That is not tidiness, it is the claim in the header made
+//     structural: `arm_blind` cannot read the settlement's coordinates even by
+//     accident, because the symbols are not in scope. `probe_lanfeed`'s ARM
+//     PLANT imports both and says so; this arm cannot.
+import { settle_core_lux, settle_grid_points,
+         settle_tier, settle_tier_ever, settle_ring_m,
+         SET_TIER_CAMP, SET_TIER_VILLAGE, SET_RING_CAMP_M,
+         SET_CORE_VILLAGE, SET_PTS_VILLAGE } from "../src/sim/settle.hml";
+
+import { npc_topic, npc_topic_arg, npc_talk, npc_pack_grant, npc_present,
+         NPC_WICK, NPC_T_KIT, NPC_OFF_KIT } from "../src/sim/npc.hml";
+
+import { transport_loopback } from "../src/net/transport.hml";
+
+import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+
+import { server_new, server_tick, server_snapshot, server_local, server_t0,
+         server_spawn_yaw, server_beat, server_settle,
+         server_npcs, server_tick_now, server_kit_verdict,
+         teach_plant_ready, teach_ring_show, teach_verdict,
+         TEACH_V_NONE, TEACH_V_INSIDE, TEACH_V_OUTSIDE,
+         UI_PANEL_NONE, UI_PANEL_CHAR,
+         SV_OPEN_KITS, SV_BEAT_PATH } from "../src/game/server.hml";
+
+import { client_new, client_set_angles, client_set_move, client_set_button,
+         client_send_command, client_apply, client_frame, client_build_render,
+         client_px, client_pz, client_dead, client_lantern_lit,
+         client_cam_yaw, client_prompt, client_talk_who, client_ui_panel,
+         client_pack_kits, client_kits_placed, client_settle_bearing,
+         client_settle_inside, client_settle_dist,
+         client_settle_tier_ever } from "../src/game/client.hml";
+
+// ---------------------------------------------------------------------------
+//  CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_SEEDS: i32    = 4;         // --seeds N
+// 30, for `probe_lanfeed`'s reason, restated because it cost that probe an
+// exit(1): `settle_step` holds the threshold one continuous in-game day before
+// promoting, the fourth post lands at ~9 min, and the Village therefore lands
+// at ~25 min. A default that cannot reach the thing it asserts is a bug.
+let g_MINUTES: i32  = 30;        // --minutes N, per seed, of GAME time
+let g_DT_MS: f64    = 16.667;
+
+// THE ASSERTION COUNT, AS A FORMULA, checked on every run: a probe that
+// silently stops running half its checks is worse than no probe.
+let PT_FIXED: i32    = 22;   // A 8 + E 3 + F 4 + D 5 + G 2
+let PT_PER_SEED: i32 = 9;
+
+// The blind lamplighter's numbers. Every one is a thing a person does, not a
+// coordinate: "get well inside the marker", "step off a bit", "count to three".
+let PT_DEEP_M: f64     = 38.0;   // walk in until the reach readout is under this
+let PT_STEP_TICKS: i32 = 150;    // ~2.5 s of walking between posts: at the run
+                                 // speed that is comfortably past the 12 m
+                                 // SV_KIT_MIN_GAP_M without being told what it is
+let PT_CHANNEL_T: i32  = 170;    // 2.5 s of held E, plus slack for the frame the
+                                 // plant itself consumed
+let PT_TURN: f64       = 1.30;   // ~75 degrees. "Step off to one side."
+
+// ---------------------------------------------------------------------------
+//  ASSERTIONS
+// ---------------------------------------------------------------------------
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+// The first ARM BLIND session, kept alive past its loop so section F can ask
+// its villagers questions. It is a REAL, EARNED session; §F says what it then
+// does to it and why.
+let g_seed0 = null;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn f1(p_x: f64): string { let out: string = sv(floor(p_x * 10.0) / 10.0); return out; }
+
+fn padl(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = " " + s; }
+    let out: string = s;
+    return out;
+}
+fn padr(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = s + " "; }
+    let out: string = s;
+    return out;
+}
+fn pi(p_v: i32, p_w: i32): string { let out: string = padl(sv(p_v), p_w); return out; }
+fn pf(p_v: f64, p_w: i32): string { let out: string = padl(f1(p_v), p_w); return out; }
+
+fn mmss(p_t: i32): string {
+    let s: i32 = p_t / 60;
+    let m: i32 = s / 60;
+    let r: i32 = s - m * 60;
+    let pad: string = "";
+    if (r < 10) { pad = "0"; }
+    let out: string = sv(m) + ":" + pad + sv(r);
+    return out;
+}
+
+fn vname(p_v: i32): string {
+    if (p_v == TEACH_V_INSIDE) { let a: string = "INSIDE"; return a; }
+    if (p_v == TEACH_V_OUTSIDE) { let b: string = "OUTSIDE"; return b; }
+    let c: string = "NONE";
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+//  THE SESSION — `main.hml`'s run_loop with the window, the renderer and the
+//  wall clock removed. Identical in shape to probe_lanfeed §HARNESS on purpose.
+// ---------------------------------------------------------------------------
+let BL_HOLD: i32  = 0;   // the shipping demobot owns the player
+let BL_HOME: i32  = 1;   // walk the compass bearing down to zero
+let BL_PLANT: i32 = 2;   // tap E, then hold E
+let BL_STEP: i32  = 3;   // step off to one side
+let BL_OUT: i32   = 4;   // walk back out, resume the hold
+
+fn session_new(p_seed: i32, p_arm: i32): object {
+    let net: object = transport_loopback();
+    let sv2: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    let s: object = {
+        seed: p_seed,
+        arm: p_arm,
+        net: net, sv: sv2, cl: cl,
+        acc: sim_accum_new(),
+        t0: server_t0(sv2),
+        tick: server_t0(sv2),
+        bot: demobot_new(cl, sv2),
+        st: BL_HOLD,
+        chan: -1,
+        walk: 0,
+        heading: 0.0,
+        // ---- what the run measured ------------------------------------
+        path_tick: -1,      // the tick SV_BEAT_PATH fired
+        path_kits: -1,      // ...and what was in the pack one second later
+        ready_tick: -1,     // the first tick `teach_plant_ready` said yes
+        ring_tick: -1,      // the first tick `teach_ring_show` said yes
+        cross_tick: -1,     // the first tick the wire said "inside the reach"
+        planted: 0,
+        agree: 0, disagree: 0,   // HUD verdict vs authority verdict, per plant
+        v_in: 0, v_out: 0,
+        vill_tick: -1,
+        end_core: 0, end_pts: 0, end_tier: 0,
+        wick_topic: -2,
+        // section E: where the wire's `set_inside` actually flips
+        edge_lo: 0.0, edge_hi: 1.0e30
+    };
+    client_set_angles(cl, server_spawn_yaw(sv2), 0.0);
+    server_tick(sv2, s.tick);
+    client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+    s.tick = s.tick + 1;
+    let out: object = s;
+    return out;
+}
+
+fn session_frame(p_s: object): i32 {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let n: i32 = sim_accum_advance(s.acc, g_DT_MS);
+    let i: i32 = 0;
+    while (i < n) {
+        client_send_command(cl, s.tick);
+        server_tick(sv2, s.tick);
+        client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+        s.tick = s.tick + 1;
+        i++;
+    }
+    client_frame(cl, g_DT_MS * 0.001, s.tick);
+    // NOT OPTIONAL: `demobot_frame` picks its target from `client_ent_*`,
+    // which read the RENDER snapshot, filled only here. probe_lanfeed's header
+    // records the hour it cost to find that out.
+    client_build_render(cl, sim_accum_alpha(s.acc));
+    let out: i32 = n;
+    return out;
+}
+
+fn clear_ui(p_cl: object) {
+    client_set_button(p_cl, BTN_BUILD, 0);
+    client_set_button(p_cl, BTN_SWITCH, 0);
+    client_set_button(p_cl, BTN_GRENADE, 0);
+    client_set_button(p_cl, BTN_INV, 0);
+}
+
+// ---------------------------------------------------------------------------
+//  ARM BLIND — THE LAMPLIGHTER WHO CAN ONLY SEE THE SCREEN
+// ---------------------------------------------------------------------------
+//  It reads the seven numbers in the header and nothing else. In particular it
+//  does not know where the town IS -- only which way the diamond points, and
+//  whether the diamond has gone amber.
+//
+//  HOLD  : the shipping demobot owns the player, exactly as ARM PLANT does.
+//  HOME  : turn until the compass bearing is ~0, walk. Stop when the screen
+//          says INSIDE THE REACH and the distance readout is under PT_DEEP_M.
+//  PLANT : tap E (which the prompt says plants), then hold E for the channel
+//          (which the prompt says lights).
+//  STEP  : turn 75 degrees off and walk for two and a half seconds, which is
+//          what "put the next one over there" looks like when nobody has told
+//          you the minimum gap is twelve metres.
+//  OUT   : pack empty; walk the bearing away and give the player back.
+//
+//  ARM OUTSIDE is the same machine with one line different: it never walks
+//  home. It plants where it stands, at the post, ~275 m out. It exists so that
+//  "the verdict is different" is measured against a control rather than argued.
+// ---------------------------------------------------------------------------
+let ARM_BLIND: i32   = 0;
+let ARM_OUTSIDE: i32 = 1;
+
+fn face_bearing(p_s: object, p_rel: f64) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    // `client_settle_bearing` is RELATIVE to where you are looking -- it is the
+    // diamond's x offset on the compass. Turning until it reads zero is what a
+    // player does with a compass and it is all this needs.
+    let want: f64 = client_cam_yaw(cl) + client_settle_bearing(cl) + p_rel;
+    client_set_angles(cl, want, 0.0);
+}
+
+fn arm_blind(p_s: object) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+
+    // 1. the shipping driver runs first, always.
+    demobot_frame(s.bot, client_px(cl), client_pz(cl));
+    clear_ui(cl);
+
+    if (client_dead(cl) == 1) { s.chan = -1; return; }
+    // Until the first lantern is lit the opening script owns the player.
+    if (client_lantern_lit(cl) == 0) { return; }
+
+    let kits: i32 = client_pack_kits(cl);
+    let inside: i32 = client_settle_inside(cl);
+    let dist: f64 = client_settle_dist(cl);
+
+    if (s.st == BL_HOLD) {
+        // A lamplighter goes home at dawn, and only carrying something worth
+        // the walk. Dawn is a thing you can see; the pack row is a thing you
+        // can see. Nothing here is off the wire that is not on the screen.
+        if (day_phase(server_tick_now(s.sv)) == PHASE_DAWN && kits > 0) {
+            if (s.arm == ARM_OUTSIDE) { s.st = BL_PLANT; }
+            else { s.st = BL_HOME; }
+            s.chan = -1;
+            s.walk = 0;
+        }
+        return;
+    }
+
+    if (kits <= 0 && s.chan < 0) { s.st = BL_OUT; }
+
+    if (s.st == BL_HOME) {
+        face_bearing(s, 0.0);
+        client_set_button(cl, BTN_FIRE, 0);
+        client_set_button(cl, BTN_ADS, 0);
+        client_set_button(cl, BTN_USE, 0);
+        if (inside == 1 && dist < PT_DEEP_M) {
+            s.st = BL_PLANT;
+            s.chan = -1;
+            return;
+        }
+        client_set_move(cl, 1.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 1);
+        return;
+    }
+
+    if (s.st == BL_PLANT) {
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 0);
+        client_set_button(cl, BTN_FIRE, 0);
+        client_set_button(cl, BTN_ADS, 0);
+        if (s.chan < 0) {
+            // >>> THE PROMPT IS THE INSTRUCTION, SO THE PROBE OBEYS IT. <<<
+            // If `teach_plant_ready` is 0 the HUD is not offering the verb and
+            // this bot does not press the key. That is the whole point: a bot
+            // that presses E regardless would pass on a tree where the prompt
+            // is a lie.
+            if (teach_plant_ready(kits, client_prompt(cl), client_talk_who(cl),
+                                  client_ui_panel(cl), client_dead(cl)) == 0) {
+                client_set_button(cl, BTN_USE, 0);
+                s.st = BL_STEP;
+                s.walk = 0;
+                return;
+            }
+            client_set_button(cl, BTN_USE, 1);      // the rising edge -> plant
+            s.chan = 0;
+            return;
+        }
+        client_set_button(cl, BTN_USE, 1);          // held -> sim.hml stage (g)
+        s.chan = s.chan + 1;
+        if (s.chan >= PT_CHANNEL_T) {
+            client_set_button(cl, BTN_USE, 0);
+            s.chan = -1;
+            s.st = BL_STEP;
+            s.walk = 0;
+        }
+        return;
+    }
+
+    if (s.st == BL_STEP) {
+        client_set_button(cl, BTN_USE, 0);
+        client_set_button(cl, BTN_SPRINT, 0);
+        // ARM OUTSIDE steps off but never walks home; it is planting a hedge of
+        // posts in the field where it stands.
+        if (s.arm == ARM_OUTSIDE) { face_bearing(s, 3.141592653589793 + PT_TURN); }
+        else { face_bearing(s, PT_TURN); }
+        client_set_move(cl, 1.0, 0.0);
+        s.walk = s.walk + 1;
+        if (s.walk >= PT_STEP_TICKS) {
+            s.walk = 0;
+            if (s.arm == ARM_OUTSIDE) { s.st = BL_PLANT; }
+            else { s.st = BL_HOME; }
+        }
+        return;
+    }
+
+    // BL_OUT: the pack is empty. Walk the bearing away and hand the player back
+    // to the shipping driver, which is where the next night's kits are earned.
+    client_set_button(cl, BTN_USE, 0);
+    if (dist < 90.0) {
+        face_bearing(s, 3.141592653589793);
+        client_set_move(cl, 1.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 1);
+        return;
+    }
+    s.st = BL_HOLD;
+}
+
+// ---------------------------------------------------------------------------
+//  ONE SEED, ONE ARM
+// ---------------------------------------------------------------------------
+fn run_seed(p_seed: i32, p_arm: i32, p_minutes: i32): object {
+    let s: object = session_new(p_seed, p_arm);
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let st: object = server_settle(sv2);
+    let stop: i32 = s.t0 + p_minutes * 3600;
+    let last_placed: i32 = 0;
+
+    while (s.tick < stop) {
+        arm_blind(s);
+        session_frame(s);
+        let now: i32 = server_tick_now(sv2);
+
+        // ---- the beats, and the two predicates the HUD draws off ---------
+        if (s.path_tick < 0 && server_beat(sv2) == SV_BEAT_PATH) { s.path_tick = now; }
+        if (s.path_tick > 0 && s.path_kits < 0 && now >= s.path_tick + 60) {
+            s.path_kits = client_pack_kits(cl);
+        }
+        if (s.ready_tick < 0) {
+            if (teach_plant_ready(client_pack_kits(cl), client_prompt(cl),
+                                  client_talk_who(cl), client_ui_panel(cl),
+                                  client_dead(cl)) == 1) { s.ready_tick = now; }
+        }
+        if (s.ring_tick < 0) {
+            if (teach_ring_show(client_pack_kits(cl), client_dead(cl)) == 1) {
+                s.ring_tick = now;
+            }
+        }
+        if (s.cross_tick < 0 && client_settle_inside(cl) == 1) { s.cross_tick = now; }
+
+        // ---- SECTION E's measurement, taken continuously -----------------
+        // Where does the wire's `set_inside` actually flip? Bracket it: the
+        // largest distance ever reported INSIDE, and the smallest ever reported
+        // OUTSIDE. `settle_ring_m(tier_ever)` has to sit between them.
+        //
+        // SAMPLED ONLY AT CAMP, and the first version of this was wrong for
+        // exactly the reason worth writing down: the ring is a function of
+        // `tier_ever`, so the moment the player's own work promotes the town it
+        // goes 64 -> 120 and a bracket that spans the promotion is comparing
+        // two different rings. The tier is read off the WIRE, like everything
+        // else this arm is allowed to see.
+        if (client_settle_tier_ever(cl) == SET_TIER_CAMP) {
+            let d_true: f64 = client_settle_dist(cl);
+            if (client_settle_inside(cl) == 1) {
+                if (d_true > s.edge_lo) { s.edge_lo = d_true; }
+            } else {
+                if (d_true < s.edge_hi) { s.edge_hi = d_true; }
+            }
+        }
+
+        // ---- SECTION C: every plant, both verdicts, compared -------------
+        let placed: i32 = client_kits_placed(cl);
+        if (placed > last_placed) {
+            last_placed = placed;
+            s.planted = placed;
+            // What the HUD draws, from `set_inside` and nothing else. This is
+            // literally `main.hml`'s `teach_step` line.
+            let hudv: i32 = teach_verdict(client_settle_inside(cl));
+            // What the authority latched at the coordinates of the post.
+            let authv: i32 = server_kit_verdict(sv2);
+            if (hudv == authv) { s.agree = s.agree + 1; }
+            else { s.disagree = s.disagree + 1; }
+            if (authv == TEACH_V_INSIDE) { s.v_in = s.v_in + 1; }
+            else { s.v_out = s.v_out + 1; }
+        }
+
+        if (s.vill_tick < 0 && settle_tier(st) >= SET_TIER_VILLAGE) {
+            s.vill_tick = now;
+        }
+    }
+
+    s.end_core = settle_core_lux(st);
+    s.end_pts = settle_grid_points(st);
+    s.end_tier = settle_tier(st);
+    // Wick's topic, if Wick exists at all. `npc_topic` is pure -- it reads and
+    // returns, it does not credit or mark met.
+    s.wick_topic = -2;
+    let sto: object = server_npcs(sv2);
+    if (sto != null) {
+        if (npc_present(sto, NPC_WICK) == 1) {
+            s.wick_topic = npc_topic(sto, st, NPC_WICK, server_tick_now(sv2));
+        }
+    }
+    let out: object = s;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  MAIN
+// ---------------------------------------------------------------------------
+fn main() {
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--seeds" && i + 1 < args.length) { i++; g_SEEDS = i32(f64(args[i])); }
+        else if (a == "--minutes" && i + 1 < args.length) { i++; g_MINUTES = i32(f64(args[i])); }
+        i++;
+    }
+
+    print("");
+    print("=============================================================");
+    print("  probe_teach — can a player who is told nothing learn it?");
+    print("=============================================================");
+    print(`  compiled ${compiled()}   seeds ${g_SEEDS}   minutes ${g_MINUTES}`);
+    print("");
+
+    // =======================================================================
+    //  A.  THE PROMPT AND THE VERB ARE ONE BOOLEAN
+    // -----------------------------------------------------------------------
+    //  `sv_ui_tick` calls `teach_plant_ready` to decide whether BTN_USE plants
+    //  a post; `main.hml`'s `teach_ready()` calls it to decide whether to SAY
+    //  so. This section pins the truth table both of them run on. It is the
+    //  section to sabotage: invert any one of the five refusals in a scratch
+    //  copy and this goes red AND section B's Village stops arriving.
+    // =======================================================================
+    print("A. THE PROMPT AND THE VERB ARE ONE BOOLEAN");
+    ck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0) == 1,
+       "a kit, nothing in reach, nobody there, no panel, alive -> the verb is offered");
+    ck(teach_plant_ready(0, 0, -1, UI_PANEL_NONE, 0) == 0,
+       "an empty pack is never offered the verb");
+    ck(teach_plant_ready(4, 1, -1, UI_PANEL_NONE, 0) == 0,
+       "a lantern in reach OUTRANKS the post in your pack (sv_ui_tick's order)");
+    ck(teach_plant_ready(4, 0, NPC_WICK, UI_PANEL_NONE, 0) == 0,
+       "a villager in reach OUTRANKS the post in your pack");
+    ck(teach_plant_ready(4, 0, -1, UI_PANEL_CHAR, 0) == 0,
+       "a modal panel eats the key entirely");
+    ck(teach_plant_ready(4, 0, -1, UI_PANEL_NONE, 1) == 0,
+       "a corpse presses nothing");
+    ck(teach_ring_show(1, 0) == 1 && teach_ring_show(0, 0) == 0 &&
+       teach_ring_show(1, 1) == 0,
+       "the Great Lantern shows its reach while you carry a wick, and not otherwise");
+    ck(teach_verdict(1) == TEACH_V_INSIDE && teach_verdict(0) == TEACH_V_OUTSIDE,
+       "the verdict is the wire's `set_inside` and nothing else");
+    print("");
+
+    // =======================================================================
+    //  B.  ARM BLIND — THE WHOLE POINT
+    // =======================================================================
+    print("B. ARM BLIND — a lamplighter who is allowed to read only the screen");
+    print("     seed  path at  kits  ready at  reach at  crossed  posts  in/out  agree  village at   core     pts");
+    let promoted: i32 = 0;
+    let agreed_all: i32 = 1;
+    let seeds_run: i32 = 0;
+    let s0: i32 = 0;
+    while (s0 < g_SEEDS) {
+        let seed: i32 = 1337;
+        if (s0 == 1) { seed = 2; }
+        if (s0 == 2) { seed = 7; }
+        if (s0 == 3) { seed = 91; }
+        if (s0 > 3) { seed = 1000 + s0; }
+        let r: object = run_seed(seed, ARM_BLIND, g_MINUTES);
+        seeds_run = seeds_run + 1;
+
+        let pt: string = "-"; if (r.path_tick > 0) { pt = mmss(r.path_tick - r.t0); }
+        let rt: string = "-"; if (r.ready_tick > 0) { rt = mmss(r.ready_tick - r.t0); }
+        let gt: string = "-"; if (r.ring_tick > 0) { gt = mmss(r.ring_tick - r.t0); }
+        let xt: string = "-"; if (r.cross_tick > 0) { xt = mmss(r.cross_tick - r.t0); }
+        let vt: string = "-"; if (r.vill_tick > 0) { vt = mmss(r.vill_tick - r.t0); }
+        print("  " + pi(seed, 7) + padl(pt, 9) + pi(r.path_kits, 6) +
+              padl(rt, 10) + padl(gt, 10) + padl(xt, 9) + pi(r.planted, 7) +
+              padl(sv(r.v_in) + "/" + sv(r.v_out), 8) + pi(r.agree, 7) +
+              padl(vt, 12) + pi(r.end_core, 8) + pi(r.end_pts, 8));
+
+        // ---- per-seed assertions (PT_PER_SEED of them) -------------------
+        ck(r.path_tick > 0, `seed ${seed}: the opening reaches SV_BEAT_PATH`);
+        ck(r.path_kits == SV_OPEN_KITS,
+           `seed ${seed}: the beat that hands you the verb hands you ${SV_OPEN_KITS} kits; pack read ${r.path_kits}`);
+        ck(r.ready_tick > 0 && r.ready_tick >= r.path_tick,
+           `seed ${seed}: the plant prompt goes live, and not before the kits arrive`);
+        ck(r.ring_tick > 0 && r.ring_tick >= r.path_tick,
+           `seed ${seed}: the Great Lantern's reach becomes showable on the same beat`);
+        ck(r.cross_tick > 0,
+           `seed ${seed}: a player following the compass diamond crosses into the reach`);
+        ck(r.planted >= 4,
+           `seed ${seed}: four posts go into the ground with nothing but the screen to go on; got ${r.planted}`);
+        ck(r.disagree == 0,
+           `seed ${seed}: the HUD's verdict equals the authority's on all ${r.planted} plants; ${r.disagree} disagreed`);
+        ck(r.v_out == 0,
+           `seed ${seed}: a player who obeys the reach readout never wastes a post; ${r.v_out} landed outside`);
+        ck(r.end_tier >= SET_TIER_VILLAGE,
+           `seed ${seed}: the town promotes to VILLAGE on screen information alone; tier ${r.end_tier}`);
+
+        if (r.end_tier >= SET_TIER_VILLAGE) { promoted = promoted + 1; }
+        if (r.disagree != 0) { agreed_all = 0; }
+
+        // ---- section E, folded in: the reach the HUD draws is the real one
+        if (s0 == 0) {
+            let ring: f64 = settle_ring_m(SET_TIER_CAMP);
+            print("");
+            print("E. THE REACH THE HUD DRAWS IS THE REACH THE SETTLEMENT USES");
+            print(`     settle_ring_m(CAMP) = ${f1(ring)} m   (the tier the player plants at)`);
+            print(`     furthest the wire ever said INSIDE  : ${f1(r.edge_lo)} m`);
+            print(`     nearest  the wire ever said OUTSIDE : ${f1(r.edge_hi)} m`);
+            ck(r.edge_lo <= ring + 0.001,
+               `nothing inside the reach was further out than the ring: ${f1(r.edge_lo)} vs ${f1(ring)}`);
+            ck(r.edge_hi >= ring - 0.001 || r.edge_hi > 1.0e29,
+               `nothing outside the reach was nearer than the ring: ${f1(r.edge_hi)} vs ${f1(ring)}`);
+            ck(ring == SET_RING_CAMP_M,
+               `and at CAMP that ring is the 64 m every design document names: ${f1(ring)}`);
+            g_seed0 = r;
+            print("");
+            print("B (continued)");
+        }
+        s0++;
+    }
+    print("");
+
+    // =======================================================================
+    //  C/D.  THE CONTROL — A PLAYER WHO IGNORES THE READOUT
+    // -----------------------------------------------------------------------
+    //  Same machine, same shipping combat driver, same number of kits; the ONE
+    //  difference is that it never walks home. If the two arms produced the
+    //  same verdicts or the same town, the signal on screen would be decoration.
+    // =======================================================================
+    print("D. THE CONTROL — the same lamplighter who plants where he stands");
+    let c: object = run_seed(1337, ARM_OUTSIDE, g_MINUTES);
+    print(`     posts ${c.planted}   verdicts ${c.v_in} inside / ${c.v_out} outside   agree ${c.agree}   tier ${c.end_tier}   core ${c.end_core}   pts ${c.end_pts}`);
+    ck(c.planted >= 2,
+       `the control arm did plant posts: ${c.planted}`);
+    ck(c.v_in == 0,
+       `every one of them was OUTSIDE the reach: ${c.v_in} inside`);
+    ck(c.disagree == 0,
+       `the HUD verdict matched the authority on all of them too: ${c.disagree} disagreed`);
+    ck(c.end_tier < SET_TIER_VILLAGE,
+       `and the town did NOT promote: tier ${c.end_tier}, core ${c.end_core}/${SET_CORE_VILLAGE}, pts ${c.end_pts}/${SET_PTS_VILLAGE}`);
+    ck(c.end_core < SET_CORE_VILLAGE,
+       `the difference is real and it is CORE_LUX: ${c.end_core} against the ${SET_CORE_VILLAGE} a Village needs`);
+    print("");
+
+    // =======================================================================
+    //  F.  WICK, AND THE GAP DIALOGUE CANNOT CLOSE
+    // -----------------------------------------------------------------------
+    //  >>> THE FOUR ASSERTIONS BELOW ARE A UNIT TEST OF THE TOPIC LADDER AND
+    //      I AM LABELLING THEM ONE. <<<  The two SESSIONS they read were earned
+    //      with no fixture; the last two calls -- `npc_pack_grant` and
+    //      `npc_talk` -- reach into `src/sim/npc.hml` to construct a state a
+    //      real 30-minute session CANNOT REACH, and that impossibility is the
+    //      finding, not a probe defect:
+    //
+    //        - Wick arrives at SET_TIER_VILLAGE (`g_npc_arrive[NPC_WICK]`), so
+    //          he does not exist until the town the player is building already
+    //          exists. He cannot teach the FIRST ring. Asserted on the control
+    //          run, which stays a Camp.
+    //        - by the time he does exist the pack is empty, and THE_HOUR_2 §2.2
+    //          measured that a fifth kit needs either a SECOND completed hold
+    //          (which never completes on any seed) or regard 192 (the hour ends
+    //          at 15). So "Wick, holding a kit" is a state the shipping game
+    //          does not currently produce.
+    //
+    //      The line is written, correct, and reachable the day the supply is.
+    //      Shipping it and saying so beats shipping it and implying it works.
+    // =======================================================================
+    print("F. WICK, AND THE GAP DIALOGUE CANNOT CLOSE");
+    let cs: object = server_npcs(c.sv);
+    let wick_at_camp: i32 = npc_present(cs, NPC_WICK);
+    print(`     at CAMP (the control run, tier ${c.end_tier}): Wick present = ${wick_at_camp}`);
+    ck(wick_at_camp == 0,
+       "Wick does not exist at CAMP, so dialogue CANNOT teach the first ring");
+
+    let bs: object = server_npcs(g_seed0.sv);
+    let bst: object = server_settle(g_seed0.sv);
+    let wick_at_vill: i32 = npc_present(bs, NPC_WICK);
+    print(`     at VILLAGE (seed 1337, earned): Wick present = ${wick_at_vill}, pack kits = ${client_pack_kits(g_seed0.cl)}`);
+    ck(wick_at_vill == 1,
+       "he does exist at VILLAGE, so the channel is real for the SECOND ring");
+    ck(client_pack_kits(g_seed0.cl) == 0,
+       `...and the pack is empty when he arrives: ${client_pack_kits(g_seed0.cl)} kits`);
+
+    // ---- THE UNIT TEST. Construct the state the session cannot. ------------
+    npc_pack_grant(bs, NPC_OFF_KIT, 1);
+    npc_talk(bs, bst, NPC_WICK, server_tick_now(g_seed0.sv));   // marks `met`
+    let wt: i32 = npc_topic(bs, bst, NPC_WICK, server_tick_now(g_seed0.sv));
+    let wa: i32 = npc_topic_arg(bs, bst, NPC_WICK, server_tick_now(g_seed0.sv));
+    print(`     UNIT: met Wick, one kit in the pack -> topic ${wt} arg ${wa}  (NPC_T_KIT = ${NPC_T_KIT}, ring ${i32(settle_ring_m(settle_tier_ever(bst)))} m)`);
+    ck(wt == NPC_T_KIT && wa == i32(settle_ring_m(settle_tier_ever(bst))),
+       `the line fires and names the CURRENT ring: topic ${wt}, arg ${wa}`);
+    print("");
+
+    // =======================================================================
+    //  G.  THE HEADLINE
+    // =======================================================================
+    print("G. THE HEADLINE");
+    print(`     ${promoted} of ${seeds_run} seeds reached VILLAGE reading ONLY what the HUD shows.`);
+    ck(promoted == seeds_run,
+       `every seed promoted on screen information alone: ${promoted} of ${seeds_run}`);
+    ck(agreed_all == 1,
+       "the picture and the authority never disagreed about a single post");
+    print("");
+    print("     WHAT THIS PROBE CANNOT SAY, stated so nobody quotes it wrongly:");
+    print("     - it measures SUFFICIENCY, not LEGIBILITY. It proves the numbers");
+    print("       a player needs are now on the wire and on the HUD; it cannot");
+    print("       prove a human notices a 5x5 diamond change colour at 320x180.");
+    print("       That half is screenshots and eyes, in the task report.");
+    print("     - Wick's line cannot teach the FIRST ring. g_npc_arrive[WICK] is");
+    print("       SET_TIER_VILLAGE, so he does not exist until the town the");
+    print("       player is trying to build already exists. Section F above.");
+    print("     - it says nothing about whether the ring of embers is PRETTY.");
+    print("");
+
+    let expect: i32 = PT_FIXED + PT_PER_SEED * seeds_run;
+    print("=============================================================");
+    print(`  ASSERTIONS  ran ${g_n}  pass ${g_ok}  fail ${g_n - g_ok}   expected ${expect}`);
+    print("=============================================================");
+    if (g_n != expect) {
+        print(`FAIL: ran ${g_n} assertions, expected ${expect}`);
+        exit(1);
+    }
+    if (g_ok != g_n) { exit(1); }
+    exit(0);
+}
+
+main();

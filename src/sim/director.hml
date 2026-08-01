@@ -186,6 +186,74 @@
 //  tier 5 40. The frame gets harder to fight and no busier to draw.
 //
 //  ---------------------------------------------------------------------------
+//  DESIGN 8 — THE HOLD IS LONGER THAN THE NIGHT, AND ALWAYS HAS BEEN
+//  ---------------------------------------------------------------------------
+//  Added 2026-08-01 by `circuit-two`. THE_HOUR measured `holds done` reaching
+//  2; THE_HOUR_2 measured 1 in every arm of every run and called it a
+//  regression from the DESIGN 7 escalation work. IT IS NOT ONE, and the bisect
+//  says so. Same instrument (the shipping `demobot.hml`, no override), same
+//  seed 1337, same 60 minutes, three trees:
+//
+//    tree      night 1        night 2        night 3        night 4     holds
+//    2d90bc8   DONE 331.0 s   abort t3       abort t1       DONE 294.8s   2
+//    b996b41   DONE 319.1 s   abort t1       abort t1       abort t2      1
+//    4e73611   DONE 319.1 s   abort t2       abort t2       abort t2      1
+//
+//  `b996b41` has NEITHER the ramp NOR the phase re-base and it reaches 1 too.
+//  So the escalation work is not what moved the number. What moved it is the
+//  fourth column: THE_HOUR's second completed hold finished in **294.83 s of a
+//  300.00 s night**. FIVE SECONDS AND A FIFTH. Every other night in every tree
+//  ran out of clock, and the tier-1 hold this bot actually plays is 294-331 s
+//  long. The night is 300. **`holds done` = 2 was a coin flip that landed
+//  once**, and it landed on the seed both documents happened to run.
+//
+//  The arithmetic underneath, from the shipped tables and nothing else:
+//
+//    budget(t,w) = 36t + 96w over 3 waves -> tier 1 spends 396 points
+//    mean body cost at tier 1 = .40*2 + .35*3 + .25*6 = 3.35  -> 118 bodies
+//    118 bodies at the 1.15 s cadence  = 135.7 s
+//    + two 8 s wave gaps               =  16.0 s
+//    ------------------------------------------------
+//    the hold the DESIGN describes     = 151.7 s   ("~2:40", DESIGN 2)
+//    the hold a player actually plays  = 319.1 s   (measured, seed 1337)
+//
+//  The 167 s of difference is `g_DIR_ALIVE_CAP`. The cap DEFERS spawns rather
+//  than cancelling them, so once it binds THE HOLD'S LENGTH IS THE PLAYER'S
+//  KILL RATE and nothing else. That is good design — a better player finishes
+//  sooner — and it means the hold has no fixed duration to size a night
+//  against. NOTHING IN THIS FILE OR IN `daycycle.hml` HAS EVER CONNECTED THE
+//  TWO NUMBERS. The night is a constant; the hold is a variable; they were
+//  never compared.
+//
+//  So this is not tuned, it is RESOLVED, and in the fiction's own words. The
+//  dawn branch below has read `// the shades dissolve; hold aborted` since W5.
+//  The shades dissolving at dawn IS the fiction of surviving the night. What
+//  the code demanded instead was "kill every body the night sends BEFORE the
+//  sun comes up", which is a strictly harder thing and is throttled by a cap
+//  the player cannot influence.
+//
+//      DAWN COMPLETES A HOLD THAT REACHED THE NIGHT'S LAST WAVE.
+//
+//  `director_night_held` below argues the bar in full. The short version is
+//  that the state machine makes it expensive: the only transition that
+//  advances `wave` is CLEARING -> alive == 0 -> GAP -> next wave, so being on
+//  wave 3 at dawn MEANS you killed every body of waves 1 and 2. Wave 1 of 3
+//  still pays nothing, which is the whole of night 2 at tier 2 on the shipped
+//  300 s night (54 of 107 bodies, wave 1) and it SHOULD fail.
+//
+//  It is deliberately NOT "you were alive at dawn": at tier 2 this bot dies
+//  23-38 times a night and would collect the reward for being a respawn queue.
+//
+//  AND THE SECOND HALF IS NOT IN THIS FILE. `server.hml`'s `sv_script` now
+//  begins the hold on `DIR_EV_HORN` — the two-minute dusk warning that has
+//  existed since W5 and meant nothing mechanically — instead of waiting for
+//  `PHASE_NIGHT`. That gives the hold DUSK 2:00 + NIGHT 5:00 = 420 s instead
+//  of 300 s, which is the first time the hold's window has been longer than
+//  the hold. The `PHASE_NIGHT` fallback below stays exactly as it was, because
+//  a player standing in their own lit town is tier 0 at dusk and must still be
+//  able to start a hold when they walk out of it.
+//
+//  ---------------------------------------------------------------------------
 //  IMPORTS — the wall (CLAUDE.md §3): @stdlib/math, src/sim/**, src/core/**.
 //  No SDL, no wobbleweed, no @stdlib/random, no clock. Ever.
 // =============================================================================
@@ -458,6 +526,16 @@ export fn director_new(): object {
         // tier the hold is actually fighting at, so this keeps the input
         // visible for the report and for the fingerprint.
         tier_world: 1,
+        // The tier the CURRENT-OR-LAST hold began at, written once by
+        // `director_begin` and by nothing else. `tier` is latched for the
+        // duration of a hold by `sim.hml` stage (h) — but only for the
+        // duration: on the tick the hold ends, stage (e) aborts it and stage
+        // (h) immediately re-samples `tier` from wherever the player is
+        // standing at DAWN, which is a bonus-0 phase. Anything that reads "how
+        // deep was the night I just survived" AFTER the hold ended therefore
+        // cannot read `tier`, and `server.hml`'s tier-scaled kit payout is
+        // exactly that reader. DESIGN 8.
+        hold_tier: 1,
         rng: rng_new(),
         spawn_seq: 0,          // monotone; the rng `entity` coordinate
 
@@ -522,6 +600,7 @@ export fn director_reset(p_d: object, p_seed: i32, p_tick: i32) {
     d.spawn_seq = 0;
     d.tier_phase = PHASE_NIGHT;
     d.tier_world = d.tier;
+    d.hold_tier = d.tier;
     d.state = DIR_IDLE;
     d.wave = 0;
     d.budget = 0;
@@ -599,6 +678,10 @@ export fn director_tier(p_d: object): i32 { let d: object = p_d; let out: i32 = 
 // "how much of this place you have not seen yet", which is exactly the reason
 // to walk. DESIGN 7.
 export fn director_tier_world(p_d: object): i32 { let d: object = p_d; let out: i32 = d.tier_world; return out; }
+// The tier the current-or-last hold BEGAN at. The one number that answers "how
+// deep was the night you just survived" on the tick after it ended, when
+// `director_tier` has already been re-sampled at dawn. DESIGN 8.
+export fn director_hold_tier(p_d: object): i32 { let d: object = p_d; let out: i32 = d.hold_tier; return out; }
 export fn director_tier_phase(p_d: object): i32 { let d: object = p_d; let out: i32 = d.tier_phase; return out; }
 // Restore the nights-survived counter. `director_step` is the only thing that
 // ADVANCES it (DIR_CLEARING -> DIR_DONE), but since DESIGN 7 that counter is
@@ -876,6 +959,55 @@ fn dir_reap_requests(p_d: object) {
     d.req_n = 0;
 }
 
+// DESIGN 8. 1 if the player is fighting the night's LAST wave. This is the
+// predicate dawn resolves a hold on, and it is much stronger than it looks —
+// READ THE STATE MACHINE BEFORE CALLING IT GENEROUS.
+//
+// The only transition that advances `wave` is DIR_CLEARING -> (alive <= 0) ->
+// DIR_GAP -> `dir_begin_wave(wave + 1)`. `alive` is the live roster, recounted
+// from the world every tick by `dir_observe`. So THE ONLY WAY TO BE ON WAVE 3
+// IS TO HAVE KILLED EVERY SINGLE BODY OF WAVES 1 AND 2. There is no timeout
+// path, no skip, and dying does not advance it — a player who dies simply
+// comes back to a field the alive cap has kept full.
+//
+// Which is why the bar is here and not one step stricter. The first version of
+// this predicate demanded DIR_CLEARING on the last wave — every body of all
+// three waves already written out. Measured, shipping `demobot.hml`, seed
+// 1337, with the horn start below: all three of nights 2, 3 and 4 reach wave 3
+// and get 87-96 of the tier's ~107 bodies out before the sun comes up, and all
+// three failed that bar. It was not measuring whether the player held the
+// post; it was measuring whether the ALIVE CAP had finished feeding, and the
+// alive cap is not a thing the player can play faster.
+//
+// `DIR_GAP` cannot satisfy this and does not need excluding by hand: the gap
+// is only ever entered when `wave + 1 < g_DIR_WAVES_PER_HOLD` (the branch above
+// it goes to DIR_DONE instead), so a director in the gap is by construction not
+// on its last wave. DIR_IDLE and DIR_ARMED are excluded because there is no
+// hold to hold.
+//
+// Exported so `probe_director` §H asserts the predicate directly instead of
+// inferring it from an event mask, and so the sabotage run can show it going
+// false on a director parked one wave short.
+// >>> AND `DIR_DONE` IS EXCLUDED, WHICH IS THE ONE THAT BIT. <<< A hold that
+// clears its last body a few seconds before sunrise sits in DIR_DONE until the
+// next horn re-arms it — `dir_abort` is not run on the normal completion path.
+// The first version of this predicate accepted DIR_DONE, so a hold that
+// finished at 23:31 was counted, and then counted AGAIN when dawn arrived at
+// 23:33. Measured, seed 1337, ARM POST: `holds done` read 1 -> 3 -> 5 over
+// three nights, the ramp fed on the inflated count, and by night 3 it was
+// running a tier-3 hold that killed the bot 84 times for 0 kills. A metric
+// that pays twice is worse than one that pays nothing, and the escalation
+// ladder reading it made it worse than that. Asserted in probe_director §H.
+export fn director_night_held(p_d: object): i32 {
+    let d: object = p_d;
+    if (d.state == DIR_IDLE) { let a: i32 = 0; return a; }
+    if (d.state == DIR_ARMED) { let b: i32 = 0; return b; }
+    if (d.state == DIR_DONE) { let c: i32 = 0; return c; }
+    if (d.wave + 1 < g_DIR_WAVES_PER_HOLD) { let e: i32 = 0; return e; }
+    let out: i32 = 1;
+    return out;
+}
+
 // Abort: dawn came, or the lantern was lit. The roster is dropped (the bodies
 // themselves are despawned by whoever owns them); no budget is carried.
 fn dir_abort(p_d: object) {
@@ -926,6 +1058,7 @@ export fn director_begin(p_d: object, p_tick: i32): i32 {
     // starting one. Never let the ramp manufacture that contradiction.
     if (t_hold < 1) { t_hold = 1; }
     d.tier = t_hold;
+    d.hold_tier = t_hold;            // survives the abort; DESIGN 8
     d.tier_phase = PHASE_NIGHT;      // makes the re-base idempotent
 
     d.tick = p_tick;
@@ -965,6 +1098,19 @@ export fn director_step(p_d: object, p_w: object, p_tick: i32,
     }
     if (phase == PHASE_DAWN) {
         if (d.state != DIR_IDLE) {
+            // DESIGN 8: the shades dissolve, and if the night had nothing left
+            // to send then dissolving them IS the hold. Same three writes the
+            // DIR_CLEARING branch below makes, in the same order, so a hold
+            // completed by dawn and a hold completed by the last kill are
+            // indistinguishable to every reader — `holds_done`, `hold_ticks`
+            // and `DIR_EV_HOLD_DONE`. `dir_abort` then runs UNCHANGED and
+            // drops the roster, because the tail of bodies is dissolved either
+            // way; the only thing that moved is whether it counted.
+            if (director_night_held(d) == 1) {
+                d.holds_done = d.holds_done + 1;
+                d.hold_ticks = tick - d.hold_start_tick;
+                d.events = d.events | DIR_EV_HOLD_DONE;
+            }
             d.events = d.events | DIR_EV_DAWN;
             dir_abort(d);
         }
@@ -1085,6 +1231,7 @@ export fn director_hash(p_d: object): u64 {
     h = dir_mix(h, d.seed);
     h = dir_mix(h, d.tier);
     h = dir_mix(h, d.tier_world);
+    h = dir_mix(h, d.hold_tier);
     h = dir_mix(h, d.tier_phase);
     h = dir_mix(h, d.state);
     h = dir_mix(h, d.wave);

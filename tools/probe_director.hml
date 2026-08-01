@@ -97,7 +97,42 @@ import { director_new, director_reset, director_set_anchor, director_set_tier,
          DIR_EV_SPAWN,
          DIR_EV_HORN, DIR_EV_HOLD_START, DIR_EV_WAVE_START, DIR_EV_WAVE_CLEAR,
          DIR_EV_HOLD_DONE, DIR_EV_DAWN, DIR_CADENCE_TICKS, DIR_GAP_TICKS,
+         director_night_held, director_hold_tier,
          DIR_HALF_FOV } from "../src/sim/director.hml";
+
+// ---------------------------------------------------------------------------
+//  SECTION S ONLY — THE REAL SESSION. `src/game/**` and `src/net/**`.
+// ---------------------------------------------------------------------------
+//  Every other section of this file drives the director directly against a
+//  stand-in world, which is the right way to test a state machine and the
+//  wrong way to find out whether the game reaches the state. THE_HOUR_2 §4.2
+//  reported `holds done` stuck at 1 in every arm of every run, and NOT ONE
+//  assertion in this file could have caught it — the reference player of
+//  sections C/E finishes its hold and goes home, because it is a player built
+//  out of the design's own TTK table and it never dies, never walks away and
+//  never meets a Spitter.
+//
+//  So section S imports the shipping server, the shipping client and the
+//  SHIPPING BOT and plays a real one. `probe_lanfeed`'s rule, quoted because
+//  it is the right rule: >>> NO FIXTURE. EVER. NOT ONCE. <<< There is no
+//  `server_settle_boot_tier`, no `director_set_holds_done`, no
+//  `director_begin` and no hand-written tier anywhere in section S. It is
+//  `server_new` -> `server_tick` -> a bot pressing buttons.
+//
+//  `nm /tmp/probe_director | grep -c SDL_` is still 0 with these three
+//  imports; `client.hml` and `server.hml` are headless (probe_lanfeed proves
+//  the same thing on the same modules).
+// ---------------------------------------------------------------------------
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha,
+         sim_director } from "../src/sim/sim.hml";
+import { transport_loopback } from "../src/net/transport.hml";
+import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+import { server_new, server_tick, server_snapshot, server_local, server_t0,
+         server_spawn_yaw, server_world, server_tick_now, server_beat,
+         SV_OPEN_KITS, SV_HOLD_KITS, SV_BEAT_PATH } from "../src/game/server.hml";
+import { client_new, client_set_angles, client_send_command, client_apply,
+         client_frame, client_build_render, client_px, client_pz,
+         client_pack_kits } from "../src/game/client.hml";
 
 // ---------------------------------------------------------------------------
 // CONFIGURATION
@@ -122,7 +157,15 @@ let g_PD_MS_GUARD: f64        = 0.0015;   // compiled   (2.0x of 0.742 us loaded
 let g_PD_MS_GUARD_INTERP: f64 = 0.0130;   // interpreted (2.05x of 6.343 us loaded)
 
 // The determinism anchor. Compiled and interpreted must both print this.
-// REGENERATED 2026-07-31 for DESIGN 7 (the night's tier + the ramp). NOTHING
+// REGENERATED 2026-08-01 for DESIGN 8 (dawn resolves a hold that reached the
+// last wave). NOTHING ABOUT THE SPEND LOOP MOVED HERE EITHER — the drift is
+// one new field in `director_hash`, `hold_tier`, which `director_begin` writes
+// and nothing else touches. `ref_hold` never runs to dawn (the reference
+// player finishes in 152-260 s of a 300 s night), so the new dawn branch does
+// not execute in any of the 100 holds section C fingerprints. The previous
+// anchor was 7985246912008184374.
+//
+// PREVIOUS NOTE, kept: REGENERATED 2026-07-31 for DESIGN 7. NOTHING
 // ABOUT THE SPEND LOOP MOVED — the drift is entirely two new fields in
 // `director_hash` (`tier_world`, `tier_phase`) and `ref_hold`'s fixture now
 // setting `holds_done` so the ramp is not the thing under test. Verified
@@ -134,12 +177,21 @@ let g_PD_MS_GUARD_INTERP: f64 = 0.0130;   // interpreted (2.05x of 6.343 us load
 // composition rows, the budget constants, the cadence, the gap, the ring or the
 // two caps moves this number — which is the point: it is the one assertion that
 // a silent retune cannot slip past.
-let g_PD_GOLDEN: u64 = 7985246912008184374;
+let g_PD_GOLDEN: u64 = 4959111391711508410;
 
 // 75 + 17 for section R (the-same-night-again: R1 roster 6, R2 ladder 4,
 // R3 the night's tier 6, R4 danger-vs-distance 3 = 19). Asserted against g_n
 // at the bottom, so a section that silently stops running is a FAILURE.
-let g_PD_EXPECT_ASSERTS: i32 = 94;
+// 94 + 17 for section S (circuit-two: S1 the window 4, S2 the truth table 6,
+// S3 dawn end-to-end 9, S4 the real session 6 = 25).
+let g_PD_EXPECT_ASSERTS: i32 = 119;
+
+// Section S's real session, in GAME minutes. 40 covers the horn at 0:33, the
+// horn at 16:33 and the horn at 32:33 — three nights, which is what it takes
+// to say anything about a SECOND one. Costs ~3 min of CPU; `--minutes N`
+// moves it and `--minutes 0` skips the arm (and then the assertion count
+// fails, which is deliberate: a skipped section must not read as a pass).
+let g_PD_S_MINUTES: i32 = 40;
 
 // ---------------------------------------------------------------------------
 // ASSERTIONS
@@ -465,6 +517,81 @@ fn ref_fingerprint(p_out: array): u64 {
     }
     let out: u64 = h;
     return out;
+}
+
+// ===========================================================================
+//  SECTION S's REAL SESSION — the shipping loop with the window removed
+// ===========================================================================
+//  Identical in shape to `probe_lanfeed`'s §HARNESS and to `main.hml`'s
+//  run_loop, on purpose: a probe that drives a different loop tests a loop
+//  nobody ships. ARM POST — `demobot.hml` owns the player for every frame and
+//  nothing here overrides a button, so this is the game driving itself.
+//
+//  Returns, in `p_out`: [holds_done, kits_peak, hold1_tick, hold2_tick,
+//                        beat, nights_seen, deaths_are_not_read]
+let g_PS_HOLDS: i32  = 0;
+let g_PS_KITS: i32   = 1;
+let g_PS_H1: i32     = 2;
+let g_PS_H2: i32     = 3;
+let g_PS_BEAT: i32   = 4;
+let g_PS_T2: i32     = 5;    // the tier the SECOND completed hold was held at
+let g_PS_FIELDS: i32 = 6;
+
+fn pd_session(p_seed: i32, p_minutes: i32, p_out: array<i32>) {
+    let out: array<i32> = p_out;
+    let i0: i32 = 0;
+    while (i0 < g_PS_FIELDS) { out[i0] = 0; i0++; }
+    out[g_PS_H1] = -1;
+    out[g_PS_H2] = -1;
+    out[g_PS_T2] = -1;
+
+    let net: object = transport_loopback();
+    let sv2: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    let acc: object = sim_accum_new();
+    let bot: object = demobot_new(cl, sv2);
+    let tick: i32 = server_t0(sv2);
+    let t0: i32 = tick;
+    client_set_angles(cl, server_spawn_yaw(sv2), 0.0);
+    server_tick(sv2, tick);
+    client_apply(cl, server_snapshot(sv2), server_local(sv2), tick);
+    tick = tick + 1;
+
+    let d: object = sim_director(server_world(sv2));
+    let holds: i32 = 0;
+    let frames: i32 = p_minutes * 60 * 60;
+    let f: i32 = 0;
+    while (f < frames) {
+        demobot_frame(bot, client_px(cl), client_pz(cl));
+        let n: i32 = sim_accum_advance(acc, 16.667);
+        let q: i32 = 0;
+        while (q < n) {
+            client_send_command(cl, tick);
+            server_tick(sv2, tick);
+            client_apply(cl, server_snapshot(sv2), server_local(sv2), tick);
+            tick = tick + 1;
+            q++;
+        }
+        client_frame(cl, 0.016667, tick);
+        // NOT OPTIONAL. `demobot.hml` picks its target out of the RENDER
+        // snapshot, which is filled only here. A harness that skips this call
+        // has a bot that can see nothing, never fires, never clears wave 1 —
+        // and it fails looking exactly like a broken director.
+        client_build_render(cl, sim_accum_alpha(acc));
+
+        let hd: i32 = director_holds_done(d);
+        if (hd > holds) {
+            let now: i32 = server_tick_now(sv2) - t0;
+            if (holds == 0) { out[g_PS_H1] = now; }
+            if (holds == 1) { out[g_PS_H2] = now; out[g_PS_T2] = director_hold_tier(d); }
+            holds = hd;
+        }
+        let k: i32 = client_pack_kits(cl);
+        if (k > out[g_PS_KITS]) { out[g_PS_KITS] = k; }
+        f++;
+    }
+    out[g_PS_HOLDS] = director_holds_done(d);
+    out[g_PS_BEAT] = server_beat(sv2);
 }
 
 // ===========================================================================
@@ -1625,6 +1752,185 @@ fn main() {
     let t_far: i32 = director_tier(dg);
     ck(t_far > t_near, "R4 the same player on deeper ground gets a deeper night: "
        + sv(t_near) + " -> " + sv(t_far));
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- S1. the hold is longer than the night -----------------");
+    // -----------------------------------------------------------------------
+    // director.hml DESIGN 8. THE_HOUR measured `holds done` 2 and THE_HOUR_2
+    // measured 1 and called the second a regression from the DESIGN 7 ramp.
+    // The bisect says otherwise and the arithmetic below is why, so it is
+    // asserted rather than written in a comment: the WINDOW a hold gets and
+    // the LENGTH a hold takes have never been compared by anything.
+    let win_night: i32 = DAY_TICKS - PHASE_TICK_NIGHT;
+    let win_horn: i32  = DAY_TICKS - HORN_TICK;
+    print("  nightfall -> dawn " + sv(win_night / 60) + " s      horn -> dawn "
+        + sv(win_horn / 60) + " s");
+    ck(HORN_TICK == PHASE_TICK_DUSK,
+       "the horn IS the first tick of dusk, so starting on it buys exactly the dusk (horn "
+       + sv(HORN_TICK) + ", dusk " + sv(PHASE_TICK_DUSK) + ")");
+    ck(win_horn == win_night + (PHASE_TICK_NIGHT - PHASE_TICK_DUSK),
+       "and the horn window is the night window plus the whole of dusk");
+
+    // The hold's own FLOOR, from the shipped tables and nothing else: bodies
+    // at the cadence, plus the gaps. A player cannot go faster than this.
+    let mean_c: f64 = 0.0;
+    let kc: i32 = 0;
+    while (kc < g_ENEMY_KIND_COUNT) {
+        mean_c = mean_c + f64(director_weight(1, kc)) * f64(director_cost(kc)) * 0.01;
+        kc++;
+    }
+    let spend_t1: i32 = director_budget(1, 0) + director_budget(1, 1) + director_budget(1, 2);
+    let bodies_t1: f64 = f64(spend_t1) / mean_c;
+    let s_floor: f64 = bodies_t1 * g_DIR_SPAWN_CADENCE_S
+                     + f64(g_DIR_WAVES_PER_HOLD - 1) * g_DIR_WAVE_GAP_S;
+    print("  tier-1 hold FLOOR " + sv(floor(s_floor * 10.0) / 10.0)
+        + " s (" + sv(floor(bodies_t1)) + " bodies at " + sv(g_DIR_SPAWN_CADENCE_S)
+        + " s + " + sv(g_DIR_WAVES_PER_HOLD - 1) + " gaps)");
+    // >>> AND THIS IS THE ASSERTION THAT WOULD HAVE CAUGHT IT. <<< A hold whose
+    // FLOOR is already half the night has no margin left for the alive cap,
+    // and the alive cap is what actually sets the duration (measured 285-331 s
+    // against this 152 s floor). If a retune ever pushes the floor past the
+    // horn window the loop breaks silently, exactly as it has been breaking.
+    ck(s_floor * 60.0 < f64(win_horn),
+       "the tier-1 hold's spawn FLOOR (" + sv(floor(s_floor)) + " s) must fit the horn->dawn window ("
+       + sv(win_horn / 60) + " s)");
+    ck(f64(win_horn) > f64(win_night) * 1.3,
+       "and the horn start is worth at least 30 % more clock: " + sv(win_night / 60)
+       + " s -> " + sv(win_horn / 60) + " s");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- S2. what dawn may and may not complete ---------------");
+    // -----------------------------------------------------------------------
+    // `director_night_held` is the whole of DESIGN 8's judgement, so it is
+    // asserted as a TRUTH TABLE rather than inferred from an event mask.
+    let ds: object = director_new();
+    director_reset(ds, g_PD_SEED, PHASE_TICK_NIGHT);
+    ck(director_night_held(ds) == 0, "S2 an IDLE director has held nothing");
+    ds.state = DIR_ARMED;
+    ck(director_night_held(ds) == 0, "S2 an ARMED director has held nothing");
+    ds.state = DIR_SPAWNING;
+    ds.wave = 0;
+    ck(director_night_held(ds) == 0, "S2 wave 1 of " + sv(g_DIR_WAVES_PER_HOLD)
+       + " is not a night held, however long it lasted");
+    ds.wave = g_DIR_WAVES_PER_HOLD - 1;
+    ck(director_night_held(ds) == 1,
+       "S2 the LAST wave is — and reaching it means every body of the earlier waves is dead");
+    ds.state = DIR_CLEARING;
+    ck(director_night_held(ds) == 1, "S2 ...clearing the last wave too");
+    ds.state = DIR_DONE;
+    ck(director_night_held(ds) == 0,
+       "S2 >>> a hold ALREADY COMPLETED is not held again — this is the double count <<<");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- S3. dawn, end to end, through director_step ----------");
+    // -----------------------------------------------------------------------
+    // Three directors, three states, one real dawn tick each. Nothing is
+    // poked after `director_step` starts.
+    let ws3: object = world_new_cap(64);
+    world_spawn_player(ws3, 1);
+
+    // (a) parked on the LAST wave: dawn completes it.
+    let da: object = director_new();
+    director_reset(da, g_PD_SEED, DAY_TICKS - 2);
+    director_set_anchor(da, 0.0, 0.0, 0.0);
+    director_set_tier_at_phase(da, 2, PHASE_NIGHT);
+    director_set_holds_done(da, 0);
+    director_begin(da, DAY_TICKS - 2);
+    da.wave = g_DIR_WAVES_PER_HOLD - 1;
+    da.state = DIR_CLEARING;
+    let h_before_a: i32 = director_holds_done(da);
+    let tier_at_begin: i32 = director_tier(da);
+    director_step(da, ws3, DAY_TICKS, 0.0, 0.0, 0.0);
+    let ev_a: i32 = director_events(da);
+    ck(director_holds_done(da) == h_before_a + 1,
+       "S3 dawn on the last wave completes the hold: holds_done " + sv(h_before_a)
+       + " -> " + sv(director_holds_done(da)));
+    ck((ev_a & DIR_EV_HOLD_DONE) != 0,
+       "S3 ...and publishes DIR_EV_HOLD_DONE, which is the edge server.hml pays kits on");
+    ck((ev_a & DIR_EV_DAWN) != 0, "S3 ...and still publishes DIR_EV_DAWN");
+    ck(director_wave_state(da) == DIR_IDLE, "S3 ...and the roster is still dropped");
+    ck(director_hold_ticks(da) > 0, "S3 ...and the hold's length is recorded");
+    // The payout's input. `director_tier` is re-sampled by sim.hml stage (h)
+    // the moment the hold is not active, so the kit grant reads THIS.
+    ck(director_hold_tier(da) == tier_at_begin,
+       "S3 `director_hold_tier` survives the abort: the night the player just held was tier "
+       + sv(director_hold_tier(da)));
+
+    // (b) parked on wave 1: dawn pays nothing.
+    let dbb: object = director_new();
+    director_reset(dbb, g_PD_SEED, DAY_TICKS - 2);
+    director_set_anchor(dbb, 0.0, 0.0, 0.0);
+    director_set_tier_at_phase(dbb, 2, PHASE_NIGHT);
+    director_set_holds_done(dbb, 0);
+    director_begin(dbb, DAY_TICKS - 2);
+    let h_before_b: i32 = director_holds_done(dbb);
+    director_step(dbb, ws3, DAY_TICKS, 0.0, 0.0, 0.0);
+    ck(director_holds_done(dbb) == h_before_b,
+       "S3 dawn on wave 1 of " + sv(g_DIR_WAVES_PER_HOLD) + " pays nothing, as it must");
+    ck((director_events(dbb) & DIR_EV_HOLD_DONE) == 0,
+       "S3 ...and publishes no HOLD_DONE for server.hml to pay on");
+
+    // (c) ALREADY DONE, then dawn arrives: it must not be paid twice.
+    let dc: object = director_new();
+    director_reset(dc, g_PD_SEED, DAY_TICKS - 2);
+    director_set_anchor(dc, 0.0, 0.0, 0.0);
+    director_set_tier_at_phase(dc, 2, PHASE_NIGHT);
+    director_set_holds_done(dc, 0);
+    director_begin(dc, DAY_TICKS - 2);
+    dc.wave = g_DIR_WAVES_PER_HOLD - 1;
+    dc.state = DIR_DONE;
+    dc.holds_done = 1;
+    director_step(dc, ws3, DAY_TICKS, 0.0, 0.0, 0.0);
+    ck(director_holds_done(dc) == 1,
+       "S3 >>> a hold that finished at 23:31 is NOT completed again by the dawn at 23:33 <<< got "
+       + sv(director_holds_done(dc)));
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("--- S4. a real session reaches a SECOND night ------------");
+    // -----------------------------------------------------------------------
+    // NO FIXTURE. `server_new` -> `server_tick` -> `demobot.hml` pressing
+    // buttons, for g_PD_S_MINUTES of game time. This is the assertion
+    // THE_HOUR_2 §8.2 asked for and the only one in this file that could have
+    // gone red on the thing it found.
+    let ps: array<i32> = [];
+    let pz0: i32 = 0;
+    while (pz0 < g_PS_FIELDS) { ps.push(0); pz0++; }
+    pd_session(g_PD_SEED, g_PD_S_MINUTES, ps);
+    print("  seed " + sv(g_PD_SEED) + "  " + sv(g_PD_S_MINUTES) + " game minutes, ARM POST");
+    print("  holds done " + sv(ps[g_PS_HOLDS])
+        + "   hold 1 @" + sv(ps[g_PS_H1] / 60) + " s"
+        + "   hold 2 @" + sv(ps[g_PS_H2] / 60) + " s"
+        + "   hold 2 tier " + sv(ps[g_PS_T2])
+        + "   kits peak " + sv(ps[g_PS_KITS]));
+    // The arm has to be ALIVE before its result means anything. A bot that
+    // never lights the lantern reaches no beat and holds no night, and would
+    // otherwise fail the next assertion for entirely the wrong reason.
+    ck(ps[g_PS_BEAT] >= SV_BEAT_PATH,
+       "S4 the session must actually get played: beat " + sv(ps[g_PS_BEAT])
+       + " of " + sv(SV_BEAT_PATH) + " (SV_BEAT_PATH)");
+    ck(ps[g_PS_HOLDS] >= 2,
+       ">>> S4 THE SECOND CIRCUIT: a real unfixtured session must survive at least TWO nights, got "
+       + sv(ps[g_PS_HOLDS]) + " <<<");
+    ck(ps[g_PS_H2] > ps[g_PS_H1],
+       "S4 ...and the second one is a SECOND one, not the first counted twice ("
+       + sv(ps[g_PS_H1] / 60) + " s then " + sv(ps[g_PS_H2] / 60) + " s)");
+    // The payout ladder, checked against what the session actually held.
+    // SV_HOLD_KITS is the floor and the tier is the rest; night 1 is pinned at
+    // tier 1 by sim.hml and by g_DIR_RAMP_BASE, so the FOUR kits a Village
+    // costs are exactly SV_OPEN_KITS + SV_HOLD_KITS and nothing about the
+    // first circuit moves.
+    ck(SV_OPEN_KITS + SV_HOLD_KITS == 4,
+       "S4 the Village arithmetic is untouched: SV_OPEN_KITS " + sv(SV_OPEN_KITS)
+       + " + SV_HOLD_KITS " + sv(SV_HOLD_KITS) + " = 4 posts");
+    ck(ps[g_PS_T2] >= 1,
+       "S4 the second night's tier is recorded for the payout, got " + sv(ps[g_PS_T2]));
+    ck(ps[g_PS_KITS] >= SV_OPEN_KITS + SV_HOLD_KITS,
+       "S4 the pack peaked at " + sv(ps[g_PS_KITS]) + " kits, at least the "
+       + sv(SV_OPEN_KITS + SV_HOLD_KITS) + " a Village costs");
     print("");
 
     // -----------------------------------------------------------------------

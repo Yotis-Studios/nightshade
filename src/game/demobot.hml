@@ -96,15 +96,156 @@
 //  route to pickups (nothing spawns `KIND_PICKUP`).  Every button it presses is
 //  a button a player has.
 //
-//  It reads `client_ammo` NOWHERE, and that is not a cheat — it is a
-//  work-around for a defect this module does not own.  `client_ammo` is
-//  `min(authority, prediction)` and LATCHES LOW (probe_waveone §E.1: the HUD
+//  It reads `client_ammo` as a FLOOR and nowhere else, and that is not a cheat
+//  — it is a work-around for a defect this module does not own.  `client_ammo`
+//  is `min(authority, prediction)` and LATCHES LOW (probe_waveone §E.1: the HUD
 //  magazine lies by up to 1 of 6 rounds), so a driver that gates its trigger on
 //  it stops shooting while holding a loaded gun.  `demobot_ammo_sync` rebuilds
 //  the magazine from the AUTHORITY'S OWN shot counter — `client_shots`, which
 //  is a number the HUD already shows the player — plus the reload transitions
 //  the player can see and hear.  REPORTED, not smuggled: the underlying
-//  client.hml bug is still open.
+//  client.hml bug is still open.  §AMMO-LATCH below is why the HUD is now also
+//  read as a lower bound.
+//
+//  =========================================================================
+//  §AMMO-LATCH — THE BUG THAT ATE THIRTY-FIVE MINUTES OF EVERY HOUR
+//  =========================================================================
+//  THE_HOUR_2 §0.4 reported two town-visit drivers dying 223 and 350 times in
+//  an hour and attributed it to "a movement override that keeps steering a
+//  player it has disarmed".  It was not the override.  IT WAS THIS FILE, and
+//  the same latch is what `probe_session` ARM POST — the shipping driver with
+//  no override at all — was doing when it recorded 112 player deaths.
+//
+//  MEASURED, `probe_session` ARM WALK, seed 1337, one row per five seconds
+//  (the trace is reproduced in this task's report).  From t = 1509 s to the end
+//  of the hour, EVERY sample reads:
+//
+//      mag = 0    client_ammo = 4    reserve = 12    brk = 1    shots FROZEN
+//
+//  The player is standing at the post on 100 HP holding a gun with FOUR ROUNDS
+//  IN IT and twelve in reserve, and the driver believes it is empty.  It is a
+//  DEADLOCK and every arrow points inward:
+//
+//    * the model says empty  ->  `fire` is gated on `ammo > 0`  ->  it never
+//      fires  ->  `client_shots` never advances  ->  repair path 1 is dead.
+//    * the model says empty  ->  it holds BTN_RELOAD  ->  `wpn_reload_begin`
+//      (weapons.hml:1200) refuses on exactly two conditions, a FULL magazine
+//      or an EMPTY reserve.  The reserve is 12, so the refusal means the
+//      magazine is full.  `client_reloading` never rises  ->  the reload
+//      transition that rebuilds `b.mag` never happens  ->  repair path 2 is
+//      dead.
+//    * `ammo <= 0` with a body inside `g_DBOT_BREAK_M` latches BREAK CONTACT,
+//      which returns before the trigger is ever reached, so the driver sprints
+//      in a circle at the leash radius for the remaining thirty-five minutes.
+//    * and the reserve is pinned at `SV_START_RESERVE`, so `sv_lantern_supply`
+//      stops paying too — `supplied` freezes, which is how the freeze looks
+//      from the outside like the lantern broke.
+//
+//  What DESYNCHRONISES the model in the first place is the watchdog below:
+//  `dry_watch > 30` FRAMES zeroes `b.mag` when the trigger was held and nothing
+//  came out.  At 60 fps that is 0.50 s against the Kestrel's 0.30 s shot
+//  interval, which is safe; at the 85 fps this game actually runs at it is
+//  0.353 s, which is one frame of jitter away from firing on a loaded gun.
+//  (That frame-rate coupling is REPORTED, not fixed: fixing it needs a `dt` the
+//  entry point does not take, and the two repairs below make the watchdog
+//  non-fatal, which is the part that matters.)
+//
+//  TWO REPAIRS, each derived from a rule the game's own code states:
+//
+//    1. THE FLOOR.  `client_ammo` is `min(authority, prediction)`.  Both terms
+//       are <= the real magazine, so the HUD is a LOWER BOUND on it and the
+//       model may never sit beneath it.  This module's header has always said
+//       "it can only ever read LOW" and then never used the fact.
+//    2. THE REFUSED-RELOAD RECOVERY.  If the model says empty and the reserve
+//       is not, and no reload has started for `g_DBOT_STUCK_F` frames, then
+//       `wpn_reload_begin` is refusing, and it refuses for exactly one other
+//       reason: THE MAGAZINE IS FULL.  So set the model full.  This catches the
+//       case the floor cannot — a `client_ammo` that latched at 0.
+//
+//  Neither repair can ever lower the model, so neither can make the bot fire a
+//  round it does not have; the authority refuses that anyway.
+//
+//  =========================================================================
+//  §ERRAND — THE BOT NOW PLAYS THE WHOLE LOOP, NOT ONLY ITS FIRST ACT
+//  =========================================================================
+//  Gate 8 measured the old driver directly: `kits placed 0, lanterns fed 7,
+//  CAMP lux 256/512 at 300 s`, with four unused lantern kits in the pack.  It
+//  lit the tutorial lantern and then fought forever.  Every `--demo` frame
+//  rate, triangle peak and screenshot anyone has quoted was therefore of a game
+//  playing only its first minute.
+//
+//  So there is a SECOND LAYER in this file now.  `demobot_frame` runs the
+//  combat driver first, unchanged and verbatim, and then `demobot_errand`,
+//  which overrides movement and the interaction keys WHEN AND ONLY WHEN the
+//  combat driver has nothing to shoot.  Out, fight, carry it home, plant, talk,
+//  trade, walk back out.  `demobot_set_errand(b, 0)` turns the layer off and
+//  gives you the driver that shipped before this wave, byte for byte — that is
+//  the control arm, and `probe_session` runs it as one.
+//
+//  MEASURED, `probe_session`, one hour of game time, seed 1337, NO FIXTURE
+//  ANYWHERE, one boolean apart:
+//
+//                             ERRAND OFF   ERRAND ON      (the control / this)
+//      town trips                      0           3
+//      posts planted                   0          10
+//      conversations                   0           3
+//      trades completed                0           3
+//      guns owned at 60:00             1           2
+//      settlement tier              CAMP     VILLAGE
+//      core lux                      256        1635
+//      buildings                       2           9
+//      villagers                       0           7 (3 named)
+//      lanterns the player lit         1          11
+//      regard (Wick)                   0          21
+//      PLAYER DEATHS                 354         103
+//
+//  and over 8 seeds x 30 game minutes: 8 OF 8 REACH VILLAGE, between 24:47 and
+//  25:10 elapsed, fewest posts 4.  The last new thing in the hour moved from
+//  THE_HOUR_2's 24:53 to 57:00.
+//
+//  Read the death row last and read it twice.  Walking home is not only richer
+//  than standing at the post, it is SAFER: 103 against 354.  The standing
+//  driver's post stops being holdable at 52:00 — its last kill — after which it
+//  respawns, fires about one round per life and dies eleven times a minute.
+//
+//  THE THREE RULES THE BROKEN DRIVERS BROKE, each now a named clause:
+//
+//    A. AN ERRAND NEVER OUTRANKS A FIGHT.  The layer returns without touching a
+//       button whenever the nearest body is inside `g_DBOT_ENGAGE_M` — the
+//       exact range at which the combat driver has a target it would shoot.  It
+//       therefore CANNOT suppress BTN_FIRE while there is anything to fire at,
+//       which is the failure THE_HOUR_2 §8.1 asked for.
+//    B. DEATH ENDS THE ERRAND.  Respawn is at the FIRST post (server.hml:1493),
+//       ~280 m from the town, so an errand that survives a death sends a fresh
+//       corpse straight back down the same road.  Death returns the bot to
+//       HOLD and forfeits the day's trip.
+//    C. DUSK ENDS THE ERRAND.  Dawn and day are for walking; dusk and night
+//       belong to the post, because the light is the ammunition.  A trip that
+//       has not finished by dusk is abandoned and the bot walks home.
+//
+//  WHAT THE ERRAND LAYER READS, AND THE ONE ORACLE IN IT, DECLARED
+//  ---------------------------------------------------------------
+//  Navigation is CLIENT-SIDE and every value is on the player's screen:
+//    * `client_settle_x` / `client_settle_z` — the settlement the compass
+//      diamond has pointed at since the first lantern was lit (main.hml:2054).
+//    * `client_settle_inside` — "a post planted here counts", which the
+//      teach-the-verb work draws on the ground as the Great Lantern's reach
+//      whenever you are carrying a wick.  The bot plants ONLY where the HUD
+//      says the grid will take it; it does not compute the ring itself.
+//    * `client_chan01` — the channel ring, so the 2.5 s hold is timed off the
+//      thing the player watches instead of off a frame count that is wrong at
+//      any frame rate but 60.
+//    * `client_phase`, `client_pack_kits`, `client_npc_count`,
+//      `client_ui_panel`, `client_ui_rows` — sky, pack, town, panel.
+//
+//  >>> THE ORACLE, AND IT IS EXACTLY ONE THING. <<<  Walking to a NAMED
+//  VILLAGER reads `npc_x` / `npc_z` off the server store, because `client.hml`
+//  publishes no villager position.  That is a MISSING CLIENT ACCESSOR and not a
+//  hidden fact: `main.hml:1240` reads those same two functions to DRAW the
+//  villagers, so the position this bot walks to is a body standing in the
+//  player's frame.  It is still a read the wire does not carry, it is declared
+//  here for the same reason `probe_session` declares ARM WALK's, and it should
+//  be deleted the day `client.hml` publishes villager positions.
 // =============================================================================
 
 import { sqrt, sin, cos, atan2 } from "@stdlib/math";
@@ -113,16 +254,25 @@ import { g_ENEMY_KIND_COUNT } from "../core/config.hml";
 
 import { ai_height_of, ai_speed_of, ai_damage_of } from "../sim/ai.hml";
 import { wpn_mag, wpn_max_range, WPN_KESTREL } from "../sim/weapons.hml";
-import { BTN_FIRE, BTN_USE, BTN_ADS, BTN_SPRINT, BTN_RELOAD } from "../sim/command.hml";
+import { BTN_FIRE, BTN_USE, BTN_ADS, BTN_SPRINT, BTN_RELOAD,
+         BTN_BUILD, BTN_SWITCH, BTN_GRENADE, BTN_INV } from "../sim/command.hml";
+import { PHASE_DAWN, PHASE_DAY } from "../sim/daycycle.hml";
+import { npc_present, npc_slot_of, npc_x, npc_z,
+         NPC_NONE, NPC_NAMED } from "../sim/npc.hml";
 
 import { server_lantern_x, server_lantern_z, SV_PSLOT,
-         SV_MODEL_LANTERN, SV_MODEL_PICKUP } from "./server.hml";
+         SV_MODEL_LANTERN, SV_MODEL_PICKUP,
+         server_settle, server_npcs, server_tick_now,
+         UI_PANEL_TRADE } from "./server.hml";
 
 import { client_set_angles, client_set_move, client_set_button,
          client_press_fire, client_reserve, client_dead, client_lantern_lit,
          client_ent_count, client_ent_id, client_ent_x, client_ent_y,
          client_ent_z, client_ent_model, client_ads, client_cam_y,
-         client_shots, client_reloading } from "./client.hml";
+         client_shots, client_reloading, client_ammo, client_phase,
+         client_pack_kits, client_settle_x, client_settle_z,
+         client_settle_inside, client_npc_count, client_ui_panel,
+         client_ui_rows, client_chan01 } from "./client.hml";
 
 // ---------------------------------------------------------------------------
 //  THE EIGHT CONSTANTS.  Every one of them is a measured number, not a taste.
@@ -135,6 +285,58 @@ export let g_DBOT_HIP_M: f64     = 0.0;    // MEASURED: iron sights at every ran
 export let g_DBOT_ENGAGE_M: f64  = 20.0;   // let it walk in; do not chip across the ring
 export let g_DBOT_BREAK_M: f64   = 4.5;    // inside this, stop shooting and BREAK CONTACT
 export let g_DBOT_CLEAR_M: f64   = 14.0;   // ...and re-engage once the nearest is past this
+
+// §AMMO-LATCH repair 2. Frames of "the model says empty, the reserve does not,
+// and no reload has started". `wpn_reload_begin` refuses only on a FULL
+// magazine or an EMPTY reserve; the reserve is not empty, so 120 frames — two
+// seconds at 60 fps, twenty times the round-trip a held BTN_RELOAD needs to
+// show up as `client_reloading > 0` — is the authority saying the gun is full.
+export let g_DBOT_STUCK_F: i32   = 120;
+
+// ---------------------------------------------------------------------------
+//  §ERRAND — THE SIX STATES OF A LAMPLIGHTER, AND THEIR NUMBERS
+// ---------------------------------------------------------------------------
+export let DBOT_ST_HOLD: i32  = 0;   // the post. The combat driver owns it.
+export let DBOT_ST_IN: i32    = 1;   // walking home
+export let DBOT_ST_PLANT: i32 = 2;   // putting posts in the ground
+export let DBOT_ST_TALK: i32  = 3;   // walking to a villager
+export let DBOT_ST_SHOP: i32  = 4;   // talking, then pressing every row
+export let DBOT_ST_OUT: i32   = 5;   // walking back to the post
+
+// "Standing on the green." Wide, because the green is where the decision about
+// WHERE to plant starts, not where any single post goes.
+export let g_DBOT_GREEN_M: f64  = 18.0;
+// The plant ring. Four posts a band, 12 m out per band, starting at 24 m: every
+// pair is >= 25 m apart against `SV_KIT_MIN_GAP_M`'s 12 m, and band 3 lands at
+// 60 m, inside the Camp's 64 m ring. Sixteen spots is one more than the fifteen
+// posts a TOWN's 32 grid points would cost.
+export let g_DBOT_RING0_M: f64  = 24.0;
+export let g_DBOT_RING_D_M: f64 = 12.0;
+export let g_DBOT_SPOTS: i32    = 16;
+export let g_DBOT_SPOT_M: f64   = 1.4;    // "arrived at the spot"
+// The channel is 2.5 s of SIM time and this is its TIMEOUT, not its length:
+// completion is detected off `client_chan01`, the ring the player watches, so
+// the hold is correct at any frame rate. 600 frames is 10 s at 60 fps and still
+// 7 s at 85 — comfortably past 2.5 s either way.
+export let g_DBOT_CHAN_MAX_F: i32 = 600;
+export let g_DBOT_TALK_M: f64   = 2.2;    // NPC_TALK_M is 2.6; stop just inside
+export let g_DBOT_POST_M: f64   = 8.0;    // "back at the post"
+// Frames the cursor sits on one shop row. FOUR SECONDS, and the number is set
+// by a file this module does not own: `main.hml`'s `demo_drive` OVERWRITES
+// BTN_GRENADE every frame after this function returns, to throw the Flare — and
+// BTN_GRENADE is also the trade panel's CONFIRM. In `--demo` the bot's own
+// confirm press is therefore clobbered, and the only edges that land are the
+// Flare's, which arrive every 2.0 s while the panel is open (the panel eats the
+// cast, so the spell cooldown never starts). 240 frames guarantees at least one
+// per row on that path and costs nothing on the probe path, where the bot's own
+// press works. REPORTED, not smuggled — see this task's report.
+export let g_DBOT_ROW_F: i32    = 240;
+export let g_DBOT_ROWS_MAX: i32 = 6;      // rows swept per villager per visit
+// Frames after the plant press by which `client_pack_kits` must have dropped.
+// If it has not, `sv_place_kit` refused this spot (something is already inside
+// SV_KIT_MIN_GAP_M) and the channel that follows would be 10 s spent holding E
+// on nothing.
+export let g_DBOT_PLANT_ACK_F: i32 = 20;
 
 // ---------------------------------------------------------------------------
 //  STATE.  One object per driven client.
@@ -150,9 +352,26 @@ export fn demobot_new(p_cl: object, p_sv: object): object {
         mag0: 0,
         res0: 0,
         dry_watch: 0,
+        stuck: 0,                        // §AMMO-LATCH repair 2's counter
         brk: 0,                          // in BREAK CONTACT
         fired: 0,                        // edge flags, for the viewmodel
-        reloaded: 0
+        reloaded: 0,
+        // --- §ERRAND ------------------------------------------------------
+        errand: 1,       // the layer is ON by default; this is the shipping bot
+        est: 0,          // DBOT_ST_*
+        due: 0,          // a dawn has broken and today's trip is not yet made
+        ph_prev: 0 - 1,  // last frame's `client_phase`, for the dawn edge
+        near_d: 1.0e30,  // nearest hostile, published by the combat pass
+        spot: 0,         // the ring position the NEXT post goes on. MONOTONE.
+        chan: 0 - 1,     // frames of USE held on the post underfoot; -1 = idle
+        saw_chan: 0,     // `client_chan01` has been seen above zero this hold
+        kits0: 0,        // pack count at the plant press, to detect a refusal
+        who: NPC_NONE,   // the villager it is walking to
+        widx: 0,         // sweep cursor over the named villagers
+        pump: 0,         // frames since this villager's conversation opened
+        rowi: 0,         // rows swept for this villager
+        trips: 0,        // completed round trips
+        presses: 0       // TALK presses issued
     };
     let out: object = b;
     return out;
@@ -164,6 +383,17 @@ export fn demobot_fired(p_b: object): i32 { let b: object = p_b; let o: i32 = b.
 export fn demobot_reloaded(p_b: object): i32 { let b: object = p_b; let o: i32 = b.reloaded; return o; }
 export fn demobot_mag(p_b: object): i32 { let b: object = p_b; let o: i32 = b.mag; return o; }
 export fn demobot_breaking(p_b: object): i32 { let b: object = p_b; let o: i32 = b.brk; return o; }
+
+// §ERRAND's switch and its report. `demobot_set_errand(b, 0)` is the CONTROL
+// ARM: the layer stops running and what is left is the driver that shipped
+// before this wave, byte for byte, because the combat pass below is unchanged.
+export fn demobot_set_errand(p_b: object, p_on: i32) { let b: object = p_b; b.errand = p_on; }
+export fn demobot_errand_on(p_b: object): i32 { let b: object = p_b; let o: i32 = b.errand; return o; }
+export fn demobot_state(p_b: object): i32 { let b: object = p_b; let o: i32 = b.est; return o; }
+export fn demobot_trips(p_b: object): i32 { let b: object = p_b; let o: i32 = b.trips; return o; }
+export fn demobot_presses(p_b: object): i32 { let b: object = p_b; let o: i32 = b.presses; return o; }
+export fn demobot_spots_used(p_b: object): i32 { let b: object = p_b; let o: i32 = b.spot; return o; }
+export fn demobot_near_d(p_b: object): f64 { let b: object = p_b; let o: f64 = b.near_d; return o; }
 
 // ---------------------------------------------------------------------------
 //  THE RECONSTRUCTED MAGAZINE
@@ -218,6 +448,35 @@ fn demobot_ammo_sync(p_b: object) {
         b.dry_watch = 0;
     }
     if (b.mag > cap) { b.mag = cap; }
+
+    // 4. >>> §AMMO-LATCH REPAIR 1 — THE FLOOR. <<<
+    //    `client_ammo` is `min(authority, prediction)`. BOTH terms are at most
+    //    the real magazine, so the HUD is a LOWER BOUND on it and this model
+    //    may never sit beneath it. Cheap, always correct, and it can only ever
+    //    raise the model toward the truth — it cannot make the bot fire a round
+    //    it does not have, because the authority refuses that on its own.
+    let hud: i32 = client_ammo(cl);
+    if (b.mag < hud) { b.mag = hud; }
+
+    // 5. >>> §AMMO-LATCH REPAIR 2 — THE REFUSED-RELOAD RECOVERY. <<<
+    //    The case the floor cannot catch is a `client_ammo` that ALSO latched
+    //    at zero. `wpn_reload_begin` (weapons.hml:1200) refuses on exactly two
+    //    conditions: a FULL magazine, or an EMPTY reserve. So if the model says
+    //    empty, the reserve says otherwise, and no reload has begun for two
+    //    seconds of held BTN_RELOAD, the authority is telling us the magazine
+    //    is full. Believe it. Without this the driver deadlocks: it will not
+    //    fire because the model says empty, and the model is only ever repaired
+    //    by firing or by a reload that will not start.
+    let res: i32 = client_reserve(cl);
+    if (b.mag <= 0 && res > 0 && rt <= 0.0 && client_dead(cl) == 0) {
+        b.stuck = b.stuck + 1;
+        if (b.stuck > g_DBOT_STUCK_F) {
+            b.mag = cap;
+            b.stuck = 0;
+        }
+    } else {
+        b.stuck = 0;
+    }
 }
 
 // Move in a WORLD direction. forward = (sin yaw, -cos yaw), right = (cos yaw,
@@ -245,12 +504,17 @@ fn demobot_dl(p_px: f64, p_pz: f64, p_lx: f64, p_lz: f64): f64 {
 }
 
 // ---------------------------------------------------------------------------
-//  ONE FRAME OF THE DEMO PLAYER
+//  ONE FRAME OF THE DEMO PLAYER — THE COMBAT HALF
 // ---------------------------------------------------------------------------
 //  `p_px` / `p_pz` are the client's own position, passed in rather than read,
 //  so this module needs no accessor `main.hml` does not already import.
+//
+//  UNCHANGED from the driver that shipped, deliberately, apart from the two
+//  lines that publish `b.near_d` — the ARM 5 == ARM 6 equality in
+//  `probe_firstminute` is this port's only drift guard and it is a statement
+//  about THIS function. §ERRAND is a separate pass, below.
 // ---------------------------------------------------------------------------
-export fn demobot_frame(p_b: object, p_px: f64, p_pz: f64) {
+fn demobot_combat(p_b: object, p_px: f64, p_pz: f64) {
     let b: object = p_b;
     let cl: object = b.cl;
     let sv2: object = b.sv;
@@ -258,6 +522,10 @@ export fn demobot_frame(p_b: object, p_px: f64, p_pz: f64) {
     let pz: f64 = p_pz;
 
     demobot_ammo_sync(b);
+    // Published for §ERRAND, which yields the frame entirely whenever this is
+    // inside `g_DBOT_ENGAGE_M`. Set here so the death and pre-lantern returns
+    // below leave it in a state that means "nothing to shoot".
+    b.near_d = 1.0e30;
 
     if (client_dead(cl) == 1) {
         client_set_move(cl, 0.0, 0.0);
@@ -389,6 +657,7 @@ export fn demobot_frame(p_b: object, p_px: f64, p_pz: f64) {
     }
     b.target = best_id;
     if (held_seen == 0 && held != 0) { b.target = best_id; }
+    b.near_d = near_d;                   // published for §ERRAND
     let any: i32 = have + have_far;
     let ammo: i32 = b.mag;
     let res: i32 = client_reserve(cl);
@@ -534,4 +803,369 @@ export fn demobot_frame(p_b: object, p_px: f64, p_pz: f64) {
         client_set_button(cl, BTN_FIRE, 0);
         b.dry_watch = 0;
     }
+}
+
+// ===========================================================================
+//  §ERRAND — THE LAMPLIGHTER WHO GOES HOME
+// ===========================================================================
+//  Everything above this line is the driver that shipped.  Everything below is
+//  the second verb, and the whole of the design contract for it is in the
+//  header: it may only run when there is nothing to shoot, it forfeits its trip
+//  on death, and it abandons its trip at dusk.
+//
+//  The plant ring.  `p_i` is MONOTONE across the whole session: trip two starts
+//  where trip one stopped, so a returning lamplighter never stands on a post it
+//  planted last week holding E at a spot `sv_place_kit` will refuse.
+// ---------------------------------------------------------------------------
+fn demobot_spot_x(p_cl: object, p_i: i32): f64 {
+    let i: i32 = p_i;
+    let band: i32 = i / 4;
+    let k: i32 = i - band * 4;
+    let r: f64 = g_DBOT_RING0_M + g_DBOT_RING_D_M * f64(band);
+    let a: f64 = (f64(k) * 90.0 + f64(band) * 45.0) * 0.017453292519943295;
+    let out: f64 = client_settle_x(p_cl) + sin(a) * r;
+    return out;
+}
+
+fn demobot_spot_z(p_cl: object, p_i: i32): f64 {
+    let i: i32 = p_i;
+    let band: i32 = i / 4;
+    let k: i32 = i - band * 4;
+    let r: f64 = g_DBOT_RING0_M + g_DBOT_RING_D_M * f64(band);
+    let a: f64 = (f64(k) * 90.0 + f64(band) * 45.0) * 0.017453292519943295;
+    let out: f64 = client_settle_z(p_cl) - cos(a) * r;
+    return out;
+}
+
+// Every button `sv_ui_tick` reads is a RISING EDGE, so a press that is not
+// released is a press that happens once. This releases all four modal keys at
+// the top of every errand frame; the state below sets at most one of them back.
+fn demobot_release_ui(p_cl: object) {
+    client_set_button(p_cl, BTN_BUILD, 0);
+    client_set_button(p_cl, BTN_SWITCH, 0);
+    client_set_button(p_cl, BTN_GRENADE, 0);
+    client_set_button(p_cl, BTN_INV, 0);
+}
+
+// Head for a world point at a run. Aim goes with the feet: there is nothing to
+// shoot when this runs (clause A), so the view may serve the walk.
+fn demobot_go(p_cl: object, p_dx: f64, p_dz: f64) {
+    let yaw: f64 = atan2(p_dx, 0.0 - p_dz);
+    client_set_angles(p_cl, yaw, 0.0);
+    demobot_move_world(p_cl, yaw, p_dx, p_dz);
+    client_set_button(p_cl, BTN_SPRINT, 1);
+    client_set_button(p_cl, BTN_ADS, 0);
+}
+
+// Forget everything that only makes sense while standing somewhere specific.
+fn demobot_drop_errand(p_b: object) {
+    let b: object = p_b;
+    b.chan = 0 - 1;
+    b.saw_chan = 0;
+    b.pump = 0;
+    b.rowi = 0;
+    b.who = NPC_NONE;
+}
+
+fn demobot_errand(p_b: object, p_px: f64, p_pz: f64) {
+    let b: object = p_b;
+    let cl: object = b.cl;
+    let sv2: object = b.sv;
+    let px: f64 = p_px;
+    let pz: f64 = p_pz;
+
+    // ---- 0. THE OPENING OWNS THE PLAYER -----------------------------------
+    // Until the tutorial lantern is lit there is no town on the wire, no kit in
+    // the pack and no verb to perform.
+    if (client_lantern_lit(cl) == 0) {
+        b.est = DBOT_ST_HOLD;
+        return;
+    }
+
+    // ---- 1. THE SKY IS THE ONLY CLOCK IT READS ----------------------------
+    // A dawn EDGE arms one trip. `b.ph_prev` starts negative so a session that
+    // begins at dawn does not manufacture an edge out of its first frame.
+    let ph: i32 = client_phase(cl);
+    if (b.ph_prev >= 0 && ph == PHASE_DAWN && b.ph_prev != PHASE_DAWN) { b.due = 1; }
+    b.ph_prev = ph;
+
+    // ---- 2. CLAUSE B: DEATH ENDS THE TRIP, NOT THE ERRAND ------------------
+    // `server.hml:1493` respawns the player at the FIRST post, ~280 m from the
+    // town, so an errand that SURVIVES a death resumes a walk from a place the
+    // player is no longer standing. The trip is therefore abandoned and the bot
+    // goes back to holding.
+    //
+    // >>> BUT `b.due` IS DELIBERATELY LEFT ARMED, AND THAT IS A MEASURED
+    // CORRECTION. <<< This block cleared it on the first attempt — "today's
+    // trip is forfeit" — and the run said otherwise: the dawn edge at 24:00
+    // armed the trip, the bot died twice inside that dawn, `due` went to zero,
+    // and the Village that appeared at 25:00 was never visited again. TRIPS
+    // FROZEN AT 1, `talks 0`, `trades 0`, thirty-five dead minutes. Clause A
+    // and clause C already forbid setting out while anything is in range or
+    // after dusk; a third rule forbidding it because you died an hour ago is
+    // not caution, it is the bot giving up.
+    if (client_dead(cl) == 1) {
+        if (b.est != DBOT_ST_HOLD) { b.est = DBOT_ST_HOLD; }
+        demobot_drop_errand(b);
+        return;
+    }
+
+    // ---- 3. CLAUSE C: DUSK ENDS THE ERRAND --------------------------------
+    // Dawn and day are for walking. Dusk and night belong to the post, because
+    // the light is the ammunition and a lamplighter caught in the open at dusk
+    // is a lamplighter with nothing to shoot back with.
+    if (b.est != DBOT_ST_HOLD && ph != PHASE_DAWN && ph != PHASE_DAY) {
+        if (b.est != DBOT_ST_OUT) {
+            demobot_drop_errand(b);
+            b.est = DBOT_ST_OUT;
+        }
+    }
+
+    // ---- 4. CLAUSE A: AN ERRAND NEVER OUTRANKS A FIGHT --------------------
+    // `g_DBOT_ENGAGE_M` is the exact range at which the combat pass above has a
+    // target it would shoot, so this yields the frame WITHOUT TOUCHING A BUTTON
+    // precisely when there is something to shoot. It cannot suppress BTN_FIRE
+    // while anything is in range, and it cannot walk a disarmed player anywhere.
+    if (b.near_d < g_DBOT_ENGAGE_M) {
+        b.chan = 0 - 1;                  // a channel does not survive a fight
+        b.saw_chan = 0;
+        return;
+    }
+
+    // ---- 5. HOLD. Leave in the MORNING, and only for a reason --------------
+    //  ARMED on the dawn edge, but the trip may start at any point in dawn OR
+    //  day, and that width is a MEASURED number rather than a taste. Departure
+    //  also needs clause A to be satisfied — nothing inside `g_DBOT_ENGAGE_M` —
+    //  and with a dawn-only gate the run below never found such a frame after
+    //  the director reached tier 2: dawn is 120 s of a 960 s day, night 3's
+    //  bodies were still standing in it, and the measured result was TRIPS
+    //  FROZEN AT 1, `talks 0`, `trades 0` and thirty-five minutes of a Village
+    //  the player never visited. Dawn plus day is 540 s and the errand still
+    //  cannot start in the dark, which is the rule that mattered.
+    if (b.est == DBOT_ST_HOLD) {
+        if (b.due == 1 && (ph == PHASE_DAWN || ph == PHASE_DAY)) {
+            // A 280 m walk needs a purpose: a post to plant, or somebody to
+            // talk to. Both are HUD facts.
+            let worth: i32 = 0;
+            if (client_pack_kits(cl) > 0) { worth = 1; }
+            if (client_npc_count(cl) > 0) { worth = 1; }
+            if (worth == 1) {
+                b.due = 0;
+                demobot_drop_errand(b);
+                b.widx = 0;
+                b.est = DBOT_ST_IN;
+            }
+        }
+        return;                          // the combat driver's footwork stands
+    }
+
+    demobot_release_ui(cl);
+
+    // ---- 6. WALK HOME ------------------------------------------------------
+    // The compass diamond has pointed here since the first lantern was lit.
+    if (b.est == DBOT_ST_IN) {
+        let dx: f64 = client_settle_x(cl) - px;
+        let dz: f64 = client_settle_z(cl) - pz;
+        if (dx * dx + dz * dz > g_DBOT_GREEN_M * g_DBOT_GREEN_M) {
+            demobot_go(cl, dx, dz);
+            client_set_button(cl, BTN_USE, 0);
+            return;
+        }
+        client_set_button(cl, BTN_SPRINT, 0);
+        // Plant first, then trade: a post lit this morning is worth regard, and
+        // regard is what opens the row that sells the next post.
+        b.est = DBOT_ST_OUT;
+        if (client_npc_count(cl) > 0) { b.est = DBOT_ST_TALK; }
+        if (client_pack_kits(cl) > 0) { b.est = DBOT_ST_PLANT; }
+        return;
+    }
+
+    // ---- 7. PLANT ----------------------------------------------------------
+    if (b.est == DBOT_ST_PLANT) {
+        if (client_pack_kits(cl) <= 0 && b.chan < 0) {
+            b.est = DBOT_ST_OUT;
+            if (client_npc_count(cl) > 0) { b.est = DBOT_ST_TALK; }
+            return;
+        }
+        if (b.spot >= g_DBOT_SPOTS) { b.spot = 0; }
+        let tx: f64 = demobot_spot_x(cl, b.spot);
+        let tz: f64 = demobot_spot_z(cl, b.spot);
+        let dx: f64 = tx - px;
+        let dz: f64 = tz - pz;
+
+        if (b.chan < 0) {
+            if (dx * dx + dz * dz > g_DBOT_SPOT_M * g_DBOT_SPOT_M) {
+                demobot_go(cl, dx, dz);
+                client_set_button(cl, BTN_USE, 0);   // released: the NEXT press
+                return;                              // is a rising edge
+            }
+            // >>> AND ONLY WHERE THE HUD SAYS THE GRID WILL TAKE IT. <<<
+            // `client_settle_inside` is the wire's own answer to the question
+            // the ring on the ground draws. A post outside it lights the road
+            // and buys the town nothing, so the bot steps to the next spot
+            // rather than spend a wick on one.
+            if (client_settle_inside(cl) == 0) {
+                b.spot = b.spot + 1;
+                if (b.spot >= g_DBOT_SPOTS) {
+                    b.spot = 0;
+                    b.est = DBOT_ST_OUT;         // the ring is walked out
+                    if (client_npc_count(cl) > 0) { b.est = DBOT_ST_TALK; }
+                }
+                return;
+            }
+            client_set_move(cl, 0.0, 0.0);
+            client_set_button(cl, BTN_SPRINT, 0);
+            client_set_button(cl, BTN_ADS, 0);
+            client_set_button(cl, BTN_USE, 1);    // the edge -> `sv_place_kit`
+            b.chan = 0;
+            b.saw_chan = 0;
+            b.kits0 = client_pack_kits(cl);
+            return;
+        }
+
+        // Holding E on the post now under our feet. `sim.hml` stage (g) runs
+        // the 2.5 s channel off the HELD bit, and `client_chan01` is the ring
+        // that draws it — so completion is read off the player's own HUD and
+        // this hold is correct at any frame rate.
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 0);
+        client_set_button(cl, BTN_USE, 1);
+        b.chan = b.chan + 1;
+        let c: f64 = client_chan01(cl);
+        if (c > 0.0) { b.saw_chan = 1; }
+        let done: i32 = 0;
+        // The plant was REFUSED (something is already inside SV_KIT_MIN_GAP_M):
+        // the pack never dropped, so there is nothing under our feet to light.
+        if (b.chan >= g_DBOT_PLANT_ACK_F && client_pack_kits(cl) >= b.kits0) { done = 1; }
+        if (b.saw_chan == 1 && c <= 0.0) { done = 1; }   // the ring completed
+        if (b.chan >= g_DBOT_CHAN_MAX_F) { done = 1; }   // ...or it never will
+        if (done == 1) {
+            client_set_button(cl, BTN_USE, 0);
+            b.chan = 0 - 1;
+            b.saw_chan = 0;
+            b.spot = b.spot + 1;
+        }
+        return;
+    }
+
+    // ---- 8. WALK TO A VILLAGER ---------------------------------------------
+    // >>> THE ONE ORACLE, DECLARED IN THE HEADER. <<< `npc_x`/`npc_z` off the
+    // server store, because `client.hml` publishes no villager position —
+    // `main.hml:1240` reads the same two functions to DRAW them.
+    if (b.est == DBOT_ST_TALK || b.est == DBOT_ST_SHOP) {
+        let sto: object = server_npcs(sv2);
+        if (sto == null) { b.est = DBOT_ST_OUT; return; }
+        if (b.who == NPC_NONE) {
+            let w: i32 = b.widx;
+            while (w < NPC_NAMED) {
+                if (npc_present(sto, w) == 1) { b.who = w; w = NPC_NAMED; }
+                else { w++; }
+            }
+            if (b.who == NPC_NONE) {
+                // NOBODY ELSE IS HOME. Not a failure: the measurement.
+                b.est = DBOT_ST_OUT;
+                return;
+            }
+            b.widx = b.who + 1;
+            b.pump = 0;
+            b.rowi = 0;
+            b.est = DBOT_ST_TALK;
+        }
+        let slot: i32 = npc_slot_of(sto, b.who);
+        if (slot < 0) { b.who = NPC_NONE; return; }
+        let st: object = server_settle(sv2);
+        let tick: i32 = server_tick_now(sv2);
+        let dx: f64 = npc_x(sto, st, slot, tick) - px;
+        let dz: f64 = npc_z(sto, st, slot, tick) - pz;
+        if (dx * dx + dz * dz > g_DBOT_TALK_M * g_DBOT_TALK_M) {
+            // They wander. If one walks off mid-conversation, chase and resume
+            // where the cursor was rather than start the row sweep again.
+            demobot_go(cl, dx, dz);
+            client_set_button(cl, BTN_USE, 0);
+            b.est = DBOT_ST_TALK;
+            return;
+        }
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 0);
+        client_set_button(cl, BTN_ADS, 0);
+        client_set_angles(cl, atan2(dx, 0.0 - dz), 0.0);
+        if (b.est == DBOT_ST_TALK) {
+            b.est = DBOT_ST_SHOP;
+            b.pump = 0;
+            client_set_button(cl, BTN_USE, 0);    // one released frame first
+            return;
+        }
+
+        // ---- 9. TALK, THEN PRESS EVERY ROW ---------------------------------
+        let p: i32 = b.pump;
+        b.pump = p + 1;
+        client_set_button(cl, BTN_USE, 0);
+        if (p == 0) {
+            client_set_button(cl, BTN_USE, 1);    // TALK — `sv_ui_tick`'s USE
+            b.presses = b.presses + 1;
+            return;
+        }
+        if (p == 1) { return; }                   // released
+        if (p == 2) { client_set_button(cl, BTN_BUILD, 1); return; }   // TRADE
+        if (p == 3) { return; }
+        if (client_ui_panel(cl) != UI_PANEL_TRADE) {
+            // It never opened, or it closed under us. Do not sit here pressing
+            // CONFIRM at nothing for six rows.
+            b.who = NPC_NONE;
+            b.pump = 0;
+            b.rowi = 0;
+            b.est = DBOT_ST_TALK;
+            return;
+        }
+        // `sv_ui_tick` opens the cursor on `npc_trade_first_open` — the first
+        // row it will actually say yes to — so the sweep starts on something
+        // takeable and steps from there.
+        let q: i32 = p - 4;
+        let k: i32 = q - (q / g_DBOT_ROW_F) * g_DBOT_ROW_F;
+        if (k == 0) { client_set_button(cl, BTN_GRENADE, 1); }              // CONFIRM
+        if (k == g_DBOT_ROW_F - 2) { client_set_button(cl, BTN_SWITCH, 1); } // NEXT ROW
+        if (k == g_DBOT_ROW_F - 1) {
+            b.rowi = b.rowi + 1;
+            let rows: i32 = client_ui_rows(cl);
+            if (rows > g_DBOT_ROWS_MAX) { rows = g_DBOT_ROWS_MAX; }
+            if (rows < 1) { rows = 1; }
+            if (b.rowi >= rows) {
+                client_set_button(cl, BTN_BUILD, 1);    // close the panel
+                b.who = NPC_NONE;
+                b.pump = 0;
+                b.rowi = 0;
+                b.est = DBOT_ST_TALK;                   // next villager
+            }
+        }
+        return;
+    }
+
+    // ---- 10. WALK BACK OUT -------------------------------------------------
+    // Note what is NOT here: BTN_USE is released for the whole walk. The
+    // previous town driver held it down "to plant on the way", which spends
+    // exactly one kit (a held key is one rising edge) into open country where
+    // `settle_lux_at` has fallen to nothing.
+    if (b.est == DBOT_ST_OUT) {
+        client_set_button(cl, BTN_USE, 0);
+        let dx: f64 = server_lantern_x(sv2) - px;
+        let dz: f64 = server_lantern_z(sv2) - pz;
+        if (dx * dx + dz * dz > g_DBOT_POST_M * g_DBOT_POST_M) {
+            demobot_go(cl, dx, dz);
+            return;
+        }
+        client_set_button(cl, BTN_SPRINT, 0);
+        b.est = DBOT_ST_HOLD;
+        b.trips = b.trips + 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  THE ENTRY POINT.  Signature unchanged: `main.hml`, `probe_firstminute`,
+//  `probe_session` and `probe_lanfeed` all call this and three of the four are
+//  files this task does not own.
+// ---------------------------------------------------------------------------
+export fn demobot_frame(p_b: object, p_px: f64, p_pz: f64) {
+    let b: object = p_b;
+    demobot_combat(b, p_px, p_pz);
+    if (b.errand == 1) { demobot_errand(b, p_px, p_pz); }
 }

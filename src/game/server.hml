@@ -118,6 +118,7 @@ import { prog_level, prog_xp_total, prog_xp_into, prog_xp_needed,
 import { ai_agent_count, ai_spawn } from "../sim/ai.hml";
 
 import { director_begin, director_wave_state, director_wave, director_tier,
+         director_hold_tier,
          director_events, director_alive, director_hold_active,
          director_wave_budget, director_wave_spawned,
          DIR_IDLE, DIR_DONE, DIR_EV_HORN, DIR_EV_WAVE_START,
@@ -497,6 +498,77 @@ export let SV_KIT_MIN_GAP_M: f64 = 12.0;   // no stacking posts on one spot
 export let SV_OPEN_KITS: i32 = 2;
 export let SV_HOLD_KITS: i32 = 2;
 
+// ===========================================================================
+//  TEACH — THE THREE PREDICATES THE HUD IS ALLOWED TO DRAW
+// ---------------------------------------------------------------------------
+//  `probe_lanfeed` printed the finding this block exists to answer, in its own
+//  output: "Four kits, and four posts inside 64 m is a Village. The game
+//  teaches NEITHER. There is no map, no marker and no line of dialogue that
+//  says the ring exists."
+//
+//  The fix is HUD content and it lives in `main.hml`. What lives HERE is the
+//  three booleans that content is allowed to be true about — and they live
+//  here for one reason:
+//
+//      >>> A PROMPT THAT DISAGREES WITH THE VERB IS A LIE, AND THE ONLY WAY
+//          TO MAKE THAT IMPOSSIBLE IS ONE IMPLEMENTATION. <<<
+//
+//  `sv_ui_tick` CALLS `teach_plant_ready` to decide whether `BTN_USE` plants.
+//  The HUD calls the same function to decide whether to say so. They cannot
+//  drift, because there is nothing to drift from. `tools/probe_teach.hml` §A
+//  sabotages the branch in a scratch copy and confirms the probe goes red.
+//
+//  These are pure functions of scalars, deliberately: `main.hml` passes them
+//  `client_*` values (what is on the wire and therefore what a player can
+//  possibly know) and a headless probe passes them the owner block's. Neither
+//  needs `src/game/server.hml` to be linked against a display, and neither can
+//  reach around the wire to get a better answer than the player has.
+// ===========================================================================
+
+// The verdict on a post the instant it goes into the ground. THE ONE FACT the
+// player has no way to learn today: a post inside the tier's ring feeds
+// CORE_LUX and the grid; a post outside it lights the road and nothing else.
+export let TEACH_V_NONE: i32    = 0;
+export let TEACH_V_INSIDE: i32  = 1;
+export let TEACH_V_OUTSIDE: i32 = 2;
+
+// WOULD `BTN_USE` PLANT A POST RIGHT NOW?  This is `sv_ui_tick`'s own priority
+// order and not a second opinion about it: a lantern in reach wins, then a
+// villager in reach, then the post you are carrying. A modal panel eats the
+// key entirely and a corpse presses nothing.
+export fn teach_plant_ready(p_kits: i32, p_in_reach: i32, p_who: i32,
+                            p_panel: i32, p_dead: i32): i32 {
+    if (p_dead != 0) { let d: i32 = 0; return d; }
+    if (p_panel != UI_PANEL_NONE) { let m: i32 = 0; return m; }
+    if (p_in_reach != 0) { let r: i32 = 0; return r; }
+    if (p_who != NPC_NONE) { let w: i32 = 0; return w; }
+    if (p_kits < 1) { let k: i32 = 0; return k; }
+    let out: i32 = 1;
+    return out;
+}
+
+// SHOULD THE GREAT LANTERN SHOW ITS REACH?  Only while you are carrying an
+// unlit wick. This is the diegetic gate and it is the whole design: the ring
+// is not a UI overlay that is always on, it is the old wick answering a new
+// one, so it appears exactly when it is the answer to a question you are
+// holding in your hands.
+export fn teach_ring_show(p_kits: i32, p_dead: i32): i32 {
+    if (p_dead != 0) { let d: i32 = 0; return d; }
+    if (p_kits < 1) { let k: i32 = 0; return k; }
+    let out: i32 = 1;
+    return out;
+}
+
+// Which of the two things just happened. `p_inside` is `l.set_inside`, which
+// `sv_publish` computes as `set_dist <= settle_ring_m(tier_ever)` — the SAME
+// ring `settle_grid_sum` integrates over, so this cannot say "it counted"
+// about a post the settlement will not count.
+export fn teach_verdict(p_inside: i32): i32 {
+    if (p_inside != 0) { let i: i32 = TEACH_V_INSIDE; return i; }
+    let o: i32 = TEACH_V_OUTSIDE;
+    return o;
+}
+
 //  WHAT THE `--town` DEV FLAG HANDS YOU, PER TIER. Fixture money and nothing
 //  else — see `server_settle_boot_tier`'s tail for why a fabricated Town needs
 //  a fabricated purse to be a coherent fixture at all.
@@ -831,6 +903,10 @@ export fn server_new(p_seed: i32, p_transport): object {
         xp_seen: 0,
         move_mult: 1.0,
         kits_placed: 0,
+        // The teaching latch. See `sv_place_kit`'s tail.
+        kit_verdict: TEACH_V_NONE,
+        kit_verdict_d: 0.0,
+        kit_verdict_n: 0,
 
         // counters, so every refusal is visible (combat.hml's rule)
         trades: 0,
@@ -1165,6 +1241,45 @@ fn sv_script(p_sv: object): i32 {
         }
     }
 
+    // ---- EVERY NIGHT AFTER THE FIRST STARTS AT THE HORN --------------------
+    // >>> THE HOLD IS LONGER THAN THE NIGHT. director.hml DESIGN 8. <<<
+    //
+    // The two long notes at T-2:00 have been in `daycycle.hml` since W5 and
+    // have never done anything except arm the director. Meanwhile the hold
+    // this bot actually plays is 294-331 s and the night it has to finish in
+    // is 300 s, so `holds done` has been a coin flip since the day both were
+    // written: THE_HOUR's second hold cleared with 5.2 s to spare and
+    // THE_HOUR_2's tree lost that margin. Bisected across three trees in
+    // director.hml DESIGN 8.
+    //
+    // Starting on the horn gives the hold DUSK (2:00) + NIGHT (5:00) = 420 s.
+    // It is the first time the window has been longer than the thing that has
+    // to fit in it, and it is the game's own beat: the horn means THEY ARE
+    // COMING, which is a sentence about the next two minutes or it is set
+    // dressing. The opening does exactly this already -- 0:33 horn, 0:36 four
+    // Husks up the hill, in the last of the daylight.
+    //
+    // >>> `sv.hold_begun == 1` IS LOAD-BEARING AND IS THE REASON THIS LINE IS
+    // HERE AND NOT IN `director_step`. <<< HORN_TICK is exactly PHASE_TICK_DUSK
+    // and the session's first horn lands at 0:33, three seconds before the
+    // block above. A director that armed and began itself at the horn would
+    // take the opening's hold away from the script: `director_begin` would
+    // return 0 at 0:36, `sv.hold_begun` would stay 0, and SV_BEAT_WAVE -- the
+    // beat `probe_waveone` and the whole opening sheet are written against --
+    // would never fire. So the script keeps the first hold and the horn takes
+    // every one after it.
+    //
+    // Tier 0 still refuses and that is deliberate, not a hole: a player who is
+    // standing inside their own lit town at dusk gets no hold from this line,
+    // and `director_step`'s PHASE_NIGHT fallback -- UNCHANGED -- still starts
+    // one the moment they walk back out into the dark.
+    if (sv.hold_begun == 1) {
+        let deh: i32 = director_events(sim_director(w));
+        if ((deh & DIR_EV_HORN) != 0) {
+            director_begin(sim_director(w), sv.tick);
+        }
+    }
+
     // ---- 0:56 the wave clears; 0:58 the path lights ------------------------
     let de: i32 = director_events(sim_director(w));
     if ((de & DIR_EV_WAVE_CLEAR) != 0) {
@@ -1225,7 +1340,38 @@ fn sv_script(p_sv: object): i32 {
     // DIR_EV_WAVE_CLEAR, so this costs one branch on one tick per night.
     if ((de & DIR_EV_HOLD_DONE) != 0) {
         if (sv.npcs != null) {
-            npc_pack_grant(sv.npcs, NPC_OFF_KIT, SV_HOLD_KITS);
+            // >>> AND THE DEEPER THE NIGHT, THE MORE LIGHT YOU CARRY HOME. <<<
+            //
+            // THE_HOUR_2 §2.4 priced the second rung at "~11 posts,
+            // approximately 396 salvage, approximately 80 min" and said 80
+            // minutes is too long. This is the half of that answer that is not
+            // a price cut. At a flat 2 kits a night, 11 posts is 5.5 nights =
+            // 88 minutes no matter how well the player plays, because the
+            // payout does not know what they survived: DESIGN 7 built a five-
+            // rung tier ladder for the night and every rung of it paid the
+            // same two kits.
+            //
+            // `SV_HOLD_KITS` stays the FLOOR, so the Village arithmetic
+            // probe_lanfeed §A pins is untouched to the token: night 1 is
+            // pinned at tier 1 by `sim.hml` and by `g_DIR_RAMP_BASE`, so it
+            // pays max(2, 1) = 2, `SV_OPEN_KITS + SV_HOLD_KITS` is still
+            // exactly 4, and the first Village still costs the same one night.
+            // Above that the ladder pays what it costs: tier 3 pays 3, tier 4
+            // pays 4, tier 5 pays 5. Nights 1..5 cumulate 4 + 2 + 3 + 4 + 5 =
+            // 18 posts against the 11 the second rung wants.
+            //
+            // And it CANNOT be farmed by standing still, which is the reason
+            // it is safe: `director_ramp_cap` only rises on a hold you
+            // completed, and the ramp is a min() against the ground under the
+            // anchor. `worldgen_shade_tier` is a patchwork, not a radius —
+            // DESIGN 7 measured tier 3 thirty metres from the spawn post and
+            // tier 4 thirty-two. So a bigger payout is bought by MOVING THE
+            // POST OUT INTO DEEPER DARK, which is the sentence the whole game
+            // is built on, and the second circuit is that sentence twice.
+            let kits: i32 = SV_HOLD_KITS;
+            let ht: i32 = director_hold_tier(sim_director(w));
+            if (ht > kits) { kits = ht; }
+            npc_pack_grant(sv.npcs, NPC_OFF_KIT, kits);
             npc_credit(sv.npcs, NPC_CRK_NIGHT, -1);
         }
     }
@@ -1729,7 +1875,36 @@ fn sv_lan_gather(p_sv: object) {
     // beginning of a village, and `settle_great_tier` reads exactly this row.
     a[0] = settle_cx(st);
     a[1] = settle_cz(st);
-    a[2] = 1.0;
+    // >>> a[2] IS THE GREAT LANTERN'S TIER AND THIS LINE USED TO WRITE 1.0
+    // OVER IT, ONCE A SECOND, FOREVER. <<<
+    //
+    // It is the same shape as the `w.model`/`w.anim` disaster forty lines
+    // down, and it had the same cause: the only paths that ever reached a
+    // TOWN went through `server_settle_boot_tier`, A FIXTURE, which writes
+    // the lantern array itself and therefore writes tier 2 directly.
+    //
+    // `settle_promote_check` gates every rung on THREE numbers, not two:
+    // grid points, CORE_LUX, and `settle_great_tier` >= `settle_tier_gl(t)`.
+    // `SET_GL_TOWN` is 2. `settle_great_tier` reads exactly `a[2]`. The one
+    // thing in the entire game that raises it is Wick's offer row 12,
+    // `NPC_OFF_LANTERN`, arg 2, price 90, tier VILLAGE, regard 0 -- open to
+    // any player the minute they have a Village, and affordable: THE_HOUR_2
+    // measured the earned Village ending its hour holding 292 salvage with
+    // nothing to buy. `npc_trade` raises `a[2]` to 2.0 and calls
+    // `settle_lanterns_set` -- and this sweep put it back within
+    // SV_SETTLE_EVERY ticks, every time, so `settle_great_tier` could only
+    // ever return 1 in a real session and `settle_promote_check` could never
+    // return TOWN.
+    //
+    // THE_HOUR_2 §2.4 priced the second rung at "~11 posts, approximately 396
+    // salvage, approximately 80 min". THAT GRIND WOULD HAVE ENDED IN NOTHING.
+    // The rung was not mispriced; it was unreachable at any price, and the
+    // price was never the part that was wrong.
+    //
+    // The floor stays 1 because a settlement always has its Great Lantern and
+    // `settle_great_tier` clamps to [0, g_LANTERN_TIERS] anyway; what this
+    // stops is the sweep DEMOTING one the player paid for.
+    if (a[2] < 1.0) { a[2] = 1.0; }
     let n: i32 = sv.lan_civic;
 
     let ring: f64 = settle_ring_m(SET_TIER_CITY);
@@ -1948,6 +2123,18 @@ fn sv_load_scale_cmd(p_sv: object, p_c: object) {
 // inside the ring and `settle.hml` saturates CORE_LUX, so a pile of twelve
 // posts on one square metre would read as one lantern's worth of light and
 // look like a bug in the settlement rather than in the player.
+// HOW MANY LANTERN KITS ARE IN THE PACK, RIGHT NOW. One scan, off the store
+// itself rather than off the published owner block, so the plant gate and the
+// plant agree within a tick.
+fn sv_kits_now(p_sv: object): i32 {
+    let sv: object = p_sv;
+    if (sv.npcs == null) { let z: i32 = 0; return z; }
+    let r: i32 = npc_pack_find_kind(sv.npcs, NPC_OFF_KIT);
+    if (r < 0) { let none: i32 = 0; return none; }
+    let out: i32 = npc_pack_count(sv.npcs, r);
+    return out;
+}
+
 fn sv_place_kit(p_sv: object, p_x: f64, p_z: f64): i32 {
     let sv: object = p_sv;
     if (sv.npcs == null) { let no: i32 = 0; return no; }
@@ -1977,6 +2164,29 @@ fn sv_place_kit(p_sv: object, p_x: f64, p_z: f64): i32 {
     }
     npc_pack_spend(sv.npcs, row);
     sv.kits_placed = sv.kits_placed + 1;
+
+    // ---- THE VERDICT, LATCHED AT THE MOMENT OF PLANTING -------------------
+    // "This one counted" has to be decided HERE, where the post's coordinates
+    // are, and not sixteen minutes later when the tier flips. The ring is
+    // `settle_ring_m(tier_ever)` -- the same ring `settle_grid_sum` integrates
+    // over and the same one `sv_publish` puts on the wire as `set_inside`, so
+    // the verdict and the settlement's own arithmetic cannot disagree.
+    //
+    // `kit_verdict_n` is MONOTONE and equals `kits_placed`, which is what lets
+    // a client adopt the edge exactly once over a lossy wire (the same shape
+    // as `weapon_force_n`). `probe_teach` §C asserts, on every plant of a real
+    // session, that the verdict latched here equals the one the HUD derives
+    // from `set_inside` alone -- so the picture and the authority are checked
+    // against each other rather than both against a comment.
+    let st: object = sv.set;
+    let vdx: f64 = settle_cx(st) - p_x;
+    let vdz: f64 = settle_cz(st) - p_z;
+    let vd: f64 = sqrt(vdx * vdx + vdz * vdz);
+    sv.kit_verdict_d = vd;
+    sv.kit_verdict = TEACH_V_OUTSIDE;
+    if (vd <= settle_ring_m(settle_tier_ever(st))) { sv.kit_verdict = TEACH_V_INSIDE; }
+    sv.kit_verdict_n = sv.kits_placed;
+
     let ok: i32 = 1;
     return ok;
 }
@@ -2061,7 +2271,19 @@ fn sv_ui_tick(p_sv: object, p_edge: i32, p_px: f64, p_pz: f64, p_tick: i32) {
                 // carrying one. Third in the priority order and last for a
                 // reason — the lantern wins, then the person, then the post
                 // you brought with you. No new key, no new wire field.
-                sv_place_kit(sv, p_px, p_pz);
+                //
+                // >>> THE GATE IS `teach_plant_ready` AND NOT A COPY OF IT. <<<
+                // The HUD draws the prompt off this same call, so the sentence
+                // on screen and the thing the key does are one boolean. See
+                // the TEACH block above the constants.
+                // The pack is read LIVE and not off `sv.local`, which
+                // `sv_publish` writes at the END of the tick and is therefore
+                // one tick stale on the tick you spend your last kit.
+                if (teach_plant_ready(sv_kits_now(sv), sv.local.in_reach,
+                                      who, sv.ui_panel,
+                                      sim_player_dead(sv.world, sv.pslot)) == 1) {
+                    sv_place_kit(sv, p_px, p_pz);
+                }
             }
         }
     }
@@ -2695,6 +2917,14 @@ export fn server_move_mult(p_sv: object): f64 { let sv: object = p_sv; let o: f6
 export fn server_fit(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_fit_mask(sv.npcs); return o; }
 export fn server_pack_items(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_pack_items(sv.npcs); return o; }
 export fn server_kits_placed(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.kits_placed; return o; }
+// THE TEACHING LATCH — read by `probe_teach`, and by nothing on the frame path.
+// `main.hml` deliberately derives its own verdict from `client_settle_inside`
+// instead of calling these: the HUD must be buildable from what the WIRE says,
+// or the picture stops being evidence about what a player can know. The probe
+// asserts the two agree.
+export fn server_kit_verdict(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.kit_verdict; return o; }
+export fn server_kit_verdict_d(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.kit_verdict_d; return o; }
+export fn server_kit_verdict_n(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.kit_verdict_n; return o; }
 // The direct grant, for probes and for `--town`: a fixture that has to reach a
 // 180-salvage rifle cannot be made to farm 4500 XP first.
 export fn server_grant_salvage(p_sv: object, p_n: i32): i32 {
@@ -2751,6 +2981,18 @@ export fn server_w6_hash(p_sv: object): i32 {
 // than shorten the design's ladder to make a demo look good -- which is the
 // thing CLAUDE.md rule 6 is about -- the ladder stays and the tool boots past
 // it. The honest in-game path is unchanged and the HUD shows its thresholds.
+// >>> A FIXTURE, AND IT SITS NEXT TO THE OTHER ONE ON PURPOSE. <<<
+// `--kits N` for the look-review rig in `main.hml`. It is `npc_pack_grant`,
+// which the honest path (`sv_script`, on SV_BEAT_PATH and on DIR_EV_HOLD_DONE)
+// already uses -- so this skips the EARNING and nothing else. No probe calls
+// it; `tools/probe_teach.hml` reaches its kits through the beats like a player.
+export fn server_grant_kits(p_sv: object, p_n: i32): i32 {
+    let sv: object = p_sv;
+    if (sv.npcs == null) { let z: i32 = 0; return z; }
+    let out: i32 = npc_pack_grant(sv.npcs, NPC_OFF_KIT, p_n);
+    return out;
+}
+
 export fn server_settle_boot_tier(p_sv: object, p_tier: i32): i32 {
     let sv: object = p_sv;
     let t: i32 = clampi(p_tier, SET_TIER_CAMP, SET_TIER_CITY);

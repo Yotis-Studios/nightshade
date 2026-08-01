@@ -258,12 +258,13 @@ import { BTN_GRENADE, BTN_SWITCH, BTN_BUILD, BTN_INV } from "../sim/command.hml"
 // W6 — the ten systems reach the picture and the HUD here.
 import { npc_offer_first, npc_offer_kind, npc_offer_arg, npc_count,
          npc_slot_who, npc_slot_class, npc_x, npc_y, npc_z, npc_yaw,
-         NPC_CLASS_NAMED, NPC_MABEL } from "../sim/npc.hml";
+         NPC_CLASS_NAMED, NPC_MABEL, NPC_WICK, NPC_T_KIT } from "../sim/npc.hml";
 import { settle_building_count, settle_building_pid, settle_plot_x,
          settle_plot_z, settle_tier_ever, settle_grid_lux,
          settle_building_state, settle_road_pt_x, settle_road_pt_z,
          SET_CON_DONE, SET_ROADS, SET_ROAD_PTS, SET_PLOT_W_M, SET_PLOT_D_M,
-         settle_cx as w6_settle_cx, settle_cz as w6_settle_cz
+         settle_cx as w6_settle_cx, settle_cz as w6_settle_cz,
+         settle_ring_m
        } from "../sim/settle.hml";
 import { BTN_FIRE, BTN_ADS, BTN_JUMP, BTN_CROUCH, BTN_SPRINT, BTN_RELOAD,
          BTN_USE, BTN_MELEE } from "../sim/command.hml";
@@ -296,8 +297,13 @@ import { server_new, server_tick, server_snapshot, server_local,
          server_force_n,
          server_points_spent, server_talks, server_ui_panel,
          server_lan_count, server_w6_hash, server_teleport,
+         server_kit_verdict, server_kit_verdict_d, server_kit_verdict_n,
+         server_grant_kits,
          UI_PANEL_NONE, UI_PANEL_CHAR, UI_PANEL_TRADE,
-         UI_MSG_NONE, UI_MSG_UNBUILT }
+         UI_MSG_NONE, UI_MSG_UNBUILT,
+         // ---- teach-the-verb: ONE implementation of "would E plant a post" ----
+         teach_plant_ready, teach_ring_show, teach_verdict,
+         TEACH_V_NONE, TEACH_V_INSIDE, TEACH_V_OUTSIDE }
        from "./server.hml";
 
 import { client_new, client_bind_fx_cells, client_set_sens, client_look,
@@ -359,7 +365,10 @@ import { client_new, client_bind_fx_cells, client_set_sens, client_look,
          client_talk_offers, client_talk_new, client_talk_prompt,
          client_talk_line, client_offer_label,
          client_ui_panel, client_ui_row, client_ui_rows, client_ui_msg,
-         client_ui_msg_text }
+         client_ui_msg_text,
+         // ---- teach-the-verb: the pack, and where the posts went ----
+         client_pack_kits, client_kits_placed,
+         client_settle_x, client_settle_z }
        from "./client.hml";
 
 // ===========================================================================
@@ -1258,6 +1267,284 @@ fn villagers_push(): i32 {
     return out;
 }
 
+// ===========================================================================
+//  TEACH THE SECOND VERB
+// ---------------------------------------------------------------------------
+//  `probe_lanfeed` printed the whole task in its own output: "Four kits, and
+//  four posts inside 64 m is a Village. The game teaches NEITHER. There is no
+//  map, no marker and no line of dialogue that says the ring exists, so a human
+//  with these four kits has no way to learn where to put them."
+//
+//  THREE FACTS, IN THE ORDER A PLAYER NEEDS THEM, AND WHAT CARRIES EACH:
+//
+//   1. YOU HAVE KITS AND YOU CAN PLANT ONE.
+//      - the PACK ROW: one `HUD_ICON_LANTERN` per kit, bottom left, appearing
+//        the instant the pack is not empty and gone the instant it is.
+//      - the GRANT CARD: the row arriving is announced once, on the beat that
+//        hands them over, because a counter that appears silently in the corner
+//        of a 320x180 frame is a counter nobody sees appear.
+//      - the PROMPT: `[E] PLANT A LANTERN POST`, on the same plate and in the
+//        same place as `HOLD [E] - LIGHT THE LANTERN` at 0:24, drawn off
+//        `teach_plant_ready` -- THE FUNCTION `sv_ui_tick` USES TO DECIDE. The
+//        prompt cannot promise a key the server will not honour.
+//
+//   2. THERE IS A PLACE WHERE IT COUNTS.
+//      - THE REACH: while you carry an unlit wick, the Great Lantern shows how
+//        far its grid runs, as a ring of embers standing on the grass at
+//        `settle_ring_m(tier_ever)`. It is not an overlay that is always on; it
+//        appears while the question is in your hands and stops when it is not.
+//        Diegetically it is the old wick answering a new one, which is exactly
+//        what a Wick Line is in `LORE.md` §7 -- "if you look at the ground on a
+//        Wick Line you can sometimes see the original paving".
+//      - the COMPASS: the home diamond already bears on the green from the
+//        moment the first lantern is lit. Carrying a kit it stops vanishing
+//        when you arrive and turns `UI_AMBER` -- one mark, two states, and the
+//        state change happens exactly at the ring.
+//      - the PROMPT's second line, which puts the same fact in metres.
+//
+//   3. THIS ONE COUNTED.
+//      - planting inside the reach: the ring FLARES, the screen takes an ember
+//        wash, and the line reads `THE GRID TAKES IT`.
+//      - planting outside it: no flare, no wash, and the line names the gap in
+//        metres. The post is still a post and still lights the road, and the
+//        line says that instead of calling it a mistake.
+//
+//  >>> AND THE COLOUR RULE THAT ALMOST CAUGHT THIS. <<<  CLAUDE.md §8:
+//  `NS_CORE` violet is reserved for hostile / collectable / player progression,
+//  and "the moment it decorates a friendly building, long-range enemy
+//  readability dies with it." A violet ring on the ground around a friendly
+//  town is precisely the forbidden case. Every mark, every plate and every
+//  glyph below is `UI_AMBER` / `EMBER` / `MUZZLE_*`, the civic warms. The only
+//  violet on this HUD is still the XP bar and the oil meter.
+// ===========================================================================
+
+// How long each one-shot signal stays up.
+let g_TEACH_FLASH_S: f64 = 1.30;    // the verdict, at the moment of planting
+let g_TEACH_CROSS_S: f64 = 2.40;    // "you are inside the reach", on crossing
+let g_TEACH_GRANT_S: f64 = 4.00;    // "N lantern kits", when the pack fills
+
+// THE REACH, as marks on the ground. The spacing is in METRES and not a mark
+// count, so a Camp's 64 m ring and a City's 320 m ring read as the same object
+// at two sizes rather than one dense ring and one dotted one.
+//
+// >>> 4.5 m, AND THE FIRST NUMBER I TRIED WAS 7.0 AND IT WAS WRONG. <<< A
+// player standing 24 m outside the reach sees an arc, and the angular spacing
+// of that arc is `step / distance`: at 7 m that is 0.29 rad = 17 degrees, so a
+// 58-degree FOV holds THREE marks and it reads as three unrelated sparks
+// rather than as an edge. 4.5 m puts five or six in frame and they line up.
+// MEASURED BY LOOKING at ns_3_teach_b_prompt_outside.png, which is why the
+// screenshot pass happens before the report and not after it.
+let g_RING_STEP_M: f64 = 6.0;
+let g_RING_MIN: i32 = 24;
+let g_RING_MAX: i32 = 96;
+// >>> AND THE SIZES ARE SOLVED, NOT TYPED, BECAUSE THE FIRST TWO WERE TYPED
+//     AND BOTH WERE INVISIBLE. <<<  A card of diameter `s` at range `d`
+//     subtends `s/d` radians; the frame is 180 px over a half-height of
+//     44.58 degrees (fov 58 at 16:9), so it lands `s/d * 57.3 / 44.58 * 90`
+//     pixels tall. At the 25-30 m a player stands off the ring:
+//
+//        s = 0.26 m (attempt 2)  ->  0.9 px    a sub-pixel dot. Nothing.
+//        s = 0.60 m              ->  2.4 px    a mark
+//        s = 1.55 m              ->  6.2 px    the warm halo around it
+//
+//     and the 6 m spacing puts them 11.5 degrees = 23 px apart at 30 m, so an
+//     arc of five or six reads as a line rather than as loose sparks.
+//
+//     THE HEIGHT IS 1.0 m AND NOT 0.4 FOR THE SAME KIND OF REASON: a glow at
+//     ankle height is swallowed by the ground's own +/-1.5 m undulation
+//     (CLAUDE.md §9.5 put that undulation there on purpose). Waist height
+//     clears it and sits near the horizon line, where the eye already is.
+let g_RING_Y_M: f64 = 1.00;
+// TWO CARDS PER MARK, and the reason is the arithmetic `lamp_flame_push` above
+// spent four waves learning: ATLAS_FX is BLEND_ADD, so a card's luminance
+// CEILING is `Rec709(tint) * alpha / 255` whatever the texture does, and
+// `g_EMBER` (255,138,42) tops out at 155.9 -- under the 220 CLAUDE.md §8 asks
+// every frame to reach, and hopeless against a dusk hillside at 17:40, which
+// is exactly what the first version of this ring looked like: nothing.
+// AN AMBER CANNOT BE AN ANCHOR. So each mark is a warm haze with a nearly
+// white core inside it, at a twentieth of the Great Lantern's size.
+let g_RING_S_HAZE: f64 = 1.55;
+let g_RING_S_CORE: f64 = 0.60;
+let g_RING_A_HAZE: f64 = 130.0;
+let g_RING_A_CORE: f64 = 215.0;
+// How many lanterns the pack row will draw before it stops counting. The loop's
+// own supply is four (SV_OPEN_KITS + SV_HOLD_KITS) and this is six, so the row
+// is never truncated by anything the economy can currently produce AND a
+// fixture that grants twenty cannot walk off the right edge: six lanterns is
+// 240..290 of a 320 px frame. Past six the row stops at six and the count is
+// understated -- stated here rather than discovered in a screenshot.
+let g_TEACH_PACK_MAX: i32 = 6;
+
+let g_teach_kits: i32 = 0;          // pack count last frame
+let g_teach_placed: i32 = -1;       // `client_kits_placed` last frame
+let g_teach_inside: i32 = -1;       // `client_settle_inside` last frame
+let g_teach_verdict: i32 = TEACH_V_NONE;
+let g_teach_d: f64 = 0.0;           // metres to the green at the last plant
+let g_teach_t: f64 = 0.0;
+let g_teach_cross_t: f64 = 0.0;
+let g_teach_grant_t: f64 = 0.0;
+let g_teach_ring_n: i32 = 0;        // marks pushed this frame
+let g_teach_ring_peak: i32 = 0;
+let g_teach_prompt_yield: i32 = 0;  // frames the plant prompt had no room
+let g_teach_plants_in: i32 = 0;     // the session's tally, for `--demo`
+let g_teach_plants_out: i32 = 0;
+// The two strings the prompt needs, rebuilt at 4 Hz with the rest of the HUD's
+// text (N3: a template string is 165 ns and this is not worth 60 of them a
+// second). `g_l_reach` is the SECOND prompt line and it is the whole of fact 2.
+let g_l_reach: string = "";
+let g_l_verdict: string = "";
+
+fn teach_step(p_dt: f64) {
+    let dt: f64 = p_dt;
+    if (g_teach_t > 0.0) { g_teach_t = g_teach_t - dt; }
+    if (g_teach_cross_t > 0.0) { g_teach_cross_t = g_teach_cross_t - dt; }
+    if (g_teach_grant_t > 0.0) { g_teach_grant_t = g_teach_grant_t - dt; }
+
+    let kits: i32 = client_pack_kits(g_cl);
+    let placed: i32 = client_kits_placed(g_cl);
+    let inside: i32 = client_settle_inside(g_cl);
+
+    // ---- the pack filled. The one beat in the game that hands you the verb.
+    if (kits > g_teach_kits) { g_teach_grant_t = g_TEACH_GRANT_S; }
+    g_teach_kits = kits;
+
+    // ---- a post went into the ground -----------------------------------
+    // `kits_placed` is the AUTHORITY's monotone counter, so this edge is a
+    // plant that really happened -- the same construction the spell-cast edge
+    // above uses, and for the same reason: a button-down test double-fires the
+    // frame that runs two ticks.
+    //
+    // The verdict is derived from `client_settle_inside` and NOTHING ELSE.
+    // That is deliberate and it is the point: `sv_publish` writes `set_inside`
+    // and `set_dist` in the same tick that `sv_place_kit` spends the kit, so
+    // this is the authority's own answer, arriving by the only road a real
+    // client has. `probe_teach` §C asserts it equals `server_kit_verdict` on
+    // every plant of a real session -- if the wire ever lies, that goes red.
+    if (g_teach_placed >= 0 && placed > g_teach_placed) {
+        g_teach_verdict = teach_verdict(inside);
+        g_teach_d = client_settle_dist(g_cl);
+        g_teach_t = g_TEACH_FLASH_S;
+        // The verdict line is built HERE, on the edge, and not with the rest of
+        // the HUD text at 4 Hz: the window is 1.30 s and a 250 ms-stale number
+        // on a 1.30 s line is a quarter of it spent lying.
+        if (g_teach_verdict == TEACH_V_INSIDE) {
+            g_teach_plants_in++;
+            g_l_verdict = "THE GRID TAKES IT";
+        } else {
+            g_teach_plants_out++;
+            let gap: i32 = i32(g_teach_d - settle_ring_m(client_settle_tier_ever(g_cl))) + 1;
+            if (gap < 1) { gap = 1; }
+            g_l_verdict = `${gap}M OUTSIDE THE REACH`;
+        }
+    }
+    g_teach_placed = placed;
+
+    // ---- crossing INTO the reach, carrying a post ------------------------
+    // SETTLEMENT.md §9.3 asks for "exactly one HUD line on crossing the ring".
+    // It is gated on carrying a kit because that is the only state in which the
+    // ring is a decision; walking home empty-handed it is just a place.
+    if (g_teach_inside >= 0 && inside == 1 && g_teach_inside == 0 && kits > 0) {
+        g_teach_cross_t = g_TEACH_CROSS_S;
+    }
+    // The prompt's second line is rebuilt at 4 Hz with the rest of the HUD text
+    // (N3), which is right for a distance that ticks down and WRONG for the one
+    // frame the boundary is crossed: the screenshot of that frame read "THE
+    // LANTERN'S REACH" over "1M TO THE REACH", 250 ms of the HUD contradicting
+    // itself. Rebuilding it on the EDGE costs one string per crossing.
+    if (inside != g_teach_inside) { hud_reach_line(); }
+    g_teach_inside = inside;
+}
+
+// Is the plant prompt live this frame? ONE call, shared with the server.
+fn teach_ready(): i32 {
+    let out: i32 = teach_plant_ready(client_pack_kits(g_cl), client_prompt(g_cl),
+                                     client_talk_who(g_cl), client_ui_panel(g_cl),
+                                     client_dead(g_cl));
+    return out;
+}
+
+// THE GREAT LANTERN'S REACH, ON THE GROUND.
+//
+// One additive ember per mark. It is FX and not world geometry for the reason
+// `lamp_flame_push` writes down at length: vertex colour can only darken and
+// the night veil multiplies the world down through that channel, so a mark
+// built as terrain goes dark with the field it is drawn on. The FX layer is the
+// only surface in this renderer that can be brighter than the night it stands
+// in -- which is the correct physics for a light and the correct legibility for
+// a thing you have to see at 22:00.
+//
+// `g_FXK_GROUND` is NOT used, and that is not a style choice: `world_render`'s
+// own note records that fx.hml packs a ground card's rgb the other way round
+// from `emit_tri_world` and that no ground card has ever been drawn. A warm
+// ring through that path would come out cyan, or not at all.
+fn reach_ring_push(p_t: f64) {
+    g_teach_ring_n = 0;
+    // >>> THE `|| g_teach_t > 0` IS A BUG THE SCREENSHOTS FOUND. <<<
+    // `teach_ring_show` is the steady-state rule -- the reach answers a wick
+    // you are CARRYING -- and on its own it turned the ring off on the exact
+    // frame you planted your LAST kit, which is the one plant whose flare
+    // matters most. `ns_17_teach_f_planted_inside` printed `kits 0 reach 0`
+    // and there was nothing on the ground to flare. The post you have just
+    // driven into the ground is still a wick answering the old one for as long
+    // as the verdict is on screen.
+    let show: i32 = teach_ring_show(client_pack_kits(g_cl), client_dead(g_cl));
+    if (show == 0 && g_teach_t > 0.0 && client_dead(g_cl) == 0) { show = 1; }
+    if (show == 0) { return; }
+    let r: f64 = settle_ring_m(client_settle_tier_ever(g_cl));
+    if (r <= 0.0) { return; }
+    let cx: f64 = client_settle_x(g_cl);
+    let cz: f64 = client_settle_z(g_cl);
+    // The cheap reject: the whole ring is out of the fog. One square root for a
+    // player who is 400 m away, which is most of a session.
+    let far: f64 = g_fog_far;
+    let ddx: f64 = cx - g_camx;
+    let ddz: f64 = cz - g_camz;
+    let dc: f64 = sqrt(ddx * ddx + ddz * ddz);
+    if (dc > r + far) { return; }
+    if (dc < r - far) { return; }
+
+    let n: i32 = clampi(i32(6.283185307179586 * r / g_RING_STEP_M),
+                        g_RING_MIN, g_RING_MAX);
+    // THE FLARE. For `g_TEACH_FLASH_S` after a post lands INSIDE the reach the
+    // whole ring answers -- brighter, bigger, and it is the only moment the
+    // ring is ever loud. Outside, `f` stays 0 and the ring does not react at
+    // all, which is exactly the difference fact 3 is asking for.
+    let f: f64 = 0.0;
+    if (g_teach_t > 0.0 && g_teach_verdict == TEACH_V_INSIDE) {
+        f = clamp01(g_teach_t / g_TEACH_FLASH_S);
+    }
+    let grow: f64 = 1.0 + 0.90 * f;
+    let t: f64 = p_t;
+    let f2: f64 = far * far;
+    let pushed: i32 = 0;
+    for (let i = 0; i < n; i++) {
+        let ang: f64 = 6.283185307179586 * f64(i) / f64(n);
+        let mx: f64 = cx + sin(ang) * r;
+        let mz: f64 = cz - cos(ang) * r;
+        let dx: f64 = mx - g_camx;
+        let dz: f64 = mz - g_camz;
+        if (dx * dx + dz * dz > f2) { continue; }
+        // The same slow breath the ambient embers use, phase-shifted round the
+        // circle so the ring reads as living light and not as a decal ring. It
+        // is FRAME time and it is allowed to be: this is cosmetic and it never
+        // reaches the sim.
+        let ph: f64 = ang * 3.0 + t * 1.1;
+        let br: f64 = 0.82 + 0.18 * sin(ph);
+        let y: f64 = ground_h(mx, mz) + g_RING_Y_M + 0.10 * sin(ph);
+        // Submission order is paint order inside one depth bucket, so the core
+        // goes LAST and nothing amber is laid over the near-white.
+        fx_push(mx, y, mz, g_RING_S_HAZE * grow * br, FX_GLOW_L, g_FXK_SPRITE,
+                pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER),
+                clampi(i32(g_RING_A_HAZE * br * (1.0 + 0.55 * f)), 0, 255));
+        fx_push(mx, y, mz, g_RING_S_CORE * grow * br, FX_EMBER, g_FXK_SPRITE,
+                pal_r(g_MUZZLE_CORE), pal_g(g_MUZZLE_CORE), pal_b(g_MUZZLE_CORE),
+                clampi(i32(g_RING_A_CORE * br * (1.0 + 0.21 * f)), 0, 255));
+        pushed++;
+    }
+    g_teach_ring_n = pushed;
+    if (pushed > g_teach_ring_peak) { g_teach_ring_peak = pushed; }
+}
+
 fn world_rebuild(p_dt: f64, p_t: f64) {
     world_clear();
     // The sim pins a 5x5 ring (`g_RING_RADIUS`); the PICTURE reaches the fog
@@ -1343,6 +1630,10 @@ fn world_rebuild(p_dt: f64, p_t: f64) {
     g_spellfx_sprites = fx_spell_emit();
     if (g_spellfx_sprites > g_spellfx_peak) { g_spellfx_peak = g_spellfx_sprites; }
 
+    teach_step(p_dt);
+    // BEFORE the entity pass, for the same reason the town is: the reach is a
+    // navigational fact and it must not be the thing that yields to a wave.
+    reach_ring_push(p_t);
     settlement_push();
     g_ent_n = entities_push();
     g_villagers_drawn = villagers_push();
@@ -2052,10 +2343,27 @@ fn hud_build() {
     // is worth nothing if the player never walks back into it. Two triangles.
     // The lantern marker owns the band while it is unlit -- the first minute
     // has exactly one objective and it stays that way.
-    if (client_lantern_lit(g_cl) == 1 && client_settle_inside(g_cl) == 0) {
+    //
+    // ---- teach-the-verb: THE MARKER STOPS ABANDONING YOU WHEN YOU ARRIVE ----
+    // The condition used to be `settle_inside == 0`, so the one instrument that
+    // knows where the ring is went dark AT the ring -- at exactly the moment a
+    // player carrying a post needs to be told they have crossed something. Now,
+    // while a kit is in the pack, the diamond stays up and CHANGES COLOUR at
+    // the boundary: `UI_GOOD` is "home is that way", `UI_AMBER` is "you are
+    // standing where it counts". Two triangles, two states, and the state
+    // change happens on the one geometric fact the whole loop turns on.
+    //
+    // AMBER IS THE CIVIC COLOUR AND THAT IS NOT A PREFERENCE (CLAUDE.md §8):
+    // `NS_CORE` violet is reserved for hostile / collectable / progression, and
+    // a violet mark meaning "your friendly town's grid" is the exact case the
+    // art bible says to guard hardest.
+    let kits_hud: i32 = client_pack_kits(g_cl);
+    let s_in: i32 = client_settle_inside(g_cl);
+    if (client_lantern_lit(g_cl) == 1 && (s_in == 0 || kits_hud > 0)) {
         let sb: f64 = client_settle_bearing(g_cl);
         let spx: f64 = cx + clampf(sb * 92.0, -44.0, 44.0);
         let smc: i32 = g_UI_GOOD;
+        if (kits_hud > 0 && s_in == 1) { smc = g_UI_AMBER; }
         if (client_settle_brownout(g_cl) == 1) { smc = g_UI_DANGER; }
         used = used + hud_sprite(HUD_ICON_DIAMOND, spx - 3.0, 14.0, smc, 200);
     }
@@ -2140,6 +2448,31 @@ fn hud_build() {
             else if (wi == w_ask) { pc = g_UI_WHITE; pa = 235; }
             used = used + hud_rect(242.0 + f64(wi) * 4.0, y_am - 13.0,
                                    3.0, 2.0, pc, pa);
+        }
+    }
+
+    // ---- teach-the-verb, FACT 1a: WHAT IS IN YOUR PACK -------------------
+    // One lantern per kit, above the owned-guns pip strip, on the side of the
+    // frame that already means "things you are carrying". It APPEARS when the
+    // pack is not empty and it is GONE when it is, so the row existing is the
+    // signal and there is no permanent "KITS 0" to learn to ignore.
+    //
+    // The contrast plate is not optional and the weapon pips learned that the
+    // hard way one wave ago: a mark this small over grass or a muzzle flash is
+    // invisible without one (CLAUDE.md §9.9). Two triangles for the plate and
+    // two per lantern.
+    //
+    // COST, MEASURED not estimated: at the four kits the loop is built around,
+    // 2 + 4x2 = 10 triangles. `g_TEACH_PACK_MAX` bounds it at 2 + 16 = 18 for a
+    // pack the economy cannot currently produce.
+    if (kits_hud > 0) {
+        let kn: i32 = kits_hud;
+        if (kn > g_TEACH_PACK_MAX) { kn = g_TEACH_PACK_MAX; }
+        used = used + hud_rect(240.0, y_am - 25.0, f64(kn) * 8.0 + 2.0, 10.0,
+                               g_UI_BLACK, 175);
+        for (let ki = 0; ki < kn; ki++) {
+            used = used + hud_sprite(HUD_ICON_LANTERN, 241.0 + f64(ki) * 8.0,
+                                     y_am - 24.0, g_UI_AMBER, 255);
         }
     }
 
@@ -2265,11 +2598,86 @@ fn hud_build() {
         }
     }
 
+    // ---- teach-the-verb, FACT 1b + 2: THE PLANT PROMPT --------------------
+    // The same plate, the same rows and the same voice as `HOLD [E] - LIGHT
+    // THE LANTERN` at 0:24, because it is the same idea: the game says what the
+    // key under your finger does, once, where it is true. It is not a tutorial
+    // box and it never appears twice.
+    //
+    // >>> IT IS DRAWN OFF `teach_plant_ready`, WHICH IS THE FUNCTION
+    //     `sv_ui_tick` USES TO DECIDE WHETHER THE KEY PLANTS. <<< One boolean,
+    // two readers. A prompt promising a key the server ignores is the failure
+    // mode this construction makes unrepresentable.
+    //
+    // WHEN IT SHOWS, AND WHY NOT ALWAYS. A prompt that is up for the whole
+    // 282 m walk home is noise, and noise is what teaches players to stop
+    // reading prompts (§9.9's cousin). It shows when you STOP -- which is when
+    // a person deciding where to put something actually stops -- or when you
+    // are inside the reach, where the decision is live whether you are moving
+    // or not.
+    //
+    // The second line is FACT 2, in metres, at the moment of the decision. It
+    // is the sentence the game has never once said.
+    //
+    // AND IT RESERVES ITS WHOLE BLOCK, 116, WHICH IS THE LESSON THE UNLOCK
+    // CARD ALREADY PAID FOR ONCE (see `g_TB_CARD` and the `+ 114` gate below):
+    // a plate is 2, "[E] PLANT A LANTERN POST" is 21 ink glyphs at 4 = 84, and
+    // the reach line is up to 20 at 4 = 80 clamped to 108 -- so a block-level
+    // gate is the only kind that either draws the sentence whole or does not
+    // draw it. MEASURED: the busiest frame this task can produce is 328 of the
+    // 334 cap (`ns_11_teach_c_planted_outside`, prompt + verdict + vignette),
+    // so the gate does not fire in any run made for this report -- and
+    // `g_teach_prompt_yield` counts it if it ever does, because a teaching
+    // signal that vanishes silently is the defect, not the fix.
+    let plant_ok: i32 = teach_ready();
+    // WHEN THE PACK FILLS, THE GATE OPENS WHETHER YOU ARE MOVING OR NOT, for
+    // `g_TEACH_GRANT_S`. The beat that hands you the verb is the one beat where
+    // "wait until they stop walking" is the wrong answer -- and it is the beat
+    // the deleted grant card below could not afford.
+    let plant_show: i32 = 0;
+    if (plant_ok == 1) {
+        if (client_speed(g_cl) < 0.6 || s_in == 1 || g_teach_grant_t > 0.0) {
+            plant_show = 1;
+        }
+    }
+    if (plant_show == 1 && used + 116 > cap) {
+        g_teach_prompt_yield = g_teach_prompt_yield + 1;
+    }
+    if (plant_show == 1 && used + 116 <= cap) {
+        used = used + hud_rect(cx - 62.0, g_Y_PROMPT, 124.0, 22.0, g_UI_BLACK, 190);
+        used = used + hud_centre(g_Y_PROMPT + 4.0, "[E] PLANT A LANTERN POST",
+                                 g_UI_WHITE, clampi(cap - used, 0, g_TB_PROMPT));
+        let reach_c: i32 = g_UI_DIM;
+        if (s_in == 1) { reach_c = g_UI_AMBER; }
+        used = used + hud_centre(g_Y_PROMPT + 12.0, g_l_reach, reach_c,
+                                 clampi(cap - used, 0, g_TB_PROMPT));
+    }
+
     // ---- W6: what they said ----------------------------------------------
     if (client_talk_topic(g_cl) >= 0 && used + 100 <= cap) {
         let line: string = client_talk_line(client_talk_who(g_cl),
                                             client_talk_topic(g_cl),
                                             client_talk_arg(g_cl));
+        // ---- teach-the-verb: WICK'S LINE, AND A SEAM I AM DECLARING -------
+        // `npc.hml` decides WHEN this topic is the most informative true thing
+        // Wick can say (its §18 step 3b); the STRING is the HUD's, and every
+        // other topic's string lives in `client_talk_line`. Mine cannot: this
+        // task owns `src/sim/npc.hml` and `src/game/main.hml` and NOT
+        // `src/game/client.hml`, and inventing a second copy of someone else's
+        // table would be worse than one branch here that says so out loud.
+        // >>> THIS BELONGS IN `client_talk_line` AS `if (t == 10)`, one line,
+        //     the next time that file is owned. <<<
+        //
+        // The arg is the ring in whole metres, so the line stays true when the
+        // town promotes and the ring goes 64 -> 120 -> 200.
+        if (client_talk_topic(g_cl) == NPC_T_KIT) {
+            // 24 characters at the widest tier, 20 of them ink, 80 triangles
+            // against the 96 the block clamps to -- so it never truncates, and
+            // it uses the same word the prompt and the ground use. Three
+            // instruments saying REACH is one lesson; three saying three
+            // different words is three.
+            line = `INSIDE ${client_talk_arg(g_cl)} M IT FEEDS US.`;
+        }
         used = used + hud_rect(cx - 80.0, g_Y_TALKLINE, 160.0, 11.0, g_UI_BLACK, 200);
         used = used + hud_centre(g_Y_TALKLINE + 3.0, line, g_UI_WHITE,
                                  clampi(cap - used, 0, 96));
@@ -2331,11 +2739,86 @@ fn hud_build() {
         used = used + hud_centre_big(g_Y_BANNER, client_banner(g_cl), g_UI_AMBER,
                                      clampi(cap - used, 0, g_TB_BANNER));
     }
-    let tt: f64 = client_toast_t(g_cl);
-    if (tt > 0.0 && used + 60 <= cap) {
-        used = used + hud_centre(g_Y_TOAST, client_toast(g_cl), g_UI_DIM,
-                                 clampi(cap - used, 0, 60));
+    // ---- teach-the-verb, FACT 3: THIS ONE COUNTED ------------------------
+    // The moment of planting, and the whole reason the task is not "put a
+    // marker on a map": inside the reach and outside it have to FEEL different
+    // AT THE MOMENT, not sixteen minutes later when the tier flips.
+    //
+    //   INSIDE   an ember wash over the frame (the same 2-triangle instrument
+    //            the lantern-lit flash uses, at half its weight), the reach
+    //            ring FLARING on the ground behind it (`reach_ring_push`), and
+    //            THE GRID TAKES IT in amber.
+    //   OUTSIDE  none of that. No wash, no flare -- the absence IS the signal,
+    //            because a player who has felt the good one twice knows what is
+    //            missing -- and a dim line naming the gap in metres.
+    //
+    // The outside line is deliberately NOT a scold. The post is real, it is
+    // lit, and `SETTLEMENT.md` §3.1 is explicit that a lantern outside the ring
+    // still lights the road it stands on. What it does not do is feed the
+    // grid, and that is the one sentence the game has never said.
+    if (g_teach_t > 0.0) {
+        let tf: f64 = clamp01(g_teach_t / g_TEACH_FLASH_S);
+        if (g_teach_verdict == TEACH_V_INSIDE) {
+            if (used + 2 <= cap) {
+                used = used + hud_rect(0.0, 0.0, f64(g_RES_W), f64(g_RES_H),
+                                       g_EMBER, clampi(i32(tf * 46.0), 0, 60));
+            }
+            if (used + 68 <= cap) {
+                used = used + hud_centre(g_Y_TOAST, g_l_verdict, g_UI_AMBER,
+                                         clampi(cap - used, 0, 68));
+            }
+        } else {
+            if (used + 84 <= cap) {
+                used = used + hud_centre(g_Y_TOAST, g_l_verdict, g_UI_DIM,
+                                         clampi(cap - used, 0, 84));
+            }
+        }
+    } else {
+        // ---- teach-the-verb, FACT 2: CROSSING INTO THE REACH -------------
+        // SETTLEMENT.md §9.3: "exactly one HUD line on crossing the ring."
+        // Only while you are carrying a post, because that is the only state
+        // in which the boundary is a decision rather than a place.
+        // 19 characters, 17 of them ink, 68 triangles against a 72 budget.
+        // >>> THE FIRST VERSION READ "INSIDE THE LANTERN'S REACH" AND THE
+        //     SCREENSHOT READ "INSIDE THE LANTERN'S RE". <<< 23 ink glyphs is
+        // 92 triangles and the clamp was 76, so `font_text_shadowed` dropped
+        // four of them -- the same defect that once printed "TINKER SMG - AT
+        // THE BEN", found the same way, by looking at the picture.
+        if (g_teach_cross_t > 0.0 && used + 72 <= cap) {
+            used = used + hud_centre(g_Y_TOAST, "THE LANTERN'S REACH",
+                                     g_UI_AMBER, clampi(cap - used, 0, 72));
+        } else {
+            let tt: f64 = client_toast_t(g_cl);
+            if (tt > 0.0 && used + 60 <= cap) {
+                used = used + hud_centre(g_Y_TOAST, client_toast(g_cl), g_UI_DIM,
+                                         clampi(cap - used, 0, 60));
+            }
+        }
     }
+
+    // ---- teach-the-verb, FACT 1: THE PACK JUST FILLED --------------------
+    // >>> THERE WAS A CARD HERE AND I TOOK IT OUT, WHICH IS THE MOST USEFUL
+    //     THING IN THIS BLOCK. <<<
+    //
+    // It was a slide-in `LANTERN KITS / [E] TO PLANT ONE` card at `g_Y_CARD`,
+    // the same instrument the game uses for a weapon unlock, gated -- as every
+    // block down here is -- on `used + 100 <= cap`. Then I photographed the
+    // beat it exists for, in a real unfixtured session (`ns_12_t61.png`,
+    // `--demo 75 --shots`, beat PATH at 1:01), and it WAS NOT THERE. The frame
+    // is 296 of 334 with the crosshair, the compass, the pack row, the wave
+    // readout, "A PATH OF LIGHT" and the plant prompt already on it, so the
+    // card had 38 triangles of room and needed 100. It yielded, correctly, and
+    // it would yield on that beat every time.
+    //
+    // A block that cannot draw on the one frame it was written for is not a
+    // feature with a budget problem, it is dead code with a comment. What
+    // actually announces the grant in that screenshot is the PROMPT --
+    // "[E] PLANT A LANTERN POST", centre screen, in the plate this game has
+    // used for instructions since 0:24 -- and it says it better than a card in
+    // the corner would have. So the card is gone and the prompt's gate now
+    // opens for `g_TEACH_GRANT_S` after the pack fills whether you are moving
+    // or not (see the gate above). Same beat, same sentence, 100 fewer
+    // triangles, and it is on screen instead of in a comment.
 
     // ---- death -----------------------------------------------------------
     if (client_dead(g_cl) == 1 && used + 62 <= cap) {
@@ -2405,6 +2888,27 @@ fn hud_strings() {
     // short is playing a slot machine, so H twice shows them.
     g_l_town = `${client_settle_tier_name(client_settle_tier(g_cl))} LUX${client_settle_core(g_cl)}/${client_settle_core_need(g_cl)} P${client_settle_pts(g_cl)}/${client_settle_pts_need(g_cl)} B${client_settle_buildings(g_cl)} N${client_npc_named(g_cl)} ${i32(client_settle_dist(g_cl))}M`;
     g_l_hand = `OIL${i32(client_oil(g_cl))}/${i32(client_oil_tank(g_cl))} ${client_spell_name(client_spell_id(g_cl))} MEL${client_mel_wpn(g_cl)} PTS${client_points(g_cl)} STR${g_settle_tris}+${g_villagers_drawn}V`;
+
+    hud_reach_line();
+}
+
+// ---- teach-the-verb: the line that carries fact 2 -----------------------
+// Called at 4 Hz with the rest of the HUD's text (N3 prices a template string
+// at 165 ns and a distance does not change meaningfully inside a quarter of a
+// second), AND on the frame the reach boundary is crossed, which is the one
+// frame where a quarter second of staleness is a visible contradiction.
+//
+// The distance is TO THE REACH, not to the green: "48M TO THE REACH" is an
+// instruction and "112M TO THE GREEN" is trivia.
+fn hud_reach_line() {
+    let ring: f64 = settle_ring_m(client_settle_tier_ever(g_cl));
+    if (client_settle_inside(g_cl) == 1) {
+        g_l_reach = "INSIDE THE REACH";
+    } else {
+        let gap: i32 = i32(client_settle_dist(g_cl) - ring) + 1;
+        if (gap < 1) { gap = 1; }
+        g_l_reach = `${gap}M TO THE REACH`;
+    }
 }
 
 // ===========================================================================
@@ -2725,6 +3229,9 @@ fn boot_game() {
     // W6: the dev tier flag, applied before the first tick so that the town
     // the player sees on frame 0 is the town they will be standing in.
     if (g_town_tier > 0) { server_settle_boot_tier(g_sv, g_town_tier); }
+    // `--kits N`. THE OTHER FIXTURE, and the one that would be a lie if any
+    // acceptance number in this task came out of a run that used it.
+    if (g_demo_kits > 0) { server_grant_kits(g_sv, g_demo_kits); }
     if (g_at_town == 1) {
         let st0: object = server_settle(g_sv);
         let tcx: f64 = w6_settle_cx(st0);
@@ -2997,7 +3504,15 @@ fn demo_ui_drive(p_t: f64, p_dt: f64): i32 {
             if (npc_slot_class(sto, i) != NPC_CLASS_NAMED) { continue; }
             let vx: f64 = npc_x(sto, st, i, g_tick);
             let vz: f64 = npc_z(sto, st, i, g_tick);
-            if (npc_slot_who(sto, i) == NPC_MABEL) {
+            // WITH `--kits N`, STEER AT WICK INSTEAD. The kit line is Wick's
+            // (npc.hml §18 step 3b) and it is the one HUD string this task
+            // added that a real session cannot reach -- so the only way to LOOK
+            // at it, which CLAUDE.md rule 7 requires of every frame changed, is
+            // to walk a fixture up to the man who says it. Three lines in a DEV
+            // driver; the default is still Mabel and still the trade loop.
+            let want_who: i32 = NPC_MABEL;
+            if (g_demo_kits > 0) { want_who = NPC_WICK; }
+            if (npc_slot_who(sto, i) == want_who) {
                 tgx = vx; tgz = vz; got = 1;
                 break;
             }
@@ -3079,6 +3594,11 @@ fn demo_ui_drive(p_t: f64, p_dt: f64): i32 {
     if (ut > 13.1 && ut < 13.3) { sw = 1; }
     if (ut > 13.6 && ut < 13.8) { cf = 1; }        // TAKE THE BRASS
     if (ut > 14.1 && ut < 14.3) { bld = 1; }       // close
+    // WITH `--kits N`: TALK A SECOND TIME. `npc_topic_fill` step 1 puts
+    // NPC_T_GREET ahead of everything until `met` is set, so the first
+    // conversation with anyone is always "YOU CAME BACK." and the kit line
+    // cannot be photographed on it. The second is the one that shows it.
+    if (g_demo_kits > 0 && ut > 15.2 && ut < 16.0) { use = 1; }
     client_set_button(g_cl, BTN_INV, inv);
     client_set_button(g_cl, BTN_BUILD, bld);
     client_set_button(g_cl, BTN_USE, use);
@@ -3087,6 +3607,124 @@ fn demo_ui_drive(p_t: f64, p_dt: f64): i32 {
     client_set_button(g_cl, BTN_MELEE, mel);
     let ok: i32 = 1;
     return ok;
+}
+
+// ===========================================================================
+//  `--demo-plant` — THE LOOK-REVIEW DRIVER FOR THE SECOND VERB
+// ---------------------------------------------------------------------------
+//  >>> THIS IS A FIXTURE AND IT IS LABELLED ONE. <<<  It is `--demo-ui`'s
+//  sibling and it exists for the same reason that one does: a signal that lasts
+//  1.30 s cannot be photographed by a five-second timer, and "I believe the
+//  flash fires" is not a look review. It runs only with `--demo-plant`, it is
+//  asserted by NOTHING, and no acceptance number in this task's report comes
+//  out of it. The number that matters comes from `tools/probe_teach.hml`, which
+//  has no fixture anywhere in it.
+//
+//  What it does: walk out past the reach, plant one post OUTSIDE it, walk back
+//  in across the boundary, plant one INSIDE, and take a named screenshot at
+//  each of the six moments a player has to be able to read.
+// ===========================================================================
+let g_dp_st: i32 = 0;
+let g_dp_t: f64 = 0.0;
+let g_dp_shot: i32 = 0;
+let g_DP_OUT_M: f64 = 88.0;      // well past the 64 m Camp reach
+let g_DP_IN_M: f64 = 42.0;       // inside it, clear of the 16 m green, and near
+                                 // enough the edge that the edge is in shot
+
+fn demo_plant_drive(p_t: f64, p_dt: f64) {
+    // >>> THE SHIPPING BOT LIGHTS THE LANTERN FIRST, AND THAT IS NOT POLITE,
+    //     IT IS THE ONLY WAY TO PHOTOGRAPH THE COMPASS. <<<  The home diamond
+    //     is gated on `client_lantern_lit`, so a rig that seizes the player at
+    //     frame 0 photographs the OPENING's objective marker and reports it as
+    //     the settlement's. The first version of this function did exactly
+    //     that; the screenshot showed an amber diamond that was the unlit
+    //     lantern 300 m the other way.
+    if (client_lantern_lit(g_cl) == 0) {
+        if (g_demobot == null) { g_demobot = demobot_new(g_cl, g_sv); }
+        demobot_frame(g_demobot, client_px(g_cl), client_pz(g_cl));
+        return;
+    }
+    let st: object = server_settle(g_sv);
+    let gx: f64 = w6_settle_cx(st);
+    let gz: f64 = w6_settle_cz(st);
+    let px: f64 = client_px(g_cl);
+    let pz: f64 = client_pz(g_cl);
+    let bx: f64 = gx - px;
+    let bz: f64 = gz - pz;
+    let d: f64 = sqrt(bx * bx + bz * bz);
+    g_dp_t = g_dp_t + p_dt;
+
+    // This is a camera as much as a driver. Outside the reach it faces the
+    // green, because the whole point is that the boundary is a thing you SEE
+    // on the ground between you and the town. Once INSIDE it turns round and
+    // looks back out at the edge it just crossed -- otherwise the ring is 97 m
+    // behind the camera and the "it counted" flare is photographed from the
+    // one angle it cannot be seen from.
+    let want: f64 = atan2(bx, 0.0 - bz);
+    if (g_dp_st >= 4) { want = want + 3.141592653589793; }
+    let dy: f64 = want - client_cam_yaw(g_cl);
+    while (dy > 3.141592653589793) { dy = dy - 6.283185307179586; }
+    while (dy < -3.141592653589793) { dy = dy + 6.283185307179586; }
+    client_look_axis(g_cl, clampf(dy * 5.0, -4.0, 4.0) * p_dt, 0.0);
+    client_set_button(g_cl, BTN_FIRE, 0);
+    client_set_button(g_cl, BTN_ADS, 0);
+    client_set_button(g_cl, BTN_SPRINT, 0);
+    client_set_button(g_cl, BTN_USE, 0);
+
+    if (g_dp_st == 0) {                       // get to g_DP_OUT_M, either way
+        if (d > g_DP_OUT_M) {
+            client_set_move(g_cl, 1.0, 0.0);
+            client_set_button(g_cl, BTN_SPRINT, 1);
+        } else {
+            client_set_move(g_cl, -1.0, 0.0);
+        }
+        if (g_dp_shot == 0 && client_settle_inside(g_cl) == 0 &&
+            d < g_DP_OUT_M + 12.0 && g_dp_t > 1.0) {
+            shot_request("teach_a_outside_looking_in"); g_dp_shot = 1;
+        }
+        if (d > g_DP_OUT_M - 1.5 && d < g_DP_OUT_M + 1.5) { g_dp_st = 1; g_dp_t = 0.0; }
+        return;
+    }
+    if (g_dp_st == 1) {                       // stand, so the prompt appears
+        client_set_move(g_cl, 0.0, 0.0);
+        if (g_dp_t > 0.9 && g_dp_shot == 1) {
+            shot_request("teach_b_prompt_outside"); g_dp_shot = 2;
+        }
+        if (g_dp_t > 1.6) { client_set_button(g_cl, BTN_USE, 1); g_dp_st = 2; g_dp_t = 0.0; }
+        return;
+    }
+    if (g_dp_st == 2) {                       // the OUTSIDE verdict
+        client_set_move(g_cl, 0.0, 0.0);
+        if (g_dp_t > 0.25 && g_dp_shot == 2) {
+            shot_request("teach_c_planted_outside"); g_dp_shot = 3;
+        }
+        if (g_dp_t > 2.2) { g_dp_st = 3; g_dp_t = 0.0; }
+        return;
+    }
+    if (g_dp_st == 3) {                       // walk IN across the boundary
+        client_set_move(g_cl, 1.0, 0.0);
+        if (g_dp_shot == 3 && client_settle_inside(g_cl) == 1) {
+            shot_request("teach_d_crossing_in"); g_dp_shot = 4;
+        }
+        if (d < g_DP_IN_M) { g_dp_st = 4; g_dp_t = 0.0; }
+        return;
+    }
+    if (g_dp_st == 4) {                       // stand inside, prompt again
+        client_set_move(g_cl, 0.0, 0.0);
+        if (g_dp_t > 1.4 && g_dp_shot == 4) {
+            shot_request("teach_e_prompt_inside"); g_dp_shot = 5;
+        }
+        if (g_dp_t > 2.1) { client_set_button(g_cl, BTN_USE, 1); g_dp_st = 5; g_dp_t = 0.0; }
+        return;
+    }
+    // the INSIDE verdict: the wash, the flare, and the line
+    client_set_move(g_cl, 0.0, 0.0);
+    if (g_dp_t > 0.25 && g_dp_shot == 5) {
+        shot_request("teach_f_planted_inside"); g_dp_shot = 6;
+    }
+    if (g_dp_t > 2.6 && g_dp_shot == 6) {
+        shot_request("teach_g_settled"); g_dp_shot = 7;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3121,6 +3759,7 @@ fn demo_ui_drive(p_t: f64, p_dt: f64): i32 {
 // ---------------------------------------------------------------------------
 fn demo_drive(p_t: f64, p_dt: f64) {
     if (g_demo_ui == 1) { demo_ui_drive(p_t, p_dt); return; }
+    if (g_demo_plant == 1) { demo_plant_drive(p_t, p_dt); return; }
     if (g_demobot == null) { g_demobot = demobot_new(g_cl, g_sv); }
 
     demobot_frame(g_demobot, client_px(g_cl), client_pz(g_cl));
@@ -3202,7 +3841,7 @@ fn shot_flush() {
     let img: buffer = framebuffer_to_rgb();
     let path: string = `${g_shot_dir}/ns_${g_shot_seq}_${g_shot_tag}.png`;
     write_png(path, img, g_RES_W, g_RES_H);
-    print(`nightshade: wrote ${path}  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  hud ${g_hud_tris}  vm ${g_vm_tris}  dc ${stat_get(STAT_DRAW_CALLS)}  beat ${server_beat_name(server_beat(g_sv))}  pos ${i32(client_px(g_cl))},${i32(client_pz(g_cl))}  d ${i32(client_lantern_dist(g_cl))}  hp ${client_hp(g_cl)} ammo ${client_ammo(g_cl)}/${client_reserve(g_cl)} rl ${f1(client_reloading(g_cl))} alive ${client_alive(g_cl)} ctl ${client_has_control(g_cl)} fog ${i32(g_fog_far)} h ${f1(tod_clock_hours(g_day_t))} camy ${f1(g_camy)} gy ${f1(g_ground_y)} p ${i32(g_pitch_deg)}`);
+    print(`nightshade: wrote ${path}  tri ${stat_get(STAT_TRIS_DRAWN)}/${stat_get(STAT_TRIS_SUBMITTED)}  hud ${g_hud_tris}  vm ${g_vm_tris}  dc ${stat_get(STAT_DRAW_CALLS)}  beat ${server_beat_name(server_beat(g_sv))}  pos ${i32(client_px(g_cl))},${i32(client_pz(g_cl))}  d ${i32(client_lantern_dist(g_cl))}  kits ${client_pack_kits(g_cl)} reach ${g_teach_ring_n}  hp ${client_hp(g_cl)} ammo ${client_ammo(g_cl)}/${client_reserve(g_cl)} rl ${f1(client_reloading(g_cl))} alive ${client_alive(g_cl)} ctl ${client_has_control(g_cl)} fog ${i32(g_fog_far)} h ${f1(tod_clock_hours(g_day_t))} camy ${f1(g_camy)} gy ${f1(g_ground_y)} p ${i32(g_pitch_deg)}`);
     g_shot_seq++;
 }
 
@@ -3450,6 +4089,11 @@ fn run_loop() {
         // server's, `asking` is the client's: when they agree at the end of a
         // 30 s run, the loop closed.
         print(`   W7 hands: held ${client_weapon_name(server_weapon(g_sv))} (${server_weapon(g_sv)})  asking ${client_weapon_name(client_in_weapon(g_cl))} (${client_in_weapon(g_cl)})  own ${server_own_count(g_sv)} mask ${server_own_mask(g_sv)}  grants ${server_force_n(g_sv)}  adopted ${client_forced(g_cl)}  denied ${sim_stat_swaps_denied(server_world(g_sv))}`);
+        // TEACH. The three signals, as counters, so a run can be diffed rather
+        // than described. `reach PEAK` is the world-triangle cost of the ring
+        // (one additive card per mark, 2 triangles each) and it is the only new
+        // WORLD geometry this task added.
+        print(`   TEACH: kits in pack ${client_pack_kits(g_cl)}  planted ${client_kits_placed(g_cl)} (${g_teach_plants_in} inside the reach, ${g_teach_plants_out} outside)  reach PEAK ${g_teach_ring_peak} marks = ${g_teach_ring_peak * 4} tris (2 cards each)  prompt yielded on ${g_teach_prompt_yield} frames  ring ${i32(settle_ring_m(client_settle_tier_ever(g_cl)))} m  server verdict ${server_kit_verdict(g_sv)}/${i32(server_kit_verdict_d(g_sv))}m n${server_kit_verdict_n(g_sv)}`);
     }
 }
 
@@ -3502,6 +4146,12 @@ fn usage() {
     print("  --at-town         DEV: start standing in the settlement");
     print("  --demo-ui         DEV: with --demo, open both modal panels on a");
     print("                    timer so their triangle cost is MEASURED");
+    print("  --demo-plant      DEV/FIXTURE: with --demo --at-town --kits 2, walk");
+    print("                    out past the Great Lantern's reach, plant one post");
+    print("                    outside it, walk back in and plant one inside, with");
+    print("                    a named screenshot at each of the six moments. It");
+    print("                    is a LOOK-REVIEW rig; nothing asserts it.");
+    print("  --kits <n>        DEV/FIXTURE: put n lantern kits in the pack at boot");
     print("  --town <0..3>     DEV: boot the settlement at CAMP/VILLAGE/TOWN/CITY.");
     print("                    The honest path is CORE_LUX 512 + 10 grid points");
     print("                    held for one whole in-game day; this skips it so");
@@ -3527,6 +4177,9 @@ let g_at_town: i32 = 0;      // DEV: wake up on the green instead of the ridge
 let g_at_town_yaw: f64 = 1.0e30;
 let g_demo_ui: i32 = 0;
 let g_demo_ui_t0: f64 = 1.0e30;
+// `--demo-plant` and `--kits N`. BOTH ARE FIXTURES. See `demo_plant_drive`.
+let g_demo_plant: i32 = 0;
+let g_demo_kits: i32 = 0;
 
 // ===========================================================================
 //  THE NIGHT-ANCHOR SCAN — `--anchorscan H`
@@ -4194,7 +4847,8 @@ fn run_anchorscan(): i32 {
 //
 // Exit status is the contract: 0 iff every assertion passed AND the expected
 // NUMBER of assertions ran.
-let g_ST_EXPECT: i32 = 25;   // 12 from W4-11, +7 W6, +2 emit pool, +4 W7-3
+let g_ST_EXPECT: i32 = 28;   // 12 from W4-11, +7 W6, +2 emit pool, +4 W7-3,
+                             // +3 teach-the-verb
 let g_st_n: i32 = 0;
 let g_st_ok: i32 = 0;
 let g_st_tri_peak: i32 = 0;
@@ -4270,6 +4924,27 @@ fn selftest_report(): i32 {
          `both modal panels fit the ${g_HUD_TRI_CAP} cap: CHARACTER ${g_panel_char_peak}, TRADE ${g_panel_trade_peak}`);
     stck(g_panel_trunc == 0,
          `no panel string was truncated: ${g_panel_trunc} dropped glyphs`);
+
+    // ---- teach-the-verb. THE PROMPT AND THE VERB ARE ONE BOOLEAN. ----------
+    // Not "the prompt looks right": `teach_plant_ready` is the function
+    // `sv_ui_tick` calls to decide whether BTN_USE plants, and `teach_ready()`
+    // is the HUD calling the same one with the client's own numbers. A boot
+    // with an empty pack must answer 0 to both, and the second case is the one
+    // with teeth -- a pack with a kit, nothing in reach and nobody to talk to
+    // must answer 1, or the prompt would never appear in the game at all.
+    stck(teach_ready() == 0 && client_pack_kits(g_cl) == 0,
+         `the plant prompt is silent with an empty pack: kits ${client_pack_kits(g_cl)}, ready ${teach_ready()}`);
+    stck(teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 0) == 1 &&
+         teach_plant_ready(0, 0, -1, UI_PANEL_NONE, 0) == 0 &&
+         teach_plant_ready(1, 1, -1, UI_PANEL_NONE, 0) == 0 &&
+         teach_plant_ready(1, 0, 2, UI_PANEL_NONE, 0) == 0 &&
+         teach_plant_ready(1, 0, -1, UI_PANEL_CHAR, 0) == 0 &&
+         teach_plant_ready(1, 0, -1, UI_PANEL_NONE, 1) == 0,
+         "the plant prompt obeys sv_ui_tick's five refusals and the one yes");
+    // The reach is the settlement's own ring, read through the wire, and the
+    // HUD is never allowed to draw a different one. 64 m at CAMP.
+    stck(settle_ring_m(client_settle_tier_ever(g_cl)) > 0.0,
+         `the reach the HUD draws is the settlement's own: ${i32(settle_ring_m(client_settle_tier_ever(g_cl)))} m at tier ${client_settle_tier_ever(g_cl)}`);
 
     // ---- W7-3. YOU ARE HOLDING SOMETHING YOU OWN, AND YOU ASKED FOR IT -----
     // Both of these have teeth in the 3 s window, and between them they are
@@ -4358,6 +5033,8 @@ fn parse_args(): i32 {
         else if (a == "--town" && i + 1 < n) { i++; g_town_tier = clampi(i32(num_or(args[i], 0.0)), 0, 3); }
         else if (a == "--at-town") { g_at_town = 1; }
         else if (a == "--demo-ui") { g_demo_ui = 1; }
+        else if (a == "--demo-plant") { g_demo_plant = 1; }
+        else if (a == "--kits" && i + 1 < n) { i++; g_demo_kits = i32(num_or(args[i], 0.0)); }
         else if (a == "--no-audio") { g_no_audio = 1; }
         else if (a == "--headless") { g_headless = 1; }
         else if (a == "--workers" && i + 1 < n) { i++; g_workers = clampi(i32(num_or(args[i], f64(g_EMIT_WORKERS))), 0, 12); }
