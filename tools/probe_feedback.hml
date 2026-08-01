@@ -80,7 +80,7 @@
 // ===========================================================================
 
 import { exit } from "@stdlib/process";
-import { sqrt, sin, cos, floor } from "@stdlib/math";
+import { sqrt, sin, cos, floor, atan2 } from "@stdlib/math";
 
 import { g_HUD_TRI_CAP, g_POSTFX_TRI_CAP, g_TRIS_STEADY, g_RES_W, g_RES_H,
          g_DMG_DIR_FADE_S, g_RESPAWN_S, g_TICK_DT
@@ -93,7 +93,9 @@ import { batch_reset } from "../../wobbleweed/src/batch.hml";
 
 // THE IMPLEMENTATION UNDER TEST, not a copy of it.
 import { hud_dmg_seg_weight, hud_dmg_seg_bearing,
-         HUD_DMG_SEGS, HUD_DMG_FRONT, HUD_DMG_RIGHT, HUD_DMG_BACK, HUD_DMG_LEFT
+         HUD_DMG_SEGS, HUD_DMG_FRONT, HUD_DMG_RIGHT, HUD_DMG_BACK, HUD_DMG_LEFT,
+         hud_elev_u, hud_elev_side, hud_elev_band_gain, hud_elev_band_h,
+         HUD_ELEV_LEVEL, HUD_ELEV_ABOVE, HUD_ELEV_BELOW
        } from "../src/render/hud.hml";
 
 import { hudgen_build_atlas, hud_font_micro, hud_font_big } from "../src/art/hudgen.hml";
@@ -107,7 +109,8 @@ import { BTN_FIRE } from "../src/sim/command.hml";
 import { transport_loopback } from "../src/net/transport.hml";
 
 import { server_new, server_tick, server_snapshot, server_local, server_t0,
-         server_spawn_yaw, server_world, server_deaths
+         server_spawn_yaw, server_world, server_deaths,
+         SV_PSLOT, SV_MODEL_LANTERN, SV_MODEL_PICKUP
        } from "../src/game/server.hml";
 
 import { client_new, client_set_angles, client_set_move, client_set_button,
@@ -117,17 +120,21 @@ import { client_new, client_set_angles, client_set_move, client_set_button,
          client_dmg_hits, client_dmg_slots, client_dmg_slot_t,
          client_dmg_slot_dir, client_fx_count, client_sounds_total,
          client_ent_count, client_ent_flags, client_fire_shots, client_buttons,
-         client_look_axis, client_cam_yaw
+         client_look_axis, client_cam_yaw,
+         client_ent_id, client_ent_x, client_ent_y, client_ent_z, client_ent_model,
+         client_cam_x, client_cam_y, client_cam_z, client_cam_pitch, client_cam_fov
        } from "../src/game/client.hml";
 
 import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+// The body-height table the vertical cue aims at the CENTRE of a body with.
+import { ai_height_of } from "../src/sim/ai.hml";
 // The damage-number ceiling in §A is DERIVED from these two, not guessed.
 import { g_wpn_dmg_near, wpn_hs_mult, WPN_KESTREL } from "../src/sim/weapons.hml";
 
 import { RSF_HIT_FLASH } from "../src/render/render_snapshot.hml";
 
 // ---------------------------------------------------------------------------
-let g_EXPECT: i32 = 28;
+let g_EXPECT: i32 = 37;
 let g_n: i32 = 0;
 let g_ok: i32 = 0;
 
@@ -630,6 +637,163 @@ fn main() {
     print(`   frame peak ${g_PEAK_FRAME_BEFORE} -> ${g_PEAK_FRAME_AFTER} of ${g_TRIS_STEADY} on the same --demo 75`);
     ck(g_PEAK_FRAME_AFTER + (g_HUD_TRI_CAP - g_PEAK_AFTER) <= g_TRIS_STEADY,
        `even a COMPLETELY full HUD leaves the frame inside its budget: ${g_PEAK_FRAME_AFTER} + ${g_HUD_TRI_CAP - g_PEAK_AFTER} unspent HUD = ${g_PEAK_FRAME_AFTER + (g_HUD_TRI_CAP - g_PEAK_AFTER)} of ${g_TRIS_STEADY}`);
+
+    // =====================================================================
+    //  E.  THE AXIS THE FOUR SEGMENTS DO NOT HAVE       (the-missing-up)
+    // ---------------------------------------------------------------------
+    //  NAIVE_PLAYER_2.md, after fifty minutes: "The things killing you FLY
+    //  ABOVE YOUR SIGHTLINE, and a 2D ring around the crosshair has no *up*."
+    //
+    //  The conclusion is right and the SIGN IS BACKWARDS, and §E2 is the
+    //  measurement that says so, taken from the same standing session §C dies
+    //  in. Everything in §E1 is the SHIPPED implementation -- `hud_elev_*` live
+    //  in src/render/hud.hml for the same reason `hud_dmg_seg_weight` does.
+    // =====================================================================
+    print("");
+    print("E. up and down: the dimension the ring cannot say");
+
+    // ---- E1. THE MATH, AT THE SHIPPING VERTICAL FOV ----------------------
+    // 58 degrees vertical (`g_FOV_HIP`); config §"the fov convention" derives
+    // it as VERTICAL from `RES_H * 0.5 / tan(fov/2)` being the focal length in
+    // pixels. Half of that -- 29.0 -- is the top and bottom edge of the frame,
+    // and it is the number the whole cue is measured against.
+    let vfov: f64 = 58.0;
+    let half: f64 = vfov * 0.5;
+    print(`   vertical fov ${f2(vfov)} deg -> the frame ends at +-${f2(half)} deg from the optical axis`);
+    ck(hud_elev_u(0.0, vfov) == 0.0 &&
+       hud_elev_u(0.0 - half, vfov) == -1.0 && hud_elev_u(half, vfov) == 1.0 &&
+       hud_elev_u(0.0 - half * 4.0, vfov) == -1.0 && hud_elev_u(half * 4.0, vfov) == 1.0,
+       `hud_elev_u maps the frame onto -1..+1 and SATURATES there: 0 on the axis, -1 at the bottom edge, +1 at the top, and still -1/+1 four times past either. It is a display weight, not a distance`);
+    // The sign, which is the half of NAIVE_PLAYER_2's diagnosis this task found
+    // to be backwards, pinned at the MEASURED contact elevation.
+    let contact_deg: f64 = -55.9;
+    ck(hud_elev_side(contact_deg, vfov) == HUD_ELEV_BELOW &&
+       hud_elev_side(0.0, vfov) == HUD_ELEV_LEVEL &&
+       hud_elev_side(0.0 - half + 0.5, vfov) == HUD_ELEV_LEVEL &&
+       hud_elev_side(half + 0.5, vfov) == HUD_ELEV_ABOVE,
+       `and it points DOWN: a source at the measured contact elevation ${f2(contact_deg)} deg reads BELOW the frame, one on the axis reads LEVEL, one half a degree inside the top edge STILL reads LEVEL (a body on the edge is a body you can see), and one half a degree past it reads ABOVE`);
+    // The grading, both channels, both directions, and the equality that makes
+    // "I do not know" render as the picture this replaced.
+    let g_lit: f64 = hud_elev_band_gain(-1.0, HUD_ELEV_BELOW);
+    let g_dark: f64 = hud_elev_band_gain(-1.0, HUD_ELEV_ABOVE);
+    let h_lit: f64 = hud_elev_band_h(-1.0, HUD_ELEV_BELOW, 5.0);
+    let h_dark: f64 = hud_elev_band_h(-1.0, HUD_ELEV_ABOVE, 5.0);
+    print(`   at u = -1 the BOTTOM band takes gain ${f2(g_lit)} and ${f2(h_lit)} px; the top takes ${f2(g_dark)} and ${f2(h_dark)} px`);
+    ck(g_lit >= g_dark * 8.0 && h_lit >= h_dark * 8.0 &&
+       hud_elev_band_gain(1.0, HUD_ELEV_ABOVE) == g_lit &&
+       hud_elev_band_h(1.0, HUD_ELEV_ABOVE, 5.0) == h_lit,
+       `the lit edge beats the blind one by ${f2(g_lit / g_dark)}x in alpha and ${f2(h_lit / h_dark)}x in height, and the two ends are exactly symmetric -- u = +1 gives the TOP band the same ${f2(g_lit)} / ${f2(h_lit)} px the bottom gets at u = -1. An asymmetric cue that is easier to see one way round teaches the wrong lesson`);
+    ck(hud_elev_band_gain(0.0, HUD_ELEV_ABOVE) == 1.0 &&
+       hud_elev_band_gain(0.0, HUD_ELEV_BELOW) == 1.0 &&
+       hud_elev_band_h(0.0, HUD_ELEV_ABOVE, 5.0) == 5.0 &&
+       hud_elev_band_h(0.0, HUD_ELEV_BELOW, 5.0) == 5.0,
+       `and with NOTHING to say -- level, or no body matching a lit slot at all -- both gains are exactly 1.0 and both bands are exactly the 5 px they always were. "I do not know" and "level" render identically and neither of them lies`);
+    // A camera with no fov is not a camera. This runs on the frame path and a
+    // NaN here becomes a NaN alpha, which SDL turns into a garbage vertex.
+    ck(hud_elev_u(-40.0, 0.0) == 0.0 && hud_elev_side(-40.0, 0.0) == HUD_ELEV_LEVEL,
+       `a zero fov answers "level" instead of dividing by it: u ${f2(hud_elev_u(-40.0, 0.0))}, side ${hud_elev_side(-40.0, 0.0)}`);
+
+    // ---- E2. AND WHICH WAY IT ACTUALLY POINTS, FROM A REAL SESSION -------
+    // The same standing player §C kills, re-run: every frame, every visible
+    // body, its elevation from the eye computed exactly the way `dmg_elev_scan`
+    // computes it -- the body's CENTRE (feet + height/2, from ai.hml's own
+    // table) against the camera's own position and pitch.
+    //
+    // >>> THIS IS THE ASSERTION THE WHOLE DESIGN RESTS ON AND IT IS WRITTEN TO
+    //     GO RED IF THE ROSTER EVER LEARNS TO FLY. <<< `ai.hml` step 4 is an
+    //     unconditional ground clamp, so a body's elevation at contact range is
+    //     fixed by three numbers: a 1.70 m eye, a 0.90 m Wisp (centre 0.45) and
+    //     AI_CONTACT_M = 1.00. atan2(0.45 - 1.70, 1.00) = -51.3 degrees against
+    //     a frame that ends at -29. The thing eating you is TWENTY-TWO DEGREES
+    //     BELOW THE BOTTOM OF YOUR SCREEN.
+    let s3: object = session_new(4242);
+    let cl3: object = s3.cl;
+    let near_n: i32 = 0;
+    let near_below: i32 = 0;
+    let near_above: i32 = 0;
+    let near_sum: f64 = 0.0;
+    let all_n: i32 = 0;
+    let all_above: i32 = 0;
+    let worst_below: f64 = 0.0;
+    let f3: i32 = 0;
+    while (f3 < 3000) {
+        session_frame(s3, 16.667);
+        let camx: f64 = client_cam_x(cl3);
+        let camy: f64 = client_cam_y(cl3);
+        let camz: f64 = client_cam_z(cl3);
+        let pitch: f64 = client_cam_pitch(cl3) * 57.29577951308232;
+        let fv: f64 = client_cam_fov(cl3);
+        let ne: i32 = client_ent_count(cl3);
+        let e: i32 = 0;
+        while (e < ne) {
+            if ((client_ent_flags(cl3, e) & 1) == 0) { e = e + 1; continue; }
+            let eid: i32 = client_ent_id(cl3, e);
+            let md: i32 = client_ent_model(cl3, e);
+            if (eid == SV_PSLOT || md == SV_MODEL_LANTERN || md == SV_MODEL_PICKUP) {
+                e = e + 1; continue;
+            }
+            let dx: f64 = client_ent_x(cl3, e) - camx;
+            let dz: f64 = client_ent_z(cl3, e) - camz;
+            let hor: f64 = sqrt(dx * dx + dz * dz);
+            if (hor < 0.05) { e = e + 1; continue; }
+            let cls: i32 = md;
+            if (cls < 0) { cls = 0; }
+            if (cls > 5) { cls = 5; }
+            let cyc: f64 = client_ent_y(cl3, e) + ai_height_of(cls) * 0.5;
+            let rel: f64 = atan2(cyc - camy, hor) * 57.29577951308232 - pitch;
+            all_n = all_n + 1;
+            if (hud_elev_side(rel, fv) == HUD_ELEV_ABOVE) { all_above = all_above + 1; }
+            if (hor <= 3.0) {
+                near_n = near_n + 1;
+                near_sum = near_sum + rel;
+                let sd: i32 = hud_elev_side(rel, fv);
+                if (sd == HUD_ELEV_BELOW) {
+                    near_below = near_below + 1;
+                    if (rel < worst_below) { worst_below = rel; }
+                }
+                if (sd == HUD_ELEV_ABOVE) { near_above = near_above + 1; }
+            }
+            e = e + 1;
+        }
+        f3 = f3 + 1;
+    }
+    let mean_near: f64 = 0.0;
+    if (near_n > 0) { mean_near = near_sum / f64(near_n); }
+    print(`   50 s standing, seed 4242: ${all_n} body-frames, ${near_n} of them inside 3 m`);
+    print(`   inside 3 m -- mean elevation ${f2(mean_near)} deg, worst ${f2(worst_below)} deg`);
+    print(`   inside 3 m -- BELOW the frame ${near_below}, ABOVE it ${near_above}`);
+    ck(near_n > 100,
+       `the standing player was inside contact range of a body on ${near_n} frames, so the numbers below are a measurement and not a rounding of nothing`);
+    ck(near_below * 4 > near_n * 3 && near_below > near_above * 20,
+       `THE SIGN, MEASURED: ${near_below} of ${near_n} contact frames put the body BELOW the bottom of the frame and ${near_above} put it above. NAIVE_PLAYER_2's "the things killing you fly above your sightline" is backwards -- ai.hml ground-clamps every body every tick, and a 0.90 m Wisp at AI_CONTACT_M from a 1.70 m eye is ${f2(worst_below)} deg down against a frame that ends at -29.0`);
+    ck(hud_elev_side(mean_near, 58.0) == HUD_ELEV_BELOW,
+       `and the MEAN contact body -- not the worst, the mean -- is already outside the frame: ${f2(mean_near)} deg lights the BOTTOM edge and the DOWN arrow. This is the frame a player spends their last second in`);
+
+    // ---- E3. WHAT IT COST: NOTHING, AND THAT WAS THE CONSTRAINT ----------
+    // §D4 above bounds the combat core at `g_PEAK_BEFORE + delta` and derives
+    // the cap from it. With delta 26 the legal range is 358..360, so a new
+    // element had exactly TWO triangles to spend. An arrowhead worth looking at
+    // (a 26x11 stepped wedge on its own UI_BLACK plate) costs EIGHT, was built,
+    // was screenshotted, and does not fit: 296 + 34 + 36 = 366 against a
+    // ceiling of 360 that is set by `g_CAP_HUD` in world_render.hml.
+    //
+    // So the cue spends the two quads the bands ALREADY had, differently:
+    // when the source is off the frame the band on the blind side is dropped --
+    // at u = +-1 it is 1 px at 10 % alpha, confirmed invisible on pixels before
+    // it was traded away -- and its quad becomes HUD_ICON_ARROW at the lit edge.
+    // Two quads in every state.
+    //
+    // THIS IS THE GUARD, AND IT IS WHY THE NUMBER IS NAMED. Set `cue_delta` to
+    // 8 and this section goes RED with the arithmetic in the message, which is
+    // the only way a later reader learns that the eight-triangle version was
+    // considered and priced rather than never thought of.
+    let cue_delta: i32 = 0;
+    let cue_worst: i32 = g_PEAK_BEFORE + delta + cue_delta;
+    print("");
+    print(`   the vertical cue: 2 quads before, 2 quads after -> delta ${cue_delta}`);
+    print(`   the arrowhead that did NOT ship: +8 -> bound ${g_PEAK_BEFORE + delta + 8}, floor ${g_PEAK_BEFORE + delta + 8 + g_HEADROOM_MIN}, ceiling ${ceil_}`);
+    ck(cue_delta == 0 && cue_worst + g_HEADROOM_MIN <= ceil_,
+       `the vertical cue costs ZERO triangles: bound ${cue_worst} + headroom ${g_HEADROOM_MIN} = ${cue_worst + g_HEADROOM_MIN} <= the layer's ceiling ${ceil_}. At the 8 the stepped arrowhead wanted it is ${g_PEAK_BEFORE + delta + 8 + g_HEADROOM_MIN} > ${ceil_} and this line goes RED -- the HUD is FULL, and the next real element needs g_CAP_HUD raised in world_render.hml, which is exactly what probe_hud predicted`);
 
     print("");
     if (g_n != g_EXPECT) {

@@ -82,7 +82,9 @@ import { g_TICK_DT, g_TICK_MS, g_MAX_ENTS, g_HP_MAX, g_CHUNK_M,
          g_ENEMY_WISP, g_ENEMY_MOTE, g_ENEMY_HUSK,
          g_DAY_TICKS, g_PHASE_DAY_END, g_TICK_HZ,
          g_WORLD_SEED_DEFAULT, g_RING_RADIUS, g_WICKLINE_M,
-         g_LANTERN_TIERS, g_SPELL_COUNT, g_SPELL_FLARE
+         g_LANTERN_TIERS, g_SPELL_COUNT, g_SPELL_FLARE,
+         g_WICKS_START, g_WICKS_MAX, g_WICK_TRIM_S,
+         g_CAIRN_R_M, g_SNUFF_R_M
        } from "../core/config.hml";
 
 import { clampi, clampf, clamp01 } from "../core/mathx.hml";
@@ -90,7 +92,7 @@ import { clampi, clampf, clamp01 } from "../core/mathx.hml";
 import { world_spawn, world_slot_of, world_id_of, world_count,
          world_despawn_id,
          KIND_AI, KIND_LANTERN, KIND_PICKUP,
-         EF_VISIBLE, EF_DEAD, SLOT_NONE, ID_NONE
+         EF_VISIBLE, EF_DEAD, EF_INVULN, SLOT_NONE, ID_NONE
        } from "../sim/world.hml";
 
 import { chunk_store_new_cap, chunk_set_source, chunk_pin_ring,
@@ -215,8 +217,15 @@ import { npc_new, npc_step, npc_refresh, npc_count, npc_named_count,
          npc_trade_takeable, npc_offer_find,
          NPC_OC_SERVICE, NPC_OC_STOCK, NPC_OC_FIT, NPC_OC_UNBUILT,
          NPC_TR_OK, NPC_TR_BADROW, NPC_TR_CLOSED, NPC_TR_POOR,
-         NPC_TR_HAVE, NPC_TR_UNBUILT
+         NPC_TR_HAVE, NPC_TR_UNBUILT, NPC_SALVAGE_MAX
        } from "../sim/npc.hml";
+
+// W10 — THE PRICE OF DYING. The RULE is `src/sim/loot.hml`'s (pure, testable
+// without a world); the EFFECT is this file's. Same split as the trade.
+import { loot_death_toll, loot_death_wicks, loot_wick_trim,
+         loot_death_drop_salvage, loot_death_drop_kits,
+         loot_cairn_add, loot_run_lost,
+         DEATH_TOLL_WICK, DEATH_TOLL_LAMP } from "../sim/loot.hml";
 
 // ===========================================================================
 //  1.  CONSTANTS — the script, and the shape of the owner block
@@ -625,6 +634,235 @@ export fn teach_verdict(p_inside: i32): i32 {
     return o;
 }
 
+// ===========================================================================
+//  THE OPENING'S OWN PREDICATES  (the-tutorial-nobody-sees)
+// ---------------------------------------------------------------------------
+//  `NAIVE_PLAYER_2.md` §0.1 is a confession: "the game prints its entire
+//  tutorial to stdout at boot ... I read it before I looked at the screen. So
+//  I cannot honestly answer 'how long until you understood what the game
+//  wanted'." Two gates and two naive players have now read that ~40-line
+//  walkthrough before playing, which means EVERY discoverability measurement
+//  this project has taken was taken by somebody holding the manual.
+//
+//  The walkthrough is deleted (see `controls_print` in `src/game/main.hml`).
+//  Everything it used to say now has to happen on the screen, and the three
+//  predicates below are the parts of that which BOTH the HUD and a headless
+//  probe have to agree about. They live here, next to `teach_plant_ready`, for
+//  the reason that block already writes down at length: a prompt that
+//  disagrees with the verb is a lie, and the only way to make that impossible
+//  is one implementation. `tools/probe_teach.hml` §T drives all three.
+//
+//  Pure functions of scalars, like the three above. No world, no wire, no
+//  display: `main.hml` feeds them `client_*` values (what a player can possibly
+//  know) and the probe feeds them a table.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+//  1.  THE COMPASS MARK: "IT IS THERE" vs "KEEP TURNING"
+// ---------------------------------------------------------------------------
+//  MEASURED DEFECT, NAIVE_PLAYER_2 §3c, and it is the single biggest one in the
+//  first minute:
+//
+//                            panned during the wake    never touched the mouse
+//    lantern found           NEVER, in 112 s           prompt at 11.9 s
+//    deaths in the first 60s 1                         0
+//
+//  "The entire difference is whether the player moved the mouse in the first
+//  four seconds" -- which is the first thing any actual person does on waking
+//  somewhere unknown. The guidance was an INITIAL HEADING, not a beacon, and it
+//  was spent in four seconds, because: "when the target goes off-compass the
+//  marker clamps to the edge of the bar and sits there, reading as STUCK rather
+//  than KEEP TURNING."
+//
+//  The clamp is correct and stays. What was missing is that a clamped mark and
+//  an on-bar mark LOOK IDENTICAL, so the bar has exactly two states and only
+//  drew one of them. `teach_mark_off` is the second bit, and it is a bit rather
+//  than a pixel because the draw site must not be allowed to invent its own
+//  threshold: the sign it returns and the clamp `teach_mark_px` applies are
+//  computed from the same two numbers, so they cannot disagree about where the
+//  bar ends.
+//
+//  92 px per radian and a +-44 px half-span are the compass bar's own geometry,
+//  moved here from the draw site: the plate is 92 px wide at cx +- 46 and the
+//  ticks are laid out at `ang` degrees from centre. 44/92 rad = 27.4 degrees,
+//  so anything more than 27 degrees off your nose is OFF THE BAR and the answer
+//  is KEEP TURNING, in the direction of the sign.
+export let TEACH_BAR_PX_PER_RAD: f64 = 92.0;
+export let TEACH_BAR_HALF_PX: f64 = 44.0;
+
+// Where the mark goes, in pixels from the centre of the bar. Clamped.
+export fn teach_mark_px(p_rel: f64): f64 {
+    let x: f64 = p_rel * TEACH_BAR_PX_PER_RAD;
+    if (x > TEACH_BAR_HALF_PX) { let hi: f64 = TEACH_BAR_HALF_PX; return hi; }
+    if (x < 0.0 - TEACH_BAR_HALF_PX) { let lo: f64 = 0.0 - TEACH_BAR_HALF_PX; return lo; }
+    let out: f64 = x;
+    return out;
+}
+
+// 0 = the mark is where the target is. +1 = it is pinned at the RIGHT end and
+// the target is further round that way. -1 = the same, to the left.
+//
+// The bearing handed in is already wrapped to +-pi (`view_wrap_pi`), so its
+// SIGN is the short way round and this needs no second opinion about which way
+// to send the player.
+export fn teach_mark_off(p_rel: f64): i32 {
+    let x: f64 = p_rel * TEACH_BAR_PX_PER_RAD;
+    if (x > TEACH_BAR_HALF_PX) { let r: i32 = 1; return r; }
+    if (x < 0.0 - TEACH_BAR_HALF_PX) { let l: i32 = 0 - 1; return l; }
+    let out: i32 = 0;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  2.  THE LANTERN BAND: THE PROMPT SURVIVES BEING RUN PAST
+// ---------------------------------------------------------------------------
+//  MEASURED DEFECT, NAIVE_PLAYER_2 §3c: "At sprint speed the prompt is on
+//  screen for under 1.1 s. Measured: absent at 11.56 s, present at 11.94 s,
+//  absent again at 12.68 s. I ran clean through the tutorial lantern and out
+//  the far side TWICE, and the game never mentioned it again."
+//
+//  `CL_PROMPT_M` is 3.2 m, so the prompt lives in a 6.4 m-wide doorway and a
+//  sprint is ~5.8 m/s. That is 1.1 s, exactly as measured, and no amount of
+//  making the words bigger fixes a doorway.
+//
+//  >>> AND THE FIX IS NOT "WIDEN CL_PROMPT_M". <<< The prompt says HOLD [E],
+//  the server honours E inside `SIM_INTERACT_R_M`, and this project's own rule
+//  -- written at the plant prompt, after it was got wrong -- is that "a prompt
+//  cannot promise a key the server will not honour." Widening the radius the
+//  WORDS use while the KEY keeps its own would rebuild that exact lie.
+//
+//  So the band is three states and only the innermost one names a key:
+//
+//    NONE     nothing. It is lit, or you are dead, or it is 40 m away.
+//    SIGHTED  `AN UNLIT LANTERN` over `<n>M`. TRUE at any distance, promises
+//             nothing, and it is on screen for the whole approach.
+//    REACH    `HOLD [E] - LIGHT THE LANTERN`. Exactly `client_prompt`, which
+//             is exactly what the key does. Unchanged.
+//
+//  At 5.8 m/s the plate is now continuously up from 22 m in to 22 m out -- 7.5
+//  seconds of run-through instead of 1.1 -- and the second line COUNTS DOWN and
+//  then BACK UP, which is what tells a player who overshot that they overshot.
+export let TEACH_LANTERN_SIGHT_M: f64 = 22.0;
+export let TEACH_BAND_NONE: i32    = 0;
+export let TEACH_BAND_SIGHTED: i32 = 1;
+export let TEACH_BAND_REACH: i32   = 2;
+
+// `p_prompt` is `client_prompt`, and it is passed in rather than recomputed
+// from `p_dist` on purpose: `CL_PROMPT_M` lives in `src/game/client.hml` and a
+// copy of it here would be a second opinion about where the key works. The
+// REACH state is therefore the client's own boolean, byte for byte.
+export fn teach_lantern_band(p_lit: i32, p_prompt: i32, p_dead: i32,
+                             p_panel: i32, p_control: i32, p_who: i32,
+                             p_dist: f64): i32 {
+    if (p_dead != 0) { let d: i32 = TEACH_BAND_NONE; return d; }
+    if (p_panel != UI_PANEL_NONE) { let m: i32 = TEACH_BAND_NONE; return m; }
+    if (p_control == 0) { let c: i32 = TEACH_BAND_NONE; return c; }
+    if (p_lit != 0) { let l: i32 = TEACH_BAND_NONE; return l; }
+    if (p_prompt != 0) { let r: i32 = TEACH_BAND_REACH; return r; }
+    // Somebody standing in front of you outranks a lantern you can only see:
+    // the talk prompt draws on the same plate, and two plates in one place is
+    // how the "two objects that read identically" complaint gets a sequel.
+    if (p_who != NPC_NONE) { let w: i32 = TEACH_BAND_NONE; return w; }
+    if (p_dist <= TEACH_LANTERN_SIGHT_M) { let s: i32 = TEACH_BAND_SIGHTED; return s; }
+    let out: i32 = TEACH_BAND_NONE;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  3.  THE CONTROLS CARD IS ON THE SCREEN, AND THE SCREEN HAS TO SAY SO
+// ---------------------------------------------------------------------------
+//  A controls card behind a key nobody knows about is the stdout tutorial with
+//  extra steps. So the hint is up until the player has PRESSED F1 ONCE, or
+//  until the first lantern is lit -- whichever happens first, because by then
+//  the opening has taught the only key it needs (`HOLD [E]`, in words, in the
+//  plate above) and the hint has become clutter on a HUD with a hard cap.
+//
+//  It is suppressed while dead and while a panel is open for the same reason
+//  everything else is: those two screens are modal and replace the HUD.
+//
+//  >>> AND IT YIELDS TO THE PROMPT, WHICH IS A BUDGET FACT BEFORE IT IS A
+//      DESIGN ONE, AND IT WAS MEASURED. <<<  With the hint up at the same time
+//      as `HOLD [E] - LIGHT THE LANTERN`, `--demo 70 --demo-teach` measured a
+//      HUD peak of 354 against a content budget of 354 -- ZERO SPARE, on the
+//      most important frame in the game, with `batch_reserve` set to DROP the
+//      overflow rather than fail. Suppressing it at REACH takes the same run to
+//      322, and 322 is the controls card, not this frame.
+//
+//      It yields at REACH and NOT at SIGHTED, and the line is where it is for a
+//      reason: the SIGHTED plate NAMES A THING, the REACH plate GIVES AN
+//      INSTRUCTION, and it is only instructions that compete. Measured on the
+//      same run, the SIGHTED frame is 156 triangles -- there is no budget
+//      argument there, and retiring the hint 22 m from the post would have cut
+//      the only mention of F1 down to five seconds.
+export fn teach_help_hint(p_opened: i32, p_lit: i32, p_dead: i32,
+                          p_panel: i32, p_control: i32, p_band: i32): i32 {
+    if (p_dead != 0) { let d: i32 = 0; return d; }
+    if (p_panel != UI_PANEL_NONE) { let m: i32 = 0; return m; }
+    if (p_control == 0) { let c: i32 = 0; return c; }
+    if (p_band == TEACH_BAND_REACH) { let b: i32 = 0; return b; }
+    if (p_opened != 0) { let o: i32 = 0; return o; }
+    if (p_lit != 0) { let l: i32 = 0; return l; }
+    let out: i32 = 1;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  4.  THE WICK BREATHES, AND THE SCENERY DOES NOT
+// ---------------------------------------------------------------------------
+//  MEASURED DEFECT, NAIVE_PLAYER_2 §5, the run it names its own low point:
+//  "Standing at the base of a big lit-looking post, crosshair on it, holding E,
+//  nothing happening, health 100 -> 46. Wrong object; no way to know." And the
+//  sentence the whole task is aimed at: "'you're in the wrong place', 'you're
+//  doing the wrong thing' and 'this object isn't interactive' ALL LOOK
+//  IDENTICAL: no prompt, and you die."
+//
+//  The settlement's lamp posts and the one interactive lantern are both tall
+//  posts with a warm head, and at 320x180 through fog they are the same handful
+//  of pixels. A STEADY GLOW CANNOT MEAN "USABLE" BECAUSE EVERY LAMP HAS ONE.
+//
+//  Motion can. Nothing else in this world pulses, so a wick breathing at 0.70
+//  Hz is a signal with no competitors and it is legible at every distance the
+//  card is drawn at -- which is the criterion, "distinguishable BEFORE you walk
+//  up to them". It costs zero triangles: it modulates a card `main.hml` was
+//  already pushing.
+//
+//  IT LIVES HERE, NOT AT THE DRAW SITE, FOR THE ONE REASON EVERYTHING ELSE IN
+//  THIS BLOCK DOES: a headless probe can then assert that the thing actually
+//  breathes. A pulse written as three literals inside `world_rebuild` is a
+//  pulse whose amplitude can be edited to zero and nothing in the suite would
+//  know -- and "a probe that passes when its feature is deleted is worse than
+//  no probe" is a rule this project has paid for.
+//
+//  THE CEILING IS NOT A TASTE KNOB. `tools/probe_nightanchor.hml` reserves
+//  luminance 220 for things that are LIT; an UNLIT wick that peaked above it
+//  would be lying about its own state. EMBER at alpha 216 ceilings at
+//  Rec709(255,138,42) * 216/255 = 132, comfortably under, and the trough at 84
+//  is still findable against a dusk hillside.
+export let TEACH_WICK_HZ: f64 = 0.70;
+export let TEACH_WICK_A_LO: f64 = 84.0;
+export let TEACH_WICK_A_HI: f64 = 216.0;
+export let TEACH_WICK_S_LO: f64 = 0.78;
+export let TEACH_WICK_S_HI: f64 = 1.08;
+
+// The breath, 0..1. Frame time in, phase out.
+export fn teach_wick01(p_t: f64): f64 {
+    let out: f64 = 0.5 + 0.5 * sin(p_t * TEACH_WICK_HZ * 6.283185307179586);
+    return out;
+}
+
+export fn teach_wick_alpha(p_t: f64): i32 {
+    let w: f64 = teach_wick01(p_t);
+    let a: f64 = TEACH_WICK_A_LO + (TEACH_WICK_A_HI - TEACH_WICK_A_LO) * w;
+    let out: i32 = i32(a);
+    return out;
+}
+
+export fn teach_wick_size(p_t: f64): f64 {
+    let w: f64 = teach_wick01(p_t);
+    let out: f64 = TEACH_WICK_S_LO + (TEACH_WICK_S_HI - TEACH_WICK_S_LO) * w;
+    return out;
+}
+
 //  WHAT THE `--town` DEV FLAG HANDS YOU, PER TIER. Fixture money and nothing
 //  else — see `server_settle_boot_tier`'s tail for why a fabricated Town needs
 //  a fabricated purse to be a coherent fixture at all.
@@ -824,6 +1062,32 @@ fn sv_local_new(): object {
         trade_ok: 0,        // rows on this villager you could take right now
         trade_why: 0,       // NPC_TR_* for the row under the cursor
         trade_price: 0,     // its price in salvage
+        // ---- W10: THE PRICE OF DYING, §5b ---------------------------------
+        // Everything the death screen, the compass and the pip row need, as
+        // numbers. No strings: in v2 this block is a packet.
+        wicks: 0,           // spare wicks in hand
+        wicks_max: 0,
+        wick01: 0.0,        // 0..1 progress toward the next trim, for a track
+        cairn_live: 0,      // is your pack on the ground somewhere
+        cairn_salvage: 0,   // what is in it
+        cairn_kits: 0,
+        cairn_x: 0.0,       // where. The BEARING is derived on the client from
+        cairn_z: 0.0,       // these two, exactly as `client_settle_bearing`
+                            // derives the town's -- two bearings computed two
+                            // ways is the bug that puts a marker behind you.
+        cairn_dist: 0.0,    // metres to it
+        got_salvage: 0,     // what the LAST trip back recovered
+        got_kits: 0,
+        // THE BILL for the death you are looking at, latched on the edge.
+        bill_salvage: 0,
+        bill_kits: 0,
+        bill_lamp: 0,
+        bill_wicks: 0,
+        // THE LIGHT, AND THE WAY TO LOSE.
+        lamps_lit: 0,
+        snuffed: 0,
+        relit: 0,
+        lost: 0,
         // ---- this tick's cosmetics ----------------------------------------
         fx_n: 0,
         fx_kind: zeros_i(SV_FX_CAP),
@@ -970,7 +1234,57 @@ export fn server_new(p_seed: i32, p_transport): object {
         points_spent: 0,
         talks: 0,
         settle_events: 0,
-        set_promotions: 0
+        set_promotions: 0,
+
+        // ---- W10: THE PRICE OF DYING --------------------------------------
+        // The ledger lives in `src/sim/loot.hml`; this is the state it acts on.
+        // Nothing here is predicted by the client and nothing here is read
+        // inside `sim_apply_command`, which is why replay is untouched: see
+        // `sv_death_price`'s header.
+        wicks: g_WICKS_START,     // spare wicks in hand, 0 .. g_WICKS_MAX
+        wick_t: 0.0,              // seconds of CONTINUOUS LIFE banked
+        wicks_burned: 0,          // lifetime, telemetry
+        wicks_trimmed: 0,         // lifetime, telemetry
+
+        // THE CAIRN — your pack, where you dropped it. One site, ever, until
+        // you pick it up: see `loot_cairn_add`'s header for why it merges
+        // rather than moves.
+        cairn_live: 0,
+        cairn_x: 0.0,
+        cairn_z: 0.0,
+        cairn_salvage: 0,
+        cairn_kits: 0,
+        cairn_tick: SV_MISS,
+        cairn_drops: 0,           // deaths that put something in it
+        cairn_takes: 0,           // trips that emptied it
+        got_salvage: 0,           // what the LAST trip recovered
+        got_kits: 0,
+
+        // >>> THE TELEMETRY OFFSETS, AND WHY THEY EXIST. <<< `npc_purse_take`
+        // adds to `sto.spent` and `npc_purse_add` adds to `sto.earned` -- both
+        // correct for a TRADE, both a lie for a drop-and-recover, which would
+        // otherwise inflate lifetime earned AND spent by the same coin every
+        // time you walked back for your own money. `npc.hml` is not this task's
+        // file, so the authority keeps the correction and applies it in
+        // `server_salvage_earned` / `server_salvage_spent`.
+        salv_earn_adj: 0,
+        salv_spent_adj: 0,
+
+        // THE LIGHT, AND THE WAY TO LOSE.
+        lamps_lit: 0,             // lit lanterns in the world, resampled 1 Hz
+        lamps_ever: 0,            // has there EVER been one (loot_run_lost arm)
+        snuffed: 0,               // posts the dark has taken
+        relit: 0,                 // posts you went back and got
+        lost: 0,                  // the run is over
+        lost_tick: SV_MISS,
+
+        // THE LAST BILL, latched on the death edge so the death screen can
+        // read it for the whole 4 s it is up. A number the player can see.
+        bill_salvage: 0,
+        bill_kits: 0,
+        bill_lamp: 0,             // 1 if this death put a post out
+        bill_wicks: 0,            // wicks left AFTER this death
+        bill_tick: SV_MISS
     };
 
     // The settlement lives in the 1200 m cell the player wakes up in, so it is
@@ -1586,6 +1900,361 @@ fn sv_lantern_supply(p_sv: object) {
 }
 
 // ===========================================================================
+//  5b.  W10 — THE PRICE OF DYING
+// ---------------------------------------------------------------------------
+//  Gate 10, having said the game is finally worth an hour:
+//
+//    "The single biggest thing still missing is a reason not to die - and its
+//     twin, a way to lose. Death is now beautifully communicated and COSTS
+//     NOTHING. That is worse than an unclear death screen, because the game's
+//     whole sentence is 'you carry what you find home' - and if dying costs
+//     you nothing, you are never carrying anything."
+//
+//  Measured by the naive player: 64 death episodes in 365 s, 252.75 s (69 %)
+//  on the death screen, cycling 0.74-1.88 s alive then 4.1 s dead, INDEFINITELY.
+//
+//  >>> AND THAT LAST WORD IS THE ACTUAL BUG. <<< The price below is the answer
+//  to "a reason not to die"; the thing that answers "a way to lose" is that
+//  the chain TERMINATES. A loop with no exit is not difficulty, it is a
+//  screensaver with a health bar.
+//
+//  ---------------------------------------------------------------------------
+//  WHERE THIS IS ALLOWED TO LIVE, AND WHY REPLAY DOES NOT MOVE
+//  ---------------------------------------------------------------------------
+//  CLAUDE.md §7: the sim is authoritative, `sim_apply_command` is pure with
+//  respect to the world, and EVERY MOVEMENT VARIABLE LIVES IN `PredictedState`.
+//  A respawn penalty that touched state the client predicts, or that fired a
+//  cosmetic from inside the sim, would break replay.
+//
+//  So NOTHING BELOW IS IN THE SIM. Every field it touches is one of:
+//
+//    * `sv.*`            — the authority's own script state, which the replay
+//                          harness does not run and the client never predicts;
+//    * the npc store's purse and pack — already server-side, already saved,
+//                          already outside `PredictedState`;
+//    * `w.anim[slot]` of a KIND_LANTERN — the lit flag, which is exactly what
+//                          `BTN_USE` writes when a player lights one. Putting a
+//                          post out is the same edit as lighting it, with the
+//                          other value.
+//
+//  It runs in `server_tick` AFTER `sim_step`, on the same edge the respawn
+//  timer already used, and it emits no cosmetic. `replay --verify` is
+//  10000/10000 at hash 16594734899016964914 with cosmetics 0, unchanged, and
+//  `tools/probe_death.hml` §G asserts that number rather than trusting this
+//  paragraph.
+// ===========================================================================
+
+// HOW MANY LIT LANTERNS EXIST, ANYWHERE. The loss condition's first argument
+// and the wick trim's geometry both need this scan, and `sv_lan_gather` cannot
+// serve it: that function only gathers posts inside the settlement's CITY ring,
+// so a lit post out on the path would be invisible to it and the run would end
+// with lamps still burning.
+fn sv_lit_lamps(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let kd = w.kind;
+    let fl = w.flags;
+    let md = w.anim;
+    let cnt: i32 = world_count(w);
+    let n: i32 = 0;
+    let slot: i32 = 0;
+    while (slot < cnt) {
+        if (kd[slot] == KIND_LANTERN && (fl[slot] & EF_DEAD) == 0) {
+            if (md[slot] == SIM_LANTERN_LIT) { n++; }
+        }
+        slot++;
+    }
+    let out: i32 = n;
+    return out;
+}
+
+// THE DARK TAKES A LAMP. The LIT post nearest where you fell, inside
+// `g_SNUFF_R_M`. Returns 1 if one went out.
+//
+// The tutorial lantern is NOT exempt, and that was the hardest call in this
+// task. Exempting it is tempting — it is the respawn anchor and the ammo
+// supply, so losing it is the one snuff that can make the next minute worse
+// rather than just poorer. It is not exempt because IT IS USUALLY THE ONLY
+// LAMP IN THE WORLD, and a rule that protects the only lamp is a rule that
+// cannot fire in the exact session Gate 10 measured: NAIVE_PLAYER_2's Run 10
+// idled for 365 s having lit precisely one lantern. An unlosable stake is not
+// a stake.
+//
+// What makes that survivable rather than a spiral is that the post is still
+// standing and still holds E: relighting it is `g_LANTERN_CHANNEL_S` of the
+// verb the game is named after, and `sv_script`'s lantern edge re-arms itself
+// (`sv.lantern_lit` is cleared here) so the beat, the supply and the respawn
+// anchor all come back with it.
+fn sv_snuff_nearest(p_sv: object, p_x: f64, p_z: f64): i32 {
+    let sv: object = p_sv;
+    let w: object = sv.world;
+    let kd = w.kind;
+    let fl = w.flags;
+    let md = w.anim;
+    let xs = w.px;
+    let zs = w.pz;
+    let lim: f64 = g_SNUFF_R_M * g_SNUFF_R_M;
+    let best: i32 = SLOT_NONE;
+    let bd: f64 = lim;
+    let cnt: i32 = world_count(w);
+    let slot: i32 = 0;
+    while (slot < cnt) {
+        if (kd[slot] == KIND_LANTERN && (fl[slot] & EF_DEAD) == 0) {
+            if (md[slot] == SIM_LANTERN_LIT) {
+                let dx: f64 = xs[slot] - p_x;
+                let dz: f64 = zs[slot] - p_z;
+                let d2: f64 = dx * dx + dz * dz;
+                if (d2 <= bd) { bd = d2; best = slot; }
+            }
+        }
+        slot++;
+    }
+    if (best == SLOT_NONE) { let none: i32 = 0; return none; }
+    md[best] = SIM_LANTERN_UNLIT;
+    sv.snuffed = sv.snuffed + 1;
+    let ok: i32 = 1;
+    return ok;
+}
+
+// >>> AND THE ONE THING THE DARK DOES NOT TAKE: `sv.lantern_lit`. <<<
+//
+// The opening's lantern going out used to clear that flag, and it was the
+// worst bug in this task -- a genuine SPIRAL, measured and not reasoned about.
+//
+// `sv.lantern_lit` is not "the wick is burning". It is FOUR things at once:
+// the respawn anchor (`server_tick` puts you back at the lantern only while it
+// is 1), the ammunition supply (`sv_lantern_supply` returns immediately if it
+// is 0), the Flare grant, and the horn. Clearing it took the player's
+// CHECKPOINT and their AMMO on the same death that took their light -- so one
+// bad wave at your own post cost you the means to fight the next one.
+//
+// MEASURED, `probe_lanfeed`, 8 seeds x 30 game minutes, isolated by building
+// the two halves separately:
+//
+//                                     hold 2 done      lanterns fed
+//     HEAD                            23:33, 8 of 8         10-11
+//     snuff clears `lantern_lit`      NEVER,  0 of 8           8-9
+//     snuff off entirely              23:33, 8 of 8         10-11
+//     snuff on, flag left alone       23:33, 8 of 8           8-9
+//
+// The lamp still goes out: it leaves `sv_lan_gather`'s feed, `lamps_lit`
+// falls, the settlement loses its light and `loot_run_lost` can still end the
+// run on it -- everything the price is FOR. What survives is the camp's
+// identity. You come back to your own post, and there is brass there, whether
+// or not the wick is still burning.
+//
+// `tools/probe_death.hml` §H asserts the flag survives a snuff of the opening
+// lantern, so this paragraph cannot drift away from the code.
+
+// THE BILL, CHARGED ONCE, ON THE DEATH EDGE.
+//
+// Order matters and is the design's own sentence: the pack falls first (it is
+// yours and it is recoverable), then a wick burns, and only when there is no
+// wick left does the dark reach for a lamp.
+fn sv_death_price(p_sv: object) {
+    let sv: object = p_sv;
+    if (sv.lost == 1) { return; }
+
+    // WHERE YOU FELL. Read live from `PredictedState` and not from `sv.local`,
+    // which `sv_publish` writes at the END of the tick and is therefore one
+    // tick stale on the one tick this function ever runs. `sim.hml` stage (e)
+    // skips movement for a dead player, so this is the last place the body
+    // stood rather than wherever it slid to.
+    let ps: array<f64> = sim_predicted(sv.world, sv.pslot);
+    let dx: f64 = move_px(ps);
+    let dz: f64 = move_pz(ps);
+
+    // ---- 1. THE PACK FALLS -----------------------------------------------
+    let purse: i32 = 0;
+    let kits: i32 = 0;
+    if (sv.npcs != null) {
+        purse = loot_death_drop_salvage(npc_purse(sv.npcs));
+        kits = loot_death_drop_kits(sv_kits_now(sv));
+        if (purse > 0) {
+            if (npc_purse_take(sv.npcs, purse) == 1) {
+                // `npc_purse_take` books this as SPENT. It was not spent; it
+                // is lying on the ground. Correct the lifetime figure here.
+                sv.salv_spent_adj = sv.salv_spent_adj + purse;
+            } else { purse = 0; }
+        }
+        if (kits > 0) {
+            let row: i32 = npc_pack_find_kind(sv.npcs, NPC_OFF_KIT);
+            let dropped: i32 = 0;
+            if (row >= 0) {
+                let i: i32 = 0;
+                while (i < kits) {
+                    if (npc_pack_spend(sv.npcs, row) == 1) { dropped++; }
+                    i++;
+                }
+            }
+            kits = dropped;
+        }
+    }
+    if (purse > 0 || kits > 0) {
+        if (sv.cairn_live == 0) {
+            sv.cairn_live = 1;
+            sv.cairn_x = dx;
+            sv.cairn_z = dz;
+            sv.cairn_tick = sv.session;
+        }
+        // ...and if a cairn was already standing, it does NOT move. See
+        // `loot_cairn_add`: one trip always recovers everything.
+        sv.cairn_salvage = loot_cairn_add(sv.cairn_salvage, purse, NPC_SALVAGE_MAX);
+        sv.cairn_kits = loot_cairn_add(sv.cairn_kits, kits, NPC_SALVAGE_MAX);
+        sv.cairn_drops = sv.cairn_drops + 1;
+    }
+
+    // ---- 2. A WICK, OR A LAMP --------------------------------------------
+    // >>> THE TRIM CLOCK RESETS HERE, ON THE DEATH EDGE, AND NOWHERE ELSE. <<<
+    // It is unconditional and it is outside the branch below, because it is
+    // the half of the wick rule that makes it a PRICE: without it the idle
+    // loop banks trim time across its own deaths and never ends, which is the
+    // whole failure mode this task exists to close. One reset, on the exact
+    // tick, so `sv_wick_tick`'s 10 Hz sampling can never leave a stale value
+    // published for five frames.
+    sv.wick_t = 0.0;
+
+    let toll: i32 = loot_death_toll(sv.wicks);
+    let took_lamp: i32 = 0;
+    if (toll == DEATH_TOLL_WICK) {
+        sv.wicks = loot_death_wicks(sv.wicks);
+        sv.wicks_burned = sv.wicks_burned + 1;
+    } else {
+        took_lamp = sv_snuff_nearest(sv, dx, dz);
+    }
+
+    // ---- 3. IS THERE ANY LIGHT LEFT --------------------------------------
+    let lit: i32 = sv_lit_lamps(sv);
+    sv.lamps_lit = lit;
+    if (lit > 0) { sv.lamps_ever = 1; }
+    if (loot_run_lost(lit, sv.lamps_ever) == 1) {
+        sv.lost = 1;
+        sv.lost_tick = sv.session;
+    }
+
+    // ---- 4. THE BILL, FOR THE SCREEN -------------------------------------
+    sv.bill_salvage = purse;
+    sv.bill_kits = kits;
+    sv.bill_lamp = took_lamp;
+    sv.bill_wicks = sv.wicks;
+    sv.bill_tick = sv.session;
+}
+
+// GO BACK AND GET IT. No prompt, no hold, no key: walk within `g_CAIRN_R_M`
+// and it is yours. That is deliberate — the cairn has no model and no world
+// marker yet (that is a render task, and `src/render/**` is not this task's
+// file), so a recovery that needed aiming would be a recovery nobody could
+// perform. The compass mark and the metre count are published for whoever
+// draws them.
+fn sv_cairn_tick(p_sv: object) {
+    let sv: object = p_sv;
+    if (sv.cairn_live == 0) { return; }
+    if (sv.npcs == null) { return; }
+    if (sim_player_dead(sv.world, sv.pslot) == 1) { return; }
+
+    // Live from `PredictedState`, not from `sv.local`: this runs BEFORE
+    // `sv_publish`, so the owner block is a tick stale and the tick it is
+    // stale on is the one where the purse changes.
+    let ps: array<f64> = sim_predicted(sv.world, sv.pslot);
+    let dx: f64 = sv.cairn_x - move_px(ps);
+    let dz: f64 = sv.cairn_z - move_pz(ps);
+    if (dx * dx + dz * dz > g_CAIRN_R_M * g_CAIRN_R_M) { return; }
+
+    let s: i32 = sv.cairn_salvage;
+    let k: i32 = sv.cairn_kits;
+    if (s > 0) {
+        npc_purse_add(sv.npcs, s);
+        // ...and un-book it as EARNED for the same reason the drop un-books it
+        // as SPENT. Walking back for your own money is not income.
+        sv.salv_earn_adj = sv.salv_earn_adj + s;
+    }
+    if (k > 0) { npc_pack_grant(sv.npcs, NPC_OFF_KIT, k); }
+
+    sv.got_salvage = s;
+    sv.got_kits = k;
+    sv.cairn_salvage = 0;
+    sv.cairn_kits = 0;
+    sv.cairn_live = 0;
+    sv.cairn_takes = sv.cairn_takes + 1;
+}
+
+// THE WICK COMES BACK BY STAYING ON YOUR FEET. `g_WICK_TRIM_S` of CONTINUOUS
+// LIFE trims one, capped at `g_WICKS_MAX`. The clock resets to zero on every
+// death, and CONTINUOUS is the whole rule.
+//
+// >>> IT USED TO REQUIRE STANDING IN A LIT LANTERN'S RADIUS, AND THAT VERSION
+//     ATE THE GAME. <<<  Measured, `probe_lanfeed` 8 seeds x 30 game minutes,
+//     the shipping loop with no fixture:
+//
+//                                    VILLAGE   lanterns fed   hold 2   the path
+//       HEAD                          8 of 8         10-11    23:33    6 of 6 LIT
+//       trim gated on lamplight       7 of 8           5-7    NEVER    1 of 6 LIT
+//       trim gated on staying alive   8 of 8         10-11    23:33    6 of 6 LIT
+//
+//     The lamplight version was thematically perfect and arithmetically wrong.
+//     A lamplighter dies 58 times an hour (THE_HOUR_2 ARM LAMP) and those
+//     deaths come in BURSTS, during a hold, at the post — so twelve seconds of
+//     CONTINUOUS anything is exactly what a wave denies you. The wick income
+//     was therefore ~0 for the player the whole game is built around, every
+//     wickless death took a post, and the five authored path posts went out on
+//     every seed. Seed 777 never became a Village at all.
+//
+//     >>> NEVER SATISFY A METRIC BY BREAKING WHAT IT PROTECTS (CLAUDE.md hard
+//     rule 5). <<< This is that rule catching a design, not a typo, and it was
+//     caught by running the loop's own instrument rather than only the new one.
+//
+// SO THE DISCRIMINATOR IS DEATH RATE, NOT LOCATION, and that is now true in
+// the code as well as in the comment. Measured on the two death rates this
+// project has on record:
+//
+//   NAIVE_PLAYER_2 Run 10   1.12 s alive per cycle  ->  0 wicks earned. The
+//                           idle loop drains and ends, which is the point.
+//   THE_HOUR_2 ARM LAMP     ~65 s alive per death   ->  5 trims per death,
+//                           capped at 3. A player who is playing is never at
+//                           zero except inside a bad wave -- and a bad wave
+//                           costing you a lamp is the design, not a bug.
+//
+// Being at a lit lantern is still what MAKES staying alive possible; it is the
+// game's sentence rather than a multiplier, and `sv_lantern_supply` already
+// pays for standing there in the currency that belongs to it: rounds.
+//
+// Sampled at 10 Hz, not 60. Twelve seconds is not a number that needs 16 ms of
+// resolution, and the accumulator adds the whole 0.1 s so the threshold is
+// exact at any sample rate.
+export let SV_WICK_EVERY: i32 = 6;
+
+fn sv_wick_tick(p_sv: object) {
+    let sv: object = p_sv;
+    if (sv.lost == 1) { return; }
+    // Dead time does not count and does not reset: `sv_death_price` owns the
+    // reset, on the edge. Two writers to one clock is how a reset gets deleted
+    // by accident and nothing goes red.
+    if (sim_player_dead(sv.world, sv.pslot) == 1) { return; }
+    if (sv.wicks >= g_WICKS_MAX) { sv.wick_t = 0.0; return; }
+
+    sv.wick_t = sv.wick_t + g_TICK_DT * f64(SV_WICK_EVERY);
+    if (sv.wick_t >= g_WICK_TRIM_S) {
+        sv.wick_t = 0.0;
+        let before: i32 = sv.wicks;
+        sv.wicks = loot_wick_trim(sv.wicks, g_WICKS_MAX);
+        if (sv.wicks > before) { sv.wicks_trimmed = sv.wicks_trimmed + 1; }
+    }
+}
+
+// THE LIGHT, RESAMPLED. Once a second, on the same cadence as the settlement
+// sweep, so `lamps_ever` arms itself the moment the opening's lantern is lit
+// and `relit` counts a post the player went back for.
+fn sv_light_tick(p_sv: object) {
+    let sv: object = p_sv;
+    let lit: i32 = sv_lit_lamps(sv);
+    if (lit > sv.lamps_lit && sv.lamps_ever == 1) {
+        sv.relit = sv.relit + (lit - sv.lamps_lit);
+    }
+    sv.lamps_lit = lit;
+    if (lit > 0) { sv.lamps_ever = 1; }
+}
+
+// ===========================================================================
 //  6.  COMMANDS
 // ===========================================================================
 
@@ -1685,6 +2354,8 @@ export fn server_tick(p_sv: object, p_tick: i32): i32 {
         if (sv.respawn_t <= 0.0) {
             sv.respawn_t = g_RESPAWN_S;
             sv.deaths = sv.deaths + 1;
+            // W10 — THE PRICE, charged exactly once, on this edge. §5b.
+            sv_death_price(sv);
         } else {
             sv.respawn_t = sv.respawn_t - g_TICK_DT;
             if (sv.respawn_t <= 0.0) {
@@ -1700,6 +2371,34 @@ export fn server_tick(p_sv: object, p_tick: i32): i32 {
                 }
                 sim_respawn_player(w, sv.pslot, rx, rz);
                 sv.respawn_t = 0.0;
+                // >>> W10 — AND IF THE RUN IS OVER, THIS IS THE LAST ONE. <<<
+                //
+                // The run ending has to be a state the WORLD is in and not
+                // only a word on a screen, for two reasons. The first is that
+                // a terminal screen with a live death loop underneath it is
+                // the bug being fixed, wearing a hat. The second is that
+                // `src/game/main.hml` is not this task's file, so a loss that
+                // existed only as a HUD string would, on the shipping tree
+                // today, look EXACTLY like the infinite death banner Gate 10
+                // measured -- worse than what it replaces.
+                //
+                // `EF_INVULN` is honoured by `combat.hml:1264` and
+                // `spells.hml:965`, i.e. by every damage path in the game. So
+                // the last lamplighter gets up one final time in a world that
+                // has no light left in it, and nothing can take anything from
+                // them again, because there is nothing left to take. The
+                // death-screen loop provably ends whether or not anybody ever
+                // draws `local.lost`.
+                if (sv.lost == 1) {
+                    let id2: i32 = sim_player_id(w, sv.pslot);
+                    if (id2 != ID_NONE) {
+                        let s2: i32 = world_slot_of(w, id2);
+                        if (s2 != SLOT_NONE) {
+                            let fl2 = w.flags;
+                            fl2[s2] = fl2[s2] | EF_INVULN;
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -1714,6 +2413,16 @@ export fn server_tick(p_sv: object, p_tick: i32): i32 {
 
     sv_script(sv);
     sv_lantern_supply(sv);
+
+    // W10 §5b — the two recoveries, and the light they are measured against.
+    // BEFORE `sv_publish`, so the purse the owner block carries is the purse
+    // AFTER a pickup rather than the tick before it: the number on screen and
+    // the number in the store must never be one frame apart on the one frame
+    // that matters.
+    sv_cairn_tick(sv);
+    if (tick % SV_WICK_EVERY == 0) { sv_wick_tick(sv); }
+    if (tick % SV_SETTLE_EVERY == 0) { sv_light_tick(sv); }
+
     sv_publish(sv);
 
     sv.ticks = sv.ticks + 1;
@@ -2851,6 +3560,29 @@ fn sv_publish_w6(p_sv: object, p_l: object) {
             l.trade_price = npc_offer_price(grow);
         }
     }
+
+    // ---- W10: THE PRICE OF DYING, §5b -------------------------------------
+    l.wicks = sv.wicks;
+    l.wicks_max = g_WICKS_MAX;
+    l.wick01 = clamp01(sv.wick_t / g_WICK_TRIM_S);
+    l.cairn_live = sv.cairn_live;
+    l.cairn_salvage = sv.cairn_salvage;
+    l.cairn_kits = sv.cairn_kits;
+    l.cairn_x = sv.cairn_x;
+    l.cairn_z = sv.cairn_z;
+    let cdx: f64 = sv.cairn_x - l.px;
+    let cdz: f64 = sv.cairn_z - l.pz;
+    l.cairn_dist = sqrt(cdx * cdx + cdz * cdz);
+    l.got_salvage = sv.got_salvage;
+    l.got_kits = sv.got_kits;
+    l.bill_salvage = sv.bill_salvage;
+    l.bill_kits = sv.bill_kits;
+    l.bill_lamp = sv.bill_lamp;
+    l.bill_wicks = sv.bill_wicks;
+    l.lamps_lit = sv.lamps_lit;
+    l.snuffed = sv.snuffed;
+    l.relit = sv.relit;
+    l.lost = sv.lost;
 }
 
 // ===========================================================================
@@ -2973,8 +3705,50 @@ export fn server_ui_row(p_sv: object): i32 { let sv: object = p_sv; let o: i32 =
 
 // ---- W7: the economy, for probes and the report line ----------------------
 export fn server_purse(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_purse(sv.npcs); return o; }
-export fn server_salvage_earned(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_earned(sv.npcs); return o; }
-export fn server_salvage_spent(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = npc_spent(sv.npcs); return o; }
+// LIFETIME EARNED AND SPENT, CORRECTED. `npc_purse_take` books a debit as
+// SPENT and `npc_purse_add` books a credit as EARNED — right for a trade, and
+// a lie for W10's drop-and-recover, which would otherwise inflate BOTH by the
+// same coin every time a player walked back for their own money. `npc.hml` is
+// not this task's file, so the correction lives with the authority that
+// created the distortion. `probe_death.hml` §D asserts the round trip is a
+// no-op on both figures.
+export fn server_salvage_earned(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let o: i32 = npc_earned(sv.npcs) - sv.salv_earn_adj;
+    if (o < 0) { o = 0; }
+    return o;
+}
+export fn server_salvage_spent(p_sv: object): i32 {
+    let sv: object = p_sv;
+    let o: i32 = npc_spent(sv.npcs) - sv.salv_spent_adj;
+    if (o < 0) { o = 0; }
+    return o;
+}
+
+// ---- W10: THE PRICE OF DYING, §5b -----------------------------------------
+export fn server_wicks(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.wicks; return o; }
+export fn server_wicks_burned(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.wicks_burned; return o; }
+export fn server_wicks_trimmed(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.wicks_trimmed; return o; }
+export fn server_wick_t(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.wick_t; return o; }
+export fn server_cairn_live(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.cairn_live; return o; }
+export fn server_cairn_salvage(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.cairn_salvage; return o; }
+export fn server_cairn_kits(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.cairn_kits; return o; }
+export fn server_cairn_x(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.cairn_x; return o; }
+export fn server_cairn_z(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.cairn_z; return o; }
+export fn server_cairn_drops(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.cairn_drops; return o; }
+export fn server_cairn_takes(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.cairn_takes; return o; }
+export fn server_got_salvage(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.got_salvage; return o; }
+export fn server_got_kits(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.got_kits; return o; }
+export fn server_bill_salvage(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.bill_salvage; return o; }
+export fn server_bill_kits(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.bill_kits; return o; }
+export fn server_bill_lamp(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.bill_lamp; return o; }
+export fn server_bill_wicks(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.bill_wicks; return o; }
+export fn server_lamps_lit(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv_lit_lamps(sv); return o; }
+export fn server_lamps_ever(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.lamps_ever; return o; }
+export fn server_snuffed(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.snuffed; return o; }
+export fn server_relit(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.relit; return o; }
+export fn server_lost(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.lost; return o; }
+export fn server_lost_tick(p_sv: object): i32 { let sv: object = p_sv; let o: i32 = sv.lost_tick; return o; }
 export fn server_load_kg(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.local.load_kg; return o; }
 export fn server_carry_kg(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.local.carry_kg; return o; }
 export fn server_overload(p_sv: object): f64 { let sv: object = p_sv; let o: f64 = sv.local.overload; return o; }

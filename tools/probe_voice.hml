@@ -1,0 +1,346 @@
+// =============================================================================
+//  probe_voice.hml — THE DAILY LINE IS A ROTATION, NOT A COIN FLIP.   W7-VOICE.
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT:
+//
+//      hemlockc -O1 tools/probe_voice.hml -o /tmp/pv && /tmp/pv
+//
+//  Headless. No SDL, no window, no wall clock. Exits 1 on any failure AND on an
+//  assertion-count mismatch.
+//
+//  -------------------------------------------------------------------------
+//  WHAT IT GUARDS, AND WHY A WRITING TASK SHIPPED A PROBE AT ALL
+//  -------------------------------------------------------------------------
+//  `docs/design/VOICE.md` §4: the fastest way to make a good line bad is to say
+//  it again. Every one of the thirty daily lines in this game is written to be
+//  read ONCE — LORE.md §8 is explicit about Mabel's, "she tells you this
+//  exactly once ... one scene, then the weather" — and the only thing standing
+//  between that and a vending machine is the selector in `src/sim/npc.hml`.
+//
+//  So this probe does not check that the lines are good. Nothing can. It checks
+//  the ONE mechanical property that decides whether a good line stays good:
+//
+//    P1  PERMUTATION.  Inside any window of NPC_LINES consecutive days the
+//        selector returns each index exactly once. Six days, six different
+//        sentences, GUARANTEED — not "on average 4.0 of 6", which is what the
+//        flat hash it replaced actually delivered.
+//    P2  NO CONSECUTIVE REPEAT.  There is no (day, who, seed) anywhere in the
+//        sweep at which two days running say the same line. This is the one a
+//        player would actually notice, and under the flat hash it fired on
+//        1 day in 6.
+//    P3  PURITY.  Same (day, who, seed) -> same index, always, with no state
+//        carried between calls and no dependence on call ORDER. The import wall
+//        and `replay --verify` both require it; a dialogue selector that
+//        remembered anything would be the one thing in `src/sim` that could not
+//        be replayed.
+//    P4  RANGE.  0 <= idx < NPC_LINES for every input including negatives.
+//
+//  -------------------------------------------------------------------------
+//  >>> IT WAS SABOTAGED BEFORE IT WAS TRUSTED. <<<
+//  -------------------------------------------------------------------------
+//  CLAUDE.md's rule: a probe that passes when its feature is deleted is worse
+//  than no probe. The deletion here is the exact line this task replaced —
+//  `npc_daily_index` reverted to the flat `hpick(day, who, seed, NPC_LINES)`.
+//  Reverted, in a scratch copy of the whole tree, rebuilt, and confirmed RED:
+//  the numbers are in `docs/design/VOICE.md` §7. P1 and P2 both go red and P3
+//  and P4 stay green, which is the correct shape — purity and range were never
+//  what was broken.
+//
+//  A NEGATIVE CONTROL IS ALSO RUN HERE, IN THIS FILE, ON EVERY RUN: section C
+//  computes the flat hash the old selector used, over the same sweep, and
+//  ASSERTS THAT IT FAILS P1 AND P2. If a future refactor makes the flat hash
+//  pass, this probe is measuring nothing and it says so out loud instead of
+//  going quietly green.
+// =============================================================================
+
+import { NPC_MABEL, NPC_ODO, NPC_WICK, NPC_CONNIE, NPC_PIP, NPC_NAMED,
+         NPC_LINES, npc_daily_index } from "../src/sim/npc.hml";
+import { xhash2, clampi } from "../src/core/mathx.hml";
+import { exit } from "@stdlib/process";
+
+let g_asserts: i32 = 0;
+let g_pass: i32 = 0;
+let g_fail: i32 = 0;
+let g_expect_asserts: i32 = 17;
+
+fn ck(p_ok: i32, p_what: string) {
+    g_asserts = g_asserts + 1;
+    if (p_ok == 1) {
+        g_pass = g_pass + 1;
+        print(`   ok    ${p_what}`);
+    } else {
+        g_fail = g_fail + 1;
+        print(`   FAIL  ${p_what}`);
+    }
+}
+
+// The seeds the sweep runs over. Deliberately includes 0, a negative, and the
+// shipping world seed, because a selector that is only correct for 1337 is a
+// selector that is correct by accident.
+let g_SEEDS: array<i32> = [1337, 0, 1, 7, 99991, -4242, 305419896, 2147483];
+let g_DAYS: i32 = 600;      // 100 cycles at NPC_LINES = 6
+
+// ---------------------------------------------------------------------------
+//  The flat hash the old selector used, reproduced here EXACTLY so section C
+//  can measure it. This is a copy on purpose: it is the thing being disproved,
+//  and importing it would mean the negative control shared a fate with the
+//  code under test.
+// ---------------------------------------------------------------------------
+fn flat_pick(p_day: i32, p_who: i32, p_seed: i32): i32 {
+    let n: i32 = NPC_LINES;
+    if (n <= 1) { let z: i32 = 0; return z; }
+    let h: u64 = xhash2(p_day, p_who, p_seed);
+    let f: f64 = f64(h) * 2.3283064365386963e-10;
+    let k: i32 = i32(f * f64(n));
+    let out: i32 = clampi(k, 0, n - 1);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  SECTION A — the four properties, on the shipping selector.
+// ---------------------------------------------------------------------------
+// Returns, packed into one array: [worst_missing_in_a_cycle, consecutive_repeats,
+//                                  out_of_range, distinct_over_6_x1000]
+fn sweep(p_flat: i32, p_out: array<i32>) {
+    let worst_missing: i32 = 0;
+    let repeats: i32 = 0;
+    let oor: i32 = 0;
+    let distinct_sum: i32 = 0;
+    let windows: i32 = 0;
+    let n: i32 = NPC_LINES;
+
+    let si: i32 = 0;
+    while (si < g_SEEDS.length) {
+        let seed: i32 = g_SEEDS[si];
+        let w: i32 = 0;
+        while (w < NPC_NAMED) {
+            // Walk the days once, keeping only the previous index. No state
+            // survives a (seed, who) pair, which is also how P3 is arranged.
+            let prev: i32 = -1;
+            let d: i32 = 0;
+            while (d < g_DAYS) {
+                let idx: i32 = 0;
+                if (p_flat == 1) { idx = flat_pick(d, w, seed); }
+                else { idx = npc_daily_index(d, w, seed); }
+                if (idx < 0 || idx >= n) { oor = oor + 1; }
+                if (d > 0 && idx == prev) { repeats = repeats + 1; }
+                prev = idx;
+                d++;
+            }
+            // P1, and the distinct-count, over every ALIGNED cycle.
+            let c: i32 = 0;
+            while (c < g_DAYS / n) {
+                let seen: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0];
+                let k: i32 = 0;
+                while (k < n) {
+                    let day: i32 = c * n + k;
+                    let idx2: i32 = 0;
+                    if (p_flat == 1) { idx2 = flat_pick(day, w, seed); }
+                    else { idx2 = npc_daily_index(day, w, seed); }
+                    let ic: i32 = clampi(idx2, 0, 7);
+                    seen[ic] = seen[ic] + 1;
+                    k++;
+                }
+                let missing: i32 = 0;
+                let distinct: i32 = 0;
+                let j: i32 = 0;
+                while (j < n) {
+                    if (seen[j] == 0) { missing = missing + 1; }
+                    else { distinct = distinct + 1; }
+                    j++;
+                }
+                if (missing > worst_missing) { worst_missing = missing; }
+                distinct_sum = distinct_sum + distinct;
+                windows = windows + 1;
+                c++;
+            }
+            w++;
+        }
+        si++;
+    }
+    p_out[0] = worst_missing;
+    p_out[1] = repeats;
+    p_out[2] = oor;
+    p_out[3] = i32(f64(distinct_sum) * 1000.0 / f64(windows));
+}
+
+fn section_rotation() {
+    print("A  THE SHIPPING SELECTOR -- npc_daily_index");
+    let r: array<i32> = [0, 0, 0, 0];
+    sweep(0, r);
+    let calls: i32 = g_SEEDS.length * NPC_NAMED * g_DAYS;
+    print(`   sweep: ${g_SEEDS.length} seeds x ${NPC_NAMED} villagers x ${g_DAYS} days = ${calls} calls`);
+    print(`   worst lines MISSING from an aligned ${NPC_LINES}-day cycle   ${r[0]}`);
+    print(`   consecutive-day REPEATS                            ${r[1]}`);
+    print(`   indices out of range                               ${r[2]}`);
+    print(`   mean DISTINCT lines per ${NPC_LINES}-day cycle              ${f64(r[3]) / 1000.0}`);
+
+    ck(bi(r[0] == 0),
+       `P1 PERMUTATION: every aligned ${NPC_LINES}-day cycle contains all ${NPC_LINES} lines (worst missing ${r[0]})`);
+    ck(bi(r[3] == NPC_LINES * 1000),
+       `P1b mean distinct per cycle is exactly ${NPC_LINES}.0, not an average (${f64(r[3]) / 1000.0})`);
+    ck(bi(r[1] == 0),
+       `P2 NO CONSECUTIVE REPEAT anywhere in ${calls} calls (${r[1]} found)`);
+    ck(bi(r[2] == 0),
+       `P4 RANGE: every index in 0..${NPC_LINES - 1} (${r[2]} out of range)`);
+}
+
+fn bi(p_b: bool): i32 {
+    if (p_b) { let a: i32 = 1; return a; }
+    let z: i32 = 0;
+    return z;
+}
+
+// ---------------------------------------------------------------------------
+//  SECTION B — purity, and the unaligned window.
+// ---------------------------------------------------------------------------
+fn section_purity() {
+    print("B  PURITY AND THE UNALIGNED WINDOW");
+
+    // Same input, called twice, interleaved with a thousand other inputs in
+    // between. A selector with memory fails this; a hash does not.
+    let a1: i32 = npc_daily_index(41, NPC_ODO, 1337);
+    let noise: i32 = 0;
+    let i: i32 = 0;
+    while (i < 1000) {
+        noise = noise + npc_daily_index(i * 7 + 3, i % NPC_NAMED, 1337 + i);
+        i++;
+    }
+    let a2: i32 = npc_daily_index(41, NPC_ODO, 1337);
+    ck(bi(a1 == a2),
+       `P3 PURITY: day 41 / ODO / 1337 gives ${a1} both before and after 1000 unrelated calls`);
+    ck(bi(noise >= 0), `P3b the 1000 interleaved calls all returned a usable index (sum ${noise})`);
+
+    // Call ORDER independence: walking the days backwards must produce the same
+    // sequence as walking them forwards.
+    let fwd: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let d: i32 = 0;
+    while (d < 12) { fwd[d] = npc_daily_index(d, NPC_PIP, 99991); d++; }
+    let mismatch: i32 = 0;
+    d = 11;
+    while (d >= 0) {
+        if (npc_daily_index(d, NPC_PIP, 99991) != fwd[d]) { mismatch = mismatch + 1; }
+        d--;
+    }
+    ck(bi(mismatch == 0), `P3c ORDER INDEPENDENT: 12 days walked backwards match forwards (${mismatch} mismatches)`);
+
+    // Negative and huge days are clamped rather than throwing or going out of
+    // range -- `day_number` cannot go negative today, and a probe that only
+    // tests what today can produce is a probe that breaks on the day it stops
+    // being true.
+    let neg: i32 = npc_daily_index(-5, NPC_MABEL, 1337);
+    let zero: i32 = npc_daily_index(0, NPC_MABEL, 1337);
+    ck(bi(neg == zero), `P4b a negative day clamps to day 0 (${neg} == ${zero}) rather than escaping the range`);
+    let big: i32 = npc_daily_index(2000000000, NPC_WICK, 1337);
+    ck(bi(big >= 0 && big < NPC_LINES), `P4c day 2e9 is still in 0..${NPC_LINES - 1} (${big})`);
+
+    // The UNALIGNED window. P1 is stated over aligned cycles because that is
+    // what the rotation guarantees; a player does not start talking on a cycle
+    // boundary, so state what an unaligned window really does rather than
+    // implying it is also perfect.
+    let worst_un: i32 = 0;
+    let si: i32 = 0;
+    while (si < g_SEEDS.length) {
+        let w: i32 = 0;
+        while (w < NPC_NAMED) {
+            let start: i32 = 1;
+            while (start < 120) {
+                let seen: array<i32> = [0, 0, 0, 0, 0, 0, 0, 0];
+                let k: i32 = 0;
+                while (k < NPC_LINES) {
+                    let ic: i32 = clampi(npc_daily_index(start + k, w, g_SEEDS[si]), 0, 7);
+                    seen[ic] = seen[ic] + 1;
+                    k++;
+                }
+                let missing: i32 = 0;
+                let j: i32 = 0;
+                while (j < NPC_LINES) {
+                    if (seen[j] == 0) { missing = missing + 1; }
+                    j++;
+                }
+                if (missing > worst_un) { worst_un = missing; }
+                start++;
+            }
+            w++;
+        }
+        si++;
+    }
+    print(`   worst lines missing from an UNALIGNED ${NPC_LINES}-day window   ${worst_un}`);
+    ck(bi(worst_un == 0),
+       `P1c an UNALIGNED ${NPC_LINES}-day window ALSO contains all ${NPC_LINES} lines (worst missing ${worst_un}) -- a player does not start talking on a cycle boundary, so this is the assertion that matters and the first draft of the selector failed it at 3`);
+}
+
+// ---------------------------------------------------------------------------
+//  SECTION C — THE NEGATIVE CONTROL. The flat hash must FAIL.
+// ---------------------------------------------------------------------------
+fn section_control() {
+    print("C  NEGATIVE CONTROL -- the flat hash this replaced MUST fail A");
+    let r: array<i32> = [0, 0, 0, 0];
+    sweep(1, r);
+    print(`   worst lines MISSING from a cycle                   ${r[0]}`);
+    print(`   consecutive-day REPEATS                            ${r[1]}`);
+    print(`   indices out of range                               ${r[2]}`);
+    print(`   mean DISTINCT lines per ${NPC_LINES}-day cycle              ${f64(r[3]) / 1000.0}`);
+
+    ck(bi(r[0] > 0),
+       `the flat hash LOSES lines from a cycle (${r[0]} missing at worst) -- if this ever reads 0 this probe is measuring nothing`);
+    ck(bi(r[1] > 0),
+       `the flat hash REPEATS on consecutive days (${r[1]} times) -- this is the defect a player notices`);
+    ck(bi(r[3] < NPC_LINES * 1000),
+       `the flat hash averages ${f64(r[3]) / 1000.0} distinct lines per ${NPC_LINES} days, not ${NPC_LINES}.0`);
+    ck(bi(r[2] == 0),
+       `and it was NEVER broken on range (${r[2]}) -- the control fails exactly P1 and P2 and nothing else, which is the correct shape`);
+}
+
+// ---------------------------------------------------------------------------
+//  SECTION D — the contract this file exists to hold the client to.
+// ---------------------------------------------------------------------------
+fn section_contract() {
+    print("D  THE CONTRACT");
+    ck(bi(NPC_LINES >= 2),
+       `NPC_LINES is ${NPC_LINES}: the sim promises the HUD ${NPC_LINES} distinct daily lines per villager, ${NPC_LINES * NPC_NAMED} in total`);
+    ck(bi(NPC_LINES <= 8),
+       `and no more than 8, which is what the seen[] array in this probe and every 3-bit packing of a line index can carry`);
+
+    // The five villagers must not share a stream: two people saying the same
+    // line on the same day is the loudest possible version of the repetition
+    // defect, and it is a different failure from P2.
+    let same: i32 = 0;
+    let d: i32 = 0;
+    while (d < 400) {
+        let a: i32 = npc_daily_index(d, NPC_MABEL, 1337);
+        let b: i32 = npc_daily_index(d, NPC_ODO, 1337);
+        let c: i32 = npc_daily_index(d, NPC_CONNIE, 1337);
+        if (a == b && b == c) { same = same + 1; }
+        d++;
+    }
+    print(`   days on which MABEL, ODO and CONNIE all draw the same index   ${same} of 400`);
+    ck(bi(same < 40),
+       `the five villagers do not share one stream: ${same} of 400 days align all three, against ${400 / (NPC_LINES * NPC_LINES)} expected by chance`);
+}
+
+fn main() {
+    print("");
+    print("=====================================================================");
+    print("  probe_voice — the daily line is a rotation, not a coin flip");
+    print("=====================================================================");
+    print("");
+    section_rotation(); print("");
+    section_purity();   print("");
+    section_control();  print("");
+    section_contract(); print("");
+
+    print(`ASSERTIONS  ran ${g_asserts}  expected ${g_expect_asserts}  pass ${g_pass}  fail ${g_fail}`);
+    if (g_asserts != g_expect_asserts) {
+        print(`FAIL  assertion COUNT mismatch: ran ${g_asserts}, expected ${g_expect_asserts}`);
+        exit(1);
+    }
+    if (g_fail != 0) {
+        print(`FAIL  ${g_fail} of ${g_asserts} assertions failed`);
+        exit(1);
+    }
+    print(`PASS  ${g_pass}/${g_asserts} assertions`);
+}
+
+main();

@@ -188,3 +188,147 @@ export fn hud_dmg_seg_weight(p_rel: f64, p_seg: i32): f64 {
     let out: f64 = c * c;
     return out;
 }
+
+// ===========================================================================
+// 4. THE AXIS THE FOUR SEGMENTS DO NOT HAVE — UP AND DOWN  (the-missing-up)
+// ---------------------------------------------------------------------------
+// NAIVE_PLAYER_2.md, after fifty minutes: "The things killing you FLY ABOVE
+// YOUR SIGHTLINE, and a 2D ring around the crosshair has no *up*. I was killed
+// by things I never saw, every run, for fifty minutes."
+//
+// >>> HALF OF THAT IS WRONG AND IT IS WRONG IN THE SIGN. <<< Nothing in this
+// game flies. `ai.hml` step 4 is a hard ground clamp -- `py[gs] = h` from
+// `chunk_height_at`, unconditionally, every tick -- and it was instrumented on
+// the shipping frame path over four runs: FEET MORE THAN 0.25 m OFF THE GROUND,
+// 0 of 25130 enemy-frames. There is no flight height to mis-tune.
+//
+// What the same instrument measured is the opposite, and it is worse:
+//
+//   --demo 40 --stand (a player who does nothing; NAIVE_PLAYER_2's own repro),
+//   seed 1337 / seed 7, elevation of the enemy's body centre from the eye,
+//   relative to the camera's optical axis, vertical half-fov 29.0 deg:
+//
+//                                        all bodies      within 3 m (contact)
+//     mean elevation                     -33.5 / -32.5   -55.9 / -55.8
+//     OUT THE TOP of the frame (>+29)     0 /  0          0 /  0     of 3709
+//     out the BOTTOM     (< -29)       3658 / 3635     3658 / 3635   of 3709
+//
+// 98.6 % of the frames in which something is close enough to bite you, it is
+// off the BOTTOM edge of the screen. The arithmetic is not subtle: the eye is
+// 1.70 m, a Wisp is 0.90 m tall so its centre is 0.45 m, `AI_CONTACT_M` is
+// 1.00 m, and atan2(0.45 - 1.70, 1.00) is -51.3 degrees against a frame that
+// ends at -29. THE THING EATING YOU IS TWENTY-TWO DEGREES BELOW THE BOTTOM OF
+// YOUR SCREEN. A player cannot see it without looking at their own feet, and
+// nothing has ever told them to.
+//
+// The naive player's INFERENCE ("it must be above me") is what a player builds
+// when the killer is never in frame and the only bodies they ever see are the
+// ones on the ridge in the distance -- and those genuinely are above: over a
+// 90 s demo-bot run, 5535 of 18451 enemy-frames had FEET ABOVE THE EYE, all of
+// it terrain. So the conclusion -- the indicator is missing a dimension -- is
+// right, and the dimension it is missing is mostly DOWN.
+//
+// ---------------------------------------------------------------------------
+// WHY THE CUE IS THE TWO EDGE BANDS AND NOT A FIFTH SEGMENT.
+// ---------------------------------------------------------------------------
+// The four segments already spend the screen's VERTICAL axis on front/back --
+// FRONT is above the crosshair, BACK is below it (§3) -- so a fifth "up"
+// segment would land on top of the axis that already means "in front of you",
+// which is the exact ambiguity §3 exists to have removed. There is nowhere left
+// near the crosshair that means "up" and nothing else.
+//
+// The frame's two EDGES do, and the damage indicator was already drawing them:
+// `hud_build` puts a full-width UI_DANGER band at the top and another at the
+// bottom whenever you are hit, both at the same alpha and the same height,
+// carrying exactly zero bits. Four triangles of the most legible real estate on
+// a 320x180 screen -- 1600 px of solid colour, at the two places that already
+// MEAN up and down -- spent on a symmetric vignette.
+//
+// So: the band on the side you must LOOK toward burns brighter and grows; the
+// other thins and dims. Zero new triangles. And when the source is outside the
+// frame entirely, the lit band grows a stepped arrowhead pointing off-screen at
+// it (8 triangles, gated), which is the standard off-screen-target idiom and
+// the only element here that is unambiguous with no learning at all.
+//
+// These four functions are pure and they are the whole behaviour worth
+// asserting, so they live here rather than at the draw site -- for the same
+// reason §3 does, and so `tools/probe_feedback.hml` tests the REAL band
+// geometry instead of a second description of it.
+// ===========================================================================
+
+export let HUD_ELEV_LEVEL: i32 =  0;   // the source is inside the frame
+export let HUD_ELEV_ABOVE: i32 =  1;   // off the TOP edge: look up
+export let HUD_ELEV_BELOW: i32 = -1;   // off the BOTTOM edge: look down
+
+// The band-gain range. 0.9 is the largest gain that keeps the LIT side inside
+// 255 from `hud_build`'s worst base alpha of 130 (130 * 1.9 = 247) while
+// leaving the dim side at 0.1 -- visible, so the player can still see that the
+// indicator is on, and clearly the loser of the pair.
+let g_ELEV_GAIN: f64 = 0.9;
+// And the height range: a 5 px base becomes 1..9 px. A 2:1 ratio reads as
+// "brighter"; a 9:1 ratio reads as a different element, which is the point.
+let g_ELEV_GROW: f64 = 4.0;
+
+// Where the source is, as a fraction of the frame's half-height:
+//    0.0 = on the optical axis      +1.0 = at the TOP edge of the frame
+//   -1.0 = at the BOTTOM edge       clamped, so it is a display weight and not
+// a distance. `p_rel_deg` is the source's elevation MINUS the camera pitch,
+// which is what makes it a screen fact rather than a world one; `p_vfov_deg` is
+// the live VERTICAL fov, so aiming down sights (which narrows it) correctly
+// makes the same body read as further off-screen.
+export fn hud_elev_u(p_rel_deg: f64, p_vfov_deg: f64): f64 {
+    let half: f64 = p_vfov_deg * 0.5;
+    // A zero or negative fov is not a camera. Answer "level" rather than
+    // dividing: this runs on the frame path and must not produce a NaN that
+    // then propagates into an alpha.
+    if (half <= 0.0001) { let z: f64 = 0.0; return z; }
+    let u: f64 = p_rel_deg / half;
+    if (u > 1.0) { u = 1.0; }
+    if (u < -1.0) { u = -1.0; }
+    let out: f64 = u;
+    return out;
+}
+
+// Which way the player must LOOK, or HUD_ELEV_LEVEL if the source is already in
+// frame. Deliberately NOT derived from `hud_elev_u`'s clamped output -- the
+// clamp saturates at exactly 1.0, so `u >= 1.0` would fire for a body sitting
+// precisely on the frame edge, which the player can see.
+export fn hud_elev_side(p_rel_deg: f64, p_vfov_deg: f64): i32 {
+    let half: f64 = p_vfov_deg * 0.5;
+    if (half <= 0.0001) { let z: i32 = HUD_ELEV_LEVEL; return z; }
+    let r: f64 = p_rel_deg;
+    if (r > half) { let up: i32 = HUD_ELEV_ABOVE; return up; }
+    if (r < 0.0 - half) { let dn: i32 = HUD_ELEV_BELOW; return dn; }
+    let out: i32 = HUD_ELEV_LEVEL;
+    return out;
+}
+
+// The multiplier the edge band on `p_side` (+1 = the TOP band, -1 = the BOTTOM
+// band) takes for a source at `p_u`. 1.0 for both when the source is level, so
+// a frame with no elevation information looks exactly like the one this
+// replaced.
+export fn hud_elev_band_gain(p_u: f64, p_side: i32): f64 {
+    let u: f64 = p_u;
+    if (u > 1.0) { u = 1.0; }
+    if (u < -1.0) { u = -1.0; }
+    let s: f64 = f64(p_side);
+    let g: f64 = 1.0 + g_ELEV_GAIN * s * u;
+    if (g < 0.0) { g = 0.0; }
+    let out: f64 = g;
+    return out;
+}
+
+// The same grading applied to the band's HEIGHT in pixels, because alpha alone
+// does not survive a bright sky behind it and thickness does. Floored at 1 px:
+// a band that reaches zero would read as the indicator having been switched
+// off, which is a different sentence from "not that way".
+export fn hud_elev_band_h(p_u: f64, p_side: i32, p_base: f64): f64 {
+    let u: f64 = p_u;
+    if (u > 1.0) { u = 1.0; }
+    if (u < -1.0) { u = -1.0; }
+    let s: f64 = f64(p_side);
+    let h: f64 = p_base + g_ELEV_GROW * s * u;
+    if (h < 1.0) { h = 1.0; }
+    let out: f64 = h;
+    return out;
+}

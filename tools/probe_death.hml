@@ -1,0 +1,940 @@
+// =============================================================================
+//  probe_death.hml — WHAT DYING COSTS, AND THAT YOU CAN GET IT BACK.   W10.
+// =============================================================================
+//
+//  Run it FROM THE NIGHTSHADE REPO ROOT:
+//
+//      hemlockc -O1 tools/probe_death.hml -o /tmp/pd && /tmp/pd
+//      /tmp/pd --idle 365          (the naive player's idle window, seconds)
+//      /tmp/pd --seed 1337
+//
+//  Exits 1 on any failed assertion AND on an assertion-count mismatch.
+//  Headless: no SDL, no wobbleweed, no window. `nm <bin> | grep -c SDL_` is 0.
+//
+//  -------------------------------------------------------------------------
+//  WHAT IT IS FOR
+//  -------------------------------------------------------------------------
+//  Gate 10: "Death is now beautifully communicated and COSTS NOTHING. That is
+//  worse than an unclear death screen, because the game's whole sentence is
+//  'you carry what you find home' - and if dying costs you nothing, you are
+//  never carrying anything."
+//
+//  NAIVE_PLAYER_2 §1, measured: 64 death episodes in 365 s, 252.75 s (69 %) on
+//  the death screen, cycling 0.74-1.88 s alive then 4.1 s dead, indefinitely.
+//  "There is no game over. Standing still is an infinite loop, not a failure."
+//
+//  So this file asserts THREE things, and the third is the one that did not
+//  exist before:
+//
+//     1. THE PRICE IS CHARGED.     Die and the pack is on the ground, a wick
+//                                  is gone, and eventually a lamp goes out.
+//     2. THE PRICE IS RECOVERABLE. Walk back and it is yours again — all of
+//                                  it, from one trip, however many times you
+//                                  died. And the things that are NOT
+//                                  recoverable are named and counted.
+//     3. THE LOOP TERMINATES.      The idle window that measured 69 % dead
+//                                  ends, at a stated second, in a stated way.
+//
+//  -------------------------------------------------------------------------
+//  SABOTAGE-VERIFIED, BOTH WAYS.  A probe that passes when its feature is
+//  deleted is worse than no probe (CLAUDE.md hard rule 8).  Every section
+//  below was verified by BREAKING the thing it measures in a scratch copy of
+//  the whole tree and confirming this file goes RED, and by confirming the
+//  sabotage actually changed the binary (md5 of the built probe).  The four
+//  sabotages and their results are in the task report; the two that matter
+//  most are:
+//
+//     charge deleted   (`sv_death_price` body -> `return;`)      §B, §D, §E red
+//     recovery deleted (`sv_cairn_tick` body -> `return;`)       §C, §E red
+//
+//  -------------------------------------------------------------------------
+//  FIXTURES, DECLARED
+//  -------------------------------------------------------------------------
+//  This probe uses three, and says so rather than pretending it drives a
+//  player:
+//
+//    `server_teleport`      to stand the player at the lantern and later at
+//                           their own cairn. A HUMAN WALKS; this probe is
+//                           measuring what happens when they arrive, not
+//                           whether they can find it.
+//    `server_grant_salvage` / `server_grant_kits`
+//                           to put something in the pack worth losing. The
+//                           earning of it is `probe_trade`'s and
+//                           `probe_lanfeed`'s subject, not this one's.
+//
+//  Everything else — the deaths, the drops, the snuffs, the wick clock, the
+//  loss — comes out of `server_new` -> `server_tick` with the real director
+//  killing the real player. NO DEATH IN THIS FILE IS FAKED.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, floor } from "@stdlib/math";
+
+import { g_TICK_HZ, g_WICKS_START, g_WICKS_MAX, g_WICK_TRIM_S,
+         g_CAIRN_R_M, g_SNUFF_R_M, g_RESPAWN_S, g_LANTERN_R_T1,
+         g_LANTERN_CHANNEL_S } from "../src/core/config.hml";
+
+import { loot_death_toll, loot_death_wicks, loot_wick_trim,
+         loot_death_drop_salvage, loot_death_drop_kits,
+         loot_cairn_add, loot_run_lost,
+         DEATH_TOLL_WICK, DEATH_TOLL_LAMP } from "../src/sim/loot.hml";
+
+import { cmd_new, cmd_set, BTN_USE } from "../src/sim/command.hml";
+
+import { sim_player_dead, sim_player_id, SIM_LANTERN_LIT } from "../src/sim/sim.hml";
+
+import { world_count, world_slot_of, KIND_LANTERN, EF_DEAD, EF_INVULN,
+         SLOT_NONE, ID_NONE } from "../src/sim/world.hml";
+
+import { npc_purse, npc_pack_count, npc_pack_find_kind,
+         NPC_OFF_KIT } from "../src/sim/npc.hml";
+
+import { server_new, server_tick, server_local, server_t0, server_tick_now,
+         server_world, server_deaths, server_purse, server_grant_salvage,
+         server_grant_kits, server_teleport, server_npcs,
+         server_lantern_x, server_lantern_z, server_lantern_lit,
+         server_spawn_yaw, server_apply_command,
+         server_salvage_earned, server_salvage_spent,
+         server_wicks, server_wicks_burned, server_wicks_trimmed, server_wick_t,
+         server_cairn_live, server_cairn_salvage, server_cairn_kits,
+         server_cairn_x, server_cairn_z, server_cairn_drops, server_cairn_takes,
+         server_got_salvage, server_got_kits,
+         server_bill_salvage, server_bill_kits, server_bill_lamp,
+         server_bill_wicks, server_lamps_lit, server_lamps_ever,
+         server_snuffed, server_relit, server_lost, server_lost_tick,
+         SV_PSLOT } from "../src/game/server.hml";
+
+// ---------------------------------------------------------------------------
+//  CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_SEED: i32  = 1337;
+let g_IDLE_S: i32 = 365;      // NAIVE_PLAYER_2 Run 10's recording length, exactly
+let g_CAP_S: i32 = 600;       // hard stop on any wait loop, in game seconds
+
+// THE ASSERTION COUNT, PINNED. A probe that silently stops running half its
+// checks is worse than no probe.
+let PD_WANT: i32 = 117;
+
+// ---------------------------------------------------------------------------
+//  ASSERTIONS
+// ---------------------------------------------------------------------------
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+fn eqi(p_msg: string, p_got: i32, p_want: i32) {
+    ck(p_got == p_want, p_msg + "  got " + sv(p_got) + " want " + sv(p_want));
+}
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn f1(p_x: f64): string { let out: string = sv(floor(p_x * 10.0) / 10.0); return out; }
+fn padl(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = " " + s; }
+    let out: string = s;
+    return out;
+}
+fn pi(p_v: i32, p_w: i32): string { let out: string = padl(sv(p_v), p_w); return out; }
+fn pf(p_v: f64, p_w: i32): string { let out: string = padl(f1(p_v), p_w); return out; }
+fn pct(p_a: i32, p_b: i32): string {
+    if (p_b <= 0) { let z: string = "0.0%"; return z; }
+    let out: string = f1(f64(p_a) * 100.0 / f64(p_b)) + "%";
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  THE SESSION.  `main.hml`'s run_loop with the window, the renderer and the
+//  wall clock removed, and with NO demo bot: this probe's player never presses
+//  a movement key, because the failure mode it exists to measure is a player
+//  who is not pressing anything.
+// ---------------------------------------------------------------------------
+fn session_new(p_seed: i32): object {
+    let s: object = {
+        sv: server_new(p_seed, null),
+        cmd: cmd_new(),
+        tick: 0,
+        t0: 0,
+        seq: 0,
+        // What the pack held on the tick BEFORE the last death. A session
+        // earns salvage from kills while it waits, so a probe that asserts the
+        // number it granted is asserting a number the game has since moved.
+        pre_purse: 0,
+        pre_kits: 0,
+        pre_earn: 0,
+        pre_spent: 0
+    };
+    s.t0 = server_t0(s.sv);
+    s.tick = s.t0;
+    let out: object = s;
+    return out;
+}
+
+// One tick, with the buttons the caller wants held. `dt_ms` is 17 for the same
+// reason the game's is: `InputCommand` carries an integer millisecond field.
+fn step(p_s: object, p_btn: i32) {
+    let s: object = p_s;
+    cmd_set(s.cmd, s.tick, 17, 0.0, 0.0, 0.0, 0.0, p_btn, 4, s.seq);
+    s.seq = s.seq + 1;
+    server_apply_command(s.sv, SV_PSLOT, s.cmd);
+    server_tick(s.sv, s.tick);
+    s.tick = s.tick + 1;
+}
+
+fn elapsed(p_s: object): i32 {
+    let s: object = p_s;
+    let out: i32 = s.tick - s.t0;
+    return out;
+}
+
+fn secs(p_s: object): f64 {
+    let out: f64 = f64(elapsed(p_s)) / f64(g_TICK_HZ);
+    return out;
+}
+
+fn dead(p_s: object): i32 {
+    let s: object = p_s;
+    let out: i32 = sim_player_dead(server_world(s.sv), SV_PSLOT);
+    return out;
+}
+
+fn kits_in_pack(p_s: object): i32 {
+    let s: object = p_s;
+    let sto: object = server_npcs(s.sv);
+    if (sto == null) { let z: i32 = 0; return z; }
+    let r: i32 = npc_pack_find_kind(sto, NPC_OFF_KIT);
+    if (r < 0) { let none: i32 = 0; return none; }
+    let out: i32 = npc_pack_count(sto, r);
+    return out;
+}
+
+fn dist2(p_ax: f64, p_az: f64, p_bx: f64, p_bz: f64): f64 {
+    let dx: f64 = p_ax - p_bx;
+    let dz: f64 = p_az - p_bz;
+    let out: f64 = sqrt(dx * dx + dz * dz);
+    return out;
+}
+
+// STAND AT THE LANTERN AND HOLD [E] UNTIL IT LIGHTS. The teleport is the
+// fixture; the CHANNEL is real — the same `BTN_USE` hold, through
+// `server_apply_command`, that a player performs.
+fn light_the_lantern(p_s: object): i32 {
+    let s: object = p_s;
+    server_teleport(s.sv, server_lantern_x(s.sv), server_lantern_z(s.sv));
+    let cap: i32 = i32(g_LANTERN_CHANNEL_S * f64(g_TICK_HZ)) + 240;
+    let i: i32 = 0;
+    while (i < cap) {
+        step(s, BTN_USE);
+        if (server_lantern_lit(s.sv) == 1) { let ok: i32 = 1; return ok; }
+        i++;
+    }
+    let no: i32 = 0;
+    return no;
+}
+
+// RUN UNTIL THE NEXT DEATH EDGE, OR GIVE UP. Returns the elapsed tick of the
+// death, or -1. Nothing is faked: the director's wave does the killing.
+fn wait_for_death(p_s: object, p_cap_s: i32): i32 {
+    let s: object = p_s;
+    let n0: i32 = server_deaths(s.sv);
+    let cap: i32 = p_cap_s * g_TICK_HZ;
+    let i: i32 = 0;
+    while (i < cap) {
+        s.pre_purse = server_purse(s.sv);
+        s.pre_kits = kits_in_pack(s);
+        s.pre_earn = server_salvage_earned(s.sv);
+        s.pre_spent = server_salvage_spent(s.sv);
+        step(s, 0);
+        if (server_deaths(s.sv) > n0) { let t: i32 = elapsed(s); return t; }
+        i++;
+    }
+    let miss: i32 = 0 - 1;
+    return miss;
+}
+
+// STAND SOMEWHERE THE LIGHT IS NOT. `g_SNUFF_R_M` out from the opening lantern
+// and then some, so a death here drops a cairn the respawn does NOT land on
+// and cannot reach a lamp to put out. Both of those are properties under test,
+// not conveniences: see §C2.
+fn go_into_the_dark(p_s: object) {
+    let s: object = p_s;
+    server_teleport(s.sv,
+                    server_lantern_x(s.sv) + g_SNUFF_R_M + 60.0,
+                    server_lantern_z(s.sv) + g_SNUFF_R_M + 60.0);
+}
+
+// MAKE THE PLAYER UNKILLABLE. A DECLARED FIXTURE, used in exactly one section.
+// `g_WICK_TRIM_S` is twelve seconds of CONTINUOUS lamplight, and measuring a
+// twelve-second window requires surviving twelve seconds — which, at the
+// opening lantern under a live wave, this game does not grant (§F measures a
+// death every ~8 s there). The thing under test is the CLOCK, not the combat,
+// so the combat is switched off with the flag `combat.hml:1264` already reads.
+fn make_invulnerable(p_s: object): i32 {
+    let s: object = p_s;
+    let w: object = server_world(s.sv);
+    let id: i32 = sim_player_id(w, SV_PSLOT);
+    if (id == ID_NONE) { let no: i32 = 0; return no; }
+    let slot: i32 = world_slot_of(w, id);
+    if (slot == SLOT_NONE) { let no2: i32 = 0; return no2; }
+    let fl = w.flags;
+    fl[slot] = fl[slot] | EF_INVULN;
+    let ok: i32 = 1;
+    return ok;
+}
+
+fn run_ticks(p_s: object, p_n: i32) {
+    let s: object = p_s;
+    let i: i32 = 0;
+    while (i < p_n) { step(s, 0); i++; }
+}
+
+// ===========================================================================
+//  §A  THE LEDGER, PURE.  No server, no world, no tick.
+// ---------------------------------------------------------------------------
+//  `src/sim/loot.hml`'s W10 block is a set of pure functions precisely so that
+//  the RULE can be red before any INTEGRATION can hide it. Break a line there
+//  and this section fails with no world booted at all.
+// ===========================================================================
+fn section_a() {
+    print("");
+    print("== A. THE LEDGER (src/sim/loot.hml, pure) ==");
+
+    // the toll: a wick is spent before a lamp, and the death you run out on
+    // still only costs a wick.
+    eqi("A1  3 wicks -> the toll is a WICK", loot_death_toll(3), DEATH_TOLL_WICK);
+    eqi("A2  1 wick  -> the toll is a WICK", loot_death_toll(1), DEATH_TOLL_WICK);
+    eqi("A3  0 wicks -> the toll is a LAMP", loot_death_toll(0), DEATH_TOLL_LAMP);
+    eqi("A4  a negative wick count cannot make it lie", loot_death_toll(0 - 4), DEATH_TOLL_LAMP);
+    ck(DEATH_TOLL_WICK != DEATH_TOLL_LAMP, "A5  the two tolls are distinct");
+
+    // the wick, down and up
+    eqi("A6  one death burns one wick", loot_death_wicks(3), 2);
+    eqi("A7  the last wick", loot_death_wicks(1), 0);
+    eqi("A8  saturates at zero", loot_death_wicks(0), 0);
+    eqi("A9  a trim gives one back", loot_wick_trim(1, g_WICKS_MAX), 2);
+    eqi("A10 a trim is capped", loot_wick_trim(g_WICKS_MAX, g_WICKS_MAX), g_WICKS_MAX);
+    eqi("A11 a trim cannot LOWER an over-cap count", loot_wick_trim(9, 3), 3);
+    // burn every wick then trim it all back: the resource is conservative.
+    let w: i32 = g_WICKS_MAX;
+    let burns: i32 = 0;
+    while (loot_death_toll(w) == DEATH_TOLL_WICK) { w = loot_death_wicks(w); burns++; }
+    eqi("A12 it takes exactly g_WICKS_MAX deaths to run out", burns, g_WICKS_MAX);
+    // BOUNDED. A `while (w < max)` here is an infinite loop the moment
+    // `loot_wick_trim` stops making progress, and a probe that HANGS on a
+    // broken feature has not gone red -- it has gone away. Found by the
+    // sabotage run that broke exactly this function.
+    let trims: i32 = 0;
+    while (w < g_WICKS_MAX && trims <= g_WICKS_MAX + 1) {
+        w = loot_wick_trim(w, g_WICKS_MAX);
+        trims++;
+    }
+    eqi("A13 and exactly that many trims to get back", trims, g_WICKS_MAX);
+
+    // what falls
+    eqi("A14 all of the purse falls", loot_death_drop_salvage(47), 47);
+    eqi("A15 an empty purse drops nothing", loot_death_drop_salvage(0), 0);
+    eqi("A16 a negative purse drops nothing", loot_death_drop_salvage(0 - 5), 0);
+    // >>> AND A LANTERN KIT DOES NOT FALL. <<< The zero is the decision, not
+    // an omission: see `loot_death_drop_kits`'s header. The supply is
+    // SV_OPEN_KITS + SV_HOLD_KITS = exactly four and exactly one Village, so a
+    // dropped kit is a town lost to one wave. MEASURED: with kits dropping,
+    // `probe_lanfeed` went VILLAGE 8 of 8 -> 7 of 8 and seed 777 planted 2
+    // posts instead of 4.
+    eqi("A17 A LANTERN KIT DOES NOT FALL", loot_death_drop_kits(2), 0);
+    eqi("A18 ...not even one", loot_death_drop_kits(1), 0);
+    eqi("A19 an empty pack drops nothing", loot_death_drop_kits(0), 0);
+
+    // the cairn merges, saturates, and never shrinks
+    eqi("A19 the cairn merges", loot_cairn_add(40, 7, 999999), 47);
+    eqi("A20 adding nothing changes nothing", loot_cairn_add(40, 0, 999999), 40);
+    eqi("A21 the cairn saturates at the cap", loot_cairn_add(999998, 50, 999999), 999999);
+    eqi("A22 a full cairn stays full", loot_cairn_add(999999, 50, 999999), 999999);
+    ck(loot_cairn_add(40, 7, 999999) >= 40, "A23 the cairn NEVER shrinks");
+
+    // the way to lose
+    eqi("A24 no lamp ever lit -> not lost (the title card is not a loss)",
+        loot_run_lost(0, 0), 0);
+    eqi("A25 lamps burning -> not lost", loot_run_lost(3, 1), 0);
+    eqi("A26 one lamp burning -> not lost", loot_run_lost(1, 1), 0);
+    eqi("A27 lit once, and now none -> LOST", loot_run_lost(0, 1), 1);
+
+    print("   toll(3)=" + sv(loot_death_toll(3)) + " toll(0)=" + sv(loot_death_toll(0))
+        + "   wicks " + sv(g_WICKS_START) + "/" + sv(g_WICKS_MAX)
+        + "   trim " + f1(g_WICK_TRIM_S) + " s"
+        + "   cairn r " + f1(g_CAIRN_R_M) + " m   snuff r " + f1(g_SNUFF_R_M) + " m");
+}
+
+// ===========================================================================
+//  §B  DIE, AND REPORT EXACTLY WHAT IT COST.
+// ---------------------------------------------------------------------------
+//  A real session. A real wave. A real death. The purse and the pack are put
+//  there by a declared fixture; everything that happens to them is not.
+// ===========================================================================
+fn section_b(): object {
+    print("");
+    print("== B. DIE, AND WHAT IT COST ==");
+
+    let s: object = session_new(g_SEED);
+    if (light_the_lantern(s) == 0) {
+        ck(false, "B0  the opening lantern lights (the probe cannot run without it)");
+        let bad: object = s;
+        return bad;
+    }
+    ck(true, "B0  the opening lantern lights");
+
+    server_grant_salvage(s.sv, 47);
+    server_grant_kits(s.sv, 2);
+    // OUT INTO THE DARK, carrying it. That is the sentence the game is about
+    // and it is the only place the pack is at risk — see §C2 for the other
+    // half, which is that dying inside your own light costs you nothing but a
+    // wick, by construction.
+    go_into_the_dark(s);
+    let p0: i32 = server_purse(s.sv);
+    let k0: i32 = kits_in_pack(s);
+    let w0: i32 = server_wicks(s.sv);
+    let lamps0: i32 = server_lamps_lit(s.sv);
+
+    eqi("B1  the pack is loaded before the first death (salvage)", p0, 47);
+    eqi("B2  ...and the kits", k0, 2);
+    eqi("B3  a fresh run starts with a full set of wicks", w0, g_WICKS_START);
+    eqi("B4  nothing has been dropped yet", server_cairn_live(s.sv), 0);
+    ck(lamps0 >= 1, "B5  a lamp is burning  got " + sv(lamps0));
+
+    let t1: i32 = wait_for_death(s, g_CAP_S);
+    ck(t1 >= 0, "B6  the game kills a player who stands still (no fake death)");
+    if (t1 < 0) { let bad2: object = s; return bad2; }
+
+    let px: f64 = server_cairn_x(s.sv);
+    let pz: f64 = server_cairn_z(s.sv);
+    let had_s: i32 = s.pre_purse;
+    let had_k: i32 = s.pre_kits;
+
+    print("   THE BILL for death 1, at " + f1(f64(t1) / f64(g_TICK_HZ)) + " s:");
+    print("     salvage dropped   " + pi(server_bill_salvage(s.sv), 6)
+        + " of " + sv(had_s) + " carried     purse now " + sv(server_purse(s.sv)));
+    print("     kits dropped      " + pi(server_bill_kits(s.sv), 6)
+        + " of " + sv(had_k) + " carried      pack now " + sv(kits_in_pack(s))
+        + "   (a kit is equipment, not loose change -- loot.hml)");
+    print("     wicks left        " + pi(server_bill_wicks(s.sv), 6)
+        + " of " + sv(g_WICKS_MAX));
+    print("     a lamp went out   " + pi(server_bill_lamp(s.sv), 6)
+        + "      lamps lit " + sv(server_lamps_lit(s.sv)));
+    print("     it is all at      " + pf(px, 8) + "," + pf(pz, 8)
+        + "   " + f1(dist2(px, pz, server_lantern_x(s.sv), server_lantern_z(s.sv)))
+        + " m from the lantern");
+
+    ck(had_s >= 47, "B7  the purse was worth losing  got " + sv(had_s));
+    eqi("B8  the purse is on the ground, not in your hand", server_purse(s.sv), 0);
+    eqi("B9  THE KITS STAY ON YOUR BACK", kits_in_pack(s), had_k);
+    eqi("B10 a cairn is standing", server_cairn_live(s.sv), 1);
+    eqi("B11 it holds exactly what fell (salvage)", server_cairn_salvage(s.sv), had_s);
+    eqi("B12 ...and no kits went into it", server_cairn_kits(s.sv), 0);
+    eqi("B13 the bill says so (salvage)", server_bill_salvage(s.sv), had_s);
+    eqi("B14 the bill charges no kits", server_bill_kits(s.sv), 0);
+    eqi("B15 a wick burned", server_wicks(s.sv), w0 - 1);
+    eqi("B16 ...and it is counted", server_wicks_burned(s.sv), 1);
+    eqi("B17 the first death does NOT take a lamp", server_bill_lamp(s.sv), 0);
+    eqi("B18 ...so the light is untouched", server_lamps_lit(s.sv), lamps0);
+    eqi("B19 the run is not over", server_lost(s.sv), 0);
+    // The baselines are the ones from the tick BEFORE the death, not from
+    // before the wait: a session earns salvage from kills while it waits, and
+    // that income is real. What is under test is that the DROP adds nothing.
+    eqi("B20 lifetime EARNED is not inflated by a drop",
+        server_salvage_earned(s.sv), s.pre_earn);
+    eqi("B21 lifetime SPENT is not inflated by a drop",
+        server_salvage_spent(s.sv), s.pre_spent);
+
+    let out: object = s;
+    return out;
+}
+
+// ===========================================================================
+//  §C  THE RECOVERY PATH, TRACED.  Go back, get it, and report what you got
+//      AND WHAT YOU DID NOT.
+// ===========================================================================
+fn section_c(p_s: object) {
+    print("");
+    print("== C. GO BACK AND GET IT ==");
+    let s: object = p_s;
+    if (server_cairn_live(s.sv) == 0) {
+        ck(false, "C0  there is a cairn to go back for");
+        return;
+    }
+    ck(true, "C0  there is a cairn to go back for");
+
+    let cx: f64 = server_cairn_x(s.sv);
+    let cz: f64 = server_cairn_z(s.sv);
+    let want_s: i32 = server_cairn_salvage(s.sv);
+    let want_k: i32 = server_cairn_kits(s.sv);
+    let wicks_before: i32 = server_wicks(s.sv);
+    let snuff_before: i32 = server_snuffed(s.sv);
+    let e0: i32 = server_salvage_earned(s.sv);
+    let sp0: i32 = server_salvage_spent(s.sv);
+
+    // Wait out the respawn, THEN stand somewhere else and confirm the cairn
+    // does not follow you: a pickup radius that is really "always" is not a
+    // recovery, it is a refund.
+    while (dead(s) == 1) { step(s, 0); }
+    server_teleport(s.sv, cx + g_CAIRN_R_M * 4.0, cz);
+    run_ticks(s, 4);
+    eqi("C1  standing 4x the radius away recovers NOTHING", server_purse(s.sv), 0);
+    eqi("C2  ...and the cairn is still standing", server_cairn_live(s.sv), 1);
+
+    // Now walk onto it.
+    server_teleport(s.sv, cx, cz);
+    run_ticks(s, 4);
+
+    print("   WHAT THE TRIP GOT BACK");
+    print("     salvage           " + pi(server_got_salvage(s.sv), 6)
+        + " of " + sv(want_s) + " dropped");
+    print("     lantern kits      " + pi(server_got_kits(s.sv), 6)
+        + " of " + sv(want_k) + " dropped -- none fell, so none to fetch");
+    print("   WHAT IT DID NOT");
+    print("     wicks             " + pi(g_WICKS_START - server_wicks(s.sv), 6)
+        + " burned, and the ONLY way back is "
+        + f1(g_WICK_TRIM_S) + " s of staying on your feet");
+    print("     posts snuffed     " + pi(server_snuffed(s.sv), 6)
+        + " (relight is " + f1(g_LANTERN_CHANNEL_S) + " s of HOLD [E], on site)");
+    print("     the clock         the walk back. It is the only price with no");
+    print("                       receipt, and it is the one Gate 10 asked for.");
+
+    eqi("C3  the salvage is back in the purse", server_purse(s.sv), want_s);
+    eqi("C4  the kits never left the pack", kits_in_pack(s), 2);
+    eqi("C5  it reports what it got (salvage)", server_got_salvage(s.sv), want_s);
+    eqi("C6  ...and what it got (kits)", server_got_kits(s.sv), want_k);
+    eqi("C7  the cairn is gone", server_cairn_live(s.sv), 0);
+    eqi("C8  ...and empty", server_cairn_salvage(s.sv), 0);
+    eqi("C9  one trip is counted", server_cairn_takes(s.sv), 1);
+    eqi("C10 THE WICK DOES NOT COME BACK WITH THE PACK", server_wicks(s.sv), wicks_before);
+    eqi("C11 nor does a snuffed post relight itself", server_snuffed(s.sv), snuff_before);
+    eqi("C12 lifetime EARNED is not inflated by a recovery", server_salvage_earned(s.sv), e0);
+    eqi("C13 lifetime SPENT is not inflated by a recovery", server_salvage_spent(s.sv), sp0);
+}
+
+// ===========================================================================
+//  §C2  THE OTHER HALF: DIE INSIDE YOUR OWN LIGHT AND THE PACK COMES HOME.
+// ---------------------------------------------------------------------------
+//  This fell out of two rules that were already true and it is kept on purpose
+//  rather than patched out. A lit lantern is where you respawn (`server_tick`),
+//  and a cairn is picked up by standing on it — so a death inside your own
+//  lamplight drops the pack and hands it straight back, and the whole bill is
+//  ONE WICK.
+//
+//  That is exactly the right target. The sentence is "you carry what you find
+//  home", and the risk therefore belongs on the CARRYING, not on the arriving.
+//  A player who dies at their own post has already got the thing home. A player
+//  who dies two hundred metres out has not, and walks.
+//
+//  It is asserted here so that a future change to the respawn rule or the
+//  pickup radius cannot silently delete it.
+// ===========================================================================
+fn section_c2() {
+    print("");
+    print("== C2. DYING IN YOUR OWN LIGHT ==");
+    let s: object = session_new(g_SEED);
+    if (light_the_lantern(s) == 0) { ck(false, "C2-0 the opening lantern lights"); return; }
+    ck(true, "C2-0 the opening lantern lights");
+
+    server_grant_salvage(s.sv, 40);
+    server_teleport(s.sv, server_lantern_x(s.sv), server_lantern_z(s.sv));
+    let t: i32 = wait_for_death(s, g_CAP_S);
+    ck(t >= 0, "C2-1 a death at the lantern");
+    let had: i32 = s.pre_purse;
+    let w_before: i32 = server_wicks(s.sv) + 1;   // it has already been charged
+    while (dead(s) == 1) { step(s, 0); }
+    run_ticks(s, 4);
+
+    eqi("C2-2 the pack is back in your hands the moment you stand up",
+        server_purse(s.sv), had);
+    eqi("C2-3 ...and there is no cairn left standing", server_cairn_live(s.sv), 0);
+    eqi("C2-4 the bill for a death in your own light is ONE WICK",
+        server_wicks(s.sv), w_before - 1);
+    print("   died at the lantern carrying " + sv(had)
+        + " -> respawned on it, picked it straight back up. Cost: 1 wick, 0 salvage.");
+}
+
+// ===========================================================================
+//  §D  THE WICK COMES BACK BY STAYING ALIVE — and the clock resets on death.
+// ---------------------------------------------------------------------------
+//  THIS SECTION USED TO ASSERT A DIFFERENT RULE, and the reason it changed is
+//  the most important measurement in this task. The trim was originally gated
+//  on standing inside a lit lantern's radius — "you are at a lantern or you
+//  are prey", which is the game's own sentence. `probe_lanfeed`, run on the
+//  shipping loop with no fixture, said what that actually did:
+//
+//                                    VILLAGE   lanterns fed   hold 2   the path
+//      HEAD                           8 of 8         10-11    23:33    6 of 6 LIT
+//      trim gated on lamplight        7 of 8           5-7    NEVER    1 of 6 LIT
+//      trim gated on staying alive    8 of 8         10-11    23:33    6 of 6 LIT
+//
+//  A lamplighter's deaths arrive in BURSTS, during a hold, at the post, so
+//  twelve CONTINUOUS seconds of anything is exactly what a wave denies. The
+//  wick income was ~0 for the only player the game is built around, so every
+//  wickless death took a post and the authored path went out on every seed.
+//
+//  The rule under test is therefore: `g_WICK_TRIM_S` of CONTINUOUS LIFE trims
+//  one, and dying resets the clock.
+// ===========================================================================
+fn section_d() {
+    print("");
+    print("== D. THE WICK, AND HOW IT COMES BACK ==");
+    let s: object = session_new(g_SEED);
+    if (light_the_lantern(s) == 0) {
+        ck(false, "D0  the opening lantern lights");
+        return;
+    }
+    ck(true, "D0  the opening lantern lights");
+
+    // Burn one, out in the dark.
+    go_into_the_dark(s);
+    let t: i32 = wait_for_death(s, g_CAP_S);
+    ck(t >= 0, "D1  a death to spend a wick on");
+    while (dead(s) == 1) { step(s, 0); }
+    let w1: i32 = server_wicks(s.sv);
+    ck(w1 < g_WICKS_MAX, "D2  a wick is missing  got " + sv(w1));
+
+    // THE FIXTURE, DECLARED (see `make_invulnerable`): twelve seconds of
+    // CONTINUOUS LIFE cannot be measured on a player the wave kills every
+    // eight. The clock is the thing under test, not the combat.
+    ck(make_invulnerable(s) == 1, "D3  the fixture arms");
+
+    // JUST UNDER the trim time: nothing yet. A threshold that fires early is a
+    // threshold nobody can reason about.
+    let out0: i32 = server_wicks_trimmed(s.sv);
+    run_ticks(s, i32((g_WICK_TRIM_S - 1.0) * f64(g_TICK_HZ)));
+    eqi("D4  " + f1(g_WICK_TRIM_S - 1.0) + " s alive is not yet a wick",
+        server_wicks(s.sv), w1);
+    eqi("D5  ...and the trim counter has not moved", server_wicks_trimmed(s.sv), out0);
+
+    // ...and just over: exactly one.
+    run_ticks(s, i32(2.0 * f64(g_TICK_HZ)));
+    let w2: i32 = server_wicks(s.sv);
+    eqi("D6  " + f1(g_WICK_TRIM_S) + " s alive trims exactly one", w2, w1 + 1);
+    eqi("D7  ...and it is counted once", server_wicks_trimmed(s.sv), out0 + 1);
+
+    // The cap holds however long you stand there.
+    run_ticks(s, i32(g_WICK_TRIM_S * 4.0 * f64(g_TICK_HZ)));
+    eqi("D8  the trim is capped at g_WICKS_MAX", server_wicks(s.sv), g_WICKS_MAX);
+
+    // >>> AND THE HALF THAT MAKES IT A PRICE: DYING RESETS THE CLOCK. <<<
+    // Without this the idle loop banks trim time across its own deaths and
+    // never ends, which is the entire failure mode this task exists to close.
+    //
+    // MEASURED ON THE CLOCK ITSELF, not on its consequences. The first version
+    // of this test banked 0.6 of a trim, died, banked 0.6 again and asserted
+    // no trim had happened -- and it PASSED with the reset deleted, because
+    // `wait_for_death` runs an unbounded number of ALIVE ticks and the clock
+    // had already wrapped and reset itself on the way. A test whose setup can
+    // silently supply the property under test is not a test. Found by the
+    // sabotage run; this is the replacement.
+    let s2: object = session_new(g_SEED);
+    if (light_the_lantern(s2) == 0) { ck(false, "D9  the second session lights"); return; }
+    ck(true, "D9  the second session lights");
+    go_into_the_dark(s2);
+    // The FIRST death takes the wick count off the cap; below the cap the
+    // clock is allowed to run at all (at g_WICKS_MAX it is held at zero).
+    ck(wait_for_death(s2, g_CAP_S) >= 0, "D10 a first death, to get off the cap");
+    while (dead(s2) == 1) { step(s2, 0); }
+    let w3: i32 = server_wicks(s2.sv);
+
+    // Bank a known, sub-threshold slice of the clock and prove it is banking.
+    run_ticks(s2, i32((g_WICK_TRIM_S * 0.5) * f64(g_TICK_HZ)));
+    let banked: f64 = server_wick_t(s2.sv);
+    ck(banked > g_WICK_TRIM_S * 0.3,
+       "D11 the clock banks while you are alive  got " + f1(banked) + " s");
+
+    // Now die, and read the clock on EVERY dead tick. It must be zero on all
+    // of them: `sv_death_price` zeroes it on the edge, so there is no window
+    // in which a stale value is published.
+    ck(wait_for_death(s2, g_CAP_S) >= 0, "D12 a death with the clock part-banked");
+    let worst: f64 = 0.0;
+    let dt: i32 = 0;
+    while (dead(s2) == 1) {
+        let v: f64 = server_wick_t(s2.sv);
+        if (v > worst) { worst = v; }
+        dt++;
+        step(s2, 0);
+    }
+    ck(dt > 0, "D13 there were dead ticks to read  got " + sv(dt));
+    ck(worst == 0.0,
+       "D14 >>> THE CLOCK IS ZERO ON EVERY TICK OF THE DEATH <<<  worst "
+       + f1(worst) + " s over " + sv(dt) + " dead ticks");
+    ck(server_wicks(s2.sv) < w3,
+       "D15 ...and that death still cost a wick  " + sv(w3)
+       + " -> " + sv(server_wicks(s2.sv)));
+
+    print("   " + f1(g_WICK_TRIM_S - 1.0) + " s alive: " + sv(w1) + " -> " + sv(w1)
+        + "     " + f1(g_WICK_TRIM_S + 1.0) + " s alive: " + sv(w1) + " -> " + sv(w2)
+        + "     cap " + sv(server_wicks(s.sv)) + "/" + sv(g_WICKS_MAX));
+    print("   banked " + f1(banked) + " s, then died: worst clock over "
+        + sv(dt) + " dead ticks was " + f1(worst) + " s. The clock resets.");
+}
+
+// ===========================================================================
+//  §E  THE ANTI-SPIRAL PROPERTY.  Die twice and ONE trip still gets it all.
+// ---------------------------------------------------------------------------
+//  This is the single most important assertion in the file. A price that makes
+//  a bad night unrecoverable turns a loop into a wall, and the player who most
+//  needs help is the one being punished hardest. The cairn MERGES and DOES NOT
+//  MOVE, so the maximum a player can ever be down is what they have earned
+//  since their last pickup — no matter how many times the night takes them.
+// ===========================================================================
+fn section_e() {
+    print("");
+    print("== E. TWO DEATHS, ONE TRIP ==");
+    let s: object = session_new(g_SEED);
+    if (light_the_lantern(s) == 0) { ck(false, "E0  the opening lantern lights"); return; }
+    ck(true, "E0  the opening lantern lights");
+
+    server_grant_salvage(s.sv, 30);
+    go_into_the_dark(s);
+    let t1: i32 = wait_for_death(s, g_CAP_S);
+    ck(t1 >= 0, "E1  the first death");
+    let had1: i32 = s.pre_purse;
+    let ax: f64 = server_cairn_x(s.sv);
+    let az: f64 = server_cairn_z(s.sv);
+    eqi("E2  the first cairn holds the first purse", server_cairn_salvage(s.sv), had1);
+
+    while (dead(s) == 1) { step(s, 0); }
+    // Earn again, somewhere else entirely, and die again.
+    server_grant_salvage(s.sv, 25);
+    server_teleport(s.sv, ax + 60.0, az + 60.0);
+    let t2: i32 = wait_for_death(s, g_CAP_S);
+    ck(t2 >= 0, "E3  the second death, 84 m from the first");
+    let had2: i32 = s.pre_purse;
+
+    let bx: f64 = server_cairn_x(s.sv);
+    let bz: f64 = server_cairn_z(s.sv);
+    let moved: f64 = dist2(ax, az, bx, bz);
+    let died_at: f64 = 0.0;
+    ck(moved < 0.001, "E4  THE CAIRN DID NOT MOVE  drifted " + f1(moved) + " m");
+    eqi("E5  it merged instead", server_cairn_salvage(s.sv), had1 + had2);
+    eqi("E6  two drops, one site", server_cairn_drops(s.sv), 2);
+
+    while (dead(s) == 1) { step(s, 0); }
+    server_teleport(s.sv, ax, az);
+    run_ticks(s, 4);
+    eqi("E7  ONE trip recovers BOTH nights", server_purse(s.sv), had1 + had2);
+    eqi("E8  ...in one pickup", server_cairn_takes(s.sv), 1);
+    print("   death 1 at " + pf(ax, 8) + "," + pf(az, 8) + " carrying " + sv(had1));
+    print("   death 2 84 m away, carrying " + sv(had2)
+        + " -> the cairn stayed put and holds " + sv(had1 + had2)
+        + ", recovered in ONE trip");
+}
+
+// ===========================================================================
+//  §F  THE IDLE LOOP, RE-MEASURED.
+// ---------------------------------------------------------------------------
+//  NAIVE_PLAYER_2 §1, the number this whole task exists to move:
+//
+//      "Over the following 365 s the game recorded 64 death episodes totalling
+//       252.75 s - 69 % of the recording spent on the death screen ... You
+//       respawn, you get less than a second and a half, you die, forever."
+//
+//  Same 365 s, same seed, same "put the pad down after lighting the lantern".
+//  This instrument is exact where theirs was a 2.7 Hz screenshot detector: it
+//  counts TICKS of `sim_player_dead`, at 60 Hz, from inside the authority.
+// ===========================================================================
+fn section_f() {
+    print("");
+    print("== F. THE IDLE LOOP (NAIVE_PLAYER_2 Run 10, re-measured) ==");
+    let s: object = session_new(g_SEED);
+    if (light_the_lantern(s) == 0) { ck(false, "F0  the opening lantern lights"); return; }
+    ck(true, "F0  the opening lantern lights");
+
+    let t_lit: i32 = elapsed(s);
+    let n: i32 = g_IDLE_S * g_TICK_HZ;
+    let t_dead: i32 = 0;       // death-screen ticks (dead, run still live)
+    let t_over: i32 = 0;       // run-over ticks
+    let t_alive: i32 = 0;
+    let lost_at: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < n) {
+        step(s, 0);
+        let d: i32 = dead(s);
+        let lo: i32 = server_lost(s.sv);
+        if (lo == 1 && lost_at < 0) { lost_at = elapsed(s); }
+        if (lo == 1) { t_over++; }
+        else {
+            if (d == 1) { t_dead++; } else { t_alive++; }
+        }
+        i++;
+    }
+
+    let deaths: i32 = server_deaths(s.sv);
+    print("   lantern lit at        " + pf(f64(t_lit) / f64(g_TICK_HZ), 8) + " s");
+    print("   window                " + pi(g_IDLE_S, 8) + " s of zero input");
+    print("   deaths                " + pi(deaths, 8));
+    print("   death-screen time     " + pf(f64(t_dead) / f64(g_TICK_HZ), 8) + " s   "
+        + pct(t_dead, n) + "   (NAIVE_PLAYER_2: 252.8 s, 69.2%)");
+    print("   run-over time         " + pf(f64(t_over) / f64(g_TICK_HZ), 8) + " s   "
+        + pct(t_over, n));
+    print("   alive                 " + pf(f64(t_alive) / f64(g_TICK_HZ), 8) + " s   "
+        + pct(t_alive, n));
+    if (lost_at >= 0) {
+        print("   THE RUN ENDED AT      " + pf(f64(lost_at) / f64(g_TICK_HZ), 8) + " s"
+            + "   (" + f1(f64(lost_at - t_lit) / f64(g_TICK_HZ))
+            + " s after the lantern was lit)");
+    } else {
+        print("   THE RUN DID NOT END   -- and that is a FAILURE, not a result");
+    }
+    print("   wicks burned          " + pi(server_wicks_burned(s.sv), 8));
+    print("   posts snuffed         " + pi(server_snuffed(s.sv), 8));
+    print("   lamps still lit       " + pi(server_lamps_lit(s.sv), 8));
+
+    ck(lost_at >= 0, "F1  THE IDLE LOOP TERMINATES (there is a way to lose)");
+    ck(deaths >= 1, "F2  ...and it terminated by dying, not by being safe");
+    // The bar: NAIVE_PLAYER_2 measured 69.2 %. Anything at or above that is a
+    // regression dressed as a feature. The bar is set to HALF of it, because a
+    // threshold that only just clears the old number teaches nobody anything.
+    let frac: f64 = f64(t_dead) * 100.0 / f64(n);
+    ck(frac < 34.6, "F3  death-screen time is under HALF the measured 69.2%  got "
+        + f1(frac) + "%");
+    eqi("F4  the run is over", server_lost(s.sv), 1);
+    eqi("F5  and it ended because the last lamp went out", server_lamps_lit(s.sv), 0);
+    ck(server_snuffed(s.sv) >= 1, "F6  at least one post was taken by the dark");
+    ck(server_wicks_burned(s.sv) >= g_WICKS_START,
+       "F7  every wick was spent first  got " + sv(server_wicks_burned(s.sv)));
+    // ...and the loop is not merely quieter, it is CLOSED: no death after the
+    // loss. `EF_INVULN` is set on the final respawn, so this is a property of
+    // the world and not of a HUD string.
+    let d_at_loss: i32 = server_deaths(s.sv);
+    run_ticks(s, 60 * g_TICK_HZ);
+    eqi("F8  no further death in the 60 s after the run ended",
+        server_deaths(s.sv), d_at_loss);
+}
+
+// ===========================================================================
+//  §H  THE SNUFF TAKES THE LAMP AND LEAVES THE CAMP.
+// ---------------------------------------------------------------------------
+//  The worst bug in this task, and it was a SPIRAL, not a typo. `sv.lantern_
+//  lit` is four things at once -- the respawn anchor, the ammunition supply,
+//  the Flare grant and the horn -- and the first version of `sv_snuff_nearest`
+//  cleared it when the opening's lantern went out. One bad wave at your own
+//  post therefore took your light, your checkpoint and your ammo together.
+//
+//  MEASURED, `probe_lanfeed`, 8 seeds x 30 game minutes, halves built
+//  separately:
+//
+//      HEAD                          hold 2 at 23:33 on 8 of 8 seeds
+//      snuff clears `lantern_lit`    hold 2 NEVER, on 0 of 8
+//      snuff on, flag left alone     hold 2 at 23:33 on 8 of 8
+//
+//  This section is the guard on the fix. It puts the opening's lantern out
+//  through the real price path and asserts that the LAMP is gone and the CAMP
+//  is not.
+// ===========================================================================
+fn section_h() {
+    print("");
+    print("== H. THE LAMP GOES OUT; THE CAMP DOES NOT ==");
+    let s: object = session_new(g_SEED);
+    if (light_the_lantern(s) == 0) { ck(false, "H0  the opening lantern lights"); return; }
+    ck(true, "H0  the opening lantern lights");
+    eqi("H1  the camp flag is up", server_lantern_lit(s.sv), 1);
+    let lit0: i32 = server_lamps_lit(s.sv);
+    ck(lit0 >= 1, "H2  a lamp is burning  got " + sv(lit0));
+
+    // Stand ON the opening lantern and die until the wicks are gone and the
+    // dark reaches for it. Every death here is the director's, not the probe's.
+    server_teleport(s.sv, server_lantern_x(s.sv), server_lantern_z(s.sv));
+    let guard: i32 = 0;
+    while (server_snuffed(s.sv) == 0 && guard < 12) {
+        if (wait_for_death(s, g_CAP_S) < 0) { guard = 12; }
+        while (dead(s) == 1) { step(s, 0); }
+        guard++;
+    }
+    ck(server_snuffed(s.sv) >= 1,
+       "H3  the dark took the lamp you died under  snuffed "
+       + sv(server_snuffed(s.sv)) + " after " + sv(server_deaths(s.sv)) + " deaths");
+    eqi("H4  ...and it is OUT (the settlement feed loses it)",
+        server_lamps_lit(s.sv), 0);
+    eqi("H5  >>> AND THE CAMP FLAG SURVIVED IT <<<", server_lantern_lit(s.sv), 1);
+    print("   deaths " + sv(server_deaths(s.sv)) + "   wicks burned "
+        + sv(server_wicks_burned(s.sv)) + "   snuffed " + sv(server_snuffed(s.sv))
+        + "   lamps lit " + sv(lit0) + " -> " + sv(server_lamps_lit(s.sv))
+        + "   lantern_lit " + sv(server_lantern_lit(s.sv)) + " (MUST be 1)");
+}
+
+// ===========================================================================
+//  §G  DETERMINISM AND SHAPE.  The price must not have moved the sim.
+// ===========================================================================
+fn section_g() {
+    print("");
+    print("== G. THE TRAP (CLAUDE.md §7) ==");
+    // Two identical sessions, same seed, no input: identical bills. If any of
+    // W10's state had leaked into `PredictedState` or into a cosmetic, this is
+    // where a divergence would surface first.
+    let a: object = session_new(g_SEED);
+    let b: object = session_new(g_SEED);
+    light_the_lantern(a);
+    light_the_lantern(b);
+    server_grant_salvage(a.sv, 33);
+    server_grant_salvage(b.sv, 33);
+    let ta: i32 = wait_for_death(a, g_CAP_S);
+    let tb: i32 = wait_for_death(b, g_CAP_S);
+    eqi("G1  two identical runs die on the same tick", ta, tb);
+    eqi("G2  ...with the same bill (salvage)",
+        server_bill_salvage(a.sv), server_bill_salvage(b.sv));
+    eqi("G3  ...the same wick count", server_wicks(a.sv), server_wicks(b.sv));
+    ck(dist2(server_cairn_x(a.sv), server_cairn_z(a.sv),
+             server_cairn_x(b.sv), server_cairn_z(b.sv)) < 0.000001,
+       "G4  ...and the same cairn, to the micrometre");
+    // The shape of the constants, so a retune cannot silently break the design.
+    ck(g_WICKS_START > 0, "G5  a run starts with at least one wick");
+    ck(g_WICKS_START <= g_WICKS_MAX, "G6  it does not start over the cap");
+    ck(g_CAIRN_R_M > 0.0, "G7  the cairn can be reached");
+    ck(g_SNUFF_R_M <= g_LANTERN_R_T1,
+       "G8  THE DARK REACHES EXACTLY AS FAR AS A LANTERN LIGHTS -- it can only"
+       + " take the lamp you died UNDER. At 140 m one death reached five posts"
+       + " of the authored path and probe_lanfeed measured 6 of 6 LIT -> 1 of 6."
+       + "  snuff " + f1(g_SNUFF_R_M) + " m vs lantern " + f1(g_LANTERN_R_T1) + " m");
+    print("   two runs, one seed: death tick " + sv(ta) + " == " + sv(tb)
+        + ", bill " + sv(server_bill_salvage(a.sv)) + " == " + sv(server_bill_salvage(b.sv)));
+}
+
+// ---------------------------------------------------------------------------
+fn main() {
+    let i: i32 = 1;
+    while (i < args.length) {
+        let a: string = args[i];
+        if (a == "--seed" && i + 1 < args.length) { g_SEED = i32(args[i + 1]); i++; }
+        else if (a == "--idle" && i + 1 < args.length) { g_IDLE_S = i32(args[i + 1]); i++; }
+        i++;
+    }
+
+    print("== probe_death: what dying costs, and that you can get it back ==");
+    print("   seed " + sv(g_SEED) + ", idle window " + sv(g_IDLE_S) + " s, "
+        + (compiled() == 1 ? "compiled" : "INTERPRETED"));
+
+    section_a();
+    let s: object = section_b();
+    section_c(s);
+    section_c2();
+    section_d();
+    section_e();
+    section_f();
+    section_h();
+    section_g();
+
+    print("");
+    print("ASSERTIONS  ran " + sv(g_n) + "  pass " + sv(g_ok) + "  fail " + sv(g_n - g_ok));
+    if (g_ok != g_n) { print("FAIL"); exit(1); }
+    if (g_n != PD_WANT) {
+        print("FAIL: expected " + sv(PD_WANT) + " assertions, ran " + sv(g_n));
+        exit(1);
+    }
+    print("PASS  " + sv(g_ok) + "/" + sv(g_n) + " assertions");
+}
+main();

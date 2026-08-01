@@ -629,3 +629,50 @@ facts:
 anyone in it. `DIRECTION.md` §3 makes it necessary; making it *specific* is a bigger decision than a
 lore document should take on its own, and the fiction is more useful to the next writer as a stated hole
 than as a guess I made.
+
+---
+
+## 15. §10 IS NOW ENFORCED — `docs/design/VOICE.md`
+
+Added by the W7 anti-cringe pass, which the project owner asked for by name.
+
+**§10 (REGISTER) has been right and unenforced for waves.** Somebody wrote six rules for how this
+world talks and then had no way to make a HUD obey them, so the game shipped `THE GRID TAKES IT` —
+a Proper Concept whose noun appears in **no other string in the game** — while this file was sitting
+here saying *"civic, not epic"* and *"short sentences and ordinary words"*.
+
+`VOICE.md` is that enforcement. It carries the full inventory of every string a player reads, a
+KEEP/FIX/CUT verdict with a reason on each, and **a four-rule style guide** for the HUD specifically.
+Read `VOICE.md` §5 before you write a line of on-screen text; read this file's §10 and §12 before you
+write a line of anybody's *voice*. They are not the same job.
+
+Three corrections to **this file**, found by that audit:
+
+1. **The currency is SALVAGE, not Ember.** §6 and §1 imply Ember is what you spend. The code calls
+   it Salvage and `src/sim/npc.hml` §7 gives the better reason: *"brass casings, wire, lamp glass —
+   what a lamplighter brings home — and it is weightless, because a purse is not a load."*
+   **Ember stays the substance** (§1: compressed light that sits in your palm as a coal). Salvage is
+   what you sell, and it is the more civic word of the two, which is the whole register.
+
+2. **EMBER HOLLOW is not in the game's own list of settlement names.** `client_site_name`'s sixteen
+   are `LANTERNMOOR ASHFORD WICKHOLLOW GREYFEN EMBERCROSS THE FOLD COLDSTILE MARROWGATE SUNDER
+   TALLOWDOWN BRIARLIGHT OLD KEEL HEARTHWAY NINE ELMS SALTMIRE THE LAST LAMP` — and §7 of this file
+   is *titled* Ember Hollow. Nothing displays that table yet, so nothing is broken; but the day it
+   does, the town this document is about will be called something else. `VOICE.md` §2.F22 has the
+   verdicts on the other fifteen.
+
+3. **§8's rule about Mabel was being broken by the code, not by a writer.** *"She tells you this
+   exactly once… Do not soften her and do not give her a second scene about it. One scene. Then the
+   weather."* — `client_talk_line` had exactly ONE daily line per villager and repeated it every
+   in-game day forever, so the game told you about her fingers every day, and told you in a form that
+   was **truncating on screen** (120 triangles against a 96-triangle clamp: it rendered as
+   `TWO FINGERS SHORT, STILL STR`). Thirty daily lines now exist, six per person, in §12.1's form,
+   and `src/sim/npc.hml`'s selector guarantees all six are said before any is repeated.
+
+**And one thing this audit did not change, on purpose.** `THE DARK TOOK YOU` looks like a §10.2
+violation — an abstract noun as the subject of a transitive verb, which is what capital-letter Evil
+reads like. It survives because of §1 and §4: *light can be stolen, so there is something that steals
+it*, and a drained creature *is not dead, it is empty.* **In this cosmology the dark taking your
+light is not a metaphor, it is the axiom.** The sentence is mechanically literal, and that is the
+test to apply to the next one: not "does it sound portentous", but "is it *true in this world's
+physics*".
