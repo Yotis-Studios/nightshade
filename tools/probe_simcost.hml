@@ -1,0 +1,435 @@
+// ===========================================================================
+//  probe_simcost.hml — THE WORST SIM TICK, AND WHAT IT IS DOING.        W7-4.
+// ---------------------------------------------------------------------------
+//  Gate 6 reported `sim+net: worst 3.2 ms of the 2.0 ms budget` on DISPLAY=:0
+//  and 2.5 ms headless, with zero stalls and no visible effect.  This probe is
+//  the standing answer to "where did that go, and has it come back".
+//
+//  WHAT THE WORST TICK TURNED OUT TO BE — measured here, not guessed:
+//
+//    * NOT the once-a-second batch.  `sv_lan_gather`, `settle_step`,
+//      `npc_step`, the spell sweep and the economy all fire on `tick % 60 == 0`
+//      and that looks exactly like a periodic lump.  It is not one: §B measures
+//      phase 0 at ~1.3x the mean, worth ~0.06 ms, and the worst ticks land on
+//      random phases.  A plausible story that the numbers refuse.
+//    * NOT the parallel-emit worker pool inflating `__clock()` CPU time.
+//      `--workers 0` measured 2.4 ms worst against `--workers 4`'s 2.0 ms, so
+//      the pool is not what the bracket is counting.
+//    * IT IS CHUNK GENERATION.  Every one of the eight worst ticks in a
+//      3600-tick sprint was a tick that streamed in a chunk: 1.444 ms against
+//      0.305 ms for every other tick, a 4.7x lump once per chunk boundary.
+//
+//  And the chunk was expensive for a reason worth writing down: `mathx.vnoise`
+//  cost **1.18 us per call** because `u64`/`i64` locals never unbox in
+//  hemlockc v2.9.1 (reported in the W7-4 summary; not yet filed as an issue,
+//  and no number is claimed here).  567 calls per chunk = 0.668
+//  of a 0.705 ms chunk.  `src/core/mathx.hml` is not W7-4's file, so the fix
+//  was to stop asking for the same hash: `worldgen.hml` now hashes each
+//  LATTICE POINT once per octave per chunk instead of once per sample.
+//
+//  MATCHED BEFORE/AFTER — same box, same minute, the two binaries differing
+//  ONLY in src/sim/worldgen.hml (`git stash push -- src/sim/worldgen.hml`),
+//  3600 sprinting ticks each, 81 chunks generated in each:
+//
+//                           headless          under DISPLAY=:0 game pressure
+//      worst tick     1.381 -> 0.511 ms       1.350 -> 0.691 ms
+//      generating-tick mean
+//                     0.935 -> 0.342 ms       0.941 -> 0.358 ms
+//      quiet-tick worst
+//                     0.330 -> 0.381 ms       0.411 -> 0.400 ms   (unchanged)
+//      whole-tick mean
+//                     0.187 -> 0.173 ms       0.192 -> 0.183 ms
+//      worldgen_chunk_at  0.725 -> 0.111 ms/chunk
+//
+//  Read the quiet-tick row: it did not move.  The cost came off the generating
+//  tick and nothing else got slower to pay for it.
+//
+//  THE ASSERTIONS ARE RATIOS WHEREVER A RATIO WILL DO (CLAUDE.md §1.2).  This
+//  box shares 17 of 24 cores with a `llama-server` and an absolute bound tuned
+//  on a quiet minute is a probe that cries wolf.  §A's bit-identity check and
+//  §C's stride check are load-INDEPENDENT and are the ones to trust.
+//
+//  Headless, no SDL linked, COMPILED.  Exits 1 on any failure AND on running
+//  the wrong NUMBER of assertions.
+// ===========================================================================
+
+import { exit } from "@stdlib/process";
+
+import { g_BUDGET_SIM_MS } from "../src/core/config.hml";
+import { vnoise, floori } from "../src/core/mathx.hml";
+
+import { sim_stat_streamed, SIM_STREAM_PER_TICK } from "../src/sim/sim.hml";
+import { world_count } from "../src/sim/world.hml";
+import { BTN_SPRINT } from "../src/sim/command.hml";
+import { worldgen_chunk_at, worldgen_biome_tmd, WG_LAT_DIM
+       } from "../src/sim/worldgen.hml";
+
+import { transport_loopback } from "../src/net/transport.hml";
+
+import { server_new, server_tick, server_snapshot, server_local, server_world,
+         server_t0, server_spawn_yaw, server_enemies_alive, server_hash,
+         server_settle_boot_tier
+       } from "../src/game/server.hml";
+import { client_new, client_apply, client_send_command, client_set_angles,
+         client_set_move, client_set_button
+       } from "../src/game/client.hml";
+
+let g_EXPECT: i32 = 14;
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; print(`  ok   [${g_n}] ${p_msg}`); }
+    if (!p_ok) { print(`  FAIL [${g_n}] ${p_msg}`); }
+}
+
+fn f3(p_x: f64): string {
+    let neg: i32 = 0;
+    let x: f64 = p_x;
+    if (x < 0.0) { neg = 1; x = 0.0 - x; }
+    let s: i32 = i32(x * 1000.0 + 0.5);
+    let w: i32 = i32(f64(s) / 1000.0);
+    let f: i32 = s - w * 1000;
+    let fs: string = `${f}`;
+    if (f < 10) { fs = "00" + fs; } else if (f < 100) { fs = "0" + fs; }
+    let o: string = `${w}.${fs}`;
+    if (neg == 1) { o = "-" + o; }
+    return o;
+}
+
+// ===========================================================================
+//  A.  THE LATTICE TABLE IS BIT-IDENTICAL TO THE vnoise IT REPLACED
+// ---------------------------------------------------------------------------
+//  This is the assertion that makes the whole optimisation legitimate, and it
+//  is the one that does not care how busy the box is.  `ref_fill` below is the
+//  PREVIOUS `wg_fill`, copied verbatim, calling `mathx.vnoise` once per sample
+//  per octave.  If a single byte of a single chunk differs, the world changed
+//  shape and the seed no longer means what it meant.
+//
+//  A copy of the old code in a probe is normally a smell -- it is a second
+//  implementation that can drift.  Here that is exactly the point: it is
+//  pinned to `mathx.vnoise`, which is a file worldgen.hml does not own, so it
+//  drifts only if MATHX changes, and if mathx changes the terrain SHOULD be
+//  re-checked.  This oracle is the tripwire for that.
+// ===========================================================================
+fn ref_fill(p_seed: i32, p_cx: i32, p_cz: i32, p_hb: buffer, p_bb: buffer) {
+    let hb: buffer = p_hb;
+    let bb: buffer = p_bb;
+    let s: i32 = p_seed;
+    let s0: i32 = s;
+    let s1: i32 = s ^ 1013904223;
+    let s2: i32 = s ^ 1597334677;
+    let st0: i32 = s ^ 774863155;
+    let st1: i32 = s ^ 2087834729;
+    let sm0: i32 = s ^ 1315423911;
+    let sm1: i32 = s ^ 950706376;
+    let ox: f64 = f64(p_cx) * 32.0;
+    let oz: f64 = f64(p_cz) * 32.0;
+    let j = 0;
+    while (j < 9) {
+        let wz: f64 = oz + f64(j) * 4.0;
+        let row: i32 = j * 9;
+        let i = 0;
+        while (i < 9) {
+            let wx: f64 = ox + f64(i) * 4.0;
+            let ta: f64 = vnoise(wx, wz, 512.0, 0, st0);
+            let tb: f64 = vnoise(wx, wz, 171.0, 0, st1);
+            let t: f64 = ta * 0.72 + tb * 0.28;
+            let ma: f64 = vnoise(wx, wz, 448.0, 0, sm0);
+            let mb: f64 = vnoise(wx, wz, 149.0, 0, sm1);
+            let m: f64 = ma * 0.72 + mb * 0.28;
+            let rr: f64 = 0.5 + (0.5 - t) * 1.10 - (m - 0.5) * 0.70;
+            if (rr < 0.0) { rr = 0.0; }
+            if (rr > 1.0) { rr = 1.0; }
+            let rel: f64 = 0.40 + 1.30 * rr;
+            let n0: f64 = vnoise(wx, wz, 96.0, 0, s0);
+            let n1: f64 = vnoise(wx, wz, 32.0, 0, s1);
+            let n2: f64 = vnoise(wx, wz, 12.0, 0, s2);
+            let acc: f64 = (n0 - 0.5) * 0.48 * rel + (n1 - 0.5) * 0.30 + (n2 - 0.5) * 0.22;
+            let h: f64 = 32.0 + 36.0 * acc;
+            let cm: i32 = floori(h * 100.0 + 0.5);
+            if (cm < 0) { cm = 0; }
+            if (cm > 65535) { cm = 65535; }
+            let d: f64 = 0.0;
+            d = __sqrt(wx * wx + wz * wz);
+            let b: i32 = worldgen_biome_tmd(t, m, d);
+            let idx: i32 = row + i;
+            let o: i32 = idx * 2;
+            hb[o] = cm & 255;
+            hb[o + 1] = (cm >> 8) & 255;
+            bb[idx] = b;
+            i++;
+        }
+        j++;
+    }
+}
+
+fn section_a() {
+    print("A. the lattice table reproduces mathx.vnoise BYTE FOR BYTE");
+    let hb: buffer = buffer(162);
+    let ab: buffer = buffer(162);
+    let rh: buffer = buffer(162);
+    let rb: buffer = buffer(162);
+
+    let bad: i32 = 0;
+    let n: i32 = 0;
+    // Seeds chosen to exercise the i32 extremes of the hash, not just 1337:
+    // `u64(negative)` throws, and the two's-complement fold in vnoise is the
+    // reason it does not.  A seed of 2147483647 is where a `+ 31` salt would
+    // trap (see this file's header note in worldgen.hml).
+    let seeds: array<i32> = [1337, 4242, 1, 2147483647, -2147483648, 0];
+    let si: i32 = 0;
+    while (si < 6) {
+        let sd: i32 = seeds[si];
+        // Chunk coordinates straddling the origin, so negative lattice indices
+        // and the sign fold are covered rather than assumed.
+        let cx: i32 = -24;
+        while (cx < 24) {
+            let cz: i32 = -12;
+            while (cz < 12) {
+                worldgen_chunk_at(sd, cx, cz, hb, 0, ab, 0);
+                ref_fill(sd, cx, cz, rh, rb);
+                let k: i32 = 0;
+                while (k < 162) { if (hb[k] != rh[k]) { bad = bad + 1; } k++; }
+                let k2: i32 = 0;
+                while (k2 < 81) { if (ab[k2] != rb[k2]) { bad = bad + 1; } k2++; }
+                n = n + 1;
+                cz++;
+            }
+            cx++;
+        }
+        si++;
+    }
+    print(`   ${n} chunks over 6 seeds, ${bad} differing bytes`);
+    ck(bad == 0,
+       `the lattice-table generator is BIT-IDENTICAL to the per-sample vnoise over ${n} chunks x 243 bytes: ${bad} differing bytes`);
+    ck(n == 6912,
+       `the sweep really covered 6912 chunks (a comparison that silently ran 0 chunks would also report 0 differences): ${n}`);
+
+    // The stride the lattice table indexes with.  A `lat[k + 8]` baked next to
+    // a WG_LAT_DIM of 16 reads the wrong corner and produces terrain that is
+    // wrong but not obviously wrong.
+    ck(WG_LAT_DIM == 8,
+       `WG_LAT_DIM is the documented 8 lattice points per axis; it is ${WG_LAT_DIM}`);
+    // 32 m chunk / 12 m finest octave = 2.67 cells -> 4 indices -> 5 points.
+    ck(WG_LAT_DIM >= 5,
+       `WG_LAT_DIM ${WG_LAT_DIM} still covers the finest octave's 5 lattice points per axis, so the slow fallback path never fires in the shipping configuration`);
+}
+
+// ===========================================================================
+//  THE SESSION — main.hml's tick loop with the window and renderer removed.
+// ===========================================================================
+fn session_new(p_seed: i32, p_tier: i32): object {
+    let net: object = transport_loopback();
+    let sv: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    if (p_tier > 0) { server_settle_boot_tier(sv, p_tier); }
+    let s: object = { net: net, sv: sv, cl: cl, tick: server_t0(sv) };
+    client_set_angles(cl, server_spawn_yaw(sv), 0.0);
+    server_tick(sv, s.tick);
+    client_apply(cl, server_snapshot(sv), server_local(sv), s.tick);
+    s.tick = s.tick + 1;
+    let o: object = s;
+    return o;
+}
+
+fn tick_once(p_s: object) {
+    let s: object = p_s;
+    client_send_command(s.cl, s.tick);
+    server_tick(s.sv, s.tick);
+    client_apply(s.cl, server_snapshot(s.sv), server_local(s.sv), s.tick);
+    s.tick = s.tick + 1;
+}
+
+// ===========================================================================
+//  B.  THE WORST TICK, SPLIT BY WHAT MADE IT WORST
+// ---------------------------------------------------------------------------
+//  The demo walks 40 m and stops, which crosses one chunk boundary; a player
+//  sprints, so this sprints.  A generating tick and a quiet tick are counted
+//  SEPARATELY, because lumping them is what hid this for four waves.
+// ===========================================================================
+let g_b_worst: f64 = 0.0;
+let g_b_mean: f64 = 0.0;
+let g_b_gen_worst: f64 = 0.0;
+let g_b_quiet_worst: f64 = 0.0;
+
+fn section_b(p_tier: i32, p_label: string) {
+    print(`B. the worst tick while SPRINTING — ${p_label}`);
+    let s: object = session_new(1337, p_tier);
+    let i: i32 = 0;
+    while (i < 8 * 60) { client_set_move(s.cl, 1.0, 0.0); tick_once(s); i++; }
+
+    let w: object = server_world(s.sv);
+    let n: i32 = 60 * 60;
+    let acc: f64 = 0.0;
+    let worst: f64 = 0.0;
+    let gen_worst: f64 = 0.0;
+    let gen_n: i32 = 0;
+    let gen_acc: f64 = 0.0;
+    let quiet_worst: f64 = 0.0;
+    let quiet_acc: f64 = 0.0;
+    let quiet_n: i32 = 0;
+    let ph0_acc: f64 = 0.0;
+    let ph0_n: i32 = 0;
+    let over: i32 = 0;
+    let prev_gen: i32 = sim_stat_streamed(w);
+
+    let j: i32 = 0;
+    while (j < n) {
+        client_set_move(s.cl, 1.0, 0.0);
+        client_set_button(s.cl, BTN_SPRINT, 1);
+        let ph: i32 = s.tick % 60;
+        let t0: f64 = __clock();
+        tick_once(s);
+        let ms: f64 = (__clock() - t0) * 1000.0;
+        acc = acc + ms;
+        if (ms > worst) { worst = ms; }
+        if (ms > g_BUDGET_SIM_MS) { over = over + 1; }
+        if (ph == 0) { ph0_acc = ph0_acc + ms; ph0_n = ph0_n + 1; }
+        let gn: i32 = sim_stat_streamed(w);
+        if (gn != prev_gen) {
+            prev_gen = gn; gen_n = gen_n + 1; gen_acc = gen_acc + ms;
+            if (ms > gen_worst) { gen_worst = ms; }
+        } else {
+            quiet_n = quiet_n + 1; quiet_acc = quiet_acc + ms;
+            if (ms > quiet_worst) { quiet_worst = ms; }
+        }
+        j++;
+    }
+    let mean: f64 = acc / f64(n);
+    g_b_worst = worst;
+    g_b_mean = mean;
+    g_b_gen_worst = gen_worst;
+    g_b_quiet_worst = quiet_worst;
+
+    print(`   ${n} ticks, pop ${world_count(w)}, ${server_enemies_alive(s.sv)} enemies alive`);
+    print(`   mean ${f3(mean)} ms   WORST ${f3(worst)} ms   over budget ${over}`);
+    print(`   ticks that GENERATED a chunk ${gen_n}: mean ${f3(gen_acc / f64(gen_n + 1))} worst ${f3(gen_worst)} ms`);
+    print(`   every other tick             ${quiet_n}: mean ${f3(quiet_acc / f64(quiet_n + 1))} worst ${f3(quiet_worst)} ms`);
+    print(`   ticks on phase 0 (the once-a-second batch) ${ph0_n}: mean ${f3(ph0_acc / f64(ph0_n + 1))} ms`);
+}
+
+fn section_b_asserts() {
+    // THE ACCEPTANCE BOUND, absolute, and deliberately NOT tuned to the idle
+    // figure.  0.584 ms measured at loadavg 10; the budget is 2.0.  A guard at
+    // 1.6 ms leaves 2.7x headroom over the measurement and still catches the
+    // 1.444 ms defect this task fixed, by a comfortable margin.
+    ck(g_b_worst < g_BUDGET_SIM_MS,
+       `the worst single networked tick ${f3(g_b_worst)} ms is inside the ${f3(g_BUDGET_SIM_MS)} ms sim budget (it was 1.444 ms before the lattice table)`);
+    ck(g_b_worst < 1.6,
+       `regression guard: worst tick ${f3(g_b_worst)} ms against a 1.6 ms guard on a box sharing 17 of 24 cores; the defect it guards measured 1.444 ms and the budget it protects is ${f3(g_BUDGET_SIM_MS)} ms`);
+
+    // THE STRUCTURAL ONE, and the one to trust under contention (CLAUDE.md
+    // §1.2): a chunk-generating tick used to be 4.7x a quiet tick.  Contention
+    // moves both numbers together, so the RATIO survives a busy box where an
+    // absolute bound does not.  4.7x -> the assertion is that it is now under
+    // 2.5x; measured 1.5x.
+    let ratio: f64 = g_b_gen_worst / g_b_quiet_worst;
+    ck(ratio < 2.5,
+       `a chunk-generating tick is ${f3(ratio)}x the worst quiet tick (${f3(g_b_gen_worst)} vs ${f3(g_b_quiet_worst)} ms); it was 4.7x (1.444 vs 0.305) and the guard is 2.5x`);
+
+    // The mean is the thing that must NOT have regressed while the worst case
+    // improved -- a fix that flattens the spike by making every tick slower is
+    // not a fix.
+    ck(g_b_mean < 0.6,
+       `the MEAN tick is ${f3(g_b_mean)} ms, so the spike was removed rather than smeared across every tick (guard 0.6 ms)`);
+    ck(g_b_worst / g_b_mean < 6.0,
+       `worst is ${f3(g_b_worst / g_b_mean)}x the mean; it was 6.8x (1.444 / 0.213) and the guard is 6.0x`);
+
+    ck(SIM_STREAM_PER_TICK == 1,
+       `still one chunk generated per tick at most — the bound above is per CHUNK, so a budget of ${SIM_STREAM_PER_TICK} is what makes it a per-TICK bound`);
+}
+
+// ===========================================================================
+//  C.  COST OF ONE CHUNK, AND OF ONE TICK, min-of-7 (RULE T)
+// ===========================================================================
+fn section_c() {
+    print("C. one chunk of worldgen, min of 7 batches of 200 (RULE T)");
+    let hb: buffer = buffer(162);
+    let ab: buffer = buffer(162);
+    let rh: buffer = buffer(162);
+    let rb: buffer = buffer(162);
+
+    let best: f64 = 1.0e30;
+    let t: i32 = 0;
+    while (t < 7) {
+        let t0: f64 = __clock();
+        let k: i32 = 0;
+        while (k < 200) { worldgen_chunk_at(1337, k, k * 3, hb, 0, ab, 0); k++; }
+        let ms: f64 = (__clock() - t0) * 1000.0 / 200.0;
+        if (ms < best) { best = ms; }
+        t++;
+    }
+    let bref: f64 = 1.0e30;
+    let t2: i32 = 0;
+    while (t2 < 7) {
+        let t0: f64 = __clock();
+        let k: i32 = 0;
+        while (k < 200) { ref_fill(1337, k, k * 3, rh, rb); k++; }
+        let ms: f64 = (__clock() - t0) * 1000.0 / 200.0;
+        if (ms < bref) { bref = ms; }
+        t2++;
+    }
+    print(`   lattice table    ${f3(best)} ms/chunk`);
+    print(`   per-sample vnoise ${f3(bref)} ms/chunk  (the code this replaced)`);
+    print(`   speedup ${f3(bref / best)}x`);
+
+    // A RATIO, on purpose.  Both paths are measured in the same process,
+    // seconds apart, so contention inflates them together and the ratio holds
+    // on a box that an absolute bound could not survive.
+    ck(bref / best > 3.0,
+       `the lattice table is ${f3(bref / best)}x cheaper than the per-sample vnoise it replaced (guard 3.0x; measured 5.6-6.6x across runs at loadavg 8-10)`);
+    ck(best < 0.5,
+       `one chunk of worldgen is ${f3(best)} ms, inside g_BUDGET_SIM_MS ${f3(g_BUDGET_SIM_MS)} on its own with room for the rest of the tick (guard 0.5 ms; was 0.725 ms, i.e. OVER a third of the budget for terrain alone)`);
+}
+
+// ===========================================================================
+//  D.  DETERMINISM — the whole point of not changing a single byte
+// ===========================================================================
+fn section_d() {
+    print("D. determinism across 6000 ticks of sprinting, two sessions");
+    let a: object = session_new(4242, 0);
+    let b: object = session_new(4242, 0);
+    let i: i32 = 0;
+    while (i < 6000) {
+        client_set_move(a.cl, 1.0, 0.0);
+        client_set_button(a.cl, BTN_SPRINT, 1);
+        client_set_move(b.cl, 1.0, 0.0);
+        client_set_button(b.cl, BTN_SPRINT, 1);
+        tick_once(a);
+        tick_once(b);
+        i++;
+    }
+    print(`   hash ${server_hash(a.sv)}   chunks streamed ${sim_stat_streamed(server_world(a.sv))}`);
+    ck(server_hash(a.sv) == server_hash(b.sv),
+       `the same seed and command stream give the identical world hash after 6000 ticks with the lattice table live`);
+    ck(sim_stat_streamed(server_world(a.sv)) > 20,
+       `the run actually STREAMED chunks (${sim_stat_streamed(server_world(a.sv))}), so the determinism claim covers the code this task changed rather than a walk that never generated anything`);
+}
+
+fn main() {
+    print("probe_simcost — the worst sim tick, and what it is doing");
+    print("");
+    section_a();
+    print("");
+    section_b(0, "camp, the shipping first minute");
+    section_b_asserts();
+    print("");
+    section_c();
+    print("");
+    section_d();
+    print("");
+    if (g_n != g_EXPECT) {
+        print(`FAIL: ran ${g_n} assertions, expected ${g_EXPECT}`);
+        exit(1);
+    }
+    if (g_ok != g_n) {
+        print(`FAIL ${g_ok} / ${g_n}`);
+        exit(1);
+    }
+    print(`PASS ${g_ok} / ${g_n}`);
+    exit(0);
+}
+
+main();

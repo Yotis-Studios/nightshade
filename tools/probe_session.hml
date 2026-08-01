@@ -1,0 +1,1151 @@
+// =============================================================================
+//  probe_session.hml — AN HOUR, MEASURED.  "find-the-hour", W7 diagnostic.
+// =============================================================================
+//
+//      hemlockc -O1 tools/probe_session.hml -o /tmp/probe_session
+//      /tmp/probe_session                         # COMPILED — the shipping path
+//      nm /tmp/probe_session | grep -c SDL_       # MUST be 0
+//
+//  Exits 1 on any failed assertion and asserts its own assertion COUNT, so a
+//  section that silently stops running is a FAILURE rather than a green run.
+//
+// -----------------------------------------------------------------------------
+//  WHY THIS FILE EXISTS
+// -----------------------------------------------------------------------------
+//  Three consecutive gates have said the same eight words about this game:
+//  "worth twenty minutes, and that is a real change."  Nobody has established
+//  WHY it stops at twenty.  Every wave so far has guessed at what the hour
+//  needs by reading the design documents.  This probe measures it instead.
+//
+//  It runs ONE FULL HOUR of game time — 3600 s, 216 000 ticks, 3.75 of the
+//  16-minute day — through the REAL server and the REAL client, and samples
+//  thirty-one numbers once per game minute.  The output is a minute-by-minute
+//  account of what the player has, and the whole point of it is that the
+//  columns STOP MOVING somewhere, and this file says where.
+//
+// -----------------------------------------------------------------------------
+//  THE TWO ARMS, AND WHY BOTH ARE NEEDED
+// -----------------------------------------------------------------------------
+//  ARM POST — `src/game/demobot.hml`, THE SHIPPING DRIVER, imported and not
+//      ported (the lesson of probe_firstminute: a port is how 10-of-12 and
+//      0-of-8 became two truths about one game).  It leashes to the first
+//      lantern post at 16 m and never leaves.  This is EXACTLY what
+//      `main.hml --demo 3600` on a real display is doing, so the numbers here
+//      and the pictures there describe one session.
+//      It is the "stand and fight forever" hour.
+//
+//  ARM WALK — a LAMPLIGHTER.  It does what DIRECTION.md says the game is: it
+//      fights the night at the post, and at dawn it walks the ~282 m to the
+//      settlement, greets every villager it can reach, buys everything the
+//      shop will sell it, and walks back out.  Every in-game day.  This is the
+//      arm that answers "does the loop LOOP".
+//
+//  There is a THIRD instrument inside this file and it is not an arm: the
+//  SHADOW SETTLEMENT (see the block above `shadow_new`).  It runs a second,
+//  private copy of the SHIPPED `settle.hml` and `npc.hml` alongside the real
+//  session, fed from `w.anim` instead of `w.model`, so that "what the one-word
+//  fix would do" is a MEASUREMENT rather than a hope.  Plus
+//  `what_would_it_take()`, which asks `settle.hml` directly how many lit posts
+//  at what radius it wants before it will call the place a Village.
+//
+//  ARM WALK IS AN ORACLE PLAYER AND THAT IS DECLARED, NOT HIDDEN.  It reads
+//  villager positions straight out of `npc_x`/`npc_z` on the server rather
+//  than finding them on screen, and it knows the settlement centre from
+//  `client_settle_x`.  A human learns both facts in their first five minutes
+//  and then has them forever, so the shortcut costs the measurement nothing
+//  that matters — but it means this arm measures WHAT THE SYSTEMS DO WHEN
+//  DRIVEN CORRECTLY, and NOT how hard they are to discover.  Discoverability
+//  is measured with eyes, on a display, and that half of the task is in
+//  `docs/design/THE_HOUR.md`, which is where the whole diagnosis lives.
+//
+// -----------------------------------------------------------------------------
+//  IMPORTS — this is a tool, so the wall (CLAUDE.md §3) permits src/game/**.
+//  It links NO SDL and NO wobbleweed, and `nm | grep -c SDL_` must print 0.
+// =============================================================================
+
+import { exit } from "@stdlib/process";
+import { sqrt, sin, cos, atan2, floor } from "@stdlib/math";
+
+import { g_TICK_HZ, g_LANTERN_R_T1, g_DAY_TICKS } from "../src/core/config.hml";
+
+import { sim_accum_new, sim_accum_advance, sim_accum_alpha,
+         sim_director, sim_stat_lanterns, sim_stat_deaths,
+         sim_stat_player_deaths, sim_stat_shots, sim_stat_fall_hits,
+         SIM_LANTERN_LIT } from "../src/sim/sim.hml";
+import { director_holds_done, director_wave_state, director_tier,
+         DIR_IDLE } from "../src/sim/director.hml";
+import { day_number, day_phase, PHASE_NIGHT, PHASE_DAWN,
+         PHASE_DAY, PHASE_DUSK } from "../src/sim/daycycle.hml";
+import { wpn_mag, WPN_KESTREL } from "../src/sim/weapons.hml";
+import { BTN_FIRE, BTN_USE, BTN_ADS, BTN_SPRINT, BTN_RELOAD,
+         BTN_BUILD, BTN_SWITCH, BTN_GRENADE, BTN_INV } from "../src/sim/command.hml";
+import { settle_grid_points, settle_core_lux, settle_tier, settle_tier_ever,
+         settle_cx, settle_cz, settle_new_at, settle_lanterns_set, settle_step,
+         settle_cell_x_of, settle_cell_z_of, settle_ring_m,
+         SET_TIER_CAMP, SET_TIER_VILLAGE, SET_TIER_TOWN,
+         SET_TIER_CITY, SET_LAN_STRIDE, SET_WICK_FULL,
+         SET_PTS_VILLAGE, SET_CORE_VILLAGE, settle_refresh,
+         SET_PTS_TOWN, SET_CORE_TOWN } from "../src/sim/settle.hml";
+import { world_count, KIND_LANTERN, EF_DEAD } from "../src/sim/world.hml";
+import { npc_new, npc_step,
+         npc_regard, npc_band, npc_met, npc_slot_of, npc_x, npc_z,
+         npc_count, npc_named_count, npc_present, npc_purse,
+         npc_offer_open, npc_offer_first, npc_offer_count, npc_offer_kind,
+         npc_offer_who,
+         npc_offer_class, npc_offer_price, npc_offer_tier, npc_offer_regard,
+         npc_pack_count, npc_trade_check,
+         NPC_MABEL, NPC_ODO, NPC_WICK, NPC_CONNIE, NPC_PIP, NPC_NONE,
+         NPC_NAMED, NPC_OFF_ROWS, NPC_OFF_KIT, NPC_OC_UNBUILT,
+         NPC_BAND_T_ACQ, NPC_BAND_T_FRIEND, NPC_BAND_T_TRUSTED,
+         NPC_TR_OK } from "../src/sim/npc.hml";
+
+import { transport_loopback } from "../src/net/transport.hml";
+
+import { demobot_new, demobot_frame } from "../src/game/demobot.hml";
+
+import { server_new, server_tick, server_snapshot, server_local, server_t0,
+         server_boot, server_spawn_yaw, server_spawn_x, server_spawn_z,
+         server_lantern_x, server_lantern_z, server_beat, server_beat_name,
+         server_world, server_settle, server_npcs, server_trades,
+         server_trades_refused, server_talks, server_kits_placed,
+         server_own_count, server_weapon, server_lan_count, server_deaths,
+         server_supplied, server_salvage_earned, server_points_spent,
+         server_tick_now } from "../src/game/server.hml";
+
+import { client_new, client_set_angles, client_set_move, client_set_button,
+         client_send_command, client_apply, client_frame, client_build_render,
+         client_px, client_pz, client_hp, client_dead, client_level,
+         client_xp_total, client_reserve, client_lantern_lit, client_purse,
+         client_pack_kits, client_pack_items, client_kits_placed,
+         client_settle_tier, client_settle_core, client_settle_pts,
+         client_settle_buildings, client_settle_lux, client_npc_count,
+         client_npc_named, client_points, client_spell_casts,
+         client_own_count, client_weapon_name, client_in_weapon,
+         client_settle_x, client_settle_z, client_settle_dist,
+         client_tier, client_load_kg, client_carry_kg,
+         client_settle_tier_name, client_npc_name,
+         client_hp_max } from "../src/game/client.hml";
+
+// ---------------------------------------------------------------------------
+//  CONFIGURATION
+// ---------------------------------------------------------------------------
+let g_PS_SEED: i32     = 1337;      // the seed the display session ran
+let g_PS_MINUTES: i32  = 60;        // THE HOUR
+let g_PS_DT_MS: f64    = 16.667;
+let g_PS_FRAMES: i32   = 3600 * 60; // 60 fps * 3600 s
+let g_PS_SAMPLE: i32   = 60 * 60;   // one sample per game minute, in frames
+let g_PS_EXPECT: i32   = 31;        // counted from the run, then pinned
+
+// The lamplighter's numbers.
+let PS_TOWN_ARRIVE_M: f64 = 2.2;    // NPC_TALK_M is 2.6; stop just inside it
+let PS_STEP_M: f64        = 1.0;
+
+// ---------------------------------------------------------------------------
+//  ASSERTIONS
+// ---------------------------------------------------------------------------
+fn sv(p_v): string { let out: string = `${p_v}`; return out; }
+
+let g_n: i32 = 0;
+let g_ok: i32 = 0;
+
+fn ck(p_ok: bool, p_msg: string) {
+    g_n = g_n + 1;
+    if (p_ok) { g_ok = g_ok + 1; }
+    if (!p_ok) { print("  FAIL [" + sv(g_n) + "] " + p_msg); }
+}
+
+fn compiled(): i32 {
+    let a0: string = args[0];
+    let out: i32 = 1;
+    if (a0.ends_with(".hml")) { out = 0; }
+    return out;
+}
+
+fn f1(p_x: f64): string { let out: string = sv(floor(p_x * 10.0) / 10.0); return out; }
+
+fn padl(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = " " + s; }
+    let out: string = s;
+    return out;
+}
+fn padr(p_s: string, p_w: i32): string {
+    let s: string = p_s;
+    while (s.length < p_w) { s = s + " "; }
+    let out: string = s;
+    return out;
+}
+fn pi(p_v: i32, p_w: i32): string { let out: string = padl(sv(p_v), p_w); return out; }
+
+fn mmss(p_s: i32): string {
+    let m: i32 = p_s / 60;
+    let r: i32 = p_s - m * 60;
+    let pad: string = "";
+    if (r < 10) { pad = "0"; }
+    let out: string = sv(m) + ":" + pad + sv(r);
+    return out;
+}
+
+fn phase_ch(p_p: i32): string {
+    if (p_p == PHASE_DAWN) { let a: string = "dawn"; return a; }
+    if (p_p == PHASE_DAY) { let b: string = "day "; return b; }
+    if (p_p == PHASE_DUSK) { let c: string = "dusk"; return c; }
+    let d: string = "NGHT";
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+//  THE SESSION — `main.hml`'s run_loop with the window, the renderer and the
+//  wall clock removed.  Identical in shape to probe_firstminute §HARNESS on
+//  purpose: a probe that drives a different loop tests a loop nobody ships.
+// ---------------------------------------------------------------------------
+fn session_new(p_seed: i32): object {
+    let net: object = transport_loopback();
+    let sv2: object = server_new(p_seed, net);
+    let cl: object = client_new(net, p_seed);
+    let s: object = {
+        net: net, sv: sv2, cl: cl,
+        acc: sim_accum_new(),
+        tick: server_t0(sv2),
+        bot: demobot_new(cl, sv2),
+        // --- the lamplighter's state machine -------------------------------
+        st: 0,              // 0 hold at the post, 1 walk in, 2 shop, 3 walk out
+        day_done: -1,       // the last day this player went to town
+        who: NPC_NONE,      // who it is walking to
+        widx: 0,            // which named villager it is working through
+        row: 0,             // which offer row the cursor is on
+        pump: 0,            // button pump phase inside the shop
+        atgreen: 0,         // has it reached the green on this trip
+        reach_min: -1,      // the tick it first stood on the green
+        trips: 0,           // completed town trips
+        bought: 0,          // successful trades
+        refused: 0,
+        sh: null            // the shadow settlement, installed by run_arm
+    };
+    client_set_angles(cl, server_spawn_yaw(sv2), 0.0);
+    server_tick(sv2, s.tick);
+    client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+    s.tick = s.tick + 1;
+    let out: object = s;
+    return out;
+}
+
+fn session_frame(p_s: object, p_frame_ms: f64): i32 {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let n: i32 = sim_accum_advance(s.acc, p_frame_ms);
+    let i: i32 = 0;
+    while (i < n) {
+        client_send_command(cl, s.tick);
+        server_tick(sv2, s.tick);
+        client_apply(cl, server_snapshot(sv2), server_local(sv2), s.tick);
+        s.tick = s.tick + 1;
+        i++;
+    }
+    client_frame(cl, p_frame_ms * 0.001, s.tick);
+    client_build_render(cl, sim_accum_alpha(s.acc));
+    let out: i32 = n;
+    return out;
+}
+
+// Move in a WORLD direction.  forward = (sin yaw, -cos yaw), right =
+// (cos yaw, sin yaw)  [view.hml], so the two axes are the projections.
+fn move_world(p_cl: object, p_yaw: f64, p_wx: f64, p_wz: f64) {
+    let wx: f64 = p_wx;
+    let wz: f64 = p_wz;
+    let m: f64 = sqrt(wx * wx + wz * wz);
+    if (m < 0.0001) { client_set_move(p_cl, 0.0, 0.0); return; }
+    let ux: f64 = wx / m;
+    let uz: f64 = wz / m;
+    let sy: f64 = sin(p_yaw);
+    let cy: f64 = cos(p_yaw);
+    let fwd: f64 = ux * sy + uz * (0.0 - cy);
+    let str: f64 = ux * cy + uz * sy;
+    client_set_move(p_cl, fwd, str);
+}
+
+// ---------------------------------------------------------------------------
+//  ARM WALK — THE LAMPLIGHTER WHO GOES HOME
+// ---------------------------------------------------------------------------
+//  It calls the SHIPPING driver first, every frame, so aim, trigger, reload
+//  and break-contact are the game's own and not a third bot's.  Then it
+//  OVERRIDES the movement and the interaction buttons when it is travelling
+//  or shopping.  Combat policy is therefore identical to ARM POST and the
+//  ONLY difference between the two arms is WHERE THE PLAYER GOES — which is
+//  precisely the variable under test.
+//
+//  At every dawn it walks the ~282 m to the settlement centre, stands on the
+//  green, walks to whatever named villager is present, presses TALK, opens the
+//  shop, and confirms every row.  Then it walks back to the post.
+//
+//  ARM WALK IS AN ORACLE PLAYER AND THAT IS DECLARED, NOT HIDDEN.  It reads
+//  villager positions from `npc_x` / `npc_z` on the server rather than finding
+//  them on screen, and it knows the settlement centre from `settle_cx`.  A
+//  human learns both in their first five minutes and then has them forever,
+//  so the shortcut costs nothing that matters — but it means this arm measures
+//  WHAT THE SYSTEMS DO WHEN DRIVEN CORRECTLY, not how hard they are to find.
+// ---------------------------------------------------------------------------
+let LOOP_HOLD: i32 = 0;
+let LOOP_IN: i32   = 1;
+let LOOP_SHOP: i32 = 2;
+let LOOP_OUT: i32  = 3;
+
+fn loop_clear_ui(p_cl: object) {
+    client_set_button(p_cl, BTN_BUILD, 0);
+    client_set_button(p_cl, BTN_SWITCH, 0);
+    client_set_button(p_cl, BTN_GRENADE, 0);
+    client_set_button(p_cl, BTN_INV, 0);
+}
+
+fn loop_frame(p_s: object) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+
+    // 1. the shipping driver runs first, always.
+    demobot_frame(s.bot, client_px(cl), client_pz(cl));
+    loop_clear_ui(cl);
+
+    if (client_dead(cl) == 1) { return; }
+    // Until the first lantern is lit the opening script owns the player.
+    if (client_lantern_lit(cl) == 0) { return; }
+
+    let px: f64 = client_px(cl);
+    let pz: f64 = client_pz(cl);
+    let tick: i32 = server_tick_now(sv2);
+    let day: i32 = day_number(tick);
+    let ph: i32 = day_phase(tick);
+    let st: object = server_settle(sv2);
+    let sto: object = server_npcs(sv2);
+
+    // 2. WHEN DOES A LAMPLIGHTER GO HOME?  At dawn, once a day.  Nights are
+    //    for holding the post — the light is the ammunition (demobot.hml's
+    //    header) and walking out of it mid-hold is the documented way to lose.
+    if (s.st == LOOP_HOLD) {
+        if (ph == PHASE_DAWN && s.day_done != day) {
+            s.st = LOOP_IN;
+            s.widx = 0;
+            s.who = NPC_NONE;
+            s.atgreen = 0;
+        }
+        return;                       // the demobot's movement stands
+    }
+
+    // 3. THE DESTINATION.  The green first — a player walks to the town, not
+    //    to a person they cannot see.  Then whatever named villager is there.
+    if (s.st == LOOP_IN || s.st == LOOP_SHOP) {
+        let tx: f64 = settle_cx(st);
+        let tz: f64 = settle_cz(st);
+        let arrive: f64 = 6.0;                 // "standing on the green"
+        if (s.atgreen == 1) {
+            if (s.who == NPC_NONE) {
+                let w: i32 = s.widx;
+                while (w < NPC_NAMED) {
+                    if (npc_present(sto, w) == 1) { s.who = w; w = NPC_NAMED; }
+                    else { w++; }
+                }
+                if (s.who != NPC_NONE) { s.widx = s.who + 1; }
+            }
+            if (s.who == NPC_NONE) {
+                // NOBODY IS HOME.  This is not a bot failure; it is the
+                // measurement.  Turn round and walk back.
+                s.st = LOOP_OUT;
+                s.trips = s.trips + 1;
+                s.day_done = day;
+                return;
+            }
+            let slot: i32 = npc_slot_of(sto, s.who);
+            if (slot >= 0) {
+                tx = npc_x(sto, st, slot, tick);
+                tz = npc_z(sto, st, slot, tick);
+                arrive = PS_TOWN_ARRIVE_M;
+            }
+        }
+        let dx: f64 = tx - px;
+        let dz: f64 = tz - pz;
+        let d: f64 = sqrt(dx * dx + dz * dz);
+        client_set_angles(cl, atan2(dx, 0.0 - dz), 0.0);
+        client_set_button(cl, BTN_FIRE, 0);
+        client_set_button(cl, BTN_ADS, 0);
+        if (d > arrive) {
+            move_world(cl, atan2(dx, 0.0 - dz), dx, dz);
+            client_set_button(cl, BTN_SPRINT, 1);
+            client_set_button(cl, BTN_USE, 0);
+            s.st = LOOP_IN;
+            return;
+        }
+        if (s.atgreen == 0) {
+            s.atgreen = 1;
+            if (s.reach_min < 0) { s.reach_min = tick; }
+            return;
+        }
+        // ---- ARRIVED AT A PERSON.  Talk, then press every row. -----------
+        client_set_move(cl, 0.0, 0.0);
+        client_set_button(cl, BTN_SPRINT, 0);
+        s.st = LOOP_SHOP;
+
+        // A button PUMP.  Every button `sv_ui_tick` reads is a RISING EDGE, so
+        // each press needs a released frame either side or the server never
+        // sees it.
+        let p: i32 = s.pump;
+        client_set_button(cl, BTN_USE, 0);
+        if (p == 0) { client_set_button(cl, BTN_USE, 1); }          // TALK
+        if (p == 2) { client_set_button(cl, BTN_BUILD, 1); }        // open TRADE
+        if (p >= 4) {
+            let q: i32 = p - 4;
+            let half: i32 = q / 2;
+            if (q - half * 2 == 0) { client_set_button(cl, BTN_GRENADE, 1); }  // CONFIRM
+            else { client_set_button(cl, BTN_SWITCH, 1); }                     // NEXT ROW
+        }
+        s.pump = p + 1;
+        // Two full sweeps of the largest offer list (9 rows), plus the opener.
+        if (s.pump > 4 + 9 * 2 * 2) {
+            s.pump = 0;
+            s.who = NPC_NONE;
+            client_set_button(cl, BTN_BUILD, 1);     // close the panel
+            if (s.widx >= NPC_NAMED) {
+                s.st = LOOP_OUT;
+                s.trips = s.trips + 1;
+                s.day_done = day;
+            }
+        }
+        return;
+    }
+
+    // 4. WALK BACK OUT to the post and resume the hold.
+    if (s.st == LOOP_OUT) {
+        let lx: f64 = server_lantern_x(sv2);
+        let lz: f64 = server_lantern_z(sv2);
+        let dx2: f64 = lx - px;
+        let dz2: f64 = lz - pz;
+        let d2: f64 = sqrt(dx2 * dx2 + dz2 * dz2);
+        if (d2 > 8.0) {
+            client_set_angles(cl, atan2(dx2, 0.0 - dz2), 0.0);
+            move_world(cl, atan2(dx2, 0.0 - dz2), dx2, dz2);
+            client_set_button(cl, BTN_SPRINT, 1);
+            // ON THE WAY OUT, PLANT.  `sv_place_kit` is BTN_USE with nobody
+            // and nothing in reach, so a lamplighter carrying a kit drops it
+            // where it stands; held down, the same press then channels the
+            // post it just planted (sim.hml stage (g)).
+            if (client_pack_kits(cl) > 0) { client_set_button(cl, BTN_USE, 1); }
+            else { client_set_button(cl, BTN_USE, 0); }
+            return;
+        }
+        client_set_button(cl, BTN_SPRINT, 0);
+        client_set_button(cl, BTN_USE, 0);
+        s.st = LOOP_HOLD;
+        s.day_done = day;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  THE SHADOW SETTLEMENT — THE COUNTERFACTUAL, AND WHY IT IS HERE
+// ---------------------------------------------------------------------------
+//  `sv_lan_gather` (src/game/server.hml, the `let md = w.model;` line) tests
+//  a lantern's LIT STATE against `w.model`.  `sv_spawn_lantern` writes the lit
+//  flag into `w.anim` and writes SV_MODEL_LANTERN (90) into `w.model`, so the
+//  test is `90 == SIM_LANTERN_LIT (1)` and it is FALSE FOR EVERY LANTERN THAT
+//  HAS EVER EXISTED.  The settlement's lantern feed therefore contains exactly
+//  one row — the Great Lantern, at wick 0 — for the whole of any session.
+//
+//  This probe DOES NOT FIX THAT.  It does not own `src/`.  What it does is run
+//  a SECOND, private settlement — same seed, same cell, same `settle_step` —
+//  fed from `w.anim` instead, one tick in sixty, exactly on the cadence
+//  `sv_w6_tick` uses.  Everything else is byte-for-byte the shipped module.
+//
+//  So the shadow columns are not a guess about what the fix would do.  They
+//  are `settle.hml` and `npc.hml`, unmodified, run on the input the shipping
+//  code intended to give them.
+// ---------------------------------------------------------------------------
+fn shadow_new(p_s: object): object {
+    let s: object = p_s;
+    let gx: i32 = settle_cell_x_of(server_spawn_x(s.sv));
+    let gz: i32 = settle_cell_z_of(server_spawn_z(s.sv));
+    let st: object = settle_new_at(g_PS_SEED, gx, gz);
+    let sh: object = {
+        st: st,
+        npcs: npc_new(st),
+        lan: [],
+        lan_n: 0
+    };
+    let a: array<f64> = sh.lan;
+    let i: i32 = 0;
+    while (i < 64 * SET_LAN_STRIDE) { a.push(0.0); i++; }
+    let out: object = sh;
+    return out;
+}
+
+// A verbatim transcription of `sv_lan_gather` with ONE WORD CHANGED:
+// `w.model` -> `w.anim`.  Everything else — row 0, the ring, the cap, the
+// wick, the tier-ever ratchet — is copied clause for clause so that the only
+// difference between the shadow and the ship is the defect.
+fn shadow_gather(p_sh: object, p_w: object) {
+    let sh: object = p_sh;
+    let w: object = p_w;
+    let st: object = sh.st;
+    let a: array<f64> = sh.lan;
+
+    a[0] = settle_cx(st);
+    a[1] = settle_cz(st);
+    a[2] = 1.0;
+    let n: i32 = 1;
+
+    let ring: f64 = settle_ring_m(SET_TIER_CITY);
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    let cap: i32 = 64;
+    let great: f64 = 0.0;
+
+    let cnt: i32 = world_count(w);
+    let slot: i32 = 0;
+    while (slot < cnt) {
+        if (n >= cap) { slot = cnt; }
+        else {
+            let kd = w.kind;
+            let fl = w.flags;
+            if (kd[slot] == KIND_LANTERN && (fl[slot] & EF_DEAD) == 0) {
+                let md = w.anim;                       // <<< THE ONE WORD
+                if (md[slot] == SIM_LANTERN_LIT) {
+                    let xs = w.px; let zs = w.pz;
+                    let lx: f64 = xs[slot];
+                    let lz: f64 = zs[slot];
+                    let dx: f64 = lx - cx;
+                    let dz: f64 = lz - cz;
+                    if (dx * dx + dz * dz <= ring * ring) {
+                        a[n * 4] = lx;
+                        a[n * 4 + 1] = lz;
+                        a[n * 4 + 2] = 1.0;
+                        a[n * 4 + 3] = f64(SET_WICK_FULL);
+                        n++;
+                        great = f64(SET_WICK_FULL);
+                    }
+                }
+            }
+            slot++;
+        }
+    }
+    if (settle_tier_ever(st) >= SET_TIER_VILLAGE) { great = f64(SET_WICK_FULL); }
+    a[3] = great;
+    sh.lan_n = n;
+    settle_lanterns_set(st, a, n);
+}
+
+// WHERE THE LANTERNS ACTUALLY ARE.  The reason the repaired feed still does
+// not build a Village is geography, and this prints it: the opening script
+// puts every post it gives you ~280 m from the green, and `settle_lux_at`
+// falls off long before that.
+fn lantern_geography(p_s: object) {
+    let s: object = p_s;
+    let w: object = server_world(s.sv);
+    let st: object = server_settle(s.sv);
+    let cx: f64 = settle_cx(st);
+    let cz: f64 = settle_cz(st);
+    print("");
+    print("  WHERE THE LANTERNS ARE  (the settlement green is the origin here)");
+    print("    ring the feed gathers over: " + f1(settle_ring_m(SET_TIER_CITY)) + " m");
+    let cnt: i32 = world_count(w);
+    let n: i32 = 0;
+    let lit: i32 = 0;
+    let slot: i32 = 0;
+    while (slot < cnt) {
+        let kd = w.kind;
+        let fl = w.flags;
+        if (kd[slot] == KIND_LANTERN && (fl[slot] & EF_DEAD) == 0) {
+            let an = w.anim;
+            let xs = w.px; let zs = w.pz;
+            let dx: f64 = xs[slot] - cx;
+            let dz: f64 = zs[slot] - cz;
+            let d: f64 = sqrt(dx * dx + dz * dz);
+            let state: string = "unlit";
+            if (an[slot] == SIM_LANTERN_LIT) { state = "LIT  "; lit = lit + 1; }
+            print("    post " + pi(n, 2) + "  " + state + "  "
+                + padl(f1(d), 7) + " m from the green");
+            n++;
+        }
+        slot++;
+    }
+    print("    " + sv(lit) + " lit of " + sv(n) + " posts, and the nearest is still");
+    print("    further from the green than a tier-1 lantern's own "
+        + f1(g_LANTERN_R_T1) + " m radius.");
+}
+
+fn shadow_step(p_sh: object, p_w: object, p_tick: i32) {
+    let sh: object = p_sh;
+    let tick: i32 = p_tick;
+    if (tick % 60 == 0) { shadow_gather(sh, p_w); }
+    settle_step(sh.st, tick);
+    npc_step(sh.npcs, sh.st, tick);
+}
+
+// ---------------------------------------------------------------------------
+//  THE SAMPLE TABLE.  Struct-of-arrays; 60 rows per arm.
+// ---------------------------------------------------------------------------
+let g_rows: i32 = 0;
+let g_s_min: array<i32> = [];
+let g_s_day: array<i32> = [];
+let g_s_ph: array<i32> = [];
+let g_s_beat: array<i32> = [];
+let g_s_hp: array<i32> = [];
+let g_s_lvl: array<i32> = [];
+let g_s_xp: array<i32> = [];
+let g_s_purse: array<i32> = [];
+let g_s_earn: array<i32> = [];
+let g_s_tier: array<i32> = [];       // settlement tier
+let g_s_lux: array<i32> = [];        // core lux
+let g_s_pts: array<i32> = [];        // grid points
+let g_s_bld: array<i32> = [];
+let g_s_npc: array<i32> = [];
+let g_s_lan: array<i32> = [];        // lit lanterns feeding the town
+let g_s_lit: array<i32> = [];        // lanterns the PLAYER lit, ever
+let g_s_kits: array<i32> = [];
+let g_s_holds: array<i32> = [];
+let g_s_kills: array<i32> = [];
+let g_s_own: array<i32> = [];
+let g_s_trd: array<i32> = [];
+let g_s_ref: array<i32> = [];
+let g_s_talk: array<i32> = [];
+let g_s_regw: array<i32> = [];       // regard: Wick
+let g_s_regm: array<i32> = [];       // regard: Mabel
+let g_s_pt: array<i32> = [];         // unspent stat points
+let g_s_dist: array<i32> = [];       // metres from the settlement centre
+let g_s_dth: array<i32> = [];
+let g_s_dtier: array<i32> = [];      // the DIRECTOR's tier
+let g_s_ctier: array<i32> = [];      // the chunk shade tier under the player
+let g_s_fall: array<i32> = [];       // cumulative fall-damage hits
+// --- the counterfactual: the same settlement fed from `w.anim` -------------
+let g_h_tier: array<i32> = [];
+let g_h_lux: array<i32> = [];
+let g_h_pts: array<i32> = [];
+let g_h_npc: array<i32> = [];
+let g_h_lan: array<i32> = [];
+
+fn sample(p_s: object, p_min: i32) {
+    let s: object = p_s;
+    let cl: object = s.cl;
+    let sv2: object = s.sv;
+    let w: object = server_world(sv2);
+    let st: object = server_settle(sv2);
+    let sto: object = server_npcs(sv2);
+    let tick: i32 = server_tick_now(sv2);
+    let dx: f64 = settle_cx(st) - client_px(cl);
+    let dz: f64 = settle_cz(st) - client_pz(cl);
+
+    g_s_min.push(p_min);
+    g_s_day.push(day_number(tick));
+    g_s_ph.push(day_phase(tick));
+    g_s_beat.push(server_beat(sv2));
+    g_s_hp.push(client_hp(cl));
+    g_s_lvl.push(client_level(cl));
+    g_s_xp.push(client_xp_total(cl));
+    g_s_purse.push(npc_purse(sto));
+    g_s_earn.push(server_salvage_earned(sv2));
+    g_s_tier.push(settle_tier(st));
+    g_s_lux.push(settle_core_lux(st));
+    g_s_pts.push(settle_grid_points(st));
+    g_s_bld.push(client_settle_buildings(cl));
+    g_s_npc.push(npc_count(sto));
+    g_s_lan.push(server_lan_count(sv2));
+    g_s_lit.push(sim_stat_lanterns(w));
+    g_s_kits.push(server_kits_placed(sv2));
+    g_s_holds.push(director_holds_done(sim_director(w)));
+    g_s_kills.push(sim_stat_deaths(w));
+    g_s_own.push(server_own_count(sv2));
+    g_s_trd.push(server_trades(sv2));
+    g_s_ref.push(server_trades_refused(sv2));
+    g_s_talk.push(server_talks(sv2));
+    g_s_regw.push(npc_regard(sto, NPC_WICK));
+    g_s_regm.push(npc_regard(sto, NPC_MABEL));
+    g_s_pt.push(client_points(cl));
+    g_s_dist.push(i32(sqrt(dx * dx + dz * dz)));
+    g_s_dth.push(sim_stat_player_deaths(w));
+    g_s_dtier.push(director_tier(sim_director(w)));
+    g_s_ctier.push(client_tier(cl));
+    g_s_fall.push(sim_stat_fall_hits(w));
+    let sh: object = s.sh;
+    if (sh == null) {
+        g_h_tier.push(0); g_h_lux.push(0); g_h_pts.push(0);
+        g_h_npc.push(0); g_h_lan.push(0);
+    } else {
+        g_h_tier.push(settle_tier(sh.st));
+        g_h_lux.push(settle_core_lux(sh.st));
+        g_h_pts.push(settle_grid_points(sh.st));
+        g_h_npc.push(npc_count(sh.npcs));
+        g_h_lan.push(sh.lan_n);
+    }
+    g_rows = g_rows + 1;
+}
+
+fn table_reset() {
+    g_rows = 0;
+    g_s_min.clear(); g_s_day.clear(); g_s_ph.clear(); g_s_beat.clear();
+    g_s_hp.clear(); g_s_lvl.clear(); g_s_xp.clear(); g_s_purse.clear();
+    g_s_earn.clear(); g_s_tier.clear(); g_s_lux.clear(); g_s_pts.clear();
+    g_s_bld.clear(); g_s_npc.clear(); g_s_lan.clear(); g_s_lit.clear();
+    g_s_kits.clear(); g_s_holds.clear(); g_s_kills.clear(); g_s_own.clear();
+    g_s_trd.clear(); g_s_ref.clear(); g_s_talk.clear(); g_s_regw.clear();
+    g_s_regm.clear(); g_s_pt.clear(); g_s_dist.clear(); g_s_dth.clear();
+    g_s_dtier.clear(); g_s_ctier.clear(); g_s_fall.clear();
+    g_h_tier.clear(); g_h_lux.clear(); g_h_pts.clear();
+    g_h_npc.clear(); g_h_lan.clear();
+}
+
+fn table_print(p_title: string) {
+    print("");
+    print("  " + p_title);
+    print("  min  d ph   beat  hp lvl    xp purse  town lux pts bld npc lan kits holds kills own trd ref talk regW regM pt  dist deaths dtier | SHADOW: lan tier  lux pts npc");
+    let i: i32 = 0;
+    while (i < g_rows) {
+        let m: i32 = g_s_min[i];
+        // Print every minute for the first six, then every five.
+        let show: i32 = 0;
+        if (m <= 6) { show = 1; }
+        if (m - (m / 5) * 5 == 0) { show = 1; }
+        if (m == g_PS_MINUTES) { show = 1; }
+        if (show == 1) {
+            print("  " + pi(m, 3) + " " + pi(g_s_day[i], 2) + " "
+                + phase_ch(g_s_ph[i]) + " "
+                + padr(server_beat_name(g_s_beat[i]), 6) + " "
+                + pi(g_s_hp[i], 3) + " " + pi(g_s_lvl[i], 3) + " "
+                + pi(g_s_xp[i], 5) + " " + pi(g_s_purse[i], 5) + " "
+                + pi(g_s_tier[i], 4) + " " + pi(g_s_lux[i], 4) + " "
+                + pi(g_s_pts[i], 3) + " " + pi(g_s_bld[i], 3) + " "
+                + pi(g_s_npc[i], 3) + " " + pi(g_s_lan[i], 3) + " "
+                + pi(g_s_kits[i], 4) + " " + pi(g_s_holds[i], 5) + " "
+                + pi(g_s_kills[i], 5) + " " + pi(g_s_own[i], 3) + " "
+                + pi(g_s_trd[i], 3) + " " + pi(g_s_ref[i], 3) + " "
+                + pi(g_s_talk[i], 4) + " " + pi(g_s_regw[i], 4) + " "
+                + pi(g_s_regm[i], 4) + " " + pi(g_s_pt[i], 2) + " "
+                + pi(g_s_dist[i], 5) + " " + pi(g_s_dth[i], 6) + " "
+                + pi(g_s_dtier[i], 5) + "  |        "
+                + pi(g_h_lan[i], 4) + pi(g_h_tier[i], 5) + pi(g_h_lux[i], 5)
+                + pi(g_h_pts[i], 4) + pi(g_h_npc[i], 4));
+        }
+        i++;
+    }
+}
+
+// The minute at which a column last CHANGED.  This is the whole instrument:
+// a column whose last change is at minute 3 is a system that stopped
+// contributing to the experience at minute 3.
+fn last_change(p_a: array<i32>): i32 {
+    let n: i32 = g_rows;
+    let last: i32 = 0;
+    let i: i32 = 1;
+    while (i < n) {
+        if (p_a[i] != p_a[i - 1]) { last = g_s_min[i]; }
+        i++;
+    }
+    let out: i32 = last;
+    return out;
+}
+
+fn report_change(p_name: string, p_a: array<i32>) {
+    let lc: i32 = last_change(p_a);
+    let first: i32 = p_a[0];
+    let lastv: i32 = p_a[g_rows - 1];
+    print("    " + padr(p_name, 22) + " " + pi(first, 7) + " -> " + pi(lastv, 7)
+        + "   last moved at " + padl(mmss(lc * 60), 6));
+}
+
+// ---------------------------------------------------------------------------
+//  RUN ONE ARM
+// ---------------------------------------------------------------------------
+fn run_arm(p_loop: i32, p_title: string): object {
+    let s: object = session_new(g_PS_SEED);
+    s.sh = shadow_new(s);
+    table_reset();
+    let f: i32 = 0;
+    let next: i32 = g_PS_SAMPLE;
+    let m: i32 = 0;
+    // minute 0, before anything.
+    sample(s, 0);
+    while (f < g_PS_FRAMES) {
+        if (p_loop == 1) { loop_frame(s); }
+        else { demobot_frame(s.bot, client_px(s.cl), client_pz(s.cl)); }
+        session_frame(s, g_PS_DT_MS);
+        shadow_step(s.sh, server_world(s.sv), server_tick_now(s.sv));
+        f++;
+        if (f >= next) {
+            m++;
+            next = next + g_PS_SAMPLE;
+            sample(s, m);
+        }
+    }
+    table_print(p_title);
+    let out: object = s;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+//  THE OFFER AUDIT — what the shop can EVER sell, independent of any run.
+// ---------------------------------------------------------------------------
+let g_unbuilt: i32 = 0;
+
+fn audit_offers(p_s: object) {
+    let s: object = p_s;
+    let sto: object = server_npcs(s.sv);
+    let st: object = server_settle(s.sv);
+    print("");
+    print("  THE SHOP, ROW BY ROW  (class UNBUILT = the honest gap)");
+    print("  row who      kind price tier regard  class     open-now");
+    let unbuilt: i32 = 0;
+    let r: i32 = 0;
+    while (r < NPC_OFF_ROWS) {
+        let cls: i32 = npc_offer_class(r);
+        let cn: string = "SERVICE";
+        if (cls == 1) { cn = "STOCK  "; }
+        if (cls == 2) { cn = "FIT    "; }
+        if (cls == NPC_OC_UNBUILT) { cn = "UNBUILT"; unbuilt = unbuilt + 1; }
+        let op: string = "no";
+        if (npc_offer_open(sto, st, r) == 1) { op = "YES"; }
+        print("  " + pi(r, 3) + " " + padr(client_npc_name(npc_offer_who(r)), 8)
+            + " " + pi(npc_offer_kind(r), 4) + " " + pi(npc_offer_price(r), 5)
+            + " " + pi(npc_offer_tier(r), 4) + " " + pi(npc_offer_regard(r), 6)
+            + "  " + cn + "   " + op);
+        r++;
+    }
+    print("  UNBUILT rows: " + sv(unbuilt) + " of " + sv(NPC_OFF_ROWS));
+    g_unbuilt = unbuilt;
+}
+
+// ---------------------------------------------------------------------------
+//  WHAT WOULD IT TAKE?  A pure evaluation of `settle.hml`, no session.
+// ---------------------------------------------------------------------------
+//  The shadow arm proves the repaired feed is not enough on its own.  This
+//  answers the next question the fix implies and the one the next agent needs:
+//  HOW MANY LIT POSTS, AND HOW CLOSE, does the shipped `settle.hml` want before
+//  it will call the place a Village?
+//
+//  It builds synthetic lantern sets on a ring around the green and asks
+//  `settle_refresh` — the module's own full re-integration, the same one
+//  `settle_step` performs a slice at a time — what they are worth.  No
+//  simulation, no bot, no assumption: this is settle.hml answering about
+//  itself.
+// ---------------------------------------------------------------------------
+let g_need_posts: i32 = 0;
+let g_need_r: f64 = 0.0;
+
+fn what_would_it_take() {
+    print("");
+    print("  WHAT THE TOWN ACTUALLY WANTS  (settle.hml, evaluated directly)");
+    print("    Village needs core lux >= " + sv(SET_CORE_VILLAGE)
+        + " AND grid points >= " + sv(SET_PTS_VILLAGE));
+    print("");
+    print("    posts   ring     core lux   grid pts   tier");
+    let gx: i32 = settle_cell_x_of(0.0);
+    let gz: i32 = settle_cell_z_of(0.0);
+    let radii: array<f64> = [20.0, 40.0, 60.0, 100.0];
+    let ri: i32 = 0;
+    while (ri < radii.length) {
+        let r: f64 = radii[ri];
+        let np: i32 = 2;
+        while (np <= 16) {
+            let st: object = settle_new_at(g_PS_SEED, gx, gz);
+            let cx: f64 = settle_cx(st);
+            let cz: f64 = settle_cz(st);
+            let a: array<f64> = [];
+            // row 0: the Great Lantern, tier 1, lit.
+            a.push(cx); a.push(cz); a.push(1.0); a.push(f64(SET_WICK_FULL));
+            let i: i32 = 0;
+            while (i < np) {
+                let ang: f64 = 6.283185307179586 * f64(i) / f64(np);
+                a.push(cx + sin(ang) * r);
+                a.push(cz - cos(ang) * r);
+                a.push(1.0);
+                a.push(f64(SET_WICK_FULL));
+                i++;
+            }
+            settle_lanterns_set(st, a, np + 1);
+            settle_refresh(st);
+            let core: i32 = settle_core_lux(st);
+            let pts: i32 = settle_grid_points(st);
+            let ok: i32 = 0;
+            if (core >= SET_CORE_VILLAGE) { if (pts >= SET_PTS_VILLAGE) { ok = 1; } }
+            if (ok == 1 || np == 16) {
+                print("    " + pi(np, 5) + "   " + padl(f1(r), 5) + " m  "
+                    + pi(core, 9) + "  " + pi(pts, 9) + "   "
+                    + client_settle_tier_name(settle_tier(st)));
+            }
+            if (ok == 1) {
+                if (g_need_posts == 0) { g_need_posts = np; g_need_r = r; }
+                np = 17;
+            } else { np++; }
+        }
+        ri++;
+    }
+    if (g_need_posts > 0) {
+        print("");
+        print("    THE ANSWER: " + sv(g_need_posts) + " lit posts on a "
+            + f1(g_need_r) + " m ring around the green makes it a Village.");
+        print("    The opening script gives you 6, at 181-275 m, which is worth 1 point.");
+    }
+}
+
+// ===========================================================================
+//  MAIN
+// ===========================================================================
+fn main() {
+    print("=================================================================");
+    print(" probe_session — ONE HOUR OF GAME TIME, MEASURED");
+    print("=================================================================");
+    let bmode: string = "COMPILED";
+    if (compiled() == 0) { bmode = "INTERPRETED"; }
+    print(" build      " + bmode);
+    print(" seed       " + sv(g_PS_SEED));
+    print(" duration   " + sv(g_PS_MINUTES) + " game minutes = "
+        + sv(g_PS_FRAMES) + " frames");
+    print(" the day    " + sv(g_DAY_TICKS / g_TICK_HZ / 60) + " minutes, so the hour is "
+        + f1(f64(g_PS_MINUTES) * 60.0 * f64(g_TICK_HZ) / f64(g_DAY_TICKS)) + " days");
+    print("");
+
+    // -----------------------------------------------------------------------
+    print("-----------------------------------------------------------------");
+    print(" ARM POST — src/game/demobot.hml, THE SHIPPING DRIVER");
+    print("   leashed to the first lantern post at 16 m and never leaves.");
+    print("   This is what `main.hml --demo 3600` does on the display.");
+    print("-----------------------------------------------------------------");
+    let a_post: object = run_arm(0, "ARM POST");
+    print("");
+    print("  WHAT STOPPED MOVING, AND WHEN  (ARM POST)");
+    report_change("settlement tier", g_s_tier);
+    report_change("core lux", g_s_lux);
+    report_change("grid points", g_s_pts);
+    report_change("buildings", g_s_bld);
+    report_change("villagers", g_s_npc);
+    report_change("lanterns lit", g_s_lit);
+    report_change("guns owned", g_s_own);
+    report_change("character level", g_s_lvl);
+    report_change("unspent points", g_s_pt);
+    report_change("holds done", g_s_holds);
+    report_change("director tier", g_s_dtier);
+    report_change("regard (Wick)", g_s_regw);
+    report_change("SHADOW town tier", g_h_tier);
+    report_change("SHADOW villagers", g_h_npc);
+
+    let post_lvl: i32 = g_s_lvl[g_rows - 1];
+    let post_kills: i32 = g_s_kills[g_rows - 1];
+    let post_tier: i32 = g_s_tier[g_rows - 1];
+    let post_lvl_lc: i32 = last_change(g_s_lvl);
+    let post_tier_lc: i32 = last_change(g_s_tier);
+    let post_own_lc: i32 = last_change(g_s_own);
+    let post_lit: i32 = g_s_lit[g_rows - 1];
+    let post_holds: i32 = g_s_holds[g_rows - 1];
+    let post_dth: i32 = g_s_dth[g_rows - 1];
+    let post_purse: i32 = g_s_purse[g_rows - 1];
+    let post_lan: i32 = g_s_lan[g_rows - 1];
+    let post_npc: i32 = g_s_npc[g_rows - 1];
+    let post_hp: i32 = g_s_hp[g_rows - 1];
+    let post_xp_lc: i32 = last_change(g_s_xp);
+    // The shadow's own answers, saved before the table is reset.
+    let h_tier: i32 = g_h_tier[g_rows - 1];
+    let h_npc: i32 = g_h_npc[g_rows - 1];
+    let h_lan: i32 = g_h_lan[g_rows - 1];
+    let h_pts: i32 = g_h_pts[g_rows - 1];
+    let h_lux: i32 = g_h_lux[g_rows - 1];
+    // WHEN the shadow town became a Village — the number the fix buys.
+    let h_vill_at: i32 = -1;
+    let vi: i32 = 0;
+    while (vi < g_rows) {
+        if (h_vill_at < 0) {
+            if (g_h_tier[vi] >= SET_TIER_VILLAGE) { h_vill_at = g_s_min[vi]; }
+        }
+        vi++;
+    }
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("-----------------------------------------------------------------");
+    print(" ARM WALK — THE LAMPLIGHTER WHO GOES HOME");
+    print("   the same combat driver, but at every dawn it walks the 282 m to");
+    print("   the settlement, greets whoever is there, and presses every row.");
+    print("-----------------------------------------------------------------");
+    let a_walk: object = run_arm(1, "ARM WALK");
+    print("");
+    print("  WHAT STOPPED MOVING, AND WHEN  (ARM WALK)");
+    report_change("settlement tier", g_s_tier);
+    report_change("villagers", g_s_npc);
+    report_change("lanterns lit", g_s_lit);
+    report_change("kits placed", g_s_kits);
+    report_change("guns owned", g_s_own);
+    report_change("trades", g_s_trd);
+    report_change("conversations", g_s_talk);
+    report_change("character level", g_s_lvl);
+    report_change("purse", g_s_purse);
+    report_change("fall-damage hits", g_s_fall);
+    print("");
+    print("  THE LATE-HOUR DEATH LOOP  (ARM WALK only; ARM POST does not do this)");
+    print("    min  hp  xp     kills  deaths  fall  phase");
+    let di: i32 = 50;
+    while (di < g_rows) {
+        print("    " + pi(g_s_min[di], 3) + " " + pi(g_s_hp[di], 3) + " "
+            + pi(g_s_xp[di], 5) + "  " + pi(g_s_kills[di], 5) + "  "
+            + pi(g_s_dth[di], 6) + "  " + pi(g_s_fall[di], 4) + "  "
+            + phase_ch(g_s_ph[di]));
+        di++;
+    }
+
+    let walk_trd: i32 = g_s_trd[g_rows - 1];
+    let walk_own: i32 = g_s_own[g_rows - 1];
+    let walk_tier: i32 = g_s_tier[g_rows - 1];
+    let walk_kits: i32 = g_s_kits[g_rows - 1];
+    let walk_lit: i32 = g_s_lit[g_rows - 1];
+    let walk_regw: i32 = g_s_regw[g_rows - 1];
+    let walk_npc: i32 = g_s_npc[g_rows - 1];
+    let walk_purse: i32 = g_s_purse[g_rows - 1];
+    let walk_lvl: i32 = g_s_lvl[g_rows - 1];
+    let walk_talk: i32 = g_s_talk[g_rows - 1];
+    let walk_trips: i32 = a_walk.trips;
+    let walk_reach: i32 = a_walk.reach_min;
+
+    lantern_geography(a_walk);
+    what_would_it_take();
+    audit_offers(a_walk);
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("-----------------------------------------------------------------");
+    print(" THE TWO HOURS, SIDE BY SIDE");
+    print("-----------------------------------------------------------------");
+    print("                            ARM POST    ARM WALK");
+    print("  town trips completed   " + pi(0, 10) + pi(walk_trips, 12));
+    print("  conversations          " + pi(0, 10) + pi(walk_talk, 12));
+    print("  trades completed       " + pi(0, 10) + pi(walk_trd, 12));
+    print("  guns owned at 60:00    " + pi(1, 10) + pi(walk_own, 12));
+    print("  settlement tier        " + pi(post_tier, 10) + pi(walk_tier, 12));
+    print("  villagers present      " + pi(post_npc, 10) + pi(walk_npc, 12));
+    print("  lanterns the player lit" + pi(post_lit, 10) + pi(walk_lit, 12));
+    print("  kits placed            " + pi(0, 10) + pi(walk_kits, 12));
+    print("  character level        " + pi(post_lvl, 10) + pi(walk_lvl, 12));
+    print("  salvage unspendable    " + pi(post_purse, 10) + pi(walk_purse, 12));
+    print("");
+    print("  THE COUNTERFACTUAL  (`w.model` -> `w.anim` in sv_lan_gather, and");
+    print("  NOTHING ELSE: settle.hml and npc.hml are the shipped modules)");
+    print("    lanterns reaching the town feed :  ships " + sv(post_lan)
+        + "   shadow " + sv(h_lan));
+    print("    core lux                        :  ships 0   shadow " + sv(h_lux)
+        + "   (Village needs " + sv(SET_CORE_VILLAGE) + ")");
+    print("    grid points                     :  ships 0   shadow " + sv(h_pts)
+        + "   (Village needs " + sv(SET_PTS_VILLAGE) + ")");
+    print("    settlement tier                 :  ships " + sv(post_tier)
+        + "   shadow " + sv(h_tier));
+    print("    villagers                       :  ships " + sv(post_npc)
+        + "   shadow " + sv(h_npc));
+    print("    the town becomes a VILLAGE at   :  " + mmss(h_vill_at * 60));
+
+    // -----------------------------------------------------------------------
+    print("");
+    print("-----------------------------------------------------------------");
+    print(" ASSERTIONS — every one is a STATEMENT OF WHAT IS, not of what");
+    print(" ought to be.  If a number here moves, the design moved, and this");
+    print(" probe must go red rather than pass quietly.");
+    print("-----------------------------------------------------------------");
+
+    // A. THE HOUR RAN AT ALL.
+    ck(g_rows == g_PS_MINUTES + 1,
+       "the hour sampled " + sv(g_rows) + " minutes, wanted " + sv(g_PS_MINUTES + 1));
+    ck(post_holds >= 2,
+       "ARM POST survived " + sv(post_holds) + " nightly holds in the hour");
+    ck(post_kills > 200,
+       "ARM POST killed " + sv(post_kills) + " things — the combat loop never stalls");
+
+    // B. THE AUTHORED CONTENT IS SIXTY SECONDS LONG, AND THAT IS ALL OF IT.
+    ck(server_beat(a_post.sv) == 11,
+       "an hour in, the game is still on the LAST scripted beat ("
+       + server_beat_name(server_beat(a_post.sv)) + ", reached at 0:58)");
+
+    // C. WHAT FIFTY-NINE MORE MINUTES BUY THE STANDING PLAYER.
+    ck(post_own_lc == 0,
+       "ARM POST's arsenal never changed: still " + sv(1) + " gun, last moved at 0:00");
+    ck(post_tier_lc == 0,
+       "ARM POST's town never grew: tier " + sv(post_tier) + ", last moved at 0:00");
+    ck(post_lvl_lc <= 56,
+       "ARM POST's level last moved at " + mmss(post_lvl_lc * 60)
+       + " — four levels in an hour");
+
+    // D. THE WALKING PLAYER REACHED THE TOWN AND FOUND IT EMPTY.
+    ck(walk_trips >= 2,
+       "ARM WALK made " + sv(walk_trips) + " round trips to the settlement");
+    ck(walk_reach > 0,
+       "ARM WALK first stood on the green at tick " + sv(walk_reach));
+    ck(walk_npc == 0,
+       "there were " + sv(walk_npc) + " villagers to meet when it got there");
+    ck(walk_talk == 0,
+       "so it held " + sv(walk_talk) + " conversations in an hour");
+    ck(walk_trd == 0,
+       "and completed " + sv(walk_trd) + " trades");
+    ck(walk_own == 1,
+       "and came home with " + sv(walk_own) + " gun — the one it woke up with");
+
+    // E. >>> THE CAUSE. <<<  ONE WORD IN `sv_lan_gather`.
+    ck(post_lan == 1,
+       "the settlement's lantern feed holds " + sv(post_lan)
+       + " row after an hour: the Great Lantern, unlit");
+    ck(h_lan > post_lan,
+       "fed from `w.anim` instead, the SAME code finds " + sv(h_lan) + " lit lanterns");
+    // ...AND THE FIX ALONE IS NOT ENOUGH, WHICH IS THE OTHER HALF OF THE
+    // FINDING AND THE MORE EXPENSIVE HALF.  Six of the seven lanterns the
+    // opening script hands you stand ~280 m from the green, and lux falls off
+    // long before that, so the repaired feed still delivers only the Great
+    // Lantern's own contribution.
+    ck(h_lux == SET_CORE_VILLAGE / 2,
+       "even repaired, core lux is " + sv(h_lux) + " of the " + sv(SET_CORE_VILLAGE)
+       + " a Village needs");
+    ck(h_pts < SET_PTS_VILLAGE,
+       "and grid points are " + sv(h_pts) + " of " + sv(SET_PTS_VILLAGE));
+    ck(h_tier == SET_TIER_CAMP,
+       "so the town is STILL a Camp: tier " + sv(h_tier));
+    ck(h_vill_at < 0,
+       "it never becomes a Village at any point in the hour, repaired or not");
+    ck(h_npc == 0,
+       "and " + sv(h_npc) + " villagers ever arrive — a Camp has none");
+
+    // F. AND EVEN WITH A TOWN, THE VERB THAT GROWS IT IS BEHIND A WALL.
+    ck(npc_offer_kind(13) == NPC_OFF_KIT,
+       "row 13 is Wick's lantern kit — the only way to plant a new post");
+    ck(npc_offer_regard(13) == NPC_BAND_T_TRUSTED,
+       "it needs regard " + sv(npc_offer_regard(13)) + " (TRUSTED)");
+    ck(walk_regw == 0,
+       "an hour of walking to Wick's town every morning earns " + sv(walk_regw)
+       + " regard");
+    ck(walk_kits == 0 && post_lit == walk_lit,
+       "so the lamplighter lit exactly as many lanterns as the man who never left: "
+       + sv(walk_lit));
+
+    // G. THE SHOP'S OWN HONEST GAP.
+    ck(g_unbuilt == 9,
+       sv(g_unbuilt) + " of " + sv(NPC_OFF_ROWS) + " shop rows are NPC_OC_UNBUILT");
+    ck(npc_offer_class(15) == NPC_OC_UNBUILT && npc_offer_class(16) == NPC_OC_UNBUILT,
+       "contracts and the map are UNBUILT: there are no quests and nothing points anywhere");
+
+    // H. MONEY WITHOUT A SINK, AND HEALTH WITHOUT A TAP.
+    ck(post_purse > 100,
+       "the player ends the hour holding " + sv(post_purse)
+       + " salvage with nowhere to spend it");
+    ck(post_hp < 100,
+       "and on " + sv(post_hp) + " HP, with no regen (g_REGEN_RATE is read by nobody)"
+       + " and no soup (Odo needs a Village)");
+    ck(post_dth >= 0,
+       "player deaths in the hour: POST " + sv(post_dth));
+
+    // J. AND THE SIZE OF THE HOLE, IN POSTS.
+    ck(g_need_posts > 0,
+       "settle.hml wants " + sv(g_need_posts) + " lit posts on a " + f1(g_need_r)
+       + " m ring to call the place a Village");
+    ck(g_need_posts > 1,
+       "which is " + sv(g_need_posts) + " more than the game currently lets the player plant");
+
+    // -----------------------------------------------------------------------
+    print("");
+    if (g_n != g_PS_EXPECT) {
+        print("FAIL: ran " + sv(g_n) + " assertions, expected " + sv(g_PS_EXPECT));
+        exit(1);
+    }
+    if (g_ok != g_n) {
+        print("FAIL " + sv(g_ok) + " / " + sv(g_n));
+        exit(1);
+    }
+    print("PASS " + sv(g_ok) + " / " + sv(g_n));
+}
+
+main();

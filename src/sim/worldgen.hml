@@ -93,13 +93,17 @@
 // ===========================================================================
 // COST, MEASURED (hemlockc -O1, __clock min-of-7, this box is never idle)
 // ===========================================================================
-// 7 `vnoise` per sample x 81 samples = 567 lattice evaluations per chunk.
-//     worldgen_chunk   0.67 - 0.70 ms/chunk   compiled -O1, loaded
-//                      3.90 - 3.96 ms/chunk   interpreted
-//     worldgen_height  8.1 - 9.2 us/point     compiled -O1, loaded
+// A chunk is 81 samples of 7 octaves.  W7-4 replaced the per-sample `vnoise`
+// calls with the lattice table described above §"THE LATTICE TABLE":
+//     worldgen_chunk   0.111 ms/chunk         compiled -O1, loadavg 9.5
+//                      0.725 - 0.731 ms       the per-sample vnoise it replaced
+//     worldgen_height  8.1 - 9.2 us/point     compiled -O1, loaded  (unchanged:
+//                      the single-point entry points still call vnoise, because
+//                      one point touches one lattice cell and has nothing to
+//                      amortise)
 // The acceptance bar and `g_BUDGET_CHUNKGEN_MS` are both 2.0 ms, so a chunk
-// costs ~34 % of its per-frame allowance and a 5x5 ring can be built inside 25
-// frames without ever exceeding it.  There is no idle number for this box
+// now costs ~5.5 % of its per-frame allowance, down from ~34 %.
+// There is no idle number for this box
 // (CLAUDE.md §1.2); `probe_worldgen` §G re-measures and prints it every run and
 // scales its bound by an empty-loop calibration so the same assertion holds
 // interpreted.
@@ -502,13 +506,47 @@ export fn worldgen_poi_z(p_seed: i32, p_cx: i32, p_cz: i32): f64 {
 }
 
 // ===========================================================================
+// THE LATTICE TABLE — why this file no longer calls `vnoise` per sample
+// ===========================================================================
+// MEASURED, and it is the whole reason W7-4 exists.  `mathx.vnoise` costs
+// **1.18 us per call** compiled -O1 (567 calls = 0.668 ms of a 0.705 ms
+// chunk), and it is not the arithmetic: it is that **`u64` and `i64` locals
+// never unbox in hemlockc v2.9.1**.  `--emit-c` on mathx.hml shows every
+// `i64(x) & mask` compiled to `hml_parse_string_to_type` and every `*`, `^`,
+// `>>` on the u64 accumulator compiled to a boxed `hml_binary_op` dispatch
+// with a retain/release pair -- about fifty of them per call.  CLAUDE.md §4
+// A13 tells you to do hash mixing in u64 because `i32 * + -` THROW on
+// overflow; that advice is right for correctness and expensive for speed, and
+// nothing in the rules said so.  REPORTED IN THE W7-4 TASK SUMMARY with a
+// repro; docs/HEMLOCK_ISSUES.md is not this task's file, so no issue number is
+// claimed here -- do not cite one until it exists.
+//
+// `mathx.hml` is `src/core/**` and is not this task's file, so the fix here is
+// not to make one hash cheaper -- it is to STOP ASKING FOR THE SAME HASH OVER
+// AND OVER.  A value-noise sample interpolates the four corners of one lattice
+// cell.  Over a 32 m chunk sampled every 4 m, the coarse octaves have exactly
+// ONE lattice cell under the whole chunk (32/512 = 0.06 of a cell), so all 81
+// samples of that octave share the same four corners -- and the old code
+// hashed those same four corners 81 times.
+//
+// So each LATTICE POINT is now hashed exactly once per octave per chunk, into
+// a small table, and the 81 samples read it.  Same expressions, same operand
+// order, same IEEE result -- `probe_simcost` §A asserts the new path is
+// BIT-IDENTICAL to `vnoise` over 4096 chunks, and `probe_worldgen` and the
+// replay hash both pin it from the other side.
+//
+//     lattice hashes per chunk   2268  ->  54       (42x fewer)
+//     worldgen_chunk_at         0.725 ms -> 0.111 ms  (min-of-7, loadavg 9.5)
+//     the worst SIM TICK        1.444 ms -> 0.584 ms  (probe_simcost, headless)
+//
+// ===========================================================================
 // THE BATCHED FORM — one chunk into caller-owned buffers
 // ===========================================================================
-// THE hot function in this file: 81 samples x 7 vnoise.  No allocation, no
-// object literal, no closure, no `defer`, no `try`, no template string.  The
-// two field evaluations are inlined rather than called so that `t` and `m` are
-// computed ONCE per sample and shared by the height, the relief and the biome
-// — calling worldgen_height() and worldgen_biome() per sample would evaluate
+// The hot function in this file.  No allocation, no object literal, no
+// closure, no `defer`, no `try`, no template string.  The two field
+// evaluations are inlined rather than called so that `t` and `m` are computed
+// ONCE per sample and shared by the height, the relief and the biome —
+// calling worldgen_height() and worldgen_biome() per sample would evaluate
 // them twice, at +57 % cost.
 //
 // Returns the number of samples written (WG_CHUNK_SAMPLES), or 0 if either
@@ -521,6 +559,210 @@ export fn worldgen_chunk(p_seed: i32, p_cx: i32, p_cz: i32,
     if (bb.length < 81) { let bad2: i32 = 0; return bad2; }
     let n: i32 = wg_fill(p_seed, p_cx, p_cz, hb, 0, bb, 0, 0);
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// THE OCTAVE SCRATCH — CALLER-OWNED, ALLOCATED PER `wg_fill`, NEVER MODULE STATE
+// ---------------------------------------------------------------------------
+// A8 says "allocate every buffer once at startup", and the first version of
+// this did exactly that: six module-level `let g_wg_*` scratch arrays.
+// `probe_worldgen` §H4 failed it immediately -- "worldgen holds no mutable
+// top-level state -- 8 g_ globals" -- and H4 was right.
+//
+// H4 is not a style rule.  This file's contract, in its own header and in
+// CLAUDE.md §7, is that the world is a PURE FUNCTION OF A SEED: it is the
+// future dedicated server's terrain source, it must link headless, and it must
+// be reproducible and re-entrant.  A8 is a rule about PER-FRAME allocation
+// (N6); a chunk is generated about once a second while walking, so the
+// exemption A8 exists to grant does not apply here and the purity does.
+//
+// MEASURED both ways, min-of-7, because "it is probably free" is not a number:
+//     module-level scratch   0.110 ms/chunk
+//     per-call scratch       0.111 ms/chunk
+// against the 0.725 - 0.731 ms this replaced.  The seven allocations do not
+// register above run-to-run noise -- 676 `push`es once a second is nothing
+// next to 54 boxed u64 lattice hashes.  So the invariant cost nothing, and an
+// earlier draft of this comment claiming "+13 us, +12 %" was quoting a
+// measurement taken before the unboxing fixes below and was simply stale.
+//
+// The finest octave is 12 m and a chunk is 32 m, so a chunk spans at most
+// 32/12 = 2.67 lattice cells -> 4 distinct indices -> 5 lattice POINTS per
+// axis; WG_LAT_DIM 8 is that with margin.  `wg_field` falls back to a
+// per-sample `vnoise` if an octave ever exceeded it, so adding a finer octave
+// can cost speed but can NEVER silently corrupt terrain.
+export let WG_LAT_DIM: i32 = 8;
+
+fn wg_zeros(p_n: i32): array<f64> {
+    let a: array<f64> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0.0); i++; }
+    let o: array<f64> = a;
+    return o;
+}
+
+fn wg_zeros_i(p_n: i32): array<i32> {
+    let a: array<i32> = [];
+    let i: i32 = 0;
+    while (i < p_n) { a.push(0); i++; }
+    let o: array<i32> = a;
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// ONE OCTAVE OVER THE CHUNK'S 9x9 SAMPLE GRID -> `p_oct[p_off .. p_off+80]`
+// ---------------------------------------------------------------------------
+// BIT-IDENTICAL to `vnoise(wx, wz, p_cell, 0, p_seed)` at each of the 81
+// samples.  Every expression below is copied verbatim from `mathx.vnoise`'s
+// `wrap == 0` path in the same operand order, because f64 does not care WHEN
+// an operation happens but does care in what order:
+//
+//     inv = 1/cell ; b = floor(w*inv) ; t = w*inv - b ; s = t*t*(3 - 2*t)
+//     h   = cx + cy + hs ; three xorshift-multiply rounds ; * 2^-32
+//     a   = n00 + (n10 - n00)*sx ; b = n01 + (n11 - n01)*sx
+//     out = a + (b - a)*sy
+//
+// The ONE structural change is that `h` is evaluated per LATTICE POINT rather
+// than per sample.  `probe_simcost` §A is the assertion that this is true.
+//
+// `floor(w * inv)` is non-decreasing in w, so the lattice indices this chunk
+// touches are the contiguous run ix[0] .. ix[8] + 1 and a dense table is the
+// right shape -- no hashing, no probing, no eviction.
+//
+// The seven scratch arrays are the CALLER's (see the scratch note above).
+// A9b prices a Hemlock argument at ~10 ns, so seven extra arguments over seven
+// calls per chunk is ~0.5 us -- below the noise on a 0.111 ms chunk, and
+// measured to be so: the per-call version came out at 0.111 ms against the
+// module-global version's 0.110 ms.
+fn wg_field(p_ox: f64, p_oz: f64, p_cell: f64, p_seed: i32, p_off: i32,
+            p_oct: array<f64>, p_lat: array<f64>, p_step: array<f64>,
+            p_ixa: array<i32>, p_sxa: array<f64>,
+            p_iza: array<i32>, p_sza: array<f64>) {
+    let ox: f64 = p_ox;
+    let oz: f64 = p_oz;
+    let cell: f64 = p_cell;
+    let seed: i32 = p_seed;
+    let off: i32 = p_off;
+
+    let inv: f64 = 1.0 / cell;
+    let ixa: array<i32> = p_ixa;
+    let sxa: array<f64> = p_sxa;
+    let iza: array<i32> = p_iza;
+    let sza: array<f64> = p_sza;
+
+    // `bx`/`bz` are DECLARED-THEN-ASSIGNED (as `d` is in `wg_fill`): a
+    // `let bx: f64 = __floor(fx)` keeps the local BOXED, and `i32(bx)` on a
+    // boxed value compiles to `hml_parse_string_to_type`.  Verified with
+    // --emit-c both ways.
+    let step: array<f64> = p_step;
+    let i: i32 = 0;
+    while (i < 9) {
+        let bx: f64 = 0.0;
+        let bz: f64 = 0.0;
+        let wx: f64 = ox + step[i];
+        let fx: f64 = wx * inv;
+        bx = __floor(fx);
+        let tx: f64 = fx - bx;
+        ixa[i] = i32(bx);
+        sxa[i] = tx * tx * (3.0 - 2.0 * tx);
+
+        let wz: f64 = oz + step[i];
+        let fz: f64 = wz * inv;
+        bz = __floor(fz);
+        let tz: f64 = fz - bz;
+        iza[i] = i32(bz);
+        sza[i] = tz * tz * (3.0 - 2.0 * tz);
+        i++;
+    }
+
+    let ix0: i32 = ixa[0];
+    let iz0: i32 = iza[0];
+    let nx: i32 = ixa[8] - ix0 + 2;
+    let nz: i32 = iza[8] - iz0 + 2;
+    // `dim` is the lattice table's ROW STRIDE and it is read from the constant,
+    // never written as a literal.  `lat[a * dim + b]` and the `k + dim` /
+    // `k + dim + 1` neighbour reads below all depend on it, and a baked `8` in
+    // any one of them would survive a change to WG_LAT_DIM and silently
+    // interpolate the wrong corner -- CLAUDE.md's "grep for every place a
+    // global was baked into a literal", in a place where the symptom would be
+    // subtly wrong terrain rather than a crash.  `probe_simcost` §A pins it.
+    let dim: i32 = WG_LAT_DIM;
+    let cap: i32 = dim;
+    let oct: array<f64> = p_oct;
+
+    // The guard, not an assumption.  An octave fine enough to span more than
+    // WG_LAT_DIM - 1 lattice cells across a 32 m chunk takes the slow path and
+    // stays CORRECT.
+    if (nx > cap || nz > cap) {
+        let j2: i32 = 0;
+        while (j2 < 9) {
+            let wz2: f64 = oz + step[j2];
+            let r2: i32 = j2 * 9;
+            let i2: i32 = 0;
+            while (i2 < 9) {
+                oct[off + r2 + i2] = vnoise(ox + step[i2], wz2, cell, 0, seed);
+                i2++;
+            }
+            j2++;
+        }
+        return;
+    }
+
+    // ---- every lattice point this chunk touches, hashed exactly once -------
+    let lat: array<f64> = p_lat;
+    let ls: i64 = i64(seed) & 4294967295;
+    let hs: u64 = u64(ls) * 3266489917;
+    let a: i32 = 0;
+    while (a < nx) {
+        let lx: i64 = i64(ix0 + a) & 4294967295;
+        let cx: u64 = u64(lx) * 2654435761;
+        let b: i32 = 0;
+        while (b < nz) {
+            let ly: i64 = i64(iz0 + b) & 4294967295;
+            let cy: u64 = u64(ly) * 2246822519;
+            let h: u64 = cx + cy + hs;
+            h = (h ^ (h >> 15)) * 2246822507;
+            h = (h ^ (h >> 13)) * 3266489909;
+            h = (h ^ (h >> 16)) & 4294967295;
+            lat[a * dim + b] = f64(h) * 2.3283064365386963e-10;
+            b++;
+        }
+        a++;
+    }
+
+    // ---- 81 bilinear reads -------------------------------------------------
+    // >>> EVERY f64 READ OUT OF AN ARRAY IS DECLARED-THEN-ASSIGNED. <<<
+    // `let n00: f64 = lat[k];` compiles to `HmlValue n00 =
+    // hml_convert_to_type(..., HML_VAL_F64)` — CLAUDE.md §2's own signature
+    // for a BOXED local — and then all six lerp operations below become boxed
+    // `hml_binary_op` dispatches.  Declaring first and assigning second gives
+    // `double n00 = hml_to_f64(...)` and native arithmetic.  This loop runs
+    // 567 times per chunk and the difference is measured in §"COST" above.
+    let sy: f64 = 0.0;
+    let sx: f64 = 0.0;
+    let n00: f64 = 0.0;
+    let n10: f64 = 0.0;
+    let n01: f64 = 0.0;
+    let n11: f64 = 0.0;
+    let j: i32 = 0;
+    while (j < 9) {
+        let dz: i32 = iza[j] - iz0;
+        sy = sza[j];
+        let row: i32 = off + j * 9;
+        let i3: i32 = 0;
+        while (i3 < 9) {
+            let k: i32 = (ixa[i3] - ix0) * dim + dz;
+            sx = sxa[i3];
+            n00 = lat[k];
+            n10 = lat[k + dim];
+            n01 = lat[k + 1];
+            n11 = lat[k + dim + 1];
+            let av: f64 = n00 + (n10 - n00) * sx;
+            let bv: f64 = n01 + (n11 - n01) * sx;
+            oct[row + i3] = av + (bv - av) * sy;
+            i3++;
+        }
+        j++;
+    }
 }
 
 // The generator core.  Private: every public entry point routes through this
@@ -547,19 +789,54 @@ fn wg_fill(p_seed: i32, p_cx: i32, p_cz: i32,
     let ox: f64 = f64(p_cx) * 32.0;
     let oz: f64 = f64(p_cz) * 32.0;
 
+    // ---- the caller-owned scratch, for this call only ---------------------
+    let oct: array<f64> = wg_zeros(567);          // 7 octaves x 81 samples
+    let lat: array<f64> = wg_zeros(WG_LAT_DIM * WG_LAT_DIM);
+    let step: array<f64> = wg_zeros(9);           // sample offsets along an edge
+    let sxa: array<f64> = wg_zeros(9);
+    let sza: array<f64> = wg_zeros(9);
+    let ixa: array<i32> = wg_zeros_i(9);
+    let iza: array<i32> = wg_zeros_i(9);
+    let q0: i32 = 0;
+    while (q0 < 9) { step[q0] = f64(q0) * 4.0; q0++; }
+
+    // The seven octaves, each evaluated over the whole 9x9 grid with its
+    // lattice hashed once.  Order and salts are exactly the seven `vnoise`
+    // calls this loop used to make per sample.
+    wg_field(ox, oz, 512.0, st0,   0, oct, lat, step, ixa, sxa, iza, sza);  // ta
+    wg_field(ox, oz, 171.0, st1,  81, oct, lat, step, ixa, sxa, iza, sza);  // tb
+    wg_field(ox, oz, 448.0, sm0, 162, oct, lat, step, ixa, sxa, iza, sza);  // ma
+    wg_field(ox, oz, 149.0, sm1, 243, oct, lat, step, ixa, sxa, iza, sza);  // mb
+    wg_field(ox, oz,  96.0, s0,  324, oct, lat, step, ixa, sxa, iza, sza);  // n0
+    wg_field(ox, oz,  32.0, s1,  405, oct, lat, step, ixa, sxa, iza, sza);  // n1
+    wg_field(ox, oz,  12.0, s2,  486, oct, lat, step, ixa, sxa, iza, sza);  // n2
+
+    // Declared-then-assigned, for the reason spelled out in `wg_field`: a
+    // `let ta: f64 = oct[q];` inside the loop is a BOXED local and boxes every
+    // expression it feeds.
+    let ta: f64 = 0.0;
+    let tb: f64 = 0.0;
+    let ma: f64 = 0.0;
+    let mb: f64 = 0.0;
+    let n0: f64 = 0.0;
+    let n1: f64 = 0.0;
+    let n2: f64 = 0.0;
+    let fh: f64 = 0.0;
+    let d: f64 = 0.0;
     let j = 0;
     while (j < 9) {
-        let wz: f64 = oz + f64(j) * 4.0;
+        let wz: f64 = oz + step[j];
         let row: i32 = j * 9;
         let i = 0;
         while (i < 9) {
-            let wx: f64 = ox + f64(i) * 4.0;
+            let wx: f64 = ox + step[i];
+            let q: i32 = row + i;
 
-            let ta: f64 = vnoise(wx, wz, 512.0, 0, st0);
-            let tb: f64 = vnoise(wx, wz, 171.0, 0, st1);
+            ta = oct[q];
+            tb = oct[81 + q];
             let t: f64 = ta * 0.72 + tb * 0.28;
-            let ma: f64 = vnoise(wx, wz, 448.0, 0, sm0);
-            let mb: f64 = vnoise(wx, wz, 149.0, 0, sm1);
+            ma = oct[162 + q];
+            mb = oct[243 + q];
             let m: f64 = ma * 0.72 + mb * 0.28;
 
             // relief — hand-inlined worldgen_relief_tm (A9)
@@ -568,17 +845,22 @@ fn wg_fill(p_seed: i32, p_cx: i32, p_cz: i32,
             if (rr > 1.0) { rr = 1.0; }
             let rel: f64 = 0.40 + 1.30 * rr;
 
-            let n0: f64 = vnoise(wx, wz, 96.0, 0, s0);
-            let n1: f64 = vnoise(wx, wz, 32.0, 0, s1);
-            let n2: f64 = vnoise(wx, wz, 12.0, 0, s2);
+            n0 = oct[324 + q];
+            n1 = oct[405 + q];
+            n2 = oct[486 + q];
             let acc: f64 = (n0 - 0.5) * 0.48 * rel + (n1 - 0.5) * 0.30 + (n2 - 0.5) * 0.22;
             let h: f64 = 32.0 + 36.0 * acc;
 
-            let cm: i32 = floori(h * 100.0 + 0.5);
+            // A9: `floori` hand-inlined.  `mathx.floori` keeps its `f0` local
+            // BOXED (`let f0: f64 = __floor(x)`), so `i32(f0)` inside it goes
+            // through `hml_parse_string_to_type` — 81 times a chunk.  The
+            // declared-then-assigned form below is the same two operations
+            // with a native double in between, and gives the same i32.
+            fh = __floor(h * 100.0 + 0.5);
+            let cm: i32 = i32(fh);
             if (cm < 0) { cm = 0; }
             if (cm > 65535) { cm = 65535; }
 
-            let d: f64 = 0.0;                    // declared-then-assigned: unboxes
             d = __sqrt(wx * wx + wz * wz);
             let b: i32 = worldgen_biome_tmd(t, m, d);
 

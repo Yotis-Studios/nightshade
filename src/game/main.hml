@@ -58,7 +58,7 @@
 import { exit } from "@stdlib/process";
 import { getenv } from "@stdlib/env";
 import { make_dirs } from "@stdlib/fs";
-import { sin, cos, sqrt, floor, atan2, divi } from "@stdlib/math";
+import { sin, cos, sqrt, floor, atan2, tan, divi } from "@stdlib/math";
 
 // ---------------------------------------------------------------------------
 // the engine
@@ -142,7 +142,11 @@ import { g_RES_W, g_RES_H, g_HUD_TRI_CAP, g_TRIS_STEADY, g_FRAME_BUDGET_MS,
          g_WORLD_SEED_DEFAULT, g_DAY_TICKS, g_EYE_STAND, g_LOW_HP,
          g_BUDGET_SIM_MS, g_TICK_DT, g_ENEMY_WISP, g_ENEMY_MOTE,
          g_ENEMY_HUSK, g_LANTERN_R_T1, g_XP_LANTERN, g_LANTERN_CHANNEL_S,
-         g_EMIT_WORKERS }
+         g_EMIT_WORKERS,
+         // (the-lamp) "how dark is it", as a FUNCTION rather than as a number
+         // copied into three files. `world_render.hml`'s night veil and
+         // `tools/probe_night.hml` both drive off exactly these.
+         gate_darkness, fog_tint_luma, g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY }
        from "../core/config.hml";
 import { clamp01, lerpf, clampi, clampf } from "../core/mathx.hml";
 
@@ -151,7 +155,8 @@ import { pal_r, pal_g, pal_b, pal_pack,
          g_UI_GOOD, g_UI_XP, g_NS_CORE, g_NS_HALO, g_EMBER, g_LIGHTNING,
          g_WINDOW_LIGHT,
          g_GRASS_MID, g_GRASS_DRY, g_DIRT_MID, g_STONE_HI,
-         g_STONE_MID, g_SAND_LO, g_VENOM, g_VENOM_HALO, g_MUZZLE_CORE }
+         g_STONE_MID, g_SAND_LO, g_VENOM, g_VENOM_HALO, g_MUZZLE_CORE,
+         g_MUZZLE_MID }
        from "../art/palette.hml";
 import { tod_eval, tod_set_weather, tod_set_mist_band, tod_sky_keys,
          tod_lightning_active, tod_clock_hours,
@@ -185,7 +190,8 @@ import { hubgen_bind_atlas, hubgen_build_all, hubgen_bake_all,
          hubgen_dome_set, hubgen_dome_clear, hubgen_sky_slice
        } from "../art/hubgen.hml";
 import { settle_render_bind, settle_render_bind_atlas,
-         settle_render_bind_glow, settle_render_bind_cells,
+         settle_render_bind_glow, settle_render_bind_lamp,
+         settle_render_bind_cells,
          settle_render_bind_ground_rgb, settle_render_ground_build,
          settle_render_ground_push, settle_render_ground_bake,
          settle_render_ground_tris, settle_render_emit,
@@ -216,7 +222,11 @@ import { meshgen_mesh, meshgen_radius, meshgen_tris,
          meshgen_enemy_mesh, meshgen_set_sun_azimuth, meshgen_bake_all,
          MESH_TREE0, MESH_TREE1, MESH_TREE2, MESH_BUSH, MESH_ROCK,
          MESH_CRATE, MESH_BARREL, MESH_LANTERN, MESH_BLOB,
-         MESH_WISP0, MESH_LANTERN_VM }
+         MESH_WISP0, MESH_LANTERN_VM,
+         MG_LAMP_A_HAZE, MG_LAMP_A_BODY, MG_LAMP_A_CORE,
+         MG_LAMP_S_HAZE, MG_LAMP_S_BODY, MG_LAMP_S_CORE,
+         MG_LAMP_WIN_A_BODY, MG_LAMP_WIN_A_CORE,
+         MG_LAMP_WIN_M, MG_LAMP_WIN_CORE_F }
        from "../art/meshgen.hml";
 
 import { assets_build, assets_build_stage, assets_atlas, assets_tex,
@@ -965,6 +975,84 @@ fn fx_push(p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_cell: i32,
     world_fx_add(p_x, p_y, p_z, p_s, p_cell, p_kind, p_r, p_g, p_b, p_a);
 }
 
+// ===========================================================================
+//  THE WORLD LAMP FLAME — the viewmodel's construction, moved into the world
+// ---------------------------------------------------------------------------
+//  THE ARITHMETIC THAT KEPT THIS FROM WORKING FOR FOUR WAVES, in one line.
+//  ATLAS_FX is BLEND_ADD, so a card contributes `texel * tint * alpha / 255^2`
+//  and its luminance CEILING is `Rec709(tint) * alpha / 255`, whatever the
+//  texture does.  `tools/probe_nightanchor.hml` [9] pins the table:
+//
+//      g_UI_AMBER      (255,196, 68)   199.30   <- under the bar AT ALPHA 255
+//      g_EMBER         (255,138, 42)   155.86   <- under the bar at alpha 255
+//      g_WINDOW_LIGHT  (255,216,160)   220.25   <- ON the bar, only at 255
+//      g_MUZZLE_MID    (255,196, 74)   199.73   <- under the bar at alpha 255
+//      g_MUZZLE_CORE   (255,248,220)   247.47   <- 27 OVER the bar
+//
+//  The shipping Great Lantern was WINDOW_LIGHT at alpha 210: ceiling 181.4,
+//  thirty-nine short, and no card size, no cell edit and no gain could have
+//  moved it.  AN AMBER CANNOT BE AN ANCHOR — which is exactly what
+//  `src/art/meshgen.hml`'s viewmodel flame wrote down after hitting the same
+//  wall, and it solved it the way a real flame is shaped: A NEARLY WHITE CORE
+//  WITH THE AMBER LIVING IN THE FALLOFF AROUND IT.  This is that, in the world.
+//
+//  THREE CARDS, SMALLEST LAST:
+//
+//      haze  EMBER       a 76   size 1.90 s   ceiling  46.4    the air
+//      body  MUZZLE_MID  a132   size 1.00 s   ceiling 103.4    the falloff
+//      core  MUZZLE_CORE a255   size 0.62 s   ceiling 247.5    THE ANCHOR
+//
+//  The two amber cards sum to 149.8 where BOTH are saturated, which is 70
+//  under the bar — so the falloff is frankly amber and frankly under 220, and
+//  ONLY the core clears it.  That is the whole difference between a lamp and
+//  the "hard white square" `src/art/fxgen.hml` records as the fifth time this
+//  rule was gamed: the bright region is bounded by the SMALLEST card, not the
+//  biggest, and everything around it is warm.
+//
+//  WHY FX AND NOT AN EMISSIVE WORLD MATERIAL.  Vertex colour can only darken
+//  (CLAUDE.md §6) and `world_render.hml`'s night veil multiplies the world down
+//  through exactly that channel, so a flame built as world geometry goes dark
+//  with the hillside it is supposed to be lighting.  The viewmodel is exempt
+//  because it draws at depth 0.05 with fog f = 0; a world lamp is not.  The FX
+//  layer is additive, so the veil cannot touch it — it is the only surface in
+//  this renderer that can be brighter than the night it stands in.
+//
+//  WHAT IT STILL PAYS.  `fx.hml` attenuates every sprite's alpha by
+//  `1 - fog * 0.85`, so the ceiling above is a NEAR-FIELD ceiling: at 15 m
+//  through the settlement's 56 m fog that costs about 5 %, and past ~35 m the
+//  core stops clearing 220 at all.  That is correct — a lamp you can barely see
+//  through half a kilometre of night air should not be anchoring the frame —
+//  and it is measured in the task report rather than hidden.
+// ===========================================================================
+// The ladder itself lives in `src/render/settle_render.hml` -- ONE definition,
+// read by the Great Lantern here, by the town's windows there, and by
+// `tools/probe_nightanchor.hml` [10], which cannot import this file.
+// The Great Lantern's glow scale.  `s` is the BODY card's diameter in metres.
+let g_LAMP_S_GREAT: f64 = 3.60;
+// The lamp head, in metres above the post's base.  `build_lantern` puts the
+// lamp box at local y 2.52 and `world_prop_add` places the post at scale 1.25,
+// so the flame belongs at 3.15 m.  THE SHIPPING CARD WAS AT 1.20 m — halfway
+// down the pole, a glow with no lamp in it, which is its own answer to "the
+// lamp post is a silhouette".
+let g_LAMP_HEAD_M: f64 = 3.15;
+
+fn lamp_flame_push(p_x: f64, p_y: f64, p_z: f64, p_s: f64, p_lit: f64) {
+    let s: f64 = p_s;
+    let f: f64 = clamp01(p_lit);
+    if (f <= 0.004) { return; }
+    // Submission order is paint order inside one depth bucket, so the core goes
+    // LAST and nothing amber is laid over the near-white.
+    fx_push(p_x, p_y, p_z, s * MG_LAMP_S_HAZE, FX_GLOW_L, g_FXK_SPRITE,
+            pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER),
+            clampi(i32(MG_LAMP_A_HAZE * f), 0, 255));
+    fx_push(p_x, p_y, p_z, s * MG_LAMP_S_BODY, FX_GLOW_L, g_FXK_SPRITE,
+            pal_r(g_MUZZLE_MID), pal_g(g_MUZZLE_MID), pal_b(g_MUZZLE_MID),
+            clampi(i32(MG_LAMP_A_BODY * f), 0, 255));
+    fx_push(p_x, p_y, p_z, s * MG_LAMP_S_CORE, FX_GLOW_L, g_FXK_SPRITE,
+            pal_r(g_MUZZLE_CORE), pal_g(g_MUZZLE_CORE), pal_b(g_MUZZLE_CORE),
+            clampi(i32(MG_LAMP_A_CORE * f), 0, 255));
+}
+
 // ---------------------------------------------------------------------------
 // THE ENTITY PASS — the only place a body reaches the picture.
 // ---------------------------------------------------------------------------
@@ -1090,12 +1178,31 @@ fn settlement_push() {
     settle_render_ground_build(st);
     settle_render_ground_push(st);
 
-    // How lit the world is, for the window glow cards. `tod` owns the night
-    // and this is its answer, not a second one.
-    let night: f64 = 0.0;
-    let dt2: f64 = g_day_t;
-    if (dt2 < 0.22 || dt2 > 0.78) { night = 1.0; }
-    else if (dt2 < 0.30 || dt2 > 0.70) { night = 0.6; }
+    // ---- HOW LIT THE WORLD IS, for the window glow cards -----------------
+    // THIS USED TO BE A THREE-STEP LADDER ON THE RAW DAY FRACTION:
+    //
+    //     if (dt2 < 0.22 || dt2 > 0.78) night = 1.0;
+    //     else if (dt2 < 0.30 || dt2 > 0.70) night = 0.6;
+    //
+    // and it is wrong at the one hour everything else in this project is
+    // graded at.  22:00 is day fraction 0.6875 — under BOTH thresholds — so
+    // `night` came out **0.0 and the town's windows were completely unlit at
+    // ten at night**.  The comment above it said "`tod` owns the night and
+    // this is its answer, not a second one", which was the right instinct and
+    // exactly what the code did not do: 0.22 / 0.30 / 0.70 / 0.78 are a second
+    // opinion about darkness, invented here, agreeing with nothing.
+    //
+    // The real answer already exists and has one definition:
+    // `src/core/config.hml`'s `gate_darkness(fog_tint_luma(...))`, which is
+    // what `world_render.hml`'s NIGHT VEIL runs on and what
+    // `tools/probe_night.hml` asserts.  The town now lights its windows on
+    // exactly the curve the world darkens on — they cannot disagree, and dusk
+    // is a smoothstep instead of two steps.
+    let e2: array<f64> = frame_env();
+    let night: f64 = gate_darkness(fog_tint_luma(env_field(e2, ENV_FOG_R),
+                                                 env_field(e2, ENV_FOG_G),
+                                                 env_field(e2, ENV_FOG_B)),
+                                   g_VEIL_GATE_NIGHT, g_VEIL_GATE_DAY);
 
     settle_render_emit(st, g_camx, g_camz, g_fog_far, night);
     g_settle_tris = settle_render_stats(SR_STAT_SUBMITTED)
@@ -1241,9 +1348,11 @@ fn world_rebuild(p_dt: f64, p_t: f64) {
     if (g_villagers_drawn > g_villagers_peak) { g_villagers_peak = g_villagers_drawn; }
     client_fx_push();
 
-    // The lantern's own glow. Unlit it is a dim ember on the post -- enough to
-    // be "the brightest object on screen" against a dusk hillside without
-    // lying about it being lit; lit it is the big one.
+    // The lantern's own light. Unlit it is a dim ember on the wick -- enough to
+    // be findable against a dusk hillside without lying about it being lit; lit
+    // it is the FLAME, and the flame is the frame's anchor. See
+    // `lamp_flame_push` for the ceiling arithmetic and for why it is three
+    // cards rather than one bigger one.
     let lit: i32 = client_lantern_lit(g_cl);
     let lx: f64 = server_lantern_x(g_sv);
     let lz: f64 = server_lantern_z(g_sv);
@@ -1251,11 +1360,46 @@ fn world_rebuild(p_dt: f64, p_t: f64) {
     let ddx: f64 = lx - g_camx; let ddz: f64 = lz - g_camz;
     if (ddx * ddx + ddz * ddz < far * far) {
         if (lit == 1) {
-            fx_push(lx, ly + 1.2, lz, 3.4, FX_GLOW_L, g_FXK_SPRITE,
-                    pal_r(g_WINDOW_LIGHT), pal_g(g_WINDOW_LIGHT),
-                    pal_b(g_WINDOW_LIGHT), 210);
+            lamp_flame_push(lx, ly + g_LAMP_HEAD_M, lz, g_LAMP_S_GREAT, 1.0);
+            // ---- THE POOL ON THE GROUND: TRIED, MEASURED, AND REMOVED -----
+            // A lamp that glows but lights nothing is a sticker, so the obvious
+            // companion to the flame is a flat additive disc of light on the
+            // grass: `fx_push(lx, ly + 0.06, lz, 7.0, FX_GLOW_L, g_FXK_GROUND,
+            // EMBER, 84)`. It is written out here rather than left as an idea
+            // because it DOES NOT WORK TODAY and the reason is worth knowing.
+            //
+            // `src/render/world_render.hml`'s `lantern_pool_emit` already
+            // carries the diagnosis, in its own words: "`p_rgb` IS
+            // `r | g<<8 | b<<16`. emit.hml's `emit_tri_world` reads it that way
+            // (`br = rgb & 255`), and `src/render/fx.hml` packs its ground card
+            // the OTHER way round, `(r<<16) | (g<<8) | b`. That is a real bug in
+            // fx.hml -- a warm lantern comes out cyan -- and it has been
+            // invisible for exactly the reason above: THE CARD IT PACKS HAS
+            // NEVER ONCE BEEN DRAWN." This call site would have been the first
+            // caller ever to draw one.
+            //
+            // MEASURED with it in, LIT frame at yaw 270, the 65 x 22 px ground
+            // patch under the post: (20.0, 30.1, 12.7). Not warmer, and not
+            // BLUER either -- so on this evidence the card is not reaching the
+            // screen at all, over and above the channel swap that would have
+            // made it cyan if it had. Two defects in one path, in a file this
+            // task does not own. Reported, not worked around: pre-swapping the
+            // channels here would turn cyan into warm today and warm into cyan
+            // the day fx.hml is fixed.
+            //
+            // The light on the surroundings therefore comes from the DYNAMIC
+            // LIGHT below, which is the mechanism the night model was built
+            // for: `terrain = bake * min(1, veil + SUM lights) * fog`, so a
+            // light does not add brightness, it gives the ground back the
+            // brightness the veil took. Its measured before/after is in the
+            // task report and it is what `--anchorscan` prints.
         } else {
-            fx_push(lx, ly + 1.2, lz, 1.1, FX_GLOW_S, g_FXK_SPRITE,
+            // Was FX_GLOW_S -- the NIGHTSHADE BLOOM cell, which fxgen.hml's own
+            // declaration marks "violet, NOT tint-neutral". An amber tint on a
+            // violet texel is a muddy mauve, and CLAUDE.md §8 guards violet
+            // harder than any other rule. FX_GLOW_L is the neutral card and is
+            // what every other warm light in this file already uses.
+            fx_push(lx, ly + g_LAMP_HEAD_M, lz, 0.9, FX_GLOW_L, g_FXK_SPRITE,
                     pal_r(g_EMBER), pal_g(g_EMBER), pal_b(g_EMBER), 150);
         }
     }
@@ -1277,7 +1421,7 @@ fn world_rebuild(p_dt: f64, p_t: f64) {
     let env: array<f64> = frame_env();
     env_clear_lights(env);
     if (lit == 1 && ddx * ddx + ddz * ddz < 3600.0) {
-        env_add_light(env, lx, ly + 1.2, lz,
+        env_add_light(env, lx, ly + g_LAMP_HEAD_M, lz,
                       f64(pal_r(g_WINDOW_LIGHT)) / 255.0 * 2.4,
                       f64(pal_g(g_WINDOW_LIGHT)) / 255.0 * 2.4,
                       f64(pal_b(g_WINDOW_LIGHT)) / 255.0 * 2.4, 11.0);
@@ -2466,6 +2610,16 @@ fn boot_assets() {
     // records that the first build of its shot harness made exactly that
     // mistake and every window came back magenta.
     settle_render_bind_glow(FX_GLOW_L, g_UI_AMBER);
+    // ...and the near-white CORE that makes a lit window an anchor. UI_AMBER's
+    // own Rec.709 luminance is 199.30, so the amber card above cannot reach 220
+    // at any alpha -- see `settle_render_bind_lamp`'s header and
+    // `tools/probe_nightanchor.hml` [9]. MUZZLE_CORE (247.47) is the palette's
+    // only near-white and it is the same colour the viewmodel's flame uses,
+    // which is deliberate: the lamp in your hand and the lamp in the window
+    // are the same fire.
+    settle_render_bind_lamp(g_MUZZLE_CORE, MG_LAMP_WIN_A_BODY,
+                            MG_LAMP_WIN_A_CORE, MG_LAMP_WIN_M,
+                            MG_LAMP_WIN_CORE_F);
     settle_render_bind_cells(CELL_COBBLE, CELL_PATH, CELL_DIRT, CELL_RUBBLE);
     settle_render_bind_ground_rgb(g_STONE_MID, g_SAND_LO, g_STONE_HI);
     spellfx_bind();
@@ -3340,6 +3494,9 @@ fn usage() {
     print("                    0 or 1 = serial, which is byte-identical output");
     print("                    and the no-threads path. Clamped to 12.");
     print("  --selftest        headless smoke test; exits 0 on pass");
+    print("  --anchorscan <h>  headless: the 8-yaw night-anchor table at hour h,");
+    print("                    measured UNLIT then LIT, HUD and viewmodel off.");
+    print("                    Add --shots <dir> to write the 16 frames.");
     print("  --at-town         DEV: start standing in the settlement");
     print("  --demo-ui         DEV: with --demo, open both modal panels on a");
     print("                    timer so their triangle cost is MEASURED");
@@ -3368,6 +3525,424 @@ let g_at_town: i32 = 0;      // DEV: wake up on the green instead of the ridge
 let g_at_town_yaw: f64 = 1.0e30;
 let g_demo_ui: i32 = 0;
 let g_demo_ui_t0: f64 = 1.0e30;
+
+// ===========================================================================
+//  THE NIGHT-ANCHOR SCAN — `--anchorscan H`
+// ---------------------------------------------------------------------------
+//  FOUR WAVES MEASURED THE 8-YAW ANCHOR TABLE BY HAND, ON A REAL DISPLAY, WITH
+//  A HUMAN DRIVING THE GAME.  That is why every one of them reported a slightly
+//  different set of yaws, and why nobody could re-run the previous wave's
+//  number to see whether their change had moved it.  This is that measurement,
+//  IN THE SHIPPING BINARY, headless and reproducible:
+//
+//      SDL_VIDEODRIVER=dummy ./build/nightshade --anchorscan 22 --headless \
+//          --no-audio --shots /tmp/scan
+//
+//  It stands the player `g_SCAN_R` metres from the Great Lantern, turns through
+//  eight yaws, renders each one with the HUD and the viewmodel off BY THE
+//  GAME'S OWN SWITCHES (`g_hud_on = 0`, `g_vm_mode = 0` — the same variables the
+//  H and the `--vm` flag write), and reports the largest 8-connected component
+//  at or above Rec.709 luminance 220.  Then it walks to the post, holds E until
+//  the authority says the lantern is lit, walks back to the same spot, and does
+//  it again.  Before and after, same binary, same seed, same camera.
+//
+//  >>> WHAT IT CANNOT DO, STATED PLAINLY.  It cannot tell SKY from WORLD: the
+//  >>> renderer has no layer id in the framebuffer and this file may not add one
+//  >>> to `world_render.hml`.  So it reports each component's MEAN COLOUR and
+//  >>> its bounding box, and the attribution rule is chromatic and is stated
+//  >>> here rather than hidden in a threshold:
+//  >>>
+//  >>>     MOON_DISC   (220,228,240)   r - b = -20   COOL
+//  >>>     STAR_BRIGHT (255,255,240)   r - b = +15   NEUTRAL
+//  >>>     MUZZLE_CORE (255,248,220)   r - b = +35   WARM   <- a flame
+//  >>>
+//  >>> A component whose mean `r - b` is at or above `g_SCAN_WARM` is a lamp;
+//  >>> anything else is the sky's business.  Every table in the task report was
+//  >>> then CHECKED BY LOOKING at the PNG the same run wrote.
+// ===========================================================================
+let g_scan: i32 = 0;
+let g_scan_h: f64 = 22.0;
+let g_scan_t: f64 = 0.0;
+let g_SCAN_R: f64 = 15.0;        // metres from the Great Lantern
+let g_SCAN_TH: f64 = 220.0;      // ART_BIBLE §8's bar
+let g_SCAN_WARM: f64 = 24.0;     // mean r - b that separates a flame from a star
+let g_SCAN_YAWS: i32 = 8;
+
+// Flood-fill scratch, allocated once (A8/N6).  16 scans over 57 600 px.
+let g_sc_lab: array<i32> = [];
+let g_sc_stk: array<i32> = [];
+// [0] size  [1] x0 [2] y0 [3] x1 [4] y1  [5] mean r  [6] mean g  [7] mean b
+let g_sc_out: array<f64> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+fn scan_hours_unwrapped(p_t: f64): f64 {
+    let h: f64 = tod_clock_hours(p_t);
+    if (h < 5.5) { h = h + 24.0; }
+    let out: f64 = h;
+    return out;
+}
+
+// tod.hml is authored on a day FRACTION; the table above is in hours.  Same
+// bisection `tools/shot.hml` uses, for the same reason, so the two harnesses
+// cannot disagree about what 22:00 is.
+fn scan_t_from_hours(p_hours: f64): f64 {
+    let want: f64 = p_hours;
+    while (want < 0.0) { want = want + 24.0; }
+    while (want >= 24.0) { want = want - 24.0; }
+    if (want < 5.5) { want = want + 24.0; }
+    let lo: f64 = 0.0;
+    let hi: f64 = 1.0;
+    for (let i = 0; i < 44; i++) {
+        let mid: f64 = (lo + hi) * 0.5;
+        if (scan_hours_unwrapped(mid) < want) { lo = mid; } else { hi = mid; }
+    }
+    let out: f64 = (lo + hi) * 0.5;
+    return out;
+}
+
+// `g_fb` is the engine readback buffer and its byte order is B, G, R, A — the
+// same order `framebuffer_to_rgb` above unpacks.  Getting this backwards makes
+// every warm object read cool and every attribution wrong, so it is read
+// through one function and nowhere else.
+fn scan_lum(p_o: i32): f64 {
+    let b: f64 = f64(ptr_deref_u8(ptr_offset(g_fb, p_o, 1)));
+    let g: f64 = f64(ptr_deref_u8(ptr_offset(g_fb, p_o + 1, 1)));
+    let r: f64 = f64(ptr_deref_u8(ptr_offset(g_fb, p_o + 2, 1)));
+    let out: f64 = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return out;
+}
+
+// The largest 8-connected component at or above `g_SCAN_TH`, and — separately —
+// the largest WARM one.  `p_warm_only` selects which.  Returns the size and
+// fills `g_sc_out`.
+fn scan_blob(p_warm_only: i32): i32 {
+    let w: i32 = g_RES_W;
+    let h: i32 = g_RES_H;
+    let n: i32 = w * h;
+    while (g_sc_lab.length < n) { g_sc_lab.push(0); }
+    while (g_sc_stk.length < n) { g_sc_stk.push(0); }
+    for (let i = 0; i < n; i++) { g_sc_lab[i] = 0; }
+    let best: i32 = 0;
+    for (let k = 0; k < 8; k++) { g_sc_out[k] = 0.0; }
+    for (let sy = 0; sy < h; sy++) {
+        for (let sx = 0; sx < w; sx++) {
+            let s0: i32 = sy * w + sx;
+            if (g_sc_lab[s0] != 0) { continue; }
+            if (scan_lum(s0 * 4) < g_SCAN_TH) { g_sc_lab[s0] = 2; continue; }
+            // flood
+            let top: i32 = 0;
+            g_sc_stk[top] = s0; top = 1;
+            g_sc_lab[s0] = 1;
+            let cnt: i32 = 0;
+            let bx0: i32 = w; let by0: i32 = h; let bx1: i32 = 0; let by1: i32 = 0;
+            let ar: f64 = 0.0; let ag: f64 = 0.0; let ab: f64 = 0.0;
+            while (top > 0) {
+                top = top - 1;
+                let c: i32 = g_sc_stk[top];
+                let cy: i32 = divi(c, w);
+                let cx: i32 = c - cy * w;
+                cnt++;
+                if (cx < bx0) { bx0 = cx; }
+                if (cx > bx1) { bx1 = cx; }
+                if (cy < by0) { by0 = cy; }
+                if (cy > by1) { by1 = cy; }
+                let o: i32 = c * 4;
+                ab = ab + f64(ptr_deref_u8(ptr_offset(g_fb, o, 1)));
+                ag = ag + f64(ptr_deref_u8(ptr_offset(g_fb, o + 1, 1)));
+                ar = ar + f64(ptr_deref_u8(ptr_offset(g_fb, o + 2, 1)));
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        let nx: i32 = cx + dx;
+                        let ny: i32 = cy + dy;
+                        if (nx < 0 || ny < 0 || nx >= w || ny >= h) { continue; }
+                        let ni: i32 = ny * w + nx;
+                        if (g_sc_lab[ni] != 0) { continue; }
+                        if (scan_lum(ni * 4) < g_SCAN_TH) { g_sc_lab[ni] = 2; continue; }
+                        g_sc_lab[ni] = 1;
+                        g_sc_stk[top] = ni; top = top + 1;
+                    }
+                }
+            }
+            let fc: f64 = f64(cnt);
+            let mr: f64 = ar / fc; let mg: f64 = ag / fc; let mb: f64 = ab / fc;
+            if (p_warm_only == 1 && mr - mb < g_SCAN_WARM) { continue; }
+            if (cnt > best) {
+                best = cnt;
+                g_sc_out[0] = fc;
+                g_sc_out[1] = f64(bx0); g_sc_out[2] = f64(by0);
+                g_sc_out[3] = f64(bx1); g_sc_out[4] = f64(by1);
+                g_sc_out[5] = mr; g_sc_out[6] = mg; g_sc_out[7] = mb;
+            }
+        }
+    }
+    let out: i32 = best;
+    return out;
+}
+
+// The GROUND BAND, rows 112..139 of the 180-row frame: the strip the night
+// inversion has been graded on since the veil landed.  It is the answer to
+// "does the dark visibly MOVE when the player lights something" -- an anchor
+// that lights nothing is a sticker, and this is the number that tells them
+// apart.  Mean Rec.709 over the band, no masking (the HUD and viewmodel are
+// off by the game's own switches).
+fn scan_band(): f64 {
+    let w: i32 = g_RES_W;
+    let acc: f64 = 0.0;
+    let n: i32 = 0;
+    for (let y = 112; y < 140; y++) {
+        for (let x = 0; x < w; x++) {
+            acc = acc + scan_lum((y * w + x) * 4);
+            n++;
+        }
+    }
+    let out: f64 = acc / f64(n);
+    return out;
+}
+
+fn scan_tick(p_n: i32) {
+    for (let k = 0; k < p_n; k++) {
+        client_send_command(g_cl, g_tick);
+        server_tick(g_sv, g_tick);
+        client_apply(g_cl, server_snapshot(g_sv), server_local(g_sv), g_tick);
+        g_tick++;
+        client_frame(g_cl, 0.016666666666666666, g_tick);
+    }
+}
+
+// One rendered frame at a fixed yaw.  The clock is PINNED: `g_day_t` is
+// overwritten after `client_build_render` and before `frame_once`, which is the
+// same place `tod_step` reads it, so the picture is at `--anchorscan H`
+// regardless of how many ticks the walk to the post took.
+fn scan_render(p_yaw_rad: f64) {
+    client_set_angles(g_cl, p_yaw_rad, 0.0);
+    // `view_set_angles` writes AIM; `view_render_yaw` reads RENDER, and only
+    // `client_frame` copies one to the other.  The first version of this
+    // function skipped it, and all eight yaws rendered the SAME picture --
+    // sixteen byte-identical PNGs that would have been read as "the change did
+    // nothing" or, worse, "the change worked at every yaw".
+    client_frame(g_cl, 0.016666666666666666, g_tick);
+    client_build_render(g_cl, 0.0);
+    g_camx = client_cam_x(g_cl);
+    g_camy = client_cam_y(g_cl);
+    g_camz = client_cam_z(g_cl);
+    g_yaw_deg = client_cam_yaw(g_cl) / g_D2R;
+    g_pitch_deg = client_cam_pitch(g_cl) / g_D2R;
+    g_fov = client_cam_fov(g_cl);
+    g_ground_y = client_py(g_cl);
+    g_day_t = g_scan_t;
+    frame_once(0.016666666666666666, 0.0);
+}
+
+// ⚠ THE SKY MUST BE FULLY RE-BAKED BEFORE A PHASE IS MEASURED.  `frame_once`
+// walks ONE panorama slice per frame, so a phase measured 60 frames after the
+// clock was pinned is measured against a HALF-BAKED sky.  The first run of this
+// scan reported 0 px at yaw 135 in the UNLIT phase and 863 px at the same yaw in
+// the LIT phase, and the difference was not the lantern at all -- it was 1800
+// extra frames of sky bake putting the moon on screen.  `sky_now` is the
+// game's own drain-to-completion, the same call `run_loop` primes with.
+fn scan_settle(p_yaw_rad: f64, p_frames: i32) {
+    for (let k = 0; k < p_frames; k++) { scan_render(p_yaw_rad); }
+    sky_now();
+    for (let k = 0; k < 3; k++) { scan_render(p_yaw_rad); }
+}
+
+// Put the player at (x, z) and let everything that settles, settle: the sim's
+// own landing, the chunk ring, the light bake and the sky.  ONE function, so
+// the two phases cannot arrive by different routes.
+// ⚠ IT TELEPORTS UNTIL THE CAMERA IS ACTUALLY THERE, AND SAYS WHERE IT ENDED.
+// One `server_teleport` is not enough: the FIRST one after the opening does not
+// take -- the phase-A camera stayed at the spawn (0, -280) while phase B landed
+// correctly at (-21.9, -264.7), and the two "before/after" tables were therefore
+// photographed 22 m apart from different hillsides. The retry is not a
+// workaround for a game bug; it is a probe refusing to report a number it has
+// not checked. The final position is PRINTED so a reader can see the two phases
+// stood in the same place.
+fn scan_stand_at(p_x: f64, p_z: f64) {
+    let tries: i32 = 0;
+    while (tries < 6) {
+        server_teleport(g_sv, p_x, p_z);
+        scan_tick(90);
+        scan_render(0.0);
+        let ex: f64 = g_camx - p_x;
+        let ez: f64 = g_camz - p_z;
+        tries++;
+        if (ex * ex + ez * ez < 4.0) { tries = 6; }
+    }
+    scan_settle(0.0, 90);
+    let dx: f64 = g_camx - p_x;
+    let dz: f64 = g_camz - p_z;
+    print(`    standing at ${f1(g_camx)}, ${f1(g_camz)}  (wanted ${f1(p_x)}, ${f1(p_z)}, off by ${f1(sqrt(dx * dx + dz * dz))} m)  eye ${f1(g_camy)}  ground ${f1(g_ground_y)}  fov ${f1(g_fov)}  fog ${i32(g_fog_far)} m`);
+}
+
+fn scan_png(p_tag: string) {
+    if (g_shot_dir.length == 0) { return; }
+    let img: buffer = framebuffer_to_rgb();
+    write_png(`${g_shot_dir}/anchor_${p_tag}.png`, img, g_RES_W, g_RES_H);
+}
+
+// Is the Great Lantern inside the frame at this yaw?  The bar is conditional —
+// "every yaw where a lit lamp is in frame" — so the condition has to be
+// computed rather than eyeballed.  Horizontal half-fov from the SHIPPING
+// vertical fov and the shipping aspect, which is the only correct way to get it
+// at 16:9 (the 4:3 assumption is what shipped the moon clipped).
+fn scan_lamp_in_frame(p_yaw_rad: f64): i32 {
+    let bx: f64 = server_lantern_x(g_sv) - g_camx;
+    let bz: f64 = server_lantern_z(g_sv) - g_camz;
+    let bearing: f64 = atan2(bx, 0.0 - bz);
+    let d: f64 = bearing - p_yaw_rad;
+    while (d > 3.141592653589793) { d = d - 6.283185307179586; }
+    while (d < -3.141592653589793) { d = d + 6.283185307179586; }
+    if (d < 0.0) { d = 0.0 - d; }
+    let halfv: f64 = g_fov * 0.5 * g_D2R;
+    let halfh: f64 = atan2(tan(halfv) * f64(g_RES_W) / f64(g_RES_H), 1.0);
+    let out: i32 = 0;
+    if (d <= halfh) { out = 1; }
+    return out;
+}
+
+fn scan_phase(p_label: string): i32 {
+    print("");
+    print(`  --- ${p_label} --------------------------------------------------`);
+    print("   yaw   in-frame   largest>=220   warmest>=220   band112..139   bbox            mean rgb");
+    let anchored: i32 = 0;
+    for (let y = 0; y < g_SCAN_YAWS; y++) {
+        let yd: f64 = f64(y) * 360.0 / f64(g_SCAN_YAWS);
+        let yr: f64 = yd * g_D2R;
+        scan_settle(yr, 3);
+        frame_set_capture(1);
+        scan_render(yr);
+        frame_set_capture(0);
+        let big: i32 = scan_blob(0);
+        let bx0: i32 = i32(g_sc_out[1]); let by0: i32 = i32(g_sc_out[2]);
+        let bx1: i32 = i32(g_sc_out[3]); let by1: i32 = i32(g_sc_out[4]);
+        let mr: i32 = i32(g_sc_out[5]); let mg: i32 = i32(g_sc_out[6]);
+        let mb: i32 = i32(g_sc_out[7]);
+        let warm: i32 = scan_blob(1);
+        let band: f64 = scan_band();
+        let inf: i32 = scan_lamp_in_frame(yr);
+        if (warm >= 40) { anchored++; }
+        print(`   ${i32(yd)}\t   ${inf}\t      ${big}\t     ${warm}\t    ${f1(band)}\t       ${bx0},${by0}..${bx1},${by1}\t  ${mr},${mg},${mb}`);
+        scan_png(`${p_label}_y${i32(yd)}`);
+    }
+    let out: i32 = anchored;
+    return out;
+}
+
+// Walk to the post and hold E, the way the game asks the player to.  This is
+// NOT a cheat that sets `lantern_lit`: the authority lights it, on the same
+// hold timer a human pays, or this function reports that it could not.
+fn scan_light_the_lantern(): i32 {
+    let lx: f64 = server_lantern_x(g_sv);
+    let lz: f64 = server_lantern_z(g_sv);
+    server_teleport(g_sv, lx + 1.2, lz);
+    scan_tick(12);
+    client_set_angles(g_cl, atan2(0.0 - 1.2, 0.0), 0.0);
+    // ⚠ E IS PRESSED EVERY TICK, NOT ONCE.  `client_set_button` RETURNS EARLY
+    // while `cl.control == 0` (client.hml:574), and control is not granted
+    // until the authority's STAND beat at session tick 180.  Setting the bit
+    // once before the loop set it into a client that was ignoring it, and the
+    // hold ran 1800 ticks against a button that was never down -- which is how
+    // the first version of this function reported "the authority lit the
+    // lantern: 0" for thirty simulated seconds standing 1.2 m from the post.
+    let n: i32 = 0;
+    while (n < 1800 && server_lantern_lit(g_sv) == 0) {
+        client_set_move(g_cl, 0.0, 0.0);
+        client_set_button(g_cl, BTN_USE, 1);
+        scan_tick(1);
+        n++;
+        if (n % 300 == 0) {
+            print(`    holding E: tick ${n}, dist ${f1(client_lantern_dist(g_cl))} m, control ${client_has_control(g_cl)}, beat ${server_beat_name(server_beat(g_sv))}`);
+        }
+    }
+    client_set_button(g_cl, BTN_USE, 0);
+    scan_tick(6);
+    print(`    the hold took ${n} ticks (${f1(f64(n) / 60.0)} s against the ${f1(g_LANTERN_CHANNEL_S)} s channel)`);
+    let out: i32 = server_lantern_lit(g_sv);
+    return out;
+}
+
+fn run_anchorscan(): i32 {
+    g_hud_on = 0;
+    g_vm_mode = 0;
+    g_scan_t = scan_t_from_hours(g_scan_h);
+    let lx: f64 = server_lantern_x(g_sv);
+    let lz: f64 = server_lantern_z(g_sv);
+    // `--at-town` moves the scan into the settlement, which is the case the
+    // "every yaw" half of the bar is really about: the Great Lantern is ONE
+    // object at ONE azimuth and can only ever be in frame at one of eight 45
+    // degree yaws (the horizontal half-fov is 44.58 degrees at 320x180 / fov
+    // 58 -- 45 misses by less than half a degree).  A town has lit windows in
+    // every direction, so a town is where "every yaw" can be answered at all.
+    if (g_at_town == 1) {
+        let st0: object = server_settle(g_sv);
+        lx = w6_settle_cx(st0) + 12.0;
+        lz = w6_settle_cz(st0) + 12.0;
+    }
+    print("");
+    print("=== NIGHT ANCHOR SCAN — the shipping binary, HUD and viewmodel off ===");
+    print(`  clock ${f1(g_scan_h)}h  (day_t ${g_scan_t}, tod_clock_hours ${f1(tod_clock_hours(g_scan_t))})`);
+    if (g_at_town == 1) {
+        print(`  IN THE SETTLEMENT at ${i32(lx)}, ${i32(lz)}, tier ${g_town_tier}  (the Great Lantern is elsewhere)`);
+    } else {
+        print(`  Great Lantern at ${i32(lx)}, ${i32(lz)};  camera ${f1(g_SCAN_R)} m away`);
+    }
+    print(`  threshold Rec.709 >= ${i32(g_SCAN_TH)}, 8-connectivity, ${g_RES_W}x${g_RES_H} native`);
+
+    // ⚠ RUN THE OPENING OUT BEFORE MEASURING ANYTHING, AND THE REASON IS TWO
+    // SEPARATE BUGS THIS SCAN WALKED STRAIGHT INTO.
+    //
+    //   1. `hud_build` draws the fade-from-black and "THE LAMPS WENT OUT ON A
+    //      TUESDAY" BEFORE its `g_hud_on == 0` early-out, because the opening is
+    //      not the HUD.  The first UNLIT phase was therefore photographed
+    //      through a black curtain and reported 0 px at every yaw -- including
+    //      the two where the moon is an 863 px disc.  LOOKED AT, which is the
+    //      only reason it was caught: the PNG has the title card in it.
+    //   2. `cl.control` is granted on the authority's STAND beat, and
+    //      `sv_set_beat` only ever moves FORWARD.  Teleporting the player to
+    //      1.2 m from the post at tick 30 fires the REACH beat first, STAND is
+    //      then refused as a lower beat, and control is never granted at all --
+    //      so `client_set_button` no-ops for the rest of the run and the hold
+    //      never happens.  (That is a real ordering hazard in `server.hml`, not
+    //      a probe artefact; it is reported rather than patched from a file this
+    //      task does not own.  A human cannot reach it because a human cannot
+    //      teleport.)
+    //
+    // Both are gone if the opening simply finishes first, WHERE THE PLAYER
+    // WAKES UP, before any teleport.
+    let opened: i32 = 0;
+    while (opened < 900) {
+        scan_tick(1);
+        opened++;
+        if (client_has_control(g_cl) == 1 && client_intro_alpha(g_cl) <= 0.002) {
+            if (opened > 240) { opened = 900; }
+        }
+    }
+    print(`  opening done: control ${client_has_control(g_cl)}, intro alpha ${f1(client_intro_alpha(g_cl))}, beat ${server_beat_name(server_beat(g_sv))}`);
+
+    // ⚠ AND BOTH PHASES ARRIVE THE SAME WAY.  The first version teleported once
+    // and then ran the 900-tick opening for phase A, but only 30 ticks for
+    // phase B -- and the STAND ANIMATION had not finished in A, so the UNLIT
+    // frames were shot from an eye 1.3 m lower, half sunk in the hillside.
+    // The ground band read 52.5 unlit against 16.5 lit and the "delta" was
+    // -36: a lantern that made the night DARKER.  It was the camera, not the
+    // lamp.  Two phases that are compared must be reached by identical paths.
+    let sx: f64 = lx + g_SCAN_R;
+    let sz: f64 = lz;
+    if (g_at_town == 1) { sx = lx; sz = lz; }
+    scan_stand_at(sx, sz);
+    let before: i32 = scan_phase("UNLIT");
+
+    let lit: i32 = scan_light_the_lantern();
+    print("");
+    print(`  the authority lit the lantern: ${lit}  (0 would mean this run proves nothing)`);
+    scan_stand_at(sx, sz);
+    let after: i32 = scan_phase("LIT");
+
+    print("");
+    print(`  yaws with a WARM world anchor >= 40 px:  UNLIT ${before} / ${g_SCAN_YAWS}   LIT ${after} / ${g_SCAN_YAWS}`);
+    let rc: i32 = 0;
+    if (lit == 0) { rc = 1; }
+    return rc;
+}
 
 // ---------------------------------------------------------------------------
 // THE SHELL'S SMOKE TEST.  `tools/probe_game.hml` is the acceptance harness —
@@ -3548,6 +4123,10 @@ fn parse_args(): i32 {
         else if (a == "--headless") { g_headless = 1; }
         else if (a == "--workers" && i + 1 < n) { i++; g_workers = clampi(i32(num_or(args[i], f64(g_EMIT_WORKERS))), 0, 12); }
         else if (a == "--selftest") { g_headless = 1; g_no_audio = 1; g_demo_s = 3.0; g_selftest = 1; }
+        else if (a == "--anchorscan" && i + 1 < n) {
+            i++; g_scan = 1; g_scan_h = num_or(args[i], 22.0);
+            g_headless = 1; g_no_audio = 1;
+        }
         else { eprint(`nightshade: unknown argument '${a}'`); usage(); let bad: i32 = 2; return bad; }
         i++;
     }
@@ -3594,6 +4173,12 @@ fn main() {
 
     print(`nightshade: boot ${f1(boot_ms)} ms, ${assets_texture_count()} textures, audio ${g_audio_on}, seed ${g_seed}, emit workers ${g_emit_workers}`);
     print(`nightshade: spawn (${i32(server_spawn_x(g_sv))}, ${i32(server_spawn_z(g_sv))})  tier ${server_tier_at(g_sv, server_spawn_x(g_sv), server_spawn_z(g_sv), 0)}  lantern ${i32(server_lantern_x(g_sv))}, ${i32(server_lantern_z(g_sv))}  vm ${vm_mesh_tris(g_vm)} tris`);
+
+    if (g_scan == 1) {
+        let src: i32 = run_anchorscan();
+        shutdown();
+        exit(src);
+    }
 
     run_loop();
     let rc2: i32 = 0;
